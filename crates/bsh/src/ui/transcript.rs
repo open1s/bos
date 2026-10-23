@@ -312,7 +312,7 @@ pub(crate) fn format_bytes(bytes: usize) -> String {
 /// that object puts `\n` escapes in front of a reader who wants the text. A
 /// failing command keeps its stderr in the same body - the red tone is the
 /// row's own signal, and the body does not hide why it failed.
-pub(crate) fn output_body(output: &str) -> String {
+pub(crate) fn output_body(lang: Lang, output: &str) -> String {
     let stdout = json_field_exact(output, "stdout");
     let stderr = json_field_exact(output, "stderr");
     if stdout.is_none() && stderr.is_none() {
@@ -327,12 +327,35 @@ pub(crate) fn output_body(output: &str) -> String {
         text.push_str(&err);
     }
     let trimmed = text.trim_end().to_string();
-    if trimmed.is_empty() {
+    let mut body = if trimmed.is_empty() {
         // A silent success is still a result: say so rather than drawing an
         // empty box.
-        return "(no output)".to_string();
+        "(no output)".to_string()
+    } else {
+        trimmed
+    };
+    // The streams above are the command's OWN, byte for byte. The explanation
+    // is a separate paragraph the tool's result asked for (a direct socket or
+    // ICMP the sandbox does not proxy), never a rewrite of stderr and never a
+    // claim that the policy refused a command it allowed.
+    if json_field_exact(output, "network_diagnostic").as_deref()
+        == Some(agent::tools::bash::UNPROXIED_DIRECT_SOCKET)
+    {
+        body.push_str("\n\n");
+        body.push_str(&tr(lang, "tool.bash.unproxiedNetwork"));
     }
-    trimmed
+    // A preset that turned the sandbox off is a cost the result must state, not
+    // a detail a reader has to infer from `sandbox: "none"`. The sentence names
+    // both consequences: no filesystem confinement AND no egress allowlist for
+    // this command. The tool-boundary policy still applied.
+    if json_field_exact(output, "sandbox").as_deref() == Some("none")
+        && json_field_exact(output, "sandbox_reason").as_deref()
+            == Some(agent::tools::bash::PRESET_SANDBOX_OFF_REASON)
+    {
+        body.push_str("\n\n");
+        body.push_str(&tr(lang, "tool.bash.sandboxOff"));
+    }
+    body
 }
 impl Shell {
     /// The text a step's path holds on disk now, when it can be read.
@@ -3458,7 +3481,7 @@ impl Shell {
             if let Some(output) = output.clone() {
                 row = row.child(self.step_block(
                     "OUT",
-                    &output_body(&output),
+                    &output_body(lang, &output),
                     None,
                     false,
                     chrome,
@@ -3557,5 +3580,74 @@ impl Shell {
                 theme::body_size_at(self.state.draft().global.general.content_font_size),
                 theme::muted(),
             ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::output_body;
+    use crate::i18n::Lang;
+
+    /// The measured failure this round explains: ping under Standard/PTC with no
+    /// allowlist file, i.e. UNRESTRICTED egress, refused by the kernel because
+    /// the sandbox only grants its proxy.
+    const PING: &str = r#"{"stdout":"","stderr":"ping: sendto: Operation not permitted","exit_code":2,"success":false,"sandbox":"heel","network":"unrestricted","network_diagnostic":"unproxied-direct-socket"}"#;
+
+    /// A proxied client's body is its own streams, byte for byte: no
+    /// explanation is invented for a command that worked.
+    #[test]
+    fn a_reachable_command_keeps_its_streams_and_gets_no_note() {
+        let output = r#"{"stdout":"ok
+","stderr":"","exit_code":0,"success":true,"sandbox":"heel","network":"unrestricted"}"#;
+        assert_eq!(output_body(Lang::En, output), "ok");
+    }
+
+    /// A kernel refusal under UNRESTRICTED egress keeps its original stderr and
+    /// gains a localized paragraph that says what actually happened, names the
+    /// clients that work, and points at the policy document. It never says the
+    /// policy refused the command.
+    #[test]
+    fn a_kernel_refused_socket_keeps_its_stderr_and_explains_itself() {
+        let en = output_body(Lang::En, PING);
+        assert!(
+            en.starts_with("ping: sendto: Operation not permitted"),
+            "the original stderr was rewritten: {en}"
+        );
+        assert!(en.contains("docs/bsh-tool-policy.md"), "{en}");
+        assert!(en.contains("not a policy refusal"), "{en}");
+        assert!(en.contains("curl, git, npm"), "{en}");
+        assert!(
+            en.contains("does not proxy direct sockets or ICMP"),
+            "the explanation names the limitation: {en}"
+        );
+
+        let zh = output_body(Lang::Zh, PING);
+        assert!(
+            zh.starts_with("ping: sendto: Operation not permitted"),
+            "the original stderr was rewritten: {zh}"
+        );
+        assert!(zh.contains("docs/bsh-tool-policy.md"), "{zh}");
+        assert!(zh.contains("沙箱不代理直接套接字与 ICMP"), "{zh}");
+        assert!(zh.contains("这不是策略拒绝"), "{zh}");
+        assert_ne!(en, zh, "zh fell back to English");
+    }
+
+    /// Without the tool's own diagnostic id there is no note, even when the
+    /// streams contain the same EPERM wording: the note follows the RESULT's
+    /// condition, not a second, divergent guess in the view.
+    #[test]
+    fn the_note_follows_the_tools_diagnostic_field() {
+        let output = r#"{"stdout":"","stderr":"ping: sendto: Operation not permitted","exit_code":2,"success":false,"sandbox":"heel","network":"deny-all"}"#;
+        assert_eq!(
+            output_body(Lang::En, output),
+            "ping: sendto: Operation not permitted",
+            "a view must not re-derive the condition"
+        );
+    }
+
+    /// Non-JSON output is passed through untouched, as before.
+    #[test]
+    fn a_plain_body_is_unchanged() {
+        assert_eq!(output_body(Lang::En, "plain text"), "plain text");
     }
 }

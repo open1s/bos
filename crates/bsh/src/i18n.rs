@@ -88,6 +88,24 @@ mod tests {
         assert_ne!(zh, en, "zh fell back to english");
     }
 
+    /// The settings footer's save confirmation is the exact copy both
+    /// languages show.
+    ///
+    /// These two keys already existed - Save wrote the success one into the
+    /// statusbar behind the dialog - so the toast reuses them rather than
+    /// adding near-duplicates. The failure string ends in a colon because the
+    /// write error is appended to it.
+    #[test]
+    fn the_settings_save_confirmation_carries_both_languages() {
+        assert_eq!(tr(Lang::En, "settings.saved"), "Settings saved");
+        assert_eq!(tr(Lang::Zh, "settings.saved"), "设置已保存");
+        assert_eq!(
+            tr(Lang::En, "settings.saveFailed"),
+            "Could not save settings:"
+        );
+        assert_eq!(tr(Lang::Zh, "settings.saveFailed"), "无法保存设置：");
+    }
+
     /// The two locale files carry exactly the same keys.
     ///
     /// `tr` renders a missing key as itself, so a key added to one file and
@@ -302,9 +320,30 @@ mod tests {
             "permission.presetReadOnly",
             "permission.presetWorkspaceWrite",
             "permission.presetFullAccess",
+            "permission.consequenceReadOnly",
+            "permission.consequenceWorkspace",
+            "permission.consequenceFull",
+            "permission.consequenceFullShell",
+            "permission.cardReadOnly",
+            "permission.cardWorkspace",
+            "permission.cardFull",
+            "permission.cardFullShell",
+            "permission.cardCapped",
+            "permission.keptShort",
+            // The derived network clause: the actors, the two sentence shapes
+            // and the phrasings the five reach states resolve to.
+            "permission.netActorsReadOnly",
+            "permission.netActorsCommands",
+            "permission.netActorsTools",
+            "permission.netActors",
+            "permission.netGeneric",
+            "permission.netReachFree",
+            "permission.netReachWorkspace",
+            "permission.netReachPreset",
+            "permission.netDenyWorkspace",
+            "permission.netDenyPreset",
             "permission.confirmTitle",
             "permission.confirmDescription",
-            "permission.confirmAcknowledge",
             "permission.confirmCancel",
             "permission.confirmEnable",
             // Language and appearance, whose cube labels are chosen by mode.

@@ -18,6 +18,17 @@
 //! Jobs live in memory only. A restart loses the roster and the output, and any
 //! process a previous launch detached keeps running outside this registry. That
 //! is stated rather than guessed: the model carries no store.
+//!
+//! # Settlement order
+//!
+//! A settled status is a promise that the capture is complete up to the
+//! settlement. The pipe readers therefore claim a writer slot before they start
+//! and release it only after their pipe reaches EOF, and [JobRegistry::finish] /
+//! [JobRegistry::kill] record the outcome but publish it only when the last
+//! writer is gone. A process the command left behind can hold a pipe open
+//! indefinitely, so the wait is bounded by this module's drain grace: a
+//! settlement that outlives it is published with what was captured, and the ring
+//! refuses later bytes, so a settled job's output never grows under a reader.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -29,6 +40,16 @@ pub const DEFAULT_OUTPUT_CAP: usize = 64 * 1024;
 
 /// Jobs a registry keeps by default.
 pub const DEFAULT_JOB_CAP: usize = 200;
+
+/// How long a settlement waits for the pipe readers after the process ended.
+///
+/// The readers reach EOF as soon as the command's last process closes its
+/// pipes, which is immediate in the normal case. A command that leaves a
+/// process behind holding a pipe open (a daemon, a background child) would keep
+/// the job from ever settling, so after this bound the job settles with what
+/// was captured and the ring seals. This is the crate's one drain bound: the
+/// background settlement and the foreground timeout both use it.
+pub(crate) const DRAIN_GRACE: Duration = Duration::from_secs(1);
 
 /// The last cap bytes written to a job, with the number of bytes the bound
 /// already dropped.
@@ -177,6 +198,16 @@ pub struct BackgroundJob {
     /// The working directory the process was started in, which is the path a
     /// policy re-check names for job_output and job_kill.
     pub cwd: PathBuf,
+    /// Pipe readers still draining this job's output.
+    ///
+    /// A settlement is accepted but not published while this is non-zero, so a
+    /// reader can never see a settled job while a reader thread can still
+    /// append. Bookkeeping rather than a fact a caller acts on: the status
+    /// itself stays [JobStatus::Running] for exactly as long as the wait.
+    writers: usize,
+    /// The status a waiter or a kill decided, held unpublished until the
+    /// writers above have drained (or the drain bound has expired).
+    outcome: Option<JobStatus>,
 }
 
 impl BackgroundJob {
@@ -266,6 +297,23 @@ impl JobOutput {
     }
 }
 
+/// Publish a job's recorded outcome, once, when it is still running.
+///
+/// The one place that assigns a settled status, so the ordering rule - publish
+/// only after the pipe readers have drained - cannot drift between the waiter's
+/// finish, a kill and the last writer's release.
+fn publish_settled(job: &mut BackgroundJob) -> bool {
+    let Some(status) = job.outcome else {
+        return false;
+    };
+    if !job.status.is_running() {
+        return false;
+    }
+    job.status = status;
+    job.finished_at = Some(Instant::now());
+    true
+}
+
 #[derive(Debug, Default)]
 struct RegistryState {
     jobs: VecDeque<BackgroundJob>,
@@ -336,6 +384,8 @@ impl JobRegistry {
             output: BoundedRing::new(self.output_cap),
             pid: None,
             cwd: cwd.into(),
+            writers: 0,
+            outcome: None,
         });
         state.version += 1;
         // The oldest job goes first. A running one is signalled after the lock
@@ -365,59 +415,168 @@ impl JobRegistry {
     }
 
     /// Append captured bytes to a job ring.
+    ///
+    /// Bytes that arrive after the status settled are refused: the settlement
+    /// either waited for every writer or gave up at the drain bound, and in
+    /// both cases a reader that observed the settled status must never see the
+    /// capture change afterwards.
     pub fn append_output(&self, id: &str, bytes: &[u8]) {
         let mut state = self.lock();
         if let Some(job) = state.jobs.iter_mut().find(|job| job.id == id) {
-            job.output.push(bytes);
-            state.version += 1;
+            if job.status.is_running() {
+                job.output.push(bytes);
+                state.version += 1;
+            }
         }
     }
 
-    /// Settle a job. A job already marked [JobStatus::Killed] keeps that
-    /// status, because a kill races the wait and the reader intent wins.
+    /// Record a job's outcome, publishing it once its output has drained.
+    ///
+    /// The first outcome wins: a kill and the wait both call this, and a job
+    /// already settled (or already holding an outcome) is left alone. Returns
+    /// whether this call recorded the outcome; when it did not publish yet, the
+    /// status stays [JobStatus::Running] until the last writer releases and the
+    /// registry's bounded settle path (or the drain bound) publishes it.
     pub fn finish(&self, id: &str, status: JobStatus) -> bool {
         let mut state = self.lock();
-        let Some(job) = state.jobs.iter_mut().find(|job| job.id == id) else {
+        let Some(index) = state.jobs.iter().position(|job| job.id == id) else {
             return false;
         };
-        if !job.status.is_running() {
+        let job = &mut state.jobs[index];
+        if !job.status.is_running() || job.outcome.is_some() {
             return false;
         }
-        job.status = status;
-        job.finished_at = Some(Instant::now());
-        state.version += 1;
+        job.outcome = Some(status);
+        let published = job.writers == 0 && publish_settled(job);
+        if published {
+            state.version += 1;
+        }
         drop(state);
-        self.settled.notify_all();
+        if published {
+            self.settled.notify_all();
+        }
         true
     }
 
-    /// Stop a running job process group and mark it [JobStatus::Killed].
+    /// Stop a running job process group and settle it as [JobStatus::Killed].
     ///
     /// Returns false for an unknown or already settled job, which is also what a
-    /// second kill reports.
+    /// second kill reports. On true the job is settled when this returns: the
+    /// kill signal goes out first, then the call waits (bounded by the module's
+    /// drain grace) for the pipes to drain, so the output readable under the
+    /// Killed status is the command's output up to the kill. A process that
+    /// survives the signal, or one the command left holding the pipe, cannot
+    /// make the stop spin forever: the bound settles with what was captured.
     pub fn kill(&self, id: &str) -> bool {
-        let pid = {
+        let (pid, published) = {
             let mut state = self.lock();
             let Some(index) = state.jobs.iter().position(|job| job.id == id) else {
                 return false;
             };
-            if !state.jobs[index].status.is_running() {
+            let job = &mut state.jobs[index];
+            if !job.status.is_running() || job.outcome.is_some() {
                 return false;
             }
             // A kill needs the pid: marking a job killed without a process to
             // signal would claim an outcome the host never performed. The
             // stop handler retries (its failed phase) if this window is hit.
-            let Some(pid) = state.jobs[index].pid else {
+            let Some(pid) = job.pid else {
                 return false;
             };
-            state.jobs[index].status = JobStatus::Killed;
-            state.jobs[index].finished_at = Some(Instant::now());
-            state.version += 1;
-            pid
+            job.outcome = Some(JobStatus::Killed);
+            let published = job.writers == 0 && publish_settled(job);
+            if published {
+                state.version += 1;
+            }
+            (pid, published)
         };
-        self.settled.notify_all();
+        if published {
+            self.settled.notify_all();
+        }
         kill_group(pid);
+        if !published {
+            // Output the killed command had already written may still be in a
+            // pipe. Settle only after the readers appended it, or at the drain
+            // bound, so a reader that sees Killed sees the complete-to-kill
+            // capture.
+            self.settle_after_writers(id, DRAIN_GRACE);
+        }
         true
+    }
+
+    /// Register one live pipe reader for a job.
+    ///
+    /// Claimed before the reader thread starts, so a waiter can never publish a
+    /// settlement in the window between the process exiting and its reader
+    /// beginning to read. Returns false when the job is already gone (the
+    /// roster bound displaced it), whose reader then has nowhere to write.
+    pub(crate) fn claim_writer(&self, id: &str) -> bool {
+        let mut state = self.lock();
+        match state.jobs.iter_mut().find(|job| job.id == id) {
+            Some(job) => {
+                job.writers += 1;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Release one pipe reader's claim, publishing a waiting settlement when
+    /// the last reader is gone.
+    pub(crate) fn release_writer(&self, id: &str) {
+        let mut state = self.lock();
+        let Some(index) = state.jobs.iter().position(|job| job.id == id) else {
+            return;
+        };
+        let job = &mut state.jobs[index];
+        if job.writers == 0 {
+            return;
+        }
+        job.writers -= 1;
+        let published = job.writers == 0 && publish_settled(job);
+        if published {
+            state.version += 1;
+        }
+        drop(state);
+        if published {
+            self.settled.notify_all();
+        }
+    }
+
+    /// Wait up to grace for the writers to drain, then publish the recorded
+    /// outcome anyway so the job settles.
+    ///
+    /// Called by the waiter after it has reaped the process (the pipes are at
+    /// EOF unless a process the command left behind holds one) and by kill,
+    /// which needs the complete-to-kill capture before it reports. A job whose
+    /// settlement is already published returns at once, and one with no
+    /// recorded outcome is returned as it stands - this never invents a status.
+    pub(crate) fn settle_after_writers(&self, id: &str, grace: Duration) -> Option<JobSummary> {
+        let deadline = Instant::now() + grace;
+        let mut state = self.lock();
+        loop {
+            let index = state.jobs.iter().position(|job| job.id == id)?;
+            let job = &state.jobs[index];
+            if !job.status.is_running() || job.outcome.is_none() {
+                return Some(job.summary(Instant::now()));
+            }
+            let now = Instant::now();
+            if job.writers == 0 || now >= deadline {
+                let job = &mut state.jobs[index];
+                if publish_settled(job) {
+                    state.version += 1;
+                }
+                let summary = state.jobs[index].summary(Instant::now());
+                drop(state);
+                self.settled.notify_all();
+                return Some(summary);
+            }
+            let (guard, _) = self
+                .settled
+                .wait_timeout(state, deadline.saturating_duration_since(now))
+                .unwrap_or_else(|e| e.into_inner());
+            state = guard;
+        }
     }
 
     /// Every job owned by session, newest first.
@@ -741,5 +900,103 @@ mod tests {
         assert!(!owned_by(&registry.list_for_session("a")[0], "b"));
         assert!(owned_by(&registry.list_for_session("a")[0], "a"));
         assert!(registry.job(&id).is_some());
+    }
+
+    /// The ordering rule in its smallest form: an outcome recorded while a
+    /// writer is alive stays unpublished until that writer releases.
+    #[test]
+    fn a_settlement_waits_for_every_writer() {
+        let registry = JobRegistry::new();
+        let id = registry.begin("a", "bash", "x");
+        assert!(registry.claim_writer(&id));
+        assert!(registry.claim_writer(&id));
+        registry.append_output(&id, b"first");
+        assert!(registry.finish(&id, JobStatus::Succeeded { code: 0 }));
+        assert_eq!(
+            registry.job(&id).expect("job").status,
+            JobStatus::Running,
+            "the outcome is not published while a writer is alive"
+        );
+        registry.append_output(&id, b"second");
+        registry.release_writer(&id);
+        assert_eq!(
+            registry.job(&id).expect("job").status,
+            JobStatus::Running,
+            "one of two writers has drained"
+        );
+        registry.release_writer(&id);
+        assert_eq!(
+            registry.job(&id).expect("job").status,
+            JobStatus::Succeeded { code: 0 },
+            "the last writer's release publishes the settlement"
+        );
+        assert_eq!(
+            registry.output_for(&id).expect("output").text,
+            "firstsecond"
+        );
+        registry.append_output(&id, b"late");
+        assert_eq!(
+            registry.output_for(&id).expect("output").text,
+            "firstsecond",
+            "a settled job refuses bytes that arrive after the publication"
+        );
+    }
+
+    /// A writer that never drains cannot keep a job running forever: the bound
+    /// publishes the outcome and seals the ring.
+    #[test]
+    fn a_settlement_past_the_drain_bound_publishes_and_seals() {
+        let registry = JobRegistry::new();
+        let id = registry.begin("a", "bash", "x");
+        assert!(registry.claim_writer(&id));
+        registry.append_output(&id, b"kept");
+        assert!(registry.finish(&id, JobStatus::Failed { code: 2 }));
+        let summary = registry
+            .settle_after_writers(&id, Duration::from_millis(20))
+            .expect("the job exists");
+        assert_eq!(summary.status, JobStatus::Failed { code: 2 });
+        assert_eq!(registry.output_for(&id).expect("output").text, "kept");
+        registry.append_output(&id, b"late");
+        registry.release_writer(&id);
+        assert_eq!(
+            registry.output_for(&id).expect("output").text,
+            "kept",
+            "the late writer's bytes are refused, so the settled capture is final"
+        );
+        assert_eq!(
+            registry.job(&id).expect("job").status,
+            JobStatus::Failed { code: 2 }
+        );
+    }
+
+    /// A kill reports its outcome only after the capture it interrupted has
+    /// drained, so a reader of a Killed job sees the bytes written before it.
+    #[test]
+    fn a_kill_publishes_only_after_the_capture_drains() {
+        let registry = Arc::new(JobRegistry::new());
+        let id = registry.begin("a", "bash", "x");
+        registry.set_pid(&id, u32::MAX);
+        assert!(registry.claim_writer(&id));
+        let writer = {
+            let registry = registry.clone();
+            let id = id.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                registry.append_output(&id, b"before-kill");
+                registry.release_writer(&id);
+            })
+        };
+        assert!(registry.kill(&id), "the kill is accepted");
+        assert_eq!(
+            registry.job(&id).expect("job").status,
+            JobStatus::Killed,
+            "kill settles before it reports"
+        );
+        assert_eq!(
+            registry.output_for(&id).expect("output").text,
+            "before-kill",
+            "the capture the kill interrupted is complete when Killed is visible"
+        );
+        writer.join().expect("the writer");
     }
 }

@@ -4,10 +4,11 @@
 //!
 //! The shell tool and the right-pane terminal are two processes with one
 //! question - what may this turn touch - and had two answers before this
-//! module: the tool built a Seatbelt profile from a root path, the terminal
-//! spawned a bare PTY. [SandboxSpec] is that answer, built once from the
-//! effective permission and the regorus policy, and consumed by both spawn
-//! paths, so the two cannot diverge by construction.
+//! module: the tool built a profile from a root path, the terminal spawned a
+//! bare PTY. [SandboxSpec] is that answer, built once from the effective
+//! permission and the regorus policy, and consumed by both spawn paths, so the
+//! two cannot diverge by construction. heel is the one sandbox implementation,
+//! and a normal (required) dependency.
 //!
 //! # The mapping
 //!
@@ -35,9 +36,8 @@
 //!   the workspace root. The deny stays a policy-tier decision (the baseline's
 //!   write-forbidden-directory rule), recorded in [SandboxSpec::denied_writes]
 //!   and enforced by the shell tool before it spawns. A write reached through a
-//!   shell variable is out of that tier's reach. The in-tree Seatbelt profile
-//!   (the heel-sandbox-off build) DOES deny them in the kernel, which is the
-//!   concrete reason the fallback is kept.
+//!   shell variable is out of that tier's reach; heel is the only sandbox
+//!   implementation, so there is no kernel deny to catch it.
 //! - **Full access is no sandbox at all**, not a permissive sandbox: the
 //!   permission already means the reader released confinement, and wrapping it
 //!   in heel's permissive level would only make the release slower.
@@ -57,7 +57,7 @@
 //! | host temp | write on the temp probe | host temp writable, or denied |
 //! | build cache | write under the cache | write+exec grant, or none |
 //! | toolchain | read on each candidate | grant, unless a narrowing module refused it |
-//! | egress | egress on each allowlist entry | a proxy exists at all, or kernel deny |
+//! | egress | egress on each allowlist entry | Unrestricted, a proxy, or kernel deny |
 //!
 //! Two properties of that derivation matter:
 //!
@@ -71,11 +71,23 @@
 //!   about and refused, the scoped root was allowed", and the kernel grant list
 //!   follows the policy's answer rather than a flag read beside it.
 //!
-//! The egress half has a live arm as well: when the derived set is not empty,
-//! the shell runs under a proxy whose policy is the RegoEgress type below,
-//! which asks the same policy PER CONNECTION for the address it resolved. The
-//! static set decides whether a proxy exists; the live callback decides each
-//! request.
+//! The egress half has three answers, mirroring the workspace file's tri-state:
+//!
+//! - **No file at all** derives [Egress::Unrestricted]. The workspace has not
+//!   declared a reach, so nothing is constrained by a rule list; heel runs its
+//!   allow-all policy. heel has no pass-through network mode, so this still runs
+//!   heel's proxy and the kernel still refuses ICMP and host-local targets - the
+//!   state means "no allowlist", not "no sandbox".
+//! - **A present file with no parsed rule** derives [Egress::DenyAll]: the
+//!   reader created the file and left it empty, which is a deliberate lockdown.
+//! - **A present file with rules** derives [Egress::Allow], and the shell runs
+//!   under a proxy whose policy is the RegoEgress type below. That proxy asks
+//!   the same policy PER CONNECTION for the address it resolved; the static set
+//!   only decides that a proxy exists.
+//!
+//! Every candidate is still a POLICY QUESTION, so a preset can only narrow the
+//! reach: a preset that declares `[]` derives DenyAll even on an unrestricted
+//! workspace, and a preset list intersects the workspace's own rules.
 //!
 //! # The terminal
 //!
@@ -88,14 +100,31 @@
 //! kernel, and exit. A shell that cannot run without a controlling terminal
 //! (fish) is replaced, and the pane says so in one line.
 //!
+//! # Platforms
+//!
+//! The shell tool is the same on all three: heel builds an SBPL profile on
+//! macOS, a Landlock rule set on Linux and an AppContainer on Windows, and the
+//! spec's grants are what it reports. The TERMINAL differs, and the difference
+//! is [TerminalPlatform]:
+//!
+//! | platform | pane's shell | why |
+//! |---|---|---|
+//! | macOS | confined, interactive | heel's SBPL profile can grant the pane's tty device (allow_tty_write) and the shell opens it by name |
+//! | Linux | confined, interactive | heel's Landlock ruleset grants /dev/tty, /dev/ptmx and /dev/pts when allow_tty_write is on, so the same by-path door opens |
+//! | Windows | interactive, not confined | heel launches through CreateProcessW with its own stdio pipes; a ConPTY is attached as a process attribute at creation, not a handle the sandbox could be given |
+//!
+//! On Windows the pane still works: it spawns the shell on its own ConPTY
+//! through portable-pty, which is the only path that performs that handshake.
+//! [TerminalSandbox::PtyNotHostable] says so in the pane instead of implying a
+//! confinement. heel is required on every platform, so macOS and Linux both
+//! claim the sandbox and only Windows states that it cannot.
+//!
 //! # What this module cannot do
 //!
 //! A .git or .bsh write reached through a shell variable is refused by the
 //! policy tier only where the command line names the path; heel has no deny
-//! inside a granted tree, so the kernel does not stop it. That is why the
-//! heel-sandbox-off build still exists. On a backend that cannot grant the pty
-//! slave (heel's Linux backend), [TerminalSandbox::PtyNotHostable] says so
-//! instead of implying a confinement.
+//! inside a granted tree, so the kernel does not stop it. There is no second
+//! backend to catch it: heel is the one sandbox implementation.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -172,7 +201,6 @@ impl ToolchainPath {
 /// back at a directory the policy denies. The proxy variables are the
 /// confinement's egress path: an inherited HTTP_PROXY would route around the
 /// sandbox's own proxy and the policy behind it.
-#[cfg_attr(not(feature = "heel-sandbox"), allow(dead_code))]
 const RESERVED_ENV: &[&str] = &[
     "TMPDIR",
     "TEMP",
@@ -298,6 +326,21 @@ pub enum Egress {
     /// Nothing, enforced by the kernel with no proxy running at all.
     #[default]
     DenyAll,
+    /// No workspace allowlist was declared at all: the turn's egress is not
+    /// constrained by a rule list.
+    ///
+    /// This is the ABSENT arm of the workspace file's tri-state, and it is why a
+    /// fresh workspace can reach the network without its reader writing a file
+    /// first. A present file that parses to no rule is `DenyAll` instead, and a
+    /// present file with rules is `Allow`: the lists being empty cannot tell
+    /// those apart, so the derivation carries the file's own state.
+    ///
+    /// The backend has no pass-through network mode (heel 0.5 always either
+    /// denies in the kernel or runs its forward proxy), so this state runs heel
+    /// under its allow-all policy: a proxy still exists and the kernel still
+    /// refuses ICMP and host-local destinations. The state means "no allowlist
+    /// constrains this turn", not "the process is unconfined".
+    Unrestricted,
     /// The rules the policy allowlisted: addresses (and CIDRs) plus hostnames.
     ///
     /// A non-empty set starts heel's proxy, which asks the RegoEgress policy
@@ -308,15 +351,32 @@ pub enum Egress {
 }
 
 impl Egress {
-    /// Whether any address is allowed.
+    /// Whether the network reach is not deny-all.
+    ///
+    /// A non-empty allowlist and the unrestricted state both answer true; an
+    /// allowlist with no entry is a deny-all and answers false.
     pub fn is_allowed(&self) -> bool {
-        matches!(self, Self::Allow(entries) if !entries.is_empty())
+        match self {
+            Self::DenyAll => false,
+            Self::Unrestricted => true,
+            Self::Allow(entries) => !entries.is_empty(),
+        }
     }
 
-    /// The allowlisted entries.
+    /// Whether no workspace allowlist was declared at all.
+    pub fn is_unrestricted(&self) -> bool {
+        matches!(self, Self::Unrestricted)
+    }
+
+    /// Whether the kernel denies every destination.
+    pub fn is_deny_all(&self) -> bool {
+        matches!(self, Self::DenyAll)
+    }
+
+    /// The allowlisted entries. The unrestricted state names none.
     pub fn entries(&self) -> &[String] {
         match self {
-            Self::DenyAll => &[],
+            Self::DenyAll | Self::Unrestricted => &[],
             Self::Allow(entries) => entries,
         }
     }
@@ -416,7 +476,15 @@ impl SandboxSpec {
             egress: Egress::DenyAll,
             decisions: Vec::new(),
         };
-        if mode == SandboxMode::FullAccess || root.as_os_str().is_empty() {
+        if mode == SandboxMode::FullAccess {
+            // A released turn is not sandboxed at all, so nothing constrains
+            // its network either: the spec says so instead of claiming a deny.
+            spec.egress = Egress::Unrestricted;
+            return spec;
+        }
+        if root.as_os_str().is_empty() {
+            // No workspace root means no egress question can be asked; the
+            // deny-all default stands rather than becoming a silent allow.
             return spec;
         }
         // Two spellings, on purpose: every QUESTION uses the policy's own root
@@ -547,42 +615,61 @@ impl SandboxSpec {
             }
         }
 
-        // 6. Egress. Every rule the data carries is a CANDIDATE: an address
+        // 6. Egress. Every rule EITHER tier names is a CANDIDATE: an address
         //    entry is asked as its own address (the strong door), a hostname
         //    entry as a name with no address (the weak door, which the policy
         //    names as such). The port list is a constraint on both, so a probe
         //    uses one of its ports - the policy's port rule then answers exactly
         //    as it will per request. What survives is the set that makes a proxy
         //    exist at all; each request is still decided live by RegoEgress.
+        //
+        //    The candidates are the UNION of the workspace list and the preset
+        //    list, because a preset may name an entry the workspace list does
+        //    not and that pair still has to be discovered. Union here is not a
+        //    widening: every candidate is still asked, and the baseline consults
+        //    only the WORKSPACE lists, so a preset-only entry is refused by the
+        //    baseline and never survives. A preset that narrows to an empty list
+        //    therefore leaves this set empty, and an empty set is what tells the
+        //    backend not to start a proxy at all - the kernel denies.
         let data = policy.data();
         let probe_port = data.egress_ports.first().copied();
         let mut allowed: Vec<String> = Vec::new();
-        for entry in &data.egress_allowlist {
-            let address = entry.split('/').next().unwrap_or(entry).to_string();
+        for entry in union_entries(&data.egress_allowlist, &data.preset_egress_allowlist) {
+            let address = entry.split('/').next().unwrap_or(&entry).to_string();
             let target = match probe_port {
-                Some(port) => Target::host_on(entry, &address, port),
-                None => Target::host(entry, &address),
+                Some(port) => Target::host_on(&entry, &address, port),
+                None => Target::host(&entry, &address),
             };
             let decision = spec.ask(policy, Action::Egress, target);
             spec.record(GrantKind::Egress, entry.clone(), &decision);
             if decision.is_allowed() {
-                allowed.push(entry.clone());
+                allowed.push(entry);
             }
         }
-        for entry in &data.egress_hosts {
+        for entry in union_entries(&data.egress_hosts, &data.preset_egress_hosts) {
             let target = match probe_port {
-                Some(port) => Target::host_on(entry, "", port),
-                None => Target::host(entry, ""),
+                Some(port) => Target::host_on(&entry, "", port),
+                None => Target::host(&entry, ""),
             };
             let decision = spec.ask(policy, Action::Egress, target);
             spec.record(GrantKind::Egress, entry.clone(), &decision);
             if decision.is_allowed() {
-                allowed.push(entry.clone());
+                allowed.push(entry);
             }
         }
-        if !allowed.is_empty() {
+        if data.egress_unrestricted && !data.preset_egress_restricted {
+            // No workspace file AND no preset narrowing: nothing constrains the
+            // reach, so the spec reports the absent-file state instead of an
+            // empty allowlist, which would be a deliberate deny-all.
+            spec.egress = Egress::Unrestricted;
+        } else if !allowed.is_empty() {
             spec.egress = Egress::Allow(allowed);
         }
+        // An empty candidate set under a PRESENT file, or under a preset that
+        // declares no reach, stays DenyAll: no entry justifies a proxy, and the
+        // kernel deny is the stronger guarantee. A preset that narrows to ports
+        // ALONE fails closed here even though the policy would allow those
+        // ports, because there is no address or hostname to name.
         spec
     }
 
@@ -788,20 +875,97 @@ impl SandboxSpec {
     /// Measured end to end: a real zsh prompt, echo, line editing, a resize the
     /// shell reports back, an outside write refused by the kernel, and exit.
     pub fn terminal(&self) -> TerminalSandbox {
+        self.terminal_for(TerminalPlatform::current())
+    }
+
+    /// The same answer for a named platform, so the table is testable.
+    ///
+    /// heel can host the pane's tty on macOS and Linux, and both use the same
+    /// by-path door:
+    ///
+    /// - **macOS**: heel's SBPL profile can grant the pane's device with
+    ///   allow_tty_write, and the shell opens it by name.
+    /// - **Linux**: heel's Landlock ruleset grants /dev/tty, /dev/ptmx and
+    ///   /dev/pts when allow_tty_write is on, so the same door opens.
+    /// - **Windows**: heel spawns through its own pipes and cannot be handed the
+    ///   pane's ConPTY, and ConPTY has no path to open.
+    ///
+    /// On Windows the pane still works: it spawns the shell on its own pty
+    /// through portable-pty (which performs the ConPTY handshake), and the pane
+    /// says why the shell is not confined.
+    pub fn terminal_for(&self, platform: TerminalPlatform) -> TerminalSandbox {
         if !self.is_confined() {
             return TerminalSandbox::Unconfined;
         }
-        #[cfg(all(unix, not(target_os = "macos")))]
-        {
-            // Landlock grants path by path, and heel's Linux backend does not
-            // name the pty slave, so the tty-by-path door is not open there.
-            TerminalSandbox::PtyNotHostable {
-                reason: "this platform's backend does not grant the pane's pty slave",
-            }
+        match platform {
+            // heel's SBPL profile grants the pane's tty device, and the shell
+            // opens it by name: see SandboxSpec::spawn_terminal.
+            TerminalPlatform::MacOs => TerminalSandbox::Sandboxed,
+            // heel's Landlock backend handles this: with allow_tty_write(true)
+            // its ruleset grants /dev/tty, /dev/ptmx and /dev/pts every
+            // filesystem right, which is exactly the door spawn_terminal uses
+            // (the shell opens /dev/pts/N by path).
+            TerminalPlatform::Linux => TerminalSandbox::Sandboxed,
+            // heel's Windows backend builds its own stdio pipes and launches
+            // through CreateProcessW with AppContainer attributes; a ConPTY is
+            // attached with PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE at creation and
+            // there is no handle to inherit, so the pane's console cannot be
+            // joined. The pane therefore runs its own ConPTY spawn, unconfined.
+            TerminalPlatform::Windows => TerminalSandbox::PtyNotHostable {
+                reason: "heel's AppContainer backend spawns through its own pipes \
+                         and cannot be handed the pane's ConPTY",
+            },
+            TerminalPlatform::Other => TerminalSandbox::PtyNotHostable {
+                reason: "no sandbox terminal integration on this platform",
+            },
         }
-        #[cfg(any(not(unix), target_os = "macos"))]
+    }
+}
+
+/// The platform a terminal spawn is planned for.
+///
+/// A value rather than a `cfg` so the decision table can be tested for all
+/// three platforms from any one of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalPlatform {
+    /// sandbox-exec with SBPL profiles.
+    MacOs,
+    /// Landlock + Seccomp.
+    Linux,
+    /// AppContainer + job objects.
+    Windows,
+    /// Anything else.
+    Other,
+}
+
+impl TerminalPlatform {
+    /// The platform this build runs on.
+    pub fn current() -> Self {
+        #[cfg(target_os = "macos")]
         {
-            TerminalSandbox::Sandboxed
+            Self::MacOs
+        }
+        #[cfg(target_os = "linux")]
+        {
+            Self::Linux
+        }
+        #[cfg(target_os = "windows")]
+        {
+            Self::Windows
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+        {
+            Self::Other
+        }
+    }
+
+    /// The stable name, for a log line or a test.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::MacOs => "macos",
+            Self::Linux => "linux",
+            Self::Windows => "windows",
+            Self::Other => "other",
         }
     }
 }
@@ -900,6 +1064,22 @@ fn narrowed_read(decision: &Decision) -> bool {
     decision.is_denied() && decision.rule.as_deref() != Some("read-outside-workspace")
 }
 
+/// The union of two rule lists, in order, without a repeat.
+///
+/// Used to build the egress CANDIDATE list from the workspace rules and the
+/// preset's own: a pair an entry appears in on both sides is probed once. The
+/// union is not a widening - every candidate is still put to the policy, and
+/// the baseline only consults the workspace lists.
+fn union_entries(first: &[String], second: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(first.len() + second.len());
+    for entry in first.iter().chain(second.iter()) {
+        if !out.contains(entry) {
+            out.push(entry.clone());
+        }
+    }
+    out
+}
+
 //
 // The spawn half.
 //
@@ -914,15 +1094,14 @@ fn narrowed_read(decision: &Decision) -> bool {
 /// confinement lives exactly as long as the process it confines.
 pub struct SandboxedChild {
     inner: ChildKind,
-    /// What started it: "heel", "seatbelt" or "none". A field rather than a
-    /// function of the variant, because the fallback backend also spawns through
-    /// a plain child process.
+    /// What started it: "heel" or "none". A field rather than a function of the
+    /// variant, because a released turn also spawns through a plain child
+    /// process.
     backend: &'static str,
 }
 
 enum ChildKind {
     Plain(std::process::Child),
-    #[cfg(feature = "heel-sandbox")]
     Heel {
         /// Declared before the child so it is dropped after it: dropping the
         /// engine kills the child, and the child must already be reaped.
@@ -939,12 +1118,11 @@ impl SandboxedChild {
     pub fn id(&self) -> u32 {
         match &self.inner {
             ChildKind::Plain(child) => child.id(),
-            #[cfg(feature = "heel-sandbox")]
             ChildKind::Heel { child, .. } => child.id(),
         }
     }
 
-    /// Which backend started the process: "heel", "seatbelt" or "none".
+    /// Which backend started the process: "heel" or "none".
     ///
     /// It is reported in the tool's result so a reader can tell a refused write
     /// from a command that simply failed.
@@ -956,7 +1134,6 @@ impl SandboxedChild {
     pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         match &mut self.inner {
             ChildKind::Plain(child) => child.try_wait(),
-            #[cfg(feature = "heel-sandbox")]
             ChildKind::Heel { child, .. } => child
                 .try_wait()
                 .map_err(|error| std::io::Error::other(error.to_string())),
@@ -964,12 +1141,30 @@ impl SandboxedChild {
     }
 
     /// Kill the process and everything it started.
+    ///
+    /// The confined backend's kill already signals the process group it created
+    /// at spawn. The released backend spawns into its own group too
+    /// (configure_plain), but std::process::Child::kill signals only the shell,
+    /// so it is signalled by the NEGATIVE pid here: a timed-out released
+    /// command must not leave a background child running behind the turn.
     pub fn kill(&mut self) {
         match &mut self.inner {
             ChildKind::Plain(child) => {
-                let _ = child.kill();
+                #[cfg(unix)]
+                {
+                    // SAFETY: the pid is this process's own unreaped child and
+                    // the negative form targets the group created for it at
+                    // spawn. The child is reaped by the caller's wait; a group
+                    // that has already exited is not an error here.
+                    unsafe {
+                        libc::kill(-(child.id() as i32), libc::SIGKILL);
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = child.kill();
+                }
             }
-            #[cfg(feature = "heel-sandbox")]
             ChildKind::Heel { child, .. } => {
                 let _ = child.kill();
             }
@@ -980,7 +1175,6 @@ impl SandboxedChild {
     pub fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
         match &mut self.inner {
             ChildKind::Plain(child) => child.wait(),
-            #[cfg(feature = "heel-sandbox")]
             ChildKind::Heel { child, .. } => futures::executor::block_on(child.wait())
                 .map_err(|error| std::io::Error::other(error.to_string())),
         }
@@ -993,7 +1187,6 @@ impl SandboxedChild {
                 .stdout
                 .take()
                 .map(|pipe| Box::new(pipe) as Box<dyn std::io::Read + Send>),
-            #[cfg(feature = "heel-sandbox")]
             ChildKind::Heel { child, .. } => child
                 .take_stdout()
                 .map(|pipe| Box::new(pipe) as Box<dyn std::io::Read + Send>),
@@ -1007,7 +1200,6 @@ impl SandboxedChild {
                 .stderr
                 .take()
                 .map(|pipe| Box::new(pipe) as Box<dyn std::io::Read + Send>),
-            #[cfg(feature = "heel-sandbox")]
             ChildKind::Heel { child, .. } => child
                 .take_stderr()
                 .map(|pipe| Box::new(pipe) as Box<dyn std::io::Read + Send>),
@@ -1035,22 +1227,54 @@ impl SandboxSpec {
         cwd: &Path,
         envs: &[(String, String)],
     ) -> Result<SandboxedChild, String> {
-        let tty = tty.display().to_string();
-        // Single-quoted: a device path has no quotes today, and the shell must
-        // not get the chance to interpret one if that ever changes.
-        let tty = tty.replace('\'', "'\\''");
-        let script = format!("exec \"$0\" -i <'{tty}' >'{tty}' 2>'{tty}'");
-        if self.mode.is_confined() {
-            #[cfg(feature = "heel-sandbox")]
-            {
+        // The door is POSIX: a shell redirects its own streams onto the device
+        // node. Windows has no such node (ConPTY is an object handle), and heel
+        // cannot be handed one, so a Windows caller is told to spawn on the pane's
+        // own pty instead of being run through /bin/sh that does not exist.
+        #[cfg(not(unix))]
+        {
+            let _ = (program, tty, cwd, envs);
+            return Err(
+                "this backend cannot start a shell on a caller-owned terminal: \
+                 spawn it on the pane's own pty"
+                    .to_string(),
+            );
+        }
+        #[allow(unreachable_code)]
+        #[cfg(unix)]
+        {
+            let tty = tty.display().to_string();
+            // Single-quoted: a device path has no quotes today, and the shell must
+            // not get the chance to interpret one if that ever changes.
+            let tty = tty.replace('\'', "'\\''");
+            let script = match Self::tty_exec_helper() {
+                // The helper claims the tty as the shell's controlling terminal
+                // before the shell starts - the login_tty handshake the pane
+                // cannot perform for its child (see bsh-tty-exec).
+                Some(helper) => format!(
+                    "exec '{}' '{tty}' \"$0\" -i",
+                    helper.display().to_string().replace('\'', "'\\''")
+                ),
+                None => format!("exec \"$0\" -i <'{tty}' >'{tty}' 2>'{tty}'"),
+            };
+            if self.mode.is_confined() {
                 return self.spawn_heel_terminal(&script, program, cwd, envs);
             }
-            #[cfg(not(feature = "heel-sandbox"))]
-            {
-                return self.spawn_terminal_seatbelt(&script, program, cwd, envs);
-            }
+            self.spawn_terminal_plain(&script, program, cwd, envs)
         }
-        self.spawn_terminal_plain(&script, program, cwd, envs)
+    }
+
+    /// The login_tty helper that ships beside the running binary.
+    ///
+    /// Tests run from `target/<profile>/deps`, so the parent directory is
+    /// checked as well; a missing helper falls back to the old spawn shape.
+    fn tty_exec_helper() -> Option<std::path::PathBuf> {
+        let exe = std::env::current_exe().ok()?;
+        let dir = exe.parent()?;
+        [dir.join("bsh-tty-exec"), dir.join("../bsh-tty-exec")]
+            .into_iter()
+            .find(|candidate| candidate.is_file())
+            .and_then(|candidate| candidate.canonicalize().ok())
     }
 
     /// Start the pane's shell with no sandbox at all.
@@ -1080,41 +1304,7 @@ impl SandboxSpec {
         })
     }
 
-    /// Start the pane's shell under the in-tree Seatbelt profile.
-    ///
-    /// The heel-sandbox-off build confines the terminal too, so the pane's
-    /// behaviour does not depend on which backend is compiled: the profile
-    /// allows writes to a tty device and denies everything else outside the
-    /// workspace.
-    #[cfg_attr(feature = "heel-sandbox", allow(dead_code))]
-    fn spawn_terminal_seatbelt(
-        &self,
-        script: &str,
-        program: &Path,
-        cwd: &Path,
-        envs: &[(String, String)],
-    ) -> Result<SandboxedChild, String> {
-        let Some(profile) = seatbelt_profile(&self.root) else {
-            return self.spawn_terminal_plain(script, program, cwd, envs);
-        };
-        let mut process = std::process::Command::new("/usr/bin/sandbox-exec");
-        process
-            .args(["-p", profile.as_str(), "/bin/sh", "-c", script])
-            .arg(program.to_string_lossy().as_ref());
-        process.current_dir(cwd).envs(envs.iter().cloned());
-        process
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        let child = process.spawn().map_err(|error| error.to_string())?;
-        Ok(SandboxedChild {
-            inner: ChildKind::Plain(child),
-            backend: "seatbelt",
-        })
-    }
-
     /// Start the pane's shell under heel, with the tty granted.
-    #[cfg(feature = "heel-sandbox")]
     fn spawn_heel_terminal(
         &self,
         script: &str,
@@ -1139,6 +1329,9 @@ impl SandboxSpec {
             Engine::Rego(sandbox) => {
                 spawn_terminal_command(sandbox.command("/bin/sh"), script, program, cwd, envs)
             }
+            Engine::Allow(sandbox) => {
+                spawn_terminal_command(sandbox.command("/bin/sh"), script, program, cwd, envs)
+            }
         }?;
         Ok(SandboxedChild {
             inner: ChildKind::Heel {
@@ -1157,14 +1350,7 @@ impl SandboxSpec {
     /// sandbox's scratch; see the module documentation for why those differ.
     pub(crate) fn spawn(&self, command: &str, cwd: &Path) -> Result<SandboxedChild, String> {
         if self.mode.is_confined() {
-            #[cfg(feature = "heel-sandbox")]
-            {
-                return self.spawn_heel(command, cwd);
-            }
-            #[cfg(not(feature = "heel-sandbox"))]
-            {
-                return self.spawn_seatbelt(command, cwd);
-            }
+            return self.spawn_heel(command, cwd);
         }
         self.spawn_plain(command, cwd)
     }
@@ -1182,35 +1368,12 @@ impl SandboxSpec {
         })
     }
 
-    /// Start the command under the in-tree Seatbelt profile.
-    ///
-    /// This is the heel-sandbox-off build, and it keeps today's semantics
-    /// exactly: writes under the workspace, the shared temp directory and
-    /// TMPDIR are allowed, and the workspace's .git and .bsh are denied in the
-    /// kernel. It is a supported build, not an error path.
-    #[cfg_attr(feature = "heel-sandbox", allow(dead_code))]
-    fn spawn_seatbelt(&self, command: &str, cwd: &Path) -> Result<SandboxedChild, String> {
-        let Some(profile) = seatbelt_profile(&self.root) else {
-            return self.spawn_plain(command, cwd);
-        };
-        let mut process = std::process::Command::new("/usr/bin/sandbox-exec");
-        process.args(["-p", profile.as_str(), "/bin/sh", "-c", command]);
-        process.current_dir(cwd);
-        configure_plain(&mut process);
-        let child = process.spawn().map_err(|error| error.to_string())?;
-        Ok(SandboxedChild {
-            inner: ChildKind::Plain(child),
-            backend: "seatbelt",
-        })
-    }
-
     /// Start the command under heel: the one sandbox implementation.
     ///
     /// The engine is built per call. That is one binary probe (heel checks the
     /// macOS version), a scratch directory and a profile string - small next to
     /// the command it wraps - and it keeps a process's sandbox and its grants
     /// from outliving the call that made them.
-    #[cfg(feature = "heel-sandbox")]
     fn spawn_heel(&self, command: &str, cwd: &Path) -> Result<SandboxedChild, String> {
         let engine = futures::executor::block_on(build_engine(self, false))?;
         // The interface a sandboxed process gets, minus what the sandbox owns.
@@ -1226,6 +1389,9 @@ impl SandboxSpec {
                 spawn_heel_command(sandbox.command("/bin/sh"), command, cwd, envs)
             }
             Engine::Rego(sandbox) => {
+                spawn_heel_command(sandbox.command("/bin/sh"), command, cwd, envs)
+            }
+            Engine::Allow(sandbox) => {
                 spawn_heel_command(sandbox.command("/bin/sh"), command, cwd, envs)
             }
         }?;
@@ -1259,7 +1425,6 @@ fn configure_plain(process: &mut std::process::Command) {
 /// The shell is sh -c with the program as $0 and the tty redirect in the
 /// script; the three standard streams are the null device so the application's
 /// own stdio is never the pane's terminal.
-#[cfg(feature = "heel-sandbox")]
 fn spawn_terminal_command(
     command: heel::Command<'_>,
     script: &str,
@@ -1283,7 +1448,6 @@ fn spawn_terminal_command(
 }
 
 /// Hand one assembled heel command to the sandbox and return its child.
-#[cfg(feature = "heel-sandbox")]
 fn spawn_heel_command(
     command: heel::Command<'_>,
     script: &str,
@@ -1305,17 +1469,19 @@ fn spawn_heel_command(
 }
 
 /// The sandboxed engine, one variant per egress answer.
-#[cfg(feature = "heel-sandbox")]
 enum Engine {
     /// No egress at all: heel starts no proxy and the kernel denies outbound
     /// traffic, which is stronger than refusing it in userspace.
     Deny(heel::Sandbox<heel::DenyAll>),
     /// An allowlist exists, so a proxy runs and asks [RegoEgress] per request.
     Rego(heel::Sandbox<RegoEgress>),
+    /// No workspace allowlist was declared: the turn's reach is not restricted,
+    /// so heel runs its allow-all policy. heel has no pass-through mode, so a
+    /// proxy is still started (and ICMP / host-local targets stay refused).
+    Allow(heel::Sandbox<heel::AllowAll>),
 }
 
 /// Build the heel configuration one spec describes.
-#[cfg(feature = "heel-sandbox")]
 async fn build_engine(spec: &SandboxSpec, allow_tty: bool) -> Result<Engine, String> {
     use heel::{Access, Sandbox, SandboxConfig};
 
@@ -1357,6 +1523,10 @@ async fn build_engine(spec: &SandboxSpec, allow_tty: bool) -> Result<Engine, Str
                 .map(Engine::Rego)
                 .map_err(|error| error.to_string())
         }
+        Egress::Unrestricted => Sandbox::with_config(builder.network(heel::AllowAll).build())
+            .await
+            .map(Engine::Allow)
+            .map_err(|error| error.to_string()),
     }
 }
 
@@ -1371,14 +1541,12 @@ async fn build_engine(spec: &SandboxSpec, allow_tty: bool) -> Result<Engine, Str
 /// between the two lookups could reach an address this check did not see. That
 /// gap is the reason the static allowlist still exists: it decides whether a
 /// proxy runs at all.
-#[cfg(feature = "heel-sandbox")]
 pub struct RegoEgress {
     policy: std::sync::Arc<PolicySet>,
     principal: Principal,
     allowlist: Vec<String>,
 }
 
-#[cfg(feature = "heel-sandbox")]
 impl heel::NetworkPolicy for RegoEgress {
     const DENIES_ALL: bool = false;
 
@@ -1410,7 +1578,6 @@ impl heel::NetworkPolicy for RegoEgress {
 }
 
 /// The egress allowlist this policy derived, for a caller that wants to log it.
-#[cfg(feature = "heel-sandbox")]
 impl RegoEgress {
     /// The policy every request is asked about, as the turn's own principal.
     ///
@@ -1430,67 +1597,10 @@ impl RegoEgress {
     }
 }
 
-/// A macOS Seatbelt profile rooted at a workspace.
-///
-/// Returns none when this host has no /usr/bin/sandbox-exec, so the caller
-/// falls back to the unconfined path. Writes are allowed under the root, the
-/// shared temp directory and TMPDIR, and the root's .git and .bsh are denied
-/// after that allowance, so a later deny wins.
-#[cfg_attr(feature = "heel-sandbox", allow(dead_code))]
-fn seatbelt_profile(root: &Path) -> Option<String> {
-    if !Path::new("/usr/bin/sandbox-exec").exists() {
-        return None;
-    }
-    let root = canonical(root);
-    let mut writable: Vec<PathBuf> = vec![
-        root.clone(),
-        PathBuf::from("/tmp"),
-        PathBuf::from("/private/tmp"),
-        std::env::temp_dir(),
-    ];
-    if let Some(temp) = std::env::var_os("TMPDIR").map(PathBuf::from) {
-        if let Ok(canonical_temp) = temp.canonicalize() {
-            writable.push(canonical_temp);
-        }
-        writable.push(temp);
-    }
-    if let Ok(canonical_temp) = std::env::temp_dir().canonicalize() {
-        writable.push(canonical_temp);
-    }
-    writable.sort();
-    writable.dedup();
-
-    let escape = |path: &Path| {
-        path.to_string_lossy()
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-    };
-    let mut profile =
-        String::from("(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write*\n");
-    for path in &writable {
-        profile.push_str(&format!("  (subpath \"{}\")\n", escape(path)));
-    }
-    for sink in ["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"] {
-        profile.push_str(&format!("  (literal \"{sink}\")\n"));
-    }
-    // The terminal pane's shell writes to the pty IT owns. macOS names those
-    // devices /dev/ttysN; without this the pane's shell would be started and
-    // then refused every write to its own screen.
-    profile.push_str("  (regex #\"^/dev/ttys[0-9]+$\")\n");
-    profile.push_str(")\n");
-    // Later rules win, so these denials override the workspace allowance.
-    profile.push_str(&format!(
-        "(deny file-write* (subpath \"{}/.git\") (subpath \"{}/.bsh\"))\n",
-        escape(&root),
-        escape(&root)
-    ));
-    Some(profile)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::{baseline_source, PolicyData, PolicySource};
+    use crate::policy::{baseline_source, EgressRuleSet, PolicyData, PolicySource};
 
     /// A compiled policy for one root and permission, plus an egress allowlist.
     fn policy(root: &Path, permission: &str, egress: &[&str]) -> Arc<PolicySet> {
@@ -1920,14 +2030,380 @@ mod tests {
         assert!(!none.egress().is_allowed());
     }
 
-    /// The terminal plan is the backend's measured answer: macOS can host the
-    /// pane's tty by path and confine the shell; a backend that cannot says why.
+    /// A compiled policy for one root whose workspace declared NO allowlist.
+    fn unrestricted_policy(root: &Path) -> Arc<PolicySet> {
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let data = PolicyData::new(root)
+            .with_permission("workspace-write")
+            .with_egress_unrestricted(true);
+        let sources: Vec<PolicySource> = vec![
+            baseline_source(),
+            crate::policy::session_permission_source("workspace-write"),
+        ];
+        Arc::new(PolicySet::compile(sources, data))
+    }
+
+    /// No workspace allowlist at all means UNRESTRICTED egress: the derived
+    /// spec is not DenyAll, and the policy allows any destination rather than
+    /// calling the empty lists a deny. This is the fresh-workspace state.
+    #[test]
+    fn an_absent_allowlist_derives_unrestricted_egress() {
+        let dir = workspace();
+        let policy = unrestricted_policy(dir.path());
+        let derived = SandboxSpec::for_policy(
+            &policy,
+            "workspace-write",
+            Principal::new("bash", "session", "preset"),
+        );
+        assert_eq!(
+            derived.egress(),
+            &Egress::Unrestricted,
+            "an absent file must not derive the empty-list deny"
+        );
+        assert!(derived.egress().is_unrestricted());
+        assert!(!derived.egress().is_deny_all());
+        assert!(derived.egress().is_allowed(), "the reach is open");
+        assert!(derived.egress().entries().is_empty(), "no rule is named");
+
+        // The policy itself agrees: a destination nothing named is allowed.
+        let decision = policy.probe(
+            &PolicyInput::new(
+                "bash",
+                Action::Egress,
+                Target::host_on("example.test", "203.0.113.9", 8443),
+            )
+            .with_session("session")
+            .with_preset("preset"),
+        );
+        assert!(decision.is_allowed(), "{decision:?}");
+        assert_eq!(decision.rule.as_deref(), Some("egress-unrestricted"));
+
+        // Full access is no sandbox at all, so nothing constrains its network:
+        // the spec says unrestricted rather than claiming a deny it ignores.
+        let released = spec(dir.path(), "danger-full-access", &[]);
+        assert!(released.egress().is_unrestricted(), "a released turn");
+    }
+
+    /// A preset's declaration still narrows the unrestricted workspace: a list
+    /// derives the allowlist, a declared empty list derives the kernel deny.
+    #[test]
+    fn a_preset_narrows_unrestricted_egress_in_the_derived_spec() {
+        let dir = workspace();
+        let with_preset = |preset: &[&str]| {
+            let root = dir
+                .path()
+                .canonicalize()
+                .unwrap_or_else(|_| dir.path().to_path_buf());
+            let data = PolicyData::new(root)
+                .with_permission("workspace-write")
+                .with_egress_unrestricted(true)
+                .with_preset("probe")
+                .with_preset_egress(true, EgressRuleSet::parse(preset));
+            Arc::new(PolicySet::compile(
+                [
+                    baseline_source(),
+                    crate::policy::session_permission_source("workspace-write"),
+                    crate::policy::preset_egress_source(),
+                ],
+                data,
+            ))
+        };
+        let derive = |policy: &Arc<PolicySet>| {
+            SandboxSpec::for_policy(
+                policy,
+                "workspace-write",
+                Principal::new("bash", "session", "probe"),
+            )
+        };
+
+        // A list: the proxy exists for only the preset's reach, not for the
+        // open workspace, so a preset-only entry is not a widening either.
+        let listed = derive(&with_preset(&["203.0.113.7"]));
+        assert_eq!(
+            listed.egress(),
+            &Egress::Allow(vec!["203.0.113.7".to_string()]),
+            "the preset's list is the reach on an open workspace"
+        );
+
+        // A declared empty list denies all: no proxy, the kernel deny.
+        let denied = derive(&with_preset(&[]));
+        assert_eq!(
+            denied.egress(),
+            &Egress::DenyAll,
+            "a declared empty list denies on an open workspace"
+        );
+        assert!(!denied.egress().is_allowed());
+    }
+
+    /// A policy whose preset declared an `egress` field, compiled with the
+    /// module that enforces it. `restricted` is true whenever the field was
+    /// DECLARED, including an empty list.
+    fn policy_with_preset_egress(
+        root: &Path,
+        addresses: &[&str],
+        hosts: &[&str],
+        ports: &[u16],
+        preset: &[&str],
+        restricted: bool,
+    ) -> Arc<PolicySet> {
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let data = PolicyData::new(root)
+            .with_permission("workspace-write")
+            .with_egress_allowlist(addresses.iter().map(|entry| entry.to_string()))
+            .with_egress_hosts(hosts.iter().map(|entry| entry.to_string()))
+            .with_egress_ports(ports.iter().copied())
+            .with_preset("scoped")
+            .with_preset_egress(restricted, EgressRuleSet::parse(preset));
+        let sources: Vec<PolicySource> = vec![
+            baseline_source(),
+            crate::policy::session_permission_source("workspace-write"),
+            crate::policy::preset_egress_source(),
+        ];
+        Arc::new(PolicySet::compile(sources, data))
+    }
+
+    /// A preset with a DECLARED EMPTY egress list denies all network: the
+    /// derived proxy set is empty, which is what tells the backend to start no
+    /// proxy at all and let the kernel deny.
+    #[test]
+    fn a_preset_that_denies_all_derives_no_proxy_and_refuses_every_workspace_entry() {
+        let dir = workspace();
+        let policy = policy_with_preset_egress(
+            dir.path(),
+            &["203.0.113.7", "198.51.100.0/24"],
+            &["api.example.test"],
+            &[],
+            &[],
+            true,
+        );
+        let spec = SandboxSpec::for_policy(
+            &policy,
+            "workspace-write",
+            Principal::new("bash", "session", "scoped"),
+        );
+        assert_eq!(
+            spec.egress(),
+            &Egress::DenyAll,
+            "a deny-all preset must leave the set empty, so no proxy runs"
+        );
+        assert!(!spec.egress().is_allowed());
+        // Every workspace entry was still ASKED, and every one was refused by
+        // the preset's own rule rather than silently dropped.
+        let asked: Vec<&GrantDecision> = spec
+            .decisions()
+            .iter()
+            .filter(|decision| decision.kind == GrantKind::Egress)
+            .collect();
+        assert_eq!(asked.len(), 3, "every workspace entry is a candidate");
+        for decision in asked {
+            assert!(!decision.allowed, "{}", decision.describe());
+            assert_eq!(
+                decision.rule.as_deref(),
+                Some("preset-egress-not-allowed"),
+                "the preset rule refused it, not the workspace list"
+            );
+        }
+    }
+
+    /// A preset that intersects keeps only the entries BOTH sides allow, and the
+    /// derived set is non-empty exactly because one entry survived.
+    #[test]
+    fn a_preset_that_intersects_keeps_only_what_the_workspace_also_allows() {
+        let dir = workspace();
+        // The workspace permits A and B; the preset permits A only.
+        let policy = policy_with_preset_egress(
+            dir.path(),
+            &["203.0.113.7", "198.51.100.8"],
+            &[],
+            &[],
+            &["203.0.113.7"],
+            true,
+        );
+        let spec = SandboxSpec::for_policy(
+            &policy,
+            "workspace-write",
+            Principal::new("bash", "session", "scoped"),
+        );
+        assert_eq!(
+            spec.egress(),
+            &Egress::Allow(vec!["203.0.113.7".to_string()]),
+            "only the intersection survives"
+        );
+        // The removed entry names the preset rule; the kept one does not.
+        let removed = spec
+            .decisions()
+            .iter()
+            .find(|decision| {
+                decision.kind == GrantKind::Egress && decision.subject == "198.51.100.8"
+            })
+            .expect("the preset-only-removed entry was asked about");
+        assert!(!removed.allowed);
+        assert_eq!(removed.rule.as_deref(), Some("preset-egress-not-allowed"));
+    }
+
+    /// A preset that declares NO egress field inherits the workspace list, and
+    /// the derived set is exactly that list.
+    #[test]
+    fn a_preset_with_no_egress_field_inherits_the_workspace_list() {
+        let dir = workspace();
+        let spec = SandboxSpec::for_policy(
+            &policy(
+                dir.path(),
+                "workspace-write",
+                &["203.0.113.7", "198.51.100.8"],
+            ),
+            "workspace-write",
+            Principal::new("bash", "session", "scoped"),
+        );
+        assert_eq!(
+            spec.egress(),
+            &Egress::Allow(vec!["203.0.113.7".to_string(), "198.51.100.8".to_string()]),
+            "an absent preset field inherits the whole workspace list"
+        );
+    }
+
+    /// A preset that names a HOST the workspace also names keeps that host as a
+    /// candidate, and the host passage survives the intersection; a preset-only
+    /// host is refused by the baseline, so the union can never widen the reach.
+    #[test]
+    fn a_preset_host_rule_is_probed_and_a_preset_only_host_is_refused() {
+        let dir = workspace();
+        // The workspace names one host; the preset names that host and another.
+        let policy = policy_with_preset_egress(
+            dir.path(),
+            &[],
+            &["api.example.test"],
+            &[],
+            &["api.example.test", "evil.example.test"],
+            true,
+        );
+        let spec = SandboxSpec::for_policy(
+            &policy,
+            "workspace-write",
+            Principal::new("bash", "session", "scoped"),
+        );
+        assert_eq!(
+            spec.egress(),
+            &Egress::Allow(vec!["api.example.test".to_string()]),
+            "the shared host survives and the preset-only host does not"
+        );
+        let refused = spec
+            .decisions()
+            .iter()
+            .find(|decision| {
+                decision.kind == GrantKind::Egress && decision.subject == "evil.example.test"
+            })
+            .expect("the preset-only host was still asked about");
+        assert!(
+            !refused.allowed,
+            "a preset cannot widen: {}",
+            refused.describe()
+        );
+    }
+
+    /// The PORT dimension narrows through the derived set: the port list is one
+    /// constraint, and a probe uses it, so an entry the preset allows at a
+    /// different port is refused with the port rule named.
+    #[test]
+    fn a_preset_port_list_is_a_constraint_on_the_derived_set() {
+        let dir = workspace();
+        // The workspace allows the address at any port; the preset narrows to
+        // 443. The probe uses the workspace's first port (none), so the preset
+        // module refuses the unstated port exactly as it will per request.
+        let policy =
+            policy_with_preset_egress(dir.path(), &["203.0.113.7"], &[], &[], &["443"], true);
+        let narrow_ports = policy.data().preset_egress_ports.clone();
+        assert_eq!(
+            narrow_ports,
+            vec![443],
+            "the preset port list is classified"
+        );
+        // Port 443 on the workspace address is allowed by BOTH tiers.
+        let allowed = policy.check(
+            &PolicyInput::new(
+                "mcp",
+                Action::Egress,
+                Target::host_on("h", "203.0.113.7", 443),
+            )
+            .with_preset("scoped"),
+        );
+        assert!(allowed.is_allowed(), "{allowed:?}");
+        // Port 80 names the PRESET'S rule, not the workspace's.
+        let refused = policy.check(
+            &PolicyInput::new(
+                "mcp",
+                Action::Egress,
+                Target::host_on("h", "203.0.113.7", 80),
+            )
+            .with_preset("scoped"),
+        );
+        assert!(refused.is_denied(), "{refused:?}");
+        assert_eq!(
+            refused.rule.as_deref(),
+            Some("preset-egress-port-not-allowed")
+        );
+        assert!(
+            refused.reason.as_deref().unwrap_or("").contains("scoped"),
+            "the reason names the preset that decided: {refused:?}"
+        );
+    }
+
+    /// The terminal plan is a per-platform TABLE: only the backend whose
+    /// profile can grant the pane's device claims the shell, and every other
+    /// platform states why it does not.
+    #[test]
+    fn the_terminal_plan_is_a_per_platform_table() {
+        let dir = workspace();
+        let confined = spec(dir.path(), "workspace-write", &[]);
+        assert_eq!(
+            confined.terminal_for(TerminalPlatform::MacOs),
+            TerminalSandbox::Sandboxed
+        );
+        // heel is required, so Linux always has its Landlock profile to apply:
+        // both unix backends host the pane's tty by path.
+        assert_eq!(
+            confined.terminal_for(TerminalPlatform::Linux),
+            TerminalSandbox::Sandboxed
+        );
+        for platform in [TerminalPlatform::Windows, TerminalPlatform::Other] {
+            match confined.terminal_for(platform) {
+                TerminalSandbox::PtyNotHostable { reason } => assert!(
+                    !reason.is_empty(),
+                    "{} must say why it cannot host the pane's pty",
+                    platform.as_str()
+                ),
+                other => panic!(
+                    "{} claims {other:?} but cannot join a caller-owned pty",
+                    platform.as_str()
+                ),
+            }
+        }
+        // A released turn has nothing to apply on any platform.
+        for platform in [
+            TerminalPlatform::MacOs,
+            TerminalPlatform::Linux,
+            TerminalPlatform::Windows,
+            TerminalPlatform::Other,
+        ] {
+            assert_eq!(
+                spec(dir.path(), "danger-full-access", &[]).terminal_for(platform),
+                TerminalSandbox::Unconfined
+            );
+        }
+    }
+
+    /// The terminal plan is the backend's measured answer: macOS and Linux can
+    /// host the pane's tty by path and confine the shell; a backend that cannot
+    /// says why.
     #[test]
     fn the_terminal_plan_matches_this_backend() {
         let dir = workspace();
         let confined = spec(dir.path(), "workspace-write", &[]);
         let answer = confined.terminal();
-        if cfg!(target_os = "macos") {
+        // heel is required and can grant the pane's device on both unix
+        // backends; Windows cannot join a ConPTY.
+        let expect_sandboxed = cfg!(target_os = "macos") || cfg!(target_os = "linux");
+        if expect_sandboxed {
             assert_eq!(answer, TerminalSandbox::Sandboxed);
             assert!(answer.is_sandboxed());
             assert!(answer.reason().is_none());
@@ -1938,7 +2414,7 @@ mod tests {
         // Read only is confined too, and answers the same way.
         assert_eq!(
             spec(dir.path(), "read-only", &[]).terminal().is_sandboxed(),
-            cfg!(target_os = "macos")
+            expect_sandboxed
         );
         // Full access has no confinement to apply.
         assert_eq!(

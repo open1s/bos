@@ -34,28 +34,23 @@ serde_yaml = { workspace = true }
 dashmap = { workspace = true }
 tempfile = "3.8"
 dirs = "7.0.0"
+# Only the login_tty helper (src/bin/bsh-tty-exec.rs) needs it, and only on
+# Unix; declared here so the bin can call setsid/TIOCSCTTY/dup2.
+libc = "0.2"
 # The tool-boundary policy engine. This is the workspace's regorus 0.13
 # (already used by bsh's terminal gate and the resource crate); the `arc`
 # default feature makes Engine Send + Sync, so one precompiled engine can sit
 # behind a Mutex and be shared by the sync tool trait.
 regorus = { workspace = true }
-# The sandbox every confined process this crate starts runs in. Optional so the
-# build works when the crate cannot be fetched: with `heel-sandbox` off the
-# shell tool falls back to its own seatbelt profile and nothing else changes.
-heel = { workspace = true, optional = true }
+# The sandbox every confined process this crate starts runs in. Required:
+# there is one implementation, with no feature flag and no in-tree fallback.
+heel = { workspace = true }
 
 [dev-dependencies]
 ureq = "3.3"
 
 [features]
 internal-api = []
-# One sandbox implementation for the shell tool: heel's SBPL/Landlock/AppContainer
-# backend replaces the hand-written profile, and the grant list is derived from
-# the regorus policy instead of being a constant. ON by default because the
-# adoption is the point; `--no-default-features` is the documented way back to
-# the in-tree profile, and it is a supported build, not an error path.
-default = ["heel-sandbox"]
-heel-sandbox = ["dep:heel"]
 
 [[example]]
 name = "basic_usage"

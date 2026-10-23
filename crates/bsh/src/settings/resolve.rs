@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
-use super::global::{GlobalSettings, ModelRef, Preset, WorkspaceRef};
+use super::global::{GlobalSettings, ModelRef, PolicyMode, Preset, SandboxChoice, WorkspaceRef};
 use super::workspace::WorkspaceSettings;
 use super::{dir, TranscriptPolicy};
 
@@ -94,6 +94,10 @@ pub(crate) enum Refusal {
     /// A preset id nothing defines. The reference rejects a missing definition
     /// rather than falling back, because the preset decides what the model sees.
     UnknownPreset(String),
+    /// The preset sets `sandbox = "none"` under a ceiling narrower than full
+    /// access. Turning confinement off can only widen, so the preset is
+    /// refused (rule `preset-sandbox-widens`) and the shell stays confined.
+    PresetSandboxWidens,
 }
 
 /// What the session carries into resolution.
@@ -159,6 +163,78 @@ impl PermissionResolution {
             reduced_by,
         }
     }
+}
+
+/// The rule a refused `sandbox = "none"` names.
+pub(crate) const PRESET_SANDBOX_WIDENS: &str = "preset-sandbox-widens";
+
+/// What a preset declared about the shell sandbox, and what is in force.
+///
+/// The declaration is tri-state: absent means "inherit today's behaviour" (heel
+/// confines whenever the effective permission is not full access), `heel`
+/// forces confinement, and `off` asks for an unconfined shell.
+///
+/// The guard is the point of this type. `off` is a WIDENING, so it is allowed
+/// only while BOTH the preset's own ceiling and the effective permission are
+/// full access. Anything narrower resolves to `heel` and records
+/// [`PRESET_SANDBOX_WIDENS`]; the resolution is then refused at send, and a
+/// build that is reached anyway still runs the shell confined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SandboxResolution {
+    /// The preset's declaration, or none for "inherit".
+    pub(crate) declared: Option<SandboxChoice>,
+    /// Whether shell commands run under heel after resolution.
+    pub(crate) heel: bool,
+    /// The shell is unconfined because the preset asked for it (not because
+    /// the permission released it). This is the state the UI must label.
+    pub(crate) off_by_preset: bool,
+    /// The rule of a refused declaration; the shell then stays confined.
+    pub(crate) refusal: Option<&'static str>,
+}
+
+impl SandboxResolution {
+    /// Resolve one preset declaration against its ceiling and the permission in
+    /// force.
+    pub(crate) fn resolve(
+        declared: Option<SandboxChoice>,
+        preset_ceiling: Option<&str>,
+        effective_permission: &str,
+    ) -> Self {
+        let heel = !is_full_access(effective_permission);
+        match declared {
+            // Inherit: today's behaviour, unchanged. An absent field can never
+            // widen, because the permission alone decides confinement.
+            None => Self {
+                declared,
+                heel,
+                off_by_preset: false,
+                refusal: None,
+            },
+            // The narrowing arm: heel is a ceiling on the shell, so it applies
+            // even when the session is full access.
+            Some(SandboxChoice::Heel) => Self {
+                declared,
+                heel: true,
+                off_by_preset: false,
+                refusal: None,
+            },
+            Some(SandboxChoice::Off) => {
+                let permitted = preset_ceiling.is_some_and(is_full_access)
+                    && is_full_access(effective_permission);
+                Self {
+                    declared,
+                    heel: !permitted,
+                    off_by_preset: permitted,
+                    refusal: (!permitted).then_some(PRESET_SANDBOX_WIDENS),
+                }
+            }
+        }
+    }
+}
+
+/// Whether one stored permission string names the full-access tier.
+pub(crate) fn is_full_access(value: &str) -> bool {
+    permission_rank(value) == permission_rank("danger-full-access")
 }
 
 /// Rank one permission string for the preset ceiling.
@@ -262,8 +338,8 @@ pub(crate) struct Resolution {
     pub(crate) preset_mcp_tools: Option<Vec<String>>,
     /// Binary-shipped Rego module ids.
     pub(crate) preset_builtin_policy: Vec<String>,
-    /// required or advisory custom-policy mode.
-    pub(crate) preset_policy_mode: Option<String>,
+    /// required or advisory policy mode; none means required.
+    pub(crate) preset_policy_mode: Option<PolicyMode>,
     /// Explicit tool allowlist, or none for all bundle tools.
     pub(crate) preset_tools: Option<Vec<String>>,
     /// Explicit skill allowlist, or none for every enabled skill.
@@ -297,6 +373,9 @@ pub(crate) struct Resolution {
     /// The session's permission and the preset ceiling folded into the mode in
     /// force. The one resolution every consumer reads.
     pub(crate) permission: PermissionResolution,
+    /// The sandbox in force after the widening guard, with the rule a refusal
+    /// named. A refused `none` resolves to heel, never to an unconfined shell.
+    pub(crate) sandbox: SandboxResolution,
     /// Register the shell tool.
     pub(crate) bash_enabled: bool,
     /// Register the filesystem tools.
@@ -439,6 +518,16 @@ pub(crate) fn resolve_with_catalogue(
             .as_ref()
             .and_then(|preset| preset.permission.as_deref()),
     );
+    // The sandbox choice is a POLICY decision, and the widening guard lives
+    // beside the permission minimum because it depends on the same ceiling.
+    let preset_sandbox = preset.as_ref().and_then(|preset| preset.sandbox);
+    let sandbox = SandboxResolution::resolve(
+        preset_sandbox,
+        preset
+            .as_ref()
+            .and_then(|preset| preset.permission.as_deref()),
+        &permission.effective,
+    );
 
     Resolution {
         model,
@@ -462,9 +551,7 @@ pub(crate) fn resolve_with_catalogue(
             .as_ref()
             .map(|preset| preset.builtin_policy.clone())
             .unwrap_or_default(),
-        preset_policy_mode: preset
-            .as_ref()
-            .and_then(|preset| preset.policy_mode.clone()),
+        preset_policy_mode: preset.as_ref().and_then(|preset| preset.policy_mode),
         preset_tools: preset.as_ref().and_then(|preset| preset.tools.clone()),
         preset_skills: preset.as_ref().and_then(|preset| preset.skills.clone()),
         preset_mcps: preset.as_ref().and_then(|preset| preset.mcps.clone()),
@@ -487,6 +574,7 @@ pub(crate) fn resolve_with_catalogue(
         max_steps: workspace.agent.max_steps,
         parallel_tool_calls: workspace.agent.parallel_tool_calls,
         permission,
+        sandbox,
         bash_enabled: workspace.agent.bash_enabled,
         file_tools_enabled: workspace.agent.file_tools_enabled,
         web_tools_enabled: workspace.agent.web_tools_enabled,
@@ -524,6 +612,9 @@ impl Resolution {
     pub(crate) fn refusal(&self) -> Option<Refusal> {
         if let Some(id) = &self.preset_missing {
             return Some(Refusal::UnknownPreset(id.clone()));
+        }
+        if self.sandbox.refusal.is_some() {
+            return Some(Refusal::PresetSandboxWidens);
         }
         self.model.refusal()
     }
@@ -1472,5 +1563,81 @@ mcp_servers = [
             "an unknown mode fails closed instead of reaching a writable arm"
         );
         assert_eq!(typo.requested, "typo", "while the stored value is visible");
+    }
+
+    /// The sandbox table, both directions and the guard.
+    ///
+    /// Absent inherits today's rule: heel unless the effective permission is
+    /// full access. Explicit heel always confines. Explicit none is permitted
+    /// only while BOTH the preset ceiling and the effective permission are full
+    /// access; every narrower row refuses with the rule and resolves to heel,
+    /// because a refused widening must never leave the shell unconfined.
+    #[test]
+    fn the_sandbox_resolution_is_a_ceiling_not_a_grant() {
+        let rows = [
+            (None, None, "workspace-write", true, false, None),
+            (None, None, "danger-full-access", false, false, None),
+            (
+                Some(SandboxChoice::Heel),
+                Some("danger-full-access"),
+                "danger-full-access",
+                true,
+                false,
+                None,
+            ),
+            (
+                Some(SandboxChoice::Off),
+                Some("danger-full-access"),
+                "danger-full-access",
+                false,
+                true,
+                None,
+            ),
+            (
+                Some(SandboxChoice::Off),
+                Some("workspace-write"),
+                "workspace-write",
+                true,
+                false,
+                Some(PRESET_SANDBOX_WIDENS),
+            ),
+            (
+                Some(SandboxChoice::Off),
+                Some("read-only"),
+                "read-only",
+                true,
+                false,
+                Some(PRESET_SANDBOX_WIDENS),
+            ),
+            (
+                Some(SandboxChoice::Off),
+                None,
+                "danger-full-access",
+                true,
+                false,
+                Some(PRESET_SANDBOX_WIDENS),
+            ),
+            (
+                Some(SandboxChoice::Off),
+                Some("danger-full-access"),
+                "workspace-write",
+                true,
+                false,
+                Some(PRESET_SANDBOX_WIDENS),
+            ),
+        ];
+        for (declared, ceiling, effective_permission, heel, off_by_preset, refusal) in rows {
+            let resolved = SandboxResolution::resolve(declared, ceiling, effective_permission);
+            assert_eq!(
+                resolved.heel, heel,
+                "heel for declared={declared:?} ceiling={ceiling:?} effective={effective_permission}"
+            );
+            assert_eq!(resolved.off_by_preset, off_by_preset);
+            assert_eq!(resolved.refusal, refusal);
+            assert!(
+                resolved.heel || resolved.off_by_preset || resolved.declared.is_none(),
+                "a preset's explicit off must resolve to heel when refused"
+            );
+        }
     }
 }

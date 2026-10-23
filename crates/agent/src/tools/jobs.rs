@@ -342,6 +342,35 @@ verdict := {"allow": false, "rule": "no-job-kill", "reason": "jobs may not be st
         assert_eq!(value["running"], serde_json::json!(false));
     }
 
+    /// The user-facing promise: a wait that reports a finished job reports the
+    /// whole capture. The command exits while a child it started still holds
+    /// the pipes and is about to write, so observing the exit status is not the
+    /// same fact as having every byte.
+    #[test]
+    fn a_finished_job_output_is_never_partial() {
+        use crate::tools::bash::BashTool;
+        let registry = Arc::new(JobRegistry::new());
+        let bash = BashTool::new("bash").with_jobs(registry.clone(), "session-a");
+        let value = bash
+            .run(&serde_json::json!({
+                "command": "printf first; sleep 0.002; ( sleep 0.02; printf last; printf err 1>&2 ) & exit 3",
+                "run_in_background": true
+            }))
+            .expect("the spawn is accepted");
+        let id = value["job_id"].as_str().expect("a job id").to_string();
+        let reader = JobTool::reader("job_output").with_jobs(registry, "session-a");
+        let read = reader
+            .run(&serde_json::json!({ "id": id, "wait_ms": 5000 }))
+            .expect("the output runs");
+        assert_eq!(read["status"], serde_json::json!("failed"));
+        assert_eq!(read["exit_code"], serde_json::json!(3));
+        let output = read["output"].as_str().expect("captured output");
+        assert!(
+            output.contains("first") && output.contains("last") && output.contains("err"),
+            "job_output reported a finished job with a partial capture: {output:?}"
+        );
+    }
+
     /// `job_output` asks the policy for a Read before it touches the roster;
     /// a denial names the rule and never returns the captured bytes.
     #[test]

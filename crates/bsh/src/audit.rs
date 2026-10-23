@@ -6,10 +6,15 @@
 //! storage, no model call, no I/O. Every figure here is counted from those two
 //! sources, so the same session always produces the same page.
 //!
-//! Two limits are stated on the page and repeated here: a shell command's
-//! output is recorded but the files it creates are not individually audited,
-//! and the only network the audit can see is tool/MCP egress - a shell's own
-//! sockets are not intercepted.
+//! What it sees, and what it does not, is stated on the page in two layered
+//! notes. For a shell call the audit records the command and its output plus the
+//! confinement the tool itself reported per call - the sandbox backend and the
+//! network reach - but the files the command creates are not individually
+//! attributed. Network REACHABILITY is gated and recorded in two tiers: the
+//! command tier, a lexical scan of the endpoints a command line names, and the
+//! connection tier, the sandbox proxy asking the policy per connection. What is
+//! not audited is the PAYLOAD: TLS is tunnelled, so "controlled" means
+//! reachability and never content.
 //!
 //! Rows are windowed like the transcript: Session::messages holds the loaded
 //! window, and a tool call's FULL text is never held here - only a bounded,
@@ -50,6 +55,13 @@ pub(crate) enum AuditCategory {
     Shell,
     /// Observable tool/MCP egress (web fetch and search).
     Network,
+    /// A call that drove the built-in browser's own document: open, snapshot,
+    /// click, type, press, back, forward, reload or close.
+    ///
+    /// Its own family rather than Network, because these calls share one pane
+    /// and one ref namespace: "which turn navigated the page the reader is
+    /// looking at" is a question the Network tag would bury.
+    Browser,
     /// A tool served by a connected MCP namespace.
     Mcp,
     /// A delegated child run.
@@ -66,6 +78,7 @@ impl AuditCategory {
             AuditCategory::FileWrite => "audit.category.fileWrite",
             AuditCategory::Shell => "audit.category.shell",
             AuditCategory::Network => "audit.category.network",
+            AuditCategory::Browser => "audit.category.browser",
             AuditCategory::Mcp => "audit.category.mcp",
             AuditCategory::Subagent => "audit.category.subagent",
             AuditCategory::Other => "audit.category.other",
@@ -87,6 +100,9 @@ impl AuditCategory {
             | "delete_file" | "move_file" | "rename_file" => AuditCategory::FileWrite,
             "bash" | "shell" | "run_command" | "exec" => AuditCategory::Shell,
             "subagent" => AuditCategory::Subagent,
+            // The browser's tools are named "browser_*", and they own the pane
+            // rather than merely reaching the network.
+            _ if name.starts_with("browser_") => AuditCategory::Browser,
             _ if name.starts_with("mcp_") || name == "mcp" => AuditCategory::Mcp,
             _ if name.starts_with("web_")
                 || name.starts_with("http_")
@@ -173,6 +189,55 @@ pub(crate) struct AuditCall {
     pub(crate) message: usize,
     /// Index of the call among that message's tools.
     pub(crate) tool_index: usize,
+    /// The sandbox backend the call's own result reported, when it reported
+    /// one: "heel" or "none". A stored result from an older build may say
+    /// "seatbelt"; the page prints whatever the record says.
+    ///
+    /// This is read from the STORED RESULT, never assumed from the effective
+    /// permission: a record written before the field existed, or a call the
+    /// engine refused before any result was produced, carries none - and the
+    /// page then says "no sandbox" rather than inventing a tier.
+    pub(crate) sandbox: Option<String>,
+    /// Why the call ran unconfined, when its result carried a reason.
+    ///
+    /// Two values are known and localized: a preset's `sandbox = "none"`
+    /// ([`agent::tools::bash::PRESET_SANDBOX_OFF_REASON`]) and the permission's
+    /// own release ([`agent::tools::bash::SANDBOX_RELEASED_REASON`]). A stored
+    /// result from before this field existed, or a non-shell tool that reported
+    /// only `sandbox: "none"`, carries none and the detail prints the backend
+    /// alone.
+    pub(crate) sandbox_reason: Option<String>,
+    /// The network confinement the call's own result reported, when it did:
+    /// "deny-all", "allowlist" or "unrestricted".
+    ///
+    /// Read from the stored result beside [AuditCall::sandbox], so a tool/MCP
+    /// egress call and a shell call each show what their own record says rather
+    /// than one global assumption for the session.
+    pub(crate) network: Option<String>,
+    /// The tool's own stable id for a failure the sandbox's networking explains
+    /// rather than the policy: a direct socket or ICMP refused by the kernel
+    /// while egress was UNRESTRICTED.
+    ///
+    /// Read from the stored result like the confinement facts. The id is
+    /// language-neutral, so the page resolves it through its locale table at
+    /// render time and switching languages re-reads the same record correctly.
+    pub(crate) diagnostic: Option<String>,
+}
+
+impl AuditCall {
+    /// The locale key that explains this call's diagnostic, when it carried one
+    /// this shell knows.
+    ///
+    /// The record stores a stable id, not prose, so the page localizes at render
+    /// time. An id from a newer build is deliberately NOT guessed at: the row
+    /// then explains nothing rather than inventing copy for a condition it does
+    /// not know.
+    pub(crate) fn diagnostic_key(&self) -> Option<&'static str> {
+        match self.diagnostic.as_deref()? {
+            agent::tools::bash::UNPROXIED_DIRECT_SOCKET => Some("tool.bash.unproxiedNetwork"),
+            _ => None,
+        }
+    }
 }
 
 /// One refused operation, from the policy denial ring.
@@ -228,6 +293,8 @@ pub(crate) struct AuditTotals {
     pub(crate) files_written: usize,
     /// Shell commands.
     pub(crate) commands: usize,
+    /// Calls that drove the built-in browser.
+    pub(crate) browser: usize,
     /// Refused operations.
     pub(crate) refusals: usize,
     /// Calls that returned without the engine's error marker.
@@ -285,7 +352,9 @@ pub(crate) struct AuditPolicy {
     pub(crate) deny_roots: usize,
     /// Entries in the workspace egress allowlist.
     pub(crate) egress_allowlist: usize,
-    /// Whether egress is restricted to the allowlist.
+    /// Whether egress is CONSTRAINED at all: true for an allowlist or a
+    /// present-but-empty file (deny-all), false only when the workspace declared
+    /// no file and the preset names no reach.
     pub(crate) egress_restricted: bool,
     /// Allowed decisions, counted per action.
     pub(crate) allows: AuditAllows,
@@ -352,6 +421,10 @@ impl AuditView {
                     ),
                     message: index,
                     tool_index,
+                    sandbox: result_field(tool.output.as_deref(), "sandbox"),
+                    sandbox_reason: result_field(tool.output.as_deref(), "sandbox_reason"),
+                    network: result_field(tool.output.as_deref(), "network"),
+                    diagnostic: result_field(tool.output.as_deref(), "network_diagnostic"),
                 });
             }
         }
@@ -458,6 +531,7 @@ impl AuditView {
                     AuditCategory::FileRead => totals.files_read += 1,
                     AuditCategory::FileWrite => totals.files_written += 1,
                     AuditCategory::Shell => totals.commands += 1,
+                    AuditCategory::Browser => totals.browser += 1,
                     _ => {}
                 }
                 match call.outcome {
@@ -797,6 +871,21 @@ fn span_of(message: &ChatMessage) -> (Option<u64>, Option<u64>) {
     (start, end)
 }
 
+/// One string field of a stored tool result, read from the JSON the tool
+/// itself returned.
+///
+/// The confinement facts (the sandbox backend and the network reach) are
+/// per-call, so they are read here rather than assumed from the session's
+/// effective permission. An output that is not JSON, that carries no such key,
+/// or that is absent (a call still running, or a record written before the
+/// field existed) yields None - the page then states that absence instead of
+/// fabricating a tier.
+fn result_field(output: Option<&str>, key: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(output?).ok()?;
+    let text = value.get(key)?.as_str()?.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
 /// How a stored output reads: the engine prefixes a tool failure with "Error: ",
 /// and an absent output is a call still running.
 fn outcome_of(output: Option<&str>) -> AuditOutcome {
@@ -1124,6 +1213,20 @@ mod tests {
         );
         assert_eq!(AuditCategory::classify("subagent"), AuditCategory::Subagent);
         assert_eq!(AuditCategory::classify("update_plan"), AuditCategory::Other);
+        // The browser's own tools own the right pane, so they are their own
+        // family rather than plain Network.
+        assert_eq!(
+            AuditCategory::classify("browser_open"),
+            AuditCategory::Browser
+        );
+        assert_eq!(
+            AuditCategory::classify("browser_snapshot"),
+            AuditCategory::Browser
+        );
+        assert_eq!(
+            AuditCategory::classify("browser_click"),
+            AuditCategory::Browser
+        );
         let namespaces = vec!["github".to_string(), "files".to_string()];
         assert_eq!(
             AuditCategory::classify_in("github_search", &namespaces),
@@ -1262,6 +1365,7 @@ mod tests {
             target: target.to_string(),
             rule: Some(rule.to_string()),
             reason: Some("outside the workspace".to_string()),
+            advisory: false,
         };
         let denials = vec![
             refusal(1_500, "/etc/passwd", "deny-outside", "audit"),
@@ -1410,6 +1514,7 @@ mod tests {
             target: "/etc/x".to_string(),
             rule: Some("deny-outside".to_string()),
             reason: None,
+            advisory: false,
         }];
         let view = AuditView::build(&session, &denials, &[]);
         let json: serde_json::Value = serde_json::from_str(&view.to_json()).expect("valid JSON");
@@ -1493,6 +1598,262 @@ mod tests {
         assert!(!call.target.contains("sk-abc-123"), "{}", call.target);
     }
 
+    /// The footer's two notes in BOTH locales, pinned by exact value. This round
+    /// exists because the previous wording ("shell network is not audited") was
+    /// false once the shell ran under the sandbox: the notes must say what the
+    /// audit now records, and the un-audited residue (payload, file attribution)
+    /// must survive in them.
+    #[test]
+    fn the_footer_notes_state_the_real_layers_in_both_locales() {
+        use crate::i18n::Lang;
+        let shell_en = Lang::En.tr("audit.limits.shell");
+        assert_eq!(
+            shell_en,
+            "Shell calls record the command, its output, and the sandbox and network the result reported per call; files a command creates are not individually attributed."
+        );
+        let network_en = Lang::En.tr("audit.limits.network");
+        assert_eq!(
+            network_en,
+            "Shell network reach is gated and recorded in two tiers (endpoints named on the command line, then the sandbox proxy per connection); payloads are not inspected, and a host assembled at runtime is caught only by the proxy."
+        );
+        assert_eq!(
+            Lang::Zh.tr("audit.limits.shell"),
+            "Shell 调用会记录命令、输出，以及该次结果自报的沙箱与网络；命令创建的文件不会逐个归属。"
+        );
+        assert_eq!(
+            Lang::Zh.tr("audit.limits.network"),
+            "Shell 的网络可达性分两层把关并记录（先扫描命令行中点名的端点，再由沙箱代理逐连接询问策略）；载荷内容不会被检查，运行时拼接的主机名只能在代理层被拦下。"
+        );
+        // The remaining honest caveats survive in BOTH: file effects are not
+        // attributed, and the payload is not inspected.
+        for (lang, attributed, payload) in [
+            (
+                Lang::En,
+                "not individually attributed",
+                "payloads are not inspected",
+            ),
+            (Lang::Zh, "不会逐个归属", "载荷内容不会被检查"),
+        ] {
+            assert!(
+                lang.tr("audit.limits.shell").contains(attributed),
+                "file effects stay un-attributed"
+            );
+            assert!(
+                lang.tr("audit.limits.network").contains(payload),
+                "the payload stays un-inspected"
+            );
+        }
+        // The claim that was WRONG before is gone from both locales.
+        for lang in [Lang::En, Lang::Zh] {
+            let network = lang.tr("audit.limits.network");
+            assert!(!network.contains("not audited"), "{network}");
+            assert!(!network.contains("不会被审计"), "{network}");
+        }
+    }
+
+    /// The confinement facts are read from the STORED RESULT, not assumed from
+    /// the session's permission: a shell result that reports them carries both,
+    /// a tool/MCP egress result that reports its own carries that, and one that
+    /// reports nothing yields None so the page can say so instead of inventing a
+    /// tier.
+    #[test]
+    fn the_confinement_facts_are_read_from_the_stored_result() {
+        let mut session = session_with(1);
+        session.messages[1].tools.push(tool(
+            "bash",
+            r#"{"command":"ping -c1 8.8.8.8"}"#,
+            Some(
+                r#"{"stdout":"","stderr":"ping: sendto: Operation not permitted","exit_code":2,"success":false,"sandbox":"heel","network":"deny-all"}"#,
+            ),
+            40,
+            1_100,
+        ));
+        // An egress tool whose OWN result carries a network state: read from
+        // that record, not from the shell's.
+        session.messages[1].tools.push(tool(
+            "mcp_web_fetch",
+            r#"{"url":"https://example.com"}"#,
+            Some(r#"{"body":"hi","sandbox":"none","network":"allowlist"}"#),
+            12,
+            1_200,
+        ));
+        // A record written before the fields existed, and one the engine
+        // refused before any result was produced.
+        session.messages[1].tools.push(tool(
+            "bash",
+            r#"{"command":"ls"}"#,
+            Some("plain text output, no JSON"),
+            3,
+            1_300,
+        ));
+        session.messages[1].tools.push(tool(
+            "bash",
+            r#"{"command":"rm"}"#,
+            Some("Error: refused by policy"),
+            2,
+            1_400,
+        ));
+        // A preset's explicit `sandbox = "none"`: the backend says none AND the
+        // record carries the attribution, so the detail can say who widened it.
+        session.messages[1].tools.push(tool(
+            "bash",
+            r#"{"command":"printf escaped > \"$T\""}"#,
+            Some(
+                r#"{"stdout":"","stderr":"","exit_code":0,"success":true,"sandbox":"none","sandbox_reason":"a preset turned the sandbox off"}"#,
+            ),
+            1,
+            1_500,
+        ));
+        // The permission released confinement with no preset involved: the
+        // record says which arm did it, so a reader never sees a bare `none`.
+        session.messages[1].tools.push(tool(
+            "bash",
+            r#"{"command":"printf outside > /tmp/x"}"#,
+            Some(
+                r#"{"stdout":"","stderr":"","exit_code":0,"success":true,"sandbox":"none","sandbox_reason":"the full-access permission released the sandbox"}"#,
+            ),
+            1,
+            1_600,
+        ));
+        let view = AuditView::build(&session, &[], &[]);
+        let calls = &view.turns[0].calls;
+        assert_eq!(calls[0].sandbox.as_deref(), Some("heel"));
+        assert_eq!(calls[0].network.as_deref(), Some("deny-all"));
+        assert_eq!(
+            calls[0].sandbox_reason, None,
+            "a heel call carries no attribution"
+        );
+        assert_eq!(
+            calls[1].network.as_deref(),
+            Some("allowlist"),
+            "an egress call reads its own network state"
+        );
+        assert_eq!(calls[1].sandbox.as_deref(), Some("none"));
+        assert_eq!(calls[2].sandbox, None, "an old record reports nothing");
+        assert_eq!(calls[2].network, None);
+        assert_eq!(calls[3].sandbox, None, "a refusal produced no result");
+        assert_eq!(calls[3].network, None);
+        assert_eq!(calls[4].sandbox.as_deref(), Some("none"));
+        assert_eq!(
+            calls[4].sandbox_reason.as_deref(),
+            Some(agent::tools::bash::PRESET_SANDBOX_OFF_REASON),
+            "the preset's attribution is read from the stored result"
+        );
+        assert_eq!(
+            calls[5].sandbox_reason.as_deref(),
+            Some(agent::tools::bash::SANDBOX_RELEASED_REASON),
+            "a permission release carries its own attribution"
+        );
+    }
+
+    /// A kernel-refused direct socket under UNRESTRICTED egress is explained
+    /// from the tool's own stable id, and the page's copy is resolved per
+    /// language at render time rather than frozen into the record.
+    #[test]
+    fn a_kernel_refusal_carries_a_localized_diagnostic() {
+        let mut session = session_with(1);
+        session.messages[1].tools.push(tool(
+            "bash",
+            r#"{"command":"ping -c 1 1.1.1.1"}"#,
+            Some(
+                r#"{"stdout":"","stderr":"ping: sendto: Operation not permitted","exit_code":2,"success":false,"sandbox":"heel","network":"unrestricted","network_diagnostic":"unproxied-direct-socket"}"#,
+            ),
+            2,
+            1_100,
+        ));
+        // The same failure on a record written before the field existed, and an
+        // id from a newer build: neither is guessed at.
+        session.messages[1].tools.push(tool(
+            "bash",
+            r#"{"command":"ping -c 1 1.1.1.1"}"#,
+            Some(
+                r#"{"stdout":"","stderr":"ping: sendto: Operation not permitted","exit_code":2,"success":false,"sandbox":"heel","network":"unrestricted"}"#,
+            ),
+            2,
+            1_200,
+        ));
+        session.messages[1].tools.push(tool(
+            "bash",
+            r#"{"command":"ping -c 1 1.1.1.1"}"#,
+            Some(
+                r#"{"stdout":"","stderr":"ping: sendto: Operation not permitted","exit_code":2,"success":false,"sandbox":"heel","network":"unrestricted","network_diagnostic":"a-newer-builds-id"}"#,
+            ),
+            2,
+            1_300,
+        ));
+        let view = AuditView::build(&session, &[], &[]);
+        let calls = &view.turns[0].calls;
+        assert_eq!(
+            calls[0].diagnostic.as_deref(),
+            Some(agent::tools::bash::UNPROXIED_DIRECT_SOCKET),
+            "the stored result is the source"
+        );
+        assert_eq!(
+            calls[0].network.as_deref(),
+            Some("unrestricted"),
+            "the policy allowed the network; the kernel refused the unproxied path"
+        );
+        assert_eq!(
+            calls[0].diagnostic_key(),
+            Some("tool.bash.unproxiedNetwork")
+        );
+        assert_eq!(
+            calls[1].diagnostic_key(),
+            None,
+            "an older record explains nothing rather than guessing"
+        );
+        assert_eq!(
+            calls[2].diagnostic_key(),
+            None,
+            "an unknown id is not rendered with invented copy"
+        );
+
+        // The one key is shared by the transcript and the audit row, and it is
+        // localizable without rewriting the record.
+        let en = crate::i18n::tr(crate::i18n::Lang::En, "tool.bash.unproxiedNetwork");
+        let zh = crate::i18n::tr(crate::i18n::Lang::Zh, "tool.bash.unproxiedNetwork");
+        for (lang, text) in [("en", &en), ("zh", &zh)] {
+            assert!(
+                text.contains("docs/bsh-tool-policy.md"),
+                "{lang} does not point at the policy document: {text}"
+            );
+            assert!(
+                text.contains("ping"),
+                "{lang} does not name the client that fails: {text}"
+            );
+        }
+        assert!(en.contains("not a policy refusal"));
+        assert!(zh.contains("这不是策略拒绝"));
+    }
+
+    /// The reader of a result field never invents one: a missing output, a
+    /// non-JSON output, a missing key, a non-string value and a blank string all
+    /// yield None.
+    #[test]
+    fn a_result_field_is_absent_rather_than_guessed() {
+        assert_eq!(super::result_field(None, "sandbox"), None);
+        assert_eq!(super::result_field(Some("not json"), "sandbox"), None);
+        assert_eq!(super::result_field(Some(r#"{"a":1}"#), "sandbox"), None);
+        assert_eq!(
+            super::result_field(Some(r#"{"sandbox":7}"#), "sandbox"),
+            None
+        );
+        assert_eq!(
+            super::result_field(Some(r#"{"sandbox":"  "}"#), "sandbox"),
+            None,
+            "a blank value is not a tier"
+        );
+        assert_eq!(
+            super::result_field(Some(r#"{"sandbox":"heel"}"#), "sandbox").as_deref(),
+            Some("heel")
+        );
+        assert_eq!(
+            super::result_field(Some(r#"{"sandbox":" heel "}"#), "sandbox").as_deref(),
+            Some("heel"),
+            "the value is trimmed"
+        );
+    }
+
     /// The search field filters turns through their calls, refusals and label,
     /// and an absent needle keeps everything.
     #[test]
@@ -1515,6 +1876,7 @@ mod tests {
             target: "/etc/passwd".to_string(),
             rule: Some("deny-outside".to_string()),
             reason: None,
+            advisory: false,
         };
         let view = AuditView::build(&session, &[denial], &[]);
         let turn = &view.turns[0];
@@ -1553,6 +1915,7 @@ mod tests {
             target: Target::path("/x").display(),
             rule: None,
             reason: None,
+            advisory: false,
         };
         let view = AuditView::build(&session, &[denial], &[]);
         assert_eq!(view.totals.calls, 1);

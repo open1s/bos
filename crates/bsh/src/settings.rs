@@ -234,6 +234,10 @@ pub(crate) struct Effective {
     pub(crate) preset_id: String,
     /// Permission ceiling, or none to inherit the session's permission.
     pub(crate) preset_permission: Option<String>,
+    /// The sandbox in force after the widening guard. A refused
+    /// `sandbox = "none"` resolves to heel, so a build reached without the send
+    /// gate still runs confined.
+    pub(crate) sandbox: resolve::SandboxResolution,
     /// Read roots; none inherits the workspace, empty allows nothing.
     pub(crate) preset_read: Option<Vec<String>>,
     /// Write roots; none inherits the workspace, empty allows nothing.
@@ -250,8 +254,8 @@ pub(crate) struct Effective {
     pub(crate) preset_mcp_tools: Option<Vec<String>>,
     /// Binary-shipped Rego module ids.
     pub(crate) preset_builtin_policy: Vec<String>,
-    /// required or advisory custom-policy mode.
-    pub(crate) preset_policy_mode: Option<String>,
+    /// required or advisory policy mode; none means required.
+    pub(crate) preset_policy_mode: Option<global::PolicyMode>,
     /// Explicit tool allowlist, or none for all bundle tools.
     pub(crate) preset_tools: Option<Vec<String>>,
     /// Explicit skill allowlist, or none for every enabled skill.
@@ -273,9 +277,14 @@ impl Effective {
     /// cannot be applied, because applying it without the policy would be
     /// wider than the preset declares.
     pub(crate) fn preset_policy_required_untrusted(&self) -> bool {
-        self.preset_policy_mode.as_deref() == Some("required")
+        self.policy_mode() == global::PolicyMode::Required
             && self.preset_policy.is_some()
             && !self.preset_trusted
+    }
+
+    /// The policy mode in force: required unless the preset says advisory.
+    pub(crate) fn policy_mode(&self) -> global::PolicyMode {
+        self.preset_policy_mode.unwrap_or_default()
     }
 
     /// The prompt the LLM call receives: the selected preset's persona when it
@@ -333,6 +342,22 @@ pub(crate) const OPENER: &str = "explorer";
 pub(crate) fn reveal_config() -> std::io::Result<()> {
     let path = settings_path();
     let target = if path.exists() { path } else { dir() };
+    reveal(&target)
+}
+
+/// Open one file in the platform's file browser.
+///
+/// The same launcher [`reveal_config`] uses, so every "open the file" control
+/// in the shell goes through one place. A path that does not exist yet reveals
+/// its own directory, which is where the reader would create it.
+pub(crate) fn reveal(path: &std::path::Path) -> std::io::Result<()> {
+    let target = if path.exists() {
+        path.to_path_buf()
+    } else {
+        path.parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| path.to_path_buf())
+    };
     std::process::Command::new(OPENER)
         .arg(target)
         .spawn()
@@ -581,6 +606,30 @@ impl Settings {
             .find(|w| w.id == self.global.general.active_workspace)
     }
 
+    /// Whether selecting `id` would turn the shell sandbox off under a ceiling
+    /// narrower than full access.
+    ///
+    /// The same guard the resolution applies, exposed before a click so the
+    /// pane and the composer menu can refuse in place instead of accepting a
+    /// preset whose turn would be refused at send.
+    pub(crate) fn preset_sandbox_widens(&self, id: &str) -> bool {
+        let Some(preset) = self.global.preset(id) else {
+            return false;
+        };
+        if preset.sandbox != Some(global::SandboxChoice::Off) {
+            return false;
+        }
+        let ceiling_full = preset
+            .permission
+            .as_deref()
+            .is_some_and(resolve::is_full_access);
+        let effective = resolve::PermissionResolution::resolve(
+            &self.workspace.agent.permission,
+            preset.permission.as_deref(),
+        );
+        !ceiling_full || !resolve::is_full_access(&effective.effective)
+    }
+
     /// Why a turn cannot be sent for one session's own choice, or none while
     /// it can.
     ///
@@ -608,7 +657,7 @@ impl Settings {
             skill_sources,
             skills,
         );
-        if resolution.preset_policy_mode.as_deref() == Some("required")
+        if resolution.preset_policy_mode.unwrap_or_default() == global::PolicyMode::Required
             && resolution.preset_policy.is_some()
             && !resolution.preset_trusted
         {
@@ -618,6 +667,7 @@ impl Settings {
             resolve::Refusal::NoModel => "composer.chooseModel",
             resolve::Refusal::UnknownModel(_) => "composer.modelUnavailable",
             resolve::Refusal::UnknownPreset(_) => "composer.presetUnavailable",
+            resolve::Refusal::PresetSandboxWidens => "composer.presetSandboxWidens",
         })
     }
 
@@ -753,6 +803,7 @@ impl Settings {
             file_tools_enabled: resolution.file_tools_enabled,
             web_tools_enabled: resolution.web_tools_enabled,
             permission: resolution.permission.clone(),
+            sandbox: resolution.sandbox,
             skill_sources: resolution.skill_sources.clone(),
             skills: resolution.skills.clone(),
             context_budget: resolution.context_budget,
@@ -1908,5 +1959,168 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A saved settings file from the previous shape resolves to the SAME
+    /// effective permission, sandbox, egress and path scopes after the front end
+    /// becomes "mode + task bundle".
+    ///
+    /// The documents are written and read back through the real loaders, not
+    /// built in memory: this is a migration test on a file, and its rows are the
+    /// frozen answer the build used before the simplification.
+    #[test]
+    fn a_saved_settings_file_resolves_to_the_same_scope_after_the_mode_change() {
+        struct Case {
+            label: &'static str,
+            permission: &'static str,
+            preset: &'static str,
+            effective: &'static str,
+            heel: bool,
+            egress: Option<Vec<&'static str>>,
+            read: Option<Vec<&'static str>>,
+            write: Option<Vec<&'static str>>,
+            deny: Vec<&'static str>,
+        }
+        let cases = [
+            Case {
+                label: "full-heel",
+                permission: "danger-full-access",
+                preset: r#"
+permission = "danger-full-access"
+sandbox = "heel"
+read = ["docs", "src"]
+write = ["docs"]
+deny = ["secrets/**", ".env"]
+egress = ["203.0.113.7"]
+web_search = false
+plugins = ["shell", "files"]
+policy_mode = "advisory"
+"#,
+                effective: "danger-full-access",
+                heel: true,
+                egress: Some(vec!["203.0.113.7"]),
+                read: Some(vec!["docs", "src"]),
+                write: Some(vec!["docs"]),
+                deny: vec!["secrets/**", ".env"],
+            },
+            Case {
+                label: "capped-read-only",
+                permission: "workspace-write",
+                preset: r#"
+permission = "read-only"
+sandbox = "heel"
+read = ["docs"]
+write = []
+deny = ["secrets/**"]
+egress = []
+web_search = false
+plugins = ["files"]
+policy_mode = "advisory"
+"#,
+                effective: "read-only",
+                heel: true,
+                egress: Some(Vec::new()),
+                read: Some(vec!["docs"]),
+                write: Some(Vec::new()),
+                deny: vec!["secrets/**"],
+            },
+        ];
+        for case in cases {
+            let home = std::env::temp_dir().join(format!(
+                "bsh-migration-{}-{}",
+                case.label,
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&home);
+            std::fs::create_dir_all(&home).expect("scratch");
+            let global_text = format!(
+                "schema_version = 1\ndefault_preset = \"guarded\"\n\n[general]\nactive_workspace = \"w1\"\n\n[presets.guarded]\n{}\n[[workspaces]]\nid = \"w1\"\nname = \"probe\"\nroot = \"{}\"\ncreated_at = 0\nupdated_at = 0\n",
+                case.preset,
+                home.to_string_lossy()
+            );
+            std::fs::write(home.join("settings.toml"), global_text).expect("global fixture");
+            let workspace_path = super::workspace::WorkspaceSettings::path(&home);
+            std::fs::create_dir_all(workspace_path.parent().expect("a parent"))
+                .expect("workspace directory");
+            std::fs::write(
+                &workspace_path,
+                format!(
+                    "schema_version = 1\n\n[agent]\npermission = \"{}\"\n",
+                    case.permission
+                ),
+            )
+            .expect("workspace fixture");
+
+            let global = GlobalSettings::load(&home.join("settings.toml"))
+                .expect("the previous global shape still loads");
+            let workspace = super::workspace::WorkspaceSettings::load(&workspace_path)
+                .expect("the previous workspace shape still loads");
+            let settings = Settings {
+                global,
+                workspace,
+                save_root: Some(home.clone()),
+                ..Settings::default()
+            };
+            let effective = settings.effective();
+            let egress = effective
+                .preset_egress
+                .as_ref()
+                .map(|entries| entries.iter().map(String::as_str).collect::<Vec<_>>());
+            let read = effective
+                .preset_read
+                .as_ref()
+                .map(|entries| entries.iter().map(String::as_str).collect::<Vec<_>>());
+            let write = effective
+                .preset_write
+                .as_ref()
+                .map(|entries| entries.iter().map(String::as_str).collect::<Vec<_>>());
+            let deny = effective
+                .preset_deny
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                (
+                    effective.permission.effective.as_str(),
+                    effective.sandbox.heel,
+                    egress,
+                    read,
+                    write,
+                    deny,
+                ),
+                (
+                    case.effective,
+                    case.heel,
+                    case.egress,
+                    case.read,
+                    case.write,
+                    case.deny,
+                ),
+                "{}: the same saved file must resolve to the same scope",
+                case.label
+            );
+            assert_eq!(
+                effective.preset_id.as_str(),
+                "guarded",
+                "{}: the preset is still the authority",
+                case.label
+            );
+            assert_eq!(
+                effective.permission.requested, case.permission,
+                "{}: the stored request is untouched",
+                case.label
+            );
+            assert_eq!(
+                effective.preset_plugins,
+                if case.label == "full-heel" {
+                    vec!["shell".to_string(), "files".to_string()]
+                } else {
+                    vec!["files".to_string()]
+                },
+                "{}: the task bundle still attaches",
+                case.label
+            );
+            let _ = std::fs::remove_dir_all(&home);
+        }
     }
 }

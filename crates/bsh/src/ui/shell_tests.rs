@@ -3517,6 +3517,71 @@ fn preset_use_in_chat_writes_the_session_not_the_default(cx: &mut TestAppContext
     assert_eq!(session_preset, None, "the no-preset card clears the chat");
 }
 
+/// A preset that turns the sandbox off under a narrower ceiling is refused
+/// WHERE IT IS CHOSEN: the card carries the reason, its Use in this chat
+/// control does not record the selection, and the direct setter refuses too.
+#[gpui::test]
+fn a_sandbox_widening_preset_is_refused_where_it_is_chosen(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("preset-sandbox-widens-ui", 1);
+        state.settings.global.presets.insert(
+            "wide".to_string(),
+            crate::settings::global::Preset {
+                name: Some("wide".to_string()),
+                plugins: vec!["shell".to_string(), "files".to_string()],
+                permission: Some(crate::caps::WORKSPACE_WRITE.to_string()),
+                sandbox: Some(crate::settings::global::SandboxChoice::Off),
+                order: Some(-1),
+                ..Default::default()
+            },
+        );
+        state.settings.global.default_preset = String::new();
+        let shell =
+            cx.new(|cx| Shell::build_for_test(window, section_index("agent-presets"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let active = cx.update(|_, cx| shell.read(cx).state.active_id.clone().expect("session"));
+
+    // The card states the refusal, so the reader sees it before pressing.
+    assert!(
+        cx.debug_bounds("preset-sandbox-0").is_some(),
+        "the card carries its sandbox line"
+    );
+
+    // The disabled Use in this chat control records nothing.
+    let use_chat = cx.debug_bounds("preset-use-0").expect("the use action");
+    cx.simulate_click(use_chat.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let session_preset = cx.update(|_, cx| shell.read(cx).state.active_session_preset());
+    assert_eq!(
+        session_preset, None,
+        "a refused preset must not become the session's choice"
+    );
+
+    // The direct path refuses as well and leaves a visible notice naming the
+    // rule. This is the guard behind the composer menu's disabled row.
+    shell.update(cx, |shell, cx| {
+        shell.state.select_session_preset(&active, "wide");
+        cx.notify();
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let (session_preset, notice) = cx.update(|_, cx| {
+        let state = &shell.read(cx).state;
+        (
+            state.active_session_preset(),
+            state.notice.clone().unwrap_or_default(),
+        )
+    });
+    assert_eq!(session_preset, None);
+    assert!(
+        notice.contains("preset-sandbox-widens"),
+        "the refusal names the rule where the choice was made: {notice}"
+    );
+}
+
 /// The composer shows the session's preset and its menu opens in place, the
 /// same way the model chip does.
 #[gpui::test]
@@ -3647,6 +3712,23 @@ fn preset_details_show_the_applied_config(cx: &mut TestAppContext) {
         cx.debug_bounds("preset-config-0").is_some(),
         "details expand the applied configuration"
     );
+    assert!(
+        cx.debug_bounds("preset-advanced-0").is_some(),
+        "Mode details carries one Advanced disclosure"
+    );
+    assert!(
+        cx.debug_bounds("preset-advanced-body-0").is_none(),
+        "Advanced starts collapsed"
+    );
+    let advanced = cx
+        .debug_bounds("preset-advanced-0")
+        .expect("the Advanced disclosure");
+    cx.simulate_click(advanced.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("preset-advanced-body-0").is_some(),
+        "the disclosure opens the advanced fields on request"
+    );
     let default = cx.update(|_, cx| shell.read(cx).state.draft().global.default_preset.clone());
     assert!(
         default.is_empty(),
@@ -3661,6 +3743,119 @@ fn preset_details_show_the_applied_config(cx: &mut TestAppContext) {
     assert!(
         cx.debug_bounds("preset-config-0").is_none(),
         "details collapse again"
+    );
+}
+
+/// The collapsed preset card names the mode a turn would actually get: when a
+/// preset ceiling lowers the session's request, the card's mode line carries the
+/// EFFECTIVE tier, not the reader's request. The text itself is the pure
+/// `card_mode_line` the card draws, and the value-encoded selector proves the
+/// rendered card was built from that resolved mode.
+#[gpui::test]
+fn the_preset_card_mode_line_reads_the_resolved_mode(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (_harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("preset-mode-line", 1);
+        state.settings.workspace.agent.permission = crate::caps::FULL_ACCESS.to_string();
+        state.settings.global.presets.insert(
+            "scope-limited".to_string(),
+            crate::settings::global::Preset {
+                name: Some("scope-limited".to_string()),
+                plugins: vec!["files".to_string()],
+                permission: Some(crate::caps::READ_ONLY.to_string()),
+                order: Some(-1),
+                ..crate::settings::global::Preset::default()
+            },
+        );
+        state.settings.global.default_preset = "scope-limited".to_string();
+        let shell =
+            cx.new(|cx| Shell::build_for_test(window, section_index("agent-presets"), state, cx));
+        Harness { shell }
+    });
+    draw_until(cx, "the capped card renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("preset-mode-0-read-only").is_some()
+    });
+    assert!(
+        cx.debug_bounds("preset-mode-0-danger-full-access")
+            .is_none(),
+        "the collapsed card must not claim the request a preset already caps"
+    );
+}
+
+/// An ADVANCED deny glob still enforces while its block is closed.
+///
+/// The card leads with the mode; the deny list lives behind Advanced. This test
+/// never opens either disclosure: it builds the turn from the settings tree and
+/// asks the real write tool, so the refusal proves the simplification moved the
+/// FIELD's presentation and not its enforcement.
+#[gpui::test]
+fn an_advanced_deny_glob_still_refuses_a_write_while_the_block_is_closed(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let mut state = state_with_workspace_tree("preset-advanced-deny");
+    let root = std::path::PathBuf::from(state.settings.active_workspace_root());
+    std::fs::create_dir_all(root.join("secrets")).expect("the denied directory");
+    state.settings.global.presets.insert(
+        "guarded".to_string(),
+        crate::settings::global::Preset {
+            name: Some("guarded".to_string()),
+            plugins: vec!["files".to_string()],
+            permission: Some(crate::caps::WORKSPACE_WRITE.to_string()),
+            write: Some(vec!["**".to_string()]),
+            deny: vec!["secrets/**".to_string()],
+            order: Some(-1),
+            ..crate::settings::global::Preset::default()
+        },
+    );
+    state.settings.global.default_preset = "guarded".to_string();
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let shell =
+            cx.new(|cx| Shell::build_for_test(window, section_index("agent-presets"), state, cx));
+        Harness { shell }
+    });
+    draw_until(cx, "the preset cards render", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("preset-0").is_some()
+    });
+    assert!(
+        cx.debug_bounds("preset-config-0").is_none(),
+        "the card leads with its mode; Mode details is closed"
+    );
+    assert!(
+        cx.debug_bounds("preset-advanced-body-0").is_none(),
+        "and the Advanced block is closed"
+    );
+
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let error = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        let id = shell.state.active_id.clone().expect("a session");
+        let choice = shell.state.session_choice(&id);
+        let built = crate::caps::build_agent(
+            &shell.state.settings,
+            &shell.state.vault,
+            &choice,
+            &shell.state.mcp,
+        );
+        let secret = root.join("secrets").join("key.pem");
+        built
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": secret.to_string_lossy(),
+                    "content": "secret",
+                }),
+            )
+            .expect_err("the advanced deny glob still refuses the write")
+    });
+    assert!(
+        error.to_string().contains("preset-deny-path"),
+        "the refusal names the scope rule: {error}"
+    );
+    assert!(
+        !root.join("secrets").join("key.pem").exists(),
+        "the refused write created nothing"
     );
 }
 
@@ -3716,7 +3911,7 @@ fn a_required_untrusted_preset_cannot_be_used_in_a_chat(cx: &mut TestAppContext)
                     "package policy.strict\n# rule: allow\nverdict := {\"allow\": true}"
                         .to_string(),
                 ),
-                policy_mode: Some("required".to_string()),
+                policy_mode: Some(crate::settings::global::PolicyMode::Required),
                 trusted: false,
                 order: Some(-1),
                 ..Default::default()
@@ -4164,6 +4359,73 @@ fn the_policy_pane_adds_and_removes_allowlist_entries(cx: &mut TestAppContext) {
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let entries = cx.update(|_, cx| shell.read(cx).state.egress_allowlist.clone());
     assert!(entries.is_empty(), "removing the row drops the entry");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The Policy pane's empty state offers the starter allowlist when no file
+/// exists (the UNRESTRICTED state), and the Create action writes EXACTLY the
+/// shared template constant - not a copy of it - so creating it denies all
+/// egress: the template parses to no rules, which is the deliberate lockdown.
+#[gpui::test]
+fn the_policy_pane_offers_and_creates_the_starter_allowlist(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/bsh-shell-policy-starter");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).expect("scratch");
+    let base_for_state = base.clone();
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("policy-starter", 1);
+        let id = state
+            .settings
+            .note_workspace("scratch", &base_for_state.to_string_lossy());
+        state.settings.global.general.active_workspace = id;
+        // Nothing seeds the file any more: the pane must show the no-file,
+        // unrestricted state until the reader presses Create.
+        state.refresh_egress_allowlist();
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("policy"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    // The empty state and its Create control are on the pane; no file exists.
+    let file = base.join(".bsh").join("egress-allowlist");
+    assert!(!file.exists(), "the premise: no file exists yet");
+    assert!(
+        cx.debug_bounds("policy-create-starter").is_some(),
+        "the empty state offers the starter allowlist"
+    );
+    assert!(
+        cx.debug_bounds("policy-open-file").is_some(),
+        "the pane carries the open-file control"
+    );
+
+    let create = cx
+        .debug_bounds("policy-create-starter")
+        .expect("the create control");
+    cx.simulate_click(create.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let bytes = std::fs::read_to_string(&file).expect("the created file");
+    assert_eq!(
+        bytes,
+        crate::caps::EGRESS_ALLOWLIST_TEMPLATE,
+        "the created file is the shared template constant itself"
+    );
+    // The template parses to no rules, so the created file IS the deny-all.
+    let rules = agent::policy::EgressRuleSet::parse([bytes.as_str()]);
+    assert!(
+        rules.is_empty(),
+        "the starter file declares no rule, which denies all egress: {rules:?}"
+    );
+    let entries = cx.update(|_, cx| shell.read(cx).state.egress_allowlist.clone());
+    assert!(entries.is_empty(), "the pane reads no entries: {entries:?}");
+
+    // With a file present the Create control is gone, so a reader is never
+    // invited to replace their own allowlist.
+    assert!(
+        cx.debug_bounds("policy-create-starter").is_none(),
+        "the create control is offered only while the file is absent"
+    );
     let _ = std::fs::remove_dir_all(&base);
 }
 
@@ -5964,10 +6226,16 @@ fn the_tools_pane_switches_the_hosted_web_search(cx: &mut TestAppContext) {
     });
     assert_eq!(after, !before, "the switch writes the setting it shows");
 
-    // And the agent the shell builds follows the draft.
+    // And the agent the shell builds follows the draft. The preset is cleared
+    // first, on purpose: the shipped default is the STANDARD preset, which
+    // declares `web_search = true` and therefore overrides this switch (the
+    // resolver's own precedence, older than this change). Clearing it leaves
+    // the switch as the only thing deciding, which is what this test proves.
     let built = cx.update(|_, cx| {
+        let mut draft = shell.read(cx).state.draft().clone();
+        draft.global.default_preset = String::new();
         crate::caps::build_agent(
-            shell.read(cx).state.draft(),
+            &draft,
             &shell.read(cx).state.vault,
             &crate::settings::resolve::SessionChoice::default(),
             &crate::mcp::McpPool::default(),
@@ -6058,6 +6326,324 @@ fn the_save_bar_does_not_scroll_with_the_section(cx: &mut TestAppContext) {
         "the save bar sits in the same place whether the section is short or long \
          (models {short}, general {tall}) - it is pinned, not scrolled with the content"
     );
+}
+
+/// The footer Save confirms INSIDE the dialog, and closing that dialog clears
+/// the confirmation with it.
+///
+/// Save keeps the dialog open, so the old path wrote "Settings saved" into the
+/// statusbar - which this dialog's scrim and its own opaque panel cover. The
+/// confirmation now lives in the panel's footer, above the control that caused
+/// it, so a save can never look like a save that did nothing.
+#[gpui::test]
+fn the_footer_save_confirms_inside_the_dialog(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = AppState::with_store(scratch_store("save-toast"));
+        tests_pin_reference_defaults(&mut state);
+        state.lang = Lang::En;
+        state.settings.global.general.lang = "en".to_string();
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("general"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    // The premise: nothing has been saved, so nothing confirms one.
+    assert!(
+        cx.debug_bounds("settings-save-toast").is_none(),
+        "a confirmation must not appear before a save"
+    );
+
+    let panel = cx.debug_bounds("settings-panel").expect("the dialog draws");
+    let save = cx
+        .debug_bounds("settings-save")
+        .expect("the footer Save is on screen");
+    cx.simulate_click(save.center(), Modifiers::default());
+    draw_until(cx, "the save confirmation appears", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("settings-save-toast").is_some()
+    });
+
+    // The dialog stayed open: Save is a commit, not a close.
+    let (overlay, toast) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (
+            format!("{:?}", shell.state.overlay),
+            shell
+                .settings_toast
+                .as_ref()
+                .map(|toast| (toast.text.clone(), toast.failed, toast.seq)),
+        )
+    });
+    assert!(
+        overlay.contains("Settings"),
+        "Save keeps the dialog open, got {overlay}"
+    );
+    assert!(
+        cx.debug_bounds("settings-panel").is_some(),
+        "and the panel is still drawn"
+    );
+    let (text, failed, seq) = toast.expect("the shell holds the confirmation");
+    assert_eq!(
+        text, "Settings saved",
+        "the confirmation is the saved string"
+    );
+    assert!(!failed, "a successful save is not the failure variant");
+    assert_eq!(seq, 1, "the first save's generation");
+
+    // It is INSIDE the panel, above the Save and right-aligned with it: an
+    // anchored confirmation, not a status line under the dialog.
+    let toast_bounds = cx
+        .debug_bounds("settings-save-toast")
+        .expect("the confirmation draws");
+    let save_bounds = cx.debug_bounds("settings-save").expect("the Save");
+    assert!(
+        toast_bounds.origin.y > panel.origin.y
+            && toast_bounds.bottom() < panel.bottom()
+            && toast_bounds.right() < panel.right(),
+        "the confirmation is inside the panel: {toast_bounds:?} in {panel:?}"
+    );
+    assert!(
+        toast_bounds.bottom() <= save_bounds.origin.y,
+        "the confirmation sits above the Save it belongs to: {toast_bounds:?} vs {save_bounds:?}"
+    );
+    assert!(
+        f32::from(save_bounds.origin.y - toast_bounds.bottom()) <= 16.0,
+        "and close to it rather than at the far end of the panel"
+    );
+    assert!(
+        f32::from(toast_bounds.right() - save_bounds.right()).abs() <= 1.0,
+        "right-aligned with the Save, got {toast_bounds:?} vs {save_bounds:?}"
+    );
+
+    // Closing the dialog clears the confirmation rather than leaving it to a
+    // timer that outlives the surface it was drawn on.
+    let close = cx
+        .debug_bounds("settings-close")
+        .expect("the header's close control");
+    cx.simulate_click(close.center(), Modifiers::default());
+    draw_until(cx, "the dialog closes", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("settings-panel").is_none()
+    });
+    assert!(
+        cx.debug_bounds("settings-save-toast").is_none(),
+        "closing the dialog clears the confirmation"
+    );
+    assert!(
+        cx.update(|_, cx| shell.read(cx).settings_toast.is_none()),
+        "and the shell no longer holds it"
+    );
+}
+
+/// The confirmation has a bounded lifetime on the app's own clock.
+///
+/// Four seconds of the deterministic executor clock: it is still up after
+/// three, and the timer clears it once the fourth has passed - no wall-clock
+/// sleep, and no confirmation that persists forever.
+#[gpui::test]
+fn the_save_confirmation_expires_after_its_lifetime(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = AppState::with_store(scratch_store("save-toast-expiry"));
+        tests_pin_reference_defaults(&mut state);
+        state.lang = Lang::En;
+        state.settings.global.general.lang = "en".to_string();
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("general"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    let save = cx.debug_bounds("settings-save").expect("the footer Save");
+    cx.simulate_click(save.center(), Modifiers::default());
+    draw_until(cx, "the save confirmation appears", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("settings-save-toast").is_some()
+    });
+
+    // Three of its four seconds: a reader still has time to read it.
+    cx.background_executor
+        .advance_clock(std::time::Duration::from_secs(3));
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("settings-save-toast").is_some(),
+        "the confirmation outlives a glance"
+    );
+
+    // Past the fourth: the app clock clears it on its own.
+    cx.background_executor
+        .advance_clock(std::time::Duration::from_secs(2));
+    cx.run_until_parked();
+    draw_until(cx, "the confirmation expires", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("settings-save-toast").is_none()
+    });
+    assert!(
+        cx.update(|_, cx| shell.read(cx).settings_toast.is_none()),
+        "and the shell drops it with the drawing"
+    );
+}
+
+/// A second save REFRESHES the one confirmation: one toast, not two, and the
+/// first save's timer cannot take the newer message down.
+#[gpui::test]
+fn a_second_save_refreshes_one_confirmation(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = AppState::with_store(scratch_store("save-toast-refresh"));
+        tests_pin_reference_defaults(&mut state);
+        state.lang = Lang::En;
+        state.settings.global.general.lang = "en".to_string();
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("general"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    let save = cx.debug_bounds("settings-save").expect("the footer Save");
+    cx.simulate_click(save.center(), Modifiers::default());
+    draw_until(cx, "the first confirmation appears", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("settings-save-toast-1").is_some()
+    });
+
+    // A second save two seconds later. The generation in the selector is what
+    // makes "replaced" observable: if the first were still drawn, its own
+    // selector would still be present beside the second.
+    cx.background_executor
+        .advance_clock(std::time::Duration::from_secs(2));
+    cx.run_until_parked();
+    let save = cx.debug_bounds("settings-save").expect("the footer Save");
+    cx.simulate_click(save.center(), Modifiers::default());
+    draw_until(
+        cx,
+        "the refreshed confirmation appears",
+        DRAW_UNTIL_MAX,
+        |cx| cx.debug_bounds("settings-save-toast-2").is_some(),
+    );
+    assert!(
+        cx.debug_bounds("settings-save-toast-1").is_none(),
+        "a second save replaces the confirmation instead of stacking a twin"
+    );
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).settings_toast.as_ref().map(|t| t.seq)),
+        Some(2),
+        "the shell holds exactly the newer confirmation"
+    );
+
+    // At t=5 the FIRST save's timer (due at t=4) has fired; it must leave the
+    // refreshed confirmation alone (due at t=6).
+    cx.background_executor
+        .advance_clock(std::time::Duration::from_secs(3));
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("settings-save-toast-2").is_some(),
+        "the stale timer does not clear the refreshed confirmation"
+    );
+
+    // Its own lifetime then ends.
+    cx.background_executor
+        .advance_clock(std::time::Duration::from_secs(2));
+    cx.run_until_parked();
+    draw_until(
+        cx,
+        "the refreshed confirmation expires",
+        DRAW_UNTIL_MAX,
+        |cx| cx.debug_bounds("settings-save-toast").is_none(),
+    );
+}
+
+/// A FAILED save says what failed, in the same place a success is confirmed.
+///
+/// The write is refused the way the existing commit tests refuse one: a regular
+/// file where the settings directory would have to be. A silent failure would
+/// be worse than no confirmation, so the text carries the error itself and the
+/// failure variant outlives the success one.
+#[gpui::test]
+fn a_failed_save_shows_the_error_in_the_footer(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let base = scratch_home("save-toast-blocked");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).expect("the scratch base");
+    let blocker = base.join("blocked");
+    std::fs::write(&blocker, b"not a directory").expect("the blocker");
+    let (harness, cx) = cx.add_window_view({
+        let blocker = blocker.clone();
+        move |window, cx| {
+            let mut state = AppState::with_store(scratch_store("save-toast-failed"));
+            tests_pin_reference_defaults(&mut state);
+            state.lang = Lang::En;
+            state.settings.global.general.lang = "en".to_string();
+            state.settings.save_root = Some(blocker);
+            let shell =
+                cx.new(|cx| Shell::build_for_test(window, section_index("general"), state, cx));
+            Harness { shell }
+        }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    let save = cx.debug_bounds("settings-save").expect("the footer Save");
+    cx.simulate_click(save.center(), Modifiers::default());
+    draw_until(cx, "the failed save is reported", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("settings-save-toast").is_some()
+    });
+
+    let (text, failed, overlay, inline) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        let toast = shell.settings_toast.as_ref();
+        (
+            toast.map(|toast| toast.text.clone()).unwrap_or_default(),
+            toast.is_some_and(|toast| toast.failed),
+            format!("{:?}", shell.state.overlay),
+            shell.developer_tools_failed,
+        )
+    });
+    let prefix = crate::i18n::tr(Lang::En, "settings.saveFailed");
+    assert!(failed, "the failure variant is the one drawn, got {text:?}");
+    assert!(
+        text.starts_with(&prefix),
+        "the confirmation names the failure the way the pane's copy does: {text:?}"
+    );
+    assert!(
+        text.len() > prefix.len(),
+        "and carries the write error itself, not just a bare heading: {text:?}"
+    );
+    assert_ne!(
+        text,
+        crate::i18n::tr(Lang::En, "settings.saved"),
+        "a failed save never claims success"
+    );
+    assert!(
+        overlay.contains("Settings"),
+        "a refused save keeps the dialog open, got {overlay}"
+    );
+    assert!(
+        inline,
+        "and the existing inline developer-tools error is still set"
+    );
+
+    // The failure stays longer than a success would: at t=5 the four-second
+    // success confirmation would be gone, this one is still readable.
+    cx.background_executor
+        .advance_clock(std::time::Duration::from_secs(5));
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("settings-save-toast").is_some(),
+        "a failure is given longer to be read than a success"
+    );
+    // Then it is bounded too, rather than parking a stale failure forever.
+    cx.background_executor
+        .advance_clock(std::time::Duration::from_secs(4));
+    cx.run_until_parked();
+    draw_until(
+        cx,
+        "the failure confirmation expires",
+        DRAW_UNTIL_MAX,
+        |cx| cx.debug_bounds("settings-save-toast").is_none(),
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// A cancelled dialog puts the previewed preferences back.
@@ -10430,6 +11016,232 @@ fn the_composer_chips_take_the_measured_select_trigger(cx: &mut TestAppContext) 
     );
 }
 
+/// The chip is the whole permission decision: exactly three rows, each carrying
+/// its one-line consequence; the current mode is marked; a lesser-or-equal mode
+/// applies immediately; and Full access asks exactly once.
+///
+/// The rendered state is asserted through the value-encoded chip selector, and
+/// each mode is written through the chip's own handler - so this proves the
+/// control a reader presses, not only a pure table.
+#[gpui::test]
+fn the_chip_offers_three_modes_and_marks_the_current_one(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let home = scratch_home("chip-three-modes");
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("chip-three-modes", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    draw_until(
+        cx,
+        "the default Workspace Write chip renders",
+        DRAW_UNTIL_MAX,
+        |cx| cx.debug_bounds("permission-chip-workspace-write").is_some(),
+    );
+
+    let rows = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        let effective = shell.state.effective();
+        super::permission::permission_rows(Lang::En, &effective, &shell.state)
+    });
+    assert_eq!(rows.len(), 3, "the chip offers exactly three modes");
+    let checked: Vec<&str> = rows
+        .iter()
+        .filter(|row| row.checked)
+        .map(|row| row.mode.value())
+        .collect();
+    assert_eq!(
+        checked,
+        [crate::caps::WORKSPACE_WRITE],
+        "a fresh session starts in Workspace Write, and only that row is marked"
+    );
+    for row in &rows {
+        assert!(
+            row.text.contains(" · "),
+            "each row pairs the label with one consequence: {}",
+            row.text
+        );
+    }
+
+    // Full access: one confirmation, no second dialog, and Cancel preserves.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.request_permission(crate::caps::FULL_ACCESS, cx)
+        })
+    });
+    draw_until(cx, "the one confirmation draws", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("permission-confirm-enable").is_some()
+    });
+    assert!(
+        cx.debug_bounds("permission-acknowledge").is_none(),
+        "the confirmation has no acknowledgement step"
+    );
+    cx.update(|_, cx| shell.update(cx, |this, cx| this.permission_cancel_confirm(cx)));
+    draw_until(
+        cx,
+        "cancel returns to the workspace chip",
+        DRAW_UNTIL_MAX,
+        |cx| cx.debug_bounds("permission-chip-workspace-write").is_some(),
+    );
+
+    // A lesser mode applies immediately and arms no gate.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.request_permission(crate::caps::READ_ONLY, cx)
+        })
+    });
+    draw_until(cx, "Read Only lands immediately", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("permission-chip-read-only").is_some()
+    });
+    assert!(
+        cx.update(|_, cx| shell.read(cx).permission_confirm.is_none()),
+        "a lesser mode never asks for confirmation"
+    );
+
+    // Full access, then straight back down: the narrowing is immediate.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.request_permission(crate::caps::FULL_ACCESS, cx)
+        })
+    });
+    draw_until(cx, "the gate is ready", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("permission-confirm-enable").is_some()
+    });
+    cx.update(|_, cx| shell.update(cx, |this, cx| this.permission_confirm_enable(cx)));
+    draw_until(cx, "Full access renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("permission-chip-danger-full-access")
+            .is_some()
+    });
+    assert!(
+        cx.debug_bounds("permission-confirm-dialog").is_none(),
+        "the gate closes and opens no second dialog"
+    );
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.request_permission(crate::caps::WORKSPACE_WRITE, cx)
+        })
+    });
+    draw_until(
+        cx,
+        "Workspace Write narrows immediately",
+        DRAW_UNTIL_MAX,
+        |cx| cx.debug_bounds("permission-chip-workspace-write").is_some(),
+    );
+    assert!(
+        cx.update(|_, cx| shell.read(cx).permission_confirm.is_none()),
+        "narrowing from Full access asks nothing"
+    );
+    assert_eq!(
+        reloaded_settings(&home).workspace.agent.permission,
+        crate::caps::WORKSPACE_WRITE,
+        "the narrowed mode is the one on disk"
+    );
+}
+
+/// The chip's three rows each state the network, as the chip builds them.
+///
+/// The popup body is the kit's own menu item, which carries no debug selector,
+/// so the observable is the row list the chip's render path builds
+/// (`permission::permission_rows`) read from the live shell after the chip has
+/// drawn - the same function, the same state. The scratch workspace has NO
+/// `.bsh/egress-allowlist`, so the honest clause is the unrestricted one; a
+/// hardcoded allowlist would fail here.
+#[gpui::test]
+fn the_chips_three_rows_each_carry_a_network_clause(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("permission-chip-network", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    draw_until(cx, "the permission chip renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("permission-chip-workspace-write").is_some()
+    });
+
+    let rows = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        let effective = shell.state.effective();
+        super::permission::permission_rows(Lang::En, &effective, &shell.state)
+    });
+    assert_eq!(rows.len(), 3, "the chip offers exactly three modes");
+    for row in &rows {
+        assert!(
+            row.text.contains("network available") || row.text.contains("network denied"),
+            "every row states its network reach: {}",
+            row.text
+        );
+    }
+    let workspace_row = rows
+        .iter()
+        .find(|row| row.mode.value() == crate::caps::WORKSPACE_WRITE)
+        .expect("the Workspace Write row");
+    assert!(
+        workspace_row
+            .text
+            .contains("Commands: network available, unrestricted."),
+        "the absent file is the real state, not a hardcoded allowlist: {}",
+        workspace_row.text
+    );
+}
+
+/// NEGATIVE: under a preset that denies every destination, no row the chip
+/// draws reads as an open network. The workspace file is ABSENT here, which is
+/// exactly the state a hardcoded "unrestricted" clause would get wrong.
+#[gpui::test]
+fn a_deny_all_preset_chip_never_reads_as_an_open_network(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("permission-chip-deny-all", 1);
+        state.settings.global.presets.insert(
+            "deny-all-network".to_string(),
+            crate::settings::global::Preset {
+                egress: Some(Vec::new()),
+                ..crate::settings::global::Preset::default()
+            },
+        );
+        state.settings.global.default_preset = "deny-all-network".to_string();
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    draw_until(cx, "the permission chip renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("permission-chip-workspace-write").is_some()
+    });
+
+    let (rows, preset) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        let effective = shell.state.effective();
+        (
+            super::permission::permission_rows(Lang::En, &effective, &shell.state),
+            effective.preset_id,
+        )
+    });
+    assert_eq!(
+        preset, "deny-all-network",
+        "the premise: the session runs the deny-all preset"
+    );
+    assert_eq!(rows.len(), 3);
+    for row in &rows {
+        assert!(
+            row.text.contains("network denied"),
+            "the deny-all preset is stated on every row: {}",
+            row.text
+        );
+        assert!(
+            row.text.contains("network denied by the preset"),
+            "and it names the preset, not the workspace file: {}",
+            row.text
+        );
+        assert!(
+            !row.text.contains("unrestricted"),
+            "no row claims an unrestricted network: {}",
+            row.text
+        );
+    }
+}
+
 /// The permission chip's menu writes through the same field the General pane's
 /// choice row writes, and - NEW SEMANTICS - the write is a COMMIT.
 ///
@@ -10619,26 +11431,32 @@ fn a_read_only_preset_caps_the_chip_policy_data_and_audit(cx: &mut TestAppContex
         "and the reduction names its cause"
     );
     let text = super::composer::permission_chip_text(Lang::En, &resolution);
-    assert!(
-        text.starts_with("Read Only"),
-        "the chip leads with the EFFECTIVE value, got {text:?}"
+    assert_eq!(
+        text, "Read Only",
+        "the chip states the mode the tools obey, in plain words"
     );
     assert!(
-        text.contains("limited by Read Only preset"),
-        "and annotates the ceiling, got {text:?}"
+        super::composer::permission_choice_checked(&resolution, crate::caps::READ_ONLY),
+        "the checkmark is on the mode the tools obey"
     );
     assert!(
-        !super::composer::permission_choice_checked(&resolution, crate::caps::READ_ONLY),
-        "the checkmark is not on the capped value"
+        !super::composer::permission_choice_checked(&resolution, crate::caps::FULL_ACCESS),
+        "not on a request the preset already caps"
     );
+    let rows = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        let effective = shell.state.effective();
+        super::permission::permission_rows(Lang::En, &effective, &shell.state)
+    });
+    let full = rows
+        .iter()
+        .find(|row| row.mode.value() == crate::caps::FULL_ACCESS)
+        .expect("the Full access row is still listed");
+    assert!(!full.enabled, "a preset ceiling disables the row above it");
     assert!(
-        super::composer::permission_choice_checked(&resolution, crate::caps::FULL_ACCESS),
-        "it is on the session's own choice"
-    );
-    assert!(
-        super::composer::permission_choice_text(Lang::En, &resolution, crate::caps::FULL_ACCESS)
-            .contains("preset caps at Read Only"),
-        "and the row above the ceiling says it will not take effect"
+        full.text.contains("This preset keeps it at Read Only"),
+        "and the row says why it cannot be chosen: {}",
+        full.text
     );
     assert!(
         cx.debug_bounds("permission-chip-read-only").is_some(),
@@ -10788,13 +11606,9 @@ fn the_general_row_and_the_chip_report_one_effective_permission(cx: &mut TestApp
         row_value, chip_text,
         "the pane and the chip must render the same string"
     );
-    assert!(
-        row_value.starts_with("Read Only"),
-        "the pane leads with the EFFECTIVE value, got {row_value:?}"
-    );
-    assert!(
-        row_value.contains("limited by Read Only preset"),
-        "and the pane carries the same ceiling annotation as the chip, got {row_value:?}"
+    assert_eq!(
+        row_value, "Read Only",
+        "the pane states the mode the tools obey, in plain words: {row_value:?}"
     );
     assert_eq!(
         row_selector, "set-perm-read-only",
@@ -11030,14 +11844,11 @@ fn the_widening_gate_cancels_byte_identical_and_confirms(cx: &mut TestAppContext
             this.request_permission(crate::caps::FULL_ACCESS, cx)
         })
     });
-    cx.update(|_, cx| {
-        shell.update(cx, |this, _| this.permission_acknowledged = true);
-    });
     cx.update(|_, cx| shell.update(cx, |this, cx| this.permission_confirm_enable(cx)));
     assert_eq!(
         reloaded_settings(&home).workspace.agent.permission,
         crate::caps::FULL_ACCESS,
-        "a confirmed widening persists"
+        "a confirmed widening persists; the two buttons are the whole gate"
     );
 }
 
@@ -11134,20 +11945,38 @@ fn a_refused_permission_write_is_reported_and_reverted(cx: &mut TestAppContext) 
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// The widening copy names both halves: what Full access loosens and what the
-/// engine still enforces.
+/// The full-access sentence names the consequence in the reader's words: the
+/// write range, the released shell and the sandbox network allowlist. It is one
+/// sentence, and none of it needs the level table to parse.
 #[test]
-fn the_widening_copy_names_the_loosened_and_enforced_halves() {
-    let text = crate::i18n::tr(Lang::En, "permission.confirmDescription");
-    for expected in [
-        "whole machine",
-        "unsandboxed",
-        "egress allowlist",
-        "preset's permission ceiling",
-    ] {
+fn the_full_access_sentence_names_the_consequences_without_the_level_table() {
+    for lang in [Lang::En, Lang::Zh] {
+        let text = crate::i18n::tr(lang, "permission.confirmDescription");
+        assert_ne!(text, "permission.confirmDescription", "{lang:?} missing");
+        assert_eq!(
+            text.matches('.').count() + text.matches('。').count(),
+            1,
+            "the confirmation is one sentence: {text}"
+        );
+        for forbidden in [
+            "level",
+            "ceiling",
+            "egress",
+            "danger-full-access",
+            "等级",
+            "上限",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "the sentence must not need the level table ({forbidden}): {text}"
+            );
+        }
+    }
+    let en = crate::i18n::tr(Lang::En, "permission.confirmDescription");
+    for expected in ["write anywhere", "unconfined commands", "network allowlist"] {
         assert!(
-            text.contains(expected),
-            "the widening confirmation must name {expected:?}: {text:?}"
+            en.contains(expected),
+            "the confirmation must name {expected:?}: {en:?}"
         );
     }
 }
@@ -12323,15 +13152,16 @@ fn the_general_header_carries_the_reference_document_action(cx: &mut TestAppCont
     );
 }
 
-/// The risk gate is the only path that writes full access, and it stays shut
-/// until the reference's own acknowledgement is ticked - the enable action is
-/// drawn disabled, and the handler refuses even if it is reached.
+/// The full-access gate is ONE confirmation: two buttons, no acknowledgement
+/// step. Nothing is written until Enable is pressed, Cancel preserves the
+/// current mode, and the sentence names the real consequence - the network
+/// allowlist stops applying - rather than a level the reader must look up.
 ///
-/// NEW SEMANTICS: the assertions read the COMMITTED settings, because that is
-/// the tree the next turn builds from. A gate that wrote only the draft would
-/// pass a draft assertion and still leave the session confined.
+/// The assertions read the COMMITTED settings, because that is the tree the
+/// next turn builds from. A gate that wrote only the draft would pass a draft
+/// assertion and still leave the session confined.
 #[gpui::test]
-fn the_risk_gate_needs_the_acknowledgement_before_it_writes(cx: &mut TestAppContext) {
+fn the_full_access_gate_is_one_confirmation_with_two_buttons(cx: &mut TestAppContext) {
     init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = AppState::with_store(scratch_store("risk-gate"));
@@ -12356,55 +13186,13 @@ fn the_risk_gate_needs_the_acknowledgement_before_it_writes(cx: &mut TestAppCont
             this.request_permission(crate::caps::FULL_ACCESS, cx)
         })
     });
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-    assert!(
-        cx.debug_bounds("permission-confirm-dialog").is_some(),
-        "full access opens the reference's own confirmation"
-    );
-    let currently = cx.update(|_, cx| {
-        shell
-            .read(cx)
-            .state
-            .settings
-            .workspace
-            .agent
-            .permission
-            .clone()
+    draw_until(cx, "the full-access gate opens", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("permission-confirm-dialog").is_some()
     });
-    assert_eq!(currently, before, "nothing is written on the offer");
-    // The confirm is drawn disabled, and the handler refuses too.
-    cx.update(|_, cx| shell.update(cx, |this, cx| this.permission_confirm_enable(cx)));
-    let refused = cx.update(|_, cx| {
-        shell
-            .read(cx)
-            .state
-            .settings
-            .workspace
-            .agent
-            .permission
-            .clone()
-    });
-    assert_eq!(refused, before, "an unticked gate refuses, not writes");
-    assert_eq!(
-        cx.update(|_, cx| shell.read(cx).permission_confirm.clone()),
-        Some(String::from(crate::caps::FULL_ACCESS)),
-        "and the gate stays open rather than silently closing"
-    );
-    // Tick the box on screen, then take the enable action.
-    let box_ = cx
-        .debug_bounds("permission-acknowledge")
-        .expect("the acknowledgement draws");
-    cx.simulate_click(box_.center(), Modifiers::default());
-    cx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(
-        cx.update(|_, cx| shell.read(cx).permission_acknowledged),
-        "the click ticks it"
+        cx.debug_bounds("permission-acknowledge").is_none(),
+        "there is no acknowledgement step: the gate is one sentence and two buttons"
     );
-    let enable = cx
-        .debug_bounds("permission-confirm-enable")
-        .expect("the enable action draws");
-    cx.simulate_click(enable.center(), Modifiers::default());
-    cx.update(|window, cx| window.draw(cx).clear(cx));
     assert_eq!(
         cx.update(|_, cx| shell
             .read(cx)
@@ -12414,16 +13202,77 @@ fn the_risk_gate_needs_the_acknowledgement_before_it_writes(cx: &mut TestAppCont
             .agent
             .permission
             .clone()),
-        crate::caps::FULL_ACCESS,
-        "a ticked gate is the one write of full access"
+        before,
+        "nothing is written while the gate is open"
     );
+    let copy = crate::i18n::tr(Lang::En, "permission.confirmDescription");
+    assert!(
+        copy.contains("network allowlist"),
+        "the sentence names the real network consequence: {copy}"
+    );
+    assert!(
+        !copy.contains("egress allowlist") && !copy.contains("ceiling"),
+        "and carries no wording that needs the level table: {copy}"
+    );
+
+    // Cancel is the preserving button.
+    let cancel = cx
+        .debug_bounds("permission-confirm-cancel")
+        .expect("the cancel control draws");
+    cx.simulate_click(cancel.center(), Modifiers::default());
+    draw_until(cx, "cancel closes the gate", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("permission-confirm-dialog").is_none()
+    });
+    assert_eq!(
+        cx.update(|_, cx| shell
+            .read(cx)
+            .state
+            .settings
+            .workspace
+            .agent
+            .permission
+            .clone()),
+        before,
+        "Cancel leaves the previous mode in place"
+    );
+    assert!(
+        cx.update(|_, cx| shell.read(cx).permission_confirm.is_none()),
+        "and the parked offer is gone"
+    );
+
+    // Re-open, then Enable is the one write. No second dialog appears.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.request_permission(crate::caps::FULL_ACCESS, cx)
+        })
+    });
+    draw_until(cx, "the gate opens again", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("permission-confirm-enable").is_some()
+    });
+    let enable = cx
+        .debug_bounds("permission-confirm-enable")
+        .expect("the enable control draws");
+    cx.simulate_click(enable.center(), Modifiers::default());
+    draw_until(cx, "the confirmed mode lands", DRAW_UNTIL_MAX, |cx| {
+        let permission = cx.update(|_, cx| {
+            shell
+                .read(cx)
+                .state
+                .settings
+                .workspace
+                .agent
+                .permission
+                .clone()
+        });
+        permission == crate::caps::FULL_ACCESS
+    });
     assert!(
         cx.debug_bounds("permission-confirm-dialog").is_none(),
-        "and the gate closes behind the write"
+        "the gate closes behind the write"
     );
     assert!(
-        !cx.update(|_, cx| shell.read(cx).permission_acknowledged),
-        "the acknowledgement resets, so the next gate starts shut"
+        cx.debug_bounds("preset-risk").is_none(),
+        "and no second dialog opens"
     );
 }
 
@@ -22496,6 +23345,269 @@ fn a_huge_output_is_a_preview_until_the_reader_opens_it(cx: &mut TestAppContext)
     });
 }
 
+/// A shell call whose stored result reports its confinement renders BOTH facts
+/// in the audit detail, and the row carries the compact chip. The wording is the
+/// stored value, never the session's permission.
+#[gpui::test]
+fn a_shell_call_renders_its_recorded_confinement(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("audit-confinement", 1);
+        tests_pin_reference_defaults(&mut state);
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id) {
+            session.messages[1].tools.push(ToolEvent {
+                name: "bash".to_string(),
+                args: "{\"command\":\"ping -c1 8.8.8.8\"}".to_string(),
+                output: Some(
+                    "{\"stdout\":\"\",\"stderr\":\"ping: sendto: Operation not permitted\",\"exit_code\":2,\"success\":false,\"sandbox\":\"heel\",\"network\":\"deny-all\"}"
+                        .to_string(),
+                ),
+                ms: Some(40),
+                at: None,
+            });
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    // The view model carries the facts straight off the record, and the detail
+    // helper renders them in the reader's language.
+    let (sandbox, network, line) = cx.update(|_, cx| {
+        let this = shell.read(cx);
+        let view = this.audit_view();
+        let call = &view.turns[0].calls[0];
+        (
+            call.sandbox.clone(),
+            call.network.clone(),
+            this.audit_confinement(call),
+        )
+    });
+    assert_eq!(sandbox.as_deref(), Some("heel"));
+    assert_eq!(network.as_deref(), Some("deny-all"));
+    assert_eq!(
+        line.as_deref(),
+        Some("Sandbox: heel \u{00b7} Network: deny-all"),
+        "the detail names both facts"
+    );
+
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.state.tab = Tab::Audit;
+            cx.notify();
+        });
+    });
+    draw_until(cx, "the audit renders the call", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("audit-turn-1").is_some() && cx.debug_bounds("audit-limits").is_some()
+    });
+    let turn = cx.debug_bounds("audit-turn-1").expect("turn 1");
+    cx.simulate_click(turn.center(), Modifiers::default());
+    draw_until(cx, "the call row opens", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("audit-call-1-0").is_some()
+    });
+    let call = cx.debug_bounds("audit-call-1-0").expect("the call row");
+    cx.simulate_click(call.center(), Modifiers::default());
+    draw_until(cx, "the call detail renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("audit-call-confinement-1-0").is_some()
+    });
+}
+
+/// A shell call the KERNEL refused while egress was UNRESTRICTED is explained in
+/// the audit detail, in the reader's language, from the record's stable id. The
+/// row must never leave "heel · unrestricted" to be misread as a policy refusal.
+#[gpui::test]
+fn a_kernel_refused_shell_call_explains_itself_in_the_audit(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("audit-diagnostic", 1);
+        tests_pin_reference_defaults(&mut state);
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id) {
+            session.messages[1].tools.push(ToolEvent {
+                name: "bash".to_string(),
+                args: "{\"command\":\"ping -c 1 1.1.1.1\"}".to_string(),
+                output: Some(
+                    "{\"stdout\":\"\",\"stderr\":\"ping: sendto: Operation not permitted\",\"exit_code\":2,\"success\":false,\"sandbox\":\"heel\",\"network\":\"unrestricted\",\"network_diagnostic\":\"unproxied-direct-socket\"}"
+                        .to_string(),
+                ),
+                ms: Some(40),
+                at: None,
+            });
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    let (network, note, diagnostic) = cx.update(|_, cx| {
+        let this = shell.read(cx);
+        let view = this.audit_view();
+        let call = &view.turns[0].calls[0];
+        (
+            call.network.clone(),
+            this.audit_diagnostic(call),
+            call.diagnostic.clone(),
+        )
+    });
+    assert_eq!(
+        network.as_deref(),
+        Some("unrestricted"),
+        "the record says the policy allowed the network"
+    );
+    assert_eq!(
+        diagnostic.as_deref(),
+        Some(agent::tools::bash::UNPROXIED_DIRECT_SOCKET),
+        "the tool's own id reaches the audit model"
+    );
+    let note = note.expect("the detail explains the failure");
+    assert!(
+        note.contains("docs/bsh-tool-policy.md") && note.contains("ping"),
+        "the explanation names the limitation and the document: {note}"
+    );
+
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.state.tab = Tab::Audit;
+            cx.notify();
+        });
+    });
+    draw_until(cx, "the audit renders the call", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("audit-turn-1").is_some()
+    });
+    let turn = cx.debug_bounds("audit-turn-1").expect("turn 1");
+    cx.simulate_click(turn.center(), Modifiers::default());
+    draw_until(cx, "the call row opens", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("audit-call-1-0").is_some()
+    });
+    let call = cx.debug_bounds("audit-call-1-0").expect("the call row");
+    cx.simulate_click(call.center(), Modifiers::default());
+    draw_until(cx, "the diagnostic line renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("audit-call-diagnostic-1-0").is_some()
+    });
+}
+
+/// A call whose stored record carries NEITHER confinement field says "no sandbox"
+/// in its detail and draws no chip on its row: the view never fabricates a tier.
+#[gpui::test]
+fn a_call_without_confinement_says_no_sandbox(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("audit-noconfinement", 1);
+        tests_pin_reference_defaults(&mut state);
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id) {
+            // An old record: plain text output, written before the fields
+            // existed. It must not borrow the session's permission.
+            session.messages[1].tools.push(ToolEvent {
+                name: "bash".to_string(),
+                args: "{\"command\":\"ls\"}".to_string(),
+                output: Some("a.txt\nb.txt".to_string()),
+                ms: Some(3),
+                at: None,
+            });
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    let (call_has_facts, line, chip) = cx.update(|_, cx| {
+        let this = shell.read(cx);
+        let view = this.audit_view();
+        let call = &view.turns[0].calls[0];
+        (
+            call.sandbox.is_some() || call.network.is_some(),
+            this.audit_confinement(call),
+            this.audit_confinement_chip(call),
+        )
+    });
+    assert!(!call_has_facts, "the old record carries no confinement");
+    assert_eq!(
+        line.as_deref(),
+        Some("no sandbox"),
+        "the detail states the absence plainly"
+    );
+    assert_eq!(chip, None, "the row draws no chip it cannot back");
+
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.state.tab = Tab::Audit;
+            cx.notify();
+        });
+    });
+    draw_until(cx, "the audit renders the call", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("audit-turn-1").is_some()
+    });
+    let turn = cx.debug_bounds("audit-turn-1").expect("turn 1");
+    cx.simulate_click(turn.center(), Modifiers::default());
+    draw_until(cx, "the call row opens", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("audit-call-1-0").is_some()
+    });
+    let call = cx.debug_bounds("audit-call-1-0").expect("the call row");
+    cx.simulate_click(call.center(), Modifiers::default());
+    draw_until(cx, "the call detail renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("audit-call-confinement-1-0").is_some()
+    });
+}
+
+/// A tool/MCP egress call reports ITS OWN recorded network state, read from its
+/// result rather than borrowed from a shell call beside it.
+#[gpui::test]
+fn an_egress_call_reports_its_own_network_state(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("audit-egress", 1);
+        tests_pin_reference_defaults(&mut state);
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id) {
+            session.messages[1].tools.push(ToolEvent {
+                name: "bash".to_string(),
+                args: "{\"command\":\"ping -c1 8.8.8.8\"}".to_string(),
+                output: Some(
+                    "{\"sandbox\":\"heel\",\"network\":\"deny-all\",\"stdout\":\"\",\"stderr\":\"\",\"exit_code\":2,\"success\":false}"
+                        .to_string(),
+                ),
+                ms: Some(40),
+                at: None,
+            });
+            session.messages[1].tools.push(ToolEvent {
+                name: "mcp_web_fetch".to_string(),
+                args: "{\"url\":\"https://example.com\"}".to_string(),
+                output: Some(
+                    "{\"body\":\"hi\",\"sandbox\":\"none\",\"network\":\"allowlist\"}".to_string(),
+                ),
+                ms: Some(12),
+                at: None,
+            });
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    let (network, sandbox, category) = cx.update(|_, cx| {
+        let view = shell.read(cx).audit_view();
+        let call = &view.turns[0].calls[1];
+        (call.network.clone(), call.sandbox.clone(), call.category)
+    });
+    assert_eq!(
+        category,
+        crate::audit::AuditCategory::Mcp,
+        "the namespaced tool is an MCP call"
+    );
+    assert_eq!(
+        network.as_deref(),
+        Some("allowlist"),
+        "the egress call's own network state, not the shell's deny-all"
+    );
+    assert_eq!(sandbox.as_deref(), Some("none"));
+}
+
 /// The audit's measure toggles are live: Duration widths the slow turn, Calls
 /// widths the busy one, exactly like the Trajectory lanes.
 #[gpui::test]
@@ -22606,6 +23718,7 @@ fn an_audit_refusal_is_drawn_at_its_turn(cx: &mut TestAppContext) {
                     target: "/etc/passwd".to_string(),
                     rule: Some("deny-outside".to_string()),
                     reason: Some("outside the workspace".to_string()),
+                    advisory: false,
                 }],
                 allows: agent::policy::AllowCounts {
                     total: 3,
@@ -22620,6 +23733,8 @@ fn an_audit_refusal_is_drawn_at_its_turn(cx: &mut TestAppContext) {
                 permission: "read-only".to_string(),
                 preset: "read-only".to_string(),
                 error: None,
+                advisories: Vec::new(),
+                advisories_total: 0,
             });
             this.state.tab = Tab::Audit;
             cx.notify();
@@ -23399,4 +24514,754 @@ fn the_open_shell_keeps_the_panel_tab_strip_where_it_was(cx: &mut TestAppContext
     );
     assert_clear_of_traffic_lights("the maximised Files tab", tab);
     assert_fully_on_screen("the maximised strip", tab, viewport_w, viewport_h);
+}
+
+/// A loopback page for the browser pane, and the number of requests it served.
+///
+/// The server thread lives as long as the test binary; a pane test needs a real
+/// HTTP answer, and a listener that outlives its test costs one parked thread.
+struct PaneSite {
+    addr: std::net::SocketAddr,
+    hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl PaneSite {
+    fn url(&self) -> String {
+        format!("http://{}/", self.addr)
+    }
+
+    fn hits(&self) -> usize {
+        self.hits.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+fn pane_site() -> PaneSite {
+    use std::io::{Read as _, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let addr = listener.local_addr().expect("the port");
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = hits.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buffer = [0u8; 4096];
+            let _ = stream.read(&mut buffer);
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body = "<html><head><title>Pane Page</title></head><body>\
+                        <p>pane body text</p><a href=\"/next\">Next</a></body></html>";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    PaneSite { addr, hits }
+}
+
+/// The policy a pane test states for this workspace.
+fn pane_policy(allowed: &[&str]) -> std::sync::Arc<agent::policy::PolicySet> {
+    std::sync::Arc::new(agent::policy::PolicySet::compile_baseline(
+        agent::policy::PolicyData::new("/tmp")
+            .with_egress_allowlist(allowed.iter().map(|entry| entry.to_string())),
+    ))
+}
+
+/// Pump the browser's worker and the frame until the pane settles.
+fn settle_browser(cx: &mut VisualTestContext, shell: &Entity<Shell>) -> crate::browser::Status {
+    let mut last = crate::browser::Status::Empty;
+    for _ in 0..400 {
+        // Outside update(): a parked task may re-enter the app to notify the
+        // pane, and borrowing it twice panics with "RefCell already borrowed".
+        cx.cx.background_executor.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        last = cx.update(|_, cx| {
+            shell
+                .read(cx)
+                .browser_pane
+                .as_ref()
+                .map(|view| view.status)
+                .unwrap_or(crate::browser::Status::Empty)
+        });
+        if last != crate::browser::Status::Loading {
+            return last;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    last
+}
+
+/// The browser pane renders the state it claims: empty, loading, then the page
+/// the local server actually served - and its link row is a real control.
+#[gpui::test]
+fn the_browser_pane_renders_loading_and_the_loaded_page(cx: &mut TestAppContext) {
+    let site = pane_site();
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(|window, cx| {
+        let state = AppState::with_store(scratch_store("browser-pane-load"));
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let policy = pane_policy(&["127.0.0.1"]);
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.state.set_policy(policy);
+            cx.notify();
+        })
+    });
+    cx.update(|_, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, cx)));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("browser-state-empty").is_some(),
+        "a browser with no page offers the address bar"
+    );
+    let url = site.url();
+    cx.update(|_, cx| shell.update(cx, |this, cx| this.browser_go(url.clone(), cx)));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("browser-state-loading").is_some(),
+        "the loading state paints on the frame that accepted the navigation"
+    );
+    assert_eq!(
+        settle_browser(cx, &shell),
+        crate::browser::Status::Ready,
+        "the page arrived"
+    );
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("browser-state-ready").is_some(),
+        "the pane draws the loaded state"
+    );
+    let view = cx
+        .update(|_, cx| shell.read(cx).browser_pane.clone())
+        .expect("the pane holds a view");
+    let snapshot = view.snapshot.expect("the page is in the view");
+    assert_eq!(snapshot.title, "Pane Page", "the server's own title");
+    assert!(
+        snapshot.text.contains("pane body text"),
+        "the server's own text: {:?}",
+        snapshot.text
+    );
+    assert!(
+        cx.debug_bounds("browser-element-e1").is_some(),
+        "the page's link is a row the reader can press"
+    );
+    // The address bar shows where the reader is, not what was typed.
+    let address = cx.update(|_, cx| shell.read(cx).browser_url.read(cx).value().to_string());
+    assert_eq!(address, url);
+    assert_eq!(site.hits(), 1, "exactly one request");
+}
+
+/// A refused navigation is shown with its rule, and the listener sees nothing.
+#[gpui::test]
+fn a_refused_navigation_is_shown_and_sends_no_request(cx: &mut TestAppContext) {
+    let site = pane_site();
+    // The allowlist names an address that is not this site's.
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(|window, cx| {
+        let state = AppState::with_store(scratch_store("browser-pane-refused"));
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let policy = pane_policy(&["192.0.2.1"]);
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.state.set_policy(policy);
+            cx.notify();
+        })
+    });
+    cx.update(|_, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, cx)));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let url = site.url();
+    cx.update(|_, cx| shell.update(cx, |this, cx| this.browser_go(url, cx)));
+    assert_eq!(
+        settle_browser(cx, &shell),
+        crate::browser::Status::Failed,
+        "a refused load with no page behind it is the failure state"
+    );
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("browser-state-failed").is_some(),
+        "the pane draws the failure it holds"
+    );
+    assert!(
+        cx.debug_bounds("browser-failure").is_some(),
+        "and says why on screen"
+    );
+    let view = cx
+        .update(|_, cx| shell.read(cx).browser_pane.clone())
+        .expect("the pane holds a view");
+    let failure = view.failure.expect("the pane explains the failure");
+    assert_eq!(failure.kind, "policy");
+    assert_eq!(
+        failure.rule.as_deref(),
+        Some("egress-not-allowlisted"),
+        "the rule travels to the pane"
+    );
+    assert_eq!(site.hits(), 0, "the listener saw no request at all");
+    // And the refusal is in the audit's own ring, under this tool.
+    let denials = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .policy
+            .as_ref()
+            .map(|policy| policy.denials())
+            .unwrap_or_default()
+    });
+    assert!(
+        denials.iter().any(|entry| entry.tool == "browser_open"
+            && entry.rule.as_deref() == Some("egress-not-allowlisted")),
+        "the refusal is an audited decision: {denials:?}"
+    );
+}
+
+/// Switching panes must not paint the browser into another tab, and must not
+/// lose the page either.
+#[gpui::test]
+fn switching_tabs_keeps_the_browser_in_its_own_pane(cx: &mut TestAppContext) {
+    let site = pane_site();
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(|window, cx| {
+        let state = AppState::with_store(scratch_store("browser-pane-tabs"));
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let policy = pane_policy(&["127.0.0.1"]);
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.state.set_policy(policy);
+            cx.notify();
+        })
+    });
+    cx.update(|_, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, cx)));
+    let url = site.url();
+    cx.update(|_, cx| shell.update(cx, |this, cx| this.browser_go(url, cx)));
+    assert_eq!(
+        settle_browser(cx, &shell),
+        crate::browser::Status::Ready,
+        "the page arrived"
+    );
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("browser-pane").is_some());
+
+    // The Files pane takes the body: the browser's controls must go with it.
+    cx.update(|_, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Files, cx)));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("browser-pane").is_none(),
+        "the browser does not leak into the Files pane"
+    );
+    assert!(
+        cx.debug_bounds("browser-state-ready").is_none(),
+        "and neither does its state line"
+    );
+    assert!(
+        cx.debug_bounds("files-pane").is_some(),
+        "Files drew instead"
+    );
+
+    // Coming back finds the same page: the browser is shell state, not a
+    // per-tab scratch buffer.
+    cx.update(|_, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, cx)));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("browser-pane").is_some());
+    let view = cx
+        .update(|_, cx| shell.read(cx).browser_pane.clone())
+        .expect("the pane still holds a view");
+    assert_eq!(
+        view.snapshot.map(|snapshot| snapshot.title),
+        Some(String::from("Pane Page")),
+        "the page survived the switch"
+    );
+    assert_eq!(site.hits(), 1, "and no request was replayed");
+}
+
+/// The Start card prints cmd-t for the Browser, so cmd-t has to open it.
+#[gpui::test]
+fn cmd_t_opens_the_browser_pane(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(|window, cx| {
+        let state = AppState::with_store(scratch_store("browser-cmd-t"));
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    // Focus something inside the shell, the way a reader's cursor sits in the
+    // composer, so the action has a path to the frame.
+    cx.update(|window, cx| {
+        use gpui_kit::Focusable as _;
+        shell.update(cx, |this, cx| {
+            this.composer
+                .update(cx, |state, cx| state.focus_handle(cx).focus(window, cx));
+        });
+    });
+    assert!(
+        cx.debug_bounds("browser-pane").is_none(),
+        "the panel starts on its Start screen"
+    );
+    cx.simulate_keystrokes("cmd-t");
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("browser-pane").is_some(),
+        "the printed chord opens the pane it names"
+    );
+    assert!(
+        cx.debug_bounds("browser-state-empty").is_some(),
+        "and the pane starts empty rather than loading a homepage nobody asked for"
+    );
+}
+
+/// The reader's actual flow: type a URL into the address bar, press Enter, see
+/// the page. The other pane tests drive the handler; this one drives the FIELD.
+#[gpui::test]
+fn typing_a_url_and_pressing_enter_opens_the_page(cx: &mut TestAppContext) {
+    let site = pane_site();
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(|window, cx| {
+        let state = AppState::with_store(scratch_store("browser-typed-url"));
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let policy = pane_policy(&["127.0.0.1"]);
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.state.set_policy(policy);
+            cx.notify();
+        })
+    });
+    cx.update(|_, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, cx)));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("browser-address").is_some(),
+        "the address bar renders"
+    );
+
+    // What a reader types, then Enter on the focused field.
+    let url = site.url();
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.browser_url
+                .update(cx, |state, cx| state.set_value(url.clone(), window, cx));
+        });
+    });
+    cx.update(|window, cx| {
+        use gpui_kit::Focusable as _;
+        shell.update(cx, |this, cx| {
+            this.browser_url
+                .update(cx, |state, cx| state.focus_handle(cx).focus(window, cx));
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.simulate_keystrokes("enter");
+    assert_eq!(
+        settle_browser(cx, &shell),
+        crate::browser::Status::Ready,
+        "Enter in the address bar opens the page (draft typed: {url})"
+    );
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let view = cx
+        .update(|_, cx| shell.read(cx).browser_pane.clone())
+        .expect("the pane holds a view");
+    assert_eq!(
+        view.snapshot.map(|snapshot| snapshot.title),
+        Some(String::from("Pane Page")),
+        "and the pane shows what the server sent"
+    );
+    assert_eq!(site.hits(), 1, "exactly one request");
+}
+
+/// A preset or permission switch is a LIVE-policy fact: the compiled document
+/// every pane, the terminal and the sandbox spec read is rebaked immediately,
+/// not only when the next turn happens to build. This is the regression test
+/// for a chip that changed its label while the policy behind it stayed old.
+#[test]
+fn switching_the_preset_or_the_permission_rebakes_the_live_policy() {
+    let mut state = state_with_turns("policy-rebake", 1);
+    let id = state.active_id.clone().expect("a session");
+    state.settings.global.presets.insert(
+        "probe".to_string(),
+        crate::settings::global::Preset {
+            permission: Some(crate::caps::WORKSPACE_WRITE.to_string()),
+            plugins: vec!["files".to_string()],
+            deny: vec![".git".to_string()],
+            ..Default::default()
+        },
+    );
+    assert!(
+        state.policy.is_none(),
+        "the premise: nothing has compiled a policy yet"
+    );
+    state.select_session_preset(&id, "probe");
+    let policy = state.policy.as_ref().expect("the switch rebakes");
+    assert_eq!(policy.data().preset, "probe");
+    assert_eq!(policy.data().permission, crate::caps::WORKSPACE_WRITE);
+    assert_eq!(
+        state.effective_in(&id).preset_id.as_str(),
+        "probe",
+        "the session choice the next turn builds from"
+    );
+
+    state
+        .commit_permission(crate::caps::READ_ONLY)
+        .expect("the mode is saved");
+    let policy = state.policy.as_ref().expect("still rebaked");
+    assert_eq!(
+        policy.data().permission,
+        crate::caps::READ_ONLY,
+        "a permission switch reaches the live policy without a turn"
+    );
+    assert_eq!(
+        policy.data().preset,
+        "probe",
+        "and keeps the preset it was compiled for"
+    );
+    assert_eq!(
+        state.effective_in(&id).permission.effective,
+        crate::caps::READ_ONLY
+    );
+
+    // A settings SAVE is the third live-policy entry: the default preset is
+    // committed from the draft and the policy must follow without waiting for
+    // a turn.
+    state.select_session_preset(&id, "");
+    assert_eq!(
+        state
+            .policy
+            .as_ref()
+            .expect("rebaked for the default")
+            .data()
+            .preset,
+        "standard",
+        "clearing the session's choice falls back to the committed default"
+    );
+    state.draft_mut().global.default_preset = "probe".to_string();
+    state.commit_settings().expect("the settings save");
+    assert_eq!(
+        state
+            .policy
+            .as_ref()
+            .expect("rebaked after Save")
+            .data()
+            .preset,
+        "probe",
+        "Save rebakes the live policy from the committed tree"
+    );
+}
+
+/// A steer joins the RUNNING agent, whose permission, sandbox and tool set
+/// were baked at spawn. Once the reader changes the preset or permission the
+/// queue must hold the message for the next (freshly built) turn instead of
+/// injecting it into the old build.
+#[test]
+fn a_steer_after_a_live_policy_change_is_refused() {
+    let mut state = state_with_turns("steer-stale-policy", 1);
+    let id = state.active_id.clone().expect("a session");
+    assert!(
+        state.begin_turn_in(&id, "turn").is_some(),
+        "the premise: a running turn"
+    );
+    state.record_turn_generation(&id);
+    assert!(
+        !state.steer_blocked(&id),
+        "the turn's own generation is not stale"
+    );
+    state.rebake_policy();
+    assert!(
+        state.steer_blocked(&id),
+        "a live preset/permission change makes the running build stale"
+    );
+    // The next turn records its own generation, which clears the block.
+    state.record_turn_generation(&id);
+    assert!(!state.steer_blocked(&id));
+}
+
+/// The policy pane lists a module's stable id, its origin and its trust state,
+/// and the wording changes with the locale (the built-in row is trusted).
+#[test]
+fn the_policy_module_row_names_id_origin_and_trust_in_both_locales() {
+    let module = agent::policy::PolicyModuleInfo {
+        id: "builtin:baseline".to_string(),
+        origin: agent::policy::PolicyOrigin::Builtin,
+        trusted: true,
+        package: "policy.baseline".to_string(),
+        rule_ids: vec!["read-inside-workspace".to_string()],
+    };
+    let en = crate::ui::settings::policy_module_head(Lang::En, &module);
+    assert!(en.contains("builtin:baseline"), "{en}");
+    assert!(en.to_lowercase().contains("built-in"), "{en}");
+    assert!(en.to_lowercase().contains("trusted"), "{en}");
+    let zh = crate::ui::settings::policy_module_head(Lang::Zh, &module);
+    assert!(zh.contains("builtin:baseline"), "{zh}");
+    assert!(zh.contains("内置"), "{zh}");
+    assert!(zh.contains("已信任"), "{zh}");
+    assert_ne!(en, zh, "the row is localized");
+
+    let workspace = agent::policy::PolicyModuleInfo {
+        id: "workspace".to_string(),
+        origin: agent::policy::PolicyOrigin::Workspace,
+        trusted: false,
+        package: "policy.workspace".to_string(),
+        rule_ids: Vec::new(),
+    };
+    let row = crate::ui::settings::policy_module_head(Lang::En, &workspace);
+    assert!(row.to_lowercase().contains("workspace"), "{row}");
+    assert!(row.to_lowercase().contains("not trusted"), "{row}");
+    assert!(!row.to_lowercase().contains("built-in"), "{row}");
+}
+
+/// A widening preset change parks behind the risk dialog: nothing is written
+/// while it is open, Cancel keeps the previous value, and Confirm applies it.
+#[gpui::test]
+fn a_widening_preset_change_waits_for_confirmation(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("preset-risk-gate", 1);
+        // A full-access session, so the preset's full-access ceiling is a real
+        // widening over the standard default rather than a capped no-op.
+        state.settings.workspace.agent.permission = crate::caps::FULL_ACCESS.to_string();
+        state.settings.global.presets.insert(
+            "wide".to_string(),
+            crate::settings::global::Preset {
+                name: Some("wide".to_string()),
+                plugins: vec!["shell".to_string(), "files".to_string()],
+                permission: Some(crate::caps::FULL_ACCESS.to_string()),
+                egress: Some(Vec::new()),
+                policy: Some(
+                    "package policy.wide\n# rule: wide-allow\nverdict := {\"allow\": true, \"rule\": \"wide-allow\"}"
+                        .to_string(),
+                ),
+                policy_mode: Some(crate::settings::global::PolicyMode::Advisory),
+                trusted: true,
+                order: Some(-1),
+                ..Default::default()
+            },
+        );
+        state.settings.global.default_preset = "standard".to_string();
+        let shell =
+            cx.new(|cx| Shell::build_for_test(window, section_index("agent-presets"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let active = cx.update(|_, cx| shell.read(cx).state.active_id.clone().expect("session"));
+
+    let use_chat = cx.debug_bounds("preset-use-0").expect("the use action");
+    cx.simulate_click(use_chat.center(), Modifiers::default());
+    draw_until(cx, "the widening gate opens", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("preset-risk").is_some()
+    });
+    let pending = cx.update(|_, cx| shell.read(cx).state.pending_preset.clone());
+    let pending = pending.expect("the change is parked, not applied");
+    assert_eq!(pending.target, "wide");
+    assert_eq!(
+        pending.facts.len(),
+        3,
+        "full access, deny-all egress and advisory policy are named: {:?}",
+        pending.facts
+    );
+    assert!(
+        cx.debug_bounds("preset-risk-acknowledge").is_none(),
+        "the gate is one sentence and two buttons, with no acknowledgement step"
+    );
+    let description =
+        crate::ui::settings::widening_sentence(Lang::En, "wide", "standard", &pending.facts);
+    assert!(
+        !description.contains("level") && !description.contains("danger-full-access"),
+        "the sentence never needs the level table: {description}"
+    );
+    // This fixture carries full access, a deny-all egress list and an advisory
+    // policy; the sandbox-off clause has its own gate test
+    // (`a_sandbox_off_widening_names_the_bash_reason_and_cancels`).
+    assert!(
+        description.contains("permission is no longer confined")
+            && description.contains("outbound connection")
+            && description.contains("policy refusal"),
+        "and it names each real consequence: {description}"
+    );
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).state.active_session_preset()),
+        None,
+        "nothing is written while the dialog is open"
+    );
+
+    // Cancel keeps the previous value and drops the dialog.
+    let cancel = cx.debug_bounds("preset-risk-cancel").expect("cancel");
+    cx.simulate_click(cancel.center(), Modifiers::default());
+    draw_until(cx, "the gate closes on cancel", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("preset-risk").is_none()
+    });
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).state.active_session_preset()),
+        None,
+        "cancelling leaves the previous preset in place"
+    );
+    assert!(
+        cx.update(|_, cx| shell.read(cx).state.pending_preset.is_none()),
+        "the parked change is gone"
+    );
+
+    // Re-open and confirm: now the session records the preset.
+    let use_chat = cx.debug_bounds("preset-use-0").expect("the use action");
+    cx.simulate_click(use_chat.center(), Modifiers::default());
+    draw_until(cx, "the gate opens again", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("preset-risk-confirm").is_some()
+    });
+    // The gate is one sentence and two buttons: Confirm applies the parked
+    // change with no acknowledgement step in between.
+    let confirm = cx
+        .debug_bounds("preset-risk-confirm")
+        .expect("the confirm control");
+    cx.simulate_click(confirm.center(), Modifiers::default());
+    draw_until(cx, "the gate closes on confirm", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("preset-risk").is_none()
+    });
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).state.active_session_preset()),
+        Some("wide".to_string()),
+        "confirming applies the parked change"
+    );
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).state.session_choice(&active).preset),
+        Some("wide".to_string())
+    );
+}
+
+/// The policy pane draws one row per compiled module, so the ids the plan
+/// reserves are visible rather than only documented.
+#[gpui::test]
+fn the_policy_pane_lists_the_compiled_modules(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("policy-module-list", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("policy"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    // A real set with an ADVISORY preset module, and one call that it advised:
+    // the pane lists the modules and the recorded warning from one snapshot.
+    let deny = "package policy.soft\n\n# rule: soft-deny-write\nverdict := {\"allow\": false, \"rule\": \"soft-deny-write\", \"reason\": \"advised\"} if {\n    input.action == \"write\"\n} else := {\"allow\": true}\n";
+    let policy = agent::policy::PolicySet::compile(
+        [
+            agent::policy::baseline_source(),
+            agent::policy::session_permission_source("workspace-write"),
+            agent::policy::PolicySource::extension("preset", deny, true).advisory(true),
+        ],
+        agent::policy::PolicyData::new(std::env::temp_dir()).with_permission("workspace-write"),
+    );
+    let policy = std::sync::Arc::new(policy);
+    shell.update(cx, |this, cx| {
+        this.state.set_policy(policy.clone());
+        this.state.settings_section = section_index("policy").expect("the policy pane");
+        cx.notify();
+    });
+    // The advisory appears AFTER the policy was installed, exactly as a tool
+    // call during a turn would produce it; the next frame must announce it.
+    let decision = policy.check(
+        &agent::policy::PolicyInput::new(
+            "write_file",
+            agent::policy::Action::Write,
+            agent::policy::Target::path(std::env::temp_dir().join("advised.md")),
+        )
+        .with_session("probe"),
+    );
+    assert!(decision.is_allowed(), "{decision:?}");
+    shell.update(cx, |this, cx| {
+        this.state.settings_section = section_index("policy").expect("the policy pane");
+        cx.notify();
+    });
+    draw_until(cx, "the module rows render", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("policy-module-2").is_some()
+    });
+    assert!(
+        cx.debug_bounds("policy-module-0").is_some(),
+        "the baseline module is listed"
+    );
+    draw_until(cx, "the advisory warning renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("policy-advisory-0").is_some()
+    });
+    // The same refusal is announced in the status line, so a reader who never
+    // opens the Policy pane still sees that a call proceeded against a refusal.
+    let notice = cx.update(|_, cx| shell.read(cx).state.notice.clone().unwrap_or_default());
+    assert!(notice.contains("advisory"), "{notice}");
+    assert!(notice.contains("soft-deny-write"), "{notice}");
+}
+
+/// A preset that turns the shell sandbox off under a full-access session is a
+/// widening the state gate parks even when the entry point is the composer
+/// chip rather than a card footer (the sandbox-off card's taller body can sit
+/// past the harness viewport, so this drives the same public setter the chip
+/// uses). The dialog names the exact bash reason and Cancel keeps the old preset.
+#[gpui::test]
+fn a_sandbox_off_widening_names_the_bash_reason_and_cancels(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("preset-sandbox-gate", 1);
+        state.settings.workspace.agent.permission = crate::caps::FULL_ACCESS.to_string();
+        state.settings.global.presets.insert(
+            "wide-off".to_string(),
+            crate::settings::global::Preset {
+                name: Some("wide-off".to_string()),
+                plugins: vec!["shell".to_string(), "files".to_string()],
+                permission: Some(crate::caps::FULL_ACCESS.to_string()),
+                sandbox: Some(crate::settings::global::SandboxChoice::Off),
+                order: Some(-1),
+                ..Default::default()
+            },
+        );
+        state.settings.global.default_preset = "standard".to_string();
+        let shell =
+            cx.new(|cx| Shell::build_for_test(window, section_index("agent-presets"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let active = cx.update(|_, cx| shell.read(cx).state.active_id.clone().expect("session"));
+
+    shell.update(cx, |this, cx| {
+        this.state.select_session_preset(&active, "wide-off");
+        cx.notify();
+    });
+    let facts = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .pending_preset
+            .as_ref()
+            .map(|pending| pending.facts.clone())
+            .unwrap_or_default()
+    });
+    assert!(
+        facts.contains(&crate::preset_catalogue::RiskFact::SandboxOff),
+        "the sandbox-off consequence is named: {facts:?}"
+    );
+    draw_until(cx, "the sandbox gate opens", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("preset-risk").is_some()
+    });
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).state.active_session_preset()),
+        None,
+        "nothing is written while the gate is open"
+    );
+    let cancel = cx.debug_bounds("preset-risk-cancel").expect("cancel");
+    cx.simulate_click(cancel.center(), Modifiers::default());
+    draw_until(cx, "the sandbox gate closes", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("preset-risk").is_none()
+    });
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).state.active_session_preset()),
+        None,
+        "cancelling keeps the previous preset"
+    );
 }

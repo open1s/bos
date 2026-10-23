@@ -798,7 +798,46 @@ impl Agent {
 
 #[cfg(test)]
 mod web_tool_tests {
-    use super::offers_web_search;
+    use super::{offers_web_search, Agent, AgentConfig};
+
+    /// The switch removes the hosted tool from the REQUEST's tool array, not
+    /// only from a call-time decision: a preset with `web_search = false`
+    /// builds an agent whose request names no `web_search`, so the provider is
+    /// never offered it.
+    #[test]
+    fn web_search_false_withdraws_the_hosted_tool_from_the_request() {
+        let with_search = Agent::from_config(AgentConfig {
+            web_search: true,
+            api_mode: "responses".to_string(),
+            ..AgentConfig::default()
+        });
+        let names: Vec<String> = with_search
+            .prepare_context()
+            .tools
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "web_search"),
+            "the premise: the switch on offers the hosted tool: {names:?}"
+        );
+
+        let without = Agent::from_config(AgentConfig {
+            web_search: false,
+            api_mode: "responses".to_string(),
+            ..AgentConfig::default()
+        });
+        let names: Vec<String> = without
+            .prepare_context()
+            .tools
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert!(
+            !names.iter().any(|name| name == "web_search"),
+            "web_search = false must remove the tool from the request: {names:?}"
+        );
+    }
 
     /// The hosted web tool needs the switch AND a protocol that can carry it.
     ///

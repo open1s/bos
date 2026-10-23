@@ -42,10 +42,12 @@ fn the_baseline_compiles_and_registers_its_rule_ids() {
         "write-outside-workspace",
         "write-forbidden-directory",
         "egress-allowlisted",
+        "egress-unrestricted",
         "egress-not-allowlisted",
         "spawn-shell-in-workspace",
         "spawn-subagent",
         "spawn-job-control",
+        "spawn-shell-full-access",
         "spawn-not-allowed",
         "capability-granted",
         "capability-read-only",
@@ -180,6 +182,22 @@ fn the_bytecode_vm_and_the_interpreter_agree() {
         let interpreter = set.check_with_interpreter(&input);
         assert_eq!(vm, interpreter, "backends disagree on {input:?}");
     }
+
+    // The released tier is a second DATA document, so the new arm's own
+    // comparison is proved on both backends too.
+    let released = PolicySet::compile_baseline(
+        PolicyData::new(dir.path()).with_permission("danger-full-access"),
+    );
+    assert_eq!(released.evaluator(), "bytecode");
+    for input in [
+        ask("bash", Action::Spawn, &outside),
+        ask("bash", Action::Spawn, dir.path()),
+        ask("python", Action::Spawn, &outside),
+    ] {
+        let vm = released.check(&input);
+        let interpreter = released.check_with_interpreter(&input);
+        assert_eq!(vm, interpreter, "backends disagree on {input:?}");
+    }
 }
 
 #[test]
@@ -251,6 +269,10 @@ fn writes_are_allowed_inside_but_never_into_bsh_or_git_internals() {
     }
 }
 
+/// The baseline's PATH rule at a tier that is not the release: the shell may
+/// start only at the workspace root. The data document here names no permission
+/// at all, which is the fail-closed case - anything that is not
+/// `danger-full-access` must never reach the released arm.
 #[test]
 fn spawn_is_the_shell_in_the_workspace_and_nothing_else() {
     let dir = workspace();
@@ -266,6 +288,47 @@ fn spawn_is_the_shell_in_the_workspace_and_nothing_else() {
 
     let other_tool = set.check(&ask("python", Action::Spawn, dir.path()));
     assert!(other_tool.is_denied(), "{other_tool:?}");
+}
+
+/// The RELEASED tier's spawn arm, and the three directions it must not widen.
+///
+/// `danger-full-access` hands the shell no workspace root, so its working
+/// directory is the host's own launch directory. The baseline therefore permits
+/// the shell by TIER at that permission, while the confined tiers keep the path
+/// rule. The arm is bash-only and tier-only: another process at the same
+/// non-workspace path still falls to `spawn-not-allowed`, and the same shell
+/// under a confined tier answers exactly as it did before the arm existed.
+#[test]
+fn the_released_tier_may_spawn_the_shell_outside_the_workspace() {
+    let dir = workspace();
+    let outside = dir.path().parent().expect("parent").join("elsewhere");
+    let released = PolicySet::compile_baseline(
+        PolicyData::new(dir.path()).with_permission("danger-full-access"),
+    );
+
+    // The root keeps the more specific arm; the released arm is the fallback
+    // the inherited full-access shell actually reaches.
+    let at_root = released.check(&ask("bash", Action::Spawn, dir.path()));
+    assert!(at_root.is_allowed(), "{at_root:?}");
+    assert_eq!(at_root.rule.as_deref(), Some("spawn-shell-in-workspace"));
+
+    let elsewhere = released.check(&ask("bash", Action::Spawn, &outside));
+    assert!(elsewhere.is_allowed(), "{elsewhere:?}");
+    assert_eq!(elsewhere.rule.as_deref(), Some("spawn-shell-full-access"));
+
+    // Bash-only: the same target through another tool is still refused.
+    let other_tool = released.check(&ask("python", Action::Spawn, &outside));
+    assert!(other_tool.is_denied(), "{other_tool:?}");
+    assert_eq!(other_tool.rule.as_deref(), Some("spawn-not-allowed"));
+
+    // Tier-only: a confined tier at the same path answers as it always did.
+    for tier in ["workspace-write", "read-only"] {
+        let confined =
+            PolicySet::compile_baseline(PolicyData::new(dir.path()).with_permission(tier));
+        let denied = confined.check(&ask("bash", Action::Spawn, &outside));
+        assert!(denied.is_denied(), "{tier}: {denied:?}");
+        assert_eq!(denied.rule.as_deref(), Some("spawn-not-allowed"), "{tier}");
+    }
 }
 
 #[test]
@@ -289,7 +352,8 @@ fn delegation_and_job_control_are_spawns_the_baseline_permits() {
     assert!(kill.is_allowed(), "{kill:?}");
     assert_eq!(kill.rule.as_deref(), Some("spawn-job-control"));
 
-    // The shell still needs the workspace root, so this did not widen bash.
+    // At this (non-released) tier the shell still needs the workspace root, so
+    // job control did not widen bash.
     let bash_elsewhere = set.check(&ask("bash", Action::Spawn, &dir.path().join("sub")));
     assert_eq!(bash_elsewhere.rule.as_deref(), Some("spawn-not-allowed"));
 }
@@ -363,6 +427,115 @@ fn egress_decides_on_the_resolved_address() {
         Target::host("localhost", "127.0.0.1"),
     ));
     assert!(empty.is_denied(), "{empty:?}");
+}
+
+/// The workspace allowlist is TRI-STATE, and the absent arm is what lets a
+/// fresh workspace reach the network: an absent file allows, a present file
+/// with no parsed rule denies all, a present file with rules constrains.
+#[test]
+fn egress_distinguishes_absent_from_present_but_empty() {
+    let dir = workspace();
+    let ask_host = |set: &PolicySet, host: &str, ip: &str, port: Option<u16>| {
+        let target = match port {
+            Some(port) => Target::host_on(host, ip, port),
+            None => Target::host(host, ip),
+        };
+        set.check(&PolicyInput::new("mcp", Action::Egress, target))
+    };
+
+    // ABSENT: the file does not exist, so no rule list constrains the turn.
+    let absent = PolicySet::compile_baseline(
+        PolicyData::new(dir.path())
+            .with_permission("workspace-write")
+            .with_egress_unrestricted(true),
+    );
+    for (host, ip, port) in [
+        ("example.com", "203.0.113.9", None),
+        ("localhost", "127.0.0.1", Some(80)),
+        ("internal", "10.1.2.3", Some(8443)),
+    ] {
+        let decision = ask_host(&absent, host, ip, port);
+        assert!(decision.is_allowed(), "{host} {ip} {port:?}: {decision:?}");
+        assert_eq!(decision.rule.as_deref(), Some("egress-unrestricted"));
+    }
+
+    // PRESENT, EMPTY: the same lists with the flag false is the file a reader
+    // created and left empty. Deny-all is the deliberate answer.
+    let present_empty =
+        PolicySet::compile_baseline(PolicyData::new(dir.path()).with_permission("workspace-write"));
+    let denied = ask_host(&present_empty, "example.com", "203.0.113.9", None);
+    assert!(denied.is_denied(), "{denied:?}");
+    assert_eq!(denied.rule.as_deref(), Some("egress-not-allowlisted"));
+
+    // PRESENT with a rule: exactly that door, as before.
+    let present_rules = PolicySet::compile_baseline(
+        PolicyData::new(dir.path())
+            .with_permission("workspace-write")
+            .with_egress_allowlist(["203.0.113.9"]),
+    );
+    assert!(ask_host(&present_rules, "example.com", "203.0.113.9", None).is_allowed());
+    assert_eq!(
+        ask_host(&present_rules, "example.com", "198.51.100.8", None)
+            .rule
+            .as_deref(),
+        Some("egress-not-allowlisted")
+    );
+
+    // The PORT rule is evaluated BEFORE the unrestricted arm, so a declaration
+    // that carries ports keeps its constraint even when the reach is open.
+    let ported = PolicySet::compile_baseline(
+        PolicyData::new(dir.path())
+            .with_permission("workspace-write")
+            .with_egress_unrestricted(true)
+            .with_egress_ports([443]),
+    );
+    assert!(ask_host(&ported, "example.com", "203.0.113.9", Some(443)).is_allowed());
+    let wrong_port = ask_host(&ported, "example.com", "203.0.113.9", Some(80));
+    assert!(wrong_port.is_denied(), "{wrong_port:?}");
+    assert_eq!(wrong_port.rule.as_deref(), Some("egress-port-not-allowed"));
+}
+
+/// A preset's own egress field still narrows an UNRESTRICTED workspace: a
+/// declared empty list denies all, a list is the reach, and an absent field
+/// inherits the workspace's open reach. Never a union.
+#[test]
+fn a_preset_narrows_an_unrestricted_workspace() {
+    let dir = workspace();
+    let compile = |restricted: bool, preset: Vec<&str>| {
+        PolicyData::new(dir.path())
+            .with_permission("workspace-write")
+            .with_egress_unrestricted(true)
+            .with_preset("probe")
+            .with_preset_egress(restricted, EgressRuleSet::parse(preset))
+    };
+    let ask = |set: &PolicySet, ip: &str| {
+        set.check(
+            &PolicyInput::new("mcp", Action::Egress, Target::host("h", ip)).with_preset("probe"),
+        )
+    };
+
+    // A declared EMPTY list denies, even though the workspace is unrestricted.
+    let empty = PolicySet::compile(
+        [baseline_source(), preset_egress_source()],
+        compile(true, Vec::new()),
+    );
+    let denied = ask(&empty, "203.0.113.9");
+    assert!(denied.is_denied(), "{denied:?}");
+    assert_eq!(denied.rule.as_deref(), Some("preset-egress-not-allowed"));
+
+    // A list is the reach: its own entry survives and nothing else does.
+    let listed = PolicySet::compile(
+        [baseline_source(), preset_egress_source()],
+        compile(true, vec!["203.0.113.9"]),
+    );
+    assert!(ask(&listed, "203.0.113.9").is_allowed());
+    let other = ask(&listed, "198.51.100.8");
+    assert!(other.is_denied(), "{other:?}");
+    assert_eq!(other.rule.as_deref(), Some("preset-egress-not-allowed"));
+
+    // An absent field inherits the unrestricted workspace.
+    let inheriting = PolicySet::compile([baseline_source()], compile(false, Vec::new()));
+    assert!(ask(&inheriting, "198.51.100.8").is_allowed());
 }
 
 #[test]
@@ -667,5 +840,184 @@ fn a_thousand_checks_stay_under_the_ceiling() {
     assert!(
         best < std::time::Duration::from_micros(50),
         "the ceiling exists to catch a per-call compile, best batch {best:?}, average {average:?}"
+    );
+}
+
+/// The rule classifier is ONE vocabulary for the workspace file and a preset's
+/// `egress` field: a bare integer is a port, an address or CIDR is an address,
+/// and anything else is a hostname. A line cannot mean one thing in one place
+/// and another in the other.
+#[test]
+fn egress_rules_are_classified_by_what_they_can_be() {
+    let rules = EgressRuleSet::parse([
+        "# a comment line",
+        "203.0.113.7",
+        "10.0.0.0/8",
+        "api.example.com",
+        "*.crates.io",
+        "443",
+        "  ",
+        "Example.COM.  # a trailing comment",
+    ]);
+    assert_eq!(rules.addresses, vec!["203.0.113.7", "10.0.0.0/8"]);
+    assert_eq!(
+        rules.hosts,
+        vec!["api.example.com", "*.crates.io", "example.com"]
+    );
+    assert_eq!(rules.ports, vec![443]);
+    assert!(!rules.is_empty());
+
+    // A netmask that is not an address is a hostname, not an address: the
+    // classifier checks the base, so a stray "/" cannot smuggle a rule into
+    // the strong door.
+    let odd = EgressRuleSet::parse(["foo/24"]);
+    assert!(odd.addresses.is_empty());
+    assert_eq!(odd.hosts, vec!["foo/24"]);
+
+    // Nothing at all is an empty set, which the caller reads as deny-all.
+    assert!(EgressRuleSet::parse(Vec::<String>::new()).is_empty());
+}
+
+/// A preset's egress list narrows: it can remove an entry the workspace allows
+/// but can never add one the workspace does not.
+#[test]
+fn a_preset_egress_list_narrows_and_never_widens() {
+    let dir = workspace();
+    let data = PolicyData::new(dir.path())
+        .with_permission("workspace-write")
+        .with_egress_allowlist(["203.0.113.7", "198.51.100.8"])
+        .with_preset("scoped")
+        .with_preset_egress(true, EgressRuleSet::parse(["203.0.113.7"]));
+    let set = PolicySet::compile([baseline_source(), preset_egress_source()], data);
+    assert!(set.error().is_none(), "{:?}", set.error());
+
+    let ask_ip = |ip: &str| {
+        set.check(
+            &PolicyInput::new("mcp", Action::Egress, Target::host("h", ip)).with_preset("scoped"),
+        )
+    };
+    assert!(
+        ask_ip("203.0.113.7").is_allowed(),
+        "the preset keeps its entry"
+    );
+    let narrowed = ask_ip("198.51.100.8");
+    assert!(narrowed.is_denied());
+    assert_eq!(narrowed.rule.as_deref(), Some("preset-egress-not-allowed"));
+
+    // A preset-only address is refused: the workspace list does not carry it.
+    let widened = ask_ip("192.0.2.9");
+    assert!(widened.is_denied(), "{widened:?}");
+    assert_eq!(widened.rule.as_deref(), Some("egress-not-allowlisted"));
+}
+
+/// A DECLARED EMPTY preset egress list denies every address, host and port,
+/// even though the workspace allowlist has entries: the empty list is the
+/// preset saying "no network", not an absent field.
+#[test]
+fn a_declared_empty_preset_egress_denies_everything() {
+    let dir = workspace();
+    let data = PolicyData::new(dir.path())
+        .with_permission("workspace-write")
+        .with_egress_allowlist(["203.0.113.7"])
+        .with_preset("locked")
+        .with_preset_egress(true, EgressRuleSet::default());
+    let set = PolicySet::compile([baseline_source(), preset_egress_source()], data);
+    let decision = set.check(
+        &PolicyInput::new("mcp", Action::Egress, Target::host("h", "203.0.113.7"))
+            .with_preset("locked"),
+    );
+    assert!(decision.is_denied(), "{decision:?}");
+    assert_eq!(decision.rule.as_deref(), Some("preset-egress-not-allowed"));
+    assert!(
+        decision.reason.as_deref().unwrap_or("").contains("locked"),
+        "the reason names the preset that decided: {decision:?}"
+    );
+    // The RENDERED refusal, which is what a tool returns and a reader sees,
+    // names both the preset and the rule in each locale.
+    for locale in ["en", "zh"] {
+        let text = set.refusal(&decision);
+        assert!(
+            text.contains("locked"),
+            "{locale}: the refusal names the deciding preset: {text}"
+        );
+        assert!(
+            text.contains("preset-egress-not-allowed"),
+            "{locale}: the refusal names the rule: {text}"
+        );
+    }
+    // The locale-aware formatter is what a tool calls, so the set carries the
+    // language the turn is running in.
+    let localized = PolicySet::compile(
+        [baseline_source(), preset_egress_source()],
+        PolicyData::new(dir.path())
+            .with_permission("workspace-write")
+            .with_egress_allowlist(["203.0.113.7"])
+            .with_preset("locked")
+            .with_preset_egress(true, EgressRuleSet::default()),
+    )
+    .with_lang("zh");
+    let zh = localized.check(
+        &PolicyInput::new("mcp", Action::Egress, Target::host("h", "203.0.113.7"))
+            .with_preset("locked"),
+    );
+    assert!(
+        localized.refusal(&zh).contains("策略拒绝"),
+        "the Chinese refusal is the localized one: {}",
+        localized.refusal(&zh)
+    );
+}
+
+/// The hostname door a preset declares is honoured, and the port list is one
+/// constraint across both doors.
+#[test]
+fn a_preset_hostname_and_port_list_both_narrow() {
+    let dir = workspace();
+    let data = PolicyData::new(dir.path())
+        .with_permission("workspace-write")
+        .with_egress_hosts(["api.example.test", "*.svc.test"])
+        .with_egress_allowlist(["203.0.113.7"])
+        .with_preset("names")
+        .with_preset_egress(true, EgressRuleSet::parse(["*.svc.test", "443"]));
+    let set = PolicySet::compile([baseline_source(), preset_egress_source()], data);
+
+    // The wildcard the preset declares, at the port it declares: allowed.
+    let ok = set.check(
+        &PolicyInput::new(
+            "mcp",
+            Action::Egress,
+            Target::host_on("build.svc.test", "203.0.113.7", 443),
+        )
+        .with_preset("names"),
+    );
+    assert!(ok.is_allowed(), "{ok:?}");
+
+    // The workspace host the preset did not declare: refused by the preset.
+    let other_host = set.check(
+        &PolicyInput::new(
+            "mcp",
+            Action::Egress,
+            Target::host_on("api.example.test", "203.0.113.7", 443),
+        )
+        .with_preset("names"),
+    );
+    assert!(other_host.is_denied());
+    assert_eq!(
+        other_host.rule.as_deref(),
+        Some("preset-egress-not-allowed")
+    );
+
+    // The declared host at the wrong port: the PORT rule refuses first.
+    let wrong_port = set.check(
+        &PolicyInput::new(
+            "mcp",
+            Action::Egress,
+            Target::host_on("build.svc.test", "203.0.113.7", 80),
+        )
+        .with_preset("names"),
+    );
+    assert!(wrong_port.is_denied());
+    assert_eq!(
+        wrong_port.rule.as_deref(),
+        Some("preset-egress-port-not-allowed")
     );
 }

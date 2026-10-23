@@ -22,6 +22,11 @@ pub enum ToolError {
         message: String,
     },
     /// The tool did not finish in time.
-    #[error("Tool execution timed out")]
-    Timeout,
+    ///
+    /// Carries the timeout's own account of itself: which call exceeded which
+    /// bound, and the output captured before the process was killed. A bare
+    /// "timed out" leaves the reader unable to tell a one-second cap from the
+    /// five-minute default, and throws away what the command had already said.
+    #[error("Tool execution timed out: {0}")]
+    Timeout(String),
 }

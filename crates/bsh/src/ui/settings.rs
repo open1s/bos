@@ -12,8 +12,9 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::*;
 
 use agent::extensions::ExtensionStandard;
+use agent::policy::EgressRuleSet;
 
-use super::shell::{ModelRowEditor, ModelsAddRoute, PresetEditor, Shell};
+use super::shell::{ModelRowEditor, ModelsAddRoute, PresetEditor, SettingsToast, Shell};
 use super::{hairline_all, hairline_bottom, hairline_top, icon, txt, DivExt, IconName};
 use crate::i18n::{tr, tr_args, Lang};
 use crate::settings::mcp::{McpScope, McpServer, McpTransport};
@@ -363,12 +364,23 @@ fn font_size_action(shell: &mut Shell, delta: i32, cx: &mut Context<Shell>) {
     cx.notify();
 }
 
-/// The reference's own label for a permission preset.
+/// One option of the General permission select: the label and the same
+/// one-line consequence the composer menu shows.
 ///
-/// Routed through the composer chip's single namer so the pane and the chip
-/// cannot drift apart.
-fn preset_label(lang: Lang, permission: &str) -> String {
-    tr(lang, super::composer::permission_label_key(permission))
+/// The network clause reads the WORKSPACE floor only: this row picks a default
+/// for future sessions, whose preset is not chosen yet, so no preset reach can
+/// be stated here without inventing one.
+fn permission_option_text(
+    lang: Lang,
+    permission: &str,
+    network: &super::permission::NetworkFacts<'_>,
+) -> String {
+    let mode = super::permission::Mode::from_permission(permission);
+    format!(
+        "{} · {}",
+        mode.label(lang),
+        mode.consequence(lang, false, network)
+    )
 }
 
 /// Choose the default permission mode for new sessions.
@@ -379,6 +391,47 @@ fn preset_label(lang: Lang, permission: &str) -> String {
 /// than landing here, so the risk gate cannot be skipped from the pane either.
 pub(crate) fn permission_action(shell: &mut Shell, key: &str, cx: &mut Context<Shell>) {
     shell.request_permission(key, cx);
+}
+
+/// The ONE sentence a widening preset gate draws.
+///
+/// The facts are the same consequences the audit and the tool results name -
+/// the released shell uses the bash tool's own reason - joined inside one
+/// sentence. No level number appears, so the reader does not need the
+/// authorization table to understand what they are confirming.
+pub(crate) fn widening_sentence(
+    lang: Lang,
+    name: &str,
+    previous: &str,
+    facts: &[crate::preset_catalogue::RiskFact],
+) -> String {
+    use crate::preset_catalogue::RiskFact;
+    let separator = if lang == Lang::Zh { "；" } else { "; " };
+    let clauses: Vec<String> = facts
+        .iter()
+        .map(|fact| match fact {
+            RiskFact::FullAccess => tr(lang, "settings.presetRiskFullAccess"),
+            RiskFact::SandboxOff => tr_args(
+                lang,
+                "settings.presetRiskSandboxOff",
+                &[(
+                    "reason",
+                    agent::tools::bash::PRESET_SANDBOX_OFF_REASON.to_string(),
+                )],
+            ),
+            RiskFact::EgressDeniedAll => tr(lang, "settings.presetRiskEgressDenied"),
+            RiskFact::AdvisoryPolicy => tr(lang, "settings.presetRiskAdvisory"),
+        })
+        .collect();
+    tr_args(
+        lang,
+        "settings.presetRiskDescription",
+        &[
+            ("name", name.to_string()),
+            ("previous", previous.to_string()),
+            ("facts", clauses.join(separator)),
+        ],
+    )
 }
 
 /// Write one of the General pane's string preferences.
@@ -754,17 +807,21 @@ struct PresetCardData {
     description: String,
     plugins: Vec<String>,
     builtin: bool,
-    level: Option<String>,
+    /// The authorization level in force (declared, or derived).
+    level: u8,
+    /// The session's requested mode, the other half of the cap the card names.
+    session_permission: String,
+    /// The RESOLVED scope: the intersection of the declaration with the
+    /// session tier and the workspace's egress state.
+    resolved: crate::preset_catalogue::ResolvedPresetScope,
     permission: Option<String>,
-    read: Option<Vec<String>>,
-    write: Option<Vec<String>>,
-    deny: Vec<String>,
+    sandbox: Option<crate::settings::global::SandboxChoice>,
+    sandbox_widens: bool,
     egress: Option<Vec<String>>,
-    web_search: Option<bool>,
     parallel_tool_calls: Option<bool>,
     mcp_tools: Option<Vec<String>>,
     builtin_policy: Vec<String>,
-    policy_mode: Option<String>,
+    policy_mode: crate::settings::global::PolicyMode,
     blocked: bool,
     tools: Option<Vec<String>>,
     skills: Option<Vec<String>>,
@@ -777,6 +834,9 @@ struct PresetCardData {
     in_chat: bool,
     has_chat: bool,
     details_open: bool,
+    /// Whether the card's Advanced block is open. Mode details starts with it
+    /// collapsed, so the card leads with the one mode decision.
+    advanced_open: bool,
     slot: String,
 }
 
@@ -788,7 +848,7 @@ impl Shell {
         view_height: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        if self.caps.is_empty() {
+        if self.caps.is_empty() || self.caps_generation != self.state.policy_generation {
             // The dialog previews the WORKSPACE configuration it is editing, so
             // it resolves without a session choice: the pane's job is to show
             // what the draft would build for a session that inherits.
@@ -803,6 +863,7 @@ impl Shell {
             // The dialog's build already knows the tool array, so the meter's
             // tools bucket follows the draft without a second build.
             self.state.set_tools_schema(built.tools_schema_chars);
+            self.caps_generation = self.state.policy_generation;
         }
         let lang = self.state.lang;
         let section = self.state.settings_section;
@@ -933,28 +994,46 @@ impl Shell {
                     })),
             );
 
-        let footer = div()
-            .pt(px(16.0))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(8.0))
-            .child(div().flex_1().min_w_0())
-            .child(
+        // The confirmation of a Save sits in the footer ABOVE the control that
+        // caused it. The status line an earlier round wrote lives in the
+        // statusbar, which this dialog covers with its scrim and its own
+        // opaque panel, so a reader never saw it. Growing the footer upward
+        // leaves the Save where it was: the bar is anchored at the panel's
+        // foot, and the confirmation only takes space from the scroller.
+        let mut footer = div().pt(px(16.0)).flex().flex_col().gap(px(8.0));
+        if let Some(toast) = self.settings_toast.as_ref() {
+            footer = footer.child(
                 div()
-                    .id("settings-save")
-                    .debug_selector(|| "settings-save".to_string())
-                    .px(px(14.0))
-                    .py(px(5.0))
-                    .rounded(px(12.0))
-                    .bg(rgb(theme::text()))
-                    .cursor_pointer()
-                    .hover(|s| s.opacity(0.9))
-                    .child(txt(tr(lang, "settings.save"), 13.0, theme::page()))
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.save_settings(cx);
-                    })),
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .justify_end()
+                    .child(self.settings_toast_pill(toast)),
             );
+        }
+        let footer = footer.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(div().flex_1().min_w_0())
+                .child(
+                    div()
+                        .id("settings-save")
+                        .debug_selector(|| "settings-save".to_string())
+                        .px(px(14.0))
+                        .py(px(5.0))
+                        .rounded(px(12.0))
+                        .bg(rgb(theme::text()))
+                        .cursor_pointer()
+                        .hover(|s| s.opacity(0.9))
+                        .child(txt(tr(lang, "settings.save"), 13.0, theme::page()))
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.save_settings(cx);
+                        })),
+                ),
+        );
 
         // The Extensions tab strip belongs to the pane, not to the scrolling
         // options box: pinned here, it stays reachable at any scroll offset.
@@ -1051,6 +1130,47 @@ impl Shell {
                     .flex_row()
                     .child(nav)
                     .child(pane),
+            )
+    }
+
+    /// The save confirmation, drawn in the footer just above the Save control.
+    ///
+    /// A `Role::Status` whose accessible label is the same text the reader
+    /// sees, so the confirmation reaches assistive technology as a status
+    /// message rather than as anonymous decoration. It has no handler and takes
+    /// no focus, so the next Save press reaches the button under the pointer.
+    /// The wash is the diff tint's own success/error pair, which stays legible
+    /// over the page in both palettes.
+    fn settings_toast_pill(&self, toast: &SettingsToast) -> Stateful<Div> {
+        let (glyph, ink, wash) = if toast.failed {
+            (IconName::TriangleAlert, theme::error(), theme::diff_del())
+        } else {
+            (IconName::Check, theme::success(), theme::diff_add())
+        };
+        let label: SharedString = toast.text.clone().into();
+        // The label's selector carries the save's generation, so a test can
+        // prove a second save REPLACED the first rather than stacking a twin.
+        let seq = toast.seq;
+        div()
+            .id("settings-save-toast")
+            .debug_selector(|| "settings-save-toast".to_string())
+            .role(Role::Status)
+            .aria_label(label.clone())
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .min_h(px(28.0))
+            .max_w(px(460.0))
+            .px(px(10.0))
+            .py(px(4.0))
+            .rounded(px(999.0))
+            .bg(rgb(wash))
+            .child(icon(glyph, 12.0, ink))
+            .child(
+                txt(label, 13.0, ink)
+                    .debug_selector(move || format!("settings-save-toast-{seq}"))
+                    .min_w_0(),
             )
     }
 
@@ -1720,6 +1840,7 @@ impl Shell {
         // The value-encoded selector mirrors the chip's own, so a test can prove
         // the row laid out reporting the effective mode; a kit Button carries no
         // debug selector of its own.
+        let network = super::permission::NetworkFacts::for_workspace(&self.state);
         let permission_row = div()
             .debug_selector(move || permission_selector)
             .child(self.select_row_with_value(
@@ -1731,15 +1852,15 @@ impl Shell {
                     options: vec![
                         (
                             crate::caps::READ_ONLY,
-                            preset_label(lang, crate::caps::READ_ONLY),
+                            permission_option_text(lang, crate::caps::READ_ONLY, &network),
                         ),
                         (
                             crate::caps::WORKSPACE_WRITE,
-                            preset_label(lang, crate::caps::WORKSPACE_WRITE),
+                            permission_option_text(lang, crate::caps::WORKSPACE_WRITE, &network),
                         ),
                         (
                             crate::caps::FULL_ACCESS,
-                            preset_label(lang, crate::caps::FULL_ACCESS),
+                            permission_option_text(lang, crate::caps::FULL_ACCESS, &network),
                         ),
                     ],
                     action: permission_action,
@@ -1994,16 +2115,27 @@ impl Shell {
                 } else {
                     for entry in audit.denials.iter().rev().take(8) {
                         let head = format!(
-                            "{} · {} · {}",
+                            "{} · {} · {}{}",
                             entry.rule.as_deref().unwrap_or("-"),
                             entry.tool,
-                            entry.target
+                            entry.target,
+                            if entry.advisory {
+                                format!(" · {}", tr(lang, "settings.policyAdvisoryTag"))
+                            } else {
+                                String::new()
+                            }
                         );
-                        let mut row = div().flex().flex_col().gap(px(2.0)).py(px(4.0)).child(txt(
-                            head,
-                            12.0,
-                            theme::text(),
-                        ));
+                        let ink = if entry.advisory {
+                            theme::warn()
+                        } else {
+                            theme::text()
+                        };
+                        let mut row = div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .py(px(4.0))
+                            .child(txt(head, 12.0, ink));
                         if let Some(reason) = &entry.reason {
                             row = row.child(txt(reason.clone(), 11.0, theme::muted()));
                         }
@@ -2070,12 +2202,21 @@ impl Shell {
             .mb(px(6.0))
             .into_any_element(),
         );
+        // The empty list has TWO different meanings and the pane must not make
+        // them read alike: no file at all leaves egress UNRESTRICTED (and offers
+        // the starter), while a file the reader created and left empty is a
+        // deliberate DENY ALL.
         if self.state.egress_allowlist.is_empty() {
+            let exists = self.state.egress_allowlist_file_exists();
             rows.push(
                 txt(
-                    tr(lang, "settings.policyAllowlistEmpty"),
+                    if exists {
+                        tr(lang, "settings.policyAllowlistFileEmpty")
+                    } else {
+                        tr(lang, "settings.policyAllowlistNoFile")
+                    },
                     12.0,
-                    theme::faint(),
+                    theme::muted(),
                 )
                 .mb(px(6.0))
                 .into_any_element(),
@@ -2152,6 +2293,152 @@ impl Shell {
                 .into_any_element(),
         );
 
+        // The two file-level actions. "Create starter allowlist" is offered only
+        // while the file is absent, so a reader who already has one is never
+        // invited to replace it; "Open file" reveals whatever path the workspace
+        // resolves to, creating nothing.
+        let file_exists = self.state.egress_allowlist_file_exists();
+        let mut file_actions = div().flex().items_center().gap(px(8.0)).mt(px(8.0));
+        if !file_exists {
+            file_actions = file_actions.child(
+                div()
+                    .id("policy-create-starter")
+                    .debug_selector(|| "policy-create-starter".to_string())
+                    .px(px(8.0))
+                    .py(px(4.0))
+                    .rounded(px(5.0))
+                    .border_1()
+                    .border_color(rgb(theme::border()))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(theme::hover())))
+                    .child(txt(
+                        tr(lang, "settings.policyCreateStarter"),
+                        12.0,
+                        theme::text(),
+                    ))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        match this.state.create_starter_egress_allowlist() {
+                            Ok(()) => {
+                                let lang = this.state.lang;
+                                this.state
+                                    .notice(tr(lang, "settings.policyStarterCreated").to_string());
+                            }
+                            Err(error) => this.state.notice(error),
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+        file_actions = file_actions.child(
+            div()
+                .id("policy-open-file")
+                .debug_selector(|| "policy-open-file".to_string())
+                .px(px(8.0))
+                .py(px(4.0))
+                .rounded(px(5.0))
+                .border_1()
+                .border_color(rgb(theme::border()))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(theme::hover())))
+                .child(txt(
+                    tr(lang, "settings.policyOpenFile"),
+                    12.0,
+                    theme::text(),
+                ))
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.open_egress_allowlist(cx);
+                })),
+        );
+        rows.push(file_actions.into_any_element());
+
+        // The compiled modules: the one surface where a reader can tell a
+        // binary-shipped rule from their own, and see the trust gate's answer.
+        rows.push(self.plugins_section_header("policy-modules-header", "settings.policyModules"));
+        rows.push(
+            txt(tr(lang, "settings.policyModulesHint"), 12.0, theme::muted())
+                .mb(px(6.0))
+                .into_any_element(),
+        );
+        match self.state.policy.as_ref() {
+            Some(policy) => {
+                for (index, module) in policy.modules().into_iter().enumerate() {
+                    let head = policy_module_head(lang, &module);
+                    let mut row = div()
+                        .debug_selector(move || format!("policy-module-{index}"))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .py(px(4.0))
+                        .child(txt(head, 12.0, theme::text()));
+                    if !module.rule_ids.is_empty() {
+                        row = row.child(txt(module.rule_ids.join(", "), 11.0, theme::faint()));
+                    }
+                    rows.push(row.into_any_element());
+                }
+            }
+            None => rows.push(
+                txt(
+                    tr(lang, "settings.policyModulesEmpty"),
+                    12.0,
+                    theme::muted(),
+                )
+                .mb(px(8.0))
+                .into_any_element(),
+            ),
+        }
+
+        // Advisory refusals: a policy_mode = advisory preset's own rules were
+        // refused, recorded, and the calls went ahead. This is the visible
+        // warning, beside the audit that carries the row.
+        rows.push(
+            self.plugins_section_header("policy-advisory-header", "settings.policyAdvisoryHeader"),
+        );
+        match self.state.policy_audit.as_ref() {
+            Some(audit) if !audit.advisories.is_empty() => {
+                rows.push(
+                    txt(
+                        tr_args(
+                            lang,
+                            "settings.policyAdvisoryHint",
+                            &[("count", audit.advisories_total.to_string())],
+                        ),
+                        12.0,
+                        theme::warn(),
+                    )
+                    .mb(px(6.0))
+                    .into_any_element(),
+                );
+                for (index, entry) in audit.advisories.iter().rev().take(8).enumerate() {
+                    let head = format!(
+                        "{} · {} · {}",
+                        entry.rule.as_deref().unwrap_or("-"),
+                        entry.tool,
+                        entry.target
+                    );
+                    let mut row = div()
+                        .debug_selector(move || format!("policy-advisory-{index}"))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .py(px(4.0))
+                        .child(txt(head, 12.0, theme::text()));
+                    if let Some(reason) = &entry.reason {
+                        row = row.child(txt(reason.clone(), 11.0, theme::muted()));
+                    }
+                    rows.push(row.into_any_element());
+                }
+            }
+            _ => rows.push(
+                txt(
+                    tr(lang, "settings.policyAdvisoryNone"),
+                    12.0,
+                    theme::muted(),
+                )
+                .mb(px(8.0))
+                .into_any_element(),
+            ),
+        }
+
         ("settings.policy", "settings.policyHint", rows)
     }
 
@@ -2197,11 +2484,23 @@ impl Shell {
         }
         match toml::from_str::<PresetFile>(&text) {
             Ok(file) => {
-                self.state
-                    .draft_mut()
-                    .global
-                    .presets
-                    .insert(id.clone(), file.preset);
+                // The same load check the settings file applies: an unparsable
+                // glob or an out-of-range level names the field here too, and
+                // nothing reaches the draft.
+                if let Err(error) =
+                    crate::settings::global::GlobalSettings::validate_preset(&id, &file.preset)
+                {
+                    self.preset_editor_error = Some(error.to_string());
+                    cx.notify();
+                    return;
+                }
+                // A declaration that widens a preset IN EFFECT is parked for
+                // the risk confirmation; cancelling leaves the previous
+                // declaration in the draft.
+                if self.state.commit_preset(&id, file.preset) {
+                    cx.notify();
+                    return;
+                }
                 self.preset_editor = None;
                 self.preset_editor_error = None;
                 self.preset_details = None;
@@ -2250,7 +2549,13 @@ impl Shell {
         let active = draft.global.default_preset.clone();
         let chat = self.state.active_session_preset();
         let has_chat = self.state.active_id.is_some();
-        let listed: Vec<String> = draft.global.preset_ids();
+        // The RESOLVED facts, read once for the whole pane: the session tier is
+        // the workspace's permission (the same input resolve.rs folds), and the
+        // workspace egress state comes from the live policy's data document,
+        // never a per-frame disk read.
+        let session_permission = draft.workspace.agent.permission.clone();
+        let workspace_reach =
+            crate::preset_catalogue::workspace_reach(self.state.policy.as_deref());
         let mut rows: Vec<AnyElement> =
             vec![
                 txt(tr(lang, "settings.presetScopeHint"), 12.0, theme::muted())
@@ -2327,9 +2632,15 @@ impl Shell {
         );
 
         let mut cards: Vec<(usize, bool, AnyElement)> = Vec::new();
-        for (index, name) in listed.into_iter().enumerate() {
-            let preset = draft.global.preset(&name).unwrap_or_default();
-            let builtin = draft.global.preset_is_shipped(&name);
+        // The ONE roster read: the catalogue walks the same settings tree the
+        // build does, so a card cannot describe a preset the build would not.
+        for (index, entry) in crate::preset_catalogue::catalogue(&draft.global)
+            .into_iter()
+            .enumerate()
+        {
+            let name = entry.id.clone();
+            let preset = entry.preset.clone();
+            let builtin = entry.builtin;
             let display = preset.name.clone().unwrap_or_else(|| match name.as_str() {
                 "standard" => tr(lang, "settings.presetStandard").to_string(),
                 "ptc" => tr(lang, "settings.presetPtc").to_string(),
@@ -2347,26 +2658,34 @@ impl Shell {
                     "read-only" => tr(lang, "settings.presetReadOnlyHint").to_string(),
                     _ => tr(lang, "settings.presetCustomHint").to_string(),
                 });
+            // The resolved scope knows the session tier and the workspace
+            // egress state; the card shows THIS, not the declaration. Both the
+            // declaration and the resolution come from the catalogue entry.
+            let resolved = crate::preset_catalogue::ResolvedPresetScope::from_catalogue(
+                &entry,
+                &session_permission,
+                &workspace_reach,
+            );
             let data = PresetCardData {
                 id: name.clone(),
                 display,
                 description,
                 plugins: preset.plugins,
                 builtin,
-                level: preset.level,
-                permission: preset.permission,
-                read: preset.read,
-                write: preset.write,
-                deny: preset.deny,
-                egress: preset.egress,
-                web_search: preset.web_search,
+                level: entry.level,
+                session_permission: session_permission.clone(),
+                resolved,
+                permission: entry.permission,
+                sandbox: entry.sandbox,
+                sandbox_widens: draft.preset_sandbox_widens(&name),
+                egress: entry.egress,
                 parallel_tool_calls: preset.parallel_tool_calls,
                 mcp_tools: preset.mcp_tools,
                 builtin_policy: preset.builtin_policy,
-                blocked: preset.policy_mode.as_deref() == Some("required")
+                blocked: entry.policy_mode == crate::settings::global::PolicyMode::Required
                     && preset.policy.is_some()
                     && !preset.trusted,
-                policy_mode: preset.policy_mode,
+                policy_mode: entry.policy_mode,
                 tools: preset.tools,
                 skills: preset.skills,
                 mcps: preset.mcps,
@@ -2378,6 +2697,7 @@ impl Shell {
                 in_chat: chat.as_deref() == Some(name.as_str()),
                 has_chat,
                 details_open: self.preset_details.as_deref() == Some(name.as_str()),
+                advanced_open: self.preset_advanced.as_deref() == Some(name.as_str()),
                 slot: index.to_string(),
             };
             cards.push((index, builtin, self.preset_card(data, cx)));
@@ -2643,12 +2963,12 @@ impl Shell {
             plugins,
             builtin,
             level,
+            session_permission,
+            resolved,
             permission,
-            read,
-            write,
-            deny,
+            sandbox,
+            sandbox_widens,
             egress,
-            web_search,
             parallel_tool_calls,
             mcp_tools,
             builtin_policy,
@@ -2665,6 +2985,7 @@ impl Shell {
             in_chat,
             has_chat,
             details_open,
+            advanced_open,
             slot,
         } = data;
         if id.is_empty() {
@@ -2697,36 +3018,81 @@ impl Shell {
                 .child(txt(label, 10.0, fg))
                 .into_any_element()
         };
-        let level_label = |level: &str| match level {
-            "standard" => tr(lang, "settings.presetLevelStandard").to_string(),
-            "ptc" => tr(lang, "settings.presetLevelPtc").to_string(),
-            "creator" => tr(lang, "settings.presetLevelCreator").to_string(),
-            "read-only" => tr(lang, "settings.presetLevelReadOnly").to_string(),
-            "inspect" => tr(lang, "settings.presetLevelInspect").to_string(),
-            "review" => tr(lang, "settings.presetLevelReview").to_string(),
-            "research" => tr(lang, "settings.presetLevelResearch").to_string(),
-            "docs" => tr(lang, "settings.presetLevelDocs").to_string(),
-            "code" => tr(lang, "settings.presetLevelCode").to_string(),
-            "admin" => tr(lang, "settings.presetLevelAdmin").to_string(),
-            other => other.to_string(),
+        // The grade is a NUMBER and a NAME, so the card, the catalogue and the
+        // risk dialog cannot describe the same preset differently.
+        let grade_label = |level: u8| -> &'static str {
+            match level {
+                0 => "settings.presetGrade0",
+                1 => "settings.presetGrade1",
+                2 => "settings.presetGrade2",
+                3 => "settings.presetGrade3",
+                _ => "settings.presetGrade4",
+            }
         };
-        let level_color = |level: &str| match level {
-            "ptc" | "creator" => theme::accent(),
-            "code" => theme::success(),
-            "read-only" | "docs" | "research" | "admin" => theme::accent(),
-            _ => theme::muted(),
+        let grade_color = |level: u8| -> u32 {
+            match level {
+                3 | 4 => theme::warn(),
+                2 => theme::success(),
+                _ => theme::muted(),
+            }
         };
+        // The one mode decision, read from the RESOLVED permission and sandbox:
+        // the card states what the turn would actually get, never the
+        // declaration. A preset that caps the session says so; a full-access
+        // session whose preset keeps the shell confined says that instead of
+        // claiming "no confinement".
+        let permission_resolution = crate::settings::resolve::PermissionResolution::resolve(
+            &session_permission,
+            permission.as_deref(),
+        );
+        let sandbox_resolution = crate::settings::resolve::SandboxResolution::resolve(
+            sandbox,
+            permission.as_deref(),
+            &resolved.permission,
+        );
+        let grade_name = tr(lang, grade_label(level));
+        let mode_line = super::permission::card_mode_line(
+            lang,
+            &grade_name,
+            &permission_resolution,
+            &sandbox_resolution,
+        );
+        // The advanced Access row keeps the resolved tier plus its declared
+        // ceiling; it is the same fact the mode line states, in the one place a
+        // reader who asked for details finds it.
         let permission_text = match permission.as_deref() {
-            Some("read-only") => tr(lang, "settings.presetPermissionReadOnly").to_string(),
-            Some("workspace-write") => tr(lang, "settings.presetPermissionWorkspace").to_string(),
-            Some("danger-full-access") => tr(lang, "settings.presetPermissionFull").to_string(),
-            _ => tr(lang, "settings.presetInherit").to_string(),
+            Some(ceiling) if ceiling != resolved.permission => format!(
+                "{} · {}: {}",
+                super::permission::Mode::from_permission(&resolved.permission).label(lang),
+                tr(lang, "settings.presetCeiling"),
+                super::permission::Mode::from_permission(ceiling).label(lang)
+            ),
+            _ => super::permission::Mode::from_permission(&resolved.permission).label(lang),
         };
-        let path_value = |list: &Option<Vec<String>>| match list {
-            None => tr(lang, "settings.presetAllPaths").to_string(),
-            Some(items) if items.is_empty() => tr(lang, "settings.presetNone").to_string(),
-            Some(items) => items.join(", "),
+        // A resolved path scope, not the declaration: \"the workspace\" is a
+        // real answer (nothing was declared), and a read-only tier shows no
+        // writes even when the preset granted them.
+        let scope_value = |reach: &crate::preset_catalogue::ScopeReach| match reach {
+            crate::preset_catalogue::ScopeReach::Workspace => {
+                tr(lang, "settings.presetAllPaths").to_string()
+            }
+            crate::preset_catalogue::ScopeReach::None => {
+                tr(lang, "settings.presetNone").to_string()
+            }
+            crate::preset_catalogue::ScopeReach::Entries(items) => items.join(", "),
         };
+        let egress_text = resolved_egress_text(&resolved.egress, lang);
+        // The sandbox text is an ADVANCED fact now. Only the refusal - which
+        // keeps the preset unusable - stays on the card, because that is where
+        // the reader can act on it.
+        let sandbox_text = preset_sandbox_text(sandbox, sandbox_widens, lang);
+        let sandbox_ink = if sandbox_widens {
+            theme::error()
+        } else {
+            theme::muted()
+        };
+        let sandbox_body = sandbox_widens;
+        let sandbox_slot = slot.clone();
 
         let header = div()
             .flex()
@@ -2759,13 +3125,14 @@ impl Shell {
                 ))
             })
             .child(div().flex_1())
-            .when_some(level.clone(), |row, level| {
+            // The level is a DETAIL, not the label: the readable grade is the
+            // first word of the mode line below, and "L2" stays on the card for
+            // a reader who already knows the table.
+            .child({
                 let level_slot = slot.clone();
-                row.child(
-                    div()
-                        .debug_selector(move || format!("preset-level-{level_slot}"))
-                        .child(txt(level_label(&level), 10.0, level_color(&level))),
-                )
+                div()
+                    .debug_selector(move || format!("preset-level-{level_slot}"))
+                    .child(txt(format!("L{level}"), 10.0, grade_color(level)))
             })
             .child(txt(id.clone(), 11.0, theme::faint()));
 
@@ -2790,15 +3157,62 @@ impl Shell {
                     theme::muted(),
                 ))
                 .on_click(cx.listener(move |this, _event, _window, cx| {
-                    this.preset_details = if this.preset_details.as_deref() == Some(&toggle) {
-                        None
+                    if this.preset_details.as_deref() == Some(&toggle) {
+                        this.preset_details = None;
+                        this.preset_advanced = None;
                     } else {
-                        Some(toggle.clone())
-                    };
+                        this.preset_details = Some(toggle.clone());
+                        // Mode details always opens with Advanced collapsed.
+                        this.preset_advanced = None;
+                    }
                     cx.stop_propagation();
                     cx.notify();
                 })),
         );
+        // The Advanced control sits in the FOOTER, not inside the expanded
+        // block: the block begins below the card's last visible row, so a
+        // control at its top is still clipped at the reference window height
+        // (the harness clicks it as a silent no-op). Gated on details_open so
+        // the collapsed card keeps its two-line footer.
+        if details_open {
+            let advanced_toggle = id.clone();
+            let advanced_slot = slot.clone();
+            let advanced_open_now = advanced_open;
+            footer = footer.child(
+                div()
+                    .debug_selector(move || format!("preset-advanced-{advanced_slot}"))
+                    .id(SharedString::from(format!("preset-advanced-{slot}")))
+                    .flex()
+                    .items_center()
+                    .gap(px(2.0))
+                    .cursor_pointer()
+                    .hover(|style| style.opacity(0.8))
+                    .child(if advanced_open_now {
+                        icon(IconName::ChevronDown, 11.0, theme::faint())
+                    } else {
+                        icon(IconName::ChevronRight, 11.0, theme::faint())
+                    })
+                    .child(txt(
+                        tr(lang, "settings.presetAdvanced"),
+                        11.0,
+                        if advanced_open_now {
+                            theme::text()
+                        } else {
+                            theme::muted()
+                        },
+                    ))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.preset_advanced =
+                            if this.preset_advanced.as_deref() == Some(&advanced_toggle) {
+                                None
+                            } else {
+                                Some(advanced_toggle.clone())
+                            };
+                        cx.stop_propagation();
+                        cx.notify();
+                    })),
+            );
+        }
         if has_policy {
             let toggle = id.clone();
             let trusted_now = trusted;
@@ -2839,14 +3253,21 @@ impl Shell {
         if has_chat {
             let picked = id.clone();
             let use_slot = slot.clone();
-            let label = if blocked {
+            // Two independent reasons a preset cannot be used here: an
+            // untrusted required policy, and a sandbox widening the guard
+            // refused. The sandbox reason is drawn first because it names the
+            // field the reader can fix (permission = danger-full-access).
+            let refused = blocked || sandbox_widens;
+            let label = if sandbox_widens {
+                tr(lang, "settings.presetSandboxWidensAction").to_string()
+            } else if blocked {
                 tr(lang, "settings.presetTrustToUse").to_string()
             } else if in_chat {
                 tr(lang, "settings.presetInUse").to_string()
             } else {
                 tr(lang, "settings.presetUseInChat").to_string()
             };
-            let ink = if in_chat || blocked {
+            let ink = if in_chat || refused {
                 theme::muted()
             } else {
                 theme::accent()
@@ -2855,7 +3276,7 @@ impl Shell {
                 .debug_selector(move || format!("preset-use-{use_slot}"))
                 .id(SharedString::from(format!("preset-use-{slot}")))
                 .child(txt(label, 11.0, ink));
-            if in_chat || blocked {
+            if in_chat || refused {
                 use_link = use_link
                     .cursor_default()
                     .on_click(cx.listener(|_this, _event, _window, cx| cx.stop_propagation()));
@@ -2925,11 +3346,32 @@ impl Shell {
                 cx.notify();
             }))
             .child(header)
-            .child(
-                txt(description, 13.0, theme::muted())
+            // One line of mode: the readable grade and the RESOLVED
+            // consequence. It takes the one line the old description held, so
+            // the card is no taller and its footer controls stay reachable.
+            // The debug selector carries the resolved tier, so a test can prove
+            // the collapsed card names the mode the build obeys.
+            .child({
+                let mode_slot = slot.clone();
+                let effective = super::permission::Mode::from_permission(&resolved.permission);
+                txt(mode_line, 12.5, theme::muted())
                     .mt(px(10.0))
-                    .line_height(px(20.0)),
-            )
+                    .h(px(20.0))
+                    .line_height(px(20.0))
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .debug_selector(move || {
+                        format!("preset-mode-{mode_slot}-{}", effective.value())
+                    })
+            })
+            .when(sandbox_body, |card| {
+                card.child(
+                    txt(sandbox_text.clone(), 11.0, sandbox_ink)
+                        .mt(px(6.0))
+                        .debug_selector(move || format!("preset-sandbox-{sandbox_slot}")),
+                )
+            })
             .child(footer);
 
         if details_open {
@@ -2948,28 +3390,37 @@ impl Shell {
                     .child(txt(value, 11.0, theme::text()).flex_1().min_w_0())
                     .into_any_element()
             };
-            let mut policy_sources = vec![tr(lang, "settings.presetPolicyBaseline").to_string()];
-            if read.is_some() || write.is_some() || !deny.is_empty() {
-                policy_sources.push(tr(lang, "settings.presetPolicyScope").to_string());
+            // The Security row lists the SAME module ids the policy pane does,
+            // so a built-in name here is the stable `builtin:` one and never a
+            // display alias that could be mistaken for a user module.
+            let mut policy_sources = vec!["builtin:baseline".to_string()];
+            let scope_active = resolved.read != crate::preset_catalogue::ScopeReach::Workspace
+                || resolved.write != crate::preset_catalogue::ScopeReach::Workspace
+                || !resolved.deny.is_empty();
+            if scope_active {
+                policy_sources.push("builtin:preset-scope".to_string());
             }
             if egress.is_some() {
-                policy_sources.push(tr(lang, "settings.presetPolicyEgress").to_string());
+                policy_sources.push("builtin:preset-egress".to_string());
             }
             if permission.as_deref() == Some("read-only")
-                && !builtin_policy.iter().any(|id| id == "read-only")
+                && !builtin_policy
+                    .iter()
+                    .any(|id| crate::caps::canonical_builtin_policy_id(id) == "builtin:read-only")
             {
-                policy_sources.push(tr(lang, "settings.presetPolicyPermission").to_string());
+                policy_sources.push("builtin:preset-permission".to_string());
             }
-            policy_sources.extend(builtin_policy.iter().cloned());
+            policy_sources.extend(
+                builtin_policy
+                    .iter()
+                    .map(|id| crate::caps::canonical_builtin_policy_id(id).to_string()),
+            );
             if has_policy {
                 policy_sources.push(if trusted {
                     tr(lang, "settings.presetPolicyCustom").to_string()
                 } else {
                     tr(lang, "settings.presetPolicyCustomUntrusted").to_string()
                 });
-            }
-            if policy_mode.as_deref() == Some("required") {
-                policy_sources.push(tr(lang, "settings.presetPolicyRequired").to_string());
             }
             let security_text = format!(
                 "{}: {}",
@@ -2998,93 +3449,143 @@ impl Shell {
                 .filter(|prompt| !prompt.is_empty())
                 .unwrap_or_else(|| tr(lang, "settings.presetWorkspacePrompt").to_string());
             let details_slot = slot.clone();
-            card = card.child(
-                div()
-                    .debug_selector(move || format!("preset-config-{details_slot}"))
-                    .mt(px(12.0))
-                    .pt(px(8.0))
-                    .border_t_1()
-                    .border_color(rgb(theme::border_soft()))
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .child(row(
-                        tr(lang, "settings.presetAccessLabel").to_string(),
-                        permission_text,
-                    ))
-                    .child(row(
-                        tr(lang, "settings.presetPathsLabel").to_string(),
-                        format!(
-                            "{}: {} · {}: {} · {}: {}",
-                            tr(lang, "settings.presetReadPath"),
-                            path_value(&read),
-                            tr(lang, "settings.presetWritePath"),
-                            path_value(&write),
-                            tr(lang, "settings.presetDenyPath"),
-                            if deny.is_empty() {
-                                tr(lang, "settings.presetNone").to_string()
+            let bundles_text = if plugins.is_empty() {
+                tr(lang, "settings.presetNone").to_string()
+            } else {
+                plugins.join(", ")
+            };
+            // The Mode details frame. The Advanced CONTROL lives in the footer
+            // (the only row guaranteed on screen); this block carries the
+            // visible summary and, when open, the advanced fields.
+            let mut details = div()
+                .debug_selector(move || format!("preset-config-{details_slot}"))
+                .mt(px(12.0))
+                .pt(px(8.0))
+                .border_t_1()
+                .border_color(rgb(theme::border_soft()))
+                .flex()
+                .flex_col()
+                .gap(px(2.0));
+            // The visible half of Mode details: the task bundle's prose, the
+            // resolved access and the bundle list.
+            details = details
+                .child(
+                    txt(description, 12.0, theme::faint())
+                        .pb(px(2.0))
+                        .line_height(px(18.0)),
+                )
+                .child(row(
+                    tr(lang, "settings.presetAccessLabel").to_string(),
+                    permission_text,
+                ))
+                .child(row(
+                    tr(lang, "settings.presetBundlesLabel").to_string(),
+                    bundles_text,
+                ));
+            if advanced_open {
+                let advanced_body_slot = slot.clone();
+                details = details.child(
+                    div()
+                        .debug_selector(move || {
+                            format!("preset-advanced-body-{advanced_body_slot}")
+                        })
+                        .mt(px(2.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(row(
+                            tr(lang, "settings.presetLevelLabel").to_string(),
+                            format!("L{level} · {}", tr(lang, grade_label(level))),
+                        ))
+                        .child(row(
+                            tr(lang, "settings.presetSandboxLabel").to_string(),
+                            sandbox_text,
+                        ))
+                        // The RESOLVED path scopes: the preset's entries after the
+                        // session tier and the workspace root. A read-only session
+                        // says "none" for writes even when the file grants them.
+                        .child(row(
+                            tr(lang, "settings.presetPathsLabel").to_string(),
+                            format!(
+                                "{}: {} · {}: {} · {}: {}",
+                                tr(lang, "settings.presetReadPath"),
+                                scope_value(&resolved.read),
+                                tr(lang, "settings.presetWritePath"),
+                                scope_value(&resolved.write),
+                                tr(lang, "settings.presetDenyPath"),
+                                resolved.deny.join(", ")
+                            ),
+                        ))
+                        // The network row keeps the declaration's own words and
+                        // appends the reach that is ACTUALLY in force after the
+                        // workspace allowlist is folded in.
+                        .child(row(
+                            tr(lang, "settings.presetNetworkLabel").to_string(),
+                            format!(
+                                "{} · {}: {}",
+                                preset_network_text(&egress, None, lang),
+                                tr(lang, "settings.presetEffective"),
+                                egress_text
+                            ),
+                        ))
+                        .child(row(
+                            tr(lang, "settings.presetWebSearch").to_string(),
+                            if resolved.web_search {
+                                tr(lang, "settings.presetOn").to_string()
                             } else {
-                                deny.join(", ")
-                            }
-                        ),
-                    ))
-                    .child(row(
-                        tr(lang, "settings.presetNetworkLabel").to_string(),
-                        match (&egress, web_search) {
-                            (Some(items), _) if items.is_empty() => {
-                                tr(lang, "settings.presetNoNetwork").to_string()
-                            }
-                            (Some(items), _) => items.join(", "),
-                            (None, Some(false)) => tr(lang, "settings.presetNoNetwork").to_string(),
-                            (None, Some(true)) => tr(lang, "settings.presetWebSearch").to_string(),
-                            (None, None) => tr(lang, "settings.presetInherit").to_string(),
-                        },
-                    ))
-                    .child(row(
-                        tr(lang, "settings.presetParallelLabel").to_string(),
-                        match parallel_tool_calls {
-                            Some(true) => tr(lang, "settings.presetOn").to_string(),
-                            Some(false) => tr(lang, "settings.presetOff").to_string(),
-                            None => tr(lang, "settings.presetInherit").to_string(),
-                        },
-                    ))
-                    .child(row(
-                        tr(lang, "settings.presetBundlesLabel").to_string(),
-                        if plugins.is_empty() {
-                            tr(lang, "settings.presetNone").to_string()
-                        } else {
-                            plugins.join(", ")
-                        },
-                    ))
-                    .child(row(
-                        tr(lang, "settings.presetToolsLabel").to_string(),
-                        value(&tools, "settings.presetAllTools", "settings.presetNone"),
-                    ))
-                    .child(row(
-                        tr(lang, "settings.presetSkillsLabel").to_string(),
-                        value(&skills, "settings.presetAllSkills", "settings.presetNone"),
-                    ))
-                    .child(row(
-                        tr(lang, "settings.presetMcpsLabel").to_string(),
-                        mcp_text,
-                    ))
-                    .child(row(
-                        tr(lang, "settings.presetExtensionsLabel").to_string(),
-                        value(
-                            &extensions,
-                            "settings.presetAllExtensions",
-                            "settings.presetNone",
-                        ),
-                    ))
-                    .child(row(
-                        tr(lang, "settings.presetPersonaLabel").to_string(),
-                        persona,
-                    ))
-                    .child(row(
-                        tr(lang, "settings.presetSecurityLabel").to_string(),
-                        security_text,
-                    )),
-            );
+                                tr(lang, "settings.presetOff").to_string()
+                            },
+                        ))
+                        .child(row(
+                            tr(lang, "settings.presetPolicyModeLabel").to_string(),
+                            match policy_mode {
+                                crate::settings::global::PolicyMode::Required => {
+                                    tr(lang, "settings.presetPolicyRequired").to_string()
+                                }
+                                crate::settings::global::PolicyMode::Advisory => {
+                                    tr(lang, "settings.presetPolicyAdvisory").to_string()
+                                }
+                            },
+                        ))
+                        .child(row(
+                            tr(lang, "settings.presetParallelLabel").to_string(),
+                            match parallel_tool_calls {
+                                Some(true) => tr(lang, "settings.presetOn").to_string(),
+                                Some(false) => tr(lang, "settings.presetOff").to_string(),
+                                None => tr(lang, "settings.presetInherit").to_string(),
+                            },
+                        ))
+                        .child(row(
+                            tr(lang, "settings.presetToolsLabel").to_string(),
+                            value(&tools, "settings.presetAllTools", "settings.presetNone"),
+                        ))
+                        .child(row(
+                            tr(lang, "settings.presetSkillsLabel").to_string(),
+                            value(&skills, "settings.presetAllSkills", "settings.presetNone"),
+                        ))
+                        .child(row(
+                            tr(lang, "settings.presetMcpsLabel").to_string(),
+                            mcp_text,
+                        ))
+                        .child(row(
+                            tr(lang, "settings.presetExtensionsLabel").to_string(),
+                            value(
+                                &extensions,
+                                "settings.presetAllExtensions",
+                                "settings.presetNone",
+                            ),
+                        ))
+                        .child(row(
+                            tr(lang, "settings.presetPersonaLabel").to_string(),
+                            persona,
+                        ))
+                        .child(row(
+                            tr(lang, "settings.presetSecurityLabel").to_string(),
+                            security_text,
+                        )),
+                );
+            }
+            card = card.child(details);
         }
 
         card.into_any_element()
@@ -5638,23 +6139,11 @@ impl Shell {
         self.task_delete = None;
         cx.notify();
     }
-    /// Flip the risk gate's acknowledgement box.
-    ///
-    /// Measured (`RiskConfirmation`): the box starts unticked every time the
-    /// gate opens, so acknowledging one mode never acknowledges the next one.
-    pub(crate) fn permission_toggle_acknowledged(&mut self, cx: &mut Context<Self>) {
-        self.permission_acknowledged = !self.permission_acknowledged;
-        cx.notify();
-    }
-
-    /// Confirm the gate: the mode is written only now, and only once the box is
-    /// ticked - which is what keeps the gate from being a second menu.
+    /// Confirm the gate: the mode is written only now, which is what keeps the
+    /// gate from being a second menu. Cancel takes the other path and leaves
+    /// the current mode untouched.
     pub(crate) fn permission_confirm_enable(&mut self, cx: &mut Context<Self>) {
-        if !self.permission_acknowledged {
-            return;
-        }
         if let Some(permission) = self.permission_confirm.take() {
-            self.permission_acknowledged = false;
             self.set_permission(&permission, cx);
         }
         cx.notify();
@@ -5663,70 +6152,153 @@ impl Shell {
     /// Backing out leaves the current mode alone.
     pub(crate) fn permission_cancel_confirm(&mut self, cx: &mut Context<Self>) {
         self.permission_confirm = None;
-        self.permission_acknowledged = false;
         cx.notify();
     }
 
-    /// The full-access risk gate, drawn over the settings dialog.
+    /// Confirm a preset change that would widen what a preset permits.
     ///
-    /// Measured (`RiskConfirmation`): the confirmation is `min(440px, 100%)`, its
-    /// warning block is a 10px-gap row whose 14px error-coloured mark sits 2px
-    /// down against a 14/22 secondary sentence, the acknowledgement is another
-    /// 10px-gap row 20px under it - a 16x16 box on a 14/22 primary label - and
-    /// the two actions are at least 72 and 136 wide. The enable action is drawn
-    /// disabled until the box is ticked, which is the reference's own
-    /// `disabled={!acknowledged}`, and the gate is the only path that writes
-    /// full access: the pane's row and the composer chip both route through
-    /// `request_permission`.
-    pub(crate) fn render_permission_confirm(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// ONE sentence and TWO buttons. The sentence names the consequences in the
+    /// same facts the audit and the tool results use (the released shell's own
+    /// reason included), but never a level number: a reader should not need the
+    /// authorization table to understand what they are confirming. Nothing is
+    /// written while the dialog is open, so Cancel leaves the previous preset
+    /// exactly as it was.
+    pub(crate) fn render_preset_confirm(&self, cx: &mut Context<Self>) -> AnyElement {
         let lang = self.state.lang;
-        let acknowledged = self.permission_acknowledged;
-        let acknowledgement = div()
-            .id("permission-acknowledge")
-            .debug_selector(|| String::from("permission-acknowledge"))
-            .mt(px(20.0))
+        let Some(pending) = self.state.pending_preset.as_ref() else {
+            return div().into_any_element();
+        };
+        let title = tr(lang, "settings.presetRiskTitle");
+        let description = widening_sentence(
+            lang,
+            &self.state.preset_label(&pending.target),
+            &pending.previous,
+            &pending.facts,
+        );
+        let confirm_label = match pending.apply {
+            crate::state::PresetApply::Default => tr(lang, "settings.presetRiskDefaultConfirm"),
+            crate::state::PresetApply::Save { .. } => tr(lang, "settings.presetRiskSaveConfirm"),
+            crate::state::PresetApply::Session(_) => tr(lang, "settings.presetRiskConfirm"),
+        };
+        div()
+            .debug_selector(|| String::from("preset-risk"))
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .bg(rgba(0x0F1115CC))
+            .occlude()
             .flex()
-            .flex_row()
-            .items_start()
-            .gap(px(10.0))
-            .cursor_pointer()
+            .items_center()
+            .justify_center()
             .child(
                 div()
-                    .flex_none()
-                    .w(px(16.0))
-                    .h(px(16.0))
-                    .mt(px(3.0))
-                    .rounded(px(4.0))
+                    .debug_selector(|| String::from("preset-risk-dialog"))
+                    .occlude()
+                    .w(px(460.0))
+                    .p(px(18.0))
+                    .rounded(px(12.0))
+                    .bg(rgb(theme::page()))
                     .border_1()
-                    .border_color(rgb(if acknowledged {
-                        theme::accent()
-                    } else {
-                        theme::border_strong()
-                    }))
-                    .bg(rgb(if acknowledged {
-                        theme::accent()
-                    } else {
-                        theme::page()
-                    }))
+                    .border_color(rgb(theme::border_strong()))
                     .flex()
-                    .items_center()
-                    .justify_center()
-                    .when(acknowledged, |box_| {
-                        box_.child(icon(IconName::Check, 11.0, theme::page()))
-                    }),
+                    .flex_col()
+                    .gap(px(12.0))
+                    .child(txt(title, 15.0, theme::text()))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_start()
+                            .gap(px(10.0))
+                            .child(div().flex_none().mt(px(2.0)).child(icon(
+                                IconName::TriangleAlert,
+                                14.0,
+                                theme::warn(),
+                            )))
+                            .child(txt(description, 13.0, theme::muted()).flex_1().min_w_0()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .justify_end()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .id("preset-risk-cancel")
+                                    .debug_selector(|| String::from("preset-risk-cancel"))
+                                    .px(px(16.0))
+                                    .h(px(30.0))
+                                    .rounded(px(8.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .border_1()
+                                    .border_color(rgb(theme::border()))
+                                    .hover(|style| style.bg(rgb(theme::hover())))
+                                    .child(txt(
+                                        tr(lang, "settings.presetRiskCancel"),
+                                        13.0,
+                                        theme::text(),
+                                    ))
+                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                        this.cancel_preset_widening(cx);
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("preset-risk-confirm")
+                                    .debug_selector(|| String::from("preset-risk-confirm"))
+                                    .px(px(16.0))
+                                    .h(px(30.0))
+                                    .rounded(px(8.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .bg(rgb(theme::accent()))
+                                    .hover(|style| style.opacity(0.9))
+                                    .child(txt(confirm_label, 13.0, theme::page()))
+                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                        this.confirm_preset_widening(cx);
+                                    })),
+                            ),
+                    ),
             )
-            .child(
-                txt(
-                    tr(lang, "permission.confirmAcknowledge"),
-                    14.0,
-                    theme::text(),
-                )
-                .flex_1()
-                .min_w_0(),
-            )
-            .on_click(cx.listener(|this, _event, _window, cx| {
-                this.permission_toggle_acknowledged(cx);
-            }));
+            .into_any_element()
+    }
+
+    /// Apply the parked widening change (the reader pressed Confirm).
+    pub(crate) fn confirm_preset_widening(&mut self, cx: &mut Context<Self>) {
+        if self.state.apply_pending_preset() {
+            // A saved declaration closes its editor; the draft now holds it.
+            self.preset_editor = None;
+            self.preset_editor_error = None;
+        }
+        self.preset_details = None;
+        cx.notify();
+    }
+
+    /// Drop the parked change: the previous preset stays exactly as it was.
+    pub(crate) fn cancel_preset_widening(&mut self, cx: &mut Context<Self>) {
+        self.state.cancel_pending_preset();
+        cx.notify();
+    }
+
+    /// The full-access confirmation, drawn over the settings dialog.
+    ///
+    /// ONE sentence and TWO buttons. The sentence names the consequence the
+    /// mode actually carries - writes leave the workspace, commands run
+    /// unconfined, and the sandbox's network allowlist no longer applies - and
+    /// the buttons are the strict pair: Cancel keeps the current mode, Enable
+    /// is the only write. There is no second dialog and no separate
+    /// acknowledgement step; the mode cannot be written until this dialog is
+    /// confirmed.
+    pub(crate) fn render_permission_confirm(&self, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
         div()
             .absolute()
             .top(px(0.0))
@@ -5748,7 +6320,7 @@ impl Shell {
                     .border_color(rgb(theme::border_strong()))
                     .flex()
                     .flex_col()
-                    .gap(px(10.0))
+                    .gap(px(12.0))
                     .child(txt(
                         tr(lang, "permission.confirmTitle"),
                         15.0,
@@ -5775,7 +6347,6 @@ impl Shell {
                                 .min_w_0(),
                             ),
                     )
-                    .child(acknowledgement)
                     .child(
                         div()
                             .flex()
@@ -5799,7 +6370,7 @@ impl Shell {
                                     label: tr(lang, "permission.confirmEnable").into(),
                                     primary: true,
                                     min_w: 136.0,
-                                    enabled: acknowledged,
+                                    enabled: true,
                                     action: |shell, cx| shell.permission_confirm_enable(cx),
                                 },
                                 cx,
@@ -5809,8 +6380,7 @@ impl Shell {
             .into_any_element()
     }
 
-    /// One button of the risk gate, at its measured minimum width and disabled
-    /// until the reference's own acknowledgement has been ticked.
+    /// One button of the risk gate, at its measured minimum width.
     ///
     /// The reference draws its two gate buttons from one component with two
     /// measured minimum widths (72 for cancel, 136 for the confirm), so the
@@ -10385,6 +10955,121 @@ impl Shell {
     }
 }
 
+/// The preset's network policy in human terms, for the Details pane.
+///
+/// The three states the `egress` field can be in are the three a reader has to
+/// be able to tell apart:
+///
+/// - absent inherits the workspace allowlist, so the preset's reach is whatever
+///   the workspace declared;
+/// - a declared EMPTY list denies all local egress;
+/// - a declared non-empty list is intersected with the workspace allowlist, so
+///   the entries shown are the preset's own reach, never a widening.
+///
+/// The entries are classified through [`EgressRuleSet`], the same parser the
+/// workspace file and the policy read through, so a hostname entry is shown as a
+/// hostname and a bare port as a port rather than being re-summarised by hand.
+/// Hosted `web search` is a SEPARATE axis - the provider runs it, not this host -
+/// and is named only when the preset grants it, so a reader does not read
+/// \"Deny all\" as \"no search either\".
+fn preset_network_text(
+    egress: &Option<Vec<String>>,
+    web_search: Option<bool>,
+    lang: Lang,
+) -> String {
+    let base = match egress {
+        None => tr(lang, "settings.presetInheritNetwork").to_string(),
+        Some(entries) => {
+            let rules = EgressRuleSet::parse(entries);
+            if rules.is_empty() {
+                tr(lang, "settings.presetNoNetwork").to_string()
+            } else {
+                let mut parts: Vec<String> = Vec::new();
+                parts.extend(rules.addresses);
+                parts.extend(rules.hosts);
+                let mut text = parts.join(", ");
+                if !rules.ports.is_empty() {
+                    let ports: Vec<String> = rules.ports.iter().map(u16::to_string).collect();
+                    text = format!(
+                        "{text} · {}: {}",
+                        tr(lang, "settings.presetNetworkPorts"),
+                        ports.join(", ")
+                    );
+                }
+                text
+            }
+        }
+    };
+    match web_search {
+        Some(true) => format!("{base} · {}", tr(lang, "settings.presetWebSearch")),
+        _ => base,
+    }
+}
+/// One policy module's pane line: its stable id, origin and trust state.
+///
+/// The wording lives here rather than inline so the probe that pins it in both
+/// locales reads the same function the pane renders.
+pub(crate) fn policy_module_head(lang: Lang, module: &agent::policy::PolicyModuleInfo) -> String {
+    let origin = match module.origin {
+        agent::policy::PolicyOrigin::Builtin => tr(lang, "settings.policyModuleBuiltin"),
+        agent::policy::PolicyOrigin::Workspace => tr(lang, "settings.policyModuleWorkspace"),
+        agent::policy::PolicyOrigin::Extension => tr(lang, "settings.policyModuleExtension"),
+    };
+    let trust = if module.trusted {
+        tr(lang, "settings.policyModuleTrusted")
+    } else {
+        tr(lang, "settings.policyModuleUntrusted")
+    };
+    format!("{} · {origin} · {trust}", module.id)
+}
+
+/// The network reach actually in force, in the language the pane draws.
+///
+/// It is the resolution of the preset's egress against the workspace state, so
+/// a card never prints "inherit the workspace allowlist" when the workspace has
+/// no file (unrestricted) or an empty one (deny all).
+fn resolved_egress_text(reach: &crate::preset_catalogue::EgressReach, lang: Lang) -> String {
+    use crate::preset_catalogue::EgressReach;
+    match reach {
+        EgressReach::Unknown => tr(lang, "settings.presetEgressUnknown").to_string(),
+        EgressReach::DenyAll => tr(lang, "settings.presetNoNetwork").to_string(),
+        EgressReach::Unrestricted => tr(lang, "settings.presetEgressUnrestricted").to_string(),
+        EgressReach::Rules {
+            entries,
+            workspace_restricted,
+        } => {
+            let text = entries.join(", ");
+            if *workspace_restricted {
+                format!("{text} · {}", tr(lang, "settings.presetEgressIntersected"))
+            } else {
+                text
+            }
+        }
+    }
+}
+
+/// The preset card's sandbox line, in the language the pane draws.
+///
+/// The refused state is separate from the three declarations: a `none` that the
+/// guard rejects is not "off" (the shell stays confined) and not "inherit" (the
+/// preset did ask for off), so it gets its own sentence naming the rule.
+fn preset_sandbox_text(
+    sandbox: Option<crate::settings::global::SandboxChoice>,
+    widens: bool,
+    lang: Lang,
+) -> String {
+    use crate::settings::global::SandboxChoice;
+    if widens {
+        return tr(lang, "settings.presetSandboxWidens").to_string();
+    }
+    let value = match sandbox {
+        Some(SandboxChoice::Heel) => tr(lang, "settings.presetSandboxHeel").to_string(),
+        Some(SandboxChoice::Off) => tr(lang, "settings.presetSandboxOff").to_string(),
+        None => tr(lang, "settings.presetSandboxInherit").to_string(),
+    };
+    format!("{}: {value}", tr(lang, "settings.presetSandboxLabel"))
+}
+
 /// Format a unix timestamp as 'YYYY-MM-DD HH:MM UTC'.
 ///
 /// The vault stores plain unix seconds and the pane shows a readable date; the
@@ -10450,6 +11135,128 @@ mod capacity_tests {
         assert_eq!(super::vault_stamp(0), "1970-01-01 00:00 UTC");
         assert_eq!(super::vault_stamp(1_700_000_000), "2023-11-14 22:13 UTC");
         assert_eq!(super::vault_stamp(951_782_400), "2000-02-29 00:00 UTC");
+    }
+}
+
+/// The preset Details network line, in both locales and in human terms.
+///
+/// The three states a reader has to tell apart are exactly the three the
+/// `egress` field can be in, and the probe pins the EXACT strings both
+/// dictionaries carry so a rewrite of one locale cannot silently drop a state.
+#[cfg(test)]
+mod network_tests {
+    use super::preset_network_text;
+    use crate::i18n::Lang;
+
+    fn text(egress: &Option<Vec<String>>, web_search: Option<bool>, locale: &str) -> String {
+        preset_network_text(egress, web_search, Lang::from_locale(locale))
+    }
+
+    /// An absent field is the inherit state, in both locales.
+    #[test]
+    fn an_absent_field_reads_as_inheritance() {
+        assert_eq!(text(&None, None, "en"), "Inherit the workspace allowlist");
+        assert_eq!(text(&None, None, "zh"), "继承工作区允许列表");
+    }
+
+    /// A declared empty list is deny-all, in both locales, and it is NOT the
+    /// same string as inheritance.
+    #[test]
+    fn a_declared_empty_list_reads_as_deny_all() {
+        let empty = Some(Vec::new());
+        assert_eq!(text(&empty, None, "en"), "Deny all");
+        assert_eq!(text(&empty, None, "zh"), "全部拒绝");
+        assert_ne!(
+            text(&empty, None, "en"),
+            text(&None, None, "en"),
+            "deny-all and inherit must not read the same"
+        );
+    }
+
+    /// A declared list shows the exact hosts and ports, classified through the
+    /// same parser the policy reads, in both locales.
+    #[test]
+    fn a_declared_list_shows_the_exact_hosts_and_ports() {
+        let list = Some(vec![
+            "203.0.113.7".to_string(),
+            "api.example.test".to_string(),
+            "443".to_string(),
+        ]);
+        assert_eq!(
+            text(&list, None, "en"),
+            "203.0.113.7, api.example.test · ports: 443"
+        );
+        assert_eq!(
+            text(&list, None, "zh"),
+            "203.0.113.7, api.example.test · 端口: 443"
+        );
+    }
+
+    /// Hosted web search is a separate axis and is named only when granted, so
+    /// \"Deny all\" is never misread as \"no search either\".
+    #[test]
+    fn hosted_search_is_named_beside_the_local_policy() {
+        assert_eq!(
+            text(&Some(Vec::new()), Some(true), "en"),
+            "Deny all · Web search"
+        );
+        assert_eq!(
+            text(&None, Some(true), "zh"),
+            "继承工作区允许列表 · 网页搜索"
+        );
+        assert_eq!(
+            text(&Some(Vec::new()), Some(false), "en"),
+            "Deny all",
+            "hosted search off adds nothing to read"
+        );
+    }
+
+    /// The SHIPPED roster through the same path the card renders: Standard, PTC
+    /// and Creator inherit the workspace reach because they keep the shell and
+    /// the MCP servers; Read-only denies all local egress because every tool it
+    /// keeps only reads the workspace. Both locales, so a translation cannot
+    /// quietly turn \"Deny all\" into something else.
+    #[test]
+    fn the_shipped_roster_renders_its_declared_network_policy() {
+        use crate::settings::global::GlobalSettings;
+        let presets = GlobalSettings::default();
+        for id in ["standard", "ptc", "creator"] {
+            let preset = presets.preset(id).expect("a shipped preset");
+            assert_eq!(
+                preset.egress, None,
+                "{id} keeps network-using tools, so it inherits the workspace reach"
+            );
+            assert_eq!(
+                preset.web_search,
+                Some(true),
+                "{id} allows web search by default, stated rather than inherited"
+            );
+            assert_eq!(
+                text(&preset.egress, preset.web_search, "en"),
+                "Inherit the workspace allowlist · Web search",
+                "{id}"
+            );
+            assert_eq!(
+                text(&preset.egress, preset.web_search, "zh"),
+                "继承工作区允许列表 · 网页搜索",
+                "{id}"
+            );
+        }
+        let read_only = presets.preset("read-only").expect("read-only");
+        assert_eq!(
+            read_only.egress,
+            Some(Vec::new()),
+            "read-only declares an empty reach, not an absent one"
+        );
+        assert_eq!(
+            text(&read_only.egress, read_only.web_search, "en"),
+            "Deny all · Web search",
+            "local egress denied; hosted search is a separate axis"
+        );
+        assert_eq!(
+            text(&read_only.egress, read_only.web_search, "zh"),
+            "全部拒绝 · 网页搜索"
+        );
     }
 }
 

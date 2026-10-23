@@ -12,6 +12,7 @@ pub(crate) mod hero;
 pub(crate) mod lane;
 pub(crate) mod meter;
 pub(crate) mod paging;
+pub(crate) mod permission;
 mod session_menu;
 mod slash_palette;
 pub(crate) mod smooth;
@@ -207,6 +208,13 @@ impl Startup {
 pub(crate) fn bind_global_actions(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-s", right_panel::SaveFile, None),
+        // The Browser pane's Start card prints this chord, so it has to open
+        // the pane - a hint that presses nothing is a lying control.
+        KeyBinding::new("cmd-t", right_panel::BrowserTab, None),
+        // Tab belongs to the shell while the terminal has focus. Without a
+        // binding the macOS input handler falls through to AppKit's key-view
+        // loop, so focus leaves the pane and the shell never sees the byte.
+        KeyBinding::new("tab", right_panel::TerminalTab, Some("terminal")),
         // The session menu's accelerators. The menu shows these keys, so they
         // have to do the same thing the row does - a hint that presses nothing
         // is a lying control.

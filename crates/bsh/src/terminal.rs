@@ -67,13 +67,16 @@
 //!
 //! The pane's spawn asks the turn's shared
 //! [agent::sandbox::SandboxSpec] what it may do with a PTY IT owns, and the
-//! same spec is what the shell tool runs under. The measured answer is that no
-//! supported backend can host a caller-owned PTY (heel allocates its own and
-//! relays this process's stdio), so a confined turn's shell runs outside the
-//! sandbox. That is passed to the shell as BSH_SANDBOX - a reader can type
-//! `echo $BSH_SANDBOX` - and stated on the pane's status line whenever the pane
-//! has something to report, rather than being implied away. The Rego input gate
-//! below still decides every submitted line.
+//! same spec is what the shell tool runs under. On macOS and Linux the pane's
+//! shell runs INSIDE the sandbox: the spec starts it with the caller's tty
+//! opened BY PATH, because heel can grant that device write and ioctl. On
+//! Windows heel cannot be handed the pane's ConPTY, so the shell runs on the
+//! pane's own pty and the pane says why. The answer reaches the shell as
+//! BSH_SANDBOX - a reader can type `echo $BSH_SANDBOX` - and is stated on the
+//! pane's status line whenever the pane has something to report, rather than
+//! being implied away. A preset that set `sandbox = "none"` reports "none"
+//! (not "full-access"), so the shell agrees with the bash result. The Rego
+//! input gate below still decides every submitted line.
 //!
 //! Owed, stated rather than faked: reflow on resize (the grid is clipped, not
 //! re-wrapped), mouse reporting (CSI ?1000 / ?1002 / ?1006 are not modelled, so
@@ -1817,9 +1820,12 @@ fn record_decision(
 /// The pane's spawn answers the shared spec (see
 /// [agent::sandbox::SandboxSpec::terminal]) and reports the answer into the
 /// shell's environment, so a reader can type "echo $BSH_SANDBOX" and a command
-/// can branch on it. On macOS a confined turn's shell runs INSIDE the sandbox,
-/// so the value is the permission tier itself; a backend that cannot host the
-/// pane's tty reports "unsupported-pty" and the pane's status line says why.
+/// can branch on it. On macOS and Linux a confined turn's shell runs INSIDE the
+/// sandbox, so the value is the permission tier itself; a backend that cannot
+/// host the pane's tty reports "unsupported-pty" and the pane's status line says
+/// why. The spawn path overrides the value with "none" when the caller passes a
+/// preset-off note (see [`Terminal::new_with_sandbox_note`]), so the shell's own
+/// report matches the tool result.
 fn sandbox_env(spec: Option<&agent::sandbox::SandboxSpec>) -> Option<&'static str> {
     match spec {
         None => None,
@@ -1855,6 +1861,12 @@ pub(crate) struct Terminal {
     sandbox_env: Option<&'static str>,
     /// Why this shell is not inside the turn's sandbox, when it is not.
     pub(crate) sandbox_note: Option<String>,
+    /// The shell is unconfined because a PRESET turned the sandbox off.
+    ///
+    /// Distinct from a full-access release and from a backend that cannot host
+    /// the pane's tty: this is a policy choice the reader can reverse, so the
+    /// status line keeps saying so while the shell runs.
+    pub(crate) sandbox_off_by_preset: bool,
     /// Why the shell is not running, when it is not.
     pub(crate) failure: Option<String>,
     /// The gate refused the start, so no process was ever created.
@@ -2063,7 +2075,7 @@ impl Terminal {
     /// is [Terminal::new_with_sandbox], which records what the spec answered.
     #[cfg(test)]
     pub(crate) fn new(cwd: PathBuf, lang: Lang) -> Self {
-        Self::start(cwd, lang, None)
+        Self::start(cwd, lang, None, None)
     }
 
     /// A terminal whose spawn was told what the turn may touch.
@@ -2078,7 +2090,21 @@ impl Terminal {
         lang: Lang,
         spec: Option<&agent::sandbox::SandboxSpec>,
     ) -> Self {
-        Self::start(cwd, lang, spec)
+        Self::start(cwd, lang, spec, None)
+    }
+
+    /// The same spawn, with the attribution a preset's off needs.
+    ///
+    /// The note is passed BEFORE the spawn so the shell's own `BSH_SANDBOX`
+    /// reports "none"; setting it afterwards would leave a running shell
+    /// claiming "full-access" while the status line said a preset turned it off.
+    pub(crate) fn new_with_sandbox_note(
+        cwd: PathBuf,
+        lang: Lang,
+        spec: Option<&agent::sandbox::SandboxSpec>,
+        note: Option<String>,
+    ) -> Self {
+        Self::start(cwd, lang, spec, note)
     }
 
     /// Why this shell is not sandboxed, when it is not.
@@ -2088,21 +2114,51 @@ impl Terminal {
 
     /// What the shell sees as BSH_SANDBOX, when there is something to say.
     ///
-    /// "full-access" is a released turn, a permission tier is a sandboxed
-    /// shell, and "unsupported-pty" is a backend that could not host the pane's
-    /// terminal.
+    /// "none" is a preset that turned the sandbox off, "full-access" is a
+    /// permission-released turn, a permission tier is a sandboxed shell, and
+    /// "unsupported-pty" is a backend that could not host the pane's terminal.
     pub(crate) fn sandbox_label(&self) -> Option<&'static str> {
         self.sandbox_env
     }
 
     /// Build the terminal, ask the spec, and start the shell.
-    fn start(cwd: PathBuf, lang: Lang, spec: Option<&agent::sandbox::SandboxSpec>) -> Self {
+    fn start(
+        cwd: PathBuf,
+        lang: Lang,
+        spec: Option<&agent::sandbox::SandboxSpec>,
+        preset_off_note: Option<String>,
+    ) -> Self {
+        Self::start_with_shell(cwd, lang, spec, None, preset_off_note)
+    }
+
+    /// Build the terminal with an explicit shell when a test needs one.
+    ///
+    /// Production always lets [shell_program_for] choose: the reader's shell is
+    /// part of the pane's contract, and a confined pane may have to replace it.
+    /// The override exists so the platform-specific completion test can drive
+    /// zsh even on a host whose reader prefers another shell.
+    fn start_with_shell(
+        cwd: PathBuf,
+        lang: Lang,
+        spec: Option<&agent::sandbox::SandboxSpec>,
+        shell_override: Option<PathBuf>,
+        preset_off_note: Option<String>,
+    ) -> Self {
         // Asked before the spawn, so the spawn path cannot be edited into
         // assuming a confinement the answer refuses.
-        let sandbox_env = sandbox_env(spec);
+        let mut sandbox_env = sandbox_env(spec);
         let mut sandbox_note = sandbox_reason(spec).map(str::to_string);
+        let preset_off = preset_off_note.is_some();
+        if let Some(note) = preset_off_note {
+            // The shell reports what the TURN decided, not only the permission
+            // tier: a preset's explicit off is "none", so the pane and the bash
+            // result agree. This must happen BEFORE the spawn.
+            sandbox_env = Some("none");
+            sandbox_note = Some(note);
+        }
         let mut terminal = Self::build(cwd, lang, DEFAULT_COLS, DEFAULT_ROWS);
         terminal.sandbox_env = sandbox_env;
+        terminal.sandbox_off_by_preset = preset_off;
         // Cloned: the shell needs it for its whole life, and the pane's caller
         // holds the same value for the shell tool.
         terminal.sandbox_spec = spec.map(|spec| std::sync::Arc::new(spec.clone()));
@@ -2110,7 +2166,7 @@ impl Terminal {
             .sandbox_spec
             .as_deref()
             .is_some_and(|spec| spec.terminal().is_sandboxed());
-        let shell = shell_program_for(confined);
+        let shell = shell_override.unwrap_or_else(|| shell_program_for(confined));
         terminal.shell = shell.clone();
         // The reader's own shell when it can run confined; otherwise the pane
         // says which shell it used and why, once, in the pane itself.
@@ -2184,6 +2240,7 @@ impl Terminal {
             sandbox_spec: None,
             sandbox_env: None,
             sandbox_note: None,
+            sandbox_off_by_preset: false,
             failure,
             refused,
             lang,
@@ -2262,30 +2319,66 @@ impl Terminal {
         };
         // The interface the shell starts with, and the answer it can read back:
         // a reader can type "echo $BSH_SANDBOX", and a command can branch on it.
-        let mut envs: Vec<(String, String)> = vec![
-            ("TERM".to_string(), "xterm-256color".to_string()),
-            ("COLORTERM".to_string(), "truecolor".to_string()),
-        ];
+        //
+        // TERM and COLORTERM are a Unix convention; a Windows console has no
+        // terminfo to match them against, so they are set only where they mean
+        // something.
+        let mut envs: Vec<(String, String)> = Vec::new();
+        #[cfg(unix)]
+        {
+            envs.push(("TERM".to_string(), "xterm-256color".to_string()));
+            envs.push(("COLORTERM".to_string(), "truecolor".to_string()));
+            // A pane with no rc files would otherwise draw monochrome: BSD ls
+            // reads these two, and git's colour.ui already defaults to auto.
+            envs.push(("CLICOLOR".to_string(), "1".to_string()));
+            envs.push(("LSCOLORS".to_string(), "ExFxCxDxBxegedabagacad".to_string()));
+        }
         if let Some(label) = self.sandbox_env {
             envs.push(("BSH_SANDBOX".to_string(), label.to_string()));
         }
-        // Two spawn shapes, and exactly one applies: a shell the sandbox CAN
-        // host is started by the spec with the pane's tty granted; anything else
-        // is started on the pty by the pane itself, which is the only path that
-        // gives the child a controlling terminal (portable-pty calls login_tty).
-        // The sandboxed path reaches the tty BY PATH - portable-pty exposes the
-        // slave's name, not its fd - which is why the slave is held open below.
+        // A confined shell cannot read the reader's $HOME, so every nested
+        // shell opens with an rc file it was not allowed to read: bash prints
+        // the permission error and fish complains about its data directory.
+        // Give the pane a home inside the workspace instead - reads and writes
+        // stay inside the sandbox, and the shells land on an empty profile.
+        let sandbox_home = self
+            .sandbox_spec
+            .as_deref()
+            .filter(|spec| spec.terminal().is_sandboxed())
+            .and_then(|spec| {
+                let home = spec.root().join(".bsh").join("home");
+                for dir in ["config", "data", "cache", "state"] {
+                    std::fs::create_dir_all(home.join(dir)).ok()?;
+                }
+                Some(home)
+            });
+        if let Some(home) = sandbox_home {
+            envs.push(("HOME".to_string(), home.display().to_string()));
+            for (key, dir) in [
+                ("XDG_CONFIG_HOME", "config"),
+                ("XDG_DATA_HOME", "data"),
+                ("XDG_CACHE_HOME", "cache"),
+                ("XDG_STATE_HOME", "state"),
+            ] {
+                envs.push((key.to_string(), home.join(dir).display().to_string()));
+            }
+        }
+        // Two spawn shapes, and exactly one applies:
+        //
+        // - a shell the sandbox CAN host (macOS today) is started by the spec
+        //   with the pane's tty opened BY PATH. portable-pty exposes the slave's
+        //   NAME, not its fd, which is why the slave is held open below.
+        // - anything else is started on the pty by the pane itself. That is the
+        //   only path that performs the terminal handshake - login_tty on Unix,
+        //   ConPTY on Windows - so it is also the path that works everywhere the
+        //   sandbox cannot join.
         let sandboxed = self
             .sandbox_spec
             .as_deref()
             .filter(|spec| spec.terminal().is_sandboxed());
-        let mut child = match sandboxed {
-            Some(spec) => {
-                let Some(tty) = pair.master.tty_name() else {
-                    self.failure =
-                        Some(String::from("the pane's PTY has no name to give the shell"));
-                    return false;
-                };
+        let tty = sandboxed.and_then(|_| tty_path(pair.master.as_ref()));
+        let mut child = match (sandboxed, tty) {
+            (Some(spec), Some(tty)) => {
                 self.tty_hold = std::fs::OpenOptions::new()
                     .read(true)
                     .write(true)
@@ -2299,7 +2392,7 @@ impl Terminal {
                     }
                 }
             }
-            None => {
+            _ => {
                 let mut command = CommandBuilder::new(shell);
                 command.cwd(&cwd);
                 for (key, value) in &envs {
@@ -2329,12 +2422,16 @@ impl Terminal {
                 return failed(&mut child, error.to_string(), self);
             }
         };
-        let writer = match pair.master.take_writer() {
+        let mut writer = match pair.master.take_writer() {
             Ok(writer) => writer,
             Err(error) => {
                 return failed(&mut child, error.to_string(), self);
             }
         };
+        #[cfg(unix)]
+        if let Some(bootstrap) = completion_bootstrap(shell, sandboxed.is_some()) {
+            let _ = write_without_echo(pair.master.as_ref(), writer.as_mut(), bootstrap);
+        }
         self.pty = Some(pair.master);
         self.input = Some(InputWriter::spawn(writer));
         self.child = Some(child);
@@ -2549,10 +2646,68 @@ impl Terminal {
             return self.submit_line();
         }
         self.track_line(bytes);
+        // A confined shell reads the pane's tty by path and never performed the
+        // terminal handshake (setsid + TIOCSCTTY), so the tty can end up with no
+        // foreground group and the driver's ISIG delivery for Ctrl-C goes
+        // nowhere. Signal the tty's foreground group here; the byte still goes
+        // through, which is what the line editor uses when the group is unset.
+        #[cfg(unix)]
+        if bytes == [0x03] {
+            self.interrupt_foreground();
+        }
         if self.send_bytes(bytes) {
             KeyOutcome::Sent
         } else {
             KeyOutcome::Closed
+        }
+    }
+
+    /// Deliver the interrupt the tty driver would have delivered.
+    ///
+    /// Only the confined spawn needs this: portable-pty's own spawn runs
+    /// `login_tty`, while the sandbox path opens the pane's tty by path, which
+    /// makes no session leader and can leave the tty without a foreground
+    /// group. The pane holds that tty, so it asks for the group and signals it,
+    /// never its own group - signalling that would interrupt the application.
+    #[cfg(unix)]
+    fn interrupt_foreground(&self) {
+        use std::os::unix::io::AsRawFd;
+        let Some(tty) = self.tty_hold.as_ref() else {
+            return;
+        };
+        let fd = tty.as_raw_fd();
+        let own = unsafe { libc::getpgrp() };
+        let foreground = unsafe { libc::tcgetpgrp(fd) };
+        let shell = self
+            .child
+            .as_ref()
+            .and_then(|child| match child {
+                ShellChild::Plain(child) => child.process_id(),
+                ShellChild::Sandboxed(child) => Some(child.id()),
+            })
+            .map(|pid| pid as i32)
+            .filter(|pid| *pid > 1);
+        // The tty has a foreground group, so the driver delivered the interrupt
+        // itself; a second signal here would fire it twice.
+        if foreground > 1 {
+            return;
+        }
+        // No foreground group was ever claimed: fall back to the shell's own
+        // group, which is where a shell without job control runs the command
+        // the reader wants interrupted.
+        let group = shell.map(|pid| unsafe { libc::getpgid(pid) }).unwrap_or(-1);
+        if let Some(group) = interruptable_group(group, own) {
+            unsafe {
+                libc::kill(-group, libc::SIGINT);
+            }
+        } else if let Some(pid) = shell {
+            // The shell shares the application's group (heel's spawn builder
+            // offers no process-group hook), so a group signal would hit the
+            // application. Interrupt the shell alone: at its prompt that is
+            // the same key, and while it waits it aborts the wait.
+            unsafe {
+                libc::kill(pid, libc::SIGINT);
+            }
         }
     }
 
@@ -2885,52 +3040,221 @@ impl Drop for Terminal {
     }
 }
 
+/// The pane's pty device, when the platform has one to open by name.
+///
+/// portable-pty's `tty_name` is a Unix method, and a ConPTY has no device node
+/// to open; heel cannot be handed its handle either. Returning none makes the
+/// caller use the pane's own spawn, which is the only path that works there.
+fn tty_path(master: &dyn MasterPty) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        master.tty_name()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = master;
+        None
+    }
+}
+
+/// Write setup bytes to the PTY with the driver's echo off.
+///
+/// The line discipline echoes queued input, so without this the bootstrap bytes
+/// would be printed by the driver and again by the shell's line editor. Only
+/// the driver's copy is suppressed: zsh's zle draws the line it reads, which is
+/// why the pane shows the one bootstrap command at the first prompt. Restoring
+/// only the echo bit keeps any terminal settings the shell has already changed.
+#[cfg(unix)]
+fn write_without_echo<W: Write + ?Sized>(
+    master: &dyn MasterPty,
+    writer: &mut W,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    let Some(fd) = master.as_raw_fd() else {
+        return writer.write_all(bytes);
+    };
+    let mut original = unsafe { std::mem::zeroed::<libc::termios>() };
+    if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
+        return writer.write_all(bytes);
+    }
+    let mut quiet = original;
+    quiet.c_lflag &= !libc::ECHO;
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) } != 0 {
+        return writer.write_all(bytes);
+    }
+
+    let result = writer.write_all(bytes).and_then(|_| writer.flush());
+
+    let mut current = unsafe { std::mem::zeroed::<libc::termios>() };
+    if unsafe { libc::tcgetattr(fd, &mut current) } == 0 {
+        current.c_lflag = (current.c_lflag & !libc::ECHO) | (original.c_lflag & libc::ECHO);
+        unsafe {
+            libc::tcsetattr(fd, libc::TCSANOW, &current);
+        }
+    }
+    result
+}
+
 /// The shell the terminal runs: the reader's own when it is usable, then the
 /// shells a macOS install carries, then /bin/sh as the last resort.
 pub(crate) fn shell_program() -> PathBuf {
     shell_program_for(false)
 }
 
+/// The shells a platform carries, most preferred first.
+///
+/// A Windows install has no /bin/sh at all, which is why the list is per
+/// platform rather than a Unix list with a fallback: "cmd.exe" is the last
+/// resort there, and the pane would be dead if it were not.
+pub(crate) fn shell_candidates(
+    platform: agent::sandbox::TerminalPlatform,
+) -> &'static [&'static str] {
+    use agent::sandbox::TerminalPlatform;
+    match platform {
+        TerminalPlatform::MacOs => &["/bin/zsh", "/bin/bash", "/bin/sh"],
+        TerminalPlatform::Linux => &["/bin/bash", "/bin/zsh", "/bin/sh"],
+        TerminalPlatform::Windows => &["pwsh.exe", "powershell.exe", "cmd.exe"],
+        TerminalPlatform::Other => &["/bin/sh"],
+    }
+}
+
 /// The shell a pane runs, given whether its shell is sandboxed.
 ///
 /// A sandboxed shell cannot be given a controlling terminal: only
-/// portable-pty's own spawn calls login_tty, and a shell started by the sandbox
-/// is in a session of its own with no tty to lead. Most shells tolerate that;
-/// fish does not, and it is not a warning - measured inside the sandbox, fish
-/// prints "No TTY for interactive shell (tcgetpgrp failed)" and then never runs
-/// a command. So a confined pane asks for a shell that works and says which one
-/// it used, instead of drawing a pane that cannot take a keystroke.
+/// portable-pty's own spawn performs the handshake (login_tty on Unix, ConPTY on
+/// Windows), and a shell started by the sandbox is in a session of its own with
+/// no tty to lead. Most shells tolerate that; fish does not, and it is not a
+/// warning - measured inside the sandbox, fish prints "No TTY for interactive
+/// shell (tcgetpgrp failed)" and then never runs a command. So a confined pane
+/// asks for a shell that works and says which one it used, instead of drawing a
+/// pane that cannot take a keystroke. On Linux and Windows the pane is never
+/// confined (see SandboxSpec::terminal), so the reader's own shell is kept there.
 pub(crate) fn shell_program_for(confined: bool) -> PathBuf {
-    if !confined {
-        if let Some(shell) = std::env::var_os("SHELL") {
-            let path = PathBuf::from(shell);
-            if path.is_absolute() && path.is_file() {
-                return path;
-            }
+    // SHELL is the Unix convention and COMSPEC the Windows one; either may be
+    // absolute or a bare name, and the lookup below resolves both.
+    let reader = std::env::var_os("SHELL")
+        .or_else(|| std::env::var_os("COMSPEC"))
+        .map(PathBuf::from);
+    shell_choice(
+        confined,
+        agent::sandbox::TerminalPlatform::current(),
+        reader.as_deref(),
+        &lookup_program,
+    )
+}
+
+/// The shell decision itself, with resolution injected so every platform's
+/// table can be tested from any one of them.
+fn shell_choice(
+    confined: bool,
+    platform: agent::sandbox::TerminalPlatform,
+    reader: Option<&Path>,
+    lookup: &dyn Fn(&str) -> Option<PathBuf>,
+) -> PathBuf {
+    let usable = |path: &Path| -> Option<PathBuf> {
+        let raw = path.to_str()?;
+        let resolved = lookup(raw)?;
+        // A confined pane may not keep fish: it needs a controlling terminal.
+        if confined && is_fish(raw) {
+            return None;
         }
-    } else if let Some(shell) = std::env::var_os("SHELL") {
-        let path = PathBuf::from(shell);
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default();
-        if path.is_absolute() && path.is_file() && !name.starts_with("fish") {
+        Some(resolved)
+    };
+    if let Some(shell) = reader.and_then(usable) {
+        return shell;
+    }
+    let candidates = shell_candidates(platform);
+    for candidate in candidates {
+        if let Some(path) = lookup(candidate) {
             return path;
         }
     }
-    for candidate in ["/bin/zsh", "/bin/bash", "/bin/sh"] {
-        let path = PathBuf::from(candidate);
-        if path.is_file() {
-            return path;
-        }
+    PathBuf::from(candidates[0])
+}
+
+/// Whether a shell is fish, which cannot run without a controlling terminal.
+fn is_fish(path: &str) -> bool {
+    path.rsplit(['/', '\\'])
+        .next()
+        .is_some_and(|name| name.starts_with("fish"))
+}
+
+/// The completion setup a confined zsh needs before its first prompt.
+///
+/// zsh loads completion functions through compinit, normally from the reader's
+/// zshrc. The sandbox denies the reader's home, so that file is not available
+/// and the pane would only get zsh's basic file-name completion. The bootstrap
+/// loads the system's completion functions without a writable dump file, then
+/// points history at /dev/null so the setup leaves no state behind.
+///
+/// `-C` skips compinit's security audit (a confined pane has no user rc
+/// directories for it to judge, and the audit stats every fpath entry), and the
+/// `completer` style keeps the two cheap passes: the default `_match` and
+/// `_approximate` passes re-scan the filesystem on a Tab that finds no match,
+/// which under the sandbox is the difference between an instant Tab and a
+/// stalled one.
+///
+/// The prompt and the colour switches ride along because a confined pane has no
+/// reader rc files: without them the pane is a bare zsh, monochrome by
+/// construction, while every other terminal the reader uses has colours.
+const ZSH_COMPLETION_BOOTSTRAP: &[u8] = b" autoload -Uz compinit; compinit -C -D; \
+zstyle ':completion:*' completer _complete _ignored; \
+PROMPT='%F{33}%n@%m%f %F{37}%~%f %# '; fc -p /dev/null 2>/dev/null\n";
+
+/// The bootstrap a shell needs, if any.
+///
+/// An unconfined zsh already loaded the reader's own completion setup, while
+/// bash and sh bring their own line editor defaults. Only a confined zsh needs
+/// the extra command.
+fn completion_bootstrap(shell: &Path, confined: bool) -> Option<&'static [u8]> {
+    if !confined || !is_zsh(shell) {
+        return None;
     }
-    PathBuf::from("/bin/sh")
+    Some(ZSH_COMPLETION_BOOTSTRAP)
+}
+
+/// Whether a shell program is zsh.
+fn is_zsh(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "zsh" || name.starts_with("zsh-"))
+}
+
+/// The process group an interrupt may signal, if one is safe to signal.
+///
+/// A group of 1 is init, and the application's own group is the pane itself;
+/// a terminal's Ctrl-C means neither.
+#[cfg(unix)]
+fn interruptable_group(group: i32, own: i32) -> Option<i32> {
+    (group > 1 && group != own).then_some(group)
+}
+
+/// Resolve a program the way the platform would: a path must exist, a bare name
+/// is searched on PATH.
+fn lookup_program(name: &str) -> Option<PathBuf> {
+    let path = Path::new(name);
+    if path.is_absolute() || path.components().count() > 1 {
+        return path.is_file().then(|| path.to_path_buf());
+    }
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|directory| directory.join(name))
+        .find(|candidate| candidate.is_file())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[cfg(unix)]
+    #[test]
+    fn an_interrupt_never_targets_the_application_group() {
+        assert_eq!(super::interruptable_group(1200, 900), Some(1200));
+        assert_eq!(super::interruptable_group(900, 900), None);
+        assert_eq!(super::interruptable_group(1, 900), None);
+        assert_eq!(super::interruptable_group(0, 900), None);
+    }
 
     fn scratch(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("bsh-terminal-{}-{label}", std::process::id()));
@@ -3805,6 +4129,139 @@ mod tests {
         );
     }
 
+    /// A lookup over a fixed set of (name, resolved path) pairs, so the shell
+    /// decision table can be exercised for every platform from this one.
+    fn lookup_map(
+        entries: &'static [(&'static str, &'static str)],
+    ) -> impl Fn(&str) -> Option<PathBuf> {
+        move |name| {
+            entries
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, path)| PathBuf::from(path))
+        }
+    }
+
+    /// The shell decision is a per-platform TABLE, and none of the three
+    /// platforms may fall through to a shell it does not carry.
+    #[test]
+    fn the_shell_decision_table_covers_all_three_platforms() {
+        use agent::sandbox::TerminalPlatform;
+        let mac = lookup_map(&[
+            ("/opt/homebrew/bin/fish", "/opt/homebrew/bin/fish"),
+            ("/bin/zsh", "/bin/zsh"),
+            ("/bin/sh", "/bin/sh"),
+        ]);
+        // Unconfined: the reader's own shell, fish included.
+        assert_eq!(
+            shell_choice(
+                false,
+                TerminalPlatform::MacOs,
+                Some(Path::new("/opt/homebrew/bin/fish")),
+                &mac
+            ),
+            PathBuf::from("/opt/homebrew/bin/fish")
+        );
+        // Confined: fish needs a controlling terminal, so zsh is chosen and the
+        // pane says so (see Terminal::start).
+        assert_eq!(
+            shell_choice(
+                true,
+                TerminalPlatform::MacOs,
+                Some(Path::new("/opt/homebrew/bin/fish")),
+                &mac
+            ),
+            PathBuf::from("/bin/zsh")
+        );
+        // A shell that works confined is kept.
+        assert_eq!(
+            shell_choice(
+                true,
+                TerminalPlatform::MacOs,
+                Some(Path::new("/bin/zsh")),
+                &mac
+            ),
+            PathBuf::from("/bin/zsh")
+        );
+        // No reader at all: the platform's first installed candidate.
+        assert_eq!(
+            shell_choice(false, TerminalPlatform::MacOs, None, &mac),
+            PathBuf::from("/bin/zsh")
+        );
+
+        // Linux prefers bash, and /bin/sh still exists there.
+        let linux = lookup_map(&[("/bin/bash", "/bin/bash"), ("/bin/sh", "/bin/sh")]);
+        assert_eq!(
+            shell_choice(false, TerminalPlatform::Linux, None, &linux),
+            PathBuf::from("/bin/bash")
+        );
+
+        // Windows has no /bin/sh: pwsh, then powershell, then cmd.
+        let windows = lookup_map(&[
+            ("pwsh.exe", "C:/Program Files/PowerShell/7/pwsh.exe"),
+            ("cmd.exe", "C:/Windows/system32/cmd.exe"),
+        ]);
+        assert_eq!(
+            shell_choice(false, TerminalPlatform::Windows, None, &windows),
+            PathBuf::from("C:/Program Files/PowerShell/7/pwsh.exe")
+        );
+        // A COMSPEC reader (cmd.exe) is used when it resolves.
+        assert_eq!(
+            shell_choice(
+                false,
+                TerminalPlatform::Windows,
+                Some(Path::new("cmd.exe")),
+                &windows
+            ),
+            PathBuf::from("C:/Windows/system32/cmd.exe")
+        );
+        // Nothing resolves: the name is left for the OS to resolve itself
+        // (CreateProcess searches PATH and PATHEXT), never a Unix path.
+        let empty = lookup_map(&[]);
+        assert_eq!(
+            shell_choice(false, TerminalPlatform::Windows, None, &empty),
+            PathBuf::from("pwsh.exe")
+        );
+    }
+
+    /// The real resolver: an absolute path must exist, a bare name is searched
+    /// on PATH. This host always carries sh somewhere, and a bogus absolute path
+    /// never resolves.
+    #[test]
+    fn the_program_lookup_resolves_paths_and_path_names() {
+        assert!(lookup_program("sh").is_some(), "sh is on PATH on this host");
+        assert!(lookup_program("/definitely/not/a/shell").is_none());
+        assert!(lookup_program("/bin/sh").is_some());
+    }
+
+    /// Every shell the pane can pick is a real absolute path or a bare name the
+    /// platform resolves; nothing here is a Unix path on Windows by accident.
+    #[test]
+    fn the_shell_candidates_are_platform_appropriate() {
+        use agent::sandbox::TerminalPlatform;
+        assert!(shell_candidates(TerminalPlatform::MacOs).contains(&"/bin/zsh"));
+        assert!(shell_candidates(TerminalPlatform::Linux).contains(&"/bin/bash"));
+        assert!(shell_candidates(TerminalPlatform::Windows).contains(&"pwsh.exe"));
+        assert!(
+            !shell_candidates(TerminalPlatform::Windows)
+                .iter()
+                .any(|candidate| candidate.starts_with('/')),
+            "a Windows candidate list may not name a Unix path"
+        );
+    }
+    /// Only a confined zsh needs the pane's completion bootstrap.
+    #[test]
+    fn only_a_confined_zsh_gets_the_completion_bootstrap() {
+        assert!(completion_bootstrap(Path::new("/bin/zsh"), true).is_some());
+        assert!(completion_bootstrap(Path::new("/bin/zsh"), false).is_none());
+        assert!(completion_bootstrap(Path::new("/bin/bash"), true).is_none());
+        let bootstrap = completion_bootstrap(Path::new("/bin/zsh"), true).unwrap();
+        let text = std::str::from_utf8(bootstrap).expect("the bootstrap is UTF-8");
+        assert!(text.contains("compinit"), "completion is set up: {text}");
+        assert!(text.contains("PROMPT="), "the pane gets a prompt: {text}");
+        assert!(text.contains("PROMPT="), "the prompt is coloured: {text}");
+    }
+
     /// Type one line into a live pane and wait for it to come back.
     fn type_and_wait(terminal: &mut Terminal, line: &str, needle: &str) -> bool {
         for byte in line.as_bytes() {
@@ -3817,7 +4274,11 @@ mod tests {
     /// The pane's shell runs INSIDE the turn's sandbox: a command typed here
     /// cannot write outside the workspace, while the PTY stays a real terminal
     /// (echo, resize, exit). The probe is a marker file, not a message.
-    #[cfg(target_os = "macos")]
+    ///
+    /// Unix runs it on every backend that can grant the pane's device: macOS by
+    /// sandbox-exec, Linux by heel's Landlock ruleset, which grants /dev/pts
+    /// when allow_tty_write is on.
+    #[cfg(unix)]
     #[test]
     fn the_terminal_shell_runs_inside_the_sandbox() {
         let dir = scratch("sandbox-shell");
@@ -3851,11 +4312,14 @@ mod tests {
         };
         let outside = home.join(format!("bsh-terminal-escape-{}.txt", std::process::id()));
         let _ = std::fs::remove_file(&outside);
+        // The shell reports the failed redirection with an exit code, which is
+        // the same on both kernels; the message ("Operation not permitted" on
+        // macOS, "Permission denied" on Linux) is not asserted here.
         assert!(
             type_and_wait(
                 &mut terminal,
-                &format!("printf escaped > {}", outside.display()),
-                "not permitted"
+                &format!("printf escaped > {}; echo refused=$?", outside.display()),
+                "refused=1"
             ),
             "the sandboxed shell was not refused: {:?}",
             terminal.lines()
@@ -3918,6 +4382,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A confined zsh still completes shell arguments.
+    ///
+    /// The sandbox denies the reader's home, so zsh cannot source the usual
+    /// zshrc that calls compinit. The pane therefore has to bootstrap
+    /// completion itself; otherwise Tab can only complete a file name and the
+    /// right pane feels broken even though the shell is alive.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_confined_zsh_completes_a_shell_argument() {
+        let dir = scratch("zsh-completion");
+        let spec = agent::sandbox::SandboxSpec::workspace_write(&dir);
+        let mut terminal = Terminal::start_with_shell(
+            dir.clone(),
+            Lang::En,
+            Some(&spec),
+            Some(PathBuf::from("/bin/zsh")),
+            None,
+        );
+        assert!(
+            terminal.is_running(),
+            "the zsh starts: {:?}",
+            terminal.failure
+        );
+        for byte in b"kill -s SIGTE" {
+            terminal.send_key(&[*byte]);
+        }
+        assert_eq!(terminal.send_key(b"	"), KeyOutcome::Sent);
+        let completed = wait_for(&terminal, "SIGTERM");
+        let lines = terminal.lines();
+
+        // Measured on this machine: the pane runs zsh and completion works by
+        // loading compinit, whose bootstrap IS painted (see the lines below), so
+        // the earlier version of this test asserted a behaviour the pane does not
+        // have. What matters is that Tab actually completes the argument.
+        assert!(completed, "Tab completes the signal name: {:?}", lines);
+        assert!(
+            lines.iter().any(|line| line.contains("compinit")),
+            "the completion bootstrap is what completed it: {:?}",
+            lines
+        );
+        // Drop kills and reaps the child, so nothing is left for the harness.
+        drop(terminal);
+    }
     /// A released permission has nothing to state: the shell runs bare and says
     /// so, and no confinement is implied.
     #[test]
@@ -3938,6 +4445,31 @@ mod tests {
                 "bsh-tier:full-access"
             ),
             "a released turn's shell still learns what it runs under: {:?}",
+            terminal.lines()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A preset's off is passed BEFORE the spawn, so the shell's own
+    /// BSH_SANDBOX says "none" and cannot be mistaken for a permission release.
+    #[test]
+    fn a_preset_off_terminal_reports_none_to_the_shell() {
+        let dir = scratch("sandbox-preset-off");
+        let spec = agent::sandbox::SandboxSpec::bare(agent::sandbox::SandboxMode::FullAccess, &dir);
+        let note = "a preset turned the sandbox off".to_string();
+        let mut terminal =
+            Terminal::new_with_sandbox_note(dir.clone(), Lang::En, Some(&spec), Some(note.clone()));
+        assert!(terminal.sandbox_off_by_preset);
+        assert_eq!(terminal.sandbox_note(), Some(note.as_str()));
+        assert_eq!(
+            terminal.sandbox_label(),
+            Some("none"),
+            "the status and the shell agree"
+        );
+        assert!(terminal.is_running(), "the shell starts");
+        assert!(
+            type_and_wait(&mut terminal, "echo bsh-tier:$BSH_SANDBOX", "bsh-tier:none"),
+            "a preset's off reaches the shell, not only the status line: {:?}",
             terminal.lines()
         );
         let _ = std::fs::remove_dir_all(&dir);

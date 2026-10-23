@@ -131,6 +131,7 @@ dependencies = [
  "dirs 7.0.0",
  "futures",
  "heel",
+ "libc",
  "log",
  "logging",
  "qserde",

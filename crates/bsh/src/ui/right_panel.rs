@@ -41,7 +41,7 @@ use crate::theme;
 // editor, and a bar repeating the tab chip's name and one control read as
 // chrome - so the keyboard shortcut is the whole affordance, the way a
 // native document editor does it.
-actions!(bsh_files, [SaveFile]);
+actions!(bsh_files, [SaveFile, TerminalTab, BrowserTab]);
 
 /// How close in time two blank-space presses must be to read as a double-click.
 ///
@@ -238,6 +238,87 @@ fn terminal_copy_shortcut(keystroke: &Keystroke) -> bool {
     let key = keystroke.key.as_str();
     (keystroke.modifiers.platform && key == "c")
         || (keystroke.modifiers.control && keystroke.modifiers.shift && key == "c")
+}
+
+impl gpui::EntityInputHandler for Shell {
+    fn text_for_range(
+        &mut self,
+        _range: std::ops::Range<usize>,
+        _adjusted_range: &mut Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        None
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<gpui::UTF16Selection> {
+        Some(gpui::UTF16Selection {
+            range: 0..0,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        None
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+
+    /// A committed composition is the only text the shell should see; the
+    /// marked preview belongs to the IME's own candidate window, not the PTY.
+    fn replace_text_in_range(
+        &mut self,
+        _range: Option<std::ops::Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(terminal) = self.right.terminal.as_mut() {
+            terminal.send_key(text.as_bytes());
+        }
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _range: Option<std::ops::Range<usize>>,
+        _new_text: &str,
+        _new_selected_range: Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range: std::ops::Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        Some(element_bounds)
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        Some(0)
+    }
 }
 
 /// Paint one snapshot of the terminal grid into the pane's bounds.
@@ -606,6 +687,23 @@ impl FilesPane {
     pub(crate) fn tab_index(&self, rel: &Path) -> Option<usize> {
         self.tabs.iter().position(|tab| tab.rel == rel)
     }
+}
+
+/// Turn what the reader typed into a URL worth asking the policy about.
+///
+/// A bare host gets https, which is what a browser does when the scheme is
+/// omitted: "example.com" is a request the reader meant, while "file:/x" and
+/// "javascript:..." keep their scheme and are refused by the transport's own
+/// rule with a sentence naming the scheme.
+fn normalize_address(typed: &str) -> String {
+    let text = typed.trim();
+    if text.is_empty() {
+        return String::new();
+    }
+    if text.contains("://") || text.to_ascii_lowercase().starts_with("http:") {
+        return text.to_string();
+    }
+    format!("https://{}", text.trim_start_matches('/'))
 }
 
 impl Shell {
@@ -1086,9 +1184,7 @@ impl Shell {
             }
             Some(RightTab::Terminal) => body.child(self.terminal_pane(cx)),
             Some(RightTab::Diff) => body.child(self.diff_pane(cx)),
-            Some(RightTab::Browser) => {
-                body.child(self.right_pane_placeholder(self.right.tab.expect("Some arm")))
-            }
+            Some(RightTab::Browser) => body.child(self.browser_pane(cx)),
         }
     }
 
@@ -1116,6 +1212,394 @@ impl Shell {
             )
     }
 
+    /// The built-in Browser pane.
+    ///
+    /// It is a text view, not a rendered page, and it draws only what the
+    /// document model actually holds: the address bar, the four navigation
+    /// controls, the loading or failure line, and the extracted title, URL,
+    /// text and interactive elements. Nothing here paints a page the browser
+    /// did not read.
+    fn browser_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = self.browser_pane.clone().unwrap_or_default();
+        let mut pane = div()
+            .debug_selector(|| String::from("browser-pane"))
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .bg(rgb(theme::page()));
+        pane = pane.child(
+            div()
+                .flex_none()
+                .w_full()
+                .h(px(36.0))
+                .px(px(theme::RIGHT_PAD))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(4.0))
+                .child(self.browser_icon(
+                    "browser-back",
+                    IconName::ArrowLeft,
+                    view.can_back,
+                    "right.browser.back",
+                    cx,
+                    |this, cx| this.browser_history(-1, cx),
+                ))
+                .child(self.browser_icon(
+                    "browser-forward",
+                    IconName::ArrowRight,
+                    view.can_forward,
+                    "right.browser.forward",
+                    cx,
+                    |this, cx| this.browser_history(1, cx),
+                ))
+                .child(self.browser_icon(
+                    "browser-reload",
+                    IconName::RotateCw,
+                    view.snapshot.is_some(),
+                    "right.browser.reload",
+                    cx,
+                    |this, cx| this.browser_reload(cx),
+                ))
+                .child(
+                    div()
+                        .debug_selector(|| String::from("browser-address"))
+                        .flex_1()
+                        .min_w_0()
+                        .child(Input::new(&self.browser_url).appearance(false).h(px(26.0))),
+                )
+                .child(self.browser_go_control(cx)),
+        );
+        pane.child(self.browser_body(view, cx))
+    }
+
+    /// One navigation control: a glyph that dims when the action cannot run.
+    fn browser_icon(
+        &self,
+        id: &'static str,
+        glyph: IconName,
+        enabled: bool,
+        label: &'static str,
+        cx: &mut Context<Self>,
+        action: fn(&mut Shell, &mut Context<Shell>),
+    ) -> impl IntoElement {
+        let tooltip = self.state.lang.tr(label);
+        let mut button = div()
+            .id(id)
+            .debug_selector(move || String::from(id))
+            .w(px(26.0))
+            .h(px(26.0))
+            .flex_none()
+            .rounded(px(theme::RADIUS_SM))
+            .flex()
+            .items_center()
+            .justify_center()
+            .tooltip_show_delay(std::time::Duration::from_millis(500))
+            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx));
+        if enabled {
+            button = button
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(theme::hover())))
+                .child(icon(glyph, 14.0, theme::muted()))
+                .on_click(cx.listener(move |this, _event, _window, cx| action(this, cx)));
+        } else {
+            button = button.child(icon(glyph, 14.0, theme::faint()));
+        }
+        button
+    }
+
+    /// The Go control.
+    fn browser_go_control(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("browser-go")
+            .debug_selector(|| String::from("browser-go"))
+            .h(px(26.0))
+            .px(px(10.0))
+            .rounded(px(theme::RADIUS_SM))
+            .border_1()
+            .border_color(rgb(theme::border()))
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(theme::hover())))
+            .flex()
+            .items_center()
+            .child(
+                txt(
+                    self.state.lang.tr("right.browser.go"),
+                    theme::CHIP_SIZE,
+                    theme::text(),
+                )
+                .font_weight(FontWeight::MEDIUM),
+            )
+            .on_click(cx.listener(|this, _event, _window, cx| this.browser_submit(cx)))
+    }
+
+    /// The pane's body: the empty state, the loading line, a failure, or the
+    /// page itself.
+    fn browser_body(&self, view: crate::browser::PaneView, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let state_id = format!("browser-state-{}", view.status.as_str());
+        let mut body = div()
+            .debug_selector(move || state_id.clone())
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .flex()
+            .flex_col()
+            .overflow_hidden();
+        if let Some(failure) = view.failure.clone() {
+            body = body.child(self.browser_failure(failure));
+        }
+        match view.status {
+            crate::browser::Status::Empty => body
+                .child(
+                    div()
+                        .flex_1()
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap(px(8.0))
+                        .px(px(theme::RIGHT_PAD * 2.0))
+                        .child(icon(IconName::Globe, 22.0, theme::faint()))
+                        .child(
+                            txt(
+                                lang.tr("right.browser.empty"),
+                                theme::CHIP_SIZE,
+                                theme::faint(),
+                            )
+                            .text_align(TextAlign::Center)
+                            .line_height(px(18.0)),
+                        ),
+                )
+                .into_any_element(),
+            crate::browser::Status::Loading => {
+                let line = crate::i18n::tr_args(
+                    lang,
+                    "right.browser.loading",
+                    &[("url", view.url.clone())],
+                );
+                body.child(
+                    div()
+                        .debug_selector(|| String::from("browser-loading"))
+                        .w_full()
+                        .px(px(theme::RIGHT_PAD))
+                        .py(px(8.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(icon(IconName::RotateCw, 12.0, theme::muted()))
+                        .child(txt(line, theme::CHIP_SIZE, theme::muted()).truncate()),
+                )
+                .into_any_element()
+            }
+            crate::browser::Status::Ready | crate::browser::Status::Failed => match view.snapshot {
+                Some(snapshot) => body
+                    .child(self.browser_page(snapshot, cx))
+                    .into_any_element(),
+                None => body
+                    .child(
+                        div()
+                            .flex_1()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(txt(
+                                lang.tr("right.browser.empty"),
+                                theme::CHIP_SIZE,
+                                theme::faint(),
+                            )),
+                    )
+                    .into_any_element(),
+            },
+        }
+    }
+
+    /// The failure line: what happened, and the rule when the policy was the
+    /// reason. It sits above the page, because a failed navigation keeps the
+    /// page the reader was already reading.
+    fn browser_failure(&self, failure: crate::browser::Failure) -> impl IntoElement {
+        let lang = self.state.lang;
+        let mut note = div()
+            .debug_selector(|| String::from("browser-failure"))
+            .flex_none()
+            .w_full()
+            .px(px(theme::RIGHT_PAD))
+            .py(px(8.0))
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .bg(rgb(theme::hover()))
+            .child(
+                txt(lang.tr(failure.key()), theme::CHIP_SIZE, theme::error())
+                    .font_weight(FontWeight::MEDIUM),
+            )
+            .child(
+                txt(failure.message.clone(), theme::CHIP_SIZE, theme::text()).line_height(px(16.0)),
+            );
+        if let Some(rule) = failure.rule.clone() {
+            note = note.child(txt(
+                crate::i18n::tr_args(lang, "right.browser.rule", &[("rule", rule)]),
+                theme::RIGHT_HINT_SIZE,
+                theme::faint(),
+            ));
+        }
+        note
+    }
+
+    /// The extracted page: title, URL, capped text and the interactive rows.
+    fn browser_page(
+        &self,
+        snapshot: crate::browser::Snapshot,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let lang = self.state.lang;
+        let mut page = div()
+            .id("browser-page")
+            .debug_selector(|| String::from("browser-page"))
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .px(px(theme::RIGHT_PAD))
+            .py(px(8.0))
+            .overflow_y_scroll();
+        page = page
+            .child(
+                div()
+                    .debug_selector(|| String::from("browser-title"))
+                    .w_full()
+                    .child(
+                        txt(snapshot.title.clone(), theme::SIDEBAR_SIZE, theme::text())
+                            .font_weight(FontWeight::MEDIUM)
+                            .line_height(px(19.0)),
+                    )
+                    .child(
+                        txt(snapshot.url.clone(), theme::RIGHT_HINT_SIZE, theme::faint())
+                            .truncate()
+                            .line_height(px(15.0)),
+                    ),
+            )
+            .child(
+                div()
+                    .debug_selector(|| String::from("browser-text"))
+                    .w_full()
+                    .child(
+                        txt(snapshot.text.clone(), theme::CHIP_SIZE, theme::text())
+                            .line_height(px(18.0)),
+                    ),
+            );
+        if snapshot.text_truncated {
+            let note = crate::i18n::tr_args(
+                lang,
+                "right.browser.capped",
+                &[
+                    ("cap", snapshot.text_cap.to_string()),
+                    ("total", snapshot.text_total_chars.to_string()),
+                ],
+            );
+            page =
+                page.child(txt(note, theme::RIGHT_HINT_SIZE, theme::faint()).line_height(px(15.0)));
+        }
+        // The element rows: the refs the model may pass back, and the only
+        // place the pane shows that a page has controls at all.
+        let heading = crate::i18n::tr_args(
+            lang,
+            "right.browser.elements",
+            &[("count", snapshot.elements_total.to_string())],
+        );
+        page = page.child(div().w_full().pt(px(4.0)).child(
+            txt(heading, theme::RIGHT_HINT_SIZE, theme::muted()).font_weight(FontWeight::MEDIUM),
+        ));
+        if snapshot.elements.is_empty() {
+            page = page.child(
+                txt(
+                    lang.tr("right.browser.noElements"),
+                    theme::RIGHT_HINT_SIZE,
+                    theme::faint(),
+                )
+                .line_height(px(15.0)),
+            );
+        }
+        for element in snapshot.elements.iter() {
+            page = page.child(self.browser_element_row(element.clone(), cx));
+        }
+        if snapshot.elements_total > snapshot.elements.len() {
+            let note = crate::i18n::tr_args(
+                lang,
+                "right.browser.cappedElements",
+                &[
+                    ("shown", snapshot.elements.len().to_string()),
+                    ("total", snapshot.elements_total.to_string()),
+                ],
+            );
+            page =
+                page.child(txt(note, theme::RIGHT_HINT_SIZE, theme::faint()).line_height(px(15.0)));
+        }
+        page
+    }
+
+    /// One interactive element as a row.
+    ///
+    /// A link row is a real control: pressing it navigates through the same
+    /// gate the address bar uses. Every other row is a readout, because this
+    /// view cannot type into a field from the reader's side without a per-field
+    /// editor - the model does that through browser_type, and drawing a
+    /// pointer cursor on a row that does nothing would be the exact "control
+    /// that only looks wired" this crate refuses.
+    fn browser_element_row(
+        &self,
+        element: crate::browser::ElementView,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let reference = element.reference.clone();
+        let id = element.reference.clone();
+        let mut row = div()
+            .id(SharedString::from(format!("browser-element-{id}")))
+            .debug_selector(move || format!("browser-element-{id}"))
+            .w_full()
+            .min_h(px(22.0))
+            .px(px(4.0))
+            .rounded(px(4.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .child(
+                txt(reference, theme::RIGHT_HINT_SIZE, theme::accent())
+                    .font_family("monospace")
+                    .flex_none(),
+            )
+            .child(txt(element.kind, theme::RIGHT_HINT_SIZE, theme::faint()).flex_none());
+        let label = if let Some(value) = element.value.clone() {
+            if value.is_empty() {
+                element.label.clone()
+            } else {
+                format!("{} = {}", element.label, value)
+            }
+        } else {
+            element.label.clone()
+        };
+        row = row.child(txt(label, theme::CHIP_SIZE, theme::text()).truncate());
+        if let Some(href) = element.href.clone() {
+            if element.kind == "link" {
+                row = row
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(theme::hover())))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.browser_go(href.clone(), cx);
+                    }));
+            }
+        }
+        row
+    }
+
     /// The managed terminal's surface: one full-bleed cell grid painted from
     /// the shell's own screen.
     ///
@@ -1136,6 +1620,11 @@ impl Shell {
                 .into_any_element();
         }
         let snapshot = std::rc::Rc::clone(&self.terminal_snapshot);
+        // The IME reaches a view only through the window's input handler, which
+        // is set during paint; without it a Chinese keyboard composes nothing
+        // the shell can read.
+        let ime_focus = self.terminal_focus.clone();
+        let ime_panel = cx.entity();
         let measured = std::rc::Rc::clone(&self.terminal_frame);
         let font_size = theme::BODY_SIZE - 1.0;
         let selection = self.right.terminal_selection;
@@ -1153,6 +1642,13 @@ impl Shell {
             .bg(rgb(theme::page()))
             .cursor_text()
             .track_focus(&self.terminal_focus)
+            // Tab is bound in this context (see terminal_tab): without a
+            // binding, the macOS input handler hands it to AppKit's key-view
+            // loop and focus leaves the pane instead of the shell completing.
+            .key_context("terminal")
+            .on_action(cx.listener(|this, _: &TerminalTab, _window, cx| {
+                this.terminal_tab(cx);
+            }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                 this.terminal_key(event, cx);
             }))
@@ -1234,6 +1730,11 @@ impl Shell {
                     frame
                 },
                 move |bounds, frame, window, cx| {
+                    window.handle_input(
+                        &ime_focus,
+                        gpui::ElementInputHandler::new(bounds, ime_panel.clone()),
+                        cx,
+                    );
                     paint_terminal_grid(bounds, &frame, &snapshot, selection, window, cx);
                 },
             )
@@ -1273,6 +1774,26 @@ impl Shell {
                 cx.stop_propagation();
             }
             // No shell to write to: the status line already says why.
+            KeyOutcome::Closed => {}
+        }
+    }
+
+    /// Tab belongs to the shell.
+    ///
+    /// The macOS input handler passes an unbound Tab to AppKit's key-view
+    /// loop, which moves focus out of the pane before the shell sees the byte,
+    /// so Tab is bound to this action in the pane's `terminal` key context and
+    /// forwarded exactly as a keystroke would be.
+    pub(crate) fn terminal_tab(&mut self, cx: &mut Context<Self>) {
+        let Some(terminal) = self.right.terminal.as_mut() else {
+            return;
+        };
+        match terminal.send_key(b"\t") {
+            KeyOutcome::Sent => cx.stop_propagation(),
+            KeyOutcome::Refused => {
+                cx.notify();
+                cx.stop_propagation();
+            }
             KeyOutcome::Closed => {}
         }
     }
@@ -1389,6 +1910,11 @@ impl Shell {
         // other ways instead: the shell's own BSH_SANDBOX, and this line while
         // the pane has something to report (below).
         let mut parts: Vec<String> = Vec::new();
+        // A preset that turned the sandbox off is a standing security fact, not
+        // a transient error: say it while the shell runs, not only after exit.
+        if terminal.sandbox_off_by_preset {
+            parts.push(lang.tr("right.terminal.sandboxOff"));
+        }
         if let Some(error) = terminal.policy_error() {
             parts.push(format!(
                 "{}: {error}",
@@ -1432,19 +1958,23 @@ impl Shell {
             }
             // A pane that is already speaking says what the spec answered too:
             // the refusal to confine, or the tier the shell actually ran under.
-            if let Some(note) = terminal.sandbox_note() {
-                text.push_str(" \u{b7} ");
-                text.push_str(&format!(
-                    "{}: {note}",
-                    lang.tr("right.terminal.unsandboxed")
-                ));
-            } else if let Some(label) = terminal.sandbox_label() {
-                text.push_str(" \u{b7} ");
-                text.push_str(&crate::i18n::tr_args(
-                    lang,
-                    "right.terminal.sandboxTier",
-                    &[("tier", label.to_string())],
-                ));
+            // The preset-off sentence was already added above; it is not a
+            // backend limitation and must not be dressed as one.
+            if !terminal.sandbox_off_by_preset {
+                if let Some(note) = terminal.sandbox_note() {
+                    text.push_str(" \u{b7} ");
+                    text.push_str(&format!(
+                        "{}: {note}",
+                        lang.tr("right.terminal.unsandboxed")
+                    ));
+                } else if let Some(label) = terminal.sandbox_label() {
+                    text.push_str(" \u{b7} ");
+                    text.push_str(&crate::i18n::tr_args(
+                        lang,
+                        "right.terminal.sandboxTier",
+                        &[("tier", label.to_string())],
+                    ));
+                }
             }
             parts.insert(0, text);
         }
@@ -2918,16 +3448,172 @@ impl Shell {
             // by it today - heel cannot host a caller-owned PTY - so the
             // terminal records that answer and the status line says it.
             let spec = self.state.sandbox_spec("terminal");
-            self.right.terminal = Some(crate::terminal::Terminal::new_with_sandbox(
-                cwd,
-                self.state.lang,
-                spec.as_deref(),
-            ));
+            let off_by_preset = self.state.effective().sandbox.off_by_preset;
+            // The note is passed BEFORE the spawn: it overrides BSH_SANDBOX to
+            // "none" for the shell itself, not only the status line.
+            let note = off_by_preset.then(|| self.state.lang.tr("right.terminal.sandboxOff"));
+            self.right.terminal = Some(match note {
+                Some(note) => crate::terminal::Terminal::new_with_sandbox_note(
+                    cwd,
+                    self.state.lang,
+                    spec.as_deref(),
+                    Some(note),
+                ),
+                None => crate::terminal::Terminal::new_with_sandbox(
+                    cwd,
+                    self.state.lang,
+                    spec.as_deref(),
+                ),
+            });
         }
         // A shell that already printed its first output would otherwise wait for
         // the next tick, so take the copy the spawn produced right away.
         self.sync_terminal(cx);
         cx.notify();
+    }
+
+    /// The policy a browser navigation asks.
+    ///
+    /// It is the SAME compiled set the turn's tools ask and the audit pane
+    /// reads - deliberately not a fresh compile: a denial recorded here has to
+    /// land in the ring the reader can see, and a second PolicySet would carry
+    /// a second ring. A shell with no compiled policy yet (no turn has been
+    /// priced) compiles one through the same constructor the turn uses, so the
+    /// rules can still not differ; the only thing that is missing in that case
+    /// is a ring to record into.
+    fn browser_policy(&self) -> std::sync::Arc<agent::policy::PolicySet> {
+        match self.state.policy.clone() {
+            Some(policy) => policy,
+            None => {
+                let eff = self.state.effective();
+                crate::caps::policy_for_effective(&self.state.settings, &eff)
+            }
+        }
+    }
+
+    /// The gate one navigation asks, named for the audit row it produces.
+    fn browser_gate(&self, tool: &'static str) -> std::sync::Arc<agent::policy::EgressGate> {
+        let eff = self.state.effective();
+        std::sync::Arc::new(agent::policy::EgressGate::new(
+            self.browser_policy(),
+            std::sync::Arc::new(agent::policy::SystemResolver),
+            self.state.active_id.clone().unwrap_or_default(),
+            eff.preset_id,
+            tool,
+        ))
+    }
+
+    /// Navigate from the address bar: the one control a reader presses to open
+    /// a page.
+    pub(crate) fn browser_submit(&mut self, cx: &mut Context<Self>) {
+        let typed = self.browser_url.read(cx).value().to_string();
+        let url = normalize_address(&typed);
+        if url.is_empty() {
+            cx.notify();
+            return;
+        }
+        self.browser_go(url, cx);
+    }
+
+    /// Start a navigation, showing the loading state on this frame.
+    pub(crate) fn browser_go(&mut self, url: String, cx: &mut Context<Self>) {
+        let gate = self.browser_gate("browser_open");
+        let handle = self.state.browser.clone();
+        // Begin here, not on the worker: the press has to have an answer before
+        // the request exists, or the pane looks inert for a frame or two.
+        let seq = handle.mutate(|browser| browser.begin(&url));
+        self.browser_refresh_pane();
+        cx.notify();
+        // The GPUI background executor, not the runner's tokio runtime: this is
+        // work the window started, and it is the executor the test scheduler
+        // can drive deterministically.
+        let task = cx.background_executor().spawn({
+            let handle = handle.clone();
+            let gate = gate.clone();
+            let url = url.clone();
+            async move { crate::browser::load(&handle, &gate, &url, seq) }
+        });
+        cx.spawn(async move |this, cx| {
+            let outcome = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.browser_refresh_pane();
+                // A refused or failed load already carries its sentence in the
+                // pane; the notice ring would only repeat it.
+                if let Err(failure) = &outcome {
+                    if failure.kind == "scheme" {
+                        this.state.notice(failure.tool_message());
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Go back, forward or reload through the pane's own controls.
+    ///
+    /// Back and forward restore a cached document, so they ask no policy
+    /// question and make no request; reload is a new navigation and goes
+    /// through the same gate a fresh open does.
+    pub(crate) fn browser_history(&mut self, step: isize, cx: &mut Context<Self>) {
+        let outcome = self.state.browser.mutate(|browser| {
+            if step < 0 {
+                browser.back()
+            } else {
+                browser.forward()
+            }
+        });
+        self.browser_refresh_pane();
+        if let Err(message) = outcome {
+            self.state.notice(message);
+        }
+        cx.notify();
+    }
+
+    /// Reload the page on screen.
+    pub(crate) fn browser_reload(&mut self, cx: &mut Context<Self>) {
+        let url = self
+            .state
+            .browser
+            .read(|browser| browser.document().map(|doc| doc.url.clone()));
+        match url {
+            Some(url) => self.browser_go(url, cx),
+            None => cx.notify(),
+        }
+    }
+
+    /// Fill the address bar from the browser when a navigation moved it.
+    ///
+    /// Only a real change retriggers it: set_value always notifies, and a
+    /// per-frame write would both repaint the field forever and fight a reader
+    /// who is typing. The guard is the URL that was last written, not the
+    /// field's focus.
+    pub(crate) fn browser_sync_address(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.browser_pane.as_ref() else {
+            return;
+        };
+        let url = view.url.clone();
+        if url.is_empty() || url == self.browser_shown_url {
+            return;
+        }
+        self.browser_shown_url.clone_from(&url);
+        self.browser_url
+            .update(cx, |state, cx| state.set_value(url, window, cx));
+    }
+
+    /// Rebuild the pane's cached view when the browser moved.
+    ///
+    /// Called from render, so it only costs an atomic read on a frame that did
+    /// not change the browser; the clone of a page's text happens once per
+    /// change, not once per frame.
+    pub(crate) fn browser_refresh_pane(&mut self) {
+        let revision = self.state.browser.revision();
+        if self.browser_pane.is_some() && revision == self.browser_rev {
+            return;
+        }
+        let view = self.state.browser.read(|browser| browser.pane_view());
+        self.browser_pane = Some(view);
+        self.browser_rev = revision;
     }
 
     /// Re-read the workspace policy when the file on disk changed.

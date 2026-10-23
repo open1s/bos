@@ -340,7 +340,10 @@ impl SlashCommand {
                 SlashEffect::Done
             }
             SlashCommand::Permission => {
-                let current = shell.state.draft().workspace.agent.permission.clone();
+                // The row marked current is the mode the tools obey, not a
+                // request a preset already narrowed: the chip and this picker
+                // answer the same question the same way.
+                let current = shell.state.effective().permission.effective;
                 let lang = shell.state.lang;
                 shell.slash.show_permissions(&current, lang);
                 SlashEffect::Chooser

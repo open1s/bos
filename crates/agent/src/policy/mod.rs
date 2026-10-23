@@ -71,6 +71,10 @@ pub mod audit;
 pub mod baseline;
 /// Egress resolution, the gate that enforces it, and the ureq resolver.
 pub mod egress;
+/// The one gated HTTP GET: a decision, then a request.
+pub mod fetch;
+/// Preset path scopes: validation and the glob-aware matching module.
+pub mod scope;
 /// Compiling sources into one engine and evaluating a decision.
 pub mod set;
 /// The principal, the action and the target a decision is about.
@@ -78,13 +82,40 @@ pub mod target;
 
 pub use audit::{AllowCounts, PolicyAudit, PolicyAuditEntry, DEFAULT_AUDIT_CAPACITY};
 pub use baseline::{
-    baseline_source, preset_egress_source, preset_permission_source, preset_scope_source,
-    session_permission_source, BASELINE_POLICY_REGO, PRESET_EGRESS_REGO, PRESET_PERMISSION_REGO,
-    PRESET_SCOPE_REGO, SESSION_PERMISSION_REGO,
+    BASELINE_POLICY_REGO, PRESET_EGRESS_REGO, PRESET_PERMISSION_REGO, SESSION_PERMISSION_REGO,
 };
-pub use egress::{EgressDenial, EgressError, EgressGate, PolicyResolver, Resolver, SystemResolver};
-pub use set::{PolicyData, PolicyError, PolicySet, PolicySource};
+pub use scope::{is_glob, preset_scope_source, validate_scope_entry, PRESET_SCOPE_REGO};
+pub use set::{
+    builtin_policy_ids, PolicyData, PolicyError, PolicyModuleInfo, PolicyOrigin, PolicySet,
+    PolicySource,
+};
+
+/// The shipped baseline under its stable built-in id.
+pub fn baseline_source() -> PolicySource {
+    baseline::baseline_source().as_builtin("builtin:baseline")
+}
+
+/// The generated session-permission module under its stable built-in id.
+pub fn session_permission_source(permission: &str) -> PolicySource {
+    baseline::session_permission_source(permission).as_builtin("builtin:session-permission")
+}
+
+/// The preset egress module under its stable built-in id.
+pub fn preset_egress_source() -> PolicySource {
+    baseline::preset_egress_source().as_builtin("builtin:preset-egress")
+}
+
+/// The generated read-only-ceiling module under its stable built-in id.
+pub fn preset_permission_source() -> PolicySource {
+    baseline::preset_permission_source().as_builtin("builtin:preset-permission")
+}
+pub use egress::{
+    EgressDenial, EgressError, EgressGate, EgressRuleSet, PolicyResolver, Resolver, SystemResolver,
+};
+pub use fetch::{fetch, http_host, join, FetchError, FetchLimits, FetchedPage};
 pub use target::{Action, Decision, PolicyInput, Target};
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_scope;

@@ -47,6 +47,13 @@ pub struct PolicyAuditEntry {
     pub rule: Option<String>,
     /// The policy's reason, when it gave one.
     pub reason: Option<String>,
+    /// Whether the refusal was ADVISORY: recorded and reported, and the call
+    /// proceeded because the preset's `policy_mode = advisory`.
+    ///
+    /// The row is kept verbatim either way, because an advisory refusal is
+    /// still a refusal the reader asked to be told about; this flag is what
+    /// tells the audit which ones did not stop the call.
+    pub advisory: bool,
 }
 
 /// Counted allows, one total per action.
@@ -73,6 +80,7 @@ pub struct PolicyAudit {
     allows: [AtomicU64; 5],
     allows_total: AtomicU64,
     denials_total: AtomicU64,
+    advisories_total: AtomicU64,
 }
 
 impl Default for PolicyAudit {
@@ -96,6 +104,7 @@ impl PolicyAudit {
             ],
             allows_total: AtomicU64::new(0),
             denials_total: AtomicU64::new(0),
+            advisories_total: AtomicU64::new(0),
         }
     }
 
@@ -122,6 +131,27 @@ impl PolicyAudit {
             return;
         }
         self.denials_total.fetch_add(1, Ordering::Relaxed);
+        self.push(input, decision, permission, false);
+    }
+
+    /// Record one ADVISORY refusal: the rule refused, the call still proceeded.
+    ///
+    /// It is a denial for every purpose except stopping the call, so it counts
+    /// in `denials_total` and lands in the same ring; the advisory counter and
+    /// the entry's flag are what the pane uses to separate "refused" from
+    /// "warned and allowed".
+    pub(crate) fn record_advisory(
+        &self,
+        input: &PolicyInput,
+        decision: &Decision,
+        permission: &str,
+    ) {
+        self.denials_total.fetch_add(1, Ordering::Relaxed);
+        self.advisories_total.fetch_add(1, Ordering::Relaxed);
+        self.push(input, decision, permission, true);
+    }
+
+    fn push(&self, input: &PolicyInput, decision: &Decision, permission: &str, advisory: bool) {
         let capacity = self.capacity.load(Ordering::Relaxed);
         if capacity == 0 {
             return;
@@ -136,6 +166,7 @@ impl PolicyAudit {
             target: input.target.display(),
             rule: decision.rule.clone(),
             reason: decision.reason.clone(),
+            advisory,
         };
         if let Ok(mut ring) = self.denials.lock() {
             while ring.len() >= capacity {
@@ -152,6 +183,7 @@ impl PolicyAudit {
         }
         self.allows_total.store(0, Ordering::Relaxed);
         self.denials_total.store(0, Ordering::Relaxed);
+        self.advisories_total.store(0, Ordering::Relaxed);
         for counter in &self.allows {
             counter.store(0, Ordering::Relaxed);
         }
@@ -163,6 +195,24 @@ impl PolicyAudit {
             .lock()
             .map(|ring| ring.iter().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// The advisory refusals in the ring, oldest first.
+    pub fn advisories(&self) -> Vec<PolicyAuditEntry> {
+        self.denials
+            .lock()
+            .map(|ring| {
+                ring.iter()
+                    .filter(|entry| entry.advisory)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Every advisory refusal ever counted.
+    pub fn advisories_total(&self) -> u64 {
+        self.advisories_total.load(Ordering::Relaxed)
     }
 
     /// The counted allows.

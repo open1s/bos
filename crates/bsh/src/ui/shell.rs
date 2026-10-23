@@ -23,6 +23,22 @@ const TAIL_EPSILON: f32 = 24.0;
 /// (`window.setTimeout(() => setCopied(false), 1e3)`).
 const COPY_FLASH: std::time::Duration = std::time::Duration::from_millis(1_000);
 
+/// How long the settings footer's save confirmation stays on screen.
+///
+/// Save is a commit that KEEPS the dialog open, so a press that worked and a
+/// press that did nothing look identical unless something says otherwise. The
+/// confirmation is drawn in the panel's own footer, with a bounded lifetime
+/// driven by the app clock (the copy flash's own pattern), so it disappears on
+/// its own rather than becoming furniture.
+const SETTINGS_TOAST: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// How long a FAILED save's confirmation stays on screen.
+///
+/// Longer than the success case because the text carries the write error the
+/// reader may have to act on; still bounded, so it cannot park a stale failure
+/// over a dialog that has since been fixed.
+const SETTINGS_TOAST_FAILED: std::time::Duration = std::time::Duration::from_secs(8);
+
 /// How far a drag must travel before it counts as a selection rather than a click.
 ///
 /// Below this the press was a click - on a control, on a link, on plain text -
@@ -123,6 +139,23 @@ pub(crate) struct PresetEditor {
     pub(crate) text: Entity<TextareaState>,
 }
 
+/// The confirmation a footer Save leaves beside the Save control.
+///
+/// A save keeps the dialog open, and the status line it used to write lives in
+/// the statusbar BEHIND this dialog's scrim and panel - which is why the reader
+/// never saw the "saved" message. This is drawn INSIDE the panel, so it cannot
+/// be hidden by the conversation underneath.
+pub(crate) struct SettingsToast {
+    /// What the reader reads; the failure variant carries the write error.
+    pub(crate) text: String,
+    /// Whether this reports a failure, so the pill's ink and glyph say so.
+    pub(crate) failed: bool,
+    /// The save that produced it. A later save REPLACES this one, and the
+    /// earlier save's expiry timer must not clear the newer confirmation -
+    /// which is why the timer compares it before clearing.
+    pub(crate) seq: u64,
+}
+
 /// What became of one submission.
 ///
 /// The attachments ride back on a refusal because only the caller knows where
@@ -177,8 +210,24 @@ pub(crate) struct Shell {
     pub(crate) plugin_search: Entity<InputState>,
     /// The egress allowlist entry field in the policy pane.
     pub(crate) policy_entry: Entity<InputState>,
+    /// The browser pane's address bar.
+    pub(crate) browser_url: Entity<InputState>,
+    /// The browser pane's view, rebuilt only when the browser changed.
+    pub(crate) browser_pane: Option<crate::browser::PaneView>,
+    /// The URL the address bar was last filled from, so a frame that did not
+    /// navigate never rewrites the field the reader is typing in.
+    pub(crate) browser_shown_url: String,
+    /// The browser revision browser_pane was built from.
+    ///
+    /// A tool can move the page from the turn's runtime, which cannot notify a
+    /// window, so the pane compares this counter instead of holding the
+    /// browser's lock every frame.
+    pub(crate) browser_rev: u64,
     /// The preset card whose config details are expanded, if any.
     pub(crate) preset_details: Option<String>,
+    /// The preset card whose Advanced block is expanded, if any. Mode details
+    /// opens with this closed, so the card leads with its mode.
+    pub(crate) preset_advanced: Option<String>,
     /// The custom preset being edited as TOML, if any.
     pub(crate) preset_editor: Option<PresetEditor>,
     /// The parse error from the last preset editor save.
@@ -263,12 +312,16 @@ pub(crate) struct Shell {
     pub(crate) trust_confirm: Option<TrustConfirm>,
     /// Why the last trust decision could not be saved, shown in that dialog.
     pub(crate) trust_error: Option<String>,
-    /// Whether the risk gate's acknowledgement box is ticked. The gate's own
-    /// confirm stays disabled until it is, like the reference's.
-    pub(crate) permission_acknowledged: bool,
     /// Set when the Show coding view toggle could not be saved, so the row can
     /// report the reference's own `developerTools.error` beside it.
     pub(crate) developer_tools_failed: bool,
+    /// The footer Save's confirmation, or none when nothing was saved this
+    /// visit. At most ONE: a repeated save refreshes this instead of stacking a
+    /// second notice.
+    pub(crate) settings_toast: Option<SettingsToast>,
+    /// The generation of `settings_toast`, so a later save can tell the earlier
+    /// save's expiry timer that its confirmation is gone.
+    pub(crate) settings_toast_seq: u64,
     /// Whether the Keyboard shortcuts disclosure is open. The reference opens a
     /// shortcut sheet here; this shell has no key bindings to edit, so the row
     /// stays a disclosure and says what it can honestly report.
@@ -599,6 +652,10 @@ pub(crate) struct Shell {
     pub(crate) composer_value: String,
     /// The agent capabilities, read once when the settings dialog opens.
     pub(crate) caps: Vec<crate::caps::CapInfo>,
+    /// The policy generation the cached capabilities were built for. A preset
+    /// or permission switch rebakes the policy, and the pane must rebuild its
+    /// tool list instead of showing the previous build's capabilities.
+    pub(crate) caps_generation: u64,
     pub(crate) plugins: Vec<crate::plugins::PluginInfo>,
     /// The settings dialog's text fields.
     pub(crate) settings_inputs: SettingsInputs,
@@ -853,6 +910,12 @@ impl Shell {
         });
         let policy_entry = cx.new(|cx| {
             InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "settings.policyAddHint"))
+        });
+        // The browser's address bar. Its placeholder says what can be opened,
+        // because an empty field would otherwise read as "anything goes".
+        let browser_url = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(crate::i18n::tr(lang, "right.browser.urlPlaceholder"))
         });
         let mcp_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "settings.mcpSearch"))
@@ -1186,6 +1249,22 @@ impl Shell {
                 }
             },
         ));
+        // The browser's address bar: Enter (or the Go control) is the one way a
+        // reader starts a navigation, and it takes the same policy path a tool
+        // call does.
+        subs.push(cx.subscribe_in(
+            &browser_url,
+            window,
+            |this: &mut Shell,
+             _state: &Entity<InputState>,
+             event: &InputEvent,
+             _window: &mut Window,
+             cx: &mut Context<Shell>| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.browser_submit(cx);
+                }
+            },
+        ));
         // The palette's keys are intercepted ABOVE the kit's input: the input
         // binds up, down, tab and escape in its own key context, so a raw key
         // listener on an ancestor never sees them. An interceptor runs before
@@ -1232,7 +1311,12 @@ impl Shell {
             search,
             plugin_search,
             policy_entry,
+            browser_url,
+            browser_pane: None,
+            browser_shown_url: String::new(),
+            browser_rev: 0,
             preset_details: None,
+            preset_advanced: None,
             preset_editor: None,
             preset_editor_error: None,
             market: Vec::new(),
@@ -1282,8 +1366,9 @@ impl Shell {
             permission_confirm: None,
             trust_confirm: None,
             trust_error: None,
-            permission_acknowledged: false,
             developer_tools_failed: false,
+            settings_toast: None,
+            settings_toast_seq: 0,
             shortcuts_open: false,
             config_open_failed: false,
             models_add_open: false,
@@ -1300,6 +1385,7 @@ impl Shell {
             catalogue_open: false,
             composer_value: String::new(),
             caps: Vec::new(),
+            caps_generation: 0,
             plugins: Vec::new(),
             settings_inputs,
             vault_inputs,
@@ -1738,12 +1824,16 @@ impl Shell {
         self.preset_editor = None;
         self.preset_editor_error = None;
         self.preset_details = None;
+        self.preset_advanced = None;
         // The Skills filter is view state, not a preference: every open starts
         // from All, so a reader never lands on a pane that hides half the
         // catalogue behind a choice they made on an earlier visit.
         self.skill_filter = SkillFilter::All;
         // A write failure belongs to the visit that saw it, like the filter.
         self.skills_save_error = None;
+        // A confirmation names the save that produced it, so a fresh visit
+        // starts with none: the toast never outlives the action it reports.
+        self.settings_toast = None;
         // The dialog opens on a fresh read of the installed packages: a package
         // may have been installed, removed or upgraded by another process since
         // the cache was filled, and this is a user action, not a render.
@@ -1765,11 +1855,15 @@ impl Shell {
         self.preset_editor = None;
         self.preset_editor_error = None;
         self.preset_details = None;
+        self.preset_advanced = None;
         let committed = &self.state.settings.global.general;
         self.state.lang = crate::i18n::Lang::from_locale(&committed.lang);
         let mode = committed.theme_mode.clone();
         crate::theme::apply_here(&mode, cx);
         self.developer_tools_failed = false;
+        // The confirmation belongs to the dialog it was drawn in, so closing
+        // the dialog clears it rather than leaving it to a timer.
+        self.settings_toast = None;
         cx.notify();
     }
 
@@ -1792,6 +1886,7 @@ impl Shell {
                 self.preset_editor = None;
                 self.preset_editor_error = None;
                 self.preset_details = None;
+                self.preset_advanced = None;
                 self.caps.clear();
                 self.plugins.clear();
                 // A save can change the inventory (an installed package added
@@ -1800,27 +1895,92 @@ impl Shell {
                 self.developer_tools_failed = false;
                 // A full Save supersedes any earlier focused-write refusal.
                 self.skills_save_error = None;
-                self.state
-                    .notice(crate::i18n::tr(self.state.lang, "settings.saved").to_string());
+                // The confirmation is drawn in THIS panel's footer. The status
+                // line the older round wrote lives in the statusbar, which the
+                // dialog's own scrim and panel cover - so a save that worked
+                // looked like a save that did nothing.
+                self.toast_settings(
+                    crate::i18n::tr(self.state.lang, "settings.saved").to_string(),
+                    false,
+                    cx,
+                );
             }
             Err(error) => {
                 // The inline error beside the developer-tools row and the
-                // notice say the same thing, so a file that could not be
-                // written is visible where the reader was looking.
+                // footer confirmation say the same thing, so a file that could
+                // not be written is visible where the reader was looking. The
+                // confirmation carries the error itself: a silent failure
+                // would be worse than no confirmation at all.
                 self.developer_tools_failed = true;
-                self.state.notice(format!(
-                    "{} {error}",
-                    crate::i18n::tr(self.state.lang, "settings.saveFailed")
-                ));
+                self.toast_settings(
+                    format!(
+                        "{} {error}",
+                        crate::i18n::tr(self.state.lang, "settings.saveFailed")
+                    ),
+                    true,
+                    cx,
+                );
             }
         }
         cx.notify();
+    }
+
+    /// Show the footer's save confirmation, replacing the one already there.
+    ///
+    /// One field and one generation: a second save REFRESHES the confirmation
+    /// (it does not add a second), and the earlier save's timer compares the
+    /// generation before clearing, so a stale timer cannot take the newer
+    /// message down. The lifetime is the app's own clock - the copy flash's
+    /// pattern - so a test drives it with `advance_clock` rather than sleeping.
+    fn toast_settings(&mut self, text: String, failed: bool, cx: &mut Context<Self>) {
+        self.settings_toast_seq = self.settings_toast_seq.wrapping_add(1);
+        let seq = self.settings_toast_seq;
+        self.settings_toast = Some(SettingsToast { text, failed, seq });
+        let lifetime = if failed {
+            SETTINGS_TOAST_FAILED
+        } else {
+            SETTINGS_TOAST
+        };
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(lifetime).await;
+            let _ = this.update(cx, |this, cx| {
+                if this
+                    .settings_toast
+                    .as_ref()
+                    .is_some_and(|toast| toast.seq == seq)
+                {
+                    this.settings_toast = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// The one reveal path: the header action and the account pane's button
     /// both land here, so the inline error and the notice cannot disagree.
     pub(crate) fn open_config(&mut self, cx: &mut Context<Self>) {
         super::settings::reveal_config_shared(self, cx);
+    }
+
+    /// Open the active workspace's egress allowlist in the platform browser.
+    ///
+    /// The same reveal seam the settings file uses, on the workspace file the
+    /// Policy pane edits. A workspace with no root has no file to open, which
+    /// the notice says rather than silently doing nothing. Absent file and all,
+    /// the reveal shows the containing directory, so the reader can create it.
+    pub(crate) fn open_egress_allowlist(&mut self, cx: &mut Context<Self>) {
+        let lang = self.state.lang;
+        match self.state.egress_allowlist_file() {
+            Some(path) => match crate::settings::reveal(&path) {
+                Ok(()) => self.state.notice(lang.tr("settings.policyOpenedFile")),
+                Err(error) => self
+                    .state
+                    .notice(format!("{} {error}", lang.tr("settings.revealFailed"))),
+            },
+            None => self.state.notice(lang.tr("settings.policyNoWorkspace")),
+        }
+        cx.notify();
     }
 
     /// The claim hint for a command token that fills the draft, which is the
@@ -1957,6 +2117,15 @@ impl Shell {
                 Submit::Accepted => {}
                 Submit::Refused(_) => self.state.restore_queued(id, queued),
             }
+            cx.notify();
+            return;
+        }
+        // The running agent was built before a preset/permission switch, so a
+        // steer would ride the OLD permission, sandbox and tool set. Keep the
+        // row queued: it drains into a fresh build when this turn ends.
+        if self.state.steer_blocked(id) {
+            let why = crate::i18n::tr(self.state.lang, "queue.settingsChanged");
+            self.state.notice(why);
             cx.notify();
             return;
         }
@@ -2223,6 +2392,7 @@ impl Shell {
             &id,
             self.state.subagents.clone(),
             self.state.jobs.clone(),
+            self.state.browser.clone(),
         );
         if let Some(error) = built.credential_error.as_ref() {
             // The vault's refusal is the real cause and names what is missing;
@@ -2439,6 +2609,7 @@ impl Shell {
             &id,
             self.state.subagents.clone(),
             self.state.jobs.clone(),
+            self.state.browser.clone(),
         );
         if let Some(error) = &built.credential_error {
             // No turn opens without a credential: a locked vault names itself
@@ -2448,6 +2619,10 @@ impl Shell {
         }
         self.state.set_tools_schema(built.tools_schema_chars);
         self.state.set_policy(built.policy.clone());
+        // The agent below is built for THIS policy generation. A steer that
+        // arrives after the reader changes the preset or permission would join
+        // this baked build, so the queue compares against this record.
+        self.state.record_turn_generation(&id);
         let agent = built.agent;
         // The agent shares this store with its `update_plan` tool, so the
         // to-do panel reads the running plan through it.
@@ -3183,7 +3358,11 @@ impl Shell {
         }
         self.state.persist_subagents();
         let expired = self.expire_job_arm(at);
-        if live || changed || subagents || expired {
+        // A tool can navigate the browser from the turn's runtime, which cannot
+        // notify this window; one atomic read per second turns that into a
+        // repaint without holding the browser's lock on the render path.
+        let browser_moved = self.state.browser.revision() != self.browser_rev;
+        if live || changed || subagents || expired || browser_moved {
             cx.notify();
         }
     }
@@ -3756,11 +3935,46 @@ impl Render for Shell {
         // is stamped, and the least recently painted is evicted when the cache
         // fills.
         self.frame_no = self.frame_no.wrapping_add(1);
+        // The browser pane's view is rebuilt only when the browser moved, which
+        // includes a TOOL navigation: the turn's runtime cannot notify a
+        // window, so the revision is compared here and on the job clock.
+        self.browser_refresh_pane();
+        self.browser_sync_address(window, cx);
         // The chip counts are cached per roster version, and the expanded job
         // rows read their output here: an unchanged ring costs two integers
         // instead of a 64 KiB copy.
         self.refresh_jobs_snapshot();
         self.refresh_job_output_cache();
+        // The advisory ring is the one policy fact a tool call can grow without
+        // a settings edit. Two atomic loads per frame keep the pane's visible
+        // warning exact; the bounded snapshot is rebuilt only when it moved.
+        if let Some(policy) = &self.state.policy {
+            let stale = self
+                .state
+                .policy_audit
+                .as_ref()
+                .is_none_or(|view| view.advisories_total != policy.advisories_total());
+            if stale {
+                self.state.refresh_policy_audit();
+                // Make the warning visible where the reader is looking, not
+                // only in the Policy pane: a refusal that did not stop the call
+                // must still be announced once.
+                if let Some(entry) = self
+                    .state
+                    .policy_audit
+                    .as_ref()
+                    .and_then(|view| view.advisories.last())
+                    .cloned()
+                {
+                    let text = crate::i18n::tr_args(
+                        self.state.lang,
+                        "settings.policyAdvisoryNotice",
+                        &[("rule", entry.rule.unwrap_or_else(|| "-".to_string()))],
+                    );
+                    self.state.notice(text);
+                }
+            }
+        }
         // The rail's container is the conversation column, which is the window
         // less the sidebar (`@container (width <= 900px)` hides the frame).
         // The frame's width is what the reference's auto-collapse measures, so
@@ -3940,6 +4154,14 @@ impl Render for Shell {
         } else {
             None
         };
+        // A preset change that widens the authorization level is parked in the
+        // state, so the gate is hosted here: the pane, the composer chip and the
+        // TOML editor all pass through it, and none can widen silently.
+        let confirm_preset = if self.state.pending_preset.is_some() {
+            Some(self.render_preset_confirm(cx))
+        } else {
+            None
+        };
         // The provider delete confirmation: the card it guards stays in the
         // list and the reference's own dialog is drawn over the panel.
         let confirm_provider_delete =
@@ -4003,6 +4225,11 @@ impl Render for Shell {
             // from wherever focus sits inside it - the composer, a field, a list
             // row. They act on the session the reader has open.
             .on_action(
+                cx.listener(|this, _: &super::right_panel::BrowserTab, _window, cx| {
+                    this.open_right_tab(super::right_panel::RightTab::Browser, cx);
+                }),
+            )
+            .on_action(
                 cx.listener(|this, _: &super::session_menu::RenameSession, window, cx| {
                     if let Some(id) = this.state.active_id.clone() {
                         this.begin_session_rename(&id, window, cx);
@@ -4052,6 +4279,7 @@ impl Render for Shell {
             .when_some(overlay, |root, overlay| root.child(overlay))
             .when_some(confirm_delete, |root, confirm| root.child(confirm))
             .when_some(confirm_permission, |root, confirm| root.child(confirm))
+            .when_some(confirm_preset, |root, confirm| root.child(confirm))
             .when_some(confirm_provider_delete, |root, confirm| root.child(confirm))
             .when_some(confirm_trust, |root, confirm| root.child(confirm))
             .when_some(confirm_vault_delete, |root, confirm| root.child(confirm))

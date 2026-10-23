@@ -174,6 +174,16 @@ pub(crate) enum SettingsError {
     EmptyExtention,
     /// Two extension entries carried the same id.
     DuplicateExtention(String),
+    /// A preset carries a level or a path scope that cannot be honoured.
+    ///
+    /// The message names the preset, the field and the value: a typo is a load
+    /// error, never a silent default.
+    InvalidPreset {
+        /// The preset id.
+        preset: String,
+        /// What is wrong, with the field named.
+        why: String,
+    },
 }
 
 impl std::fmt::Display for SettingsError {
@@ -186,6 +196,9 @@ impl std::fmt::Display for SettingsError {
             Self::EmptyExtention => write!(f, "an extension entry carries no id"),
             Self::DuplicateExtention(id) => {
                 write!(f, "the extension {id:?} is installed twice")
+            }
+            Self::InvalidPreset { preset, why } => {
+                write!(f, "the preset {preset:?} is invalid: {why}")
             }
         }
     }
@@ -590,6 +603,187 @@ pub(crate) struct ModelEntry {
     pub(crate) input_types: Option<Vec<String>>,
 }
 
+/// The shell sandbox a preset asks for.
+///
+/// This is a POLICY choice, not a build flag: heel remains the one sandbox
+/// implementation and a required dependency. `Heel` asks for confinement even
+/// when the session's permission would otherwise release it; `Off` asks for an
+/// unconfined shell and is only permitted under a full-access ceiling, because
+/// turning confinement off can otherwise only widen what the session may do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) enum SandboxChoice {
+    /// Confine shell commands with heel.
+    #[serde(rename = "heel")]
+    Heel,
+    /// Run shell commands unconfined; requires a full-access ceiling.
+    #[serde(rename = "none")]
+    Off,
+}
+
+impl SandboxChoice {
+    /// The value the preset's TOML uses.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Heel => "heel",
+            Self::Off => "none",
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SandboxChoice {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = SandboxChoice;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("sandbox: \"heel\" or \"none\"")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                match value {
+                    "heel" => Ok(SandboxChoice::Heel),
+                    "none" => Ok(SandboxChoice::Off),
+                    other => Err(E::custom(format!(
+                        "sandbox: expected \"heel\" or \"none\", got \"{other}\""
+                    ))),
+                }
+            }
+        }
+        deserializer.deserialize_str(Visitor)
+    }
+}
+
+/// What a policy refusal means for the call that met it.
+///
+/// This is a PRESET-level choice, and it is applied once, at the policy build
+/// every tool's question passes through. `Required` - the default, and what
+/// every preset written before this field meant - stops the call and returns
+/// the refusal. `Advisory` records the same refusal in the audit and the pane's
+/// warning ring, then lets the call proceed: the preset author asked to be told,
+/// not obeyed.
+///
+/// Advisory relaxes only the modules THE PRESET contributes (its scope, its
+/// egress, its named guard modules and its custom Rego). The baseline, the
+/// session tier and the workspace policy are never advisory, so a preset cannot
+/// use this mode to exceed the session's permission or leave the workspace.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum PolicyMode {
+    /// A refusal stops the call.
+    #[default]
+    Required,
+    /// A refusal is recorded and reported, and the call proceeds.
+    Advisory,
+}
+
+impl PolicyMode {
+    /// The value the preset's TOML uses.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Required => "required",
+            Self::Advisory => "advisory",
+        }
+    }
+}
+
+/// The highest authorization level a preset may declare.
+pub(crate) const MAX_PRESET_LEVEL: u8 = 4;
+
+/// Read a preset's `level`.
+///
+/// An integer 0..=4 is the documented form. The names an older declaration may
+/// carry are accepted and mapped onto the same scale so an existing settings
+/// file keeps loading; an unknown value is an error, never a silent default.
+fn deserialize_level<'de, D>(deserializer: D) -> Result<Option<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Visitor;
+    impl<'de> serde::de::Visitor<'de> for Visitor {
+        type Value = Option<u8>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("level: an integer 0..=4")
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_any(self)
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            u8::try_from(value)
+                .ok()
+                .filter(|level| *level <= MAX_PRESET_LEVEL)
+                .map(Some)
+                .ok_or_else(|| {
+                    E::custom(format!(
+                        "level: expected an integer 0..={MAX_PRESET_LEVEL}, got {value}"
+                    ))
+                })
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            if (0..=i64::from(MAX_PRESET_LEVEL)).contains(&value) {
+                Ok(Some(value as u8))
+            } else {
+                Err(E::custom(format!(
+                    "level: expected an integer 0..={MAX_PRESET_LEVEL}, got {value}"
+                )))
+            }
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            let level = match value.trim() {
+                "inspect" => 0,
+                "read-only" | "review" | "research" => 1,
+                "standard" | "code" | "ptc" | "creator" | "docs" => 2,
+                "elevated" => 3,
+                "admin" | "full-access" => 4,
+                other => {
+                    return Err(E::custom(format!(
+                        "level: expected an integer 0..={MAX_PRESET_LEVEL} (or a legacy name), got '{other}'"
+                    )))
+                }
+            };
+            Ok(Some(level))
+        }
+    }
+    deserializer.deserialize_option(Visitor)
+}
+
 /// One agent preset: the plugin composition a session runs under.
 ///
 /// Measured from the reference (`@deepseek-ai/dsh-agent-preset`): the
@@ -599,9 +793,11 @@ pub(crate) struct ModelEntry {
 /// and prompt sections, and the model is session and workspace state. A shipped
 /// preset publishes no `name`: the dictionaries carry its copy.
 ///
-/// BSH adds two fields the reference does not have: `policy`, a Rego module the
-/// preset may contribute, and `trusted`, the reader's explicit permission for
-/// it to apply. An untrusted policy is ignored, never failed.
+/// BSH adds three fields the reference does not have: `policy`, a Rego module
+/// the preset may contribute; `trusted`, the reader's explicit permission for
+/// it to apply (an untrusted policy is ignored, never failed); and `sandbox`,
+/// the per-preset heel choice, which may narrow to heel or widen to an
+/// unconfined shell only under a full-access ceiling.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 #[serde(deny_unknown_fields)]
@@ -619,15 +815,36 @@ pub(crate) struct Preset {
     /// Roster order.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) order: Option<i64>,
-    /// Authorization tier for display and risk grouping:
-    /// inspect, review, research, docs, code or admin.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) level: Option<String>,
+    /// Authorization level, 0..=4. Absent DERIVES it from what the preset
+    /// actually grants ([`Preset::derived_level`]).
+    ///
+    /// The levels are documented in [`PRESET_LEVELS`] and in the crate's
+    /// `docs/preset-authorization-plan.md`: 0 inspect grants nothing, 1
+    /// read-only reads the workspace, 2 standard writes inside it with a
+    /// confined shell, 3 elevated holds a full-access ceiling while the shell
+    /// stays confined, and 4 full-access releases the shell. A value outside
+    /// 0..=4 is a LOAD error naming the field, never a silent clamp.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_level"
+    )]
+    pub(crate) level: Option<u8>,
     /// The permission ceiling this preset grants: read_only,
     /// workspace_write or full_access. The session's permission is capped by
     /// this value; a preset can never raise it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) permission: Option<String>,
+    /// The shell sandbox this preset asks for, or none to inherit today's
+    /// behaviour (heel whenever the effective permission confines).
+    ///
+    /// `heel` is the narrowing arm: it confines even a full-access session.
+    /// `none` is the widening arm and is only permitted when the preset
+    /// declares `permission = "danger-full-access"` AND the session resolves to
+    /// full access; any narrower ceiling refuses the preset with rule
+    /// `preset-sandbox-widens` and keeps the shell confined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) sandbox: Option<SandboxChoice>,
     /// Read roots, workspace-relative. None inherits the workspace; an empty
     /// list allows no reads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -641,6 +858,11 @@ pub(crate) struct Preset {
     pub(crate) deny: Vec<String>,
     /// Egress allowlist. None inherits the workspace allowlist; an empty list
     /// denies all egress; entries are intersected with the workspace list.
+    ///
+    /// "Inherits" is itself tri-state on the workspace side: no
+    /// `.bsh/egress-allowlist` file leaves the reach UNRESTRICTED, a present
+    /// file with no rule is a deliberate deny-all, and a present file with
+    /// rules is the allowlist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) egress: Option<Vec<String>>,
     /// Whether hosted web search is offered. None inherits the model setting.
@@ -658,10 +880,10 @@ pub(crate) struct Preset {
     /// are combined with the custom policy below.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) builtin_policy: Vec<String>,
-    /// Whether the custom policy is required for the preset to be usable:
-    /// required or advisory. Required and untrusted makes the preset refuse.
+    /// Whether a policy refusal is required or advisory. Absent means
+    /// required, which is what every older preset declaration meant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) policy_mode: Option<String>,
+    pub(crate) policy_mode: Option<PolicyMode>,
     /// Explicit tool allowlist, or none for every tool the mounted bundles
     /// and the permission mode provide. An empty list mounts no tools.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -699,6 +921,79 @@ pub(crate) struct Preset {
 }
 
 impl Preset {
+    /// The authorization level in force.
+    ///
+    /// A declared level wins; an absent one is DERIVED, never defaulted to a
+    /// number the preset's own facts contradict.
+    pub(crate) fn effective_level(&self) -> u8 {
+        self.level.unwrap_or_else(|| self.derived_level())
+    }
+
+    /// Derive the level from what this preset actually grants.
+    ///
+    /// The derivation is deliberately conservative: it reads the DECLARATION,
+    /// not a session, so the same preset grades the same way in every chat.
+    ///
+    /// | Level | Shipped | What it grants |
+    /// |---|---|---|
+    /// | 0 | - | nothing: no bundles, tools, MCP servers, extensions, reads, writes, egress or hosted search |
+    /// | 1 | read-only | reads the workspace (or its declared read scope); no writes, no shell, no local egress |
+    /// | 2 | standard, ptc, creator | the session tier capped by the preset: workspace writes and a confined shell |
+    /// | 3 | - | a full-access CEILING with `sandbox = "heel"`: the tier is released but the shell stays confined |
+    /// | 4 | - | a full-access ceiling with the shell released (`sandbox` absent or `none`) |
+    pub(crate) fn derived_level(&self) -> u8 {
+        let permission = self.permission.as_deref().map(str::trim);
+        if permission == Some("danger-full-access") {
+            return match self.sandbox {
+                Some(SandboxChoice::Heel) => 3,
+                _ => 4,
+            };
+        }
+        if self.grants_nothing() {
+            return 0;
+        }
+        if permission == Some("read-only") {
+            return 1;
+        }
+        2
+    }
+
+    /// Whether this preset mounts nothing that can act at all.
+    fn grants_nothing(&self) -> bool {
+        self.plugins.is_empty()
+            && self.tools.as_ref().is_none_or(Vec::is_empty)
+            && self.mcps.as_ref().is_none_or(Vec::is_empty)
+            && self.extensions.as_ref().is_none_or(Vec::is_empty)
+            && self.read.as_ref().is_some_and(Vec::is_empty)
+            && self.write.as_ref().is_some_and(Vec::is_empty)
+            && self.egress.as_ref().is_some_and(Vec::is_empty)
+            && self.web_search != Some(true)
+    }
+
+    /// Validate every path-scope entry in this declaration.
+    ///
+    /// Returns the first problem as (field, entry, why). The caller prefixes the
+    /// preset id, so the load error names the declaration, the field and the
+    /// value a reader has to fix. Nothing is ever dropped or defaulted.
+    pub(crate) fn scope_problem(&self) -> Option<(&'static str, String, String)> {
+        let fields: [(&'static str, Option<&Vec<String>>); 3] = [
+            ("read", self.read.as_ref()),
+            ("write", self.write.as_ref()),
+            ("deny", Some(&self.deny)),
+        ];
+        for (field, entries) in fields {
+            let Some(entries) = entries else {
+                continue;
+            };
+            for entry in entries {
+                if let Err(why) = agent::policy::validate_scope_entry(entry) {
+                    return Some((field, entry.clone(), why));
+                }
+            }
+        }
+        None
+    }
+
     /// Render this declaration as a full, annotated TOML template.
     ///
     /// Every field is present: a set field is an active assignment, an unset one
@@ -724,11 +1019,16 @@ impl Preset {
             "\"What this preset is for.\"",
         );
         out.push_str(
-            "# Roster order (lower first) and authorization tier:\n\
-             # inspect | review | research | docs | code | admin.\n",
+            "# Roster order (lower first) and authorization level 0..=4.\n\
+             # 0 inspect: grants nothing. 1 read-only: reads the workspace, no\n\
+             # writes, no shell, no local egress. 2 standard: the session tier\n\
+             # capped here, workspace writes and a confined shell (standard,\n\
+             # ptc, creator). 3 elevated: a full-access ceiling with a confined\n\
+             # shell. 4 full-access: a full-access ceiling with the shell\n\
+             # released. Unset DERIVES the level from these fields.\n",
         );
         push_optional_order(&mut out, self.order);
-        push_optional_string(&mut out, "level", self.level.as_deref(), "\"read-only\"");
+        push_optional_level(&mut out, self.level);
         out.push('\n');
 
         out.push_str(
@@ -741,13 +1041,37 @@ impl Preset {
             self.permission.as_deref(),
             "\"read-only\"",
         );
-        out.push_str("# Workspace-relative roots. Unset inherits the workspace; [] allows none.\n");
+        out.push_str(
+            "# Shell sandbox. heel is the only sandbox implementation (a required\n\
+             # dependency, with no build flag or fallback); this field chooses\n\
+             # whether it is applied. \"heel\" confines commands even under full\n\
+             # access. \"none\" runs SHELL commands unconfined (no kernel\n\
+             # filesystem confinement and no egress allowlist) and requires\n\
+             # permission = \"danger-full-access\" with a full-access session.\n\
+             # Unset follows the effective permission. A narrower ceiling refuses\n\
+             # sandbox = \"none\" with rule preset-sandbox-widens and keeps the\n\
+             # shell confined; file tools keep their own permission and policy\n\
+             # checks either way.\n",
+        );
+        push_optional_string(
+            &mut out,
+            "sandbox",
+            self.sandbox.map(SandboxChoice::as_str),
+            "\"heel\"",
+        );
+        out.push_str(
+            "# Path scopes: workspace-relative or absolute paths and globs. Unset\n\
+             # inherits the workspace; [] allows none. deny wins over read and\n\
+             # write. A literal entry matches itself and everything below it; an\n\
+             # entry with * ? [ or { is a glob (e.g. \"src/**/*.rs\"). An invalid\n\
+             # entry is a load error naming the field, never a silent default.\n",
+        );
         push_optional_list(&mut out, "read", self.read.as_deref(), "[\".\"]");
         push_optional_list(
             &mut out,
             "write",
             self.write.as_deref(),
-            "[\"docs\", \"README.md\"]",
+            "[\"docs\", \"README.md\", \"src/**/*.rs\"]",
         );
         out.push_str("# Always denied, unioned with the baseline's .git/.bsh rules.\n");
         push_list(&mut out, "deny", &self.deny);
@@ -769,7 +1093,13 @@ impl Preset {
         out.push('\n');
 
         out.push_str(
-            "# Egress allowlist. Unset inherits the workspace list; [] denies all egress.\n",
+            "# Network policy. Unset inherits the workspace allowlist, which is\n\
+             # UNRESTRICTED when the workspace has no .bsh/egress-allowlist file; []\n\
+             # denies all local egress even then. A non-empty list is INTERSECTED with\n\
+             # the workspace list and never widens it. One rule per entry: an address\n\
+             # or CIDR (the strong door, decided on the resolved address), a hostname\n\
+             # with an optional leading \"*.\" (the weak door, decided on the name) or a\n\
+             # bare port. Hosted web search is governed by web_search below.\n",
         );
         push_optional_list(&mut out, "egress", self.egress.as_deref(), "[]");
         out.push_str(
@@ -821,13 +1151,14 @@ impl Preset {
         push_list(&mut out, "builtin_policy", &self.builtin_policy);
         out.push_str(
             "# Custom Rego policy (narrowing only). policy_mode: required | advisory.\n\
-             # required + untrusted refuses the preset; advisory ignores an untrusted\n\
-             # module.\n",
+             # required + untrusted refuses the preset. advisory records the\n\
+             # preset's own refusals in the audit and lets the call proceed; the\n\
+             # baseline, the session tier and the workspace policy still refuse.\n",
         );
         push_optional_string(
             &mut out,
             "policy_mode",
-            self.policy_mode.as_deref(),
+            self.policy_mode.map(PolicyMode::as_str),
             "\"advisory\"",
         );
         out.push_str(&format!("trusted = {}\n", self.trusted));
@@ -868,6 +1199,14 @@ fn push_optional_bool(out: &mut String, key: &str, value: Option<bool>, example:
     match value {
         Some(value) => out.push_str(&format!("{key} = {value}\n")),
         None => out.push_str(&format!("# {key} = {example}\n")),
+    }
+}
+
+/// A set level, or the commented example that documents it.
+fn push_optional_level(out: &mut String, value: Option<u8>) {
+    match value {
+        Some(level) => out.push_str(&format!("level = {level}\n")),
+        None => out.push_str("# level = 2\n"),
     }
 }
 
@@ -928,10 +1267,37 @@ fn preset_deny_paths() -> Vec<String> {
 /// The shipped declaration for an id, or none.
 ///
 /// Standard mounts the three core bundles and inherits every tool, skill, MCP
-/// server, extension and the workspace prompt. Minimal starts from no tools at
-/// all: no bundles, and explicit empty allowlists for skills, MCP servers and
-/// extensions so it stays a chat-only preset.
-fn built_in_preset(id: &str) -> Option<Preset> {
+/// server, extension and the workspace prompt.
+///
+/// # The network policy of a shipped preset
+///
+/// Each shipped preset carries a network policy that matches what it actually
+/// does, derived from the tools it keeps, not guessed:
+///
+/// - `standard` and `ptc` ALLOW NETWORK ACCESS BY DEFAULT: they keep the `shell`
+///   bundle (`bash` can reach the network through its own client) and the MCP
+///   servers, and both declare `web_search = true`. They declare NO `egress`
+///   field, which INHERITS the workspace allowlist - so the reach is the
+///   workspace's own decision and the preset does not narrow it. On a FRESH
+///   workspace there is no allowlist file, and the tri-state reads that as
+///   UNRESTRICTED egress: that is what "allowed by default" means here. Once a
+///   file exists the same inheritance is constrained by it, and a preset can
+///   never widen that floor. `creator` is the same.
+/// - `read-only` keeps only `read_file`, `list_dir` and `update_plan` - none of
+///   which opens a socket - so it declares `egress = []`, which DENIES ALL local
+///   egress. A read of the workspace needs no network, and the derived proxy
+///   set is empty, so the kernel denies outbound traffic with no proxy running.
+///
+/// The `egress` field governs only LOCAL egress - the shell, MCP and any tool
+/// that opens a socket under this host. Hosted `web_search` runs on the model
+/// provider's own servers and is governed by `web_search`, which is why
+/// `read-only` can deny local egress and still offer hosted search, and why
+/// `standard`/`ptc` state the search grant explicitly.
+///
+/// A preset may also declare its network reach as a non-empty list: entries are
+/// intersected with the workspace allowlist, never unioned with it, so a preset
+/// can narrow the workspace's reach and never widen it.
+pub(crate) fn built_in_preset(id: &str) -> Option<Preset> {
     let standard_bundles = vec!["shell".to_string(), "files".to_string(), "plan".to_string()];
     let standard_guard = || {
         (
@@ -941,18 +1307,32 @@ fn built_in_preset(id: &str) -> Option<Preset> {
     };
     match id {
         "standard" => Some(Preset {
-            level: Some("standard".to_string()),
+            level: Some(2),
             plugins: standard_bundles,
             deny: standard_guard().0,
             builtin_policy: standard_guard().1,
+            // No `egress` field: Standard keeps the shell and the MCP servers,
+            // so it ALLOWS NETWORK ACCESS by inheriting the workspace
+            // allowlist. It cannot grant more than the workspace does - a
+            // preset only ever narrows - so "allowed by default" means it does
+            // not restrict here, not that it widens the workspace floor.
+            //
+            // Web search is STATED rather than left to the workspace default:
+            // Standard is the everyday preset and search is part of what it is
+            // for, so the Details row shows the grant instead of a reader
+            // inferring it from a switch somewhere else.
+            web_search: Some(true),
             order: Some(10),
             ..Preset::default()
         }),
         "ptc" => Some(Preset {
-            level: Some("ptc".to_string()),
+            level: Some(2),
             plugins: standard_bundles,
             deny: standard_guard().0,
             builtin_policy: standard_guard().1,
+            // No `egress` field, exactly as Standard: PTC batches the same
+            // tools including the shell, so it ALLOWS NETWORK ACCESS by
+            // inheriting the workspace allowlist and narrows nothing.
             web_search: Some(true),
             parallel_tool_calls: Some(true),
             system_prompt: Some(
@@ -962,10 +1342,13 @@ fn built_in_preset(id: &str) -> Option<Preset> {
             ..Preset::default()
         }),
         "creator" => Some(Preset {
-            level: Some("creator".to_string()),
+            level: Some(2),
             plugins: standard_bundles,
             deny: standard_guard().0,
             builtin_policy: standard_guard().1,
+            // No `egress` field: Creator authors extensions by installing
+            // packages through the shell, so it needs the workspace's reach and
+            // inherits it.
             web_search: Some(true),
             system_prompt: Some(
                 "You extend bsh through conversation. Inspect the existing extension and settings formats before writing; create extension packages, skills and presets inside the workspace, and keep changes reversible.".to_string(),
@@ -974,7 +1357,7 @@ fn built_in_preset(id: &str) -> Option<Preset> {
             ..Preset::default()
         }),
         "read-only" => Some(Preset {
-            level: Some("read-only".to_string()),
+            level: Some(1),
             permission: Some("read-only".to_string()),
             read: Some(vec![".".to_string()]),
             write: Some(Vec::new()),
@@ -988,6 +1371,13 @@ fn built_in_preset(id: &str) -> Option<Preset> {
             skills: Some(Vec::new()),
             mcps: Some(Vec::new()),
             extensions: Some(Vec::new()),
+            // Local egress is DENIED: every tool this preset keeps reads the
+            // workspace and none opens a socket, so the reach it needs is none.
+            // The empty list is declared, not absent, which is the difference
+            // between "no network" and "inherit the workspace"; the derived
+            // proxy set is empty, so the kernel denies with no proxy running.
+            // Hosted `web_search` below is the provider's own tool and is not
+            // local egress.
             egress: Some(Vec::new()),
             web_search: Some(true),
             builtin_policy: vec![
@@ -996,7 +1386,7 @@ fn built_in_preset(id: &str) -> Option<Preset> {
                 "no-shell".to_string(),
                 "no-egress".to_string(),
             ],
-            policy_mode: Some("required".to_string()),
+            policy_mode: Some(PolicyMode::Required),
             system_prompt: Some(
                 "You are a read-only analyst. Read the workspace and search the web when useful, but never modify files, run commands, or claim you did. If a change is needed, propose it and stop.".to_string(),
             ),
@@ -1302,7 +1692,52 @@ impl GlobalSettings {
                 return Err(SettingsError::DuplicateExtention(extension.id.clone()));
             }
         }
+        // A preset's level and path scopes are checked HERE, at load, so an
+        // unparsable glob or an out-of-range level names the preset and the
+        // field instead of quietly becoming an allow-everything or a dropped
+        // deny entry.
+        for (id, preset) in &self.presets {
+            if let Some(level) = preset.level {
+                if level > MAX_PRESET_LEVEL {
+                    return Err(SettingsError::InvalidPreset {
+                        preset: id.clone(),
+                        why: format!(
+                            "level: expected an integer 0..={MAX_PRESET_LEVEL}, got {level}"
+                        ),
+                    });
+                }
+            }
+            if let Some((field, entry, why)) = preset.scope_problem() {
+                return Err(SettingsError::InvalidPreset {
+                    preset: id.clone(),
+                    why: format!("{field}: {entry:?}: {why}"),
+                });
+            }
+        }
         Ok(())
+    }
+
+    /// Validate one preset declaration on its own, for the editor's save path.
+    ///
+    /// The editor parses a `[preset]` table directly, so it never passes
+    /// through [`GlobalSettings::validate`]; this is the same check with the id
+    /// the reader is editing in the message.
+    pub(crate) fn validate_preset(id: &str, preset: &Preset) -> Result<(), SettingsError> {
+        if let Some(level) = preset.level {
+            if level > MAX_PRESET_LEVEL {
+                return Err(SettingsError::InvalidPreset {
+                    preset: id.to_string(),
+                    why: format!("level: expected an integer 0..={MAX_PRESET_LEVEL}, got {level}"),
+                });
+            }
+        }
+        match preset.scope_problem() {
+            Some((field, entry, why)) => Err(SettingsError::InvalidPreset {
+                preset: id.to_string(),
+                why: format!("{field}: {entry:?}: {why}"),
+            }),
+            None => Ok(()),
+        }
     }
 
     /// Every skill source, migrated and defaulted.
@@ -1850,7 +2285,7 @@ updated_at = 2
     }
 
     /// One TOML file wrapper, so a template can be parsed as the editor does.
-    #[derive(serde::Deserialize)]
+    #[derive(Debug, serde::Deserialize)]
     struct TemplateFile {
         preset: Preset,
     }
@@ -1865,8 +2300,9 @@ updated_at = 2
             name: Some("Full".to_string()),
             description: Some("All fields set".to_string()),
             order: Some(7),
-            level: Some("code".to_string()),
+            level: Some(2),
             permission: Some("workspace-write".to_string()),
+            sandbox: Some(SandboxChoice::Heel),
             read: Some(vec![".".to_string()]),
             write: Some(vec!["docs".to_string()]),
             deny: vec![".git".to_string()],
@@ -1875,7 +2311,7 @@ updated_at = 2
             parallel_tool_calls: Some(true),
             mcp_tools: Some(vec!["github_search".to_string()]),
             builtin_policy: vec!["deny-secrets".to_string()],
-            policy_mode: Some("advisory".to_string()),
+            policy_mode: Some(PolicyMode::Advisory),
             tools: Some(vec!["read_file".to_string(), "subagent".to_string()]),
             skills: Some(vec!["alpha".to_string()]),
             mcps: Some(vec!["github".to_string()]),
@@ -1894,6 +2330,7 @@ updated_at = 2
             "order",
             "level",
             "permission",
+            "sandbox",
             "read",
             "write",
             "deny",
@@ -1942,6 +2379,7 @@ updated_at = 2
             "order",
             "level",
             "permission",
+            "sandbox",
             "read",
             "write",
             "egress",
@@ -1971,6 +2409,32 @@ updated_at = 2
         }
         let parsed: TemplateFile = toml::from_str(&text).expect("the template parses");
         assert_eq!(parsed.preset, preset);
+    }
+
+    /// A sandbox value outside the two names is a LOAD error naming the field.
+    ///
+    /// The alternative - silently treating an unknown word as "inherit" - would
+    /// turn a misspelled `none` into a confined shell or a misspelled `heel`
+    /// into an unconfined one, so the parser refuses by name.
+    #[test]
+    fn a_malformed_sandbox_value_is_a_load_error_naming_the_field() {
+        let text = "[presets.custom]\nplugins = []\nsandbox = \"seatbelt\"\n";
+        let error = GlobalSettings::from_toml(text).expect_err("seatbelt is not a sandbox");
+        let message = error.to_string();
+        assert!(message.contains("sandbox"), "{message}");
+        assert!(message.contains("seatbelt"), "{message}");
+        assert!(
+            message.contains("heel") && message.contains("none"),
+            "the error names both accepted values: {message}"
+        );
+
+        // The preset editor's own wrapper parses the same field, so its error
+        // carries the same field name rather than a bare enum message.
+        let editor = toml::from_str::<TemplateFile>("[preset]\nsandbox = \"seatbelt\"\n")
+            .expect_err("the editor refuses the same value");
+        let message = editor.to_string();
+        assert!(message.contains("sandbox"), "{message}");
+        assert!(message.contains("seatbelt"), "{message}");
     }
 
     #[test]

@@ -93,7 +93,10 @@ The host installs one data document:
       "workspace_prefix": "/workspace/",
       "preset": "<agent preset id>",
       "permission": "workspace-write",
-      "egress_allowlist": ["127.0.0.1", "10.0.0.0/8"]
+      "egress_allowlist": ["127.0.0.1", "10.0.0.0/8"],
+      "egress_hosts": [],
+      "egress_ports": [],
+      "egress_unrestricted": false
     }
 
 `permission` is the **effective** permission: the session's mode capped by the
@@ -126,7 +129,33 @@ classified by what it can be:
   rebind survives it - and it exists for a policy that names a service rather
   than an address.
 
-A missing file declares nothing, which denies all egress.
+### The file is tri-state: absent, empty, or rules
+
+The file's own existence is a policy input, not a detail:
+
+| state | data | reach |
+|---|---|---|
+| **ABSENT** - no file | `egress_unrestricted = true` | **UNRESTRICTED**: any address, hostname and port. This is the fresh-workspace state; the network works out of the box, and Standard/PTC inherit it. |
+| **PRESENT, no rule** - only comments/blanks | all lists empty, `egress_unrestricted = false` | **DENY ALL**: the reader created the file and left it empty, which is a deliberate lockdown. |
+| **PRESENT with rules** | the classified lists | **ALLOWLIST**: exactly the doors the rules name. |
+
+Creating the file therefore OPTS INTO CONTROL. Nothing seeds it: registering or
+opening a workspace writes nothing, because auto-writing the starter would flip
+a fresh, unrestricted workspace into a deny-all its owner never chose. The
+Policy pane offers **Create starter allowlist** as an explicit action, and its
+copy states that creating the file and leaving it empty denies all egress.
+Deleting the file restores the unrestricted default.
+
+Allow-all has no hostname spelling (a bare `*` is a hostname rule that matches
+no host); the honest equivalent is an address rule covering every address,
+`0.0.0.0/0` and/or `::/0`, which the starter documents as a commented example
+beside a worked allow example.
+
+The security consequence is stated rather than implied: a fresh workspace is
+permissive, and the reader opts into control by creating the file. A workspace
+that wants the old deny-by-default floor creates the file and leaves it empty
+(or writes `#` comments); a workspace that wants one destination writes that
+rule.
 
 Every network path is decided by the policy, at two points:
 
@@ -134,15 +163,31 @@ Every network path is decided by the policy, at two points:
    line literally names (`curl`, `wget`, `ssh`, `scp`, `sftp`, `rsync`, `nc`,
    `ping`, and `git` with a fetching subcommand), resolves each name, and asks
    the policy about every resolved address. A refusal names its rule and no
-   process runs. This tier is also the only network gate in the
-   `heel-sandbox`-off build.
-2. **On every connection.** With heel on, the shell runs under a proxy that asks
-   the same policy per request with the host, the resolved address AND the
-   port. Under no allowlist at all heel starts no proxy and the kernel refuses
-   outbound traffic outright.
+   process runs.
+2. **On every connection.** With heel on, the shell runs under heel's proxy,
+   which asks the same policy per request with the host, the resolved address
+   AND the port. An ABSENT file leaves the reach unrestricted, so the proxy runs
+   heel's allow-all policy (heel 0.5 has no pass-through mode, so a proxy still
+   exists and the kernel still refuses ICMP and host-local destinations); a
+   PRESENT file runs the policy-backed proxy; a present-but-empty file starts
+   no proxy at all and the kernel refuses outbound traffic outright.
 
 The shell tool's result reports which of these applies as `network`:
-`deny-all`, `allowlist` or `unrestricted`.
+`unrestricted` (no file), `deny-all` (present-but-empty, or a preset's `[]`),
+or `allowlist` (rules constrain the reach).
+
+**`unrestricted` is a policy state, not a pass-through.** The generated profile
+still denies every direct socket and grants only the localhost proxy, so a client
+that ignores the proxy environment - ICMP/`ping`, raw sockets, a TCP client with
+no proxy support - fails with the kernel's EPERM/EACCES even though the policy
+allows the network. Proxy-aware clients (`curl`, `git`, `npm`) work: they use
+the proxy heel points them at. To tell the two apart, the result carries
+`network_diagnostic: "unproxied-direct-socket"` on exactly that failure (a
+non-zero exit, a confined heel shell, `network == "unrestricted"`, and a network
+syscall beside EPERM/EACCES). The shell renders that id through
+`tool.bash.unproxiedNetwork` (English and Chinese) in both the transcript step
+body and the audit row, so the reader learns the kernel refused a path the
+sandbox does not proxy - not that the policy refused the command.
 
 ## Composition is intersection
 
@@ -151,8 +196,10 @@ narrow the baseline, never widen it: saying `allow` for a path the baseline
 denies still denies, because the baseline's `verdict` is evaluated too. Deny
 wins; the first denying module in source order supplies the rule and reason.
 
-The egress file is the one widening control: a workspace policy cannot add an
-address, host or port the file does not name. Edit `.bsh/egress-allowlist`.
+The egress file is where the workspace declares its reach: an ABSENT file
+leaves it open, and a PRESENT file constrains it to what it names. Once the file
+exists, a workspace policy cannot add an address, host or port the file does not
+name; edit `.bsh/egress-allowlist` to change the reach.
 
 ## Preset authority
 
@@ -163,6 +210,7 @@ explicit empty list mounts nothing:
     [presets.scoped]
     level = "docs"                    # inspect | review | research | docs | code | admin
     permission = "workspace-write"    # preset ceiling: read-only | workspace-write | danger-full-access
+    sandbox = "heel"                  # heel | none; absent follows the permission
     read = ["."]                      # workspace-relative read roots; [] = none
     write = ["docs", "README.md"]     # workspace-relative write roots; [] = none
     deny = [".git", ".bsh", ".env", "secrets", ".ssh", ".aws"]
@@ -190,15 +238,25 @@ explicit empty list mounts nothing:
 - permission is a ceiling, not a grant. The effective permission is
   min(session permission, preset permission), so a read-only preset keeps a
   Full-access session read-only.
+- sandbox is the shell confinement toggle, and it is a per-preset POLICY choice,
+  not a build flag: heel is still the one sandbox implementation and a required
+  dependency. Absent inherits today's behaviour (heel whenever the effective
+  permission confines). `heel` is the narrowing arm and confines even a
+  full-access session. `none` is the widening arm and is permitted only when
+  the preset declares `permission = "danger-full-access"` AND the session is
+  full access; under any narrower ceiling the preset is REFUSED with rule
+  `preset-sandbox-widens` and the shell stays confined. A malformed value is a
+  load error naming `sandbox`, never a silent default.
 - read and write are workspace-relative roots. None inherits the workspace;
   an empty list allows nothing. deny always wins and is unioned with the
   baseline .git/.bsh rules.
 - egress is a second allowlist of ADDRESSES. None inherits the workspace
-  .bsh/egress-allowlist; an empty list denies all egress; entries are
-  intersected with the workspace list. Because the preset's list is address
-  based, a hostname rule in the workspace file is only reachable while the
-  preset's egress scope is unrestricted. web_search overrides the hosted
-  web-search setting.
+  .bsh/egress-allowlist - which is UNRESTRICTED when that file is absent, so an
+  inherited reach can be open; an empty list denies all egress even then;
+  entries are intersected with the workspace list, never unioned. Because the
+  preset's list is address based, a hostname rule in the workspace file is only
+  reachable while the preset's egress scope is absent (unrestricted).
+  web_search overrides the hosted web-search setting.
 - plugins gates the core bundles; a selected preset with an empty list mounts
   none.
 - tools, skills, mcps, mcp_tools and extensions are allowlists. Absent means
@@ -265,11 +323,57 @@ Known limits of this slice:
 - MCP HTTP connections are pool-level; a preset's egress list is enforced by
   the turn policy, not by reconnecting the shared pool per session. Presets
   that must be network-free disable MCP servers and the shell.
-- The shell network path is not egress-gated. L0-L2 presets disable the shell;
-  code is sandboxed for files but not for network.
+- The shell network path is gated by heel: a derived allowlist runs a proxy
+  that asks the policy per connection, a present-but-empty file derives no proxy
+  (the kernel denies), and an absent file runs heel's allow-all policy. A
+  command endpoint named literally is also refused at the command tier before a
+  process exists.
 - A preset write scope narrower than the workspace disables the shell rather
-  than generating a custom Seatbelt profile. The code preset keeps the
-  workspace-wide sandbox.
+  than generating a custom profile. The code preset keeps the workspace-wide
+  sandbox.
+
+### What turning the sandbox off means
+
+`sandbox = "none"` is honest about its cost, because the cost is real:
+
+- **No filesystem confinement.** The kernel boundary heel installs is gone, so
+  a shell command can write outside the workspace (a path assembled in a
+  variable, an interpreter, a build tool). The tool-boundary policy still
+  checks the write targets the command line literally names, and a policy
+  denial still refuses the call before a process exists; a target the tool
+  cannot see is not checked.
+- **No egress enforcement for shell commands.** The workspace
+  `.bsh/egress-allowlist` is enforced by heel's proxy, which asks the Rego
+  policy per connection. No heel means no proxy and no per-connection check, so
+  a command can reach a host the file does not name. The command-tier scan still
+  refuses endpoints the command line literally names; a name or address built
+  at runtime is not seen.
+- **The tool-boundary policy still applies.** `Read`, `write`, `egress` and
+  `spawn` decisions are still made for what the host can see; turning the
+  sandbox off removes the kernel tier, not the policy tier.
+- **The toggle governs the shell and the terminal, not the file tools.** The
+  file tools keep their own permission tier and their own Rego checks; `none`
+  does not release them, and `heel` does not add a second confinement to them.
+
+The toggle therefore exists to let a deliberately full-access preset say
+"unconfined" out loud, never to let a narrower preset escape its ceiling. The
+guard is the reason the field cannot widen: `none` under a read-only or
+workspace-write ceiling (or with no declared ceiling) is refused with
+`preset-sandbox-widens`; the selection is refused, the turn is not sendable,
+and the shell stays under heel. If a build is reached another way, the preset's
+other limits still apply and the sandbox resolves to heel, so the refusal can
+never leave a quietly unconfined shell.
+
+Two readings are worth stating explicitly. On a session that is already full
+access, `none` is the explicit spelling of today's release and changes
+nothing; the behavioural arm is `heel`, which narrows a full-access session.
+And every unconfined bash result is attributed: a preset's choice records the
+reason `a preset turned the sandbox off`, while a permission-released run
+records `the full-access permission released the sandbox`. For a preset's off,
+the audit detail, the terminal status line (and its `BSH_SANDBOX=none`) and the
+transcript's command note all show the consequence; a permission release is
+attributed in the audit detail and the raw result, because it is the ordinary
+full-access state rather than a policy choice.
 
 ## Failure is asymmetric
 
@@ -287,8 +391,12 @@ In plain English:
 - **Reads** are allowed inside the workspace root and refused outside it.
 - **Writes** are allowed under the root, except anywhere below a `.bsh` or
   `.git` directory. A write outside the root is refused.
-- **Egress** is allowed only when the resolved address is in
-  `data.egress_allowlist` (exact address or CIDR). Empty means deny all.
+- **Egress** is tri-state. An absent allowlist file
+  (`data.egress_unrestricted`) allows any address, hostname and port. A present
+  file allows only what it names: the resolved address in
+  `data.egress_allowlist` (exact address or CIDR) or a hostname in
+  `data.egress_hosts`, at a port in `data.egress_ports` when that list is
+  non-empty. A present file that declares no rule denies all egress.
 - **Spawn** is allowed for `bash` with the workspace root as its working
   directory, and for `job_kill` (stopping a job the session owns) and
   `subagent` (delegating to a child agent). A workspace policy may narrow
@@ -352,19 +460,34 @@ target, the evaluator backend, and a failure message when the set is in its
 failure mode. Its Refresh control re-reads the live ring and its Clear control
 empties it. The same pane edits the workspace egress allowlist: one address or
 CIDR range per row, Add writes the file, Remove takes it out, and the next turn
-picks the change up.
+picks the change up. The pane distinguishes the two empty states in words: with
+no file, egress is UNRESTRICTED and it offers **Create starter allowlist**
+(writes the commented template); with a file that declares no rule, egress is
+deny-all and it says that uncommenting a line allows one, or deleting the file
+restores the unrestricted default. Creating the starter therefore opts into
+control: it declares no rule, so it denies all egress. **Open file** reveals the
+path in the platform browser (a missing file reveals its directory).
 
 ## Bash confinement
 
-In **Workspace Write**, on macOS, the shell runs under a Seatbelt profile
-(sandbox-exec): writes are allowed under the workspace, the temp directories
-and the device sinks, and denied everywhere else, including the workspace's
-.git and .bsh internals. The kernel enforces this per write syscall, so a path
-reached through a shell variable or an interpreter is still blocked. A host
-without /usr/bin/sandbox-exec falls back to the lexical pre-spawn scan, which is
-a guard rail rather than a sandbox. **Full access** is not sandboxed. Tools that
-insist on writing their own caches outside the workspace (for example ~/.cargo)
-need Full access or a cache relocated into the workspace.
+heel is the one sandbox implementation and a required dependency, on macOS,
+Linux and Windows. In **Workspace Write**, the shell runs under it with the
+grants the policy derived: writes are allowed under the workspace and the paths
+the policy allows, and denied everywhere else. Writes are not executable except
+in a policy-granted build cache, so a payload dropped into the workspace cannot
+be run. The kernel enforces this per write syscall, so a path reached through a
+shell variable or an interpreter is still blocked.
+
+heel has no deny rule inside a granted tree: a write to the workspace's .git or
+.bsh reached through a shell variable is refused by the tool-boundary policy
+(which names the rule) rather than by the kernel, and a command line that names
+the path is refused before it spawns. **Full access** is not sandboxed by
+default. A preset can still narrow it with `sandbox = "heel"`, which builds the
+Workspace Write grants even though the session permission is full access; and
+`sandbox = "none"` can only widen where the preset and the session are both
+full access. Tools that insist on writing their own caches outside the
+workspace (for example ~/.cargo) need Full access or a cache relocated into the
+workspace.
 
 ## What is not gated
 
@@ -372,11 +495,13 @@ need Full access or a cache relocated into the workspace.
   mcp; the extension trust gate still decides which packages may contribute a
   server, and a workspace policy can deny the spawn. MCP HTTP requests are gated
   at resolution.
-- Network from **inside bash**: the shell's child is not routed through the
-  egress gate. The policy gates the tool's own MCP HTTP path, and the Seatbelt
-  profile allows process and network by default, so a shell command can still
-  reach the network when the egress allowlist is empty. A shell network gate is
-  a later kernel-tier item.
+- Network from **inside bash**: the shell's child is routed through heel's
+  egress proxy. A derived allowlist asks the policy per connection; a
+  present-but-empty file starts no proxy and the kernel denies outbound traffic;
+  an absent file runs heel's allow-all policy, which still refuses ICMP and
+  host-local destinations (heel has no pass-through network mode). A command
+  that resolves a name itself can still reach an address through a hostname
+  rule's rebind window; address rules are the strong door.
 - The kernel tier: no eBPF on macOS and no EndpointSecurity entitlement in this
   slice. `PolicySet::check` is the documented seam a syscall broker would call.
 - Secrets: the audit records paths, hosts and rule ids; never environment

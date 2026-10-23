@@ -12,7 +12,8 @@ use std::sync::Arc;
 
 use agent::memory::{FileMemory, MemoryStore};
 use agent::policy::{
-    Action, EgressGate, PolicyData, PolicyInput, PolicySet, PolicySource, SystemResolver, Target,
+    Action, EgressGate, EgressRuleSet, PolicyData, PolicyInput, PolicySet, PolicySource,
+    SystemResolver, Target,
 };
 use agent::tools::{BashTool, FunctionTool, PlanTool};
 use agent::{Agent, AgentConfig, ToolError};
@@ -194,6 +195,52 @@ pub(crate) fn is_confined(permission: &str) -> bool {
 /// call time.
 pub(crate) fn allows_writes(permission: &str) -> bool {
     permission != READ_ONLY
+}
+
+/// The one sandbox spec for a turn's shell and its terminal pane.
+///
+/// Resolution decides heel vs off once (`Effective::sandbox`); this maps that
+/// decision onto the spec both spawn paths share:
+///
+/// - heel resolves to a policy-derived spec. A FULL-ACCESS session whose
+///   PRESET asked for heel is built as Workspace Write: the permission released
+///   confinement, and the preset narrowed it back, so the grants and the egress
+///   proxy come from the policy exactly as they do for a confined session.
+/// - off (permitted only at full access) is `bare(FullAccess)`: it spawns a
+///   bare shell and the tool result reports `sandbox: "none"`.
+/// - an absent field at full access keeps the permission's own full-access
+///   spec, which is byte-for-byte today's behaviour.
+pub(crate) fn sandbox_spec_for(
+    policy: &Arc<PolicySet>,
+    eff: &Effective,
+    tool: &str,
+    session: &str,
+) -> Arc<agent::sandbox::SandboxSpec> {
+    let principal = agent::sandbox::Principal::new(tool, session, eff.preset_id.clone());
+    if eff.sandbox.heel {
+        // A forced heel under full access must NOT derive a FullAccess spec:
+        // that spec is exactly the release the preset narrowed back.
+        let tier = if eff.permission.effective == FULL_ACCESS {
+            WORKSPACE_WRITE
+        } else {
+            eff.permission.effective.as_str()
+        };
+        Arc::new(agent::sandbox::SandboxSpec::for_policy(
+            policy, tier, principal,
+        ))
+    } else if eff.sandbox.declared == Some(crate::settings::global::SandboxChoice::Off) {
+        Arc::new(agent::sandbox::SandboxSpec::bare(
+            agent::sandbox::SandboxMode::FullAccess,
+            policy.data().workspace_root.clone(),
+        ))
+    } else {
+        // Inherit at full access: the permission's own release, unchanged.
+        Arc::new(agent::sandbox::SandboxSpec::for_policy(
+            policy,
+            &eff.permission.effective,
+            principal,
+        ))
+    }
 }
 
 /// Which tools a turn may offer, after permission, preset and policy agree.
@@ -405,6 +452,10 @@ pub(crate) fn build_agent_for_session(
         session,
         None,
         Arc::new(agent::jobs::JobRegistry::new()),
+        // A build that only prices the request's tools carries its own browser:
+        // the tool schema must be the one a real turn sends, and nothing a
+        // pricing build does may reach the reader's pane.
+        Arc::new(crate::browser::BrowserHandle::new()),
     )
 }
 
@@ -430,6 +481,7 @@ pub(crate) fn build_agent_for_session_with_subagents(
         parent,
         subagents,
         Arc::new(agent::jobs::JobRegistry::new()),
+        Arc::new(crate::browser::BrowserHandle::new()),
     )
 }
 
@@ -448,6 +500,7 @@ pub(crate) fn build_agent_for_session_with_subagents_and_jobs(
     parent: &str,
     subagents: Arc<crate::subagent::SubagentRegistry>,
     jobs: Arc<agent::jobs::JobRegistry>,
+    browser: Arc<crate::browser::BrowserHandle>,
 ) -> BuiltAgent {
     build_agent_for_session_inner(
         settings,
@@ -457,6 +510,7 @@ pub(crate) fn build_agent_for_session_with_subagents_and_jobs(
         session,
         Some((parent, subagents)),
         jobs,
+        browser,
     )
 }
 
@@ -469,6 +523,7 @@ fn build_agent_for_session_inner(
     session: &str,
     subagents: Option<(&str, Arc<crate::subagent::SubagentRegistry>)>,
     jobs: Arc<agent::jobs::JobRegistry>,
+    browser: Arc<crate::browser::BrowserHandle>,
 ) -> BuiltAgent {
     let eff = settings.effective_for(choice);
     // A contributed provider may declare that it needs no credential - an open
@@ -580,6 +635,10 @@ fn build_agent_for_session_inner(
     // tool that is reached another way is still refused (defence in depth).
     let permission = eff.permission.effective.clone();
     let confined = is_confined(&permission);
+    // The SHELL's confinement is its own resolved fact: a preset may force heel
+    // under full access, or (only at full access) turn it off. The file tools
+    // keep following the permission tier, which the preset already caps.
+    let shell_confined = eff.sandbox.heel;
     let writes = allows_writes(&permission);
     // ONE capability decision for the shell family and the delegation tool.
     // Permission, the preset's tool allowlist and the Rego capability answer
@@ -590,7 +649,21 @@ fn build_agent_for_session_inner(
         let mut shell_tools: Vec<Arc<dyn agent::tools::Tool>> = Vec::new();
         if gates.bash && !off_tool("bash") {
             let config = agent::tools::bash::BashToolConfig {
-                workspace_root: if confined {
+                // The cwd is the workspace root whenever the shell is CONFINED
+                // or a preset explicitly unconfined it: for those two arms the
+                // spawn question is asked about this path, and the baseline's
+                // path rule answers it.
+                //
+                // An INHERITED full-access release is the third arm, and it is
+                // deliberately handed None: None is the one switch that leaves
+                // BashTool's validator unset and so drops its destructive and
+                // elevated-privilege guards. None also means the shell's cwd is
+                // the app's launch directory rather than the workspace, so the
+                // policy MUST permit the spawn by TIER - that is what the
+                // baseline's `spawn-shell-full-access` arm is for. A path-only
+                // policy would refuse every command here before a process
+                // existed, which is exactly the bug this arm fixes.
+                workspace_root: if shell_confined || eff.sandbox.off_by_preset {
                     root.as_ref().map(|r| r.to_string_lossy().to_string())
                 } else {
                     None
@@ -600,20 +673,20 @@ fn build_agent_for_session_inner(
             };
             // ONE sandbox spec for the shell and the terminal pane: the grants
             // are the policy's own answers, asked once per candidate, so the
-            // confinement is not a profile this file wrote down. Full access
-            // derives an unconfined spec, which spawns a bare shell - the same
-            // release the permission already means.
-            let spec = Arc::new(agent::sandbox::SandboxSpec::for_policy(
-                &policy,
-                &permission,
-                agent::sandbox::Principal::new("bash", session, preset.clone()),
-            ));
-            let bash = BashTool::new("bash")
+            // confinement is not a profile this file wrote down. At full access
+            // the DEFAULT is still an unconfined spec (today's release); a
+            // preset's explicit heel is the narrowing arm, and an explicit none
+            // is the widening arm the resolver already guard-checked.
+            let spec = sandbox_spec_for(&policy, &eff, "bash", session);
+            let mut bash = BashTool::new("bash")
                 .with_config(config)
                 .with_policy(policy.clone(), session, preset.clone())
                 .with_jobs(jobs.clone(), session)
                 .with_background(gates.background_spawn)
                 .with_sandbox_spec(spec);
+            if eff.sandbox.off_by_preset {
+                bash = bash.with_sandbox_reason(agent::tools::bash::PRESET_SANDBOX_OFF_REASON);
+            }
             shell_tools.push(Arc::new(bash));
         }
         // The job tools share the shell bundle but each has its own gate: a
@@ -871,6 +944,19 @@ fn build_agent_for_session_inner(
             attach_subagent_tool(&mut agent, context);
         }
     }
+
+    // The built-in browser: its tools act on ONE shared pane and ask the SAME
+    // policy every other tool asks. The handle is the shell's, so a call and the
+    // reader's pane show the same document; a pricing build passes its own.
+    crate::browser::attach(
+        &mut agent,
+        crate::browser::Tools {
+            browser,
+            policy: policy.clone(),
+            session: session.to_string(),
+            preset: preset.clone(),
+        },
+    );
 
     // The meter's tools bucket follows the request's own tool array, so it is
     // priced from the registry that request will serialize.
@@ -1513,39 +1599,72 @@ fn build_policy(settings: &Settings, eff: &Effective, root: Option<&Path>) -> Po
         // preset's ceiling alone and never the requested mode.
         .with_permission(eff.permission.effective.clone());
     if let Some(root) = root {
-        // One file, three rule shapes: addresses (the strong door), hostnames
-        // (the weak door) and ports (a constraint on both).
-        let rules = read_egress_rules(root);
-        data = data
-            .with_egress_allowlist(rules.addresses)
-            .with_egress_hosts(rules.hosts)
-            .with_egress_ports(rules.ports);
-        let read_roots = eff
+        // The file is TRI-STATE, and the state is a fact the empty rule lists
+        // cannot carry: ABSENT means nothing constrains egress (a fresh
+        // workspace reaches the network), PRESENT with no rule is a deliberate
+        // deny-all, PRESENT with rules is the allowlist. Only the last one is
+        // described by the three rule shapes (addresses = the strong door,
+        // hostnames = the weak door, ports = a constraint on both).
+        match read_egress_rules(root) {
+            WorkspaceEgress::Absent => {
+                data = data.with_egress_unrestricted(true);
+            }
+            WorkspaceEgress::Empty => {
+                // The baseline's deny-all floor is the right answer for a file
+                // the reader created and left empty.
+            }
+            WorkspaceEgress::Rules(rules) => {
+                data = data
+                    .with_egress_allowlist(rules.addresses)
+                    .with_egress_hosts(rules.hosts)
+                    .with_egress_ports(rules.ports);
+            }
+        }
+        // One parse of each scope list into its LITERAL roots (prefix
+        // matching, what every shipped preset relies on) and its GLOBS (the
+        // entries that carry * ? [ or {). Both shapes reach the same decision,
+        // and deny is decided first so it wins even inside a granted root.
+        let (read_roots, read_globs) = eff
             .preset_read
             .as_ref()
-            .map(|items| preset_scope_roots(root, items))
+            .map(|items| preset_scope_patterns(root, items, false))
             .unwrap_or_default();
-        let write_roots = eff
+        let (write_roots, write_globs) = eff
             .preset_write
             .as_ref()
-            .map(|items| preset_scope_roots(root, items))
+            .map(|items| preset_scope_patterns(root, items, false))
             .unwrap_or_default();
-        let deny_roots = preset_scope_roots(root, &eff.preset_deny);
-        data = data.with_preset_scope(
-            eff.preset_read.is_some(),
-            read_roots,
-            eff.preset_write.is_some(),
-            write_roots,
-            deny_roots,
-        );
+        let (deny_roots, deny_globs) = preset_scope_patterns(root, &eff.preset_deny, true);
+        data = data
+            .with_preset_scope(
+                eff.preset_read.is_some(),
+                read_roots,
+                eff.preset_write.is_some(),
+                write_roots,
+                deny_roots,
+            )
+            .with_preset_globs(read_globs, write_globs, deny_globs);
         if let Some(egress) = &eff.preset_egress {
-            data = data.with_preset_egress(true, egress.clone());
+            // The preset's own entries are classified through the SAME parser
+            // the workspace file uses, so a preset can name an address, a
+            // hostname (with a `*.` wildcard) or a bare port and mean the same
+            // thing the file means. A declared empty list still restricts: it
+            // is the preset saying "no network", not an absent field, and the
+            // policy then refuses every address while the derived proxy set
+            // stays empty.
+            data = data.with_preset_egress(true, EgressRuleSet::parse(egress));
         }
     }
     // The session tier as a policy fact, generated for the effective level.
     // A read-only session denies writes, egress and spawns here as well as in
     // the Rust registration matrix; that matrix is the floor (the tools are not
     // even offered), and this module is the second tier (defence in depth).
+    // ADVISORY applies to the modules the PRESET contributes, and only to
+    // them. The baseline, the session tier and the workspace policy are never
+    // marked: in advisory mode the preset's own scope, egress, guard and custom
+    // Rego warn instead of blocking, while the floor still refuses. That is
+    // what keeps advisory from widening the session or leaving the workspace.
+    let advisory = eff.policy_mode() == crate::settings::global::PolicyMode::Advisory;
     let mut sources = vec![
         agent::policy::baseline_source(),
         agent::policy::session_permission_source(&eff.permission.effective),
@@ -1553,30 +1672,34 @@ fn build_policy(settings: &Settings, eff: &Effective, root: Option<&Path>) -> Po
     let scope_active =
         eff.preset_read.is_some() || eff.preset_write.is_some() || !eff.preset_deny.is_empty();
     if scope_active {
-        sources.push(agent::policy::preset_scope_source());
+        sources.push(agent::policy::preset_scope_source().advisory(advisory));
     }
     if eff.preset_egress.is_some() {
-        sources.push(agent::policy::preset_egress_source());
+        sources.push(agent::policy::preset_egress_source().advisory(advisory));
     }
     // A read-only CEILING is also a policy fact of its own: the preset's module
     // narrows independently of the session tier. The built-in read-only module
     // already carries this rule; add the generated one only when the preset does
     // not name it, so every read-only preset is enforced by Rego.
     let generated_read_only = eff.preset_permission.as_deref() == Some("read-only")
-        && !eff.preset_builtin_policy.iter().any(|id| id == "read-only");
+        && !eff
+            .preset_builtin_policy
+            .iter()
+            .any(|id| canonical_builtin_policy_id(id) == "builtin:read-only");
     if generated_read_only {
-        sources.push(agent::policy::preset_permission_source());
+        sources.push(agent::policy::preset_permission_source().advisory(advisory));
     }
     for id in &eff.preset_builtin_policy {
         match builtin_policy_source(id) {
-            Some(source) => sources.push(source),
+            Some(source) => sources.push(source.advisory(advisory)),
             None => {
                 // An unknown built-in id must not silently disappear from the
                 // set: an unparseable placeholder latches the failure mode.
                 warn!("unknown preset builtin policy '{id}'");
-                sources.push(PolicySource::new(
+                sources.push(PolicySource::extension(
                     "preset-builtin",
                     "# unknown preset builtin policy",
+                    false,
                 ));
             }
         }
@@ -1584,22 +1707,23 @@ fn build_policy(settings: &Settings, eff: &Effective, root: Option<&Path>) -> Po
     // A required policy that the reader has not trusted makes the preset
     // unusable; refuse it in the set as well as in the send gate.
     if eff.preset_policy_required_untrusted() {
-        sources.push(PolicySource::new(
+        sources.push(PolicySource::extension(
             "preset-policy",
             "# required preset policy is untrusted",
+            false,
         ));
     } else if eff.preset_trusted {
         // A preset is an authority only after the reader trusts it. An
-        // untrusted advisory policy is ignored; the send gate refuses the
-        // required case before a turn starts.
+        // untrusted policy is ignored; the send gate refuses the required case
+        // before a turn starts.
         if let Some(policy) = eff.preset_policy.as_deref() {
-            sources.push(PolicySource::new("preset", policy));
+            sources.push(PolicySource::extension("preset", policy, true).advisory(advisory));
         }
     }
     if let Some(root) = root {
         let path = root.join(".bsh").join("policy.rego");
         match std::fs::read_to_string(&path) {
-            Ok(rego) => sources.push(PolicySource::new("workspace", rego)),
+            Ok(rego) => sources.push(PolicySource::workspace("workspace", rego)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 // A policy file that exists but cannot be read must not
@@ -1607,7 +1731,7 @@ fn build_policy(settings: &Settings, eff: &Effective, root: Option<&Path>) -> Po
                 // the workspace meant to narrow. An unparseable placeholder
                 // latches the set into its failure mode instead.
                 warn!("policy file {} could not be read: {error}", path.display());
-                sources.push(PolicySource::new(
+                sources.push(PolicySource::workspace(
                     "workspace",
                     "# the workspace policy exists but could not be read",
                 ));
@@ -1702,44 +1826,86 @@ verdict := {"allow": false, "rule": "deny-git-writes", "reason": "writes into Gi
 } else := {"allow": true}
 "#;
 
-fn builtin_policy_source(id: &str) -> Option<PolicySource> {
-    let (label, rego) = match id {
-        "deny-secrets" => ("builtin-deny-secrets", BUILTIN_DENY_SECRETS),
-        "read-only" => ("builtin-read-only", BUILTIN_READ_ONLY),
-        "no-shell" => ("builtin-no-shell", BUILTIN_NO_SHELL),
-        "no-egress" => ("builtin-no-egress", BUILTIN_NO_EGRESS),
-        "docs-only" => ("builtin-docs-only", BUILTIN_DOCS_ONLY),
-        "deny-git-writes" => ("builtin-deny-git-writes", BUILTIN_DENY_GIT_WRITES),
-        _ => return None,
-    };
-    Some(PolicySource::new(label, rego))
+/// The stable id a preset's `builtin_policy` entry names.
+///
+/// The bare names (`deny-secrets`) are the vocabulary every existing preset
+/// file uses, so they are accepted as aliases and canonicalised to the
+/// `builtin:` id; an unknown entry is returned unchanged so the loader can
+/// report it rather than silently substituting one.
+pub(crate) fn canonical_builtin_policy_id(id: &str) -> &str {
+    let trimmed = id.trim();
+    let bare = trimmed.strip_prefix("builtin:").unwrap_or(trimmed);
+    match bare {
+        "deny-secrets" => "builtin:deny-secrets",
+        "read-only" => "builtin:read-only",
+        "no-shell" => "builtin:no-shell",
+        "no-egress" => "builtin:no-egress",
+        "docs-only" => "builtin:docs-only",
+        "deny-git-writes" => "builtin:deny-git-writes",
+        _ => trimmed,
+    }
 }
 
-/// Resolve a preset's workspace-relative scope entries to canonical absolute
-/// roots. Entries that escape the workspace are ignored: an invalid narrowing
-/// is safer than a silent widening.
-fn preset_scope_roots(root: &std::path::Path, items: &[String]) -> Vec<String> {
-    items
-        .iter()
-        .filter_map(|item| {
-            let rel = std::path::Path::new(item);
-            if rel.is_absolute()
-                || rel
-                    .components()
-                    .any(|component| component == std::path::Component::ParentDir)
-            {
-                warn!("preset scope entry '{item}' is not workspace-relative");
-                return None;
+fn builtin_policy_source(id: &str) -> Option<PolicySource> {
+    let canonical = canonical_builtin_policy_id(id);
+    let rego = match canonical {
+        "builtin:deny-secrets" => BUILTIN_DENY_SECRETS,
+        "builtin:read-only" => BUILTIN_READ_ONLY,
+        "builtin:no-shell" => BUILTIN_NO_SHELL,
+        "builtin:no-egress" => BUILTIN_NO_EGRESS,
+        "builtin:docs-only" => BUILTIN_DOCS_ONLY,
+        "builtin:deny-git-writes" => BUILTIN_DENY_GIT_WRITES,
+        _ => return None,
+    };
+    Some(PolicySource::builtin(canonical, rego))
+}
+
+/// Resolve a preset scope list into its LITERAL roots and GLOB patterns.
+///
+/// The two shapes are not alternatives: a list may mix `docs` (a literal
+/// prefix, which is what a directory entry has always meant) with
+/// `src/**/*.rs` (a glob). A literal entry is canonicalized when the path
+/// exists so a symlinked workspace compares like the tools' resolved paths; a
+/// pattern cannot be canonicalized, so it is joined to the same canonical root
+/// the tools use.
+///
+/// Validation happens at LOAD (`Preset::scope_problem`), so an entry here has
+/// already been accepted. The fallback still fails CLOSED: an entry that slips
+/// through is logged and, for a deny list, becomes a match-everything pattern
+/// rather than disappearing - a dropped deny entry would be a widening.
+fn preset_scope_patterns(
+    root: &std::path::Path,
+    items: &[String],
+    deny: bool,
+) -> (Vec<String>, Vec<String>) {
+    let mut roots: Vec<String> = Vec::new();
+    let mut globs: Vec<String> = Vec::new();
+    for item in items {
+        let entry = item.trim();
+        if let Err(why) = agent::policy::validate_scope_entry(entry) {
+            warn!("preset scope entry '{entry}' is invalid ({why}); refusing to drop it silently");
+            // A deny entry that cannot be parsed denies everything in the
+            // workspace instead of vanishing. A read/write entry is skipped,
+            // which NARROWS (the scope no longer grants it) rather than widens.
+            if deny {
+                globs.push("**".to_string());
             }
-            let joined = root.join(rel);
+            continue;
+        }
+        let path = std::path::Path::new(entry);
+        let joined = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.join(path)
+        };
+        if agent::policy::is_glob(entry) {
+            globs.push(joined.to_string_lossy().to_string());
+        } else {
             let canonical = joined.canonicalize().unwrap_or(joined);
-            if !canonical.starts_with(root) {
-                warn!("preset scope entry '{item}' resolves outside the workspace");
-                return None;
-            }
-            Some(canonical.to_string_lossy().to_string())
-        })
-        .collect()
+            roots.push(canonical.to_string_lossy().to_string());
+        }
+    }
+    (roots, globs)
 }
 
 /// The egress rules this workspace declares.
@@ -1756,40 +1922,162 @@ fn preset_scope_roots(root: &std::path::Path, items: &[String]) -> Vec<String> {
 ///   is the weaker door - it survives a rebind - and it exists for a policy that
 ///   names a service rather than an address.
 ///
-/// A missing file means no rules at all, which denies all egress: the
-/// baseline's documented default.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct EgressRules {
-    pub(crate) addresses: Vec<String>,
-    pub(crate) hosts: Vec<String>,
-    pub(crate) ports: Vec<u16>,
+/// The file is TRI-STATE, and the three states are different decisions:
+///
+/// - [`WorkspaceEgress::Absent`] - no file at all. The workspace declared
+///   nothing, so egress is UNRESTRICTED; this is the state of a fresh workspace,
+///   which is why the network works out of the box.
+/// - [`WorkspaceEgress::Empty`] - the file exists and parses to no rule (only
+///   comments and blanks). The reader created the file and left it empty, which
+///   is a deliberate deny-all.
+/// - [`WorkspaceEgress::Rules`] - the file declares rules, which constrain the
+///   reach exactly as before.
+///
+/// The classification itself is [`EgressRuleSet`], the one parser both this
+/// file and a preset's own `egress` field read through, so a line cannot mean
+/// one thing here and another in a preset.
+///
+/// An unreadable file is reported as PRESENT (a deny-all), never as absent: a
+/// permission error or a directory at the path must not widen a workspace that
+/// meant to constrain itself. Only `NotFound` is the absent state.
+fn read_egress_rules(root: &Path) -> WorkspaceEgress {
+    let path = egress_allowlist_path(root);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return WorkspaceEgress::Absent;
+        }
+        Err(error) => {
+            warn!("the workspace egress allowlist could not be read: {error}");
+            return WorkspaceEgress::Empty;
+        }
+    };
+    let rules = EgressRuleSet::parse([text]);
+    if rules.is_empty() {
+        WorkspaceEgress::Empty
+    } else {
+        WorkspaceEgress::Rules(rules)
+    }
 }
 
-fn read_egress_rules(root: &Path) -> EgressRules {
-    let path = root.join(".bsh").join("egress-allowlist");
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return EgressRules::default();
-    };
-    let mut rules = EgressRules::default();
-    for line in text.lines() {
-        let entry = line.split('#').next().unwrap_or("").trim();
-        if entry.is_empty() {
-            continue;
-        }
-        if let Ok(port) = entry.parse::<u16>() {
-            rules.ports.push(port);
-            continue;
-        }
-        let base = entry.split('/').next().unwrap_or(entry);
-        let is_address = entry.parse::<std::net::IpAddr>().is_ok()
-            || (entry.contains('/') && base.parse::<std::net::IpAddr>().is_ok());
-        if is_address {
-            rules.addresses.push(entry.to_string());
-        } else {
-            rules.hosts.push(entry.to_ascii_lowercase());
-        }
+/// What the workspace egress file declares, in the three states the policy
+/// answers differently.
+///
+/// The rule lists cannot carry the distinction: an absent file and a
+/// present-but-empty file both have no rule, and the first is UNRESTRICTED
+/// while the second is a deliberate DENY ALL. The reader owns the file's state
+/// so the policy can be told which it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WorkspaceEgress {
+    /// No `.bsh/egress-allowlist` file at all: nothing is constrained.
+    Absent,
+    /// The file exists and parses to no rule: a deliberate deny-all.
+    Empty,
+    /// The file exists and declares at least one rule.
+    Rules(EgressRuleSet),
+}
+
+/// The one path the workspace's egress allowlist lives at.
+///
+/// The reader, the pane's create action and the settings reveal all derive the
+/// path here, so the file the shell shows and the file the policy parses cannot
+/// drift apart.
+pub(crate) fn egress_allowlist_path(root: &Path) -> PathBuf {
+    root.join(".bsh").join("egress-allowlist")
+}
+
+/// The starter body the Policy pane's "Create starter allowlist" offers.
+///
+/// This is the SINGLE source of truth for that text: the pane action writes
+/// exactly these bytes, so the copy a reader sees and the file they get cannot
+/// drift apart.
+///
+/// CREATING THE FILE IS AN OPT-IN TO CONTROL. With no file at all the workspace
+/// is UNRESTRICTED - the network works out of the box - while a file that
+/// exists and declares no rule DENIES ALL EGRESS. The starter therefore states
+/// both facts in its own words and parses to ZERO rules: the reader who writes
+/// it has deliberately chosen the deny-all floor, and uncommenting a rule is
+/// how they open one destination.
+///
+/// The starter carries a commented DENY ALL example, a commented ALLOW ALL
+/// (nearest-equivalent) example and one WORKED allow example, every rule still
+/// commented so the file itself cannot change the floor when it is written.
+///
+/// Allow-all is NOT expressible as a single hostname rule: the parser reads a
+/// hostname rule as an exact name or a leading "*." suffix, so a bare "*"
+/// matches no host, and there is no "any hostname" spelling. The real, closest
+/// equivalent is an address rule covering every address - `0.0.0.0/0` for IPv4
+/// and `::/0` for IPv6 - which the parser classifies as an ADDRESS rule and
+/// `net.cidr_contains` then matches against any resolved address. That is what
+/// the commented example below documents, honestly, rather than inventing a
+/// syntax the parser does not accept.
+pub(crate) const EGRESS_ALLOWLIST_TEMPLATE: &str = "\
+# Egress allowlist for this workspace.
+#
+# CREATING THIS FILE OPTS INTO CONTROL.
+#
+# With NO file at all the workspace is UNRESTRICTED: the network works out of
+# the box. A file that EXISTS and declares no rule - only comments and blank
+# lines, like this starter - DENIES ALL EGRESS. That is deliberate: the file is
+# the workspace's network floor, and an empty one is a lockdown, not an
+# absence. Delete the file to restore the unrestricted default, or uncomment a
+# rule to allow a destination.
+#
+# This file can only NARROW what the baseline and the preset allow; a preset
+# may narrow it further and can never add a destination this file does not
+# name.
+#
+# One rule per line; blank lines and '#' comments are ignored. A line is one of
+# three shapes, decided by what it can be:
+#
+#   port     443              a bare integer: a destination PORT. No port lines
+#                             means any port; one or more means only those.
+#   address  203.0.113.7      an address or a CIDR range: the STRONG door,
+#            10.0.0.0/8       decided on the resolved IP, so a DNS rebind
+#                             cannot ride it.
+#   hostname api.example.com  anything else: a HOSTNAME, the WEAKER door -
+#            *.crates.io      the name is what the policy saw, so a rebind
+#                             survives it. A leading '*.' matches any subdomain.
+#
+# Every line below is a COMMENTED example, so this file declares no rule and
+# egress is denied until you deliberately uncomment one.
+#
+# WORKED EXAMPLE - allow one IPv4 address on the HTTPS port. Uncomment both
+# lines to make the HTTPS URL of 203.0.113.7 reachable and nothing else:
+# 203.0.113.7
+# 443
+#
+# Example: allow a service by name (the weaker door).
+# api.example.com
+# *.crates.io
+#
+# DENY ALL: what this file already does. Leave no uncommented rule. There is no
+# deny-all keyword - a present file with no rule IS the deny.
+#
+# ALLOW ALL: there is no wildcard-hostname spelling for any host: a hostname
+# rule matches an exact name or a leading '*.' suffix, so '*' matches no host.
+# The nearest real equivalent is an address rule covering every address; the
+# parser accepts it and it is the honest allow-all:
+# 0.0.0.0/0
+# ::/0
+";
+
+/// Write the starter allowlist whether or not one is already there.
+///
+/// This is the Policy pane's explicit "Create starter allowlist" action: the
+/// reader asked for the template, so an existing file is replaced with exactly
+/// the template bytes. Nothing seeds this file automatically: an auto-seeded
+/// file would flip a fresh, unrestricted workspace into a deny-all one.
+///
+/// The written file declares no rule, so creating it DENIES all egress; the
+/// pane's notice and the template's own prose both say so before the reader
+/// clicks. The workspace-registration path never calls this.
+pub(crate) fn write_egress_allowlist_template(root: &Path) -> std::io::Result<()> {
+    let path = egress_allowlist_path(root);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
-    rules
+    std::fs::write(&path, EGRESS_ALLOWLIST_TEMPLATE)
 }
 
 /// Ask the policy about one concrete path before a tool touches it.
@@ -2050,18 +2338,50 @@ fn open_memory(settings: &Settings) -> Option<Arc<dyn MemoryStore>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_messages, allows_writes, build_agent, compactable_span, is_confined,
-        plugin_provider_node, read_egress_rules, refresh_plugin_providers, surfaced_capabilities,
-        tool_gates_for, with_bridge_pool, BuiltAgent, FULL_ACCESS, READ_ONLY, WORKSPACE_WRITE,
+        agent_messages, allows_writes, build_agent, compactable_span, egress_allowlist_path,
+        is_confined, plugin_provider_node, read_egress_rules, refresh_plugin_providers,
+        sandbox_spec_for, surfaced_capabilities, tool_gates_for, with_bridge_pool, BuiltAgent,
+        WorkspaceEgress, EGRESS_ALLOWLIST_TEMPLATE, FULL_ACCESS, READ_ONLY, WORKSPACE_WRITE,
     };
     use crate::settings::global::{ModelEntry, Preset};
     use crate::settings::resolve::SessionChoice;
     use crate::settings::Settings;
     use crate::vault::Vault;
-    use agent::policy::{Action, PolicyInput, Target};
+    use agent::policy::{Action, EgressRuleSet, PolicyInput, Target};
 
+    /// The browser's tools reach the request. A pane the model cannot drive is
+    /// a picture; this asserts the nine names are on the agent a turn runs.
+    #[test]
+    fn a_build_offers_the_browser_tools() {
+        let built = build_agent(
+            &Settings::default(),
+            &Vault::disabled(),
+            &SessionChoice::default(),
+            &crate::mcp::McpPool::default(),
+        );
+        let registry = built.agent.registry().expect("a tool registry");
+        let names = registry.async_tool_names();
+        for tool in [
+            "browser_open",
+            "browser_snapshot",
+            "browser_click",
+            "browser_type",
+            "browser_press",
+            "browser_back",
+            "browser_forward",
+            "browser_reload",
+            "browser_close",
+        ] {
+            assert!(
+                names.iter().any(|name| name == tool),
+                "{tool} is offered to the model: {names:?}"
+            );
+        }
+    }
     /// The egress file carries three rule shapes, and a line is classified by
-    /// what it can be: a port number, an address, or a hostname.
+    /// what it can be: a port number, an address, or a hostname. The reader also
+    /// reports the file's own STATE, which the rule lists cannot carry: absent
+    /// (unrestricted), present-but-empty (deny-all), or present with rules.
     #[test]
     fn egress_rules_are_classified_by_what_they_can_be() {
         let root = std::env::temp_dir().join(format!("bsh-egress-rules-{}", std::process::id()));
@@ -2077,7 +2397,10 @@ mod tests {
              443\n",
         )
         .expect("the allowlist");
-        let rules = read_egress_rules(&root);
+        let rules = match read_egress_rules(&root) {
+            WorkspaceEgress::Rules(rules) => rules,
+            other => panic!("a file with rules must read as Rules, got {other:?}"),
+        };
         assert_eq!(rules.addresses, vec!["203.0.113.7", "10.0.0.0/8"]);
         assert_eq!(
             rules.hosts,
@@ -2086,11 +2409,269 @@ mod tests {
         );
         assert_eq!(rules.ports, vec![443]);
 
-        // A missing file declares nothing at all, which denies all egress.
-        let empty = read_egress_rules(&root.join("nowhere"));
-        assert!(empty.addresses.is_empty() && empty.hosts.is_empty() && empty.ports.is_empty());
+        // A missing file is ABSENT, not an empty rule list: the policy answers
+        // it with UNRESTRICTED egress, so the two must not be conflated.
+        assert_eq!(
+            read_egress_rules(&root.join("nowhere")),
+            WorkspaceEgress::Absent,
+            "no file is its own state"
+        );
+
+        // A file that exists with only comments is PRESENT and EMPTY: the
+        // deliberate deny-all, which is a different decision from absence.
+        let present = root.join("present-empty");
+        std::fs::create_dir_all(present.join(".bsh")).expect(".bsh");
+        std::fs::write(
+            present.join(".bsh").join("egress-allowlist"),
+            "# nothing is allowed\n\n",
+        )
+        .expect("the empty allowlist");
+        assert_eq!(
+            read_egress_rules(&present),
+            WorkspaceEgress::Empty,
+            "an existing file with no rule is a deny-all"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// The starter template parses to ZERO rules, so WRITING IT is the
+    /// deny-all floor rather than a way to get network access; it states the
+    /// tri-state in its own copy (creating the file opts into control, leaving
+    /// it empty denies all, deleting it restores the unrestricted default) and
+    /// documents a commented deny-all example, a commented allow-all
+    /// (nearest-equivalent) example and one worked allow example.
+    #[test]
+    fn the_starter_allowlist_parses_to_no_rules() {
+        let rules = EgressRuleSet::parse([EGRESS_ALLOWLIST_TEMPLATE]);
+        assert!(
+            rules.is_empty(),
+            "the template must declare no rule: {rules:?}"
+        );
+        assert!(rules.addresses.is_empty() && rules.hosts.is_empty() && rules.ports.is_empty());
+        // A commented DENY-ALL marker and a commented ALLOW-ALL / nearest
+        // equivalent line are both present and both still commented.
+        assert!(
+            EGRESS_ALLOWLIST_TEMPLATE.contains("# DENY ALL"),
+            "the template names the deny-all marker"
+        );
+        assert!(
+            EGRESS_ALLOWLIST_TEMPLATE.contains("# ALLOW ALL"),
+            "the template names the allow-all marker"
+        );
+        // Allow-all is not expressible as a hostname wildcard; the honest form is
+        // the address rule covering every address, and it is COMMENTED.
+        for line in EGRESS_ALLOWLIST_TEMPLATE.lines() {
+            let bare = line.split('#').next().unwrap_or("").trim();
+            assert!(
+                bare.is_empty(),
+                "every line of the template is blank or commented; found: {line:?}"
+            );
+        }
+        assert!(
+            EGRESS_ALLOWLIST_TEMPLATE.contains("# 0.0.0.0/0")
+                && EGRESS_ALLOWLIST_TEMPLATE.contains("# ::/0"),
+            "the allow-all nearest equivalent is documented and commented"
+        );
+        // The copy is the contract: the reader must learn that the file's
+        // EXISTENCE is what opts into control, that an empty one denies, that
+        // absence is unrestricted, and that a worked allow example is present.
+        for phrase in [
+            "CREATING THIS FILE OPTS INTO CONTROL",
+            "UNRESTRICTED",
+            "DENIES ALL EGRESS",
+            "Delete the file to restore",
+            "WORKED EXAMPLE",
+        ] {
+            assert!(
+                EGRESS_ALLOWLIST_TEMPLATE.contains(phrase),
+                "the starter states the tri-state; missing {phrase:?}"
+            );
+        }
+    }
+
+    /// The documented allow-all nearest equivalent really is one: the parser
+    /// reads `0.0.0.0/0` and `::/0` as ADDRESS rules, which is what the template
+    /// claims. A bare `*` does NOT match any host, which is why the template does
+    /// not offer it.
+    #[test]
+    fn allow_all_is_the_address_rule_and_not_a_hostname_wildcard() {
+        let rules = EgressRuleSet::parse(["0.0.0.0/0", "::/0", "*"]);
+        assert_eq!(
+            rules.addresses,
+            vec!["0.0.0.0/0", "::/0"],
+            "the covering ranges are address rules"
+        );
+        assert_eq!(
+            rules.hosts,
+            vec!["*"],
+            "a bare star is a hostname rule, not any host"
+        );
+    }
+
+    /// A workspace whose allowlist file EXISTS but is empty denies all egress:
+    /// the very command a fresh (absent-file) workspace allows is refused, the
+    /// listener sees no hit, and the tool reports `network: "deny-all"`. This is
+    /// the deliberate lockdown the pane's starter action opts into.
+    #[test]
+    fn a_present_but_empty_allowlist_denies_all_network() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let Some(host) = lan_address() else {
+            eprintln!("no non-loopback IPv4 address on this host; the egress probe needs one");
+            return;
+        };
+        let listener = std::net::TcpListener::bind((host.as_str(), 0)).expect("a listener");
+        let port = listener.local_addr().expect("its port").port();
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        serve_http(listener, std::sync::Arc::clone(&hits));
+
+        let root = scratch("egress-present-empty");
+        // The reader created the file and left it empty. The pane's starter is
+        // exactly that file, so use the same writer.
+        crate::caps::write_egress_allowlist_template(&root).expect("the starter file");
+        assert!(
+            egress_allowlist_path(&root).exists(),
+            "the premise: a PRESENT file"
+        );
+        let mut settings = rooted(&root);
+        settings.global.default_preset = "standard".to_string();
+        let built = build(&settings);
+        assert!(
+            !built.policy.data().egress_unrestricted,
+            "a present file is not the absent state"
+        );
+        let spec = agent::sandbox::SandboxSpec::for_policy(
+            &built.policy,
+            WORKSPACE_WRITE,
+            agent::sandbox::Principal::new("bash", "session", "standard"),
+        );
+        assert_eq!(
+            spec.egress(),
+            &agent::sandbox::Egress::DenyAll,
+            "an empty file derives the kernel deny, not an open reach"
+        );
+
+        let bash = built
+            .agent
+            .registry()
+            .expect("registry")
+            .get("bash")
+            .expect("bash");
+        // The endpoint is hidden in variables, so the command tier cannot name
+        // it: the command RUNS and only the sandbox can refuse the connection.
+        let hidden = bash
+            .run(&serde_json::json!({
+                "command": format!(
+                    "H={host}; P={port}; curl -sS --max-time 3 -o /dev/null \"http://$H:$P/\""
+                )
+            }))
+            .expect("the command runs");
+        assert_eq!(
+            hidden["network"],
+            serde_json::json!("deny-all"),
+            "the honest state for an empty file: {hidden}"
+        );
+        assert!(
+            !hidden["success"].as_bool().unwrap_or(true),
+            "the empty file let the request out: {hidden}"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "a listener was reached");
+
+        // A literal endpoint is refused before a process exists and names the
+        // baseline rule it violated.
+        match bash.run(&serde_json::json!({
+            "command": format!("curl -sS --max-time 3 -o /dev/null http://{host}:{port}/")
+        })) {
+            Err(agent::ToolError::Failed(message)) => assert!(
+                message.contains("egress-not-allowlisted"),
+                "the empty file refuses with the baseline rule: {message}"
+            ),
+            other => panic!("an empty allowlist must refuse the literal endpoint, got {other:?}"),
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "a refused command connected"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A workspace with a PRESENT allowlist reaches only the address it names,
+    /// reports `network: "allowlist"`, and still refuses an address the file
+    /// does not carry.
+    #[test]
+    fn a_present_allowlist_reaches_only_its_endpoint() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let Some(host) = lan_address() else {
+            eprintln!("no non-loopback IPv4 address on this host; the egress probe needs one");
+            return;
+        };
+        let listener = std::net::TcpListener::bind((host.as_str(), 0)).expect("a listener");
+        let port = listener.local_addr().expect("its port").port();
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        serve_http(listener, std::sync::Arc::clone(&hits));
+
+        let root = scratch("egress-present-rules");
+        std::fs::create_dir_all(root.join(".bsh")).expect(".bsh");
+        std::fs::write(
+            egress_allowlist_path(&root),
+            format!("# the one reachable address\n{host}\n"),
+        )
+        .expect("the allowlist");
+        let mut settings = rooted(&root);
+        settings.global.default_preset = "standard".to_string();
+        let built = build(&settings);
+        let spec = agent::sandbox::SandboxSpec::for_policy(
+            &built.policy,
+            WORKSPACE_WRITE,
+            agent::sandbox::Principal::new("bash", "session", "standard"),
+        );
+        assert_eq!(
+            spec.egress(),
+            &agent::sandbox::Egress::Allow(vec![host.clone()]),
+            "the file's address is the derived allowlist"
+        );
+
+        let bash = built
+            .agent
+            .registry()
+            .expect("registry")
+            .get("bash")
+            .expect("bash");
+        let allowed = bash
+            .run(&serde_json::json!({
+                "command": format!("curl -sS --max-time 3 http://{host}:{port}/")
+            }))
+            .expect("the command runs");
+        assert_eq!(
+            allowed["network"],
+            serde_json::json!("allowlist"),
+            "a real rule reports the allowlist: {allowed}"
+        );
+        assert!(allowed["success"].as_bool().unwrap_or(false), "{allowed}");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the allowed endpoint was reached"
+        );
+
+        // An address the file does not name is refused at the command tier.
+        match bash.run(&serde_json::json!({
+            "command": "curl -sS --max-time 3 -o /dev/null http://203.0.113.9/"
+        })) {
+            Err(agent::ToolError::Failed(message)) => assert!(
+                message.contains("egress-not-allowlisted"),
+                "the unlisted address is refused: {message}"
+            ),
+            other => panic!("an unlisted address must be refused, got {other:?}"),
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the refused command did not connect"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A transcript with `turns` exchanges, so the gate has history to fold.
     fn turns(count: usize) -> Vec<crate::model::ChatMessage> {
         let mut messages = Vec::new();
@@ -2475,9 +3056,17 @@ mod tests {
     /// The setting is the reader's half of the decision; the engine holds the
     /// other half, so this pins that the value arrives and that a chat-protocol
     /// provider is not handed a hosted tool it would reject.
+    ///
+    /// The preset is cleared first, on purpose: `Settings::default()` ships the
+    /// STANDARD preset, which now declares `web_search = true` and therefore
+    /// OVERRIDES this switch (that precedence is the resolver's own -
+    /// `preset_web_search.unwrap_or(web_tools_enabled)` - and is older than this
+    /// change, which only extended it to Standard). With the preset cleared the
+    /// switch is the only thing deciding, which is what this test is about.
     #[test]
     fn the_web_tools_switch_reaches_the_agent() {
         let mut settings = bare();
+        settings.global.default_preset = String::new();
         assert!(
             settings.workspace.agent.web_tools_enabled,
             "the shipped default offers web search"
@@ -2492,6 +3081,380 @@ mod tests {
             !build(&settings).agent.config().web_search,
             "switching it off withdraws the tool"
         );
+    }
+
+    /// Standard and PTC ALLOW NETWORK AND WEB SEARCH BY DEFAULT. Proved through
+    /// the build and a REAL shell, on a fresh workspace with NO `.bsh/egress-allowlist`:
+    /// the command reaches a local endpoint, the result reports
+    /// `network: "unrestricted"`, and the derived spec is the unrestricted state
+    /// rather than an empty-list deny.
+    #[test]
+    fn standard_and_ptc_allow_network_and_search_by_default() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let Some(host) = lan_address() else {
+            eprintln!("no non-loopback IPv4 address on this host; the egress probe needs one");
+            return;
+        };
+        let root = scratch("preset-default-network");
+        // NO allowlist file: this is the fresh-workspace state, which the
+        // tri-state reads as UNRESTRICTED.
+        assert!(
+            !egress_allowlist_path(&root).exists(),
+            "the premise: a fresh workspace has no allowlist file"
+        );
+        for id in ["standard", "ptc"] {
+            let listener = std::net::TcpListener::bind((host.as_str(), 0)).expect("a listener");
+            let port = listener.local_addr().expect("its port").port();
+            let hits = std::sync::Arc::new(AtomicUsize::new(0));
+            serve_http(listener, std::sync::Arc::clone(&hits));
+
+            let mut settings = rooted(&root);
+            settings.global.default_preset = id.to_string();
+            // The workspace switch ON, which is its shipped default: the preset
+            // must not be the thing that withdraws search.
+            settings.workspace.agent.web_tools_enabled = true;
+            let built = build(&settings);
+            assert!(
+                built.agent.config().web_search,
+                "{id} offers web search by default"
+            );
+            // Network reach: no `egress` field, so the preset inherits the
+            // workspace, and the absent file leaves that reach unrestricted.
+            assert!(
+                !built.policy.data().preset_egress_restricted,
+                "{id} narrows nothing"
+            );
+            assert!(
+                built.policy.data().egress_unrestricted,
+                "{id} builds against the absent-file state"
+            );
+            let spec = agent::sandbox::SandboxSpec::for_policy(
+                &built.policy,
+                WORKSPACE_WRITE,
+                agent::sandbox::Principal::new("bash", "session", id),
+            );
+            assert_eq!(
+                spec.egress(),
+                &agent::sandbox::Egress::Unrestricted,
+                "{id} must not derive an empty-list deny"
+            );
+            assert!(spec.egress().is_allowed() && !spec.egress().is_deny_all());
+            assert!(
+                spec.egress().entries().is_empty(),
+                "{id} needs no allowlist entry to reach the network"
+            );
+
+            let bash = built
+                .agent
+                .registry()
+                .expect("registry")
+                .get("bash")
+                .expect("bash");
+            let result = bash
+                .run(&serde_json::json!({
+                    "command": format!("curl -sS --max-time 3 http://{host}:{port}/")
+                }))
+                .expect("the command runs");
+            assert_eq!(
+                result["network"],
+                serde_json::json!("unrestricted"),
+                "{id} reports the absent-file state: {result}"
+            );
+            assert!(
+                result["success"].as_bool().unwrap_or(false),
+                "{id} could not reach the network out of the box: {result}"
+            );
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                1,
+                "{id}: the allowed endpoint was reached exactly once"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A Standard/PTC turn on a fresh workspace (NO allowlist file) reaches an
+    /// HTTP endpoint THROUGH heel's proxy: the listener counts the request, the
+    /// response comes back, and the result reports the absent-file state,
+    /// `unrestricted`.
+    ///
+    /// The command first proves the proxy environment exists, so a success
+    /// cannot be a direct connection that happened to be allowed: only
+    /// localhost:<proxy port> is granted, and `curl` uses the proxy it is
+    /// handed.
+    #[test]
+    fn standard_and_ptc_reach_http_through_the_heel_proxy() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let Some(host) = lan_address() else {
+            eprintln!("no non-loopback IPv4 address on this host; the proxy probe needs one");
+            return;
+        };
+        for id in ["standard", "ptc"] {
+            let listener = std::net::TcpListener::bind((host.as_str(), 0)).expect("a listener");
+            let port = listener.local_addr().expect("its port").port();
+            let hits = std::sync::Arc::new(AtomicUsize::new(0));
+            serve_http(listener, std::sync::Arc::clone(&hits));
+
+            let root = scratch(&format!("proxy-http-{id}"));
+            assert!(
+                !egress_allowlist_path(&root).exists(),
+                "{id}: the premise is the ABSENT allowlist file"
+            );
+            let mut settings = rooted(&root);
+            settings.global.default_preset = id.to_string();
+            let built = build(&settings);
+            assert!(
+                built.policy.data().egress_unrestricted,
+                "{id}: the absent file must derive UNRESTRICTED egress"
+            );
+            let bash = built
+                .agent
+                .registry()
+                .expect("registry")
+                .get("bash")
+                .expect("bash");
+            // NO_PROXY is cleared so the inherited environment cannot make curl
+            // bypass the proxy: the only path out is heel's.
+            let command = format!(
+                "[ -n \"$HTTP_PROXY\" ] || {{ printf 'no proxy'; exit 97; }}\n\
+                 NO_PROXY=; no_proxy=; curl -sS --max-time 5 http://{host}:{port}/"
+            );
+            let result = bash
+                .run(&serde_json::json!({ "command": command }))
+                .expect("the command runs");
+            assert_eq!(
+                result["network"],
+                serde_json::json!("unrestricted"),
+                "{id} reports the absent-file state: {result}"
+            );
+            assert!(
+                result["success"].as_bool().unwrap_or(false),
+                "{id} could not reach the endpoint through the proxy: {result}"
+            );
+            assert_eq!(
+                result["stdout"].as_str().unwrap_or_default().trim(),
+                "ok",
+                "{id}: the proxy did not return the listener's body: {result}"
+            );
+            assert!(
+                hits.load(Ordering::SeqCst) >= 1,
+                "{id}: the listener was never reached: {result}"
+            );
+            eprintln!("{id}: HTTP listener hits = {}", hits.load(Ordering::SeqCst));
+            assert!(
+                !egress_allowlist_path(&root).exists(),
+                "{id}: the probe created an allowlist file, changing the state it proves"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// A TCP connection to a NON-LISTED, non-host-local endpoint succeeds
+    /// through the proxy's CONNECT tunnel: the destination is not on any
+    /// allowlist (there is no file at all) and is not host-local (heel's proxy
+    /// refuses those), yet bytes round-trip and the result still reports
+    /// `unrestricted`.
+    ///
+    /// This is the TCP path that DOES work. It is a tunnel established by the
+    /// sandbox proxy, not a direct socket: the ICMP test beside it pins that a
+    /// direct socket has no path.
+    #[test]
+    fn standard_and_ptc_reach_a_non_listed_tcp_endpoint_through_the_connect_tunnel() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let Some(host) = lan_address() else {
+            eprintln!("no non-loopback IPv4 address on this host; the tunnel probe needs one");
+            return;
+        };
+        for id in ["standard", "ptc"] {
+            let listener = std::net::TcpListener::bind((host.as_str(), 0)).expect("a listener");
+            let port = listener.local_addr().expect("its port").port();
+            let hits = std::sync::Arc::new(AtomicUsize::new(0));
+            serve_http(listener, std::sync::Arc::clone(&hits));
+
+            let root = scratch(&format!("proxy-tcp-{id}"));
+            assert!(
+                !egress_allowlist_path(&root).exists(),
+                "{id}: the premise is the ABSENT allowlist file"
+            );
+            let mut settings = rooted(&root);
+            settings.global.default_preset = id.to_string();
+            let built = build(&settings);
+            let bash = built
+                .agent
+                .registry()
+                .expect("registry")
+                .get("bash")
+                .expect("bash");
+            // `-X connect` is the proxy CONNECT method: nc opens a TCP tunnel to
+            // the destination the proxy has never been asked about at the
+            // command tier, and the raw request travels inside it.
+            let command = format!(
+                "P=$(printf '%s' \"$HTTP_PROXY\" | cut -d/ -f3); [ -n \"$P\" ] || {{ printf 'no proxy'; exit 97; }}\n\
+                 printf 'GET / HTTP/1.0\\r\\n\\r\\n' | nc -X connect -x \"$P\" -w 5 {host} {port}"
+            );
+            let result = bash
+                .run(&serde_json::json!({ "command": command }))
+                .expect("the command runs");
+            assert_eq!(
+                result["network"],
+                serde_json::json!("unrestricted"),
+                "{id} reports the absent-file state: {result}"
+            );
+            assert!(
+                hits.load(Ordering::SeqCst) >= 1,
+                "{id}: no TCP connection reached the non-listed endpoint: {result}"
+            );
+            eprintln!(
+                "{id}: TCP tunnel listener hits = {}",
+                hits.load(Ordering::SeqCst)
+            );
+            assert!(
+                result["stdout"].as_str().unwrap_or_default().contains("ok"),
+                "{id}: the tunnel did not carry the response back: {result}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// ICMP has NO proxied path in this sandbox even when the policy allows the
+    /// network: the profile denies every direct socket and grants only the
+    /// localhost proxy, so the send is refused while `network` honestly says
+    /// `unrestricted`. A released full-access shell does not change that: the
+    /// proxy is the one way out, and it speaks TCP, not ICMP.
+    ///
+    /// The probe bounds ITSELF with an overall deadline (`-t` on macOS, `-w`
+    /// elsewhere) on top of the per-packet wait, and a watchdog turns any
+    /// residual hang into a named failure in seconds. A packet COUNT is not a
+    /// deadline: on this host (macOS 26, 2026-10-24) a `ping -c 1` probe was
+    /// observed still alive minutes into a full-suite run, while the `-t 2`
+    /// form returns in about two seconds. The bash tool's own default bound is
+    /// 300 s, far too long for this test to wait on.
+    ///
+    /// MEASURED OUTCOME ON THIS HOST: the kernel EPERM branch. The probe exits
+    /// 2 after about 2 s with "ping: sendto: Operation not permitted" on
+    /// stderr, so the result carries
+    /// network_diagnostic = unproxied-direct-socket. The other branch - a send
+    /// that is allowed out but gets no reply - is accepted too, but then the
+    /// result must NOT claim a kernel refusal.
+    ///
+    /// This is the KNOWN LIMITATION, pinned on purpose. If this test starts
+    /// receiving replies (success), heel grew a pass-through network mode:
+    /// delete this limitation, update `docs/bsh-tool-policy.md`, and stop
+    /// showing the unproxied-socket diagnostic.
+    #[test]
+    fn standard_and_ptc_deny_icmp_even_when_egress_is_unrestricted() {
+        for id in ["standard", "ptc"] {
+            let root = scratch(&format!("icmp-{id}"));
+            assert!(
+                !egress_allowlist_path(&root).exists(),
+                "{id}: the premise is the ABSENT allowlist file"
+            );
+            let mut settings = rooted(&root);
+            settings.global.default_preset = id.to_string();
+            let built = build(&settings);
+            let bash = built
+                .agent
+                .registry()
+                .expect("registry")
+                .get("bash")
+                .expect("bash");
+            // macOS: -W is the per-packet reply wait in MILLISECONDS and -t is
+            // the overall deadline in seconds. Elsewhere: -W and -w are both
+            // seconds. The command returns in about two seconds either way,
+            // instead of parking the turn on the tool's 300 s default.
+            let ping = if cfg!(target_os = "macos") {
+                "ping -c 1 -W 1000 -t 2 1.1.1.1"
+            } else {
+                "ping -c 1 -W 1 -w 2 1.1.1.1"
+            };
+            // The configured bound is 300 s, so this test must never wait on
+            // it: the call runs on its own thread and a watchdog fails it by
+            // name. That makes "the probe is bounded" an assertion rather than
+            // a hope about this host's ping.
+            let probe = std::sync::Arc::clone(&bash);
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let started = std::time::Instant::now();
+            std::thread::spawn(move || {
+                let _ = sender.send(probe.run(&serde_json::json!({ "command": ping })));
+            });
+            let result = match receiver.recv_timeout(std::time::Duration::from_secs(20)) {
+                Ok(result) => result.expect("the command runs and reports its own failure"),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                    "{id}: the bounded ICMP probe HUNG past 20 s - the command needs its own deadline"
+                ),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("{id}: the probe thread died without a result")
+                }
+            };
+            let elapsed = started.elapsed();
+            eprintln!("{id}: ICMP probe returned in {elapsed:?}: {result}");
+            assert_eq!(
+                result["sandbox"],
+                serde_json::json!("heel"),
+                "{id}: the probe must run under the sandbox"
+            );
+            assert_eq!(
+                result["network"],
+                serde_json::json!("unrestricted"),
+                "{id}: the policy did allow the network: {result}"
+            );
+            if result["success"].as_bool().unwrap_or(false) {
+                panic!(
+                    "{id}: ping SUCCEEDED - heel now has a pass-through network path. \
+                     This known limitation is over: update docs/bsh-tool-policy.md and \
+                     the unproxied-socket diagnostic, then delete this test. {result}"
+                );
+            }
+            let text = format!(
+                "{}{}",
+                result["stdout"].as_str().unwrap_or_default(),
+                result["stderr"].as_str().unwrap_or_default()
+            )
+            .to_ascii_lowercase();
+            // Two honest outcomes, ONE invariant: ICMP never travels through
+            // the proxy. A refused send says so with the kernel's own errno and
+            // must carry the diagnostic; a send that was merely allowed out
+            // gets no reply, and must not claim a kernel refusal it never saw.
+            let kernel_refusal = text.contains("operation not permitted")
+                || text.contains("permission denied")
+                || text.contains("eperm")
+                || text.contains("eacces");
+            if kernel_refusal {
+                assert_eq!(
+                    result["network_diagnostic"],
+                    serde_json::json!(agent::tools::bash::UNPROXIED_DIRECT_SOCKET),
+                    "{id}: the kernel refusal is not explained in the result: {result}"
+                );
+            } else {
+                assert!(
+                    text.contains("packet loss") || text.contains("timeout"),
+                    "{id}: neither a kernel refusal nor a no-reply exit: {result}"
+                );
+                assert_eq!(
+                    result["network_diagnostic"],
+                    serde_json::Value::Null,
+                    "{id}: a no-reply exit must not claim a kernel refusal: {result}"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// The preset's OWN grant is what offers search: even with the workspace
+    /// switch off, Standard still hands the agent the tool, because its
+    /// declaration is `web_search = true` rather than an inherited default.
+    #[test]
+    fn the_standard_preset_states_its_own_search_grant() {
+        let root = scratch("preset-standard-search");
+        let mut settings = rooted(&root);
+        settings.global.default_preset = "standard".to_string();
+        settings.workspace.agent.web_tools_enabled = false;
+        let built = build(&settings);
+        assert!(
+            built.agent.config().web_search,
+            "Standard's own grant survives the workspace switch"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A session's chosen provider is the endpoint the agent is built against,
@@ -3301,6 +4264,7 @@ verdict := {{"allow": false, "rule": "{rule}", "reason": "refused by the workspa
             "session",
             Arc::new(crate::subagent::SubagentRegistry::default()),
             jobs.clone(),
+            Arc::new(crate::browser::BrowserHandle::new()),
         );
         let registry = built.agent.registry().expect("registry");
         let marker = root.join("marker.txt");
@@ -4310,7 +5274,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             "strict".to_string(),
             Preset {
                 policy: Some("package policy.strict\nverdict := {\"allow\": true}".to_string()),
-                policy_mode: Some("required".to_string()),
+                policy_mode: Some(crate::settings::global::PolicyMode::Required),
                 ..Preset::default()
             },
         );
@@ -4848,5 +5812,1306 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             surfaced_capabilities(&[]).is_empty(),
             "nothing loaded means nothing to claim"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // The preset network policy, proved end to end through a real shell.
+    //
+    // The observable of every case here is a SIDE EFFECT, not an error
+    // string: a listener that counts its hits, a marker file the command
+    // would have written, and the `network` field the bash tool reports.
+    // ------------------------------------------------------------------
+
+    /// The host's non-loopback IPv4 address, the only address a heel proxy
+    /// will forward to (it refuses a host-local target), so a probe can prove
+    /// a real connection was or was not made.
+    fn lan_address() -> Option<String> {
+        let candidates: &[(&str, &[&str])] = &[
+            ("/usr/sbin/ipconfig", &["getifaddr", "en0"]),
+            ("/usr/sbin/ipconfig", &["getifaddr", "en1"]),
+            (
+                "/bin/sh",
+                &["-c", "hostname -I 2>/dev/null | awk '{print $1}'"],
+            ),
+        ];
+        for (program, args) in candidates {
+            if !std::path::Path::new(program).exists() {
+                continue;
+            }
+            let Ok(output) = std::process::Command::new(program).args(*args).output() else {
+                continue;
+            };
+            let host = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if host.parse::<std::net::IpAddr>().is_ok()
+                && !host.starts_with("127.")
+                && !host.starts_with("169.254.")
+            {
+                return Some(host);
+            }
+        }
+        None
+    }
+
+    /// Serve HTTP 200 to every connection, counting the hits.
+    fn serve_http(
+        listener: std::net::TcpListener,
+        hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::io::{Read as _, Write as _};
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let hits = std::sync::Arc::clone(&hits);
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut request = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while stream.read(&mut byte).unwrap_or(0) == 1 {
+                        request.push(byte[0]);
+                        if request.ends_with(b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                    );
+                });
+            }
+        });
+    }
+
+    /// A settings document whose workspace allowlist is `entries`, with one
+    /// custom preset selected for the turn.
+    fn preset_build(
+        root: &std::path::Path,
+        entries: &str,
+        preset: Preset,
+    ) -> (Settings, BuiltAgent) {
+        std::fs::create_dir_all(root.join(".bsh")).expect(".bsh");
+        std::fs::write(root.join(".bsh/egress-allowlist"), entries).expect("egress list");
+        let mut settings = rooted(root);
+        settings.global.presets.insert("probe".to_string(), preset);
+        settings.global.default_preset = "probe".to_string();
+        let built = build(&settings);
+        (settings, built)
+    }
+
+    /// A shell-keeping preset that declares `egress = []` must refuse a
+    /// command whose literal endpoint the WORKSPACE allowlist permits: the
+    /// refusal names the preset's rule, no process side effect appears, the
+    /// listener sees no hit, and the derived spec has no proxy at all.
+    #[test]
+    fn a_deny_all_preset_refuses_a_workspace_allowed_endpoint() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let Some(host) = lan_address() else {
+            eprintln!("no non-loopback IPv4 address on this host; the egress probe needs one");
+            return;
+        };
+        let listener = std::net::TcpListener::bind((host.as_str(), 0)).expect("a listener");
+        let port = listener.local_addr().expect("its port").port();
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        serve_http(listener, std::sync::Arc::clone(&hits));
+
+        let root = scratch("preset-egress-deny-all");
+        let (settings, built) = preset_build(
+            &root,
+            &format!("{host}\n"),
+            Preset {
+                permission: Some(WORKSPACE_WRITE.to_string()),
+                plugins: vec!["shell".to_string(), "files".to_string()],
+                // A DECLARED empty list: deny all network, even here.
+                egress: Some(Vec::new()),
+                ..Preset::default()
+            },
+        );
+        let url = format!("http://{host}:{port}/");
+        let command = format!("printf ran > ran.txt && curl -sS --max-time 3 -o /dev/null {url}");
+        let bash = built
+            .agent
+            .registry()
+            .expect("registry")
+            .get("bash")
+            .expect("bash");
+        match bash.run(&serde_json::json!({ "command": command })) {
+            Err(agent::ToolError::Failed(message)) => assert!(
+                message.contains("preset-egress"),
+                "the refusal names the preset's rule: {message}"
+            ),
+            other => panic!("expected the preset to refuse the command, got {other:?}"),
+        }
+        assert!(
+            !root.join("ran.txt").exists(),
+            "the command's side effect happened before the network decision"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "a refused command connected"
+        );
+
+        // The derived set is EMPTY, which is what tells the backend to start no
+        // proxy at all: the kernel denies.
+        let eff = settings.effective();
+        let spec = agent::sandbox::SandboxSpec::for_policy(
+            &built.policy,
+            &eff.permission.effective,
+            agent::sandbox::Principal::new("bash", "session", "probe"),
+        );
+        assert_eq!(
+            spec.egress(),
+            &agent::sandbox::Egress::DenyAll,
+            "a deny-all preset must derive no proxy"
+        );
+        assert!(!spec.egress().is_allowed(), "no proxy is the kernel deny");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A preset whose network policy touches variables the command tier cannot
+    /// see still has the KERNEL refuse it, and the tool result reports
+    /// `network: "deny-all"`.
+    #[test]
+    fn a_deny_all_preset_reports_deny_all_and_the_kernel_holds() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let Some(host) = lan_address() else {
+            eprintln!("no non-loopback IPv4 address on this host; the egress probe needs one");
+            return;
+        };
+        let listener = std::net::TcpListener::bind((host.as_str(), 0)).expect("a listener");
+        let port = listener.local_addr().expect("its port").port();
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        serve_http(listener, std::sync::Arc::clone(&hits));
+
+        let root = scratch("preset-egress-deny-all-kernel");
+        let (_settings, built) = preset_build(
+            &root,
+            &format!("{host}\n"),
+            Preset {
+                permission: Some(WORKSPACE_WRITE.to_string()),
+                plugins: vec!["shell".to_string(), "files".to_string()],
+                egress: Some(Vec::new()),
+                ..Preset::default()
+            },
+        );
+        // The endpoint is hidden in variables, so the command tier cannot name
+        // it and only the kernel can refuse the connection.
+        let command = format!(
+            "H={host}; P={port}; printf ran > ran.txt && curl -sS --max-time 3 -o /dev/null \"http://$H:$P/\""
+        );
+        let bash = built
+            .agent
+            .registry()
+            .expect("registry")
+            .get("bash")
+            .expect("bash");
+        let result = bash
+            .run(&serde_json::json!({ "command": command }))
+            .expect("the command runs");
+        assert_eq!(
+            result["network"],
+            serde_json::json!("deny-all"),
+            "the honest signal for a deny-all preset: {result}"
+        );
+        assert!(
+            !result["success"].as_bool().unwrap_or(true),
+            "deny-all let the request out: {result}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "a connection reached the listener"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A preset that intersects: the workspace allows A and B, the preset
+    /// allows A, so A is reachable through the proxy and B is refused with the
+    /// preset's rule named.
+    #[test]
+    fn an_intersecting_preset_reaches_what_both_allow_and_refuses_the_rest() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let Some(host_a) = lan_address() else {
+            eprintln!("no non-loopback IPv4 address on this host; the egress probe needs one");
+            return;
+        };
+        // A second address the workspace lists but the preset does not: the
+        // host's own address is enough because the preset keeps only A.
+        let listener_a = std::net::TcpListener::bind((host_a.as_str(), 0)).expect("a listener");
+        let port_a = listener_a.local_addr().expect("its port").port();
+        let hits_a = std::sync::Arc::new(AtomicUsize::new(0));
+        serve_http(listener_a, std::sync::Arc::clone(&hits_a));
+
+        let root = scratch("preset-egress-intersect");
+        // The workspace lists TWO entries; the preset keeps the first.
+        let (_settings, built) = preset_build(
+            &root,
+            &format!("{host_a}\n203.0.113.9\n"),
+            Preset {
+                permission: Some(WORKSPACE_WRITE.to_string()),
+                plugins: vec!["shell".to_string(), "files".to_string()],
+                egress: Some(vec![host_a.clone()]),
+                ..Preset::default()
+            },
+        );
+        let bash = built
+            .agent
+            .registry()
+            .expect("registry")
+            .get("bash")
+            .expect("bash");
+
+        // A: allowed by both tiers, so the proxy forwards it and the listener
+        // answers 200.
+        let allowed = bash
+            .run(&serde_json::json!({
+                "command": format!("curl -sS --max-time 3 http://{host_a}:{port_a}/")
+            }))
+            .expect("the command runs");
+        assert_eq!(
+            allowed["network"],
+            serde_json::json!("allowlist"),
+            "{allowed}"
+        );
+        assert!(allowed["success"].as_bool().unwrap_or(false), "{allowed}");
+        assert!(
+            allowed["stdout"].as_str().unwrap_or("").contains("ok"),
+            "{allowed}"
+        );
+        assert_eq!(
+            hits_a.load(Ordering::SeqCst),
+            1,
+            "the allowed endpoint was reached"
+        );
+
+        // B: allowed by the workspace, removed by the preset. The command tier
+        // refuses it and names the preset's rule.
+        match bash.run(&serde_json::json!({
+            "command": "curl -sS --max-time 3 -o /dev/null http://203.0.113.9/"
+        })) {
+            Err(agent::ToolError::Failed(message)) => assert!(
+                message.contains("preset-egress"),
+                "the preset rule refused the removed entry: {message}"
+            ),
+            other => panic!("expected the preset to refuse the removed entry, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Run one shell command from a build and return the structured result.
+    ///
+    /// A policy refusal is a panic here: every case below hides its write or
+    /// endpoint in a variable so the command tier must pass and the outcome is
+    /// decided by confinement, which is what the test is about.
+    fn bash_result(built: &BuiltAgent, command: &str) -> serde_json::Value {
+        built
+            .agent
+            .registry()
+            .expect("registry")
+            .get("bash")
+            .expect("bash")
+            .run(&serde_json::json!({ "command": command }))
+            .unwrap_or_else(|error| panic!("the command tier refused: {error}"))
+    }
+
+    /// One settings tree with a full-access session and one preset carrying an
+    /// explicit sandbox choice.
+    fn preset_sandbox_build(
+        root: &std::path::Path,
+        sandbox: crate::settings::global::SandboxChoice,
+        permission: &str,
+        session_permission: &str,
+    ) -> (Settings, BuiltAgent) {
+        let mut settings = rooted(root);
+        settings.workspace.agent.permission = session_permission.to_string();
+        settings.global.presets.insert(
+            "probe".to_string(),
+            Preset {
+                permission: Some(permission.to_string()),
+                sandbox: Some(sandbox),
+                plugins: vec!["shell".to_string(), "files".to_string()],
+                ..Preset::default()
+            },
+        );
+        settings.global.default_preset = "probe".to_string();
+        let built = build(&settings);
+        (settings, built)
+    }
+
+    /// `sandbox = "none"` at full access is the widening arm working as
+    /// designed: the shell runs outside the workspace and writes a file there.
+    ///
+    /// The path arrives through a shell variable, so the command tier cannot
+    /// see it and the absence of the kernel boundary is what lets the write
+    /// land. This is the cost the docs state, proved rather than implied.
+    #[test]
+    fn a_full_access_preset_with_sandbox_none_runs_outside_the_workspace() {
+        let root = scratch("preset-sandbox-none-write");
+        let outside_dir = scratch("preset-sandbox-none-outside");
+        let outside = outside_dir.join(format!("escaped-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&outside);
+        let (settings, built) = preset_sandbox_build(
+            &root,
+            crate::settings::global::SandboxChoice::Off,
+            FULL_ACCESS,
+            FULL_ACCESS,
+        );
+        let resolved = settings.effective();
+        assert!(
+            !resolved.sandbox.heel,
+            "the preset asked for an unconfined shell"
+        );
+        assert!(resolved.sandbox.off_by_preset);
+        assert!(resolved.sandbox.refusal.is_none());
+
+        let result = bash_result(
+            &built,
+            &format!("T=\"{}\"; printf escaped > \"$T\"", outside.display()),
+        );
+        assert_eq!(result["sandbox"], serde_json::json!("none"), "{result}");
+        assert_eq!(
+            result["sandbox_reason"],
+            serde_json::json!(agent::tools::bash::PRESET_SANDBOX_OFF_REASON),
+            "the result names who turned the sandbox off: {result}"
+        );
+        assert!(
+            result["success"].as_bool().unwrap_or(false),
+            "an unsandboxed command reached its outside target: {result}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).expect("the outside file"),
+            "escaped"
+        );
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The guard, in both narrower directions: a preset that turns the sandbox
+    /// off under a workspace-write or read-only ceiling is REFUSED with
+    /// `preset-sandbox-widens`, the effective sandbox stays heel, and the same
+    /// command leaves no marker.
+    #[test]
+    fn a_narrow_preset_cannot_turn_the_sandbox_off() {
+        for ceiling in [WORKSPACE_WRITE, READ_ONLY] {
+            let root = scratch(&format!("preset-sandbox-widens-{ceiling}"));
+            let outside_dir = scratch(&format!("preset-sandbox-widens-out-{ceiling}"));
+            let outside = outside_dir.join(format!("marker-{}-{ceiling}.txt", std::process::id()));
+            let _ = std::fs::remove_file(&outside);
+            let (settings, built) = preset_sandbox_build(
+                &root,
+                crate::settings::global::SandboxChoice::Off,
+                ceiling,
+                ceiling,
+            );
+            let resolved = settings.effective();
+            assert_eq!(
+                resolved.sandbox.refusal,
+                Some(crate::settings::resolve::PRESET_SANDBOX_WIDENS),
+                "{ceiling}: the declaration is refused, not silently ignored"
+            );
+            assert!(resolved.sandbox.heel, "{ceiling}: the shell stays confined");
+            assert!(!resolved.sandbox.off_by_preset);
+            assert_eq!(
+                settings.refusal_for(&SessionChoice::default()),
+                Some("composer.presetSandboxWidens"),
+                "{ceiling}: the send gate names the rule's locale key"
+            );
+
+            let registry = built.agent.registry().expect("registry");
+            if ceiling == WORKSPACE_WRITE {
+                let result = bash_result(
+                    &built,
+                    &format!("T=\"{}\"; printf escaped > \"$T\"", outside.display()),
+                );
+                assert_eq!(result["sandbox"], serde_json::json!("heel"), "{result}");
+                assert!(
+                    !result["success"].as_bool().unwrap_or(true),
+                    "the heel kernel let the outside write through: {result}"
+                );
+            } else {
+                assert!(
+                    registry.get("bash").is_none(),
+                    "read-only registers no shell, so the refused preset cannot run the command at all"
+                );
+            }
+            assert!(
+                !outside.exists(),
+                "{ceiling}: the command's marker exists, so it ran despite the refusal"
+            );
+            let _ = std::fs::remove_file(&outside);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// The narrowing arm: `sandbox = "heel"` confines even a full-access
+    /// session, and the result reports the backend that actually ran.
+    #[test]
+    fn an_explicit_heel_confines_a_full_access_session() {
+        let root = scratch("preset-sandbox-heel-full");
+        let outside_dir = scratch("preset-sandbox-heel-outside");
+        let outside = outside_dir.join(format!("escaped-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&outside);
+        let (settings, built) = preset_sandbox_build(
+            &root,
+            crate::settings::global::SandboxChoice::Heel,
+            FULL_ACCESS,
+            FULL_ACCESS,
+        );
+        let resolved = settings.effective();
+        assert_eq!(
+            resolved.permission.effective, FULL_ACCESS,
+            "the permission itself is still full access; heel is the extra ceiling"
+        );
+        assert!(resolved.sandbox.heel, "the preset narrowed the shell");
+
+        let result = bash_result(
+            &built,
+            &format!("T=\"{}\"; printf escaped > \"$T\"", outside.display()),
+        );
+        assert_eq!(result["sandbox"], serde_json::json!("heel"), "{result}");
+        assert!(
+            !result["success"].as_bool().unwrap_or(true),
+            "the heel kernel allowed the outside write: {result}"
+        );
+        assert!(!outside.exists(), "the sandbox let the write escape");
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The inherited FULL-ACCESS arm as a user meets it: PTC declares no sandbox
+    /// field, so the shell is handed `workspace_root: None` and its cwd is the
+    /// app's launch directory, NOT the workspace. The policy must permit that
+    /// spawn by TIER (`spawn-shell-full-access`); a path-only policy refused
+    /// every command before a process existed, which is the reported bug.
+    #[test]
+    fn an_inherited_full_access_shell_spawns_where_the_release_puts_it() {
+        let root = scratch("full-access-inherited-spawn");
+        let mut settings = rooted(&root);
+        settings.workspace.agent.permission = FULL_ACCESS.to_string();
+        settings.global.default_preset = "ptc".to_string();
+        let resolved = settings.effective();
+        assert_eq!(resolved.permission.effective, FULL_ACCESS);
+        assert!(
+            !resolved.sandbox.heel && !resolved.sandbox.off_by_preset,
+            "the premise: PTC inherits, so the shell is released with no root"
+        );
+        let built = build(&settings);
+        assert_eq!(built.policy.data().permission, FULL_ACCESS);
+
+        // The path the tool asks about is the launch directory, which is what
+        // BashTool falls back to when no root is configured. It is NOT the
+        // workspace, which is why a path-only rule refused everything.
+        let launch = std::env::current_dir().expect("a launch directory");
+        assert!(
+            !launch.starts_with(&root),
+            "the premise: the launch directory is outside the scratch workspace"
+        );
+        let decision = built.policy.check(
+            &PolicyInput::new("bash", Action::Spawn, Target::path(&launch))
+                .with_session("session")
+                .with_preset("ptc"),
+        );
+        assert!(
+            decision.is_allowed(),
+            "the released tier permits the shell: {decision:?}"
+        );
+        assert_eq!(decision.rule.as_deref(), Some("spawn-shell-full-access"));
+
+        let result = bash_result(&built, "echo hi");
+        assert_eq!(
+            result["stdout"].as_str().unwrap_or("").trim(),
+            "hi",
+            "{result}"
+        );
+        assert_eq!(result["exit_code"], serde_json::json!(0), "{result}");
+        assert!(result["success"].as_bool().unwrap_or(false), "{result}");
+        assert_eq!(result["sandbox"], serde_json::json!("none"), "{result}");
+        assert_eq!(
+            result["sandbox_reason"],
+            serde_json::json!(agent::tools::bash::SANDBOX_RELEASED_REASON),
+            "the release names itself: {result}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The preset NARROWING arm under full access still asks about the workspace
+    /// root: a heel preset hands the shell that root, so the spawn is the path
+    /// rule's and the command runs confined.
+    #[test]
+    fn a_heel_preset_under_full_access_spawns_at_the_workspace_root() {
+        let root = scratch("full-access-heel-spawn");
+        let (settings, built) = preset_sandbox_build(
+            &root,
+            crate::settings::global::SandboxChoice::Heel,
+            FULL_ACCESS,
+            FULL_ACCESS,
+        );
+        let resolved = settings.effective();
+        assert!(resolved.sandbox.heel, "the premise: the preset narrows");
+        assert_eq!(built.policy.data().permission, FULL_ACCESS);
+
+        let decision = built.policy.check(
+            &PolicyInput::new("bash", Action::Spawn, Target::path(root.clone()))
+                .with_session("session")
+                .with_preset("probe"),
+        );
+        assert!(decision.is_allowed(), "{decision:?}");
+        assert_eq!(
+            decision.rule.as_deref(),
+            Some("spawn-shell-in-workspace"),
+            "a confined shell is the path rule's, not the released arm's"
+        );
+
+        let result = bash_result(&built, "echo hi");
+        assert_eq!(
+            result["stdout"].as_str().unwrap_or("").trim(),
+            "hi",
+            "{result}"
+        );
+        assert_eq!(result["sandbox"], serde_json::json!("heel"), "{result}");
+        assert!(result["success"].as_bool().unwrap_or(false), "{result}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The two confined tiers keep their spawn answers, and the released arm
+    /// widens nothing else: at full access the same non-workspace path is
+    /// admitted only for `bash`, while another tool keeps the old rule.
+    #[test]
+    fn the_confined_tiers_keep_their_spawn_answers() {
+        let root = scratch("tier-spawn-answers");
+        let outside =
+            std::env::temp_dir().join(format!("bsh-spawn-outside-{}", std::process::id()));
+        let probe = |built: &BuiltAgent, tool: &str, target: &std::path::Path, preset: &str| {
+            built.policy.check(
+                &PolicyInput::new(tool, Action::Spawn, Target::path(target))
+                    .with_session("session")
+                    .with_preset(preset),
+            )
+        };
+
+        // Workspace Write: the shell spawns AT the root through the path rule,
+        // and a non-workspace target is still refused there.
+        let write = build(&rooted(&root));
+        assert_eq!(write.policy.data().permission, WORKSPACE_WRITE);
+        let at_root = probe(&write, "bash", &root, "");
+        assert!(at_root.is_allowed(), "{at_root:?}");
+        assert_eq!(at_root.rule.as_deref(), Some("spawn-shell-in-workspace"));
+        let elsewhere = probe(&write, "bash", &outside, "");
+        assert!(elsewhere.is_denied(), "{elsewhere:?}");
+        assert_eq!(elsewhere.rule.as_deref(), Some("spawn-not-allowed"));
+
+        // Read Only registers no shell at all, so there is no spawn to permit.
+        let mut read_only = rooted(&root);
+        read_only.workspace.agent.permission = READ_ONLY.to_string();
+        let built = build(&read_only);
+        assert_eq!(built.policy.data().permission, READ_ONLY);
+        assert!(
+            built
+                .agent
+                .registry()
+                .expect("registry")
+                .get("bash")
+                .is_none(),
+            "read-only keeps the shell out of the request"
+        );
+
+        // Full access: the non-workspace path is the released tier's answer for
+        // bash, and ONLY for bash - another process keeps the old rule.
+        let mut wide = rooted(&root);
+        wide.workspace.agent.permission = FULL_ACCESS.to_string();
+        let built = build(&wide);
+        let released = probe(&built, "bash", &outside, "");
+        assert!(released.is_allowed(), "{released:?}");
+        assert_eq!(released.rule.as_deref(), Some("spawn-shell-full-access"));
+        let other = probe(&built, "python", &outside, "");
+        assert!(other.is_denied(), "{other:?}");
+        assert_eq!(other.rule.as_deref(), Some("spawn-not-allowed"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The shipped presets declare no toggle, so their effective sandbox is
+    /// exactly today's: heel under the default Workspace Write, and no
+    /// attribution when a full-access session inherits and is released.
+    #[test]
+    fn the_shipped_presets_keep_their_sandbox_behaviour() {
+        let mut settings = bare();
+        for id in ["standard", "ptc", "creator", "read-only"] {
+            let preset = settings
+                .global
+                .preset(id)
+                .unwrap_or_else(|| panic!("the shipped {id}"));
+            assert_eq!(
+                preset.sandbox, None,
+                "the shipped {id} must not declare a sandbox choice"
+            );
+            settings.global.default_preset = id.to_string();
+            let resolved = settings.effective();
+            assert!(
+                resolved.sandbox.heel,
+                "{id} stays confined under the default Workspace Write"
+            );
+            assert!(!resolved.sandbox.off_by_preset, "{id} turns nothing off");
+            assert!(resolved.sandbox.refusal.is_none(), "{id} refuses nothing");
+            let built = build(&settings);
+            let spec = sandbox_spec_for(&built.policy, &resolved, "bash", "session");
+            assert_eq!(
+                spec.mode(),
+                if id == "read-only" {
+                    agent::sandbox::SandboxMode::ReadOnly
+                } else {
+                    agent::sandbox::SandboxMode::WorkspaceWrite
+                },
+                "{id}'s shell spec is today's tier"
+            );
+        }
+
+        // A full-access session that inherits Standard is still released: the
+        // absent field must not silently become a forced heel.
+        let mut wide = bare();
+        wide.workspace.agent.permission = FULL_ACCESS.to_string();
+        wide.global.default_preset = "standard".to_string();
+        let resolved = wide.effective();
+        assert!(
+            !resolved.sandbox.heel,
+            "today's full-access release survives an absent sandbox field"
+        );
+        assert!(!resolved.sandbox.off_by_preset);
+        let built = build(&wide);
+        let spec = sandbox_spec_for(&built.policy, &resolved, "bash", "session");
+        assert_eq!(spec.mode(), agent::sandbox::SandboxMode::FullAccess);
+    }
+
+    /// The egress consequence, stated as the tradeoff rather than hidden.
+    ///
+    /// With `sandbox = "none"` a command reaches a host the workspace allowlist
+    /// does NOT name (the endpoint is in a variable, so the command-tier scan
+    /// cannot see it either). With the same preset asking for heel, the proxy
+    /// refuses the same request and the listener sees no second hit. That is
+    /// the cost of turning the sandbox off: the allowlist is enforced by heel,
+    /// so no heel means no egress enforcement for shell commands.
+    #[test]
+    fn a_preset_that_turns_the_sandbox_off_also_bypasses_the_egress_allowlist() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let Some(host) = lan_address() else {
+            eprintln!("no non-loopback IPv4 address on this host; the egress probe needs one");
+            return;
+        };
+        let listener = std::net::TcpListener::bind((host.as_str(), 0)).expect("a listener");
+        let port = listener.local_addr().expect("its port").port();
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        serve_http(listener, std::sync::Arc::clone(&hits));
+
+        let root = scratch("preset-sandbox-none-egress");
+        // The workspace allowlist names a DIFFERENT address, so this host is
+        // outside it.
+        std::fs::create_dir_all(root.join(".bsh")).expect(".bsh");
+        std::fs::write(root.join(".bsh/egress-allowlist"), "203.0.113.9\n")
+            .expect("egress allowlist");
+        let command = format!("H={host}; P={port}; curl -sS --max-time 3 \"http://$H:$P/\"");
+        // The listener's body, so "allowed" and "refused by the proxy" are
+        // distinguishable: heel's refusal is a body, not a curl exit code.
+        let reached = "ok";
+
+        // Off: the endpoint is reached. The command tier cannot name it (a
+        // variable), and there is no proxy to ask.
+        let (settings, built) = preset_sandbox_build(
+            &root,
+            crate::settings::global::SandboxChoice::Off,
+            FULL_ACCESS,
+            FULL_ACCESS,
+        );
+        assert!(!settings.effective().sandbox.heel);
+        let off = bash_result(&built, &command);
+        assert_eq!(off["sandbox"], serde_json::json!("none"), "{off}");
+        assert!(
+            off["stdout"].as_str().unwrap_or("").contains(reached),
+            "the unsandboxed request did not reach the listener: {off}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the unsandboxed shell ignored the workspace allowlist (this is the documented cost)"
+        );
+
+        // Heel: the same preset, confined. The proxy asks the policy for the
+        // resolved address and refuses it; no second connection arrives.
+        let (settings, built) = preset_sandbox_build(
+            &root,
+            crate::settings::global::SandboxChoice::Heel,
+            FULL_ACCESS,
+            FULL_ACCESS,
+        );
+        assert!(settings.effective().sandbox.heel);
+        let heel = bash_result(&built, &command);
+        assert_eq!(heel["sandbox"], serde_json::json!("heel"), "{heel}");
+        assert!(
+            !heel["stdout"].as_str().unwrap_or("").contains(reached),
+            "the heel proxy allowed an address outside the workspace allowlist: {heel}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a confined request reached the listener, so the allowlist did not hold"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A preset with no `egress` field inherits the workspace allowlist: the
+    /// derived proxy set is the whole workspace list, and the shell reports
+    /// `network: "allowlist"`.
+    #[test]
+    fn an_absent_preset_egress_inherits_the_workspace_list() {
+        let Some(host) = lan_address() else {
+            eprintln!("no non-loopback IPv4 address on this host; the egress probe needs one");
+            return;
+        };
+        let root = scratch("preset-egress-inherit");
+        let (_settings, built) = preset_build(
+            &root,
+            &format!("{host}\n203.0.113.9\n"),
+            Preset {
+                permission: Some(WORKSPACE_WRITE.to_string()),
+                plugins: vec!["shell".to_string(), "files".to_string()],
+                // No egress field at all: inherit.
+                ..Preset::default()
+            },
+        );
+        assert!(
+            !built.policy.data().preset_egress_restricted,
+            "an absent field does not restrict"
+        );
+        let spec = agent::sandbox::SandboxSpec::for_policy(
+            &built.policy,
+            WORKSPACE_WRITE,
+            agent::sandbox::Principal::new("bash", "session", "probe"),
+        );
+        match spec.egress() {
+            agent::sandbox::Egress::Allow(entries) => assert!(
+                entries.contains(&host) && entries.contains(&"203.0.113.9".to_string()),
+                "the whole workspace list is inherited: {entries:?}"
+            ),
+            other => panic!("an inherited list must derive a proxy, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The shipped read-only preset reads the workspace and needs no network,
+    /// so its own policy derives NO proxy - even on an UNRESTRICTED workspace
+    /// (no allowlist file). This is the shipped declaration, not a hand-built
+    /// one, and it proves the narrowing invariant: a preset's declared empty
+    /// reach denies without the workspace having to declare anything.
+    #[test]
+    fn the_shipped_read_only_preset_derives_no_proxy() {
+        let root = scratch("preset-read-only-network");
+        // NO workspace allowlist: egress is unrestricted before the preset.
+        assert!(!egress_allowlist_path(&root).exists());
+        let mut settings = rooted(&root);
+        settings.global.default_preset = "read-only".to_string();
+        let built = build(&settings);
+        assert!(
+            built.policy.data().egress_unrestricted,
+            "the premise: the workspace itself is open"
+        );
+        let spec = agent::sandbox::SandboxSpec::for_policy(
+            &built.policy,
+            READ_ONLY,
+            agent::sandbox::Principal::new("bash", "session", "read-only"),
+        );
+        assert_eq!(
+            spec.egress(),
+            &agent::sandbox::Egress::DenyAll,
+            "read-only needs no network, so it derives no proxy"
+        );
+        // And the policy refuses the address outright: the preset's declared
+        // empty reach denies even though the workspace itself is open.
+        let decision = built.policy.check(
+            &PolicyInput::new("mcp", Action::Egress, Target::host("h", "203.0.113.7"))
+                .with_preset("read-only"),
+        );
+        assert!(decision.is_denied(), "{decision:?}");
+        // Two tiers can refuse a read-only preset's egress and the FIRST module
+        // in source order reports: the generated session tier denies egress for
+        // a read-only effective permission, and the preset's own module denies
+        // it again. Either name is honest; what must NOT happen is the
+        // workspace's allowlist winning, which is what the assertion above
+        // rules out.
+        let rule = decision.rule.as_deref().unwrap_or("");
+        assert!(
+            rule == "session-read-only-egress"
+                || rule.starts_with("preset-egress")
+                || rule == "no-egress",
+            "an egress tier of the preset refused it, not the workspace list: {decision:?}"
+        );
+        // The preset's declaration itself is what restricts, and it is
+        // empty: the workspace's open default does not make it reachable.
+        assert!(
+            built.policy.data().preset_egress_restricted,
+            "declared, not absent"
+        );
+        assert!(
+            built.policy.data().preset_egress_allowlist.is_empty()
+                && built.policy.data().preset_egress_hosts.is_empty()
+                && built.policy.data().preset_egress_ports.is_empty(),
+            "read-only declares an empty reach"
+        );
+        assert!(
+            built
+                .policy
+                .rule_ids()
+                .iter()
+                .any(|id| id == "preset-egress-not-allowed"),
+            "the shipped read-only preset compiles the preset egress module: {:?}",
+            built.policy.rule_ids()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A preset WITH a list still narrows an unrestricted workspace: the
+    /// preset's entries are the whole reach, so a destination the open
+    /// workspace would have allowed is refused and the local listener sees no
+    /// hit. The workspace's openness is not a union with the preset.
+    #[test]
+    fn a_preset_with_a_list_still_narrows_an_unrestricted_workspace() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let Some(host) = lan_address() else {
+            eprintln!("no non-loopback IPv4 address on this host; the egress probe needs one");
+            return;
+        };
+        let listener = std::net::TcpListener::bind((host.as_str(), 0)).expect("a listener");
+        let port = listener.local_addr().expect("its port").port();
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        serve_http(listener, std::sync::Arc::clone(&hits));
+
+        let root = scratch("preset-egress-unrestricted-narrow");
+        assert!(
+            !egress_allowlist_path(&root).exists(),
+            "the premise: the workspace declares no file"
+        );
+        let mut settings = rooted(&root);
+        settings.global.presets.insert(
+            "probe".to_string(),
+            Preset {
+                permission: Some(WORKSPACE_WRITE.to_string()),
+                plugins: vec!["shell".to_string(), "files".to_string()],
+                // A list that does NOT name the local endpoint.
+                egress: Some(vec!["203.0.113.9".to_string()]),
+                ..Preset::default()
+            },
+        );
+        settings.global.default_preset = "probe".to_string();
+        let built = build(&settings);
+        assert!(
+            built.policy.data().egress_unrestricted,
+            "the workspace itself is open"
+        );
+        assert!(
+            built.policy.data().preset_egress_restricted,
+            "the preset declares a reach"
+        );
+        let spec = agent::sandbox::SandboxSpec::for_policy(
+            &built.policy,
+            WORKSPACE_WRITE,
+            agent::sandbox::Principal::new("bash", "session", "probe"),
+        );
+        assert_eq!(
+            spec.egress(),
+            &agent::sandbox::Egress::Allow(vec!["203.0.113.9".to_string()]),
+            "the preset's list is the reach, not the open workspace"
+        );
+
+        let bash = built
+            .agent
+            .registry()
+            .expect("registry")
+            .get("bash")
+            .expect("bash");
+        // The local endpoint is allowed by the OPEN workspace but not by the
+        // preset, so the preset's rule refuses it before a process exists.
+        match bash.run(&serde_json::json!({
+            "command": format!("curl -sS --max-time 3 -o /dev/null http://{host}:{port}/")
+        })) {
+            Err(agent::ToolError::Failed(message)) => assert!(
+                message.contains("preset-egress"),
+                "the preset's list refused the local endpoint: {message}"
+            ),
+            other => panic!("the preset must narrow the open workspace, got {other:?}"),
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "the local endpoint stayed unreachable through the preset"
+        );
+
+        // The entry the PRESET names is admitted by the policy: the list is the
+        // reach, not a deny of everything.
+        let listed = built.policy.check(
+            &PolicyInput::new("mcp", Action::Egress, Target::host("h", "203.0.113.9"))
+                .with_preset("probe"),
+        );
+        assert!(listed.is_allowed(), "{listed:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The port dimension narrows through a preset: a preset that lists only
+    /// port 443 refuses the same address at another port, naming the port rule.
+    #[test]
+    fn a_preset_port_list_refuses_the_wrong_port_with_its_own_rule() {
+        let root = scratch("preset-egress-ports");
+        let (_settings, built) = preset_build(
+            &root,
+            "203.0.113.7\n",
+            Preset {
+                permission: Some(WORKSPACE_WRITE.to_string()),
+                plugins: vec!["shell".to_string(), "files".to_string()],
+                egress: Some(vec!["203.0.113.7".to_string(), "443".to_string()]),
+                ..Preset::default()
+            },
+        );
+        assert_eq!(
+            built.policy.data().preset_egress_ports,
+            vec![443u16],
+            "the bare integer is classified as a port"
+        );
+        let ask = |port: u16| {
+            built.policy.check(
+                &PolicyInput::new(
+                    "mcp",
+                    Action::Egress,
+                    Target::host_on("h", "203.0.113.7", port),
+                )
+                .with_preset("probe"),
+            )
+        };
+        assert!(ask(443).is_allowed(), "the declared port is allowed");
+        let refused = ask(80);
+        assert!(refused.is_denied(), "{refused:?}");
+        assert_eq!(
+            refused.rule.as_deref(),
+            Some("preset-egress-port-not-allowed")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A preset that declares no read/write/deny/web_search/policy_mode resolves
+    /// EXACTLY as before: the shipped defaults install no scope restriction, and
+    /// the read-only preset keeps its own declared list. This is the "absent
+    /// field behaves as today" contract, asserted on the policy data a build
+    /// actually hands Rego.
+    #[test]
+    fn the_shipped_presets_resolve_the_same_scope_with_the_new_fields_absent() {
+        let root = scratch("preset-absent-defaults");
+        let standard = build(&rooted(&root));
+        let data = standard.policy.data();
+        assert!(
+            !data.preset_read_restricted && !data.preset_write_restricted,
+            "no declared list inherits the workspace"
+        );
+        assert!(data.preset_read_roots.is_empty());
+        assert!(
+            data.preset_read_globs.is_empty()
+                && data.preset_write_globs.is_empty()
+                && data.preset_deny_globs.is_empty(),
+            "standard declares no globs"
+        );
+        assert_eq!(
+            data.preset_deny_roots.len(),
+            6,
+            "the shipped secret list is untouched: {:?}",
+            data.preset_deny_roots
+        );
+        assert!(
+            !data.preset_egress_restricted,
+            "standard inherits the workspace reach"
+        );
+
+        let mut read_only_settings = rooted(&root);
+        read_only_settings.global.default_preset = "read-only".to_string();
+        let read_only = build(&read_only_settings);
+        let data = read_only.policy.data();
+        assert!(data.preset_read_restricted, "read-only declares reads");
+        assert_eq!(
+            data.preset_read_roots,
+            vec![root.to_string_lossy().to_string()],
+            "'.' resolves to the workspace root itself"
+        );
+        assert!(
+            data.preset_write_restricted && data.preset_write_roots.is_empty(),
+            "an empty write list allows no writes"
+        );
+        assert!(
+            data.preset_egress_restricted,
+            "read-only declares egress = [], a deny-all"
+        );
+        assert_eq!(data.permission, "read-only");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The glob scope reaches the TOOL boundary: a deny inside a granted write
+    /// scope refuses the call and names the preset rule; a write outside the
+    /// granted globs refuses; a read outside a declared read glob refuses while
+    /// one inside succeeds.
+    #[test]
+    fn a_preset_glob_scope_is_enforced_by_the_file_tools() {
+        let root = scratch("preset-glob-tools");
+        std::fs::create_dir_all(root.join("src")).expect("src");
+        std::fs::write(root.join("src").join("lib.rs"), "pub fn x() {}").expect("a source file");
+        std::fs::write(root.join("README.md"), "# readme").expect("a readme");
+        std::fs::create_dir_all(root.join("secrets")).expect("secrets");
+
+        // (a) Deny wins inside the workspace even when the tier and a broad
+        // write scope would allow it.
+        let mut settings = rooted(&root);
+        settings.global.presets.insert(
+            "guarded".to_string(),
+            Preset {
+                permission: Some(WORKSPACE_WRITE.to_string()),
+                plugins: vec!["files".to_string()],
+                write: Some(vec!["**".to_string()]),
+                deny: vec!["secrets/**".to_string()],
+                ..Preset::default()
+            },
+        );
+        settings.global.default_preset = "guarded".to_string();
+        let built = build(&settings);
+        let secret = root.join("secrets").join("key.pem");
+        let error = built
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": secret.to_string_lossy(),
+                    "content": "secret",
+                }),
+            )
+            .expect_err("the deny scope refuses the write");
+        assert!(
+            error.to_string().contains("preset-deny-path"),
+            "the refusal names the scope rule: {error}"
+        );
+        assert!(!secret.exists(), "the refused write created nothing");
+
+        // (b) A write scope refuses outside its globs.
+        settings.global.presets.insert(
+            "docs-only".to_string(),
+            Preset {
+                permission: Some(WORKSPACE_WRITE.to_string()),
+                plugins: vec!["files".to_string()],
+                write: Some(vec!["docs/**".to_string()]),
+                ..Preset::default()
+            },
+        );
+        settings.global.default_preset = "docs-only".to_string();
+        let built = build(&settings);
+        let outside = root.join("src").join("new.rs");
+        let error = built
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": outside.to_string_lossy(),
+                    "content": "fn main() {}",
+                }),
+            )
+            .expect_err("the write scope refuses the path");
+        assert!(error.to_string().contains("preset-write-scope"), "{error}");
+        assert!(!outside.exists());
+        // The same preset writes inside its glob.
+        built
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": root.join("docs").join("note.md").to_string_lossy(),
+                    "content": "ok",
+                }),
+            )
+            .expect("the declared glob allows the write");
+
+        // (c) A read scope refuses outside its globs and allows inside.
+        settings.global.presets.insert(
+            "sources".to_string(),
+            Preset {
+                permission: Some(WORKSPACE_WRITE.to_string()),
+                plugins: vec!["files".to_string()],
+                read: Some(vec!["src/**/*.rs".to_string()]),
+                ..Preset::default()
+            },
+        );
+        settings.global.default_preset = "sources".to_string();
+        let built = build(&settings);
+        let registry = built.agent.registry().expect("registry");
+        registry
+            .execute(
+                "read_file",
+                &serde_json::json!({ "path": root.join("src").join("lib.rs").to_string_lossy() }),
+            )
+            .expect("a read inside the glob is allowed");
+        let error = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({ "path": root.join("README.md").to_string_lossy() }),
+            )
+            .expect_err("a read outside the glob is refused");
+        assert!(error.to_string().contains("preset-read-scope"), "{error}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `web_search = false` reaches the agent's request switch, so the hosted
+    /// tool is not offered - the same removal `egress = []` performs for the
+    /// network. The engine's own test pins the request's tool array.
+    #[test]
+    fn web_search_false_withdraws_the_hosted_tool_at_the_build() {
+        let root = scratch("preset-web-search");
+        let mut settings = rooted(&root);
+        settings.global.presets.insert(
+            "no-search".to_string(),
+            Preset {
+                web_search: Some(false),
+                ..Preset::default()
+            },
+        );
+        settings.global.default_preset = "no-search".to_string();
+        let built = build(&settings);
+        assert!(
+            !built.agent.config().web_search,
+            "the built agent asks the provider for no hosted web search"
+        );
+
+        settings.global.presets.insert(
+            "search".to_string(),
+            Preset {
+                web_search: Some(true),
+                ..Preset::default()
+            },
+        );
+        settings.global.default_preset = "search".to_string();
+        let built = build(&settings);
+        assert!(built.agent.config().web_search, "the positive case");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// One preset whose own policy refuses writes, in both modes: advisory
+    /// records the refusal and lets the call through; required refuses it and
+    /// leaves no side effect.
+    #[test]
+    fn policy_mode_decides_whether_a_preset_refusal_stops_the_call() {
+        let rego = "package policy.soft\n\n# rule: soft-deny-write\nverdict := {\"allow\": false, \"rule\": \"soft-deny-write\", \"reason\": \"this preset advises against writes\"} if {\n    input.action == \"write\"\n} else := {\"allow\": true}\n";
+        let root = scratch("preset-policy-mode");
+        let mut settings = rooted(&root);
+        settings.global.presets.insert(
+            "soft".to_string(),
+            Preset {
+                permission: Some(WORKSPACE_WRITE.to_string()),
+                plugins: vec!["files".to_string()],
+                policy: Some(rego.to_string()),
+                trusted: true,
+                policy_mode: Some(crate::settings::global::PolicyMode::Advisory),
+                ..Preset::default()
+            },
+        );
+        settings.global.default_preset = "soft".to_string();
+        let built = build(&settings);
+        let target = root.join("notes.md");
+        built
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": target.to_string_lossy(),
+                    "content": "advisory",
+                }),
+            )
+            .expect("an advisory refusal lets the call proceed");
+        assert!(target.exists(), "the call's effect is real");
+        let advisories = built.policy.advisories();
+        assert_eq!(advisories.len(), 1, "{advisories:?}");
+        assert!(advisories[0].advisory);
+        assert_eq!(
+            advisories[0].rule.as_deref(),
+            Some("soft-deny-write"),
+            "the audit records the refusal verbatim"
+        );
+        assert_eq!(built.policy.advisories_total(), 1);
+
+        // The floor is not advisory: a write outside the workspace still fails.
+        let outside =
+            std::env::temp_dir().join(format!("bsh-advisory-outside-{}.md", std::process::id()));
+        let error = built
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": outside.to_string_lossy(),
+                    "content": "nope",
+                }),
+            )
+            .expect_err("advisory never widens the baseline");
+        assert!(
+            error.to_string().contains("write-outside-workspace")
+                || error.to_string().contains("escapes the workspace"),
+            "the floor still refuses outside the workspace: {error}"
+        );
+        assert!(!outside.exists());
+
+        // The SAME preset in required mode refuses the in-workspace write.
+        settings.global.presets.insert(
+            "soft".to_string(),
+            Preset {
+                permission: Some(WORKSPACE_WRITE.to_string()),
+                plugins: vec!["files".to_string()],
+                policy: Some(rego.to_string()),
+                trusted: true,
+                policy_mode: Some(crate::settings::global::PolicyMode::Required),
+                ..Preset::default()
+            },
+        );
+        let required = build(&settings);
+        let refused = root.join("required.md");
+        let error = required
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": refused.to_string_lossy(),
+                    "content": "required",
+                }),
+            )
+            .expect_err("required refuses the call");
+        assert!(error.to_string().contains("soft-deny-write"), "{error}");
+        assert!(!refused.exists(), "no side effect on a hard refusal");
+        assert!(required.policy.advisories().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A path scope that cannot be honoured is a LOAD error naming the preset
+    /// and the field, never a silent default.
+    #[test]
+    fn an_unparsable_path_scope_names_the_preset_and_field() {
+        let text = "[presets.bad]\nread = [\"docs/[unclosed\"]\n";
+        let error = crate::settings::global::GlobalSettings::from_toml(text)
+            .expect_err("an unparsable glob is refused");
+        let message = error.to_string();
+        assert!(message.contains("bad"), "names the preset: {message}");
+        assert!(message.contains("read"), "names the field: {message}");
+        assert!(
+            message.contains("character class"),
+            "says what is wrong: {message}"
+        );
+
+        let escape = "[presets.bad]\nwrite = [\"../outside\"]\n";
+        let error = crate::settings::global::GlobalSettings::from_toml(escape)
+            .expect_err("a parent escape is refused");
+        assert!(error.to_string().contains("write"), "{error}");
+        assert!(error.to_string().contains(".."), "{error}");
     }
 }

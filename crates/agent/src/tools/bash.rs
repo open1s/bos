@@ -1,6 +1,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::jobs::{JobRegistry, JobStatus};
 use crate::policy::{Action, PolicyInput, PolicySet, Target};
@@ -102,11 +103,15 @@ pub struct BashTool {
     ///
     /// The spec is the ONE seam the tool and the terminal share: it is built
     /// from the effective permission and the regorus policy, so the grants a
-    /// command gets are the policy's answers rather than a constant. With the
-    /// heel-sandbox feature on, heel's native backend enforces them; with it
-    /// off the spec still describes them and the in-tree Seatbelt profile is
-    /// the boundary.
+    /// command gets are the policy's answers rather than a constant. heel is
+    /// the one sandbox implementation and enforces them.
     sandbox: Option<Arc<SandboxSpec>>,
+    /// A caller-supplied reason the child is unconfined.
+    ///
+    /// A PRESET that turned the sandbox off sets this. When it is unset the
+    /// result still carries a reason: [`SANDBOX_RELEASED_REASON`], so
+    /// `sandbox: "none"` is never left bare.
+    sandbox_reason: Option<String>,
     /// The roster a run_in_background call registers in, when the shell wires
     /// one. Without it the flag is refused rather than silently run foreground.
     jobs: Option<Arc<JobRegistry>>,
@@ -129,6 +134,7 @@ impl BashTool {
             validator: None,
             policy: None,
             sandbox: None,
+            sandbox_reason: None,
             jobs: None,
             job_session: String::new(),
             background: true,
@@ -182,6 +188,16 @@ impl BashTool {
     /// may touch.
     pub fn with_sandbox_spec(mut self, spec: Arc<SandboxSpec>) -> Self {
         self.sandbox = Some(spec);
+        self
+    }
+
+    /// Record a more specific reason this command is unconfined.
+    ///
+    /// A build sets this when a POLICY (a preset) turned the sandbox off. An
+    /// unset reason is not left absent: the result falls back to
+    /// [`SANDBOX_RELEASED_REASON`], so `sandbox: "none"` always says why.
+    pub fn with_sandbox_reason(mut self, reason: impl Into<String>) -> Self {
+        self.sandbox_reason = Some(reason.into());
         self
     }
 
@@ -244,6 +260,7 @@ impl BashTool {
             Some(spec) if !spec.is_confined() => "unrestricted",
             Some(spec) => match spec.egress() {
                 Egress::DenyAll => "deny-all",
+                Egress::Unrestricted => "unrestricted",
                 Egress::Allow(_) => "allowlist",
             },
             None => "unrestricted",
@@ -304,16 +321,31 @@ impl BashTool {
                 },
                 Err(_) => JobStatus::Failed { code: -1 },
             };
+            // Record the outcome, then wait for the readers that were already
+            // draining before this thread looked at the exit status. The
+            // registry publishes the settled status itself when the last
+            // reader releases; a process the command left holding a pipe open
+            // is bounded by the drain grace, so the job still settles.
             waiter_jobs.finish(&waiter_id, status);
+            waiter_jobs.settle_after_writers(&waiter_id, crate::jobs::DRAIN_GRACE);
         });
-        Ok(serde_json::json!({
+        let mut answer = serde_json::json!({
             "job_id": id,
             "message": "started in background",
             "pid": pid,
             "sandbox": backend,
             "network": network,
             "status": JobStatus::Running.as_str(),
-        }))
+        });
+        // Same attribution as the foreground result: a bare "none" is never
+        // left unexplained, whether a preset or the permission released it.
+        if backend == "none" {
+            answer["sandbox_reason"] = serde_json::json!(self
+                .sandbox_reason
+                .as_deref()
+                .unwrap_or(SANDBOX_RELEASED_REASON));
+        }
+        Ok(answer)
     }
 }
 
@@ -328,11 +360,20 @@ pub struct BashExecutionResult {
     pub exit_code: i32,
     /// Whether the process exited successfully.
     pub success: bool,
-    /// The backend that ran the command: "heel", "seatbelt" or "none".
+    /// The backend that ran the command: "heel" or "none".
     ///
     /// A reader can tell a refusal the sandbox made from a command that simply
     /// failed, and a test can prove which boundary was actually in force.
     pub sandbox: String,
+    /// Why this command ran WITHOUT the sandbox.
+    ///
+    /// `sandbox: "none"` is never left bare: a preset's explicit choice carries
+    /// [`PRESET_SANDBOX_OFF_REASON`], and every other unconfined run carries
+    /// [`SANDBOX_RELEASED_REASON`]. The distinction matters because a preset's
+    /// choice can be revoked by selecting another preset, while a full-access
+    /// release follows the session permission.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_reason: Option<String>,
     /// What the command's network could reach: "deny-all", "allowlist" or
     /// "unrestricted".
     ///
@@ -340,21 +381,182 @@ pub struct BashExecutionResult {
     /// network" needs the answer the sandbox enforced, not an inference from the
     /// command line.
     pub network: String,
+    /// Why a failed command was refused by the KERNEL even though its egress was
+    /// UNRESTRICTED.
+    ///
+    /// The sandbox profile denies every direct socket and only grants the
+    /// localhost proxy, so a client that ignores the proxy environment (ICMP,
+    /// raw sockets, a TCP client with no proxy support) fails with EPERM/EACCES
+    /// while the policy itself allows the network. That reads exactly like a
+    /// policy refusal, which it is not, so the result names the condition and a
+    /// UI can explain it. The value is a stable id, not prose: the localized
+    /// copy lives in the shell's string table.
+    ///
+    /// Present only when the command failed with a network-syscall error under
+    /// an unrestricted, confined (heel) egress; absent otherwise, so an older
+    /// record and a success are indistinguishable from "no diagnostic".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_diagnostic: Option<String>,
 }
 
-/// Read one child pipe to the end on its own thread.
+/// The result's stable id for "a direct socket was refused because only the
+/// proxy is granted".
+///
+/// A code rather than an English sentence: the shell renders it through its own
+/// locale table, and the persisted result stays language-neutral.
+pub const UNPROXIED_DIRECT_SOCKET: &str = "unproxied-direct-socket";
+
+/// The reason a bash result carries when a preset turned the sandbox off.
+///
+/// Plain English rather than an id: the result is read by the model and by the
+/// audit's raw record, and the condition is a policy decision the reader must
+/// be able to see without translating it. The shell's audit detail resolves the
+/// same sentence through its locale table, so both readings agree.
+pub const PRESET_SANDBOX_OFF_REASON: &str = "a preset turned the sandbox off";
+
+/// The reason a bash result carries when the full-access permission released
+/// the sandbox (no preset asked for it).
+///
+/// Distinct from [`PRESET_SANDBOX_OFF_REASON`] on purpose: a reader who sees
+/// `sandbox: "none"` must be able to tell a policy choice from the permission
+/// tier that governs every tool in the turn.
+pub const SANDBOX_RELEASED_REASON: &str = "the full-access permission released the sandbox";
+
+/// Whether a failed command needs the unproxied-socket explanation.
+///
+/// Fires only when ALL of these hold, so it can never claim a policy refusal:
+///
+/// - the command did not succeed;
+/// - it ran under heel (the confined backend; a full-access command has no
+///   sandbox to blame);
+/// - its egress was UNRESTRICTED (an allowlist or deny-all is a different
+///   story, and those are already explained by the policy);
+/// - its streams carry a network syscall name (sendto, connect, socket) beside
+///   the kernel's EPERM/EACCES wording. A command that merely prints
+///   "Operation not permitted" without a network call does not match.
+///
+/// The scan is bounded: the diagnostic answers a failed command, and a
+/// megabyte of output must not turn one check into a full lowercase copy of it.
+fn unproxied_direct_socket(
+    sandbox: &str,
+    network: &str,
+    success: bool,
+    stdout: &str,
+    stderr: &str,
+) -> Option<&'static str> {
+    const SCAN: usize = 8_192;
+    if success || sandbox != "heel" || network != "unrestricted" {
+        return None;
+    }
+    let syscall = ["sendto", "connect", "socket"];
+    let errno = [
+        "operation not permitted",
+        "permission denied",
+        "eperm",
+        "eacces",
+    ];
+    let mut head = String::with_capacity(SCAN * 2 + 2);
+    for stream in [stdout, stderr] {
+        head.extend(stream.chars().take(SCAN));
+        head.push('\n');
+    }
+    let head = head.to_ascii_lowercase();
+    (syscall.iter().any(|name| head.contains(name)) && errno.iter().any(|name| head.contains(name)))
+        .then_some(UNPROXIED_DIRECT_SOCKET)
+}
+
+/// Read one child pipe to the end on its own thread into a shared buffer.
 ///
 /// Both pipes are drained while the process is waited for: a command whose
 /// output fills a pipe buffer would otherwise block before it could exit, and a
-/// timeout could never fire.
-fn drain<R: std::io::Read + Send + 'static>(mut pipe: R) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    let _ = pipe.read_to_end(&mut bytes);
-    bytes
+/// timeout could never fire. The bytes land in a shared buffer rather than in
+/// the thread's return value, so a caller whose bounded wait expires (a process
+/// the command left behind still holds the pipe open) keeps everything read up
+/// to the drain bound.
+fn drain_pipe<R: std::io::Read + Send + 'static>(
+    mut pipe: R,
+    sink: Arc<Mutex<Vec<u8>>>,
+    done: Arc<AtomicBool>,
+) {
+    std::thread::spawn(move || {
+        let mut buffer = [0u8; 8192];
+        loop {
+            match pipe.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => sink
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .extend_from_slice(&buffer[..read]),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        done.store(true, Ordering::Release);
+    });
+}
+
+/// Wait up to grace for a pipe reader to reach EOF, reporting whether it did.
+///
+/// The wait is the foreground ordering guarantee: the capture is complete only
+/// once the reader has seen EOF, which is why the result is built after it and
+/// never before. It is bounded because a command can leave a process behind
+/// that keeps a pipe open; the caller then keeps everything appended before the
+/// bound instead of holding the turn open. No extra thread is parked on the
+/// abandoned reader, which would otherwise outlive the call by the holder's
+/// whole lifetime.
+fn wait_for_drain(done: Option<&AtomicBool>, grace: std::time::Duration) -> bool {
+    let Some(done) = done else {
+        return true;
+    };
+    let deadline = std::time::Instant::now() + grace;
+    loop {
+        if done.load(Ordering::Acquire) {
+            return true;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        std::thread::sleep(
+            deadline
+                .saturating_duration_since(now)
+                .min(std::time::Duration::from_millis(5)),
+        );
+    }
+}
+
+/// Take everything the pipe readers appended so far.
+fn take_capture(sink: &Mutex<Vec<u8>>) -> Vec<u8> {
+    std::mem::take(&mut *sink.lock().unwrap_or_else(|error| error.into_inner()))
+}
+
+/// How much of a timed-out command's output the timeout error carries.
+///
+/// The error travels to the model and the transcript, so one pathological
+/// command must not be able to turn a single failure into megabytes; the first
+/// bytes are also the ones that say what the command had started to do.
+const TIMEOUT_EXCERPT: usize = 512;
+
+/// The first [TIMEOUT_EXCERPT] characters of a captured stream, marked when the
+/// capture was longer.
+fn timeout_excerpt(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let mut excerpt: String = text.chars().take(TIMEOUT_EXCERPT).collect();
+    if text.chars().nth(TIMEOUT_EXCERPT).is_some() {
+        excerpt.push('…');
+    }
+    excerpt
 }
 
 /// Feed one child pipe into a job's bounded ring until the pipe closes.
+///
+/// The writer slot is claimed here, in the spawning thread, BEFORE the reader
+/// starts: a waiter that reaps the child can therefore never publish the
+/// settled status in the window where the reader has not started yet. The slot
+/// is released only after the pipe reaches EOF, which is the signal that
+/// publishes a deferred settlement.
 fn pipe_to_jobs<R: Read + Send + 'static>(mut pipe: R, jobs: Arc<JobRegistry>, id: String) {
+    let claimed = jobs.claim_writer(&id);
     std::thread::spawn(move || {
         let mut buffer = [0u8; 8192];
         loop {
@@ -364,6 +566,9 @@ fn pipe_to_jobs<R: Read + Send + 'static>(mut pipe: R, jobs: Arc<JobRegistry>, i
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             }
+        }
+        if claimed {
+            jobs.release_writer(&id);
         }
     });
 }
@@ -479,10 +684,9 @@ impl Tool for BashTool {
 
         // The second tier, from the spec rather than from the policy: a target
         // the derived spec marks as forbidden is refused even when the policy
-        // tier's own answer was reached another way. Under heel this is the
-        // ONLY tier that denies .git and .bsh writes - the backend has no way to
-        // carve a deny out of the workspace grant - so the refusal names the
-        // rule that decided it.
+        // tier's own answer was reached another way. This is the ONLY tier that
+        // denies .git and .bsh writes - heel has no way to carve a deny out of
+        // the workspace grant - so the refusal names the rule that decided it.
         if let Some(spec) = self.sandbox.as_deref() {
             for target in write_targets(command, &cwd) {
                 if let Some(denial) = spec.denies_write(&target) {
@@ -499,8 +703,7 @@ impl Tool for BashTool {
         // the policy BEFORE a process exists, so a refused connection is a
         // refusal with a rule rather than a failed command. This is the same
         // egress question the proxy asks per connection; here it is asked about
-        // a command line, which is also the only network gate the
-        // heel-sandbox-off build has.
+        // a command line, before the kernel tier sees the connection.
         if let Some(policy) = &self.policy {
             self.check_network(policy, command)?;
         }
@@ -543,12 +746,18 @@ impl Tool for BashTool {
         // project rather than whatever directory the app was launched from.
         let mut child = self.spawn_command(command, &cwd)?;
         let backend = child.backend();
-        let stdout = child
-            .take_stdout()
-            .map(|pipe| std::thread::spawn(move || drain(pipe)));
-        let stderr = child
-            .take_stderr()
-            .map(|pipe| std::thread::spawn(move || drain(pipe)));
+        let stdout_sink = Arc::new(Mutex::new(Vec::new()));
+        let stderr_sink = Arc::new(Mutex::new(Vec::new()));
+        let stdout_done = child.take_stdout().map(|pipe| {
+            let done = Arc::new(AtomicBool::new(false));
+            drain_pipe(pipe, stdout_sink.clone(), done.clone());
+            done
+        });
+        let stderr_done = child.take_stderr().map(|pipe| {
+            let done = Arc::new(AtomicBool::new(false));
+            drain_pipe(pipe, stderr_sink.clone(), done.clone());
+            done
+        });
 
         // The configured timeout is enforced here: a command that never returns
         // must not hold the turn open forever. Zero means no limit.
@@ -573,23 +782,50 @@ impl Tool for BashTool {
             }
         }
         let status = child.wait().map_err(|e| ToolError::Failed(e.to_string()))?;
-        let stdout = stdout
-            .and_then(|thread| thread.join().ok())
-            .unwrap_or_default();
-        let stderr = stderr
-            .and_then(|thread| thread.join().ok())
-            .unwrap_or_default();
+        // The result is formed only after the readers reach EOF, so a reader
+        // never sees a stdout/stderr pair that is missing bytes the command
+        // wrote. A reader still alive after the process ended means something
+        // the command left behind holds the pipe; the bound keeps a timeout
+        // from waiting on that process, and the capture so far is kept.
+        wait_for_drain(stdout_done.as_deref(), crate::jobs::DRAIN_GRACE);
+        wait_for_drain(stderr_done.as_deref(), crate::jobs::DRAIN_GRACE);
+        let stdout = take_capture(&stdout_sink);
+        let stderr = take_capture(&stderr_sink);
         if timed_out {
-            return Err(ToolError::Timeout);
+            // A timeout is not a blank failure: it names the command, the bound
+            // it exceeded and the bytes captured before the kill, so a reader
+            // can tell what ran and what it managed to say. The kill above
+            // reaches the whole process group, so the readers reached EOF and
+            // the capture is everything the command wrote before its bound.
+            return Err(ToolError::Timeout(format!(
+                "'{}' exceeded its {}s bound and was killed; partial stdout {:?}, partial stderr {:?}",
+                timeout_excerpt(command.as_bytes()),
+                self.config.timeout_secs,
+                timeout_excerpt(&stdout),
+                timeout_excerpt(&stderr)
+            )));
         }
 
+        let stdout = String::from_utf8_lossy(&stdout).to_string();
+        let stderr = String::from_utf8_lossy(&stderr).to_string();
+        let success = status.success();
+        let network = self.network_label().to_string();
+        let network_diagnostic =
+            unproxied_direct_socket(backend, &network, success, &stdout, &stderr)
+                .map(str::to_string);
         let result = BashExecutionResult {
-            stdout: String::from_utf8_lossy(&stdout).to_string(),
-            stderr: String::from_utf8_lossy(&stderr).to_string(),
+            stdout,
+            stderr,
             exit_code: status.code().unwrap_or(-1),
-            success: status.success(),
+            success,
             sandbox: backend.to_string(),
-            network: self.network_label().to_string(),
+            sandbox_reason: (backend == "none").then(|| {
+                self.sandbox_reason
+                    .clone()
+                    .unwrap_or_else(|| SANDBOX_RELEASED_REASON.to_string())
+            }),
+            network,
+            network_diagnostic,
         };
 
         serde_json::to_value(result).map_err(|e| ToolError::Failed(e.to_string()))
@@ -879,8 +1115,8 @@ fn write_targets(command: &str, cwd: &Path) -> Vec<PathBuf> {
     targets
 }
 
-// The Seatbelt profile moved to crate::sandbox: the spec owns the confinement
-// now, so the tool and the terminal cannot build two different ones.
+// The confinement lives in crate::sandbox: the spec owns it, so the tool and
+// the terminal cannot build two different ones.
 
 #[cfg(test)]
 mod tests {
@@ -894,6 +1130,16 @@ mod tests {
         assert!(result.is_ok());
         let value = result.unwrap();
         assert_eq!(value["stdout"].as_str().unwrap().trim(), "hello");
+        assert_eq!(
+            value["sandbox"],
+            serde_json::json!("none"),
+            "a tool with no spec runs unconfined"
+        );
+        assert_eq!(
+            value["sandbox_reason"],
+            serde_json::json!(SANDBOX_RELEASED_REASON),
+            "an unconfined result always says why, even without a preset"
+        );
     }
 
     #[test]
@@ -1012,6 +1258,51 @@ mod tests {
         }
     }
 
+    /// The INHERITED full-access arm. The shell is handed no workspace root, so
+    /// its cwd is this process's own directory, which is not the policy's
+    /// workspace. The released tier must permit the spawn THERE: a path-only
+    /// policy refused every command before a process existed, which is the
+    /// reported bug this arm fixes.
+    #[test]
+    fn a_full_access_policy_spawns_the_shell_with_no_workspace_root() {
+        let dir = tempfile::tempdir().expect("workspace");
+        let outside = dir.path().parent().expect("parent").join(format!(
+            "bsh-bash-released-escape-{}.txt",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&outside);
+        let policy = std::sync::Arc::new(crate::policy::PolicySet::compile_baseline(
+            crate::policy::PolicyData::new(dir.path()).with_permission("danger-full-access"),
+        ));
+        // No workspace_root in the config: the cwd is the test process directory.
+        let tool = BashTool::new("bash").with_policy(policy, "session", "preset");
+        let result = tool
+            .run(&serde_json::json!({ "command": "echo hi" }))
+            .expect("the released tier permits the spawn");
+        assert_eq!(result["stdout"].as_str().unwrap_or("").trim(), "hi");
+        assert_eq!(result["exit_code"], serde_json::json!(0), "{result}");
+        assert_eq!(result["sandbox"], serde_json::json!("none"), "{result}");
+        assert_eq!(
+            result["sandbox_reason"],
+            serde_json::json!(SANDBOX_RELEASED_REASON),
+            "the release says why: {result}"
+        );
+
+        // The release is the SPAWN, not a release of the policy's write
+        // confinement: a command that names a write outside the workspace is
+        // still refused, and no file appears.
+        let error = tool
+            .run(&serde_json::json!({
+                "command": format!("echo hi > {}", outside.display())
+            }))
+            .expect_err("the write policy still confines full access");
+        assert!(
+            error.to_string().contains("write-outside-workspace"),
+            "{error}"
+        );
+        assert!(!outside.exists(), "the refused write created the file");
+    }
+
     /// A redirect outside the workspace is detected before a process exists,
     /// and the probe proves the target was never created.
     #[test]
@@ -1060,85 +1351,6 @@ mod tests {
         let copy = write_targets("cp a.txt /tmp/b.txt", root);
         assert_eq!(copy, vec![std::path::PathBuf::from("/tmp/b.txt")]);
         assert!(write_targets("ls -la", root).is_empty());
-    }
-
-    /// The Seatbelt profile blocks a write the lexical scan cannot see: the
-    /// target lives in a shell variable, so the scan resolves it inside the
-    /// workspace while the kernel resolves it in the home directory.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_seatbelt_sandbox_blocks_a_variable_write_outside() {
-        if !std::path::Path::new("/usr/bin/sandbox-exec").exists() {
-            return;
-        }
-        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
-            return;
-        };
-        let dir = tempfile::tempdir().expect("workspace");
-        let outside = home.join(format!("bsh-sandbox-escape-{}.txt", std::process::id()));
-        let _ = std::fs::remove_file(&outside);
-        let policy = std::sync::Arc::new(crate::policy::PolicySet::compile_baseline(
-            crate::policy::PolicyData::new(dir.path()),
-        ));
-        let tool = BashTool::new("bash")
-            .with_workspace(dir.path().to_str().expect("utf-8"))
-            .with_policy(policy, "session", "preset")
-            .with_sandbox(dir.path());
-        let command = format!("T=\"{}\"; printf hi > \"$T\"", outside.display());
-        let result = tool
-            .run(&serde_json::json!({ "command": command }))
-            .expect("the command runs and reports its own failure");
-        assert!(
-            !result["success"].as_bool().unwrap_or(true),
-            "the sandboxed command failed: {result}"
-        );
-        assert!(
-            !outside.exists(),
-            "the kernel sandbox let the variable write escape"
-        );
-    }
-
-    /// The same profile still allows a write inside the workspace, and denies
-    /// the workspace's own .git internals even through a variable.
-    ///
-    /// This is the heel-sandbox-off build. heel has no way to carve a deny out
-    /// of a granted tree (see heel_cannot_deny_a_git_write_inside_the_workspace_grant),
-    /// so this kernel-level deny is exactly what the fallback is kept for.
-    #[cfg(all(target_os = "macos", not(feature = "heel-sandbox")))]
-    #[test]
-    fn a_seatbelt_sandbox_allows_the_workspace_and_denies_git() {
-        if !std::path::Path::new("/usr/bin/sandbox-exec").exists() {
-            return;
-        }
-        let dir = tempfile::tempdir().expect("workspace");
-        std::fs::create_dir_all(dir.path().join(".git")).expect(".git");
-        std::fs::write(dir.path().join(".git").join("config"), "original").expect("config");
-        let policy = std::sync::Arc::new(crate::policy::PolicySet::compile_baseline(
-            crate::policy::PolicyData::new(dir.path()),
-        ));
-        let tool = BashTool::new("bash")
-            .with_workspace(dir.path().to_str().expect("utf-8"))
-            .with_policy(policy, "session", "preset")
-            .with_sandbox(dir.path());
-
-        tool.run(&serde_json::json!({
-            "command": "T=inside-sbx.txt; printf hi > \"$T\""
-        }))
-        .expect("an in-workspace write runs");
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("inside-sbx.txt")).expect("inside file"),
-            "hi"
-        );
-
-        tool.run(&serde_json::json!({
-            "command": "T=.git/config; printf hacked > \"$T\""
-        }))
-        .expect("the command runs and reports its own failure");
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join(".git").join("config")).expect("config"),
-            "original",
-            "the kernel sandbox let a .git write through"
-        );
     }
 
     /// A background run returns at once and leaves a running job behind.
@@ -1193,6 +1405,215 @@ mod tests {
         let output = registry.output_for(&id).expect("captured output").text;
         assert!(output.contains("out"), "stdout was captured: {output:?}");
         assert!(output.contains("err"), "stderr was captured: {output:?}");
+    }
+
+    /// A settled status is a promise that the capture is complete.
+    ///
+    /// The command writes to both pipes and exits immediately, so the waiter
+    /// can observe the exit while a pipe reader is still being scheduled. A
+    /// reader that trusts the status must never see a finished job whose
+    /// output is missing a byte the command wrote; the round number is reported
+    /// because the race only shows on some of the fifty spawns.
+    #[test]
+    fn a_settled_job_has_all_the_output_its_command_wrote() {
+        const ROUNDS: usize = 50;
+        for round in 0..ROUNDS {
+            // Two shapes of the same ordering violation. An even round writes
+            // and exits at once, leaving the last bytes buffered in the pipes
+            // when the waiter reaps the child (the flush race the flake
+            // reports). An odd round writes, sleeps briefly, and exits while a
+            // child it started still holds the pipes and is about to write
+            // (the drained-late race): the status must not settle while any
+            // writer can still append.
+            let command = if round % 2 == 0 {
+                "printf first; printf last; printf err 1>&2; exit 3"
+            } else {
+                "printf first; sleep 0.002; ( sleep 0.02; printf last; printf err 1>&2 ) & exit 3"
+            };
+            let registry = Arc::new(crate::jobs::JobRegistry::new());
+            let tool = BashTool::new("bash").with_jobs(registry.clone(), "session-a");
+            let value = tool
+                .run(&serde_json::json!({
+                    "command": command,
+                    "run_in_background": true
+                }))
+                .unwrap_or_else(|error| panic!("round {round}: the spawn was refused: {error:?}"));
+            let id = value["job_id"].as_str().expect("a job id").to_string();
+            let summary = registry
+                .wait_for(&id, std::time::Duration::from_secs(5))
+                .expect("the job exists");
+            assert_eq!(
+                summary.status,
+                JobStatus::Failed { code: 3 },
+                "round {round}: the command's own exit code"
+            );
+            let output = registry.output_for(&id).expect("captured output").text;
+            assert!(
+                output.contains("first") && output.contains("last") && output.contains("err"),
+                "round {round}: a settled job is missing captured output: {output:?}"
+            );
+        }
+    }
+
+    /// A killed job keeps every byte it wrote before the signal.
+    ///
+    /// The command announces itself, then waits: the marker file proves the
+    /// write reached the pipe before the kill, so a Killed status with a
+    /// capture that does not hold it is the ordering bug. The stop must also
+    /// not wait for the rest of the command.
+    #[test]
+    fn a_killed_job_keeps_the_output_it_wrote_before_the_kill() {
+        let dir = tempfile::tempdir().expect("a scratch workspace");
+        let marker = dir.path().join("written");
+        let registry = Arc::new(crate::jobs::JobRegistry::new());
+        let tool = BashTool::new("bash").with_jobs(registry.clone(), "session-a");
+        let command = format!(
+            "printf before-kill; printf before-kill 1>&2; touch {}; sleep 30; printf after-kill",
+            marker.display()
+        );
+        let value = tool
+            .run(&serde_json::json!({
+                "command": command,
+                "run_in_background": true
+            }))
+            .expect("the spawn is accepted");
+        let id = value["job_id"].as_str().expect("a job id").to_string();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(marker.exists(), "the command never reached its kill window");
+        assert!(registry.kill(&id), "the stop is accepted");
+        // kill publishes only after the capture drained, so no wait is needed
+        // for the status: a reader that sees Killed sees those bytes.
+        let summary = registry
+            .wait_for(&id, std::time::Duration::from_secs(5))
+            .expect("the job exists");
+        assert_eq!(summary.status, JobStatus::Killed);
+        let output = registry.output_for(&id).expect("captured output").text;
+        assert!(
+            output.contains("before-kill"),
+            "the killed job lost output it wrote before the kill: {output:?}"
+        );
+        assert!(
+            !output.contains("after-kill"),
+            "the killed job captured output from after the kill: {output:?}"
+        );
+    }
+
+    /// A command can exit while a process it started still holds its pipes.
+    ///
+    /// The job must settle with the bytes the command wrote, within the drain
+    /// bound, and the capture must not change afterwards: the late writer's
+    /// output belongs to no settled job and is refused.
+    #[test]
+    fn a_job_whose_pipe_outlives_its_process_settles_with_what_it_wrote() {
+        let registry = Arc::new(crate::jobs::JobRegistry::new());
+        let tool = BashTool::new("bash").with_jobs(registry.clone(), "session-a");
+        let value = tool
+            .run(&serde_json::json!({
+                "command": "printf captured; ( sleep 1.5; printf late ) & exit 0",
+                "run_in_background": true
+            }))
+            .expect("the spawn is accepted");
+        let id = value["job_id"].as_str().expect("a job id").to_string();
+        let started = std::time::Instant::now();
+        let summary = registry
+            .wait_for(&id, std::time::Duration::from_secs(5))
+            .expect("the job exists");
+        assert_eq!(summary.status, JobStatus::Succeeded { code: 0 });
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the drain bound did not settle the job: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            registry.output_for(&id).expect("captured output").text,
+            "captured",
+            "the settle keeps every byte the command wrote"
+        );
+        // The holder writes at 1.5s, after the bound settled the job.
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        assert_eq!(
+            registry.output_for(&id).expect("captured output").text,
+            "captured",
+            "a settled job's capture changed after it was published"
+        );
+    }
+
+    /// A 200 KB command fills the ring before the status settles.
+    ///
+    /// The ring holds the tail, so "complete" at settle means exactly the last
+    /// cap bytes were appended; a short ring is the drain lagging the exit.
+    #[test]
+    fn a_large_output_job_settles_with_a_full_ring() {
+        let written = 200_000usize;
+        let registry = Arc::new(crate::jobs::JobRegistry::new());
+        let tool = BashTool::new("bash").with_jobs(registry.clone(), "session-a");
+        let value = tool
+            .run(&serde_json::json!({
+                "command": format!("head -c {written} /dev/zero | tr '\\0' z"),
+                "run_in_background": true
+            }))
+            .expect("the spawn is accepted");
+        let id = value["job_id"].as_str().expect("a job id").to_string();
+        let summary = registry
+            .wait_for(&id, std::time::Duration::from_secs(10))
+            .expect("the job exists");
+        assert_eq!(summary.status, JobStatus::Succeeded { code: 0 });
+        let output = registry.output_for(&id).expect("captured output");
+        assert_eq!(
+            output.bytes,
+            crate::jobs::DEFAULT_OUTPUT_CAP,
+            "the settle saw a short ring"
+        );
+        assert_eq!(
+            output.dropped,
+            (written - crate::jobs::DEFAULT_OUTPUT_CAP) as u64,
+            "the settle saw only {} of {written} written bytes",
+            output.bytes + output.dropped as usize
+        );
+        assert!(
+            output.text.bytes().all(|byte| byte == b'z'),
+            "the captured tail is not the command's output"
+        );
+    }
+
+    /// A timeout settles even when the command left a process holding the pipe.
+    ///
+    /// Killing the shell leaves its background child alive with the inherited
+    /// pipes, so an unbounded join would hold the turn open for that child's
+    /// whole life. The call must report its timeout at the drain bound instead.
+    #[test]
+    fn a_timed_out_command_settles_without_waiting_for_a_leftover_holder() {
+        let dir = tempfile::tempdir().expect("a scratch workspace");
+        let pidfile = dir.path().join("holder.pid");
+        let tool = BashTool::new("bash").with_config(BashToolConfig {
+            timeout_secs: 1,
+            ..BashToolConfig::default()
+        });
+        let command = format!(
+            "printf captured; sleep 25 & echo $! > {}; wait",
+            pidfile.display()
+        );
+        let started = std::time::Instant::now();
+        let result = tool.run(&serde_json::json!({ "command": command }));
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(result, Err(ToolError::Timeout(_))),
+            "the call reports a timeout, got {result:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(4),
+            "the timeout outlived its drain bound: {elapsed:?}"
+        );
+        // The leftover holder is not the tool's to keep: clean it up so the
+        // test leaves no process behind.
+        if let Ok(pid) = std::fs::read_to_string(&pidfile) {
+            let _ = std::process::Command::new("/bin/kill")
+                .args(["-KILL", pid.trim()])
+                .status();
+        }
     }
 
     /// A denied spawn never reaches the roster and never starts a child.
@@ -1316,12 +1737,116 @@ mod tests {
         // killing the shell really ends the command.
         let result = tool.run(&serde_json::json!({ "command": "while :; do :; done" }));
         assert!(
-            matches!(result, Err(ToolError::Timeout)),
+            matches!(result, Err(ToolError::Timeout(_))),
             "the call reports a timeout, got {result:?}"
         );
         assert!(
             started.elapsed() < std::time::Duration::from_secs(4),
             "it did not wait for the loop to end on its own"
+        );
+    }
+
+    /// A command that never writes must not hold the turn for the tool's
+    /// default bound: with a one-second configured timeout the call reports in
+    /// about a second, names the command and the bound, and says that its
+    /// capture was empty rather than leaving the reader to guess.
+    #[test]
+    fn a_silent_command_times_out_promptly_and_names_its_bound() {
+        let tool = BashTool::new("bash").with_config(BashToolConfig {
+            timeout_secs: 1,
+            ..BashToolConfig::default()
+        });
+        let started = std::time::Instant::now();
+        let result = tool.run(&serde_json::json!({ "command": "sleep 30" }));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "a one-second bound reported after {elapsed:?}"
+        );
+        match result {
+            Err(ToolError::Timeout(message)) => {
+                assert!(
+                    message.contains("sleep 30"),
+                    "the command is unnamed: {message}"
+                );
+                assert!(
+                    message.contains("1s bound"),
+                    "the bound is unnamed: {message}"
+                );
+                assert!(
+                    message.contains("partial stdout \"\""),
+                    "the empty capture is not reported: {message}"
+                );
+            }
+            other => panic!("expected a named timeout, got {other:?}"),
+        }
+    }
+
+    /// The bytes the command wrote before the bound are carried by the timeout
+    /// error, not thrown away with the process: the capture is the only record
+    /// of what a killed command had already done.
+    #[test]
+    fn a_timed_out_command_reports_what_it_wrote_before_the_bound() {
+        let tool = BashTool::new("bash").with_config(BashToolConfig {
+            timeout_secs: 1,
+            ..BashToolConfig::default()
+        });
+        let result = tool.run(&serde_json::json!({ "command": "printf checkpoint; sleep 30" }));
+        match result {
+            Err(ToolError::Timeout(message)) => {
+                assert!(
+                    message.contains("checkpoint"),
+                    "the partial output is lost: {message}"
+                )
+            }
+            other => panic!("expected a named timeout, got {other:?}"),
+        }
+    }
+
+    /// The bound kills the PROCESS GROUP, not just the shell command: a child
+    /// the shell put in the background is gone at the bound, so a released
+    /// shell cannot leave work running behind a finished turn.
+    #[cfg(unix)]
+    #[test]
+    fn a_timeout_kills_the_released_shells_whole_process_group() {
+        let dir = tempfile::tempdir().expect("a scratch workspace");
+        let pidfile = dir.path().join("child.pid");
+        let tool = BashTool::new("bash").with_config(BashToolConfig {
+            timeout_secs: 1,
+            ..BashToolConfig::default()
+        });
+        // The background child holds a pipe and would outlive a kill aimed at
+        // the shell alone; it writes its pid first so the test can look for it.
+        let command = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
+        let started = std::time::Instant::now();
+        let result = tool.run(&serde_json::json!({ "command": command }));
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(result, Err(ToolError::Timeout(_))),
+            "the call reports a timeout, got {result:?}"
+        );
+        let pid: u32 = std::fs::read_to_string(&pidfile)
+            .expect("the child wrote its pid")
+            .trim()
+            .parse()
+            .expect("a numeric pid");
+        let mut gone = false;
+        for _ in 0..40 {
+            if !crate::jobs::pid_exists(pid) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            gone,
+            "the timed-out shell left its background child alive (pid {pid})"
+        );
+        // A group that really died closes its pipes, so the drain grace is not
+        // paid: the call reports at its bound, not one second per stream later.
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "the bound reported after {elapsed:?}"
         );
     }
 
@@ -1349,7 +1874,6 @@ mod tests {
     }
 
     /// A shell tool whose policy carries all three egress rule shapes.
-    #[cfg(feature = "heel-sandbox")]
     fn sandboxed_tool_with(
         root: &std::path::Path,
         permission: &str,
@@ -1399,6 +1923,31 @@ mod tests {
             .with_sandbox_spec(spec)
     }
 
+    /// A shell tool confined by heel with UNRESTRICTED egress: no allowlist
+    /// file, the state a fresh workspace derives.
+    fn sandboxed_unrestricted_tool(root: &std::path::Path, permission: &str) -> BashTool {
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let data = crate::policy::PolicyData::new(&root)
+            .with_permission(permission)
+            .with_egress_unrestricted(true);
+        let policy = std::sync::Arc::new(crate::policy::PolicySet::compile(
+            vec![
+                crate::policy::baseline_source(),
+                crate::policy::session_permission_source(permission),
+            ],
+            data,
+        ));
+        let spec = std::sync::Arc::new(crate::sandbox::SandboxSpec::for_policy(
+            &policy,
+            permission,
+            crate::sandbox::Principal::new("bash", "session", "preset"),
+        ));
+        BashTool::new("bash")
+            .with_workspace(root.to_str().expect("a utf-8 path"))
+            .with_policy(policy, "session", "preset")
+            .with_sandbox_spec(spec)
+    }
+
     /// A scratch workspace with a .git directory, so the deny can be probed.
     fn sandbox_workspace() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("a scratch workspace");
@@ -1411,7 +1960,6 @@ mod tests {
     /// kernel, and the probe proves it: the path is reached through a shell
     /// variable, so the lexical scan cannot see it and only the sandbox can
     /// stop it. The same command's in-workspace write succeeds.
-    #[cfg(feature = "heel-sandbox")]
     #[test]
     fn heel_refuses_a_write_outside_the_workspace_and_allows_one_inside() {
         let dir = sandbox_workspace();
@@ -1457,7 +2005,6 @@ mod tests {
     /// WRITE and EXEC are separate grants: a payload written into the workspace
     /// is there, and running it is refused. A build cache the POLICY granted is
     /// the deliberate exception, and executes.
-    #[cfg(feature = "heel-sandbox")]
     #[test]
     fn heel_refuses_write_then_execute_except_in_a_granted_build_cache() {
         let dir = sandbox_workspace();
@@ -1479,10 +2026,16 @@ mod tests {
             "a payload written into the workspace was executed: {payload}"
         );
         // The outer shell's own exit code is masked by the trailing echo, so the
-        // named refusal is the kernel's, not the shell's.
-        let stderr = payload["stderr"].as_str().unwrap_or_default();
+        // named refusal is the kernel's, not the shell's. macOS says "Operation
+        // not permitted" and Linux says "Permission denied" for the same
+        // refusal, so the assertion is on the kind of error rather than one
+        // kernel's wording.
+        let stderr = payload["stderr"]
+            .as_str()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
         assert!(
-            stderr.contains("Operation not permitted"),
+            stderr.contains("permit") || stderr.contains("denied"),
             "the drop-and-run did not fail with the sandbox's named refusal: {payload}"
         );
 
@@ -1520,10 +2073,8 @@ mod tests {
 
     /// The measured limitation, pinned so nobody assumes otherwise: heel has no
     /// way to deny a path inside a granted tree, so a .git write reached
-    /// through a variable gets through the kernel. That is why the
-    /// heel-sandbox-off build still exists, and why this test will fail the day
-    /// heel grows a deny grant.
-    #[cfg(feature = "heel-sandbox")]
+    /// through a variable gets through the kernel; the policy tier is the only
+    /// deny. This test fails the day heel grows a deny grant.
     #[test]
     fn heel_cannot_deny_a_git_write_inside_the_workspace_grant() {
         let dir = sandbox_workspace();
@@ -1544,7 +2095,6 @@ mod tests {
 
     /// The proxy asks the policy PER CONNECTION, for the address it resolved:
     /// the decision is regorus's, not a list baked in at build time.
-    #[cfg(feature = "heel-sandbox")]
     #[test]
     fn the_egress_callback_asks_regorus_per_connection() {
         use heel::NetworkPolicy as _;
@@ -1605,7 +2155,6 @@ mod tests {
 
     /// A policy confined to one port refuses a command that names another, at
     /// the command tier, before a process exists.
-    #[cfg(feature = "heel-sandbox")]
     #[test]
     fn a_port_rule_refuses_a_network_command_with_its_own_rule() {
         let Some(host) = host_lan_address() else {
@@ -1685,15 +2234,30 @@ mod tests {
     /// heel's proxy refuses to forward to a host-local address, so a loopback
     /// listener cannot prove an allow case; a listener on the host's LAN
     /// address can, because that is not loopback or link-local.
-    #[cfg(feature = "heel-sandbox")]
     fn host_lan_address() -> Option<String> {
-        for interface in ["en0", "en1"] {
-            let output = std::process::Command::new("/usr/sbin/ipconfig")
-                .args(["getifaddr", interface])
-                .output()
-                .ok()?;
+        // macOS names interfaces; Linux asks the kernel for the first address a
+        // non-loopback interface carries.
+        let candidates: &[(&str, &[&str])] = &[
+            ("/usr/sbin/ipconfig", &["getifaddr", "en0"]),
+            ("/usr/sbin/ipconfig", &["getifaddr", "en1"]),
+            ("/bin/sh", &["-c", "hostname -I 2>/dev/null | awk '{print $1}'"]),
+            (
+                "/bin/sh",
+                &["-c", "ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1"],
+            ),
+        ];
+        for (program, args) in candidates {
+            if !std::path::Path::new(program).exists() {
+                continue;
+            }
+            let Ok(output) = std::process::Command::new(program).args(*args).output() else {
+                continue;
+            };
             let host = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !host.is_empty() {
+            if host.parse::<std::net::IpAddr>().is_ok()
+                && !host.starts_with("127.")
+                && !host.starts_with("169.254.")
+            {
                 return Some(host);
             }
         }
@@ -1701,7 +2265,6 @@ mod tests {
     }
 
     /// Serve HTTP 200 to every connection, counting them.
-    #[cfg(feature = "heel-sandbox")]
     fn serve_http(
         listener: std::net::TcpListener,
         hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -1731,7 +2294,6 @@ mod tests {
 
     /// DenyAll refuses the connection in the kernel, and the policy's allowlist
     /// lets the SAME connection through the proxy.
-    #[cfg(feature = "heel-sandbox")]
     #[test]
     fn network_activity_is_gated_before_a_process_and_again_by_the_kernel() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1801,45 +2363,124 @@ mod tests {
         );
     }
 
-    /// With the feature off the in-tree Seatbelt profile is the boundary, and
-    /// it still confines writes to the workspace.
-    #[cfg(not(feature = "heel-sandbox"))]
+    /// The unproxied-socket explanation has ONE trigger, and it never doubles as
+    /// a policy claim: a failure, under heel, with UNRESTRICTED egress, whose
+    /// streams name a network syscall beside EPERM/EACCES. Every one of those
+    /// conditions is required, and a different errno does not match.
     #[test]
-    fn the_fallback_runs_commands_under_the_seatbelt_profile() {
-        if !std::path::Path::new("/usr/bin/sandbox-exec").exists() {
-            return;
-        }
-        let dir = sandbox_workspace();
-        // The home directory, not the temp directory: the in-tree profile
-        // deliberately allows writes under the shared temp dirs, because that is
-        // where a command legitimately puts scratch files. Home is the escape.
-        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
-            return;
-        };
-        let outside = home.join(format!(
-            "bsh-fallback-escape-{}-{}.txt",
-            std::process::id(),
-            line!()
-        ));
-        let _ = std::fs::remove_file(&outside);
-        let tool = sandboxed_tool(dir.path(), "workspace-write", &[]);
-
-        let allowed = tool
-            .run(&serde_json::json!({ "command": "printf hi > inside.txt" }))
-            .expect("an in-workspace write runs");
-        assert_eq!(allowed["sandbox"], serde_json::json!("seatbelt"));
-        assert!(allowed["success"].as_bool().unwrap_or(false), "{allowed}");
-
-        let denied = tool
-            .run(&serde_json::json!({
-                "command": format!("T=\"{}\"; printf escaped > \"$T\"", outside.display())
-            }))
-            .expect("the command runs");
-        assert_eq!(denied["sandbox"], serde_json::json!("seatbelt"));
-        assert!(
-            !outside.exists(),
-            "the fallback profile let the write escape through a variable"
+    fn the_unproxied_socket_diagnostic_has_one_trigger() {
+        let ping = "ping: sendto: Operation not permitted";
+        assert_eq!(
+            unproxied_direct_socket("heel", "unrestricted", false, "", ping),
+            Some(UNPROXIED_DIRECT_SOCKET),
+            "the measured ping failure is the condition"
         );
-        let _ = std::fs::remove_file(&outside);
+        // The same words on stdout, and the POSIX symbol instead of the prose.
+        assert_eq!(
+            unproxied_direct_socket("heel", "unrestricted", false, "socket: EACCES", ""),
+            Some(UNPROXIED_DIRECT_SOCKET)
+        );
+        assert_eq!(
+            unproxied_direct_socket("heel", "unrestricted", false, "", "connect: EPERM"),
+            Some(UNPROXIED_DIRECT_SOCKET)
+        );
+        // A success is not a refusal.
+        assert_eq!(
+            unproxied_direct_socket("heel", "unrestricted", true, "", ping),
+            None
+        );
+        // Only an UNRESTRICTED reach gets this explanation: deny-all and
+        // allowlist are policy states with their own answers.
+        for network in ["deny-all", "allowlist", "unrestricted-ish"] {
+            assert_eq!(
+                unproxied_direct_socket("heel", network, false, "", ping),
+                None,
+                "{network} must not borrow the unrestricted explanation"
+            );
+        }
+        // A full-access command has no sandbox to blame.
+        assert_eq!(
+            unproxied_direct_socket("none", "unrestricted", false, "", ping),
+            None
+        );
+        // A different errno is a different failure (a refused connection).
+        assert_eq!(
+            unproxied_direct_socket(
+                "heel",
+                "unrestricted",
+                false,
+                "",
+                "connect: Connection refused"
+            ),
+            None
+        );
+        // The errno wording alone is not enough: the syscall has to be named.
+        assert_eq!(
+            unproxied_direct_socket(
+                "heel",
+                "unrestricted",
+                false,
+                "",
+                "chmod: Operation not permitted"
+            ),
+            None
+        );
+    }
+
+    /// End to end through a real heel sandbox with UNRESTRICTED egress: the
+    /// kernel refuses ICMP and the result says so in a machine-readable field,
+    /// while the network label honestly stays "unrestricted". This is the
+    /// user-visible trap: ping fails although the policy allows the network.
+    #[test]
+    fn an_unrestricted_heel_sandbox_explains_a_kernel_refused_ping() {
+        let dir = sandbox_workspace();
+        let tool = sandboxed_unrestricted_tool(dir.path(), "workspace-write");
+        // BOUNDED probe: the test is about the sandbox's prompt refusal, not
+        // about how long a host that silently drops ICMP makes ping wait. The
+        // wait cap is milliseconds on macOS and seconds elsewhere.
+        let ping = if cfg!(target_os = "macos") {
+            "ping -c 1 -W 2000 1.1.1.1"
+        } else {
+            "ping -c 1 -W 2 1.1.1.1"
+        };
+        let result = tool
+            .run(&serde_json::json!({ "command": ping }))
+            .expect("the command runs and reports its own failure");
+        assert_eq!(result["sandbox"], serde_json::json!("heel"));
+        assert_eq!(
+            result["network"],
+            serde_json::json!("unrestricted"),
+            "the policy DID allow the network: {result}"
+        );
+        assert!(
+            !result["success"].as_bool().unwrap_or(true),
+            "ICMP was allowed: heel grew a pass-through path, update the docs: {result}"
+        );
+        let text = format!(
+            "{}{}",
+            result["stdout"].as_str().unwrap_or_default(),
+            result["stderr"].as_str().unwrap_or_default()
+        )
+        .to_ascii_lowercase();
+        assert!(
+            text.contains("permit") || text.contains("denied"),
+            "the kernel did not print its EPERM/EACCES wording: {result}"
+        );
+        assert_eq!(
+            result["network_diagnostic"],
+            serde_json::json!(UNPROXIED_DIRECT_SOCKET),
+            "the failure is not explained in the result: {result}"
+        );
+
+        // A command that simply succeeds carries no diagnostic at all, so the
+        // field's presence really does mean "this failure needs explaining".
+        let quiet = tool
+            .run(&serde_json::json!({ "command": "printf ok" }))
+            .expect("the command runs");
+        assert_eq!(
+            quiet.get("network_diagnostic"),
+            None,
+            "a success must not carry a diagnostic: {quiet}"
+        );
     }
 }

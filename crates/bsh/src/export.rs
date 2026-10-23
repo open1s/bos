@@ -237,6 +237,7 @@ mod tests {
                 files_read: 1,
                 files_written: 0,
                 commands: 1,
+                browser: 0,
                 refusals: 1,
                 succeeded: 2,
                 failed: 0,
@@ -259,6 +260,12 @@ mod tests {
                         preview: "body".to_string(),
                         message: 0,
                         tool_index: 0,
+                        // A file read has no confinement of its own: the audit
+                        // records none rather than inventing a tier.
+                        sandbox: None,
+                        sandbox_reason: None,
+                        network: None,
+                        diagnostic: None,
                     },
                     crate::audit::AuditCall {
                         tool: "bash".to_string(),
@@ -269,6 +276,12 @@ mod tests {
                         preview: "a.md".to_string(),
                         message: 0,
                         tool_index: 1,
+                        // The shell's own recorded confinement, the new fact the
+                        // export carries.
+                        sandbox: Some("heel".to_string()),
+                        sandbox_reason: None,
+                        network: Some("deny-all".to_string()),
+                        diagnostic: None,
                     },
                 ],
                 refusals: vec![crate::audit::AuditRefusal {
@@ -300,6 +313,15 @@ mod tests {
             .map(|turn| turn["calls"].as_array().map_or(0, Vec::len))
             .sum();
         assert_eq!(calls, 2, "one JSON object per call");
+        // The per-call confinement the shell's own result reported travels with
+        // the export, and a call that carried none stays null rather than
+        // inheriting the shell's tier.
+        let shell = &json["turns"][0]["calls"][1];
+        assert_eq!(shell["sandbox"], serde_json::json!("heel"));
+        assert_eq!(shell["network"], serde_json::json!("deny-all"));
+        let read = &json["turns"][0]["calls"][0];
+        assert!(read["sandbox"].is_null(), "a file read has no sandbox tier");
+        assert!(read["network"].is_null());
         // Choosing a .json path flips the pair rather than overwriting it.
         let chosen_json = root.join("second.json");
         let (md, json) = write_audit(&view, crate::i18n::Lang::En, &chosen_json).expect("the pair");

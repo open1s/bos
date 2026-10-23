@@ -11,6 +11,7 @@ rust_i18n::i18n!("locales", fallback = "en");
 
 pub(crate) mod assets;
 pub(crate) mod audit;
+pub(crate) mod browser;
 pub(crate) mod caps;
 mod editors;
 pub(crate) mod export;
@@ -23,6 +24,7 @@ pub(crate) mod mcp;
 pub(crate) mod model;
 pub(crate) mod notes;
 pub(crate) mod plugins;
+pub(crate) mod preset_catalogue;
 pub(crate) mod reference;
 pub(crate) mod runner;
 pub(crate) mod settings;

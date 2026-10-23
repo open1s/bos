@@ -58,22 +58,14 @@ struct ModelChipData {
 pub(crate) const EFFORT_LEVELS: [Option<&str>; 5] =
     [None, Some("off"), Some("low"), Some("medium"), Some("high")];
 
-/// Ask for files and mention them in the composer.
 /// The permission modes the chip's menu offers, in the reference's own order.
 ///
 /// The reference's `PRESET_LABEL_KEYS` map is read-only, then
-/// workspace-write, then full access, so the menu draws that order and the
-/// General pane's row reads the same list. The chip and the pane both write
+/// workspace-write, then full access, so the menu draws that order and every
+/// other surface reads the same three modes. The chip and the pane both write
 /// `Settings.permission`, which is the one field `caps::build_agent` obeys.
 pub(crate) fn permission_modes() -> [(&'static str, &'static str); 3] {
-    [
-        (crate::caps::READ_ONLY, "permission.presetReadOnly"),
-        (
-            crate::caps::WORKSPACE_WRITE,
-            "permission.presetWorkspaceWrite",
-        ),
-        (crate::caps::FULL_ACCESS, "permission.presetFullAccess"),
-    ]
+    super::permission::MODES.map(|mode| (mode.value(), mode.label_key()))
 }
 
 /// The measured rule for the primary control: it stops only while a turn runs
@@ -154,71 +146,29 @@ fn chip_label(label: impl Into<SharedString>, weight: FontWeight) -> Div {
         .whitespace_nowrap()
 }
 
-/// The chip's text: the EFFECTIVE permission, annotated with the ceiling when
-/// the preset lowered the request.
+/// The chip's text: the mode in force, in plain words.
 ///
-/// The effective value leads because that is the mode the tools obey; the
-/// annotation names the request and the ceiling, which is the fact the reader
-/// needs to understand why their choice did not take the session further.
+/// The effective value is the one the tools obey. A preset ceiling is a
+/// consequence the notice line reports when it acts, not a permanent second
+/// label the reader has to decode; the collapsed preset card carries it too.
 pub(crate) fn permission_chip_text(
     lang: crate::i18n::Lang,
     permission: &crate::settings::resolve::PermissionResolution,
 ) -> String {
-    let effective = lang.tr(permission_label_key(&permission.effective));
-    match &permission.reduced_by {
-        Some(ceiling) => format!(
-            "{effective} · {}",
-            crate::i18n::tr_args(
-                lang,
-                "permission.limitedBy",
-                &[
-                    (
-                        "requested",
-                        lang.tr(permission_label_key(&permission.requested)),
-                    ),
-                    ("ceiling", lang.tr(permission_label_key(ceiling))),
-                ],
-            )
-        ),
-        None => effective,
-    }
+    super::permission::chip_text(lang, permission)
 }
 
-/// Whether one menu row carries the checkmark: the session's OWN request, not
-/// the effective value, so a capped chat still shows what the reader chose.
+/// Whether one menu row carries the checkmark: the mode the tools obey.
+///
+/// It used to follow the reader's REQUEST, which put the check on Full access
+/// while the chip and the build were confined. Two controls answering "what may
+/// this session do" must not disagree.
+#[cfg(test)]
 pub(crate) fn permission_choice_checked(
     permission: &crate::settings::resolve::PermissionResolution,
     value: &str,
 ) -> bool {
-    value == permission.requested
-}
-
-/// One menu row's text. A row above the ceiling stays selectable but says the
-/// preset will cap it, so the menu explains the chip's annotation in place.
-pub(crate) fn permission_choice_text(
-    lang: crate::i18n::Lang,
-    permission: &crate::settings::resolve::PermissionResolution,
-    value: &str,
-) -> String {
-    let label = lang.tr(permission_label_key(value));
-    if crate::settings::resolve::permission_rank(value)
-        > crate::settings::resolve::permission_rank(&permission.effective)
-    {
-        let ceiling = permission
-            .reduced_by
-            .as_deref()
-            .unwrap_or(&permission.effective);
-        format!(
-            "{label} · {}",
-            crate::i18n::tr_args(
-                lang,
-                "permission.menuCapped",
-                &[("ceiling", lang.tr(permission_label_key(ceiling)))],
-            )
-        )
-    } else {
-        label
-    }
+    super::permission::Mode::from_permission(&permission.effective).value() == value
 }
 
 impl Shell {
@@ -241,8 +191,9 @@ impl Shell {
                 // chip (it reads the same resolution) and say it in the notice
                 // line, instead of silently landing on the lower mode.
                 let resolution = self.state.effective().permission;
+                let mut message = None;
                 if let Some(ceiling) = resolution.reduced_by.as_deref() {
-                    self.state.notice(crate::i18n::tr_args(
+                    message = Some(crate::i18n::tr_args(
                         lang,
                         "permission.ceilingNotice",
                         &[
@@ -254,6 +205,22 @@ impl Shell {
                             ),
                         ],
                     ));
+                }
+                // A turn that is ALREADY streaming was built with the old
+                // permission (the sandbox spec and the tool set are baked at
+                // spawn). Say so where the chip was pressed, instead of
+                // letting the new label imply the running turn changed.
+                if let Some(id) = self.state.active_id.clone() {
+                    if self.state.is_streaming(&id) {
+                        let next = crate::i18n::tr(lang, "permission.nextTurn").to_string();
+                        message = Some(match message {
+                            Some(existing) => format!("{existing} {next}"),
+                            None => next,
+                        });
+                    }
+                }
+                if let Some(message) = message {
+                    self.state.notice(message);
                 }
             }
             Err(error) => {
@@ -299,7 +266,9 @@ impl Shell {
                 self.set_permission(permission, cx);
                 return;
             }
-            self.permission_acknowledged = false;
+            // ONE confirmation, one sentence, two buttons: the gate names the
+            // consequence and Cancel leaves the current mode untouched. There is
+            // no second dialog and no separate acknowledgement step.
             self.permission_confirm = Some(permission.to_string());
             cx.notify();
             return;
@@ -388,11 +357,7 @@ pub(crate) fn model_choices(models: &[String], current: &str) -> Vec<(String, bo
 /// `PermissionResolution::resolve` normalises it to and the chip must not
 /// claim more access than the tools have.
 pub(crate) fn permission_label_key(permission: &str) -> &'static str {
-    match permission {
-        crate::caps::WORKSPACE_WRITE => "permission.presetWorkspaceWrite",
-        crate::caps::FULL_ACCESS => "permission.presetFullAccess",
-        _ => "permission.presetReadOnly",
-    }
+    super::permission::Mode::from_permission(permission).label_key()
 }
 
 impl Shell {
@@ -410,6 +375,11 @@ impl Shell {
         // The chip names the mode the tools OBEY: the session's request capped
         // by the preset ceiling, resolved once above and annotated when the
         // ceiling lowered it.
+        // The chip's rows are built once, from this resolution and the live
+        // egress facts: the label, the rows and the policy cannot describe
+        // different turns. The workspace file's state is the one AppState cached
+        // (never read from disk per frame).
+        let permission_rows = super::permission::permission_rows(lang, &effective, &self.state);
         let permission = effective.permission.clone();
         let label = effective.model_name;
         // The menu rows are nicknames, so the checked row compares against the
@@ -521,7 +491,13 @@ impl Shell {
                                     ))
                                     // The reference's plan slot sits beside the
                                     // mode chips, and only while the mode is on.
-                                    .child(self.permission_chip(permission, streaming, lang, cx))
+                                    .child(self.permission_chip(
+                                        permission,
+                                        permission_rows,
+                                        streaming,
+                                        lang,
+                                        cx,
+                                    ))
                                     .when_some(self.plan_chip(lang, cx), |row, chip| {
                                         row.child(chip)
                                     }),
@@ -795,12 +771,32 @@ impl Shell {
             .as_deref()
             .map(|id| self.state.effective_in(id).preset_id)
             .unwrap_or_else(|| self.state.effective().preset_id);
+        // A session that recorded a preset the sandbox guard now refuses must
+        // say so at the chip, not only when the next send is rejected.
+        let refused_effective =
+            !effective.trim().is_empty() && self.state.preset_sandbox_widens(&effective);
         let label = if effective.trim().is_empty() {
             lang.tr("input.defaultPreset").to_string()
+        } else if refused_effective {
+            format!(
+                "{effective} · {}",
+                lang.tr("settings.presetSandboxWidensAction")
+            )
         } else {
             effective
         };
-        let listed = self.state.settings.global.preset_ids();
+        let listed: Vec<(String, bool)> = self
+            .state
+            .settings
+            .global
+            .preset_ids()
+            .into_iter()
+            .map(|name| {
+                let widens = self.state.preset_sandbox_widens(&name);
+                (name, widens)
+            })
+            .collect();
+        let refused_label = lang.tr("settings.presetSandboxWidensAction").to_string();
         let session = self.state.active_id.clone().unwrap_or_default();
         let shell = cx.entity();
         let chip = trigger_chrome(
@@ -837,20 +833,32 @@ impl Shell {
                                 });
                             }),
                     );
-                    for name in listed.iter() {
+                    for (name, widens) in listed.iter() {
                         let pick = shell.clone();
                         let sid = session.clone();
                         let picked = name.clone();
                         let chosen = explicit.as_deref() == Some(name.as_str());
-                        menu =
-                            menu.item(PopupMenuItem::new(name.clone()).checked(chosen).on_click(
-                                move |_, _window, cx| {
-                                    pick.update(cx, |this, cx| {
-                                        this.state.select_session_preset(&sid, &picked);
-                                        cx.notify();
-                                    });
-                                },
-                            ));
+                        if *widens {
+                            // Disabled AND labelled: a click cannot record a
+                            // preset the send gate would refuse, and the reason
+                            // is visible where the choice is made.
+                            menu = menu.item(
+                                PopupMenuItem::new(format!("{name} · {refused_label}"))
+                                    .checked(chosen)
+                                    .disabled(true),
+                            );
+                        } else {
+                            menu = menu.item(
+                                PopupMenuItem::new(name.clone()).checked(chosen).on_click(
+                                    move |_, _window, cx| {
+                                        pick.update(cx, |this, cx| {
+                                            this.state.select_session_preset(&sid, &picked);
+                                            cx.notify();
+                                        });
+                                    },
+                                ),
+                            );
+                        }
                     }
                     menu
                 }),
@@ -860,6 +868,7 @@ impl Shell {
     fn permission_chip(
         &self,
         permission: crate::settings::resolve::PermissionResolution,
+        choices: Vec<super::permission::ModeChoice>,
         streaming: bool,
         lang: crate::i18n::Lang,
         cx: &mut Context<Self>,
@@ -869,19 +878,10 @@ impl Shell {
         // builder is `Fn`, so every capture is cloned into it anyway.
         let text = permission_chip_text(lang, &permission);
         let effective = permission.effective.clone();
-        // The checkmark is the session's OWN choice, not the effective value: a
-        // capped chat still records the mode the reader picked (see
-        // `permission_choice_checked`).
-        let choices: Vec<(&'static str, String, bool)> = permission_modes()
-            .iter()
-            .map(|(value, _key)| {
-                (
-                    *value,
-                    permission_choice_text(lang, &permission, value),
-                    permission_choice_checked(&permission, value),
-                )
-            })
-            .collect();
+        // Three rows, each one line: the label and its consequence - the network
+        // clause included, derived by `permission::rows_for`. The check follows
+        // the mode in force, and a row a preset ceiling cannot grant is disabled
+        // and says which mode the preset keeps.
         let chip = trigger_chrome(
             Button::new("composer-permission")
                 .ghost()
@@ -903,14 +903,23 @@ impl Shell {
             .child(chip.disabled(streaming).dropdown_menu_with_anchor(
                 Anchor::TopLeft,
                 move |menu, _, _| {
-                    let mut menu = menu;
-                    for (value, label, checked) in choices.clone() {
+                    // The row now states its network consequence, so the kit's
+                    // 500px ceiling would wrap - and the fixed 26px item height
+                    // would then clip the very clause that was added. The 330
+                    // minimum stays; the ceiling fits the longest resolved row
+                    // (the preset-confined Full access line) on one line.
+                    let mut menu = menu.min_w(px(330.0)).max_w(px(820.0));
+                    for choice in choices.clone() {
+                        let item = PopupMenuItem::new(choice.text).checked(choice.checked);
+                        if !choice.enabled {
+                            menu = menu.item(item.disabled(true));
+                            continue;
+                        }
                         let pick = shell.clone();
-                        menu = menu.item(PopupMenuItem::new(label).checked(checked).on_click(
-                            move |_, _window, cx| {
-                                pick.update(cx, |this, cx| this.request_permission(value, cx));
-                            },
-                        ));
+                        let value = choice.mode.value();
+                        menu = menu.item(item.on_click(move |_, _window, cx| {
+                            pick.update(cx, |this, cx| this.request_permission(value, cx));
+                        }));
                     }
                     menu
                 },

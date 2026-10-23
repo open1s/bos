@@ -297,6 +297,49 @@ pub(crate) struct PolicyAuditView {
     pub(crate) preset: String,
     /// Why the set is in its failure mode, when it is.
     pub(crate) error: Option<String>,
+    /// Advisory refusals: recorded, reported, and NOT blocking.
+    ///
+    /// They live in the same denial ring; this snapshot is what the policy pane
+    /// lists as the warnings `policy_mode = advisory` produced.
+    pub(crate) advisories: Vec<agent::policy::PolicyAuditEntry>,
+    /// Every advisory refusal ever counted.
+    pub(crate) advisories_total: u64,
+}
+
+/// How a widening preset change would be applied once confirmed.
+#[derive(Debug, Clone)]
+pub(crate) enum PresetApply {
+    /// Make it the default for sessions that name none.
+    Default,
+    /// Record it on one session.
+    Session(String),
+    /// Write an edited declaration back into the draft.
+    Save {
+        /// The preset id being edited.
+        id: String,
+        /// The parsed declaration (boxed: it is much larger than the other
+        /// variants and the pending value only lives until the dialog closes).
+        preset: Box<crate::settings::global::Preset>,
+    },
+}
+
+/// A preset change that is waiting for the reader's confirmation.
+///
+/// The selection path is the ONE choke point every surface (the pane, the
+/// composer chip, the editor) goes through. A change whose level rises, or
+/// whose own policy becomes advisory, parks here with its consequences named
+/// instead of taking effect silently; cancelling drops it and leaves the
+/// previous value untouched.
+#[derive(Debug, Clone)]
+pub(crate) struct PresetWidening {
+    /// The preset being applied.
+    pub(crate) target: String,
+    /// The consequences the dialog names.
+    pub(crate) facts: Vec<crate::preset_catalogue::RiskFact>,
+    /// The display name of the preset in force before the change.
+    pub(crate) previous: String,
+    /// What confirming would do.
+    pub(crate) apply: PresetApply,
 }
 
 /// The subagent currently rendered by the chat/trajectory view model.
@@ -455,6 +498,14 @@ pub(crate) struct AppState {
     /// A server is a process or an endpoint, so connecting is expensive and
     /// must survive across turns; the pool reconciles when the settings change.
     pub(crate) mcp: crate::mcp::McpPool,
+    /// The built-in browser: one document, one history, read by the pane and
+    /// driven by the model's tools.
+    ///
+    /// Shell-level rather than session-level, because the pane is one surface
+    /// the reader looks at: switching sessions must not swap the page out from
+    /// under it. Each navigation still records its decision under the session
+    /// that asked, so the audit stays per-conversation.
+    pub(crate) browser: Arc<crate::browser::BrowserHandle>,
     /// The bounded ring of trust decisions, oldest first.
     ///
     /// This crate has no extension-wide audit surface, so the trust gate keeps
@@ -476,8 +527,27 @@ pub(crate) struct AppState {
     pub(crate) policy: Option<Arc<agent::policy::PolicySet>>,
     /// The audit snapshot the policy pane last read.
     pub(crate) policy_audit: Option<PolicyAuditView>,
+    /// Bumped whenever the LIVE policy is replaced, so a cached capabilities
+    /// list in the view can tell it is stale without comparing policies.
+    pub(crate) policy_generation: u64,
+    /// The policy generation each running turn's agent was built at.
+    ///
+    /// A steer joins the RUNNING agent, whose sandbox spec and tools were
+    /// baked at spawn. If the preset or permission changed after that, the
+    /// steer would ride the old build; this records the build so the queue
+    /// can hold the message for the next turn instead.
+    turn_policy_generation: std::collections::HashMap<String, u64>,
+    /// A widening preset change awaiting confirmation, if any.
+    pub(crate) pending_preset: Option<PresetWidening>,
     /// Egress allowlist entries read for the policy pane.
     pub(crate) egress_allowlist: Vec<String>,
+    /// Whether the active workspace's `.bsh/egress-allowlist` file EXISTS.
+    ///
+    /// The rule list cannot carry the tri-state: an ABSENT file leaves egress
+    /// UNRESTRICTED while a PRESENT file with no rule is a deliberate deny-all.
+    /// Cached beside the entries on the same read, so a permission row states
+    /// the network reach without touching the disk per frame.
+    pub(crate) egress_allowlist_present: bool,
     /// The locale key of the standing provider-form refusal, if any.
     pub(crate) provider_refusal: Option<&'static str>,
     /// The name of the provider the form is editing, if any.
@@ -707,6 +777,7 @@ impl AppState {
             compacting: std::collections::HashSet::new(),
             runner: Runner::new(),
             mcp: crate::mcp::McpPool::default(),
+            browser: Arc::new(crate::browser::BrowserHandle::new()),
             trust_audit: std::collections::VecDeque::new(),
             notice: None,
             stat_open: false,
@@ -714,7 +785,11 @@ impl AppState {
             tools_schema_chars: 0,
             policy: None,
             policy_audit: None,
+            policy_generation: 0,
+            turn_policy_generation: std::collections::HashMap::new(),
+            pending_preset: None,
             egress_allowlist: Vec::new(),
+            egress_allowlist_present: false,
             provider_refusal: None,
             editing_provider: None,
             removing_provider: None,
@@ -761,6 +836,10 @@ impl AppState {
         // present from the first frame rather than appearing after a refresh.
         crate::caps::refresh_plugin_providers(&mut state.settings);
         state.ensure_active();
+        // The allowlist is read, never seeded: with no file the workspace's
+        // egress is UNRESTRICTED, and writing the starter here would flip a
+        // fresh workspace into a deny-all before its owner asked for one. The
+        // pane offers the starter as an explicit action instead.
         state.refresh_egress_allowlist();
         state
     }
@@ -834,15 +913,15 @@ impl AppState {
     pub(crate) fn sandbox_spec(&self, tool: &str) -> Option<Arc<agent::sandbox::SandboxSpec>> {
         let policy = self.policy.clone()?;
         let eff = self.effective();
-        Some(Arc::new(agent::sandbox::SandboxSpec::for_policy(
+        // The SAME mapping the turn's build uses, so a preset's heel/off choice
+        // reaches the pane too: heel forces confinement under full access, and
+        // off is the bare spec (only at full access).
+        Some(crate::caps::sandbox_spec_for(
             &policy,
-            &eff.permission.effective,
-            agent::sandbox::Principal::new(
-                tool,
-                self.active_id.clone().unwrap_or_default(),
-                eff.preset_id,
-            ),
-        )))
+            &eff,
+            tool,
+            &self.active_id.clone().unwrap_or_default(),
+        ))
     }
 
     /// The values a build for the session on screen uses.
@@ -1038,6 +1117,10 @@ impl AppState {
     /// because the chat the editor sits over already exists.
     pub(crate) fn set_workspace(&mut self, workspace: &str) {
         self.settings.global.general.active_workspace = workspace.to_string();
+        // Re-read the new workspace's allowlist. Nothing is seeded: a missing
+        // file means the workspace is unrestricted, and the pane's explicit
+        // starter action is the only writer.
+        self.refresh_egress_allowlist();
         if let Some(id) = self.active_id.clone() {
             if let Some(session) = self.store.session_mut(&id) {
                 session.workspace = workspace.to_string();
@@ -1069,6 +1152,10 @@ impl AppState {
     pub(crate) fn adopt_workspace(&mut self, name: &str, root: &str) -> String {
         let id = self.settings.note_workspace(name, root);
         self.sync_store_roots();
+        // Registration writes NOTHING into the new workspace. In particular the
+        // egress allowlist is not seeded: a fresh workspace has no file, which
+        // is the UNRESTRICTED state; auto-writing the starter would turn that
+        // into a deny-all the reader never chose.
         id
     }
 
@@ -1169,6 +1256,7 @@ impl AppState {
     /// sits under. This one leaves every existing chat where it is.
     pub(crate) fn new_session_in(&mut self, workspace: &str) -> Option<String> {
         self.settings.global.general.active_workspace = workspace.to_string();
+        self.refresh_egress_allowlist();
         self.new_session()
     }
 
@@ -3141,7 +3229,45 @@ impl AppState {
     /// Keep the latest turn's policy and refresh the pane's audit snapshot.
     pub(crate) fn set_policy(&mut self, policy: Arc<agent::policy::PolicySet>) {
         self.policy = Some(policy);
+        self.policy_generation = self.policy_generation.wrapping_add(1);
         self.refresh_policy_audit();
+    }
+
+    /// Record the policy generation a turn's agent was just built at.
+    pub(crate) fn record_turn_generation(&mut self, id: &str) {
+        self.turn_policy_generation
+            .insert(id.to_string(), self.policy_generation);
+    }
+
+    /// Whether a steer would join an agent built for a policy that has since
+    /// been replaced.
+    ///
+    /// Only a RUNNING turn can be steered, and only a generation recorded at
+    /// its spawn is comparable; a turn with no record predates this guard and
+    /// is not blocked.
+    pub(crate) fn steer_blocked(&self, id: &str) -> bool {
+        self.is_streaming(id)
+            && self
+                .turn_policy_generation
+                .get(id)
+                .copied()
+                .is_some_and(|generation| generation != self.policy_generation)
+    }
+
+    /// Recompile the live policy from the committed settings and the session
+    /// on screen.
+    ///
+    /// A preset, a permission tier or a trusted policy is part of the policy
+    /// DATA, not only of the next turn's registration: the terminal pane, the
+    /// audit/policy pane and the sandbox spec read this document. Without a
+    /// rebake they kept the previous choice until a turn happened to rebuild,
+    /// which is why a switch looked inert until the next send. The next turn
+    /// still builds its own agent; this makes every surface that reads the
+    /// live policy agree immediately.
+    pub(crate) fn rebake_policy(&mut self) {
+        let eff = self.effective();
+        let policy = crate::caps::policy_for_effective(&self.settings, &eff);
+        self.set_policy(policy);
     }
 
     /// The policy verdict behind one tool call of the active session.
@@ -3244,6 +3370,8 @@ impl AppState {
             permission: policy.data().permission.clone(),
             preset: policy.data().preset.clone(),
             error: policy.error().map(ToString::to_string),
+            advisories: policy.advisories(),
+            advisories_total: policy.advisories_total(),
         });
     }
 
@@ -3258,14 +3386,26 @@ impl AppState {
     /// The egress allowlist file of the active workspace.
     fn egress_allowlist_path(&self) -> Option<PathBuf> {
         let root = self.settings.active_workspace_root();
-        (!root.trim().is_empty()).then(|| PathBuf::from(root).join(".bsh").join("egress-allowlist"))
+        (!root.trim().is_empty()).then(|| crate::caps::egress_allowlist_path(&PathBuf::from(root)))
     }
 
-    /// Reload the allowlist entries from disk.
+    /// Reload the allowlist entries and the file's presence from disk.
+    ///
+    /// PRESENCE is recorded exactly as `caps::read_egress_rules` judges it: a
+    /// readable file is PRESENT (even with no rule), a permission error or a
+    /// directory at the path is PRESENT-and-empty (the deny-all floor), and only
+    /// a missing file is the ABSENT, UNRESTRICTED state. The two facts are read
+    /// together so the label and the policy cannot disagree about which state
+    /// the workspace is in.
     pub(crate) fn refresh_egress_allowlist(&mut self) {
-        self.egress_allowlist = self
-            .egress_allowlist_path()
-            .and_then(|path| std::fs::read_to_string(path).ok())
+        let read = self.egress_allowlist_path().map(std::fs::read_to_string);
+        self.egress_allowlist_present = match &read {
+            Some(Ok(_)) => true,
+            Some(Err(error)) => error.kind() != std::io::ErrorKind::NotFound,
+            None => false,
+        };
+        self.egress_allowlist = read
+            .and_then(Result::ok)
             .map(|text| {
                 text.lines()
                     .map(|line| line.split('#').next().unwrap_or("").trim())
@@ -3298,6 +3438,53 @@ impl AppState {
         Ok(())
     }
 
+    /// Whether the active workspace's allowlist file exists on disk.
+    ///
+    /// The pane's empty state distinguishes "no file yet" from "a file that
+    /// declares nothing", because they are DIFFERENT decisions: no file means
+    /// egress is unrestricted (and the pane offers the starter), while an empty
+    /// file means deny-all (and the pane says so).
+    pub(crate) fn egress_allowlist_file_exists(&self) -> bool {
+        self.egress_allowlist_path()
+            .map(|path| path.exists())
+            .unwrap_or(false)
+    }
+
+    /// Write the starter allowlist to the active workspace.
+    ///
+    /// This is the pane's explicit action and the ONLY writer of a missing
+    /// file: the reader asked for the template, so the file is written with
+    /// exactly [`crate::caps::EGRESS_ALLOWLIST_TEMPLATE`] and nothing else. It
+    /// declares no rule, so creating it turns the workspace's unrestricted
+    /// default into a deny-all - which the pane's copy states before the click.
+    pub(crate) fn create_starter_egress_allowlist(&mut self) -> Result<(), String> {
+        let root = self.settings.active_workspace_root();
+        if root.trim().is_empty() {
+            return Err("no active workspace".to_string());
+        }
+        crate::caps::write_egress_allowlist_template(&PathBuf::from(&root))
+            .map_err(|error| error.to_string())?;
+        self.refresh_egress_allowlist();
+        Ok(())
+    }
+
+    /// The path of the active workspace's allowlist file, when there is one.
+    pub(crate) fn egress_allowlist_file(&self) -> Option<PathBuf> {
+        self.egress_allowlist_path()
+    }
+
+    /// Persist the entries, keeping the file's own comments.
+    ///
+    /// `self.egress_allowlist` already carries EVERY rule the file declared -
+    /// [`AppState::refresh_egress_allowlist`] reads comments out and keeps the
+    /// rest, hostname and port shapes included - so writing that list back is
+    /// lossless and a hand-written line is never dropped by a pane edit.
+    ///
+    /// The comments are the one thing the entry list does not carry, so they are
+    /// read back and re-emitted verbatim: a seeded starter file keeps its prose
+    /// the first time the reader adds an address through the pane. A file with
+    /// no comments at all gets the plain header instead of the starter template,
+    /// because this is the pane's own write and not the seeder.
     fn save_egress_allowlist(&self) -> Result<(), String> {
         let path = self
             .egress_allowlist_path()
@@ -3305,11 +3492,26 @@ impl AppState {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
-        let mut text = String::from(
-            "# Egress allowlist for the tool-boundary policy.
-# One exact IP or CIDR range per line; # starts a comment.
-",
-        );
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let comments: Vec<&str> = existing
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim();
+                trimmed.is_empty() || trimmed.starts_with('#')
+            })
+            .collect();
+        let mut text = String::new();
+        if comments.iter().any(|line| !line.trim().is_empty()) {
+            for line in &comments {
+                text.push_str(line);
+                text.push('\n');
+            }
+        } else {
+            text.push_str(
+                "# Egress allowlist for the tool-boundary policy.\n\
+                 # One exact IP or CIDR range per line; # starts a comment.\n",
+            );
+        }
         for entry in &self.egress_allowlist {
             text.push_str(entry);
             text.push('\n');
@@ -3349,6 +3551,10 @@ impl AppState {
                 // The MCP pane is config, and config is only real once the
                 // pool reflects it: reconcile now rather than at the next turn.
                 self.refresh_mcp();
+                // A saved preset, permission or policy is a live-policy fact:
+                // rebake now so the terminal, the audit and the sandbox spec
+                // read the committed tree without waiting for a turn.
+                self.rebake_policy();
                 Ok(())
             }
             Err(error) => {
@@ -3383,7 +3589,10 @@ impl AppState {
         }
         self.settings.ensure_workspace();
         match self.settings.save() {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.rebake_policy();
+                Ok(())
+            }
             Err(error) => {
                 self.settings.workspace.agent.permission = previous;
                 if let (Some(draft), Some(previous)) = (self.draft.as_mut(), drafted) {
@@ -3654,7 +3863,175 @@ impl AppState {
     }
 
     pub(crate) fn select_preset(&mut self, name: &str) {
+        if self.preset_sandbox_widens(name) {
+            self.notice(crate::i18n::tr(self.lang, "settings.presetSandboxWidens"));
+            return;
+        }
+        let current = self.effective_default_preset();
+        if let Some(pending) = self.widening_change(
+            name,
+            current.as_ref(),
+            PresetApply::Default,
+            self.draft().global.default_preset.clone(),
+        ) {
+            self.pending_preset = Some(pending);
+            return;
+        }
         self.draft_mut().global.default_preset = name.to_string();
+    }
+
+    /// The preset a session that names none inherits.
+    fn effective_default_preset(&self) -> Option<crate::settings::global::Preset> {
+        let id = self.draft().global.default_preset.clone();
+        self.draft().global.preset(&id)
+    }
+
+    /// The preset currently in force for one session: its own choice, else the
+    /// global default.
+    fn effective_session_preset(&self, id: &str) -> Option<crate::settings::global::Preset> {
+        let named = self
+            .store
+            .session(id)
+            .and_then(|session| session.agent_preset.clone())
+            .unwrap_or_else(|| self.draft().global.default_preset.clone());
+        self.draft().global.preset(&named)
+    }
+
+    /// Build the pending change when `target` would widen over `current`.
+    ///
+    /// A preset with no risk facts, the same preset, or one that only narrows
+    /// applies immediately: the guard exists for widening, not for every click.
+    fn widening_change(
+        &self,
+        target: &str,
+        current: Option<&crate::settings::global::Preset>,
+        apply: PresetApply,
+        previous: String,
+    ) -> Option<PresetWidening> {
+        let target_preset = self.draft().global.preset(target)?;
+        self.widening_change_for(target, &target_preset, current, apply, previous)
+    }
+
+    /// The same guard for a declaration that is not in the tree yet (the editor's
+    /// parsed buffer).
+    fn widening_change_for(
+        &self,
+        target: &str,
+        target_preset: &crate::settings::global::Preset,
+        current: Option<&crate::settings::global::Preset>,
+        apply: PresetApply,
+        previous: String,
+    ) -> Option<PresetWidening> {
+        let facts = crate::preset_catalogue::widening_facts(current, target_preset);
+        if facts.is_empty() {
+            return None;
+        }
+        Some(PresetWidening {
+            target: target.to_string(),
+            facts,
+            previous: self.preset_label(&previous),
+            apply,
+        })
+    }
+
+    /// Put an edited declaration into the draft, or park it when it widens a
+    /// preset that is currently in effect.
+    ///
+    /// Returns true when the change is parked and needs the reader's
+    /// confirmation. A preset that is not in effect cannot widen anything a
+    /// turn runs, so editing it applies immediately.
+    pub(crate) fn commit_preset(
+        &mut self,
+        id: &str,
+        preset: crate::settings::global::Preset,
+    ) -> bool {
+        let in_effect = self.draft().global.default_preset == id
+            || self.active_session_preset().as_deref() == Some(id);
+        if in_effect {
+            let previous = self.draft().global.presets.get(id).cloned();
+            if let Some(pending) = self.widening_change_for(
+                id,
+                &preset,
+                previous.as_ref(),
+                PresetApply::Save {
+                    id: id.to_string(),
+                    preset: Box::new(preset.clone()),
+                },
+                id.to_string(),
+            ) {
+                self.pending_preset = Some(pending);
+                return true;
+            }
+        }
+        self.draft_mut()
+            .global
+            .presets
+            .insert(id.to_string(), preset);
+        false
+    }
+
+    /// Confirm the parked widening change and apply it.
+    ///
+    /// Returns whether an editor should close (the change was a saved
+    /// declaration). Nothing applies without this call, so a cancel cannot
+    /// leave a half-applied preset.
+    pub(crate) fn apply_pending_preset(&mut self) -> bool {
+        let Some(pending) = self.pending_preset.take() else {
+            return false;
+        };
+        let mut closes_editor = false;
+        match pending.apply {
+            PresetApply::Default => {
+                self.draft_mut().global.default_preset = pending.target.clone();
+            }
+            PresetApply::Session(id) => {
+                self.write_session_preset(&id, &pending.target);
+            }
+            PresetApply::Save { id, preset } => {
+                self.draft_mut().global.presets.insert(id, *preset);
+                closes_editor = true;
+            }
+        }
+        self.notice(crate::i18n::tr_args(
+            self.lang,
+            "settings.presetWidened",
+            &[("name", self.preset_label(&pending.target))],
+        ));
+        closes_editor
+    }
+
+    /// Drop the parked change. The previous value is untouched.
+    pub(crate) fn cancel_pending_preset(&mut self) {
+        self.pending_preset = None;
+    }
+
+    /// Record one session's preset without asking the widening gate.
+    fn write_session_preset(&mut self, id: &str, preset: &str) {
+        if let Some(session) = self.store.session_mut(id) {
+            session.agent_preset = (!preset.is_empty()).then(|| preset.to_string());
+            session.updated_at = now();
+        }
+        self.save_session(id);
+        // A preset is a live-policy fact: the terminal spec, the policy pane
+        // and the audit read the compiled document, so recompile it for the
+        // session on screen NOW rather than at some later turn. A turn that is
+        // already streaming keeps its own build; its next tool call is the only
+        // part of it a rebuild could reach, and it is not rebuilt.
+        if self.active_id.as_deref() == Some(id) {
+            self.rebake_policy();
+            if self.is_streaming(id) {
+                self.notice(crate::i18n::tr(self.lang, "preset.nextTurn"));
+            }
+        }
+    }
+
+    /// Whether one preset would turn the sandbox off under a narrower ceiling.
+    ///
+    /// Read from the DRAFT, because the pane edits presets before saving: a
+    /// declaration just typed must refuse in the same frame, and a saved one
+    /// must refuse identically after a restart.
+    pub(crate) fn preset_sandbox_widens(&self, id: &str) -> bool {
+        self.draft().preset_sandbox_widens(id)
     }
 
     /// Create a custom preset from the safe read-only template and return its
@@ -3676,7 +4053,7 @@ impl AppState {
         };
         let preset = crate::settings::global::Preset {
             name: Some("Custom".to_string()),
-            level: Some("read-only".to_string()),
+            level: Some(1),
             permission: Some("read-only".to_string()),
             read: Some(vec![".".to_string()]),
             write: Some(Vec::new()),
@@ -3725,11 +4102,32 @@ impl AppState {
     /// next turn reads it through `Session::choice`.
     pub(crate) fn select_session_preset(&mut self, id: &str, preset: &str) {
         let preset = preset.trim();
-        if let Some(session) = self.store.session_mut(id) {
-            session.agent_preset = (!preset.is_empty()).then(|| preset.to_string());
-            session.updated_at = now();
+        // Clearing is always allowed. Naming a preset whose sandbox choice the
+        // guard refused is NOT: a click must not record a selection the send
+        // gate would reject, because the reader would see a chip for a turn
+        // that can never run.
+        if self.preset_sandbox_widens(preset) {
+            self.notice(crate::i18n::tr(self.lang, "settings.presetSandboxWidens"));
+            return;
         }
-        self.save_session(id);
+        if !preset.is_empty() {
+            let current = self.effective_session_preset(id);
+            let previous = self
+                .store
+                .session(id)
+                .and_then(|session| session.agent_preset.clone())
+                .unwrap_or_else(|| self.draft().global.default_preset.clone());
+            if let Some(pending) = self.widening_change(
+                preset,
+                current.as_ref(),
+                PresetApply::Session(id.to_string()),
+                previous,
+            ) {
+                self.pending_preset = Some(pending);
+                return;
+            }
+        }
+        self.write_session_preset(id, preset);
     }
 
     /// Switch one plugin on or off in the draft.
@@ -6101,7 +6499,12 @@ mod tests {
         state.settings.global.general.active_workspace = id;
         state.refresh_egress_allowlist();
         assert!(state.egress_allowlist.is_empty());
+        assert!(
+            !state.egress_allowlist_present,
+            "no file yet: the ABSENT, unrestricted state"
+        );
 
+        // A present file with RULES is the allowlist.
         state
             .add_egress_allowlist("127.0.0.1")
             .expect("an address is accepted");
@@ -6122,6 +6525,93 @@ mod tests {
         assert!(!text.contains("127.0.0.1"), "{text}");
         state.refresh_egress_allowlist();
         assert_eq!(state.egress_allowlist, vec!["10.0.0.0/8".to_string()]);
+        assert!(
+            state.egress_allowlist_present,
+            "the file exists, so the row states an allowlist rather than an open network"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+    /// Registering a workspace writes NOTHING, and in particular the egress
+    /// allowlist stays ABSENT - the UNRESTRICTED state a fresh workspace has.
+    /// Auto-seeding the starter here would flip that to a deny-all the reader
+    /// never chose. The pane's explicit action is the only writer.
+    #[test]
+    fn registering_a_workspace_leaves_the_allowlist_absent() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/bsh-state-policy-seed");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("scratch");
+        let mut state =
+            super::AppState::with_store(crate::store::Store::open_at(base.join("store")));
+        let id = state.adopt_workspace("scratch", &base.to_string_lossy());
+        state.settings.global.general.active_workspace = id;
+        state.refresh_egress_allowlist();
+        let file = base.join(".bsh").join("egress-allowlist");
+        assert!(
+            !file.exists(),
+            "registration must not write the allowlist (it would deny all egress)"
+        );
+        assert!(
+            !state.egress_allowlist_file_exists(),
+            "the pane reads the ABSENT state, which is unrestricted"
+        );
+        assert!(state.egress_allowlist.is_empty(), "no rule is invented");
+        assert!(
+            !state.egress_allowlist_present,
+            "no file: the network clause must read 'unrestricted'"
+        );
+
+        // The explicit starter action is what writes the file, and what it
+        // writes parses to no rule: a deliberate deny-all, now that the file
+        // exists.
+        state
+            .create_starter_egress_allowlist()
+            .expect("the starter is written");
+        assert!(state.egress_allowlist_file_exists(), "the pane sees a file");
+        assert!(
+            state.egress_allowlist_present,
+            "a present file with no rule is the deny-all state, not the absent one"
+        );
+        assert!(
+            state.egress_allowlist.is_empty(),
+            "the present file declares no rule, which is why it denies all"
+        );
+        let seeded = std::fs::read_to_string(&file).expect("the file");
+        assert_eq!(seeded, crate::caps::EGRESS_ALLOWLIST_TEMPLATE);
+        assert!(
+            agent::policy::EgressRuleSet::parse([seeded.as_str()]).is_empty(),
+            "the starter declares no rule, which is the deny-all floor"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The pane's explicit Create writes exactly the shared template over
+    /// whatever is there, and the file parses to no rules - creating it is the
+    /// deliberate deny-all, not an absent-file default.
+    #[test]
+    fn the_starter_action_writes_the_template_and_denies_all() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/bsh-state-policy-starter");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("scratch");
+        let mut state =
+            super::AppState::with_store(crate::store::Store::open_at(base.join("store")));
+        let id = state
+            .settings
+            .note_workspace("scratch", &base.to_string_lossy());
+        state.settings.global.general.active_workspace = id;
+        let file = base.join(".bsh").join("egress-allowlist");
+        assert!(!state.egress_allowlist_file_exists(), "no file yet");
+        state
+            .create_starter_egress_allowlist()
+            .expect("the starter is written");
+        assert!(state.egress_allowlist_file_exists(), "the file now exists");
+        let bytes = std::fs::read_to_string(&file).expect("the file");
+        assert_eq!(bytes, crate::caps::EGRESS_ALLOWLIST_TEMPLATE);
+        assert!(
+            agent::policy::EgressRuleSet::parse([bytes.as_str()]).is_empty(),
+            "creating the starter IS the deny-all floor (the file exists, empty)"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

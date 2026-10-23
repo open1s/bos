@@ -9,8 +9,43 @@ use regorus::rvm::vm::RegoVM;
 use regorus::{Engine, Rc, Value};
 
 use super::audit::{PolicyAudit, PolicyAuditEntry};
-use super::baseline::baseline_source;
+use super::baseline_source;
+use super::egress::EgressRuleSet;
 use super::target::{inside_root, normalize_path, Action, Decision, PolicyInput, Target};
+
+/// Where one policy module came from.
+///
+/// The origin decides the DEFAULT trust and the id namespace: a built-in module
+/// ships in the binary and is trusted by construction, while a workspace file
+/// or an extension contribution is the reader's own material and must pass the
+/// host's trust gate before it is compiled. The pane lists the origin beside
+/// every module id, because "which policy refused me" is only answerable when
+/// the reader can tell their own rule from the floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PolicyOrigin {
+    /// Shipped in the binary under a `builtin:` id, trusted by default.
+    Builtin,
+    /// Read from the workspace's own `.bsh/policy.rego`.
+    Workspace,
+    /// Supplied by a preset declaration or an installed extension.
+    Extension,
+}
+
+impl PolicyOrigin {
+    /// The stable lower-case name the pane and the audit show.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Builtin => "built-in",
+            Self::Workspace => "workspace",
+            Self::Extension => "extension",
+        }
+    }
+
+    /// Whether a module from this origin is trusted without a separate gate.
+    pub fn trusted_by_default(self) -> bool {
+        matches!(self, Self::Builtin | Self::Workspace)
+    }
+}
 
 /// One Rego module the host supplies to [`PolicySet::compile`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,15 +54,103 @@ pub struct PolicySource {
     pub id: String,
     /// The Rego source.
     pub rego: String,
+    /// Where the module came from.
+    pub origin: PolicyOrigin,
+    /// Whether the host's trust gate admitted this module.
+    ///
+    /// A built-in and a workspace module are trusted by location; an extension
+    /// module is trusted only after the reader's explicit approval, which the
+    /// host records on the preset declaration. The flag is metadata at this
+    /// layer - an untrusted extension module never reaches the set - and it is
+    /// what the policy pane lists so the reader can see the gate's answer.
+    pub trusted: bool,
+    /// Whether this module's refusal is ADVISORY.
+    ///
+    /// The host sets it on the modules a preset contributes when the preset's
+    /// `policy_mode = advisory`. Such a refusal is recorded in the audit and
+    /// returned as a warning, and the call proceeds - the preset author asked
+    /// to be told rather than obeyed. The baseline, the session tier and the
+    /// workspace policy are never advisory: the floor still refuses, which is
+    /// what keeps advisory from widening the session.
+    pub advisory: bool,
 }
 
 impl PolicySource {
-    /// Name one source.
+    /// Name an extension-supplied source. The default constructor keeps the
+    /// historical signature, and the origin makes the trust question explicit
+    /// to a caller that does not name one: an unnamed contribution is an
+    /// extension's, not the binary's.
     pub fn new(id: impl Into<String>, rego: impl Into<String>) -> Self {
         Self {
             id: id.into(),
             rego: rego.into(),
+            origin: PolicyOrigin::Extension,
+            trusted: false,
+            advisory: false,
         }
+    }
+
+    /// Name a module shipped in the binary. It is trusted by default and its id
+    /// must live under `builtin:`.
+    pub fn builtin(id: impl Into<String>, rego: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            rego: rego.into(),
+            origin: PolicyOrigin::Builtin,
+            trusted: true,
+            advisory: false,
+        }
+    }
+
+    /// Name the workspace's own policy file. It is the reader's material,
+    /// written inside a directory the tool boundary refuses to write, so it is
+    /// trusted by location.
+    pub fn workspace(id: impl Into<String>, rego: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            rego: rego.into(),
+            origin: PolicyOrigin::Workspace,
+            trusted: true,
+            advisory: false,
+        }
+    }
+
+    /// Name an extension-supplied module, with the host's trust answer.
+    pub fn extension(id: impl Into<String>, rego: impl Into<String>, trusted: bool) -> Self {
+        Self {
+            id: id.into(),
+            rego: rego.into(),
+            origin: PolicyOrigin::Extension,
+            trusted,
+            advisory: false,
+        }
+    }
+
+    /// Mark this module's refusals as advisory.
+    ///
+    /// Only the modules a preset itself contributes may be advisory; the floor
+    /// (baseline, session tier, workspace) is never marked, so advisory can
+    /// relax the preset's own narrowing but cannot widen the session.
+    pub fn advisory(mut self, advisory: bool) -> Self {
+        self.advisory = advisory;
+        self
+    }
+
+    /// Return this source with a different id.
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        self.id = id.into();
+        self
+    }
+
+    /// Stamp a binary-shipped module's stable `builtin:` id and origin.
+    ///
+    /// The wrapper constructors in [`super`] use it so the in-tree Rego text
+    /// keeps living beside its module while its identity is the reserved one.
+    pub fn as_builtin(mut self, id: impl Into<String>) -> Self {
+        self.id = id.into();
+        self.origin = PolicyOrigin::Builtin;
+        self.trusted = true;
+        self
     }
 }
 
@@ -55,6 +178,19 @@ pub struct PolicyData {
     /// Destination ports egress may use. Empty means any port; a non-empty list
     /// refuses a request whose port the caller did not state.
     pub egress_ports: Vec<u16>,
+    /// Whether the workspace declared NO egress allowlist file at all.
+    ///
+    /// The three states of `.bsh/egress-allowlist` are not the two an empty and
+    /// a non-empty rule list can express. An ABSENT file declares nothing and
+    /// leaves egress UNRESTRICTED, so a fresh workspace can reach the network
+    /// without its reader writing a file first. A file that is PRESENT and
+    /// parses to no rule is a deliberate deny-all. The lists are empty in both
+    /// cases, so the distinction is this flag, and the baseline's
+    /// `egress-unrestricted` arm is the only reader of it.
+    ///
+    /// Defaults to false, which keeps the documented deny-all floor for a
+    /// caller that builds the data directly.
+    pub egress_unrestricted: bool,
     /// Whether the preset restricts reads to `preset_read_roots`.
     pub preset_read_restricted: bool,
     /// Canonical absolute read roots the preset allows.
@@ -65,6 +201,19 @@ pub struct PolicyData {
     pub preset_write_roots: Vec<String>,
     /// Canonical absolute paths the preset always denies.
     pub preset_deny_roots: Vec<String>,
+    /// Absolute GLOB patterns the preset allows to read.
+    ///
+    /// A scope entry containing `*`, `?`, `[` or `{` is a glob rather than a
+    /// literal root; the two lists are parallel, not alternatives, so a preset
+    /// that mixes `docs` and `src/**/*.rs` keeps both meanings.
+    pub preset_read_globs: Vec<String>,
+    /// Absolute GLOB patterns the preset allows to write.
+    pub preset_write_globs: Vec<String>,
+    /// Absolute GLOB patterns the preset always denies.
+    ///
+    /// A deny glob is decided BEFORE the read and write scopes, so it refuses a
+    /// path the tier and the workspace root would otherwise allow.
+    pub preset_deny_globs: Vec<String>,
     /// The preset's permission ceiling, mirrored into Rego.
     pub preset_permission: String,
     /// The effective permission: the session's mode capped by the preset's
@@ -75,8 +224,15 @@ pub struct PolicyData {
     pub permission: String,
     /// Whether the preset restricts egress to the preset allowlist.
     pub preset_egress_restricted: bool,
-    /// Egress entries the preset allows, intersected with the workspace list.
+    /// Egress ADDRESS entries the preset allows, intersected with the
+    /// workspace list. An exact address or a CIDR range; the strong door.
     pub preset_egress_allowlist: Vec<String>,
+    /// Egress HOSTNAME entries the preset allows, lower-cased. A leading
+    /// `*.` matches any subdomain. The weaker door, and named as such.
+    pub preset_egress_hosts: Vec<String>,
+    /// Destination ports the preset allows. Empty means the preset does not
+    /// narrow the port dimension; a non-empty list refuses any other port.
+    pub preset_egress_ports: Vec<u16>,
 }
 
 /// Lower-case one hostname entry and drop its trailing dot.
@@ -106,15 +262,21 @@ impl PolicyData {
             egress_allowlist: Vec::new(),
             egress_hosts: Vec::new(),
             egress_ports: Vec::new(),
+            egress_unrestricted: false,
             preset_read_restricted: false,
             preset_read_roots: Vec::new(),
             preset_write_restricted: false,
             preset_write_roots: Vec::new(),
             preset_deny_roots: Vec::new(),
+            preset_read_globs: Vec::new(),
+            preset_write_globs: Vec::new(),
+            preset_deny_globs: Vec::new(),
             preset_permission: String::new(),
             permission: String::new(),
             preset_egress_restricted: false,
             preset_egress_allowlist: Vec::new(),
+            preset_egress_hosts: Vec::new(),
+            preset_egress_ports: Vec::new(),
         }
     }
 
@@ -182,6 +344,18 @@ impl PolicyData {
         self
     }
 
+    /// Declare that the workspace has NO egress allowlist file.
+    ///
+    /// This is the absent arm of the tri-state: egress is unrestricted unless a
+    /// preset narrows it. It is a fact about the workspace (the reader has not
+    /// created the file yet), not a widening a caller may apply over a file
+    /// that exists: a present file with no parsed rule must be handed over with
+    /// this flag false so the baseline keeps its deny-all answer.
+    pub fn with_egress_unrestricted(mut self, unrestricted: bool) -> Self {
+        self.egress_unrestricted = unrestricted;
+        self
+    }
+
     /// Install the preset's path scope. Empty restricted lists deny all reads
     /// or writes; unrestricted inherits the baseline.
     pub fn with_preset_scope(
@@ -200,6 +374,24 @@ impl PolicyData {
         self
     }
 
+    /// Install the preset's GLOB scopes beside its literal roots.
+    ///
+    /// The two shapes are parallel: a preset may declare `read = ["docs",
+    /// "src/**/*.rs"]`, and a path matches when it is under the literal root
+    /// OR matches the glob. Deny wins over both because the scope module
+    /// decides it first.
+    pub fn with_preset_globs(
+        mut self,
+        read_globs: Vec<String>,
+        write_globs: Vec<String>,
+        deny_globs: Vec<String>,
+    ) -> Self {
+        self.preset_read_globs = read_globs;
+        self.preset_write_globs = write_globs;
+        self.preset_deny_globs = deny_globs;
+        self
+    }
+
     /// Mirror the preset's permission ceiling into the data document.
     pub fn with_preset_permission(mut self, permission: impl Into<String>) -> Self {
         self.preset_permission = permission.into();
@@ -213,10 +405,18 @@ impl PolicyData {
         self
     }
 
-    /// Install the preset's egress scope. A restricted empty list denies all.
-    pub fn with_preset_egress(mut self, restricted: bool, allowlist: Vec<String>) -> Self {
+    /// Install the preset's egress scope, classified into its three shapes.
+    ///
+    /// `restricted` is true whenever the preset DECLARED an `egress` field,
+    /// even an empty one: a declared empty list denies everything, which is not
+    /// the same as an absent field. The rules carry the preset's own addresses,
+    /// hostnames and ports; the policy intersects each of them with the
+    /// workspace list rather than replacing it.
+    pub fn with_preset_egress(mut self, restricted: bool, rules: EgressRuleSet) -> Self {
         self.preset_egress_restricted = restricted;
-        self.preset_egress_allowlist = allowlist;
+        self.preset_egress_allowlist = rules.addresses;
+        self.preset_egress_hosts = rules.hosts;
+        self.preset_egress_ports = rules.ports;
         self
     }
 
@@ -274,6 +474,10 @@ impl PolicyData {
             Value::from(roots(&self.egress_hosts)),
         );
         root.insert(Value::from("egress_ports"), Value::from(ports));
+        root.insert(
+            Value::from("egress_unrestricted"),
+            Value::from(self.egress_unrestricted),
+        );
         let mut scope: BTreeMap<Value, Value> = BTreeMap::new();
         scope.insert(
             Value::from("read_restricted"),
@@ -295,6 +499,18 @@ impl PolicyData {
             Value::from("deny_roots"),
             Value::from(roots(&self.preset_deny_roots)),
         );
+        scope.insert(
+            Value::from("read_globs"),
+            Value::from(roots(&self.preset_read_globs)),
+        );
+        scope.insert(
+            Value::from("write_globs"),
+            Value::from(roots(&self.preset_write_globs)),
+        );
+        scope.insert(
+            Value::from("deny_globs"),
+            Value::from(roots(&self.preset_deny_globs)),
+        );
         root.insert(Value::from("preset_scope"), Value::from(scope));
         root.insert(
             Value::from("preset_permission"),
@@ -304,6 +520,11 @@ impl PolicyData {
             Value::from("permission"),
             Value::from(self.permission.as_str()),
         );
+        let preset_ports: Vec<Value> = self
+            .preset_egress_ports
+            .iter()
+            .map(|port| Value::from(u64::from(*port)))
+            .collect();
         let mut egress: BTreeMap<Value, Value> = BTreeMap::new();
         egress.insert(
             Value::from("restricted"),
@@ -313,6 +534,11 @@ impl PolicyData {
             Value::from("allowlist"),
             Value::from(roots(&self.preset_egress_allowlist)),
         );
+        egress.insert(
+            Value::from("hosts"),
+            Value::from(roots(&self.preset_egress_hosts)),
+        );
+        egress.insert(Value::from("ports"), Value::from(preset_ports));
         root.insert(Value::from("preset_egress"), Value::from(egress));
         Value::from(root)
     }
@@ -340,6 +566,29 @@ pub enum PolicyError {
         /// Second source.
         second: String,
     },
+    /// Two sources declared the same module id.
+    #[error("policy modules '{first}' and '{second}' share the id '{id}'")]
+    DuplicateId {
+        /// First source.
+        first: String,
+        /// Second source.
+        second: String,
+        /// The id both claimed.
+        id: String,
+    },
+    /// A workspace or extension module claimed an id reserved for a module
+    /// shipped in the binary.
+    #[error(
+        "the {origin} policy module '{claimed}' claims the built-in id '{claimed}'; built-in ids are reserved for binary-shipped modules (for example '{builtin}')"
+    )]
+    BuiltinIdClaimed {
+        /// The origin that tried to claim it.
+        origin: &'static str,
+        /// The id it claimed.
+        claimed: String,
+        /// The built-in module the id belongs to.
+        builtin: String,
+    },
     /// The data document could not be installed.
     #[error("policy data is invalid: {0}")]
     InvalidData(String),
@@ -359,12 +608,50 @@ pub enum PolicyError {
     },
 }
 
-/// One compiled module: what to query, and the rule ids it declares.
+/// One compiled module: what to query, where it came from, and its rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PolicyModule {
     id: String,
+    origin: PolicyOrigin,
+    trusted: bool,
+    advisory: bool,
     query: String,
     rule_ids: Vec<String>,
+}
+
+/// One module as the policy pane lists it.
+///
+/// The four facts answer "which policy refused me, and who is responsible for
+/// it": the stable id, the origin that decides whether a trust gate applies,
+/// that gate's answer, and the rule ids the module declares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyModuleInfo {
+    /// The stable module id (a `builtin:` id for a binary-shipped module).
+    pub id: String,
+    /// Where the module came from.
+    pub origin: PolicyOrigin,
+    /// Whether the module is trusted to apply.
+    pub trusted: bool,
+    /// The module's package path, as its `package` declaration reads.
+    pub package: String,
+    /// Every `# rule: <id>` the module declares, in source order.
+    pub rule_ids: Vec<String>,
+}
+
+/// The stable ids of every policy module this crate ships in the binary.
+///
+/// A `builtin:` id is reserved: a workspace file or an extension module that
+/// declares one is refused at compile time, naming both the claim and the
+/// built-in it would shadow. The host may add its own built-ins (the preset
+/// guard modules in `bsh`) under the same namespace.
+pub fn builtin_policy_ids() -> &'static [&'static str] {
+    &[
+        "builtin:baseline",
+        "builtin:session-permission",
+        "builtin:preset-scope",
+        "builtin:preset-egress",
+        "builtin:preset-permission",
+    ]
 }
 
 /// One bytecode program and the entry point it answers.
@@ -429,6 +716,29 @@ impl PolicySet {
                     return set;
                 }
             };
+            // The `builtin:` namespace is RESERVED. A workspace file or an
+            // extension module that declares one of these ids is refused by
+            // name: a user module must never be able to shadow the floor the
+            // binary ships, because the pane, the audit and the reader all read
+            // a built-in id as trusted.
+            if module.origin != PolicyOrigin::Builtin {
+                if let Some(builtin) = builtin_id_claimed(&module.id) {
+                    set.failure = Some(PolicyError::BuiltinIdClaimed {
+                        origin: module.origin.as_str(),
+                        claimed: module.id.clone(),
+                        builtin,
+                    });
+                    return set;
+                }
+            }
+            if let Some(previous) = modules.iter().find(|other| other.id == module.id) {
+                set.failure = Some(PolicyError::DuplicateId {
+                    first: previous.id.clone(),
+                    second: module.id.clone(),
+                    id: module.id.clone(),
+                });
+                return set;
+            }
             if let Some(previous) = modules.iter().find(|other| other.query == module.query) {
                 set.failure = Some(PolicyError::DuplicatePackage {
                     first: previous.id.clone(),
@@ -552,9 +862,80 @@ impl PolicySet {
     /// map to the failure asymmetry: deny writes and egress, allow a read
     /// inside the workspace root. Every decision is recorded in the audit.
     pub fn check(&self, input: &PolicyInput) -> Decision {
-        let decision = self.evaluate(input);
+        let evaluated = self.evaluate(input);
+        let decision = evaluated.decision;
+        // ADVISORY is applied HERE, at the one point every tool's question
+        // passes, and only to a module the host marked advisory (the preset's
+        // own contributions). The engine's verdict is unchanged and the
+        // refusal is recorded verbatim; the call simply proceeds with the
+        // refusal in its reason so a caller can surface it. The floor modules
+        // are never advisory, so nothing a preset says can widen the session,
+        // the workspace policy or the baseline.
+        if decision.is_denied() && self.module_is_advisory(evaluated.module.as_deref(), &decision) {
+            self.audit
+                .record_advisory(input, &decision, &self.data.permission);
+            return Decision {
+                allow: true,
+                rule: decision.rule.clone(),
+                reason: Some(format!("advisory: {}", decision.refusal(&self.lang))),
+            };
+        }
         self.audit.record(input, &decision, &self.data.permission);
         decision
+    }
+
+    /// Whether the module that denied this decision is advisory.
+    ///
+    /// A missing module, an engine failure and a failure-asymmetry verdict are
+    /// all HARD: only a rule a real module supplied can be downgraded to a
+    /// warning.
+    fn module_is_advisory(&self, module: Option<&str>, decision: &Decision) -> bool {
+        if decision
+            .rule
+            .as_deref()
+            .is_some_and(|rule| rule.starts_with("policy-evaluator-"))
+        {
+            return false;
+        }
+        let Some(id) = module else {
+            return false;
+        };
+        self.modules
+            .iter()
+            .any(|module| module.id == id && module.advisory)
+    }
+
+    /// Every compiled module, in evaluation order, as the policy pane lists it.
+    pub fn modules(&self) -> Vec<PolicyModuleInfo> {
+        self.modules
+            .iter()
+            .map(|module| PolicyModuleInfo {
+                id: module.id.clone(),
+                origin: module.origin,
+                trusted: module.trusted,
+                package: module
+                    .query
+                    .strip_prefix("data.")
+                    .and_then(|rest| rest.strip_suffix(".verdict"))
+                    .unwrap_or(&module.query)
+                    .to_string(),
+                rule_ids: module.rule_ids.clone(),
+            })
+            .collect()
+    }
+
+    /// The advisory refusals in the denial ring, oldest first.
+    ///
+    /// They are recorded in the same ring as hard denials - an advisory refusal
+    /// is still a refusal a reader must be able to see - and filtered here for
+    /// the pane that reports what was waved through.
+    pub fn advisories(&self) -> Vec<PolicyAuditEntry> {
+        self.audit.advisories()
+    }
+
+    /// Every advisory refusal ever counted.
+    pub fn advisories_total(&self) -> u64 {
+        self.audit.advisories_total()
     }
 
     /// Answer a question WITHOUT recording it.
@@ -569,7 +950,7 @@ impl PolicySet {
     /// data, same failure asymmetry - so a spec cannot be derived from a
     /// weaker policy than the one that gates the tools.
     pub fn probe(&self, input: &PolicyInput) -> Decision {
-        self.evaluate(input)
+        self.evaluate(input).decision
     }
 
     /// Evaluate through the interpreter even when bytecode is available.
@@ -579,17 +960,18 @@ impl PolicySet {
     #[cfg(test)]
     pub(crate) fn check_with_interpreter(&self, input: &PolicyInput) -> Decision {
         let input_value = input.to_rego_value(&self.data.workspace_root_text());
-        let decision = self.evaluate_interpreter(input, input_value);
-        self.audit.record(input, &decision, &self.data.permission);
-        decision
+        let evaluated = self.evaluate_interpreter(input, input_value);
+        self.audit
+            .record(input, &evaluated.decision, &self.data.permission);
+        evaluated.decision
     }
 
-    fn evaluate(&self, input: &PolicyInput) -> Decision {
+    fn evaluate(&self, input: &PolicyInput) -> Evaluated {
         if let Some(error) = &self.failure {
-            return self.failure_decision(input, &error.to_string());
+            return Evaluated::hard(self.failure_decision(input, &error.to_string()));
         }
         if self.modules.is_empty() {
-            return self.failure_decision(input, "no policy modules are compiled");
+            return Evaluated::hard(self.failure_decision(input, "no policy modules are compiled"));
         }
         let input_value = input.to_rego_value(&self.data.workspace_root_text());
 
@@ -610,10 +992,14 @@ impl PolicySet {
     }
 
     /// Evaluate through the bytecode programs.
-    fn evaluate_vms(&self, input: &PolicyInput, input_value: Value) -> Decision {
+    fn evaluate_vms(&self, input: &PolicyInput, input_value: Value) -> Evaluated {
         let mut vm_guard = match self.vms.lock() {
             Ok(guard) => guard,
-            Err(_) => return self.failure_decision(input, "the policy VM lock is poisoned"),
+            Err(_) => {
+                return Evaluated::hard(
+                    self.failure_decision(input, "the policy VM lock is poisoned"),
+                )
+            }
         };
         if let Some(vms) = vm_guard.as_mut() {
             let mut allow_rule: Option<String> = None;
@@ -622,13 +1008,15 @@ impl PolicySet {
                 let value = match module.vm.execute_entry_point_by_name(&module.entry) {
                     Ok(value) => value,
                     Err(error) => {
-                        return self.failure_decision(
-                            input,
-                            &PolicyError::Evaluation {
-                                policy: module.id.clone(),
-                                message: error.to_string(),
-                            }
-                            .to_string(),
+                        return Evaluated::hard(
+                            self.failure_decision(
+                                input,
+                                &PolicyError::Evaluation {
+                                    policy: module.id.clone(),
+                                    message: error.to_string(),
+                                }
+                                .to_string(),
+                            ),
                         );
                     }
                 };
@@ -639,15 +1027,19 @@ impl PolicySet {
                         }
                     }
                     Ok(Verdict::Deny { rule, reason }) => {
-                        return Decision {
-                            allow: false,
-                            rule,
-                            reason: reason
-                                .or_else(|| Some(format!("denied by the '{}' policy", module.id))),
+                        return Evaluated {
+                            decision: Decision {
+                                allow: false,
+                                rule,
+                                reason: reason.or_else(|| {
+                                    Some(format!("denied by the '{}' policy", module.id))
+                                }),
+                            },
+                            module: Some(module.id.clone()),
                         };
                     }
                     Err(message) => {
-                        return self.failure_decision(
+                        return Evaluated::hard(self.failure_decision(
                             input,
                             &format!(
                                 "{} ({message})",
@@ -655,29 +1047,33 @@ impl PolicySet {
                                     policy: module.id.clone(),
                                 }
                             ),
-                        );
+                        ));
                     }
                 }
             }
-            return Decision {
+            return Evaluated::hard(Decision {
                 allow: true,
                 rule: allow_rule,
                 reason: None,
-            };
+            });
         }
         drop(vm_guard);
-        self.failure_decision(input, "the bytecode programs disappeared mid-check")
+        Evaluated::hard(self.failure_decision(input, "the bytecode programs disappeared mid-check"))
     }
 
     /// Evaluate through the interpreter. Used as the fallback, and by tests to
     /// compare the two backends on the same policy.
-    fn evaluate_interpreter(&self, input: &PolicyInput, input_value: Value) -> Decision {
+    fn evaluate_interpreter(&self, input: &PolicyInput, input_value: Value) -> Evaluated {
         let mut guard = match self.engine.lock() {
             Ok(guard) => guard,
-            Err(_) => return self.failure_decision(input, "the policy engine lock is poisoned"),
+            Err(_) => {
+                return Evaluated::hard(
+                    self.failure_decision(input, "the policy engine lock is poisoned"),
+                )
+            }
         };
         let Some(engine) = guard.as_mut() else {
-            return self.failure_decision(input, "no policy engine is compiled");
+            return Evaluated::hard(self.failure_decision(input, "no policy engine is compiled"));
         };
 
         engine.set_input(input_value);
@@ -686,13 +1082,15 @@ impl PolicySet {
             let value = match engine.eval_rule(module.query.clone()) {
                 Ok(value) => value,
                 Err(error) => {
-                    return self.failure_decision(
-                        input,
-                        &PolicyError::Evaluation {
-                            policy: module.id.clone(),
-                            message: error.to_string(),
-                        }
-                        .to_string(),
+                    return Evaluated::hard(
+                        self.failure_decision(
+                            input,
+                            &PolicyError::Evaluation {
+                                policy: module.id.clone(),
+                                message: error.to_string(),
+                            }
+                            .to_string(),
+                        ),
                     );
                 }
             };
@@ -703,15 +1101,18 @@ impl PolicySet {
                     }
                 }
                 Ok(Verdict::Deny { rule, reason }) => {
-                    return Decision {
-                        allow: false,
-                        rule,
-                        reason: reason
-                            .or_else(|| Some(format!("denied by the '{}' policy", module.id))),
+                    return Evaluated {
+                        decision: Decision {
+                            allow: false,
+                            rule,
+                            reason: reason
+                                .or_else(|| Some(format!("denied by the '{}' policy", module.id))),
+                        },
+                        module: Some(module.id.clone()),
                     };
                 }
                 Err(message) => {
-                    return self.failure_decision(
+                    return Evaluated::hard(self.failure_decision(
                         input,
                         &format!(
                             "{} ({message})",
@@ -719,15 +1120,15 @@ impl PolicySet {
                                 policy: module.id.clone(),
                             }
                         ),
-                    );
+                    ));
                 }
             }
         }
-        Decision {
+        Evaluated::hard(Decision {
             allow: true,
             rule: allow_rule,
             reason: None,
-        }
+        })
     }
 
     fn failure_decision(&self, input: &PolicyInput, why: &str) -> Decision {
@@ -762,6 +1163,27 @@ impl std::fmt::Debug for PolicySet {
             .field("failure", &self.failure)
             .field("lang", &self.lang)
             .finish_non_exhaustive()
+    }
+}
+
+/// One evaluation: the verdict a caller enforces, and the module that denied.
+///
+/// The module is kept OUT of [`Decision`] so the public answer stays the same
+/// size it was before advisory mode existed (a larger `Decision` pushed the
+/// egress error types over clippy's size budget); the host uses it only to
+/// decide whether the denial was advisory.
+struct Evaluated {
+    decision: Decision,
+    module: Option<String>,
+}
+
+impl Evaluated {
+    /// A verdict that no module's advisory flag may downgrade.
+    fn hard(decision: Decision) -> Self {
+        Self {
+            decision,
+            module: None,
+        }
     }
 }
 
@@ -870,10 +1292,48 @@ fn module_for(source: &PolicySource) -> Result<PolicyModule, PolicyError> {
         message,
     })?;
     Ok(PolicyModule {
-        id: source.id.clone(),
+        id: effective_module_id(source),
+        origin: source.origin,
+        trusted: source.trusted,
+        advisory: source.advisory,
         query: format!("data.{package}.verdict"),
         rule_ids: extract_rule_ids(&source.rego),
     })
+}
+
+/// The id a source's module is compiled under.
+///
+/// A module may declare its own id with a `# module: <id>` header comment. That
+/// is what lets a workspace file or an extension package CLAIM an id - and the
+/// claim is checked against the reserved `builtin:` namespace in
+/// [`PolicySet::compile`], so a user module cannot shadow the binary's floor.
+/// Without the directive the host-assigned label is the id.
+/// The built-in id a non-built-in module tried to claim, when it claimed one.
+///
+/// Every id under the reserved prefix is refused, whether or not this binary
+/// currently ships it: the namespace belongs to the binary, and a future module
+/// must not collide with a name a user file could already have taken.
+fn builtin_id_claimed(id: &str) -> Option<String> {
+    id.trim()
+        .starts_with("builtin:")
+        .then(|| id.trim().to_string())
+}
+
+fn effective_module_id(source: &PolicySource) -> String {
+    for line in source.rego.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix('#') else {
+            continue;
+        };
+        let Some(rest) = rest.trim().strip_prefix("module:") else {
+            continue;
+        };
+        let id = rest.trim();
+        if !id.is_empty() {
+            return id.to_string();
+        }
+    }
+    source.id.clone()
 }
 
 /// Read the `package a.b` declaration and return its dotted path.

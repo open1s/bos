@@ -67,8 +67,8 @@ rand = "0.10.3"
 # Supply chain, stated plainly: this is a young crate (created 2026-10-23, zero
 # stars, a fork of lexoliu/heel) whose API changed the same day it was measured.
 # Pinning removes drift, not trust: review the diff before moving the commit.
-# The `heel-sandbox` feature in `agent` is what turns it on, and the build
-# stays green with that feature off, where the seatbelt profile is the boundary.
+# heel is a REQUIRED dependency of `agent`: there is one sandbox
+# implementation and no feature flag or in-tree fallback that turns it off.
 heel = { git = "https://github.com/open1s/heel", rev = "6db173aa0baf48ef06c3e946b9b074e7ae81ac9c", default-features = false }
 
 [workspace.package]

@@ -11,6 +11,17 @@
 //! one place an HTTP client turns a name into an address. Resolution results are
 //! cached for the life of the gate (one turn / one session), so a tool that
 //! makes several requests to one host resolves once.
+//! # One vocabulary for a network rule
+//!
+//! A network rule list is written by a human in two places - the workspace file
+//! `.bsh/egress-allowlist` and a preset's own `egress` field - and both must
+//! mean the same three things. [`EgressRuleSet`] is that one parser and that one
+//! vocabulary: a bare integer is a PORT, something that parses as an address or
+//! a CIDR range is an ADDRESS rule (the strong door, decided on the resolved
+//! IP), and anything else is a HOSTNAME rule (the weaker door, decided on the
+//! name). The workspace file, the preset field and the tests all classify
+//! through it, so a rule cannot mean one thing in the file and another in a
+//! preset.
 
 use std::collections::HashMap;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -326,6 +337,93 @@ impl ureq::unversioned::resolver::Resolver for PolicyResolver {
     }
 }
 
+/// One classified set of network rules: the three shapes a rule list may carry.
+///
+/// This is the ONE parser for a human-written network rule list. The workspace
+/// file `.bsh/egress-allowlist` and a preset's `egress` field both read through
+/// it, so a rule cannot mean one thing in the file and another in a preset.
+///
+/// A line is classified by what it can be, in this order:
+///
+/// - a bare integer is a destination PORT (`443`). No port rule means any port;
+///   one or more means only those.
+/// - something that parses as an address or as a CIDR range is an ADDRESS rule
+///   (`203.0.113.7`, `10.0.0.0/8`). This is the strong door: the policy decides
+///   on the resolved address, so a DNS rebind cannot ride it.
+/// - anything else is a HOSTNAME rule (`api.example.com`, `*.crates.io`). This
+///   is the weaker door - it survives a rebind - and it exists for a policy that
+///   names a service rather than an address.
+///
+/// An empty set is not the same as no set: a caller that receives one has a
+/// declared, empty rule list, which denies every address, host and port. The
+/// distinction between “absent” and “empty” is not expressible here, so it
+/// lives in the caller: bsh's file reader reports absent vs present-but-empty
+/// and mirrors it as `PolicyData::egress_unrestricted`, while a preset's own
+/// field is absent vs declared in `preset_egress_restricted`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EgressRuleSet {
+    /// Address rules: an exact address or a CIDR range.
+    pub addresses: Vec<String>,
+    /// Hostname rules, lower-cased. A leading `*.` matches any subdomain.
+    pub hosts: Vec<String>,
+    /// Destination ports. Empty means any port.
+    pub ports: Vec<u16>,
+}
+
+impl EgressRuleSet {
+    /// Classify every entry of a rule list. Comments, blank lines and a
+    /// trailing `#` comment on a line are ignored, so the same text a file
+    /// carries can be handed in directly.
+    pub fn parse<I, S>(entries: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut set = Self::default();
+        for raw in entries {
+            let text = raw.as_ref();
+            for line in text.lines() {
+                let entry = line.split('#').next().unwrap_or("").trim();
+                set.push(entry);
+            }
+        }
+        set
+    }
+
+    /// Classify ONE already-trimmed entry, appending it to the right list.
+    ///
+    /// An empty entry is ignored; every other entry lands in exactly one list,
+    /// because the three tests are ordered: a port first, then an address, and
+    /// a hostname as the fallback.
+    pub fn push(&mut self, entry: &str) {
+        if entry.is_empty() {
+            return;
+        }
+        if let Ok(port) = entry.parse::<u16>() {
+            self.ports.push(port);
+            return;
+        }
+        let base = entry.split('/').next().unwrap_or(entry);
+        let is_address = entry.parse::<std::net::IpAddr>().is_ok()
+            || (entry.contains('/') && base.parse::<std::net::IpAddr>().is_ok());
+        if is_address {
+            self.addresses.push(entry.to_string());
+        } else {
+            self.hosts.push(normalize_hostname(entry));
+        }
+    }
+
+    /// Whether the set declares no rule at all, which denies everything.
+    pub fn is_empty(&self) -> bool {
+        self.addresses.is_empty() && self.hosts.is_empty() && self.ports.is_empty()
+    }
+}
+
+/// Lower-case a hostname rule and drop a trailing dot, so it matches the name
+/// the policy later compares it against.
+fn normalize_hostname(entry: &str) -> String {
+    entry.trim().trim_end_matches('.').to_ascii_lowercase()
+}
 /// The host and port a URL names, for a transport that must check before it
 /// builds an agent. Returns none for a URL with no host.
 pub fn host_and_port(url: &str) -> Option<(String, u16)> {

@@ -30,8 +30,8 @@ reference feature has no backing here (no data behind it, no framework seam),
 say so in the final report instead of faking it.
 
 **The mirror is functional, not only visual** (user requirement, round 110). Every
-increment reports the four axes too, and `docs/ui-parity-requirements.md` §3C keeps the
-running status:
+increment reports the four axes too, and this file's own round notes keep the running
+status:
 1. **Backend in Rust** - the behaviour behind the control (a setting written, a turn
    opened, a tool gated) lives in the BOS crates, not in the view.
 2. **Interaction** - what a click, double click, key press and mouse move or hover do,
@@ -78,7 +78,7 @@ binary is the one to launch when a section has to be deep-linked.
      for one word, recovers the exact wording of a pane in both languages. It
      is a tmp file, so recreate it from the recipe above if it is gone; it is
      the cheapest way to pin reference wording.
-3. `docs/ui-parity-requirements.md` §11 records the reference's settings
+3. The reference's settings structure is recorded in `docs/agents-shell-reference.md`:
    structure; `docs/gui-requirements.md` records the wider shell.
 
 Sidebar entries are PLUGINS with their own dictionaries (round 73), which is where a row name actually lives: each one does `ctx.locale.register(NS, { zh, en })` and then `const t = ctx.locale.bind(NS)`, so recovering a sidebar wording means grepping the NAMESPACE and reading its en/zh objects, not the sentence. Measured: the panel id constant is `const PANEL_ID = "plugins"` for the plugins page and `const PANEL_ID = "schedules"` for the one the Automation tasks row opens, and the plugin-manager namespace is `NS = "pluginManager"`. The MCP row is not one of those two ids, so it comes from a third plugin namespace that is still unidentified - that is why sentence-grepping failed for it twice. Keys tried and refuted (zero hits) so they are not retried: `automationTasks`, `mcpConnector`, `connectorNav`, `nav.plugin`.
@@ -237,7 +237,7 @@ the composer draft does not follow the step. The full measured table, with the s
 and the extraction recipe, is `docs/ui-mirror/reference/dsh-type-scale.md`.
 Round 95 measured the controls those sizes sit in
 (`AppearanceRow`/`FontSizeRow.module.css`, inline in `lib/client.js` too); their
-metrics are in `docs/round-history.md`, and the click test proves the
+metrics are recorded in this file's round notes, and the click test proves the
 hover-revealed stepper chevrons stay hit-testable at `opacity: 0`. Seams that cost
 compile cycles: the kit's
 border macros are whole-pixel only, so a `.5px` hairline is written into
@@ -429,7 +429,7 @@ cost, so the next test is cheap:
 ### Round history (rounds 37-77)
 
 The round-by-round record - the seam each round closed, its evidence and its
-traps - lives in `docs/round-history.md`, moved there when this file passed the
+traps - lives in the round notes in this file, condensed when this file passed the
 workspace instruction budget. What stays here is what changes how the next
 increment is written:
 
@@ -2264,3 +2264,56 @@ reference ever changes them.
 Not drawn: the reference's column header row (th, 12 at weight 500) because this
 list has no columns, and 8px/10px mono tabular turn labels on the rail, which the
 kind-slot design does not have a place for.
+
+Round 169 made the workspace egress allowlist DISCOVERABLE through one
+constant, `caps::EGRESS_ALLOWLIST_TEMPLATE`, the single source of truth the
+Policy pane's Create action writes and its test compares against, so no copy can
+drift. EVERY line of the template is a `#` comment, so the file it writes parses
+to ZERO rules (`EgressRuleSet::parse`).
+
+Round 170 reversed the SEEDING half: the file is TRI-STATE and only its own
+presence constrains. No file at all -> `PolicyData::egress_unrestricted` ->
+`Egress::Unrestricted` (the network works out of the box, which is what
+Standard/PTC inherit); a PRESENT file that parses to no rule -> `Egress::DenyAll`
+(the reader opted into a lockdown by creating it); rules -> the allowlist. The
+automatic seeder is GONE (`seed_egress_allowlist`,
+`AppState::seed_workspace_allowlist`), because writing the starter on
+registration/opening turned every fresh workspace into a deny-all before its
+owner asked for one. The pane's Create action is the only writer, and its copy
+says that an empty file denies all egress. The reader must distinguish a
+`NotFound` from any other read error and treat the latter as PRESENT (deny),
+never as absent: an unreadable file must not widen the workspace.
+
+ALLOW-ALL is honest here, and the honest answer is an ADDRESS rule: a bare `*`
+classifies as a HOSTNAME, and `host_matches` only accepts an exact name or a
+leading `*.` suffix, so `*` matches NO host - there is no wildcard-hostname
+spelling. The nearest real equivalent the parser accepts is `0.0.0.0/0` / `::/0`,
+which `net.cidr_contains` matches against any resolved address; the template
+documents that pair as a commented example, and a test pins that `0.0.0.0/0`
+classifies as an address while `*` classifies as a hostname.
+
+The pane gained the affordances with handlers: the empty state distinguishes "no
+file yet" from "a file that declares nothing" and offers Create starter allowlist
+(writes the template) and Open file (reveals the path through the same
+`settings::reveal` seam the settings file uses). Eight new locale keys, en+zh,
+with parity enforced by the existing `the_two_locale_files_carry_the_same_keys`.
+
+Round 171 made the permission chip's three consequence lines TRUE about the
+network, DERIVED rather than written. The workspace `.bsh/egress-allowlist` is
+tri-state, so every row appends a sentence built from `permission::NetworkFacts`
+(the file's state + the preset's resolved `egress`): Read Only names web search
+and the browser, Workspace Write names commands, Full access names tools, and a
+preset that keeps the shell confined swaps in the sentence that names that
+constraint. `WorkspaceEgress` is classified by the policy's own
+`EgressRuleSet::parse` from facts AppState already cached - `egress_allowlist`
+plus the new `egress_allowlist_present`, both set by the one
+`refresh_egress_allowlist` read - so a render never stats the disk. Traps: the
+resolved `sandbox.heel` answers for the mode IN FORCE, so the Full access row
+claimed "this preset keeps the shell confined" on an ordinary Workspace Write
+session; the row now asks the preset's own declaration
+(`preset_forces_heel`). The kit's popup caps at 500px and each item is a fixed
+26px high, so a longer row wraps and clips its own network clause; the permission
+menu now sets `.max_w(px(820.0))`. Tests: all three modes x both locales x the
+three file states, the preset-list and deny-all intersections, a negative that a
+deny-all preset never reads as open, and two rendered `draw_until` tests reading
+the rows the chip builds (absent file and deny-all preset).

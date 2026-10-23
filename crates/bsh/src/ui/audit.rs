@@ -5,10 +5,17 @@
 //! refusals it met. It does not call a model and generates no prose - every
 //! figure comes from a count over the records.
 //!
-//! What it cannot see is stated on the page itself: a shell command's output is
-//! recorded but the files it creates are not individually audited, and the only
-//! network the audit can observe is tool/MCP egress - a shell's own sockets are
-//! not intercepted. Those are limits of the data, not of this view.
+//! What it sees, and what it cannot, is stated on the page itself in two
+//! layered notes. A shell call records the command, its output, and the
+//! confinement the tool's own result carried per call - the sandbox backend and
+//! the network reach (both drawn in the call detail, read from the stored
+//! record) - but the files the command creates are not individually attributed.
+//! Network REACHABILITY is gated and recorded in two tiers: the command line's
+//! named endpoints, then the sandbox proxy asking the policy per connection. The
+//! PAYLOAD is not inspected (TLS is tunnelled); "controlled" means reachability,
+//! never content, and a host assembled at runtime is invisible to the lexical
+//! tier and caught only at the connection tier. Those are limits of the data, not
+//! of this view.
 //!
 //! The list is a timeline of turns, not a grouped table by resource, because the
 //! question "what happened, in order?" is the one an audit reader asks first.
@@ -38,12 +45,19 @@ impl Shell {
         let Some(session) = self.state.active_session() else {
             return AuditView::default();
         };
-        let denials = self
-            .state
-            .policy_audit
-            .as_ref()
-            .map(|audit| audit.denials.as_slice())
-            .unwrap_or_default();
+        // ADVISORY refusals are refusals the reader was TOLD about, not ones
+        // that stopped a call: the Audit tab counts what was blocked, while the
+        // Policy pane lists the advisory ring on its own. Mixing them here would
+        // make "refusals" mean two different things on one page.
+        let advisory_free = self.state.policy_audit.as_ref().map(|audit| {
+            audit
+                .denials
+                .iter()
+                .filter(|entry| !entry.advisory)
+                .cloned()
+                .collect::<Vec<_>>()
+        });
+        let denials = advisory_free.as_deref().unwrap_or_default();
         let mut mcp: Vec<String> = self
             .state
             .mcp
@@ -109,7 +123,12 @@ impl Shell {
             policy.write_scope = data.preset_write_roots.len();
             policy.deny_roots = data.preset_deny_roots.len();
             policy.egress_allowlist = data.egress_allowlist.len();
-            policy.egress_restricted = data.preset_egress_restricted;
+            // RESTRICTED is the EFFECTIVE state, not only the preset's field:
+            // an absent workspace file leaves egress unrestricted, while a
+            // present file - even one that declares no rule - constrains it (to
+            // the allowlist, or to a deny-all when it is empty). Reading only
+            // the preset flag would print "unrestricted" for an empty file.
+            policy.egress_restricted = data.preset_egress_restricted || !data.egress_unrestricted;
         }
         policy
     }
@@ -729,6 +748,9 @@ impl Shell {
             audit::AuditCategory::FileWrite => theme::warn(),
             audit::AuditCategory::Shell => theme::text(),
             audit::AuditCategory::Network => theme::accent(),
+            // The browser owns the right pane, so it reads as a workspace
+            // surface rather than as plain egress.
+            audit::AuditCategory::Browser => theme::accent(),
             audit::AuditCategory::Mcp => theme::accent(),
             audit::AuditCategory::Subagent => theme::warn(),
             audit::AuditCategory::Other => theme::muted(),
@@ -930,6 +952,27 @@ impl Shell {
                     .font_family(theme::CODE_FONT)
                     .child(txt(call.target.clone(), 12.0, theme::muted()).line_height(px(18.0))),
             )
+            // The row's summary of the confinement, when the call's own result
+            // reported one: a compact "heel · deny-all". A record with neither
+            // fact draws no chip - the row cannot imply a tier the stored call
+            // never carried (the open detail says "no sandbox" instead).
+            .when_some(self.audit_confinement_chip(call), |row, chip| {
+                row.child(
+                    div()
+                        .flex_none()
+                        .h(px(16.0))
+                        .px(px(5.0))
+                        .flex()
+                        .items_center()
+                        .rounded(px(4.0))
+                        .bg(rgb(theme::hover()))
+                        .child(
+                            txt(chip, 10.0, theme::faint())
+                                .font_family(theme::CODE_FONT)
+                                .line_height(px(14.0)),
+                        ),
+                )
+            })
             .child(
                 div()
                     .w(px(56.0))
@@ -1023,6 +1066,32 @@ impl Shell {
                                 .debug_selector(|| format!("audit-call-exec-{turn}-{index}"))
                                 .child(txt(exec, 11.0, ink)),
                         )
+                        // The PER-CALL confinement the tool's own result
+                        // reported. Read from the stored record: a call whose
+                        // output carries no sandbox field says so plainly rather
+                        // than borrowing the session's permission.
+                        .when_some(self.audit_confinement(call), |column, line| {
+                            column.child(
+                                div()
+                                    .debug_selector(|| {
+                                        format!("audit-call-confinement-{turn}-{index}")
+                                    })
+                                    .child(txt(line, 11.0, theme::faint())),
+                            )
+                        })
+                        // The failure the sandbox's networking explains, in the
+                        // reader's language. The stored record carries an id, so
+                        // this line survives a language switch and never claims
+                        // the policy refused a command it allowed.
+                        .when_some(self.audit_diagnostic(call), |column, line| {
+                            column.child(
+                                div()
+                                    .debug_selector(|| {
+                                        format!("audit-call-diagnostic-{turn}-{index}")
+                                    })
+                                    .child(txt(line, 11.0, theme::warn())),
+                            )
+                        })
                 })
                 .child(
                     div()
@@ -1178,6 +1247,80 @@ impl Shell {
         super::hairline_bottom(row)
             .border_color(rgb(theme::border_soft()))
             .into_any_element()
+    }
+
+    /// What confinement the call's own result reported, as one line.
+    ///
+    /// Both facts come from the STORED result, never from a session-wide
+    /// assumption: the sandbox backend and the network reach the tool itself
+    /// recorded for THAT call. A call with no sandbox field - full access, a
+    /// refusal that produced no result, or a record written before the field
+    /// existed - says "no sandbox" rather than implying a confinement it never
+    /// had. The network half is drawn only when the record carries it, so the
+    /// two facts stay independent.
+    pub(crate) fn audit_confinement(&self, call: &AuditCall) -> Option<String> {
+        let lang = self.state.lang;
+        let mut sandbox = match call.sandbox.as_deref() {
+            Some(sandbox) => tr_args(
+                lang,
+                "audit.call.sandboxField",
+                &[("sandbox", sandbox.to_string())],
+            ),
+            None => lang.tr("audit.call.noSandbox"),
+        };
+        // `none` alone does not say who released confinement. The bash result
+        // always stores a reason; the two known ones are localized, and an
+        // id/text from a newer build is printed rather than guessed at.
+        if let Some(reason) = call.sandbox_reason.as_deref() {
+            let reason = if reason == agent::tools::bash::PRESET_SANDBOX_OFF_REASON {
+                lang.tr("audit.call.sandboxOffReason")
+            } else if reason == agent::tools::bash::SANDBOX_RELEASED_REASON {
+                lang.tr("audit.call.sandboxReleasedReason")
+            } else {
+                reason.to_string()
+            };
+            sandbox = format!("{sandbox} ({reason})");
+        }
+        match call.network.as_deref() {
+            Some(network) => {
+                let network = tr_args(
+                    lang,
+                    "audit.call.networkField",
+                    &[("network", network.to_string())],
+                );
+                Some(format!("{sandbox} \u{00b7} {network}"))
+            }
+            None => Some(sandbox),
+        }
+    }
+
+    /// The reader-facing explanation for a failure the SANDBOX's networking
+    /// caused, or none when the record carried no diagnostic this build knows.
+    ///
+    /// The text lives in the locale table (one key shared with the transcript
+    /// step body), so the same record reads in English or Chinese and switching
+    /// languages does not require a new tool call. It says the kernel refused a
+    /// direct socket/ICMP path the sandbox does not proxy, names the clients that
+    /// do work, and points at the policy document - it never says the policy
+    /// refused a command the policy allowed.
+    pub(crate) fn audit_diagnostic(&self, call: &AuditCall) -> Option<String> {
+        call.diagnostic_key().map(|key| self.state.lang.tr(key))
+    }
+
+    /// The row's compact confinement chip, or none when the record carries
+    /// neither fact.
+    ///
+    /// The row is a summary, so it draws the RAW recorded values ("heel",
+    /// "deny-all") rather than the labelled field form the open detail uses.
+    /// None means nothing was reported, and the row then draws no chip at all -
+    /// a summary must not imply a tier the call never had.
+    pub(crate) fn audit_confinement_chip(&self, call: &AuditCall) -> Option<String> {
+        match (call.sandbox.as_deref(), call.network.as_deref()) {
+            (Some(sandbox), Some(network)) => Some(format!("{sandbox} \u{00b7} {network}")),
+            (Some(sandbox), None) => Some(sandbox.to_string()),
+            (None, Some(network)) => Some(network.to_string()),
+            (None, None) => None,
+        }
     }
 
     /// The page's own statement of what it cannot see.

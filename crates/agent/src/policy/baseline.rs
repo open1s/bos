@@ -10,18 +10,31 @@
 //! - **Reads** are allowed inside the workspace root and refused outside it.
 //! - **Writes** are allowed under the workspace root, except anywhere below a
 //!   `.bsh` or `.git` directory. A write outside the root is refused.
-//! - **Egress** is allowed only when the resolved address is on
-//!   `data.egress_allowlist` (an exact address, or a CIDR range) OR the hostname
-//!   matches `data.egress_hosts` (exact, or a `*.` subdomain rule), AND - when
-//!   `data.egress_ports` is non-empty - the destination port is on it. All
-//!   three lists are empty by default, so egress is denied by default. A
-//!   hostname rule is the weaker door: it survives a DNS rebind, which is why
-//!   the address list exists.
-//! - **Spawn** is allowed only for the `bash` tool when its working directory is
-//!   the workspace root. `job_kill` (stopping a job this session owns) and
-//!   `subagent` (delegating to a child agent) are also spawns the baseline
-//!   permits; the workspace policy narrows them. Any other process start is
-//!   refused.
+//! - **Egress** is TRI-STATE, and the three states are distinct:
+//!   - `data.egress_unrestricted` is true when the workspace has NO allowlist
+//!     file at all. The resolved address, the hostname and the port are then
+//!     all reachable: a fresh workspace permits the network out of the box.
+//!   - a present allowlist constrains the reach: the resolved address must be
+//!     on `data.egress_allowlist` (an exact address, or a CIDR range) OR the
+//!     hostname must match `data.egress_hosts` (exact, or a `*.` subdomain
+//!     rule), AND - when `data.egress_ports` is non-empty - the destination
+//!     port must be on it.
+//!   - a present file that parses to NO rule (comments and blanks only) is a
+//!     deliberate deny-all: the non-empty lists are absent, so the last egress
+//!     arm refuses.
+//!
+//!   The port rule is evaluated BEFORE the unrestricted arm, so declaring a
+//!   port list never loses its constraint. A hostname rule is the weaker door:
+//!   it survives a DNS rebind, which is why the address list exists.
+//! - **Spawn** is allowed for the `bash` tool in two cases: when its working
+//!   directory is the workspace root, and - at the effective permission
+//!   `danger-full-access` - wherever the RELEASED shell starts. The second arm
+//!   exists because the inherited full-access shell is handed no workspace root,
+//!   so its working directory is the host's own launch directory: a path-only
+//!   rule would refuse every command at the one tier that released confinement.
+//!   `job_kill` (stopping a job this session owns) and `subagent` (delegating
+//!   to a child agent) are also spawns the baseline permits; the workspace
+//!   policy narrows them. Any other process start is refused.
 //! - **Capability** is the registration-time question. The four gated tools -
 //!   `run_in_background`, `job_output`, `job_kill` and `subagent` - are
 //!   offered only while `data.permission` grants side effects; a read-only
@@ -82,6 +95,10 @@ verdict := {"allow": true, "rule": "capability-granted"} if {
 } else := {"allow": false, "rule": "egress-port-not-allowed", "reason": "the destination port is outside the egress port list"} if {
     input.action == "egress"
     not port_allowed(input.target.port)
+# rule: egress-unrestricted
+} else := {"allow": true, "rule": "egress-unrestricted"} if {
+    input.action == "egress"
+    data.egress_unrestricted
 # rule: egress-host-allowlisted
 } else := {"allow": true, "rule": "egress-host-allowlisted"} if {
     input.action == "egress"
@@ -111,6 +128,11 @@ verdict := {"allow": true, "rule": "capability-granted"} if {
 } else := {"allow": true, "rule": "spawn-job-control"} if {
     input.action == "spawn"
     input.tool == "job_kill"
+# rule: spawn-shell-full-access
+} else := {"allow": true, "rule": "spawn-shell-full-access"} if {
+    input.action == "spawn"
+    input.tool == "bash"
+    data.permission == "danger-full-access"
 # rule: spawn-not-allowed
 } else := {"allow": false, "rule": "spawn-not-allowed", "reason": "this process may not be spawned"} if {
     input.action == "spawn"
@@ -242,25 +264,129 @@ path_under(path, root) if {
 "#;
 
 /// The preset egress-scope module: enforced only when the preset declares an
-/// egress list. It intersects with the workspace egress allowlist.
+/// egress list (`data.preset_egress.restricted`). It NARROWS the workspace
+/// policy, so the two are intersected: an entry must satisfy the preset's own
+/// rules AND the baseline's. A declared EMPTY list denies every address, host
+/// and port, which is the preset saying "no network".
+///
+/// A rule list carries up to three shapes, classified by the host into
+/// `data.preset_egress.allowlist` (addresses/CIDRs), `.hosts` (hostnames, with a
+/// leading `*.`) and `.ports`. The two dimensions compose the way the baseline
+/// composes them:
+///
+/// - the PORT dimension is a constraint on both doors, so a declared port list
+///   refuses any other port;
+/// - the ADDRESS and HOSTNAME rules are two doors and either admits, because a
+///   reader who names both an address and a name means "these are what I allow".
+///
+/// A dimension the preset did not declare is not a constraint, so a preset that
+/// names only a host does not silently also require a port.
 pub const PRESET_EGRESS_REGO: &str = r#"package policy.preset_egress
 
-# rule: preset-egress
-verdict := {"allow": false, "rule": "preset-egress", "reason": "the resolved address is outside the preset's egress scope"} if {
+# Two named refusals so a reader learns WHICH dimension of the preset refused:
+# the port list first (it constrains both doors), then the address and hostname
+# doors together. Each repeats the preset id, so the audit and the refusal both
+# name the preset that decided as well as the rule.
+# rule: preset-egress-port-not-allowed
+verdict := {"allow": false, "rule": "preset-egress-port-not-allowed", "reason": preset_refusal(" allows only its listed ports")} if {
     input.action == "egress"
     data.preset_egress.restricted
-    not allowed(input.target.ip)
+    not preset_port_allowed(input.target.port)
+# rule: preset-egress-not-allowed
+} else := {"allow": false, "rule": "preset-egress-not-allowed", "reason": preset_refusal(" does not allow this destination")} if {
+    input.action == "egress"
+    data.preset_egress.restricted
+    not allowed
 } else := {"allow": true}
 
-allowed(ip) if {
-    some entry in data.preset_egress.allowlist
-    entry == ip
+# The reason names the preset that decided, so a refusal and its audit row both
+# say WHICH preset refused and not only which rule. A decision with no preset
+# named (an empty input.preset) falls back to the rule-level wording rather than
+# printing an empty name.
+preset_refusal(tail) := concat("", ["preset '", input.preset, "'", tail]) if {
+    input.preset != ""
 }
 
-allowed(ip) if {
+preset_refusal(_tail) := "the preset's egress scope refuses this destination" if {
+    input.preset == ""
+}
+
+# Allowed when the preset declared at least one rule AND every declared
+# dimension is satisfied: the port list constrains both doors, and the address
+# and hostname rules are alternative doors.
+#
+# The `declares_anything` term is what makes a DECLARED EMPTY list deny all. A
+# declared empty list is the preset saying "no network"; without this term the
+# per-dimension rules below would each read an empty list as "no constraint"
+# and wave everything through.
+allowed if {
+    declares_anything
+    preset_port_allowed(input.target.port)
+    preset_door_allowed
+}
+
+declares_anything if {
+    count(data.preset_egress.allowlist) > 0
+}
+
+declares_anything if {
+    count(data.preset_egress.hosts) > 0
+}
+
+declares_anything if {
+    count(data.preset_egress.ports) > 0
+}
+
+# A preset that declares no ports leaves the port dimension open.
+preset_port_allowed(_port) if {
+    count(data.preset_egress.ports) == 0
+}
+
+preset_port_allowed(port) if {
+    some declared in data.preset_egress.ports
+    declared == port
+}
+
+# A preset that declares no address and no hostname leaves the door open;
+# otherwise one of the two doors must admit.
+preset_door_allowed if {
+    count(data.preset_egress.allowlist) == 0
+    count(data.preset_egress.hosts) == 0
+}
+
+preset_door_allowed if {
+    preset_address_allowed
+}
+
+preset_door_allowed if {
+    preset_host_allowed
+}
+
+preset_address_allowed if {
+    some entry in data.preset_egress.allowlist
+    entry == input.target.ip
+}
+
+preset_address_allowed if {
     some entry in data.preset_egress.allowlist
     contains(entry, "/")
-    net.cidr_contains(entry, ip)
+    net.cidr_contains(entry, input.target.ip)
+}
+
+# The hostname door is the weaker one and the hostname is a hint, not the unit
+# the decision is made on: it is only consulted because the preset named it.
+preset_host_allowed if {
+    some entry in data.preset_egress.hosts
+    preset_host_matches(lower(input.target.host), lower(entry))
+}
+
+preset_host_matches(host, entry) if {
+    entry == host
+}
+
+preset_host_matches(host, entry) if {
+    startswith(entry, "*.")
+    endswith(host, substring(entry, 1, -1))
 }
 "#;
 
