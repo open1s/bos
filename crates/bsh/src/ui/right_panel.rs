@@ -19,14 +19,14 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use gpui_kit::component::diff::{Diff, DiffEvent, DiffMode, DiffState};
+use gpui_kit::component::diff::{Diff, DiffEvent, DiffFile, DiffMode, DiffState};
 use gpui_kit::component::input::{
     Editor, EditorState, Input, InputEvent, InputState, Textarea, TextareaState,
 };
 use gpui_kit::Focusable;
 use gpui_kit::*;
 
-use super::diff_pane;
+use super::diff_pane::{self, DiffSource};
 use super::shell::{Shell, SideDrag};
 use super::{hairline_left, handle_bar, icon, txt, DivExt, IconName};
 use crate::files::{self, Kind};
@@ -696,7 +696,10 @@ impl Shell {
                 let body = self.right_panel_body(cx);
                 let took = started.elapsed();
                 if took.as_millis() >= 2 {
-                    eprintln!("BSHPROBE right_panel_body {:?} tab={:?}", took, self.right.tab);
+                    eprintln!(
+                        "BSHPROBE right_panel_body {:?} tab={:?}",
+                        took, self.right.tab
+                    );
                 }
                 body
             });
@@ -1909,6 +1912,7 @@ impl Shell {
         let name = row.name.clone();
         let dir = row.dir;
         let rel_click = rel.to_path_buf();
+        let rel_diff = rel.to_path_buf();
         let rel_rename = rel.to_path_buf();
         let rel_delete = rel.to_path_buf();
         let rel_toggle = rel.to_path_buf();
@@ -1987,6 +1991,33 @@ impl Shell {
                     .flex_row()
                     .items_center()
                     .gap(px(2.0))
+                    // A directory has nothing to compare, so the action is a file's
+                    // only. It is the pane's entry point: the Diff tab alone can
+                    // never load anything, because a comparison needs a FILE.
+                    .when(!dir, |strip| {
+                        strip.child(
+                            div()
+                                .debug_selector(|| format!("diff-{}", row.name))
+                                .id(SharedString::from(format!("diff-{}", row.name.clone())))
+                                .px(px(4.0))
+                                .rounded(px(4.0))
+                                .cursor_pointer()
+                                .opacity(0.0)
+                                .group_hover(row_group.clone(), |s| s.opacity(1.0))
+                                .hover(|s| s.bg(rgb(theme::hover())))
+                                .child(icon(IconName::GitCompareArrows, 12.0, theme::faint()))
+                                .on_click({
+                                    let shell = shell.clone();
+                                    let rel = rel_diff.clone();
+                                    move |_event, _window, cx| {
+                                        cx.stop_propagation();
+                                        shell.update(cx, |this, cx| {
+                                            this.open_diff(&rel, cx);
+                                        });
+                                    }
+                                }),
+                        )
+                    })
                     .child(
                         div()
                             .id(rename_id)
@@ -3517,61 +3548,139 @@ impl Shell {
     ///
     /// The pane is reached by OPENING A FILE, not by a separate "pick a file"
     /// flow: a `.diff`/`.patch` opens as the patch it is, a conflicted file
-    /// opens as the merge it is, and any other file opens as itself so the pane
-    /// never shows a blank surface for a file the reader asked about.
+    /// opens as the merge it is, and any other file opens against its committed
+    /// text so the pane never shows a blank surface for a file the reader asked
+    /// about.
+    ///
+    /// The READ happens on the runner's runtime, not here: a large file plus the
+    /// two git subprocesses behind a real comparison are exactly the work that
+    /// would stall the window on a click. The pane is focused first so the press
+    /// has an immediate answer, then the result lands.
     pub(crate) fn open_diff(&mut self, rel: &Path, cx: &mut Context<Self>) {
         let Some(root) = self.state.workspace_root() else {
-            self.right.diff.error = Some(self.state.lang.tr("right.files.noWorkspace"));
-            self.right.tab = Some(RightTab::Diff);
-            self.right.open = true;
-            cx.notify();
+            self.diff_refused("right.files.noWorkspace", cx);
             return;
         };
-        let Some(path) = files::resolve(&root, rel) else {
-            self.right.diff.error = Some(self.state.lang.tr("right.files.outside"));
-            self.right.tab = Some(RightTab::Diff);
-            self.right.open = true;
-            cx.notify();
-            return;
-        };
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                self.right.diff.error = Some(io_msg(&error));
-                self.right.tab = Some(RightTab::Diff);
-                self.right.open = true;
-                cx.notify();
-                return;
-            }
-        };
-        // The bound is the editor's own: a patch is a document like any other,
-        // and a 40MB one would be pasted into a row list.
-        if bytes.len() as u64 > files::MAX_OPEN_BYTES {
-            self.right.diff.error = Some(self.state.lang.tr("diff.oversized"));
-            self.right.tab = Some(RightTab::Diff);
-            self.right.open = true;
-            cx.notify();
+        if files::resolve(&root, rel).is_none() {
+            self.diff_refused("right.files.outside", cx);
             return;
         }
+        // Answer the click now: the pane is where the result is going.
+        self.right.tab = Some(RightTab::Diff);
+        self.right.open = true;
+        self.right.diff.error = None;
+        cx.notify();
+        let rel = rel.to_path_buf();
+        // The GPUI background executor, not the runner's tokio runtime: this is
+        // work the window started, and this executor is the one the test
+        // scheduler can drive deterministically. A tokio runtime runs on threads
+        // the harness refuses to see activity from.
+        let loading = cx.background_executor().spawn({
+            let root = root.clone();
+            let rel = rel.clone();
+            async move { diff_pane::read_for(&root, &rel) }
+        });
         let label = rel.to_string_lossy().to_string();
-        let (mut parsed, source) = match diff_pane::load(&label, &bytes) {
-            Ok(loaded) => loaded,
-            Err(key) => {
-                self.right.diff.error = Some(self.state.lang.tr(key));
-                self.right.tab = Some(RightTab::Diff);
-                self.right.open = true;
-                cx.notify();
-                return;
-            }
-        };
-        // The file table is shared with the editor, so a patch of a `.tsx` is
-        // highlighted as one and the two surfaces cannot disagree.
+        cx.spawn(async move |this, cx| {
+            let loaded = loading.await;
+            let _ = this.update(cx, |this, cx| match loaded {
+                Ok(loaded) => match diff_pane::classify(
+                    &label,
+                    &loaded.bytes,
+                    loaded.git.as_deref(),
+                    loaded.untracked,
+                ) {
+                    Ok((parsed, source)) => {
+                        this.present_comparison(&rel, parsed, source, cx);
+                    }
+                    Err(key) => this.diff_refused(key, cx),
+                },
+                Err(diff_pane::LoadFailure::Key(key)) => this.diff_refused(key, cx),
+                Err(diff_pane::LoadFailure::Io(error)) => {
+                    this.diff_refused_text(io_msg(&error), cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Put a refusal on the comparison pane and focus it.
+    fn diff_refused(&mut self, key: &'static str, cx: &mut Context<Self>) {
+        let text = self.state.lang.tr(key);
+        self.diff_refused_text(text, cx);
+    }
+
+    /// The same refusal when the message is already built.
+    fn diff_refused_text(&mut self, text: String, cx: &mut Context<Self>) {
+        self.right.diff.error = Some(text);
+        self.right.tab = Some(RightTab::Diff);
+        self.right.open = true;
+        cx.notify();
+    }
+
+    /// Highlight and show a comparison parsed for a workspace file.
+    ///
+    /// The language table is the editor's own, so a patch of a `.tsx` is
+    /// highlighted as one and the two surfaces cannot disagree.
+    fn present_comparison(
+        &mut self,
+        rel: &Path,
+        parsed: Vec<DiffFile>,
+        source: DiffSource,
+        cx: &mut Context<Self>,
+    ) {
+        let mut parsed = parsed;
         if let Some(language) = diff_pane::language_for(rel) {
             parsed = parsed
                 .into_iter()
                 .map(|file| file.with_language(language))
                 .collect();
         }
+        self.show_comparison(rel.to_path_buf(), parsed, source, cx);
+    }
+
+    /// Open a comparison that was built rather than read from a file.
+    ///
+    /// This is the CHAT side's entry point: a step that wrote a file knows the
+    /// change it asked for, and `diff_pane::patch_for` turns that into a patch
+    /// the kit parses. The pane is the same one a `.patch` file opens, so a
+    /// request and a file are read the same way. The source is always
+    /// read-only here, because a request is not a document that can be saved
+    /// back over itself.
+    pub(crate) fn open_diff_text(&mut self, label: &str, patch: &str, cx: &mut Context<Self>) {
+        let files = match DiffFile::parse(patch) {
+            Ok(files) if !files.is_empty() => files,
+            _ => {
+                self.right.diff.error = Some(self.state.lang.tr("diff.error"));
+                self.right.tab = Some(RightTab::Diff);
+                self.right.open = true;
+                cx.notify();
+                return;
+            }
+        };
+        let path = PathBuf::from(label);
+        let files = match diff_pane::language_for(&path) {
+            Some(language) => files
+                .into_iter()
+                .map(|file| file.with_language(language))
+                .collect(),
+            None => files,
+        };
+        self.show_comparison(path, files, DiffSource::Patch, cx);
+    }
+
+    /// Put a parsed comparison on screen and focus the pane.
+    ///
+    /// Every arrival - a file, a conflict, a request - ends here, so the tab,
+    /// the resolution subscription and the conflict bookkeeping cannot drift
+    /// between the paths that open one.
+    fn show_comparison(
+        &mut self,
+        path: PathBuf,
+        parsed: Vec<DiffFile>,
+        source: DiffSource,
+        cx: &mut Context<Self>,
+    ) {
         let conflicts: usize = parsed.iter().map(|file| file.conflicts().len()).sum();
         let mode = diff_pane::mode_of(&self.state.settings.global.general.diff_mode);
         let files = parsed.clone();
@@ -3580,8 +3689,6 @@ impl Shell {
             state.set_mode(mode, cx);
             state
         });
-        // The pane has to know when a conflict is resolved, because the save
-        // control appears only once nothing is left unresolved.
         // The pane has to know when a conflict is resolved, because the save
         // control appears only once nothing is left unresolved. Reading it off
         // the state is what keeps a resolution made by the kit's own commands
@@ -3604,7 +3711,7 @@ impl Shell {
         })
         .detach();
         self.right.diff.state = Some(state);
-        self.right.diff.path = Some(rel.to_path_buf());
+        self.right.diff.path = Some(path);
         self.right.diff.source = Some(source);
         self.right.diff.error = None;
         self.right.diff.conflicts = conflicts;
@@ -3718,7 +3825,24 @@ impl Shell {
                         .gap(px(6.0))
                         .px(px(theme::RIGHT_PAD))
                         .child(icon(IconName::GitCompareArrows, 22.0, theme::faint()))
-                        .child(txt(lang.tr("diff.empty"), theme::CHIP_SIZE, theme::muted())),
+                        .child(txt(lang.tr("diff.empty"), theme::CHIP_SIZE, theme::text()))
+                        // Name the two ways a comparison arrives. A pane that
+                        // only says it is empty is the reason this surface read
+                        // as unreachable: the reader had no way to know the tab
+                        // needs a FILE, not a setting.
+                        .child(
+                            div()
+                                .debug_selector(|| String::from("diff-empty-hint"))
+                                .px(px(20.0))
+                                .child(
+                                    txt(
+                                        lang.tr("diff.emptyHint"),
+                                        theme::CHIP_SIZE,
+                                        theme::faint(),
+                                    )
+                                    .line_height(px(17.0)),
+                                ),
+                        ),
                 )
                 .children(self.right.diff.error.clone().map(|error| {
                     txt(error, theme::CHIP_SIZE, theme::error())
@@ -3727,6 +3851,124 @@ impl Shell {
                 .into_any_element();
         };
         let wrap = self.state.settings.global.general.diff_wrap;
+        let mode = self.right.diff.mode;
+        let name = self
+            .right
+            .diff
+            .path
+            .as_ref()
+            .map(|path| diff_pane::display_name(path))
+            .unwrap_or_default();
+        // The counts are the pane's own title detail: a file row already says
+        // the path, so the header spends the space on what changed.
+        let (added, deleted) = {
+            let document = state.read(cx);
+            document
+                .files()
+                .iter()
+                .fold((0usize, 0usize), |(a, d), file| {
+                    (a + file.additions(), d + file.deletions())
+                })
+        };
+        // A merge can be written back, and only once nothing is left
+        // unresolved: a partially merged file is not a merge. The predicate is
+        // `DiffView`'s own so the control and the handler cannot disagree.
+        let mergeable = self.right.diff.is_merge();
+        let chip = |id: &'static str, label: String, on: bool| {
+            let hover = label.clone();
+            div()
+                .debug_selector(move || id.to_string())
+                .id(SharedString::from(id))
+                .h(px(20.0))
+                .px(px(7.0))
+                .flex()
+                .items_center()
+                .flex_none()
+                .rounded(px(6.0))
+                .cursor_pointer()
+                .when(on, |cell| cell.bg(rgb(theme::hover())))
+                .child(if on {
+                    txt(label, 11.0, theme::text()).into_any_element()
+                } else {
+                    txt(hover.clone(), 11.0, theme::faint()).into_any_element()
+                })
+        };
+        let header = div()
+            .debug_selector(|| String::from("diff-toolbar"))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .h(px(32.0))
+            .px(px(theme::RIGHT_PAD))
+            .flex_none()
+            .border_b_1()
+            .border_color(rgb(theme::border_soft()))
+            .child(icon(IconName::GitCompareArrows, 13.0, theme::faint()))
+            .child(
+                div()
+                    .debug_selector(|| String::from("diff-title"))
+                    .flex_1()
+                    .min_w_0()
+                    .child(txt(name, 12.0, theme::text()).truncate()),
+            )
+            .when(added > 0, |row| {
+                row.child(txt(format!("+{added}"), 11.0, theme::success()))
+            })
+            .when(deleted > 0, |row| {
+                row.child(txt(format!("\u{2212}{deleted}"), 11.0, theme::error()))
+            })
+            .child(
+                chip(
+                    "diff-mode",
+                    match mode {
+                        DiffMode::Split => self.state.lang.tr("diff.modeSplit"),
+                        _ => self.state.lang.tr("diff.modeUnified"),
+                    },
+                    true,
+                )
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.toggle_diff_mode(cx);
+                })),
+            )
+            .child(
+                chip("diff-wrap", self.state.lang.tr("diff.wrap"), wrap).on_click(cx.listener(
+                    |this, _event, _window, cx| {
+                        this.toggle_diff_wrap(cx);
+                    },
+                )),
+            )
+            .when(mergeable, |row| {
+                row.child(
+                    chip("diff-save", self.state.lang.tr("diff.save"), true).on_click(cx.listener(
+                        |this, _event, _window, cx| {
+                            this.save_merged(cx);
+                        },
+                    )),
+                )
+            })
+            .when(self.right.diff.is_open(), |row| {
+                row.child(
+                    div()
+                        .debug_selector(|| String::from("diff-close"))
+                        .id("diff-close")
+                        .h(px(20.0))
+                        .w(px(20.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .flex_none()
+                        .rounded(px(6.0))
+                        .cursor_pointer()
+                        .hover(|cell| cell.bg(rgb(theme::hover())))
+                        .child(icon(IconName::Close, 11.0, theme::faint()))
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.right.diff.clear();
+                            this.right.diff.error = None;
+                            cx.notify();
+                        })),
+                )
+            });
         let mut body = div()
             .debug_selector(|| String::from("diff-body"))
             .flex_1()
@@ -3741,7 +3983,7 @@ impl Shell {
         if let Some(error) = self.right.diff.error.clone() {
             body = body.child(txt(error, theme::CHIP_SIZE, theme::error()));
         }
-        pane.child(body).into_any_element()
+        pane.child(header).child(body).into_any_element()
     }
 }
 

@@ -209,11 +209,14 @@ impl PackageMeta {
                         .map(crate::mcp::ExtensionMcp::launch)
                         .collect();
                 // Read before the struct literal takes the fields by move.
-                let loaded_capabilities: Vec<String> = extension
-                    .loaded_capabilities()
-                    .into_iter()
-                    .map(|capability| capability.as_str().to_string())
-                    .collect();
+                // What this shell can put in front of the reader: the
+                // contributions that loaded, minus the kinds bsh has no
+                // surface for.
+                let loaded_capabilities: Vec<String> =
+                    crate::caps::surfaced_capabilities(&extension.loaded_capabilities())
+                        .into_iter()
+                        .map(|capability| capability.as_str().to_string())
+                        .collect();
                 (
                     Some(Self {
                         name: extension.id,

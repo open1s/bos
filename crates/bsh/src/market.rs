@@ -99,6 +99,15 @@ pub(crate) struct MarketPlugin {
     /// Search keywords (remote indexes declare these).
     pub(crate) keywords: Vec<String>,
     /// Declared capabilities: what the package says it does.
+    ///
+    /// Deliberately NOT drawn. A DSH package declares tools or models in its
+    /// manifest and delivers none, so printing the declaration would tell the
+    /// reader it can select a model it cannot; `loaded_capabilities` carries
+    /// what actually arrived and is what the row shows. The declaration is kept
+    /// because it is what the manifest said, which is the fact a later
+    /// declared-versus-surfaced comparison would need - and until that exists,
+    /// nothing may read it.
+    #[allow(dead_code)]
     pub(crate) capabilities: Vec<Capability>,
     /// The capabilities that actually loaded, which is what the row's chip line
     /// draws.
@@ -194,7 +203,8 @@ fn add_candidate(
             // Read the loaded set before the fields are moved out of the
             // extension, so the row's chips can say what arrived while the
             // refusal pill says what did not.
-            let loaded_capabilities = extension.loaded_capabilities();
+            let loaded_capabilities =
+                crate::caps::surfaced_capabilities(&extension.loaded_capabilities());
             scan.plugins.push(MarketPlugin {
                 id: extension.id,
                 name: extension.name,

@@ -334,6 +334,25 @@ pub(crate) fn output_body(output: &str) -> String {
     }
     trimmed
 }
+impl Shell {
+    /// The text a step's path holds on disk now, when it can be read.
+    ///
+    /// A step records the path the model wrote, which may be absolute; the
+    /// workspace loader resolves relative paths only, so an absolute one inside
+    /// the workspace is trimmed to its relative form first. `None` is the honest
+    /// answer for a file that moved, was deleted, or sits outside the workspace -
+    /// the caller then falls back to the synthetic patch header.
+    pub(crate) fn current_text_of(&self, path: &str) -> Option<String> {
+        let root = self.state.workspace_root()?;
+        let candidate = std::path::Path::new(path);
+        let rel = match candidate.strip_prefix(&root) {
+            Ok(rel) => rel.to_path_buf(),
+            Err(_) => candidate.to_path_buf(),
+        };
+        let bytes = crate::files::read(&root, &rel).ok()?;
+        String::from_utf8(bytes).ok()
+    }
+}
 /// The patch a write or an edit asked for, as `-` / `+` lines.
 ///
 /// This is the SHAPE of the change the model requested, not a disk diff: bsh
@@ -785,7 +804,6 @@ impl TranscriptLayout {
     fn height(&self, index: usize) -> Option<f32> {
         self.heights.get(index).copied().flatten()
     }
-
 }
 
 /// Whether a message row carries images.
@@ -2672,6 +2690,58 @@ impl Shell {
                     cx.notify();
                 })),
         );
+        // A step that wrote or edited a file can open its change in the Diff
+        // pane. The patch is the one the REQUEST carried - bsh keeps no
+        // before-image - so the pane shows what the step asked for, which is
+        // the same shape the row already previews inline.
+        if let Some(lines) = tool_diff(&name, &args) {
+            if let Some(path) = tool_path(&args) {
+                // The change has usually landed, so the hunk is LOCATED in the
+                // file as it is now: real line numbers and real context, not the
+                // synthetic `@@ -1,N` a request alone can justify. A file that
+                // cannot be read falls back to that synthetic header rather than
+                // refusing to open.
+                let current = self.current_text_of(&path);
+                let patch = match current {
+                    Some(text) => crate::ui::diff_pane::patch_for_located(&path, &lines, &text)
+                        .or_else(|| crate::ui::diff_pane::patch_for(&path, &lines)),
+                    None => crate::ui::diff_pane::patch_for(&path, &lines),
+                };
+                if let Some(patch) = patch {
+                    let label = path.clone();
+                    row = row.child(
+                        div()
+                            .debug_selector(move || {
+                                format!("view-diff-{message_index}-{tool_index}")
+                            })
+                            .id(SharedString::from(format!(
+                                "view-diff-{message_index}-{tool_index}"
+                            )))
+                            .ml(px(10.0))
+                            .mb(px(4.0))
+                            .px(px(7.0))
+                            .h(px(22.0))
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .gap(px(5.0))
+                            .rounded(px(6.0))
+                            .cursor_pointer()
+                            .hover(|chip| chip.bg(rgb(theme::hover())))
+                            .child(icon(IconName::GitCompareArrows, 11.0, theme::muted()))
+                            .child(txt(
+                                tr(lang, "chat.viewDiff"),
+                                theme::CHIP_SIZE,
+                                theme::muted(),
+                            ))
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                cx.stop_propagation();
+                                this.open_diff_text(&label, &patch, cx);
+                            })),
+                    );
+                }
+            }
+        }
         // A step with no recorded arguments and no output used to unfold to nothing,
         // so a press looked ignored. Say so instead.
         if open && args.trim().is_empty() && output.is_none() {

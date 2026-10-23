@@ -23,6 +23,39 @@ use crate::plugins::{self, PluginInfo};
 use crate::settings::{Effective, Settings};
 use crate::vault::{self, Vault, VaultError};
 
+/// The capabilities this shell can actually put in front of the reader.
+///
+/// A package that loads is not the same as a package that is usable here. The
+/// registry accepts every contribution kind, but bsh draws four of them: a
+/// package's tools become model-facing tools, its hooks become agent plugins,
+/// its skills become skill manifests, and its providers become entries in the
+/// model picker.
+///
+/// The other three land in the host registry and stop there. A command is
+/// registered but bsh's composer palette is a fixed list, so a reader never
+/// sees it; a panel is registered but nothing renders a registry panel; a
+/// prompt has no consumer at all. Listing them beside the four that work
+/// would put a capability chip on a control the reader cannot reach, which is
+/// the same lie as declaring a capability that never loaded.
+///
+/// The filter is a pure function of the loaded set, so it cannot drift from
+/// what the registry holds.
+pub(crate) fn surfaced_capabilities(
+    loaded: &[agent::extensions::Capability],
+) -> Vec<agent::extensions::Capability> {
+    use agent::extensions::Capability;
+    loaded
+        .iter()
+        .copied()
+        .filter(|capability| {
+            matches!(
+                capability,
+                Capability::Tools | Capability::Hooks | Capability::Skills | Capability::Models
+            )
+        })
+        .collect()
+}
+
 /// Lower one extension package's declared model providers onto this shell's
 /// provider node.
 ///
@@ -1875,8 +1908,8 @@ fn open_memory(settings: &Settings) -> Option<Arc<dyn MemoryStore>> {
 mod tests {
     use super::{
         agent_messages, allows_writes, build_agent, compactable_span, is_confined,
-        plugin_provider_node, refresh_plugin_providers, tool_gates_for, BuiltAgent, FULL_ACCESS,
-        READ_ONLY, WORKSPACE_WRITE,
+        plugin_provider_node, refresh_plugin_providers, surfaced_capabilities, tool_gates_for,
+        BuiltAgent, FULL_ACCESS, READ_ONLY, WORKSPACE_WRITE,
     };
     use crate::settings::global::{ModelEntry, Preset};
     use crate::settings::resolve::SessionChoice;
@@ -4366,5 +4399,42 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         );
 
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+    /// A capability chip has to name something the reader can reach.
+    ///
+    /// The registry accepts commands, panels and prompts, but bsh draws
+    /// none of them: the composer palette is a fixed list, nothing renders a
+    /// registry panel, and a prompt has no consumer. Listing them would put a
+    /// chip on a control that does not exist.
+    #[test]
+    fn only_the_capabilities_this_shell_draws_are_surfaced() {
+        use agent::extensions::Capability;
+
+        let loaded = vec![
+            Capability::Tools,
+            Capability::Hooks,
+            Capability::Skills,
+            Capability::Models,
+            Capability::Commands,
+            Capability::Panels,
+            Capability::Prompts,
+        ];
+        assert_eq!(
+            surfaced_capabilities(&loaded),
+            vec![
+                Capability::Tools,
+                Capability::Hooks,
+                Capability::Skills,
+                Capability::Models
+            ],
+            "the four kinds bsh draws survive, and the three it does not are dropped"
+        );
+
+        // A package whose whole payload was refused surfaces nothing, which is
+        // what the row beside its refusal disclosure has to say.
+        assert!(
+            surfaced_capabilities(&[]).is_empty(),
+            "nothing loaded means nothing to claim"
+        );
     }
 }

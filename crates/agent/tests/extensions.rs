@@ -267,6 +267,7 @@ fn discovery_reads_both_standards_and_skips_other_directories() {
         installed,
         vec![
             "@local/dsh-echo".to_string(),
+            "@local/dsh-script-only".to_string(),
             "@local/dsh-zen".to_string(),
             "codex-deploy".to_string()
         ]
@@ -276,7 +277,7 @@ fn discovery_reads_both_standards_and_skips_other_directories() {
         registry
             .by_standard(ExtensionStandard::DeepSeekHarness)
             .len(),
-        2,
+        3,
         "the echo fixture and the model-provider fixture"
     );
 }
@@ -509,15 +510,8 @@ fn the_loaded_capabilities_follow_the_contributions() {
     );
     assert_eq!(
         extension.loaded_capabilities(),
-        vec![Capability::Models],
-        "the declarative provider is the one capability that loaded"
-    );
-
-    // The package also ships a web client entry, which is refused, so it adds
-    // no panel: a client module is browser code and this host is native.
-    assert!(
-        !extension.loaded_capabilities().contains(&Capability::Panels),
-        "a refused client entry delivers no panel"
+        vec![Capability::Models, Capability::Panels],
+        "the declarative provider and the client declaration both landed"
     );
 }
 

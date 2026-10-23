@@ -81,6 +81,33 @@ fn draw_until(
     );
 }
 
+/// Wait for work that finishes OFF the UI thread.
+///
+/// `draw_until` pumps frames, which is right for anything a frame produces. A
+/// comparison load runs on the runner's runtime - a file read plus two git
+/// subprocesses - so frames alone can outrun it; this interleaves short sleeps
+/// and gives up on a wall-clock deadline instead of a frame count.
+fn draw_until_settled(
+    cx: &mut VisualTestContext,
+    what: &str,
+    mut predicate: impl FnMut(&mut VisualTestContext) -> bool,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        // `run_until_parked` is what POLLS the spawned future: a frame alone
+        // draws, it does not drive the executor the completion lands on.
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        if predicate(cx) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "draw_until_settled: `{what}` still did not hold after 10s"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
 /// Press the same spot twice with NO frame in between.
 ///
 /// The tree reads a double-click from wall-clock time (`SELF_DOUBLE_MS`),
@@ -13072,6 +13099,164 @@ fn the_inspect_link_opens_the_call_in_the_trajectory(cx: &mut TestAppContext) {
         "with its panel open"
     );
 }
+/// The Files tab carries the action that FEEDS the comparison pane. The Diff
+/// tab on its own can never load anything, because a comparison needs a file
+/// and that tab has no picker - which is why the surface read as unreachable.
+#[gpui::test]
+fn a_file_row_opens_the_comparison_pane(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("right-diff-row");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    let toggle = cx
+        .debug_bounds("hdr-show-right-panel")
+        .expect("the header carries the right panel's toggle");
+    cx.simulate_click(toggle.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let card = cx
+        .debug_bounds("right-card-right.tab.files")
+        .expect("the Files card renders");
+    cx.simulate_click(card.center(), Modifiers::default());
+    draw_until(cx, "the tree renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("diff-README.md").is_some()
+    });
+
+    let action = cx
+        .debug_bounds("diff-README.md")
+        .expect("the README row carries its diff control");
+    cx.simulate_click(action.center(), Modifiers::default());
+    draw_until_settled(cx, "the comparison opens", |cx| {
+        cx.update(|_, cx| shell.read(cx).right.diff.is_open())
+    });
+
+    let (tab, open) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (shell.right.tab, shell.right.open)
+    });
+    assert_eq!(
+        tab,
+        Some(crate::ui::right_panel::RightTab::Diff),
+        "the panel switches to the comparison"
+    );
+    assert!(open, "and stays open");
+    // A plain file with no patch opens as itself rather than as nothing, so
+    // the pane answers "is this file dirty?" instead of going blank.
+    assert!(cx.debug_bounds("diff-body").is_some(), "the file is drawn");
+}
+
+/// A step that wrote a file can open its change in the Diff pane: the chat
+/// A step that wrote a file can open its change in the Diff pane: the chat
+/// side's entry point. Without it the Diff tab could never load anything,
+/// because a comparison needs a file and the tab has no file picker.
+#[gpui::test]
+fn a_write_step_opens_its_change_in_the_diff_pane(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("view-diff", 2);
+        tests_pin_reference_defaults(&mut state);
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id) {
+            session.messages[1].tools.push(crate::model::ToolEvent {
+                name: "edit_file".to_string(),
+                args:
+                    r#"{"path":"src/lib.rs","old_string":"let a = 1;","new_string":"let a = 2;"}"#
+                        .to_string(),
+                output: Some("ok".to_string()),
+                ms: Some(5),
+                at: None,
+            });
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    // The premise: nothing is on the comparison surface yet.
+    assert!(
+        cx.update(|_, cx| !shell.read(cx).right.diff.is_open()),
+        "the pane starts empty"
+    );
+    let chip = cx
+        .debug_bounds("view-diff-1-0")
+        .expect("the step offers its diff");
+    cx.simulate_click(chip.center(), Modifiers::default());
+    draw_until(cx, "the comparison opens", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| shell.read(cx).right.diff.is_open())
+    });
+
+    let (tab, open, conflicts) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (
+            shell.right.tab,
+            shell.right.open,
+            shell.right.diff.conflicts,
+        )
+    });
+    assert_eq!(
+        tab,
+        Some(crate::ui::right_panel::RightTab::Diff),
+        "the panel switches to the comparison"
+    );
+    assert!(open, "and the panel is on screen");
+    assert_eq!(conflicts, 0, "a patch carries no conflict to resolve");
+    // The surface a reader lands on is usable, not an empty box.
+    assert!(cx.debug_bounds("diff-body").is_some(), "the diff renders");
+    assert!(
+        cx.debug_bounds("diff-toolbar").is_some(),
+        "with its mode and wrap controls"
+    );
+    assert!(
+        cx.debug_bounds("diff-title").is_some(),
+        "and a title naming the file"
+    );
+}
+
+/// The Diff tab alone cannot load anything: a comparison needs a FILE. This is
+/// the path the Files tab's action takes - a patch on disk opened as itself.
+#[gpui::test]
+fn a_patch_file_opens_as_a_comparison(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("diff-file", 1);
+        tests_pin_reference_defaults(&mut state);
+        let root = state.workspace_root().expect("a workspace root");
+        std::fs::write(
+            root.join("change.patch"),
+            "--- a/lib.rs\n+++ b/lib.rs\n@@ -1,1 +1,1 @@\n-let a = 1;\n+let a = 2;\n",
+        )
+        .expect("the fixture");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_diff(std::path::Path::new("change.patch"), cx);
+        });
+    });
+    draw_until_settled(cx, "the patch opens", |cx| {
+        cx.debug_bounds("diff-body").is_some()
+    });
+    let (tab, conflicts) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (shell.right.tab, shell.right.diff.conflicts)
+    });
+    assert_eq!(tab, Some(crate::ui::right_panel::RightTab::Diff));
+    assert_eq!(conflicts, 0, "a patch has no conflict to resolve");
+    assert!(
+        cx.debug_bounds("diff-error").is_none(),
+        "and it loaded without an error"
+    );
+}
+
+/// A call that started while another was still running is a SUBTOOL, indented
 /// A call that started while another was still running is a SUBTOOL, indented
 /// under it. The nesting is derived from the recorded times, so it needs no
 /// parent column and works on logs already on disk.
