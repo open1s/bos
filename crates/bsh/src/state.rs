@@ -820,6 +820,31 @@ impl AppState {
         self.settings.effective_for(&self.session_choice(id))
     }
 
+    /// The sandbox spec the shell and the terminal share for this turn.
+    ///
+    /// The terminal pane is not a tool: it has no per-turn build, so it derives
+    /// the spec from the live policy and the session on screen instead - the
+    /// same policy, the same permission, a different tool name. Reading it here
+    /// rather than building one in the pane is what keeps the two spawn paths
+    /// on one description of what the turn may touch.
+    ///
+    /// None when no policy has been compiled yet: a pane opened before the
+    /// first build has nothing to derive from, and inventing a default would
+    /// be exactly the second source of truth this seam exists to remove.
+    pub(crate) fn sandbox_spec(&self, tool: &str) -> Option<Arc<agent::sandbox::SandboxSpec>> {
+        let policy = self.policy.clone()?;
+        let eff = self.effective();
+        Some(Arc::new(agent::sandbox::SandboxSpec::for_policy(
+            &policy,
+            &eff.permission.effective,
+            agent::sandbox::Principal::new(
+                tool,
+                self.active_id.clone().unwrap_or_default(),
+                eff.preset_id,
+            ),
+        )))
+    }
+
     /// The values a build for the session on screen uses.
     ///
     /// No session at all reads as no choice, which is also what a session that

@@ -1379,8 +1379,15 @@ impl Shell {
                 text.push_str(": ");
                 text.push_str(reason);
             }
+            // A refused start spawned nothing, so there is no shell whose
+            // confinement could be described: the refusal is the whole line.
             return Some((text, true));
         }
+        // A RUNNING shell carries no chrome: the pane's status line is for what
+        // went wrong, and a standing warning band under a working shell would be
+        // prose explaining state. The sandbox answer reaches the reader two
+        // other ways instead: the shell's own BSH_SANDBOX, and this line while
+        // the pane has something to report (below).
         let mut parts: Vec<String> = Vec::new();
         if let Some(error) = terminal.policy_error() {
             parts.push(format!(
@@ -1422,6 +1429,22 @@ impl Shell {
             if !terminal.refused {
                 text.push_str(" \u{b7} ");
                 text.push_str(&lang.tr("right.terminal.restartHint"));
+            }
+            // A pane that is already speaking says what the spec answered too:
+            // the refusal to confine, or the tier the shell actually ran under.
+            if let Some(note) = terminal.sandbox_note() {
+                text.push_str(" \u{b7} ");
+                text.push_str(&format!(
+                    "{}: {note}",
+                    lang.tr("right.terminal.unsandboxed")
+                ));
+            } else if let Some(label) = terminal.sandbox_label() {
+                text.push_str(" \u{b7} ");
+                text.push_str(&crate::i18n::tr_args(
+                    lang,
+                    "right.terminal.sandboxTier",
+                    &[("tier", label.to_string())],
+                ));
             }
             parts.insert(0, text);
         }
@@ -2890,7 +2913,16 @@ impl Shell {
         }
         if tab == RightTab::Terminal && self.right.terminal.is_none() {
             let cwd = self.state.workspace_root().unwrap_or_default();
-            self.right.terminal = Some(crate::terminal::Terminal::new(cwd, self.state.lang));
+            // The SAME spec the shell tool runs under, derived from the live
+            // policy and the effective permission. The pane cannot be confined
+            // by it today - heel cannot host a caller-owned PTY - so the
+            // terminal records that answer and the status line says it.
+            let spec = self.state.sandbox_spec("terminal");
+            self.right.terminal = Some(crate::terminal::Terminal::new_with_sandbox(
+                cwd,
+                self.state.lang,
+                spec.as_deref(),
+            ));
         }
         // A shell that already printed its first output would otherwise wait for
         // the next tick, so take the copy the spawn produced right away.
@@ -2925,6 +2957,12 @@ impl Shell {
             if let Some(terminal) = self.right.terminal.as_mut() {
                 terminal.resize(frame.cols, frame.rows);
             }
+        }
+        // A shell that exited is noticed here rather than only by the reader:
+        // the pane keeps a slave description open for a sandboxed shell, so the
+        // master does not EOF on its own. The child is the authority.
+        if let Some(terminal) = self.right.terminal.as_mut() {
+            terminal.poll();
         }
         let Some(terminal) = self.right.terminal.as_ref() else {
             return;

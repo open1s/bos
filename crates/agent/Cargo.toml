@@ -39,12 +39,23 @@ dirs = "7.0.0"
 # default feature makes Engine Send + Sync, so one precompiled engine can sit
 # behind a Mutex and be shared by the sync tool trait.
 regorus = { workspace = true }
+# The sandbox every confined process this crate starts runs in. Optional so the
+# build works when the crate cannot be fetched: with `heel-sandbox` off the
+# shell tool falls back to its own seatbelt profile and nothing else changes.
+heel = { workspace = true, optional = true }
 
 [dev-dependencies]
 ureq = "3.3"
 
 [features]
 internal-api = []
+# One sandbox implementation for the shell tool: heel's SBPL/Landlock/AppContainer
+# backend replaces the hand-written profile, and the grant list is derived from
+# the regorus policy instead of being a constant. ON by default because the
+# adoption is the point; `--no-default-features` is the documented way back to
+# the in-tree profile, and it is a supported build, not an error path.
+default = ["heel-sandbox"]
+heel-sandbox = ["dep:heel"]
 
 [[example]]
 name = "basic_usage"

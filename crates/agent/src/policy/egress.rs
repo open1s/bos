@@ -185,7 +185,7 @@ impl EgressGate {
             let input = PolicyInput::new(
                 self.tool.clone(),
                 Action::Egress,
-                Target::host(host, addr.ip().to_string()),
+                Target::host_on(host, addr.ip().to_string(), port),
             )
             .with_session(self.session.clone())
             .with_preset(self.preset.clone());

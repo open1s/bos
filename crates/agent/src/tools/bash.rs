@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use crate::jobs::{JobRegistry, JobStatus};
 use crate::policy::{Action, PolicyInput, PolicySet, Target};
+use crate::sandbox::{SandboxMode, SandboxSpec, SandboxedChild};
 use crate::security::WorkspaceValidator;
 use react::tool::{Tool, ToolError};
 use serde::{Deserialize, Serialize};
@@ -97,10 +98,15 @@ pub struct BashTool {
     config: BashToolConfig,
     validator: Option<WorkspaceValidator>,
     policy: Option<BashPolicy>,
-    /// When set, the command runs under a macOS Seatbelt profile that denies
-    /// writes outside this root (plus temp dirs), so the confinement is
-    /// enforced per syscall rather than only by the lexical scan.
-    sandbox_root: Option<PathBuf>,
+    /// When set, the command runs inside the sandbox this spec describes.
+    ///
+    /// The spec is the ONE seam the tool and the terminal share: it is built
+    /// from the effective permission and the regorus policy, so the grants a
+    /// command gets are the policy's answers rather than a constant. With the
+    /// heel-sandbox feature on, heel's native backend enforces them; with it
+    /// off the spec still describes them and the in-tree Seatbelt profile is
+    /// the boundary.
+    sandbox: Option<Arc<SandboxSpec>>,
     /// The roster a run_in_background call registers in, when the shell wires
     /// one. Without it the flag is refused rather than silently run foreground.
     jobs: Option<Arc<JobRegistry>>,
@@ -122,7 +128,7 @@ impl BashTool {
             config: BashToolConfig::default(),
             validator: None,
             policy: None,
-            sandbox_root: None,
+            sandbox: None,
             jobs: None,
             job_session: String::new(),
             background: true,
@@ -157,17 +163,31 @@ impl BashTool {
         self
     }
 
-    /// Confine the child with a macOS Seatbelt profile rooted at `root`.
+    /// Confine the child to `root` with the default Workspace Write spec.
     ///
-    /// The profile allows writes under the root, the temp directories and the
-    /// standard device sinks, and explicitly denies the root's `.git` and
-    /// `.bsh` directories. It is applied only when `/usr/bin/sandbox-exec`
-    /// exists; otherwise the lexical scan remains the boundary. The kernel
-    /// enforces this per write syscall, including writes reached through shell
-    /// variables or an interpreter that the lexical scan cannot see.
+    /// This is the policy-free constructor: the grants are the ones a default
+    /// Workspace Write turn gets (the root writable, its build caches writable
+    /// and executable, the toolchain readable and executable) without asking a
+    /// policy. A caller that has a compiled policy should pass the derived spec
+    /// with [BashTool::with_sandbox_spec] instead, so the policy decides.
     pub fn with_sandbox(mut self, root: impl Into<PathBuf>) -> Self {
-        self.sandbox_root = Some(root.into());
+        self.sandbox = Some(Arc::new(SandboxSpec::workspace_write(root)));
         self
+    }
+
+    /// Confine the child with a spec derived from the turn's policy.
+    ///
+    /// This is what the shell wire-up uses, and the same value is handed to the
+    /// terminal's spawn path, so the two cannot disagree about what the turn
+    /// may touch.
+    pub fn with_sandbox_spec(mut self, spec: Arc<SandboxSpec>) -> Self {
+        self.sandbox = Some(spec);
+        self
+    }
+
+    /// The spec this tool runs commands under, when it has one.
+    pub fn sandbox_spec(&self) -> Option<&Arc<SandboxSpec>> {
+        self.sandbox.as_ref()
     }
 
     /// Replace the configuration; a workspace root also installs a validator.
@@ -188,36 +208,62 @@ impl BashTool {
         self
     }
 
-    /// The child command line for one shell invocation, before its pipes.
+    /// Refuse a command whose literal network endpoints the policy denies.
     ///
-    /// With a sandbox root the child is wrapped in sandbox-exec: the profile
-    /// denies writes outside the workspace and temp dirs per syscall, which
-    /// closes the lexical scan's variable/interpreter gap. This is the existing
-    /// per-syscall boundary for a background job too; no new confinement is
-    /// implied by detaching it.
-    fn command_process(&self, command: &str) -> std::process::Command {
-        let mut process = match self.sandbox_root.as_deref().and_then(seatbelt_profile) {
-            Some(profile) => {
-                let mut process = std::process::Command::new("/usr/bin/sandbox-exec");
-                process.args(["-p", profile.as_str(), "/bin/sh", "-c", command]);
-                process
+    /// Every resolved address must be allowed, exactly as the egress gate
+    /// requires: a name that resolves to one allowlisted and one unknown address
+    /// is refused, because the client could pick the unknown one. A name that
+    /// does not resolve is asked as a NAME, so a hostname rule can still admit
+    /// it (an ssh alias, a host only the command's own resolver knows).
+    fn check_network(&self, policy: &BashPolicy, command: &str) -> Result<(), ToolError> {
+        use std::net::ToSocketAddrs as _;
+        for (host, port) in network_targets(command) {
+            let addresses: Vec<String> = (host.as_str(), port)
+                .to_socket_addrs()
+                .map(|addrs| addrs.map(|addr| addr.ip().to_string()).collect())
+                .unwrap_or_default();
+            if addresses.is_empty() {
+                policy.check(&self.name, Action::Egress, Target::host_on(&host, "", port))?;
+                continue;
             }
-            None => {
-                let mut process = std::process::Command::new("sh");
-                process.args(["-c", command]);
-                process
+            for address in addresses {
+                policy.check(
+                    &self.name,
+                    Action::Egress,
+                    Target::host_on(&host, address, port),
+                )?;
             }
-        };
-        if let Some(root) = self
-            .config
-            .workspace_root
-            .as_deref()
-            .map(str::trim)
-            .filter(|root| !root.is_empty())
-        {
-            process.current_dir(root);
         }
-        process
+        Ok(())
+    }
+
+    /// What the command's network could reach, as the spec enforces it.
+    fn network_label(&self) -> &'static str {
+        use crate::sandbox::Egress;
+        match self.sandbox.as_deref() {
+            Some(spec) if !spec.is_confined() => "unrestricted",
+            Some(spec) => match spec.egress() {
+                Egress::DenyAll => "deny-all",
+                Egress::Allow(_) => "allowlist",
+            },
+            None => "unrestricted",
+        }
+    }
+
+    /// Start one shell invocation under this tool's spec, with its output piped.
+    ///
+    /// Every spawn - foreground, background, confined, released - goes through
+    /// here, so there is one place that decides what a command runs inside. With
+    /// no spec the command is bare; with one, the spec's backend starts it and
+    /// the spec's grants are what the kernel enforces.
+    fn spawn_command(&self, command: &str, cwd: &Path) -> Result<SandboxedChild, ToolError> {
+        let spec = match self.sandbox.as_deref() {
+            Some(spec) => spec.clone(),
+            // No spec means Full access: the permission already released
+            // confinement, and a bare shell is that release.
+            None => SandboxSpec::bare(SandboxMode::FullAccess, cwd),
+        };
+        spec.spawn(command, cwd).map_err(ToolError::Failed)
     }
 
     /// Spawn a command without waiting for it, registering it in the roster.
@@ -233,30 +279,23 @@ impl BashTool {
                 "run_in_background is not available: no job registry is configured".to_string(),
             ));
         };
-        let mut process = self.command_process(command);
-        process
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt as _;
-            process.process_group(0);
-        }
-        let mut child = process
-            .spawn()
-            .map_err(|e| ToolError::Failed(e.to_string()))?;
+        let mut child = self.spawn_command(command, cwd)?;
         let pid = child.id();
+        let backend = child.backend();
+        let network = self.network_label();
         let id = jobs.begin_in(self.job_session.clone(), self.name.clone(), command, cwd);
         jobs.set_pid(&id, pid);
-        if let Some(stdout) = child.stdout.take() {
+        if let Some(stdout) = child.take_stdout() {
             pipe_to_jobs(stdout, jobs.clone(), id.clone());
         }
-        if let Some(stderr) = child.stderr.take() {
+        if let Some(stderr) = child.take_stderr() {
             pipe_to_jobs(stderr, jobs.clone(), id.clone());
         }
         let waiter_jobs = jobs.clone();
         let waiter_id = id.clone();
+        // The child moves into the waiter: it carries the sandbox that started
+        // it, and dropping that sandbox kills every process it owns. Detaching
+        // the job must not detach the confinement.
         std::thread::spawn(move || {
             let status = match child.wait() {
                 Ok(status) if status.success() => JobStatus::Succeeded { code: 0 },
@@ -271,6 +310,8 @@ impl BashTool {
             "job_id": id,
             "message": "started in background",
             "pid": pid,
+            "sandbox": backend,
+            "network": network,
             "status": JobStatus::Running.as_str(),
         }))
     }
@@ -287,6 +328,18 @@ pub struct BashExecutionResult {
     pub exit_code: i32,
     /// Whether the process exited successfully.
     pub success: bool,
+    /// The backend that ran the command: "heel", "seatbelt" or "none".
+    ///
+    /// A reader can tell a refusal the sandbox made from a command that simply
+    /// failed, and a test can prove which boundary was actually in force.
+    pub sandbox: String,
+    /// What the command's network could reach: "deny-all", "allowlist" or
+    /// "unrestricted".
+    ///
+    /// Reported beside the backend because a reader asking "did this touch the
+    /// network" needs the answer the sandbox enforced, not an inference from the
+    /// command line.
+    pub network: String,
 }
 
 /// Read one child pipe to the end on its own thread.
@@ -424,6 +477,34 @@ impl Tool for BashTool {
             }
         }
 
+        // The second tier, from the spec rather than from the policy: a target
+        // the derived spec marks as forbidden is refused even when the policy
+        // tier's own answer was reached another way. Under heel this is the
+        // ONLY tier that denies .git and .bsh writes - the backend has no way to
+        // carve a deny out of the workspace grant - so the refusal names the
+        // rule that decided it.
+        if let Some(spec) = self.sandbox.as_deref() {
+            for target in write_targets(command, &cwd) {
+                if let Some(denial) = spec.denies_write(&target) {
+                    return Err(ToolError::Failed(format!(
+                        "sandbox: {} is refused ({})",
+                        target.display(),
+                        denial.describe()
+                    )));
+                }
+            }
+        }
+
+        // The network tier: every endpoint the command literally names is put to
+        // the policy BEFORE a process exists, so a refused connection is a
+        // refusal with a rule rather than a failed command. This is the same
+        // egress question the proxy asks per connection; here it is asked about
+        // a command line, which is also the only network gate the
+        // heel-sandbox-off build has.
+        if let Some(policy) = &self.policy {
+            self.check_network(policy, command)?;
+        }
+
         if let Some(ref _validator) = self.validator {
             if WorkspaceValidator::is_destructive_command(command) {
                 return Err(ToolError::Failed(
@@ -460,20 +541,13 @@ impl Tool for BashTool {
 
         // A command runs in the workspace it is confined to, so `ls` lists the
         // project rather than whatever directory the app was launched from.
-        let mut process = self.command_process(command);
-        process
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let mut child = process
-            .spawn()
-            .map_err(|e| ToolError::Failed(e.to_string()))?;
+        let mut child = self.spawn_command(command, &cwd)?;
+        let backend = child.backend();
         let stdout = child
-            .stdout
-            .take()
+            .take_stdout()
             .map(|pipe| std::thread::spawn(move || drain(pipe)));
         let stderr = child
-            .stderr
-            .take()
+            .take_stderr()
             .map(|pipe| std::thread::spawn(move || drain(pipe)));
 
         // The configured timeout is enforced here: a command that never returns
@@ -487,13 +561,13 @@ impl Tool for BashTool {
                 Ok(None) => {
                     if self.config.timeout_secs > 0 && started.elapsed() >= limit {
                         timed_out = true;
-                        let _ = child.kill();
+                        child.kill();
                         break;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
                 Err(error) => {
-                    let _ = child.kill();
+                    child.kill();
                     return Err(ToolError::Failed(error.to_string()));
                 }
             }
@@ -514,6 +588,8 @@ impl Tool for BashTool {
             stderr: String::from_utf8_lossy(&stderr).to_string(),
             exit_code: status.code().unwrap_or(-1),
             success: status.success(),
+            sandbox: backend.to_string(),
+            network: self.network_label().to_string(),
         };
 
         serde_json::to_value(result).map_err(|e| ToolError::Failed(e.to_string()))
@@ -524,6 +600,130 @@ impl Tool for BashTool {
 const WRITE_COMMANDS: &[&str] = &[
     "touch", "mkdir", "rm", "rmdir", "cp", "mv", "ln", "tee", "truncate", "install", "dd",
 ];
+
+/// The commands whose arguments name a network endpoint.
+///
+/// Only these are scanned. A URL in some other command's argument is not a
+/// connection - refusing "echo https://example.com" would be a false refusal -
+/// and a command that reaches the network through its own configuration (a
+/// package manager's index, a git remote named in .git/config) names no host
+/// here at all. Those are left to the kernel and to the sandbox's proxy, which
+/// see the connection itself rather than a guess about a command line.
+const NETWORK_COMMANDS: &[&str] = &[
+    "curl", "wget", "nc", "ncat", "netcat", "ssh", "scp", "sftp", "telnet", "rsync", "ping",
+];
+
+/// The git subcommands that open a connection, and so may name a host.
+const GIT_NETWORK_SUBCOMMANDS: &[&str] =
+    &["clone", "fetch", "pull", "push", "ls-remote", "submodule"];
+
+/// The endpoints a command line literally names, best effort.
+///
+/// A URL with a scheme yields its host and port (443 or 80 by scheme); an ssh
+/// or rsync destination (`user@host:path`) yields its host and port 22. A
+/// host named only inside a config file is not visible here, which is why this
+/// tier is a guard rail: the sandbox's proxy is the enforcement.
+fn network_targets(command: &str) -> Vec<(String, u16)> {
+    let tokens = shell_tokens(command);
+    let mut targets: Vec<(String, u16)> = Vec::new();
+    let mut index = 0usize;
+    while index < tokens.len() {
+        // The command word is the first token that is neither an assignment nor
+        // a separator.
+        while index < tokens.len()
+            && (tokens[index].contains('=')
+                || matches!(
+                    tokens[index].as_str(),
+                    "|" | "||" | ";" | "&&" | "&" | "(" | ")"
+                ))
+        {
+            index += 1;
+        }
+        let Some(word) = tokens.get(index) else {
+            break;
+        };
+        let name = Path::new(word)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(word.as_str())
+            .to_string();
+        let mut wants_network = NETWORK_COMMANDS.contains(&name.as_str());
+        if name == "git" {
+            wants_network = tokens
+                .get(index + 1)
+                .is_some_and(|sub| GIT_NETWORK_SUBCOMMANDS.contains(&sub.as_str()));
+        }
+        index += 1;
+        while index < tokens.len() {
+            let token = &tokens[index];
+            if matches!(token.as_str(), "|" | "||" | ";" | "&&" | "&") {
+                break;
+            }
+            if wants_network {
+                if let Some(target) = endpoint_in(token) {
+                    if !targets.contains(&target) {
+                        targets.push(target);
+                    }
+                }
+            }
+            index += 1;
+        }
+    }
+    targets
+}
+
+/// The endpoint one argument names, when it names one.
+fn endpoint_in(token: &str) -> Option<(String, u16)> {
+    // A URL: scheme://[user@]host[:port][/path]
+    if let Some((scheme, rest)) = token.split_once("://") {
+        let default_port = match scheme.to_ascii_lowercase().as_str() {
+            "https" => 443,
+            "http" => 80,
+            "ftp" => 21,
+            "ssh" | "git" | "sftp" => 22,
+            _ => return None,
+        };
+        let authority = rest.split('/').next().unwrap_or(rest);
+        let authority = authority.rsplit('@').next().unwrap_or(authority);
+        let (host, port) = split_host_port(authority, default_port)?;
+        return Some((host, port));
+    }
+    // An ssh/rsync destination: [user@]host:path. A bare "word:word" is a
+    // local path far more often than a host, so the ssh form needs a user or a
+    // dotted name; anything else is left to the sandbox, which sees the socket.
+    let (user_host, path) = token.split_once(':')?;
+    if path.is_empty() || path.starts_with("//") || user_host.is_empty() {
+        return None;
+    }
+    let host = user_host.rsplit('@').next().unwrap_or(user_host);
+    if host.is_empty()
+        || host.contains('/')
+        || host.contains(':')
+        || (!user_host.contains('@') && !host.contains('.'))
+    {
+        return None;
+    }
+    let (host, port) = split_host_port(host, 22)?;
+    Some((host, port))
+}
+
+/// Split `host[:port]`, refusing anything that is not a hostname or address.
+fn split_host_port(authority: &str, default_port: u16) -> Option<(String, u16)> {
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => match port.parse::<u16>() {
+            Ok(port) => (host, port),
+            Err(_) => return None,
+        },
+        None => (authority, default_port),
+    };
+    let host = host.trim_matches(['[', ']']);
+    let looks_like_host = !host.is_empty()
+        && !host.starts_with('-')
+        && host.chars().all(|ch| {
+            ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | ':' | '*' | '%')
+        });
+    looks_like_host.then(|| (host.to_ascii_lowercase(), port))
+}
 
 /// Split a shell line into words and the operators the scan cares about.
 ///
@@ -679,58 +879,8 @@ fn write_targets(command: &str, cwd: &Path) -> Vec<PathBuf> {
     targets
 }
 
-/// A macOS Seatbelt profile that allows writes under `root` and the temp
-/// directories, and denies the root's `.git` and `.bsh` internals.
-///
-/// Returns none when this host has no `sandbox-exec`, so the caller falls back
-/// to the lexical scan. The profile is a single SBPL string: `allow default`
-/// keeps reads, process execution and network as they were, `deny file-write*`
-/// closes every write, and the following rules re-open the intended paths.
-fn seatbelt_profile(root: &Path) -> Option<String> {
-    if !Path::new("/usr/bin/sandbox-exec").exists() {
-        return None;
-    }
-    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let mut writable: Vec<PathBuf> = vec![
-        root.clone(),
-        PathBuf::from("/tmp"),
-        PathBuf::from("/private/tmp"),
-        std::env::temp_dir(),
-    ];
-    if let Some(temp) = std::env::var_os("TMPDIR").map(PathBuf::from) {
-        if let Ok(canonical) = temp.canonicalize() {
-            writable.push(canonical);
-        }
-        writable.push(temp);
-    }
-    if let Ok(canonical) = std::env::temp_dir().canonicalize() {
-        writable.push(canonical);
-    }
-    writable.sort();
-    writable.dedup();
-
-    let escape = |path: &Path| {
-        path.to_string_lossy()
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-    };
-    let mut profile =
-        String::from("(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write*\n");
-    for path in &writable {
-        profile.push_str(&format!("  (subpath \"{}\")\n", escape(path)));
-    }
-    for sink in ["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"] {
-        profile.push_str(&format!("  (literal \"{sink}\")\n"));
-    }
-    profile.push_str(")\n");
-    // Later rules win, so these denials override the workspace allowance.
-    profile.push_str(&format!(
-        "(deny file-write* (subpath \"{}/.git\") (subpath \"{}/.bsh\"))\n",
-        escape(&root),
-        escape(&root)
-    ));
-    Some(profile)
-}
+// The Seatbelt profile moved to crate::sandbox: the spec owns the confinement
+// now, so the tool and the terminal cannot build two different ones.
 
 #[cfg(test)]
 mod tests {
@@ -950,7 +1100,11 @@ mod tests {
 
     /// The same profile still allows a write inside the workspace, and denies
     /// the workspace's own .git internals even through a variable.
-    #[cfg(target_os = "macos")]
+    ///
+    /// This is the heel-sandbox-off build. heel has no way to carve a deny out
+    /// of a granted tree (see heel_cannot_deny_a_git_write_inside_the_workspace_grant),
+    /// so this kernel-level deny is exactly what the fallback is kept for.
+    #[cfg(all(target_os = "macos", not(feature = "heel-sandbox")))]
     #[test]
     fn a_seatbelt_sandbox_allows_the_workspace_and_denies_git() {
         if !std::path::Path::new("/usr/bin/sandbox-exec").exists() {
@@ -1169,5 +1323,523 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(4),
             "it did not wait for the loop to end on its own"
         );
+    }
+
+    // =====================================================================
+    // The sandbox seam: one spec, two callers, measured observables.
+    // =====================================================================
+
+    /// A compiled policy for one root and permission, plus an egress allowlist.
+    fn sandbox_policy(
+        root: &std::path::Path,
+        permission: &str,
+        egress: &[&str],
+    ) -> std::sync::Arc<crate::policy::PolicySet> {
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let data = crate::policy::PolicyData::new(root)
+            .with_permission(permission)
+            .with_egress_allowlist(egress.iter().map(|entry| entry.to_string()));
+        std::sync::Arc::new(crate::policy::PolicySet::compile(
+            vec![
+                crate::policy::baseline_source(),
+                crate::policy::session_permission_source(permission),
+            ],
+            data,
+        ))
+    }
+
+    /// A shell tool whose policy carries all three egress rule shapes.
+    #[cfg(feature = "heel-sandbox")]
+    fn sandboxed_tool_with(
+        root: &std::path::Path,
+        permission: &str,
+        addresses: &[&str],
+        hosts: &[&str],
+        ports: &[u16],
+    ) -> BashTool {
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let data = crate::policy::PolicyData::new(&root)
+            .with_permission(permission)
+            .with_egress_allowlist(addresses.iter().map(|entry| entry.to_string()))
+            .with_egress_hosts(hosts.iter().map(|entry| entry.to_string()))
+            .with_egress_ports(ports.iter().copied());
+        let policy = std::sync::Arc::new(crate::policy::PolicySet::compile(
+            vec![
+                crate::policy::baseline_source(),
+                crate::policy::session_permission_source(permission),
+            ],
+            data,
+        ));
+        let spec = std::sync::Arc::new(crate::sandbox::SandboxSpec::for_policy(
+            &policy,
+            permission,
+            crate::sandbox::Principal::new("bash", "session", "preset"),
+        ));
+        BashTool::new("bash")
+            .with_workspace(root.to_str().expect("a utf-8 path"))
+            .with_policy(policy, "session", "preset")
+            .with_sandbox_spec(spec)
+    }
+
+    /// A shell tool confined by a spec derived from the policy.
+    fn sandboxed_tool(root: &std::path::Path, permission: &str, egress: &[&str]) -> BashTool {
+        // One spelling, as the shell wires it: the policy compares the spawn's
+        // cwd against its own root, so a symlinked temp root must not be given
+        // two names.
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let policy = sandbox_policy(&root, permission, egress);
+        let spec = std::sync::Arc::new(crate::sandbox::SandboxSpec::for_policy(
+            &policy,
+            permission,
+            crate::sandbox::Principal::new("bash", "session", "preset"),
+        ));
+        BashTool::new("bash")
+            .with_workspace(root.to_str().expect("a utf-8 path"))
+            .with_policy(policy, "session", "preset")
+            .with_sandbox_spec(spec)
+    }
+
+    /// A scratch workspace with a .git directory, so the deny can be probed.
+    fn sandbox_workspace() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("a scratch workspace");
+        std::fs::create_dir_all(dir.path().join(".git")).expect(".git");
+        std::fs::write(dir.path().join(".git").join("config"), "original").expect("the config");
+        dir
+    }
+
+    /// With the heel backend a write OUTSIDE the workspace is refused by the
+    /// kernel, and the probe proves it: the path is reached through a shell
+    /// variable, so the lexical scan cannot see it and only the sandbox can
+    /// stop it. The same command's in-workspace write succeeds.
+    #[cfg(feature = "heel-sandbox")]
+    #[test]
+    fn heel_refuses_a_write_outside_the_workspace_and_allows_one_inside() {
+        let dir = sandbox_workspace();
+        let outside = std::env::temp_dir().join(format!(
+            "bsh-heel-escape-{}-{}.txt",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_file(&outside);
+        let tool = sandboxed_tool(dir.path(), "workspace-write", &[]);
+
+        let denied = tool
+            .run(&serde_json::json!({
+                "command": format!("T=\"{}\"; printf escaped > \"$T\"", outside.display())
+            }))
+            .expect("the command runs and reports its own failure");
+        assert_eq!(
+            denied["sandbox"],
+            serde_json::json!("heel"),
+            "the result names the backend that ran it"
+        );
+        assert!(
+            !denied["success"].as_bool().unwrap_or(true),
+            "the sandbox did not refuse the write: {denied}"
+        );
+        assert!(
+            !outside.exists(),
+            "the kernel let the write escape through a variable"
+        );
+
+        let allowed = tool
+            .run(&serde_json::json!({ "command": "T=inside.txt; printf hi > \"$T\"" }))
+            .expect("an in-workspace write runs");
+        assert_eq!(allowed["sandbox"], serde_json::json!("heel"));
+        assert!(allowed["success"].as_bool().unwrap_or(false), "{allowed}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("inside.txt")).expect("the inside file"),
+            "hi"
+        );
+        let _ = std::fs::remove_file(&outside);
+    }
+
+    /// WRITE and EXEC are separate grants: a payload written into the workspace
+    /// is there, and running it is refused. A build cache the POLICY granted is
+    /// the deliberate exception, and executes.
+    #[cfg(feature = "heel-sandbox")]
+    #[test]
+    fn heel_refuses_write_then_execute_except_in_a_granted_build_cache() {
+        let dir = sandbox_workspace();
+        std::fs::create_dir_all(dir.path().join("target")).expect("the cache");
+        let tool = sandboxed_tool(dir.path(), "workspace-write", &[]);
+
+        let payload = tool
+            .run(&serde_json::json!({
+                "command": "printf '#!/bin/sh\\nprintf RAN > ran-root.txt\\n' > payload.sh \
+                            && chmod +x payload.sh && ./payload.sh; echo rc=$?"
+            }))
+            .expect("the command runs");
+        assert!(
+            dir.path().join("payload.sh").exists(),
+            "the workspace write itself is allowed"
+        );
+        assert!(
+            !dir.path().join("ran-root.txt").exists(),
+            "a payload written into the workspace was executed: {payload}"
+        );
+        // The outer shell's own exit code is masked by the trailing echo, so the
+        // named refusal is the kernel's, not the shell's.
+        let stderr = payload["stderr"].as_str().unwrap_or_default();
+        assert!(
+            stderr.contains("Operation not permitted"),
+            "the drop-and-run did not fail with the sandbox's named refusal: {payload}"
+        );
+
+        let cache = tool
+            .run(&serde_json::json!({
+                "command": "printf '#!/bin/sh\\nprintf CACHE > cache-ran.txt\\n' > target/tool.sh \
+                            && chmod +x target/tool.sh && ./target/tool.sh; echo rc=$?"
+            }))
+            .expect("the command runs");
+        assert!(
+            dir.path().join("cache-ran.txt").exists(),
+            "a policy-granted build cache could not be executed: {cache}"
+        );
+    }
+
+    /// A write the policy forbids is refused before a process exists, and the
+    /// refusal names the rule that decided it.
+    #[test]
+    fn a_git_write_is_refused_with_the_rule_that_refused_it() {
+        let dir = sandbox_workspace();
+        let tool = sandboxed_tool(dir.path(), "workspace-write", &[]);
+        let result = tool.run(&serde_json::json!({ "command": "printf hacked > .git/config" }));
+        match result {
+            Err(ToolError::Failed(message)) => assert!(
+                message.contains("write-forbidden-directory"),
+                "the refusal names its rule: {message}"
+            ),
+            other => panic!("expected a refused .git write, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".git").join("config")).expect("the config"),
+            "original"
+        );
+    }
+
+    /// The measured limitation, pinned so nobody assumes otherwise: heel has no
+    /// way to deny a path inside a granted tree, so a .git write reached
+    /// through a variable gets through the kernel. That is why the
+    /// heel-sandbox-off build still exists, and why this test will fail the day
+    /// heel grows a deny grant.
+    #[cfg(feature = "heel-sandbox")]
+    #[test]
+    fn heel_cannot_deny_a_git_write_inside_the_workspace_grant() {
+        let dir = sandbox_workspace();
+        let tool = sandboxed_tool(dir.path(), "workspace-write", &[]);
+        let result = tool
+            .run(&serde_json::json!({ "command": "T=.git/config; printf hacked > \"$T\"" }))
+            .expect("the command runs");
+        assert!(
+            result["success"].as_bool().unwrap_or(false),
+            "the write was refused, so heel DOES deny inside the grant now: {result}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".git").join("config")).expect("the config"),
+            "hacked",
+            "the kernel denied the variable write: the limitation is closed, update the docs"
+        );
+    }
+
+    /// The proxy asks the policy PER CONNECTION, for the address it resolved:
+    /// the decision is regorus's, not a list baked in at build time.
+    #[cfg(feature = "heel-sandbox")]
+    #[test]
+    fn the_egress_callback_asks_regorus_per_connection() {
+        use heel::NetworkPolicy as _;
+        let dir = sandbox_workspace();
+        let policy = sandbox_policy(dir.path(), "workspace-write", &["127.0.0.1"]);
+        let egress = crate::sandbox::RegoEgress::new(
+            policy,
+            crate::sandbox::Principal::new("bash", "session", "preset"),
+            vec!["127.0.0.1".to_string()],
+        );
+        assert_eq!(egress.allowlist(), &["127.0.0.1".to_string()]);
+        let decide = |host: &str| {
+            futures::executor::block_on(egress.check(&heel::DomainRequest::new(host, 80)))
+        };
+        assert!(decide("127.0.0.1"), "an allowlisted address was refused");
+        assert!(
+            !decide("198.51.100.9"),
+            "an address the policy does not list was allowed"
+        );
+
+        // A PORT list is enforced by the same callback: the request's port
+        // travels in the target, so the policy's port rule answers per request.
+        let ported = std::sync::Arc::new(crate::policy::PolicySet::compile(
+            vec![
+                crate::policy::baseline_source(),
+                crate::policy::session_permission_source("workspace-write"),
+            ],
+            crate::policy::PolicyData::new(dir.path())
+                .with_permission("workspace-write")
+                .with_egress_allowlist(["127.0.0.1"])
+                .with_egress_ports([443u16]),
+        ));
+        let ported = crate::sandbox::RegoEgress::new(
+            ported,
+            crate::sandbox::Principal::new("bash", "session", "preset"),
+            vec!["127.0.0.1".to_string()],
+        );
+        assert!(
+            futures::executor::block_on(ported.check(&heel::DomainRequest::new("127.0.0.1", 443))),
+            "an allowlisted address on an allowlisted port was refused"
+        );
+        assert!(
+            !futures::executor::block_on(ported.check(&heel::DomainRequest::new("127.0.0.1", 80))),
+            "a port outside the list was allowed"
+        );
+
+        // The same callback with an empty allowlist refuses everything: the
+        // policy, not the presence of a proxy, is what decides.
+        let empty = crate::sandbox::RegoEgress::new(
+            sandbox_policy(dir.path(), "workspace-write", &[]),
+            crate::sandbox::Principal::new("bash", "session", "preset"),
+            Vec::new(),
+        );
+        assert!(!futures::executor::block_on(
+            empty.check(&heel::DomainRequest::new("127.0.0.1", 80))
+        ));
+    }
+
+    /// A policy confined to one port refuses a command that names another, at
+    /// the command tier, before a process exists.
+    #[cfg(feature = "heel-sandbox")]
+    #[test]
+    fn a_port_rule_refuses_a_network_command_with_its_own_rule() {
+        let Some(host) = host_lan_address() else {
+            eprintln!("no non-loopback IPv4 address on this host; the egress probe needs one");
+            return;
+        };
+        let listener = std::net::TcpListener::bind((host.as_str(), 0)).expect("a listener");
+        let port = listener.local_addr().expect("its port").port();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        serve_http(listener, std::sync::Arc::clone(&hits));
+        let url = format!("http://{host}:{port}/");
+        let command = format!("printf ran > ran.txt && curl -sS --max-time 3 {url}");
+        let dir = sandbox_workspace();
+
+        // Allowed address, wrong port: refused, and the rule names the port.
+        let refused =
+            sandboxed_tool_with(dir.path(), "workspace-write", &[host.as_str()], &[], &[1])
+                .run(&serde_json::json!({ "command": command }));
+        match refused {
+            Err(ToolError::Failed(message)) => assert!(
+                message.contains("egress-port-not-allowed"),
+                "the refusal names the port rule: {message}"
+            ),
+            other => panic!("expected a port refusal, got {other:?}"),
+        }
+        assert!(
+            !dir.path().join("ran.txt").exists(),
+            "the command ran despite the port rule"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a port-refused command connected"
+        );
+
+        // The same command on an allowed port goes through the proxy.
+        let allowed = sandboxed_tool_with(
+            dir.path(),
+            "workspace-write",
+            &[host.as_str()],
+            &[],
+            &[port],
+        )
+        .run(&serde_json::json!({ "command": command }))
+        .expect("the command runs");
+        assert_eq!(allowed["network"], serde_json::json!("allowlist"));
+        assert!(allowed["success"].as_bool().unwrap_or(false), "{allowed}");
+        assert!(
+            hits.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the proxy never reached the listener: {allowed}"
+        );
+    }
+
+    /// The result says what the command's network could reach, so a reader does
+    /// not have to infer it from a command line.
+    #[test]
+    fn the_result_reports_the_network_confinement() {
+        let plain = BashTool::new("bash")
+            .run(&serde_json::json!({ "command": "printf ok" }))
+            .expect("the command runs");
+        assert_eq!(plain["network"], serde_json::json!("unrestricted"));
+
+        let dir = sandbox_workspace();
+        let denied = sandboxed_tool(dir.path(), "workspace-write", &[])
+            .run(&serde_json::json!({ "command": "printf ok" }))
+            .expect("the command runs");
+        assert_eq!(denied["network"], serde_json::json!("deny-all"));
+
+        let allowed = sandboxed_tool(dir.path(), "workspace-write", &["203.0.113.7"])
+            .run(&serde_json::json!({ "command": "printf ok" }))
+            .expect("the command runs");
+        assert_eq!(allowed["network"], serde_json::json!("allowlist"));
+    }
+
+    /// A non-loopback address of this host.
+    ///
+    /// heel's proxy refuses to forward to a host-local address, so a loopback
+    /// listener cannot prove an allow case; a listener on the host's LAN
+    /// address can, because that is not loopback or link-local.
+    #[cfg(feature = "heel-sandbox")]
+    fn host_lan_address() -> Option<String> {
+        for interface in ["en0", "en1"] {
+            let output = std::process::Command::new("/usr/sbin/ipconfig")
+                .args(["getifaddr", interface])
+                .output()
+                .ok()?;
+            let host = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !host.is_empty() {
+                return Some(host);
+            }
+        }
+        None
+    }
+
+    /// Serve HTTP 200 to every connection, counting them.
+    #[cfg(feature = "heel-sandbox")]
+    fn serve_http(
+        listener: std::net::TcpListener,
+        hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        std::thread::spawn(move || {
+            use std::io::Write as _;
+            for stream in listener.incoming().flatten() {
+                let hits = std::sync::Arc::clone(&hits);
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut request = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while stream.read(&mut byte).unwrap_or(0) == 1 {
+                        request.push(byte[0]);
+                        if request.ends_with(b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                    );
+                });
+            }
+        });
+    }
+
+    /// DenyAll refuses the connection in the kernel, and the policy's allowlist
+    /// lets the SAME connection through the proxy.
+    #[cfg(feature = "heel-sandbox")]
+    #[test]
+    fn network_activity_is_gated_before_a_process_and_again_by_the_kernel() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let Some(host) = host_lan_address() else {
+            eprintln!("no non-loopback IPv4 address on this host; the egress probe needs one");
+            return;
+        };
+        let listener = std::net::TcpListener::bind((host.as_str(), 0)).expect("a listener");
+        let port = listener.local_addr().expect("its port").port();
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        serve_http(listener, std::sync::Arc::clone(&hits));
+        let url = format!("http://{host}:{port}/");
+        let dir = sandbox_workspace();
+        let literal = format!("printf ran > ran.txt && curl -sS --max-time 3 -o /dev/null {url}");
+
+        // 1. The command tier: DenyAll, a literal URL, nothing spawned.
+        let refused = sandboxed_tool(dir.path(), "workspace-write", &[])
+            .run(&serde_json::json!({ "command": literal }));
+        match refused {
+            Err(ToolError::Failed(message)) => assert!(
+                message.contains("egress-not-allowlisted"),
+                "the refusal names its rule: {message}"
+            ),
+            other => panic!("expected a refused network command, got {other:?}"),
+        }
+        assert!(
+            !dir.path().join("ran.txt").exists(),
+            "the command ran before the network decision"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "a refused command connected"
+        );
+
+        // 2. The same endpoint reached through variables is invisible to the
+        //    command tier, so the process runs and the KERNEL refuses.
+        let hidden = format!(
+            "H={host}; P={port}; printf ran2 > ran2.txt && curl -sS --max-time 3 -o /dev/null \"http://$H:$P/\""
+        );
+        let kernel = sandboxed_tool(dir.path(), "workspace-write", &[])
+            .run(&serde_json::json!({ "command": hidden }))
+            .expect("the command runs");
+        assert_eq!(kernel["sandbox"], serde_json::json!("heel"));
+        assert_eq!(kernel["network"], serde_json::json!("deny-all"));
+        assert!(
+            !kernel["success"].as_bool().unwrap_or(true),
+            "deny-all let the request out: {kernel}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "a connection reached the listener under DenyAll"
+        );
+
+        // 3. The same literal endpoint, allowlisted by the policy, goes through
+        //    the proxy and reaches the listener.
+        let allowed = sandboxed_tool(dir.path(), "workspace-write", &[host.as_str()])
+            .run(&serde_json::json!({ "command": literal }))
+            .expect("the command runs");
+        assert_eq!(allowed["sandbox"], serde_json::json!("heel"));
+        assert_eq!(allowed["network"], serde_json::json!("allowlist"));
+        assert!(allowed["success"].as_bool().unwrap_or(false), "{allowed}");
+        assert!(
+            hits.load(Ordering::SeqCst) >= 1,
+            "the proxy never reached the listener: {allowed}"
+        );
+    }
+
+    /// With the feature off the in-tree Seatbelt profile is the boundary, and
+    /// it still confines writes to the workspace.
+    #[cfg(not(feature = "heel-sandbox"))]
+    #[test]
+    fn the_fallback_runs_commands_under_the_seatbelt_profile() {
+        if !std::path::Path::new("/usr/bin/sandbox-exec").exists() {
+            return;
+        }
+        let dir = sandbox_workspace();
+        // The home directory, not the temp directory: the in-tree profile
+        // deliberately allows writes under the shared temp dirs, because that is
+        // where a command legitimately puts scratch files. Home is the escape.
+        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+            return;
+        };
+        let outside = home.join(format!(
+            "bsh-fallback-escape-{}-{}.txt",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_file(&outside);
+        let tool = sandboxed_tool(dir.path(), "workspace-write", &[]);
+
+        let allowed = tool
+            .run(&serde_json::json!({ "command": "printf hi > inside.txt" }))
+            .expect("an in-workspace write runs");
+        assert_eq!(allowed["sandbox"], serde_json::json!("seatbelt"));
+        assert!(allowed["success"].as_bool().unwrap_or(false), "{allowed}");
+
+        let denied = tool
+            .run(&serde_json::json!({
+                "command": format!("T=\"{}\"; printf escaped > \"$T\"", outside.display())
+            }))
+            .expect("the command runs");
+        assert_eq!(denied["sandbox"], serde_json::json!("seatbelt"));
+        assert!(
+            !outside.exists(),
+            "the fallback profile let the write escape through a variable"
+        );
+        let _ = std::fs::remove_file(&outside);
     }
 }

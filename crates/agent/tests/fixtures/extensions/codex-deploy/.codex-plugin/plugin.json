@@ -2,24 +2,45 @@
   "name": "codex-deploy",
   "version": "0.4.0",
   "description": "Fixture Codex plugin used by the extension tests.",
-  "author": { "name": "BOS tests" },
+  "author": {
+    "name": "Fixture Co",
+    "email": "fixture@example.invalid",
+    "url": "https://example.invalid/"
+  },
   "homepage": "https://example.invalid/",
   "repository": "https://example.invalid/",
   "license": "MIT",
-  "keywords": ["fixture"],
+  "keywords": [
+    "fixture"
+  ],
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "apps": "./.app.json",
   "interface": {
     "displayName": "Codex Deploy Fixture",
     "shortDescription": "Deploys things in tests.",
-    "longDescription": "A fixture package.",
-    "developerName": "BOS tests",
+    "longDescription": "A fixture package that mirrors the shape of the 64 shipped Codex plugin manifests.",
+    "developerName": "Fixture Co",
     "category": "Developer Tools",
-    "capabilities": ["Interactive", "Read"],
-    "defaultPrompt": ["Deploy the app"],
-    "brandColor": "#000000",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Deploy the app",
+      "Show me the deploy plan"
+    ],
+    "brandColor": "#0a0a0a",
+    "brandColorDark": "#fafafa",
     "composerIcon": "./assets/icon.svg",
-    "logo": "./assets/icon.svg"
+    "logo": "./assets/icon.svg",
+    "logoDark": "./assets/icon.svg",
+    "screenshots": [
+      "./assets/icon.svg"
+    ],
+    "websiteURL": "https://example.invalid/",
+    "privacyPolicyURL": "https://example.invalid/privacy",
+    "termsOfServiceURL": "https://example.invalid/terms",
+    "supportURL": "https://example.invalid/support"
   }
 }

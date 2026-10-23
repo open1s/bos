@@ -86,6 +86,17 @@ fn json_files(dir: &Path) -> Result<Vec<PathBuf>, ExtensionError> {
     Ok(files)
 }
 
+/// Every Markdown file directly under `dir`, `*.md` and `*.md.tmpl`.
+///
+/// Both shapes are shipped: the Codex plugin `commands/` and `agents/`
+/// directories on this machine carry 12 plain `.md` files and an equal number
+/// of `.md.tmpl` twins (Vercel, Zoom and Figma all ship the pair), where the
+/// template is the same document with its placeholders unsubstituted. Reading
+/// only `.md` would drop half of a package's commands silently.
+///
+/// A `_`-prefixed file is a shared fragment, not a command: `vercel` and `zoom`
+/// both ship `_conventions.md` for other command files to reference, and
+/// registering it would put a private helper in the reader's command list.
 fn markdown_files(dir: &Path) -> Result<Vec<PathBuf>, ExtensionError> {
     let mut files = Vec::new();
     for entry in std::fs::read_dir(dir).map_err(|source| ExtensionError::Io {
@@ -97,19 +108,64 @@ fn markdown_files(dir: &Path) -> Result<Vec<PathBuf>, ExtensionError> {
             source,
         })?;
         let path = entry.path();
-        if path.is_file()
-            && path
-                .extension()
-                .and_then(std::ffi::OsStr::to_str)
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
-        {
+        if path.is_file() && is_markdown(&path) && !is_fragment(&path) {
             files.push(path);
         }
     }
-    files.sort();
+    // A resolved `.md` is ordered before its `.md.tmpl` twin, so the pair's
+    // deduplication keeps the document a reader would actually run. Lexical order
+    // happens to give this (`.md` is a prefix of `.md.tmpl`), but the rule is
+    // stated explicitly because it is a contract, not a coincidence.
+    files.sort_by(|left, right| {
+        let key = |path: &PathBuf| (document_name(path), is_template(path));
+        key(left).cmp(&key(right))
+    });
     Ok(files)
 }
 
+/// Whether a file is the packer's unsubstituted template variant.
+fn is_template(path: &Path) -> bool {
+    path.file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|name| name.to_ascii_lowercase().ends_with(".md.tmpl"))
+}
+
+/// Whether a file is a Markdown document this shim reads: `x.md` or `x.md.tmpl`.
+fn is_markdown(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or_default();
+    let lowered = name.to_ascii_lowercase();
+    lowered.ends_with(".md") || lowered.ends_with(".md.tmpl")
+}
+
+/// Whether a Markdown file is a shared fragment rather than a contribution.
+fn is_fragment(path: &Path) -> bool {
+    path.file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|name| name.starts_with('_'))
+}
+
+/// The contribution name a Markdown file yields.
+///
+/// `deploy.md` and `deploy.md.tmpl` are the same command, so both reduce to
+/// `deploy`; a `.tmpl` suffix is the packer's marker, never part of the name.
+fn document_name(path: &Path) -> String {
+    let stem = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or_default();
+    let lowered = stem.to_ascii_lowercase();
+    let trimmed = if lowered.ends_with(".md.tmpl") {
+        &stem[..stem.len() - ".md.tmpl".len()]
+    } else if lowered.ends_with(".md") {
+        &stem[..stem.len() - ".md".len()]
+    } else {
+        stem
+    };
+    trimmed.to_string()
+}
 fn frontmatter_str(frontmatter: Option<&serde_yaml::Value>, key: &str) -> Option<String> {
     let mapping = frontmatter?.as_mapping()?;
     let key = serde_yaml::Value::String(key.to_string());
@@ -316,6 +372,13 @@ pub(crate) fn read_tools(
 }
 
 /// Read `commands/*.md` under `root`.
+///
+/// A packer ships `deploy.md` and `deploy.md.tmpl` as a PAIR - the second is the
+/// same document with its placeholders unsubstituted - so both reduce to one
+/// command. The plain `.md` wins when both exist (it is the resolved document),
+/// and the `.tmpl` twin is skipped rather than registered twice: a duplicate is
+/// a hard error in the registry, so without this rule a perfectly ordinary
+/// packed plugin would fail to install at all.
 pub(crate) fn read_commands(
     root: &Path,
     standard: ExtensionStandard,
@@ -326,15 +389,17 @@ pub(crate) fn read_commands(
         return Ok(Vec::new());
     }
     let mut contributions = Vec::new();
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for path in markdown_files(&dir)? {
+        let name = document_name(&path);
+        if !seen.insert(name.clone()) {
+            // A resolved document already claimed this name; the template is the
+            // same command.
+            continue;
+        }
         let text = read_text(&path)?;
         let (frontmatter, body) =
             split_frontmatter(&text).map_err(|message| manifest_error(standard, &path, message))?;
-        let name = path
-            .file_stem()
-            .and_then(std::ffi::OsStr::to_str)
-            .unwrap_or_default()
-            .to_string();
         if name.trim().is_empty() {
             return Err(manifest_error(
                 standard,

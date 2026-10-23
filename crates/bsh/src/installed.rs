@@ -188,8 +188,16 @@ impl PackageMeta {
     /// The MCP refusal is dropped here for the same reason the market drops it:
     /// `mcp::extension_servers` starts the declared servers itself, so calling
     /// it a problem would be a false alarm.
-    fn read(root: &Path) -> (Option<Self>, Option<String>) {
-        match agent::extensions::ExtensionRegistry::load(root) {
+    ///
+    /// `trust` is the reader's own decision, read from the inventory record. It
+    /// is the ONLY thing that decides whether a DSH package's JavaScript host
+    /// entry runs: an untrusted package is parsed declaratively (and its entry
+    /// refused by name), a trusted one is executed in the bridge. The path is
+    /// part of the decision upstream - a record whose directory moved is
+    /// untrusted again - so this function takes the resolved verdict rather than
+    /// re-deriving it from a flag.
+    fn read(root: &Path, trust: agent::extensions::Trust) -> (Option<Self>, Option<String>) {
+        match agent::extensions::ExtensionRegistry::load_with_trust(root, trust) {
             Ok(package) => {
                 let extension = package.extension;
                 let refusals = package
@@ -248,7 +256,10 @@ impl PackageMeta {
 /// manifest/locale mtime under it.
 #[derive(Debug, Clone)]
 struct CachedPackage {
-    stamp: Option<SystemTime>,
+    /// The file stamp AND whether the parse executed a trusted entry. Both
+    /// belong in the key: a trust change must invalidate the cache, because the
+    /// parse is a different parse once the entry runs.
+    stamp: Option<(SystemTime, bool)>,
     meta: Option<PackageMeta>,
     error: Option<String>,
 }
@@ -283,8 +294,13 @@ impl InstalledCache {
             .map(str::trim)
             .filter(|path| !path.is_empty())
             .map(crate::caps::expand_path);
+        let trust = if record.is_trusted() {
+            agent::extensions::Trust::Trusted
+        } else {
+            agent::extensions::Trust::Untrusted
+        };
         let (meta, load_error) = match &root {
-            Some(path) => self.read_cached(path),
+            Some(path) => self.read_cached(path, trust),
             None => (None, None),
         };
         let standard = meta
@@ -342,14 +358,22 @@ impl InstalledCache {
     }
 
     /// The cached parse for one directory, re-read only when its stamp moved.
-    fn read_cached(&mut self, root: &Path) -> (Option<PackageMeta>, Option<String>) {
-        let stamp = package_stamp(root);
+    fn read_cached(
+        &mut self,
+        root: &Path,
+        trust: agent::extensions::Trust,
+    ) -> (Option<PackageMeta>, Option<String>) {
+        // The cache key carries trust as well as the file stamp: a package that
+        // was JUST trusted must be re-read, because its parse now includes an
+        // execution. Without this the row would keep showing the untrusted parse
+        // - and the tools it refused - until some unrelated file changed.
+        let stamp = package_stamp(root).map(|stamp| (stamp, trust.permits_execution()));
         let stale = match self.packages.get(root) {
             Some(cached) => cached.stamp != stamp,
             None => true,
         };
         if stale {
-            let (meta, error) = PackageMeta::read(root);
+            let (meta, error) = PackageMeta::read(root, trust);
             self.packages
                 .insert(root.to_path_buf(), CachedPackage { stamp, meta, error });
         }
@@ -551,5 +575,58 @@ mod tests {
         assert_eq!(cache.packages.len(), 1, "one directory, one parse");
         cache.clear();
         assert!(cache.packages.is_empty(), "save/install clears the view");
+    }
+
+    /// The trust verdict is what decides whether a DSH package's host entry is
+    /// EXECUTED, and the parse cache must not serve an untrusted parse to a
+    /// package that has just been trusted.
+    ///
+    /// The fixture writes a marker file the moment it is imported, so the marker
+    /// is direct evidence of execution rather than of a successful `apply`. Two
+    /// facts are asserted: an untrusted record leaves no marker, and trusting the
+    /// SAME record - through the same cache - runs it. Without the trust half of
+    /// the cache key the second resolve would return the cached untrusted parse
+    /// and the marker would still be absent.
+    #[test]
+    fn trusting_a_package_runs_its_entry_and_the_cache_follows() {
+        if agent::extensions::bridge::find_interpreter().is_none() {
+            eprintln!("skipped: no Node interpreter");
+            return;
+        }
+        let source = fixture("dsh-untrusted");
+        let root = std::env::temp_dir().join(format!("bsh-trust-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("scratch");
+        for entry in fs::read_dir(&source).expect("fixture") {
+            let entry = entry.expect("entry");
+            fs::copy(entry.path(), root.join(entry.file_name())).expect("copy");
+        }
+        let marker = root.join("executed.marker");
+        assert!(!marker.exists(), "the scratch copy starts clean");
+
+        let mut cache = InstalledCache::default();
+        let untrusted = record("bridge-trust", &root);
+        let view = cache.resolve(&untrusted, true);
+        assert!(!view.trusted, "a bare record is untrusted");
+        assert!(!marker.exists(), "an untrusted package's entry never ran");
+        assert!(
+            !view
+                .loaded_capabilities
+                .iter()
+                .any(|capability| capability == "tools"),
+            "nothing the refused entry would register is reported: {:?}",
+            view.loaded_capabilities
+        );
+
+        let mut trusted = record("bridge-trust", &root);
+        trusted.trusted = true;
+        trusted.trusted_path = trusted.path.clone();
+        let view = cache.resolve(&trusted, true);
+        assert!(view.trusted, "the trusted record resolves as trusted");
+        assert!(
+            marker.exists(),
+            "trusting the package ran its entry, through the same cache"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 }

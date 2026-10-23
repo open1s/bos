@@ -63,6 +63,18 @@
 //! policies: the file, its reload and the audit are the management surface.
 //! The contract and worked examples are in `docs/bsh-terminal-policy.md`.
 //!
+//! # The sandbox
+//!
+//! The pane's spawn asks the turn's shared
+//! [agent::sandbox::SandboxSpec] what it may do with a PTY IT owns, and the
+//! same spec is what the shell tool runs under. The measured answer is that no
+//! supported backend can host a caller-owned PTY (heel allocates its own and
+//! relays this process's stdio), so a confined turn's shell runs outside the
+//! sandbox. That is passed to the shell as BSH_SANDBOX - a reader can type
+//! `echo $BSH_SANDBOX` - and stated on the pane's status line whenever the pane
+//! has something to report, rather than being implied away. The Rego input gate
+//! below still decides every submitted line.
+//!
 //! Owed, stated rather than faked: reflow on resize (the grid is clipped, not
 //! re-wrapped), mouse reporting (CSI ?1000 / ?1002 / ?1006 are not modelled, so
 //! a full-screen program that asks for the mouse gets no events; the way back
@@ -1800,6 +1812,30 @@ fn record_decision(
         ring.push(row);
     }
 }
+/// What the shell sees as BSH_SANDBOX, when there is something to say.
+///
+/// The pane's spawn answers the shared spec (see
+/// [agent::sandbox::SandboxSpec::terminal]) and reports the answer into the
+/// shell's environment, so a reader can type "echo $BSH_SANDBOX" and a command
+/// can branch on it. On macOS a confined turn's shell runs INSIDE the sandbox,
+/// so the value is the permission tier itself; a backend that cannot host the
+/// pane's tty reports "unsupported-pty" and the pane's status line says why.
+fn sandbox_env(spec: Option<&agent::sandbox::SandboxSpec>) -> Option<&'static str> {
+    match spec {
+        None => None,
+        Some(spec) => match spec.terminal() {
+            agent::sandbox::TerminalSandbox::Unconfined => Some("full-access"),
+            agent::sandbox::TerminalSandbox::Sandboxed => Some(spec.mode().as_str()),
+            agent::sandbox::TerminalSandbox::PtyNotHostable { .. } => Some("unsupported-pty"),
+        },
+    }
+}
+
+/// Why the pane's shell is not confined, when it is not.
+fn sandbox_reason(spec: Option<&agent::sandbox::SandboxSpec>) -> Option<&'static str> {
+    spec.and_then(|spec| spec.terminal().reason())
+}
+
 /// A running terminal: the pane's one shell, its PTY, the screen, and the gate.
 pub(crate) struct Terminal {
     screen: Arc<Mutex<Screen>>,
@@ -1809,6 +1845,16 @@ pub(crate) struct Terminal {
     exited: Arc<AtomicBool>,
     /// The shell's working directory, which is also the input gate's cwd.
     pub(crate) cwd: PathBuf,
+    /// The turn's sandbox, when the pane was given one.
+    ///
+    /// The spawn path hands this SAME value to the sandbox, so the shell the
+    /// reader types into is the one the shell tool runs under: one spec, one
+    /// set of grants, one policy.
+    sandbox_spec: Option<std::sync::Arc<agent::sandbox::SandboxSpec>>,
+    /// The value the shell sees as BSH_SANDBOX, when there is one to report.
+    sandbox_env: Option<&'static str>,
+    /// Why this shell is not inside the turn's sandbox, when it is not.
+    pub(crate) sandbox_note: Option<String>,
     /// Why the shell is not running, when it is not.
     pub(crate) failure: Option<String>,
     /// The gate refused the start, so no process was ever created.
@@ -1826,9 +1872,68 @@ pub(crate) struct Terminal {
     pty: Option<Box<dyn MasterPty + Send>>,
     /// The bounded hand-off to the thread that owns the PTY's write side.
     input: Option<InputWriter>,
-    child: Option<Box<dyn Child + Send + Sync>>,
+    /// One extra description of the pty's slave, held for the pane's life.
+    ///
+    /// A sandboxed shell opens the tty by PATH a moment after the spawn, and
+    /// until it does the master reads EIO - which the reader would take for the
+    /// shell exiting. Keeping one slave description open closes that window.
+    /// Liveness does not depend on it: the clock polls the child itself.
+    tty_hold: Option<std::fs::File>,
+    child: Option<ShellChild>,
     /// The size last pushed to the PTY, so a same-size frame is not a syscall.
     size: Option<(u16, u16)>,
+    /// The shell this pane runs.
+    ///
+    /// Kept so a restart runs the SAME shell: a confined pane may have had to
+    /// replace the reader's shell (fish cannot run without a controlling
+    /// terminal), and a restart that reached for $SHELL again would hand the
+    /// reader a pane that cannot take a keystroke.
+    shell: PathBuf,
+}
+
+/// The pane's shell process, whichever backend started it.
+///
+/// A confined shell is started by the sandbox (which keeps the confinement
+/// alive for exactly as long as the process); a released one is started on the
+/// pty directly. Both are waited on, killed and polled the same way, so the
+/// pane has one notion of "the shell".
+enum ShellChild {
+    /// Started on the pty by the pane itself.
+    Plain(Box<dyn Child + Send + Sync>),
+    /// Started by the turn's sandbox; the confinement lives in this value.
+    Sandboxed(agent::sandbox::SandboxedChild),
+}
+
+impl ShellChild {
+    /// Whether the shell has exited, without blocking.
+    fn has_exited(&mut self) -> bool {
+        match self {
+            Self::Plain(child) => matches!(child.try_wait(), Ok(Some(_))),
+            Self::Sandboxed(child) => matches!(child.try_wait(), Ok(Some(_))),
+        }
+    }
+
+    /// Stop the shell and everything it started.
+    fn kill(&mut self) {
+        match self {
+            Self::Plain(child) => {
+                let _ = child.kill();
+            }
+            Self::Sandboxed(child) => child.kill(),
+        }
+    }
+
+    /// Reap it, so a killed shell does not stay a zombie for the pane's life.
+    fn reap(&mut self) {
+        match self {
+            Self::Plain(child) => {
+                let _ = child.wait();
+            }
+            Self::Sandboxed(child) => {
+                let _ = child.wait();
+            }
+        }
+    }
 }
 
 /// Marks the shell dead however its reader thread ends, including a panic.
@@ -1952,9 +2057,80 @@ impl Terminal {
     /// the gate is asked whether the shell may start. Nothing is spawned when
     /// it says no, and a policy that exists but cannot be parsed fails CLOSED:
     /// an unusable rule must never widen the gate it was meant to narrow.
+    /// A terminal with no spec: the pane's shell, gated by the policy file.
+    ///
+    /// Test-only now that the pane passes the turn's spec; the real spawn path
+    /// is [Terminal::new_with_sandbox], which records what the spec answered.
+    #[cfg(test)]
     pub(crate) fn new(cwd: PathBuf, lang: Lang) -> Self {
+        Self::start(cwd, lang, None)
+    }
+
+    /// A terminal whose spawn was told what the turn may touch.
+    ///
+    /// The spec is the same value the shell tool runs under. Its answer for a
+    /// caller-owned PTY is "this backend cannot host one" (see
+    /// [agent::sandbox::SandboxSpec::terminal]), so the pane runs its shell the
+    /// only way it can and shows that sentence rather than a confinement it
+    /// does not have. A policy-backed input gate still decides every line.
+    pub(crate) fn new_with_sandbox(
+        cwd: PathBuf,
+        lang: Lang,
+        spec: Option<&agent::sandbox::SandboxSpec>,
+    ) -> Self {
+        Self::start(cwd, lang, spec)
+    }
+
+    /// Why this shell is not sandboxed, when it is not.
+    pub(crate) fn sandbox_note(&self) -> Option<&str> {
+        self.sandbox_note.as_deref()
+    }
+
+    /// What the shell sees as BSH_SANDBOX, when there is something to say.
+    ///
+    /// "full-access" is a released turn, a permission tier is a sandboxed
+    /// shell, and "unsupported-pty" is a backend that could not host the pane's
+    /// terminal.
+    pub(crate) fn sandbox_label(&self) -> Option<&'static str> {
+        self.sandbox_env
+    }
+
+    /// Build the terminal, ask the spec, and start the shell.
+    fn start(cwd: PathBuf, lang: Lang, spec: Option<&agent::sandbox::SandboxSpec>) -> Self {
+        // Asked before the spawn, so the spawn path cannot be edited into
+        // assuming a confinement the answer refuses.
+        let sandbox_env = sandbox_env(spec);
+        let mut sandbox_note = sandbox_reason(spec).map(str::to_string);
         let mut terminal = Self::build(cwd, lang, DEFAULT_COLS, DEFAULT_ROWS);
-        let shell = shell_program();
+        terminal.sandbox_env = sandbox_env;
+        // Cloned: the shell needs it for its whole life, and the pane's caller
+        // holds the same value for the shell tool.
+        terminal.sandbox_spec = spec.map(|spec| std::sync::Arc::new(spec.clone()));
+        let confined = terminal
+            .sandbox_spec
+            .as_deref()
+            .is_some_and(|spec| spec.terminal().is_sandboxed());
+        let shell = shell_program_for(confined);
+        terminal.shell = shell.clone();
+        // The reader's own shell when it can run confined; otherwise the pane
+        // says which shell it used and why, once, in the pane itself.
+        if confined {
+            let reader = std::env::var_os("SHELL").map(PathBuf::from);
+            let replaced = reader
+                .as_deref()
+                .is_some_and(|reader| reader.is_absolute() && reader != shell.as_path());
+            if replaced {
+                sandbox_note = Some(crate::i18n::tr_args(
+                    lang,
+                    "right.terminal.shellReplaced",
+                    &[("shell", shell.display().to_string())],
+                ));
+            }
+        }
+        terminal.sandbox_note = sandbox_note;
+        if let Some(note) = terminal.sandbox_note.clone() {
+            terminal.write_notice(&note);
+        }
         if !terminal.refused {
             let cwd = terminal.cwd.clone();
             let command = shell.display().to_string();
@@ -2005,6 +2181,9 @@ impl Terminal {
             version: Arc::new(AtomicU64::new(0)),
             exited: Arc::new(AtomicBool::new(false)),
             cwd,
+            sandbox_spec: None,
+            sandbox_env: None,
+            sandbox_note: None,
             failure,
             refused,
             lang,
@@ -2014,8 +2193,10 @@ impl Terminal {
             typed_line: String::new(),
             pty: None,
             input: None,
+            tty_hold: None,
             child: None,
             size: None,
+            shell: PathBuf::new(),
         };
         if let Some(error) = terminal.policy_error.clone() {
             let subject = terminal.policy_path.display().to_string();
@@ -2046,11 +2227,17 @@ impl Terminal {
         // child that turns out to be alive is killed rather than waited on from
         // the UI thread.
         if let Some(mut previous) = self.child.take() {
-            if previous.try_wait().ok().flatten().is_none() {
-                let _ = previous.kill();
+            if !previous.has_exited() {
+                previous.kill();
             }
-            let _ = previous.wait();
+            previous.reap();
         }
+        // The previous pty's slave description goes with the shell it served,
+        // and its reader ends when that slave goes. A SHARED liveness flag would
+        // then mark this new shell dead the moment the old reader noticed, so
+        // every shell gets a flag of its own.
+        self.tty_hold = None;
+        self.exited = Arc::new(AtomicBool::new(false));
         // Open at the size the pane has now, not at the default: a restart used
         // to hand the new shell an 80x24 window while the grid kept the pane's
         // real width, so the prompt wrapped in the wrong place until the next
@@ -2073,38 +2260,79 @@ impl Terminal {
         } else {
             self.cwd.clone()
         };
-        let mut command = CommandBuilder::new(shell);
-        command.cwd(cwd);
-        command.env("TERM", "xterm-256color");
-        command.env("COLORTERM", "truecolor");
-        let mut child = match pair.slave.spawn_command(command) {
-            Ok(child) => child,
-            Err(error) => {
-                self.failure = Some(error.to_string());
-                return false;
+        // The interface the shell starts with, and the answer it can read back:
+        // a reader can type "echo $BSH_SANDBOX", and a command can branch on it.
+        let mut envs: Vec<(String, String)> = vec![
+            ("TERM".to_string(), "xterm-256color".to_string()),
+            ("COLORTERM".to_string(), "truecolor".to_string()),
+        ];
+        if let Some(label) = self.sandbox_env {
+            envs.push(("BSH_SANDBOX".to_string(), label.to_string()));
+        }
+        // Two spawn shapes, and exactly one applies: a shell the sandbox CAN
+        // host is started by the spec with the pane's tty granted; anything else
+        // is started on the pty by the pane itself, which is the only path that
+        // gives the child a controlling terminal (portable-pty calls login_tty).
+        // The sandboxed path reaches the tty BY PATH - portable-pty exposes the
+        // slave's name, not its fd - which is why the slave is held open below.
+        let sandboxed = self
+            .sandbox_spec
+            .as_deref()
+            .filter(|spec| spec.terminal().is_sandboxed());
+        let mut child = match sandboxed {
+            Some(spec) => {
+                let Some(tty) = pair.master.tty_name() else {
+                    self.failure =
+                        Some(String::from("the pane's PTY has no name to give the shell"));
+                    return false;
+                };
+                self.tty_hold = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&tty)
+                    .ok();
+                match spec.spawn_terminal(shell, &tty, &cwd, &envs) {
+                    Ok(child) => ShellChild::Sandboxed(child),
+                    Err(error) => {
+                        self.failure = Some(error);
+                        return false;
+                    }
+                }
+            }
+            None => {
+                let mut command = CommandBuilder::new(shell);
+                command.cwd(&cwd);
+                for (key, value) in &envs {
+                    command.env(key, value);
+                }
+                match pair.slave.spawn_command(command) {
+                    Ok(child) => ShellChild::Plain(child),
+                    Err(error) => {
+                        self.failure = Some(error.to_string());
+                        return false;
+                    }
+                }
             }
         };
         drop(pair.slave);
         // A process whose output has no reader is a process the pane cannot
         // show and cannot stop: kill and reap it rather than leave it running.
-        let kill = |child: &mut Box<dyn Child + Send + Sync>| {
-            let _ = child.kill();
-            let _ = child.wait();
+        let failed = |child: &mut ShellChild, failure: String, this: &mut Self| {
+            child.kill();
+            child.reap();
+            this.failure = Some(failure);
+            false
         };
         let reader = match pair.master.try_clone_reader() {
             Ok(reader) => reader,
             Err(error) => {
-                kill(&mut child);
-                self.failure = Some(error.to_string());
-                return false;
+                return failed(&mut child, error.to_string(), self);
             }
         };
         let writer = match pair.master.take_writer() {
             Ok(writer) => writer,
             Err(error) => {
-                kill(&mut child);
-                self.failure = Some(error.to_string());
-                return false;
+                return failed(&mut child, error.to_string(), self);
             }
         };
         self.pty = Some(pair.master);
@@ -2113,6 +2341,38 @@ impl Terminal {
         self.size = Some((cols, rows));
         self.spawn_reader(reader);
         true
+    }
+
+    /// Write one line into the pane before the shell's first output.
+    ///
+    /// A standing caveat - a shell that had to be replaced, a backend that
+    /// cannot host the tty - goes where the reader is looking rather than into a
+    /// status line that only appears when something has already gone wrong.
+    fn write_notice(&self, text: &str) {
+        if let Ok(mut screen) = self.screen.lock() {
+            let mut line = text.as_bytes().to_vec();
+            line.extend_from_slice(b"\r\n");
+            screen.feed(&line);
+        }
+        self.version.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Notice a shell that exited, independently of the reader's EOF.
+    ///
+    /// The reader ends the pane on EOF, but the pane keeps one slave
+    /// description open (see tty_hold), so the master does not EOF on its own.
+    /// The child is the authority, and the terminal clock asks here.
+    pub(crate) fn poll(&mut self) {
+        if self.exited.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        if child.has_exited() {
+            self.exited.store(true, Ordering::Relaxed);
+            self.version.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// The size the PTY and the grid should be at: the pane's last measurement,
@@ -2230,7 +2490,14 @@ impl Terminal {
         if self.refused || self.is_running() {
             return false;
         }
-        let shell = shell_program();
+        // The shell this pane already chose, not $SHELL again: see Terminal::shell.
+        // A terminal built without a process has no choice yet, and falls back to
+        // the released shell.
+        let shell = if self.shell.as_os_str().is_empty() {
+            shell_program()
+        } else {
+            self.shell.clone()
+        };
         let cwd = self.cwd.clone();
         let command = shell.display().to_string();
         let decision = self.decide("start", &command, |gate| gate.start(&shell, &cwd));
@@ -2607,10 +2874,10 @@ impl Terminal {
 impl Drop for Terminal {
     fn drop(&mut self) {
         if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
+            child.kill();
             // Reap it: a killed child that is never waited on stays a zombie
             // for the rest of the process's life.
-            let _ = child.wait();
+            child.reap();
         }
         // Dropping the sender is what ends the writer thread: it finishes the
         // write it is in (the killed child has closed the other end) and exits.
@@ -2621,13 +2888,37 @@ impl Drop for Terminal {
 /// The shell the terminal runs: the reader's own when it is usable, then the
 /// shells a macOS install carries, then /bin/sh as the last resort.
 pub(crate) fn shell_program() -> PathBuf {
-    if let Some(shell) = std::env::var_os("SHELL") {
+    shell_program_for(false)
+}
+
+/// The shell a pane runs, given whether its shell is sandboxed.
+///
+/// A sandboxed shell cannot be given a controlling terminal: only
+/// portable-pty's own spawn calls login_tty, and a shell started by the sandbox
+/// is in a session of its own with no tty to lead. Most shells tolerate that;
+/// fish does not, and it is not a warning - measured inside the sandbox, fish
+/// prints "No TTY for interactive shell (tcgetpgrp failed)" and then never runs
+/// a command. So a confined pane asks for a shell that works and says which one
+/// it used, instead of drawing a pane that cannot take a keystroke.
+pub(crate) fn shell_program_for(confined: bool) -> PathBuf {
+    if !confined {
+        if let Some(shell) = std::env::var_os("SHELL") {
+            let path = PathBuf::from(shell);
+            if path.is_absolute() && path.is_file() {
+                return path;
+            }
+        }
+    } else if let Some(shell) = std::env::var_os("SHELL") {
         let path = PathBuf::from(shell);
-        if path.is_absolute() && path.is_file() {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if path.is_absolute() && path.is_file() && !name.starts_with("fish") {
             return path;
         }
     }
-    for candidate in ["/bin/zsh", "/bin/fish", "/bin/bash", "/bin/sh"] {
+    for candidate in ["/bin/zsh", "/bin/bash", "/bin/sh"] {
         let path = PathBuf::from(candidate);
         if path.is_file() {
             return path;
@@ -3512,6 +3803,144 @@ mod tests {
             "",
             "a selection past the window has nothing to copy"
         );
+    }
+
+    /// Type one line into a live pane and wait for it to come back.
+    fn type_and_wait(terminal: &mut Terminal, line: &str, needle: &str) -> bool {
+        for byte in line.as_bytes() {
+            terminal.send_key(&[*byte]);
+        }
+        terminal.send_key(b"\r");
+        wait_for(terminal, needle)
+    }
+
+    /// The pane's shell runs INSIDE the turn's sandbox: a command typed here
+    /// cannot write outside the workspace, while the PTY stays a real terminal
+    /// (echo, resize, exit). The probe is a marker file, not a message.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_terminal_shell_runs_inside_the_sandbox() {
+        let dir = scratch("sandbox-shell");
+        let spec = agent::sandbox::SandboxSpec::workspace_write(&dir);
+        let mut terminal = Terminal::new_with_sandbox(dir.clone(), Lang::En, Some(&spec));
+        assert_eq!(terminal.sandbox_label(), Some("workspace-write"));
+        // A pane with something to explain (this host's fish cannot run
+        // confined) says it in the pane; either way the shell is live.
+        assert!(
+            terminal.is_running(),
+            "the shell starts inside the sandbox: {:?}",
+            terminal.failure
+        );
+
+        // The tier reached the shell's own environment, through a real PTY: the
+        // echo is the shell's line discipline, not the pane's.
+        assert!(
+            type_and_wait(
+                &mut terminal,
+                "echo bsh-tier:$BSH_SANDBOX",
+                "bsh-tier:workspace-write"
+            ),
+            "the shell did not report its sandbox: {:?}",
+            terminal.lines()
+        );
+
+        // A write outside the workspace is refused BY THE KERNEL: the probe file
+        // never appears, wherever the command resolved the path from.
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            return;
+        };
+        let outside = home.join(format!("bsh-terminal-escape-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&outside);
+        assert!(
+            type_and_wait(
+                &mut terminal,
+                &format!("printf escaped > {}", outside.display()),
+                "not permitted"
+            ),
+            "the sandboxed shell was not refused: {:?}",
+            terminal.lines()
+        );
+        assert!(
+            !outside.exists(),
+            "the kernel let a terminal write escape the workspace"
+        );
+
+        // The same command inside the workspace lands.
+        assert!(
+            type_and_wait(
+                &mut terminal,
+                "printf inside > inside-terminal.txt; echo wrote=$?",
+                "wrote=0"
+            ),
+            "an in-workspace write failed: {:?}",
+            terminal.lines()
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("inside-terminal.txt")).expect("the inside file"),
+            "inside"
+        );
+
+        // The terminal is still a terminal: it resizes and its shell exits.
+        terminal.resize(100, 30);
+        assert_eq!(terminal.size(), Some((100, 30)));
+        for byte in b"exit" {
+            terminal.send_key(&[*byte]);
+        }
+        terminal.send_key(b"\r");
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                terminal.poll();
+                !terminal.is_running()
+            }),
+            "exit ends the sandboxed shell"
+        );
+
+        // Enter starts a fresh sandboxed shell, and the old reader's end does
+        // not mark it dead.
+        assert!(
+            matches!(terminal.send_key(b"\r"), KeyOutcome::Sent),
+            "Enter starts a new shell"
+        );
+        assert!(
+            terminal.is_running(),
+            "the new shell is alive: {:?}",
+            terminal.failure
+        );
+        assert!(
+            type_and_wait(
+                &mut terminal,
+                "echo again:$BSH_SANDBOX",
+                "again:workspace-write"
+            ),
+            "the restarted shell kept its sandbox: {:?}",
+            terminal.lines()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A released permission has nothing to state: the shell runs bare and says
+    /// so, and no confinement is implied.
+    #[test]
+    fn a_full_access_terminal_reports_the_released_tier() {
+        let dir = scratch("sandbox-none");
+        let spec = agent::sandbox::SandboxSpec::bare(agent::sandbox::SandboxMode::FullAccess, &dir);
+        let mut terminal = Terminal::new_with_sandbox(dir.clone(), Lang::En, Some(&spec));
+        assert!(
+            terminal.sandbox_note().is_none(),
+            "a released turn has no sandbox to explain"
+        );
+        assert_eq!(terminal.sandbox_label(), Some("full-access"));
+        assert!(terminal.is_running(), "the shell starts");
+        assert!(
+            type_and_wait(
+                &mut terminal,
+                "echo bsh-tier:$BSH_SANDBOX",
+                "bsh-tier:full-access"
+            ),
+            "a released turn's shell still learns what it runs under: {:?}",
+            terminal.lines()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A shell restarted by Enter keeps the pane's size: the new PTY used to

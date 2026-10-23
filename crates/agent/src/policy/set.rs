@@ -44,6 +44,17 @@ pub struct PolicyData {
     ///
     /// Empty is the documented default and denies all egress.
     pub egress_allowlist: Vec<String>,
+    /// Hostnames egress may reach, lower-cased. A leading "*." matches any
+    /// subdomain ("*.example.com" but not "example.com").
+    ///
+    /// This is the WEAKER door and it is named as such: a hostname rule survives
+    /// a DNS rebind, because the name is what the policy saw. An address rule is
+    /// what the kernel-level tools use; a host rule exists for a policy that
+    /// names a service rather than an address.
+    pub egress_hosts: Vec<String>,
+    /// Destination ports egress may use. Empty means any port; a non-empty list
+    /// refuses a request whose port the caller did not state.
+    pub egress_ports: Vec<u16>,
     /// Whether the preset restricts reads to `preset_read_roots`.
     pub preset_read_restricted: bool,
     /// Canonical absolute read roots the preset allows.
@@ -68,6 +79,14 @@ pub struct PolicyData {
     pub preset_egress_allowlist: Vec<String>,
 }
 
+/// Lower-case one hostname entry and drop its trailing dot.
+///
+/// DNS names are case-insensitive and "example.com." is the same name, so a
+/// policy that matched the raw text could be walked around.
+fn normalize_host_entry(host: &str) -> String {
+    host.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
 impl PolicyData {
     /// Data for `workspace_root`, with no preset and an empty allowlist.
     ///
@@ -85,6 +104,8 @@ impl PolicyData {
             workspace_root,
             preset: String::new(),
             egress_allowlist: Vec::new(),
+            egress_hosts: Vec::new(),
+            egress_ports: Vec::new(),
             preset_read_restricted: false,
             preset_read_roots: Vec::new(),
             preset_write_restricted: false,
@@ -116,6 +137,48 @@ impl PolicyData {
     /// Add one allowlist entry.
     pub fn allow_egress(mut self, entry: impl Into<String>) -> Self {
         self.egress_allowlist.push(entry.into());
+        self
+    }
+
+    /// Replace the hostname allowlist.
+    ///
+    /// Entries are lower-cased and a trailing dot is dropped, because DNS names
+    /// are case-insensitive and "example.com." is the same name: a policy that
+    /// matched the raw text could be walked around.
+    pub fn with_egress_hosts<I, S>(mut self, hosts: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.egress_hosts = hosts
+            .into_iter()
+            .map(|host| normalize_host_entry(&host.into()))
+            .filter(|host| !host.is_empty())
+            .collect();
+        self
+    }
+
+    /// Add one hostname to the allowlist.
+    pub fn allow_host(mut self, host: impl Into<String>) -> Self {
+        let host = normalize_host_entry(&host.into());
+        if !host.is_empty() {
+            self.egress_hosts.push(host);
+        }
+        self
+    }
+
+    /// Replace the port allowlist. An empty list means any port.
+    pub fn with_egress_ports<I>(mut self, ports: I) -> Self
+    where
+        I: IntoIterator<Item = u16>,
+    {
+        self.egress_ports = ports.into_iter().collect();
+        self
+    }
+
+    /// Allow one destination port.
+    pub fn allow_port(mut self, port: u16) -> Self {
+        self.egress_ports.push(port);
         self
     }
 
@@ -184,6 +247,17 @@ impl PolicyData {
             .iter()
             .map(|entry| Value::from(entry.as_str()))
             .collect();
+        let roots = |items: &[String]| -> Vec<Value> {
+            items
+                .iter()
+                .map(|item| Value::from(item.as_str()))
+                .collect()
+        };
+        let ports: Vec<Value> = self
+            .egress_ports
+            .iter()
+            .map(|port| Value::from(u64::from(*port)))
+            .collect();
         let mut root: BTreeMap<Value, Value> = BTreeMap::new();
         root.insert(
             Value::from("workspace_root"),
@@ -195,12 +269,11 @@ impl PolicyData {
         );
         root.insert(Value::from("preset"), Value::from(self.preset.as_str()));
         root.insert(Value::from("egress_allowlist"), Value::from(allowlist));
-        let roots = |items: &[String]| -> Vec<Value> {
-            items
-                .iter()
-                .map(|item| Value::from(item.as_str()))
-                .collect()
-        };
+        root.insert(
+            Value::from("egress_hosts"),
+            Value::from(roots(&self.egress_hosts)),
+        );
+        root.insert(Value::from("egress_ports"), Value::from(ports));
         let mut scope: BTreeMap<Value, Value> = BTreeMap::new();
         scope.insert(
             Value::from("read_restricted"),
@@ -482,6 +555,21 @@ impl PolicySet {
         let decision = self.evaluate(input);
         self.audit.record(input, &decision, &self.data.permission);
         decision
+    }
+
+    /// Answer a question WITHOUT recording it.
+    ///
+    /// A grant candidate is the host's question, not a tool action: deriving a
+    /// sandbox spec asks the policy about paths and addresses no tool touched,
+    /// and those answers must not fill the denial ring or the allow counters a
+    /// reader is shown. Enforcement keeps using [PolicySet::check], which
+    /// audits; this is the same evaluation with the ring left alone.
+    ///
+    /// The answer is identical in every other respect - same modules, same
+    /// data, same failure asymmetry - so a spec cannot be derived from a
+    /// weaker policy than the one that gates the tools.
+    pub fn probe(&self, input: &PolicyInput) -> Decision {
+        self.evaluate(input)
     }
 
     /// Evaluate through the interpreter even when bytecode is available.

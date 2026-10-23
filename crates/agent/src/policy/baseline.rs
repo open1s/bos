@@ -11,8 +11,12 @@
 //! - **Writes** are allowed under the workspace root, except anywhere below a
 //!   `.bsh` or `.git` directory. A write outside the root is refused.
 //! - **Egress** is allowed only when the resolved address is on
-//!   `data.egress_allowlist` (an exact address, or a CIDR range). The list is
-//!   empty by default, so egress is denied by default.
+//!   `data.egress_allowlist` (an exact address, or a CIDR range) OR the hostname
+//!   matches `data.egress_hosts` (exact, or a `*.` subdomain rule), AND - when
+//!   `data.egress_ports` is non-empty - the destination port is on it. All
+//!   three lists are empty by default, so egress is denied by default. A
+//!   hostname rule is the weaker door: it survives a DNS rebind, which is why
+//!   the address list exists.
 //! - **Spawn** is allowed only for the `bash` tool when its working directory is
 //!   the workspace root. `job_kill` (stopping a job this session owns) and
 //!   `subagent` (delegating to a child agent) are also spawns the baseline
@@ -74,6 +78,14 @@ verdict := {"allow": true, "rule": "capability-granted"} if {
 # rule: write-outside-workspace
 } else := {"allow": false, "rule": "write-outside-workspace", "reason": "writes are confined to the workspace"} if {
     input.action == "write"
+# rule: egress-port-not-allowed
+} else := {"allow": false, "rule": "egress-port-not-allowed", "reason": "the destination port is outside the egress port list"} if {
+    input.action == "egress"
+    not port_allowed(input.target.port)
+# rule: egress-host-allowlisted
+} else := {"allow": true, "rule": "egress-host-allowlisted"} if {
+    input.action == "egress"
+    egress_host_allowed(input.target.host)
 # rule: egress-allowlisted
 } else := {"allow": true, "rule": "egress-allowlisted"} if {
     input.action == "egress"
@@ -142,6 +154,36 @@ egress_allowed(ip) if {
     some entry in data.egress_allowlist
     contains(entry, "/")
     net.cidr_contains(entry, ip)
+}
+
+# An empty port list means any port. A target whose port is unknown fails a
+# non-empty list, so a request that does not state its port is refused rather
+# than waved through a restriction it cannot be checked against.
+port_allowed(_port) if {
+    count(data.egress_ports) == 0
+}
+
+port_allowed(port) if {
+    some allowed in data.egress_ports
+    allowed == port
+}
+
+# A hostname rule is the WEAKER door and is named as such: it survives a DNS
+# rebind, because the name is what the policy saw. It exists for a policy that
+# names a service rather than an address; the address rule below is the
+# stronger one, and the kernel-level gates use it.
+egress_host_allowed(host) if {
+    some entry in data.egress_hosts
+    host_matches(lower(host), lower(entry))
+}
+
+host_matches(host, entry) if {
+    entry == host
+}
+
+host_matches(host, entry) if {
+    startswith(entry, "*.")
+    endswith(host, substring(entry, 1, -1))
 }
 "#;
 

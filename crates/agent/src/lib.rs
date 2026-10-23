@@ -13,6 +13,7 @@ pub mod metrics;
 pub mod plugins;
 pub mod policy;
 pub mod prelude;
+pub mod sandbox;
 pub mod security;
 pub mod session;
 pub mod skills;

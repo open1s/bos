@@ -48,6 +48,7 @@
 //! `agents/*.md`. Those files contribute real tools, commands, skills, and
 //! prompts without executing code; the imperative path stays refused.
 
+pub mod bridge;
 mod codex;
 mod declarative;
 mod dsh;
@@ -382,12 +383,91 @@ pub struct ExtensionDetails {
     pub icon: Option<PathBuf>,
     /// The DSH `engines.dsh` compatibility range, when declared.
     pub engines: Option<String>,
+    /// The Codex `interface` block, as the manifest declares it.
+    pub interface: Option<CodexInterface>,
     /// A declared JavaScript host entry (DSH), whether or not it was executed.
     pub host_entry: Option<PathBuf>,
     /// A declared JavaScript client entry (DSH), whether or not it was executed.
     pub client_entry: Option<PathBuf>,
 }
 
+/// Whether a package may have its JavaScript entry EXECUTED.
+///
+/// This is the gate the whole imperative path hangs on. Installing a package,
+/// or reading its manifest, must never execute anything: the reader has to say
+/// yes first. The host owns the stored decision (bsh keeps it in the settings
+/// document, cleared when the package path changes); this crate only enforces
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Trust {
+    /// The package has not been approved. Its declaration is read and its
+    /// commands, panels, providers and tools are listed, but nothing it ships
+    /// is executed: no child process is started.
+    #[default]
+    Untrusted,
+    /// The reader approved this exact package at this exact path. Its host
+    /// entry may run.
+    Trusted,
+}
+
+impl Trust {
+    /// Whether the entry may be executed.
+    pub fn permits_execution(self) -> bool {
+        matches!(self, Trust::Trusted)
+    }
+
+    /// The short name used in reports.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Trust::Untrusted => "untrusted",
+            Trust::Trusted => "trusted",
+        }
+    }
+}
+/// The Codex `interface` block, in the shape the shipped plugins declare it.
+///
+/// Measured over the 64 Codex plugin manifests on this machine: every one
+/// carries `displayName`, `shortDescription`, `longDescription`, `developerName`,
+/// `category`, `capabilities` and `defaultPrompt`; 61 carry the three URL fields;
+/// 57-60 carry `composerIcon`/`logo`; 49 carry `brandColor`; 46 carry
+/// `screenshots`; 15 carry `supportURL`; 10 carry the dark pair.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CodexInterface {
+    /// The card title.
+    pub display_name: Option<String>,
+    /// The one-line description.
+    pub short_description: Option<String>,
+    /// The long description.
+    pub long_description: Option<String>,
+    /// The publisher name.
+    pub developer_name: Option<String>,
+    /// The category the reference groups the card under.
+    pub category: Option<String>,
+    /// The declared capability words (Read, Write, ...).
+    pub capabilities: Vec<String>,
+    /// The suggested prompts the reference shows on a fresh card.
+    pub default_prompt: Vec<String>,
+    /// The light accent colour, e.g. #0a0a0a.
+    pub brand_color: Option<String>,
+    /// The dark accent colour.
+    pub brand_color_dark: Option<String>,
+    /// The composer icon path, relative to the package.
+    pub composer_icon: Option<String>,
+    /// The card logo path, relative to the package.
+    pub logo: Option<String>,
+    /// The dark-mode logo path.
+    pub logo_dark: Option<String>,
+    /// Screenshot paths, relative to the package.
+    pub screenshots: Vec<String>,
+    /// The publisher website.
+    pub website_url: Option<String>,
+    /// The privacy policy URL.
+    pub privacy_policy_url: Option<String>,
+    /// The terms-of-service URL.
+    pub terms_of_service_url: Option<String>,
+    /// The support URL.
+    pub support_url: Option<String>,
+}
 /// The declarative DSH `dsh.client` section.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClientManifest {

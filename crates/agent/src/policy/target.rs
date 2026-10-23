@@ -64,13 +64,17 @@ impl std::fmt::Display for Action {
 pub enum Target {
     /// An absolute path.
     Path(PathBuf),
-    /// A network endpoint: the name the request used, and the address it
-    /// actually resolves to.
+    /// A network endpoint: the name the request used, the address it actually
+    /// resolves to, and the port it asked for.
     Host {
-        /// The hostname as written by the caller.
+        /// The hostname as written by the caller, normalised to lower case.
         host: String,
-        /// The resolved address the policy decides on, as text.
+        /// The resolved address the policy decides on, as text. Empty when the
+        /// name could not be resolved (a host-rule-only question).
         ip: String,
+        /// The destination port, when the caller knows it. A policy that names
+        /// ports refuses a request whose port it cannot see.
+        port: Option<u16>,
     },
 }
 
@@ -85,10 +89,23 @@ impl Target {
     }
 
     /// A host target. `ip` is the address the policy decides on.
+    ///
+    /// The port is left unknown, which a policy that names ports refuses. Use
+    /// [Target::host_on] whenever the port is known.
     pub fn host(host: impl Into<String>, ip: impl Into<String>) -> Self {
         Target::Host {
-            host: host.into(),
+            host: normalize_host(&host.into()),
             ip: ip.into(),
+            port: None,
+        }
+    }
+
+    /// A host target for a request with a known destination port.
+    pub fn host_on(host: impl Into<String>, ip: impl Into<String>, port: u16) -> Self {
+        Target::Host {
+            host: normalize_host(&host.into()),
+            ip: ip.into(),
+            port: Some(port),
         }
     }
 
@@ -116,11 +133,22 @@ impl Target {
         }
     }
 
+    /// The destination port, when this target is a host and the caller knew it.
+    pub fn port(&self) -> Option<u16> {
+        match self {
+            Target::Host { port, .. } => *port,
+            Target::Path(_) => None,
+        }
+    }
+
     /// One-line rendering for an audit row.
     pub fn display(&self) -> String {
         match self {
             Target::Path(path) => path.display().to_string(),
-            Target::Host { host, ip } => format!("{host} ({ip})"),
+            Target::Host { host, ip, port } => match port {
+                Some(port) => format!("{host}:{port} ({ip})"),
+                None => format!("{host} ({ip})"),
+            },
         }
     }
 
@@ -134,10 +162,19 @@ impl Target {
                     Value::from(path.to_string_lossy().as_ref()),
                 );
             }
-            Target::Host { host, ip } => {
+            Target::Host { host, ip, port } => {
                 fields.insert(Value::from("kind"), Value::from("host"));
                 fields.insert(Value::from("host"), Value::from(host.as_str()));
                 fields.insert(Value::from("ip"), Value::from(ip.as_str()));
+                // Null when unknown: a policy that names ports refuses it, so an
+                // unknown port can never ride a port list it was not given.
+                fields.insert(
+                    Value::from("port"),
+                    match port {
+                        Some(port) => Value::from(*port as u64),
+                        None => Value::Null,
+                    },
+                );
             }
         }
         Value::from(fields)
@@ -283,6 +320,11 @@ fn reason_for(rule: &str, zh: bool) -> Option<String> {
             "不能写入 .bsh 或 .git 内部",
         ),
         "egress-allowlisted" => ("the address is allowlisted", "地址在白名单内"),
+        "egress-host-allowlisted" => ("the hostname is allowlisted", "主机名在白名单内"),
+        "egress-port-not-allowed" => (
+            "the destination port is not on the egress port list",
+            "目标端口不在出站端口白名单内",
+        ),
         "egress-not-allowlisted" => (
             "the resolved address is not on the egress allowlist",
             "解析后的地址不在出站白名单内",
@@ -305,6 +347,14 @@ fn reason_for(rule: &str, zh: bool) -> Option<String> {
         _ => return None,
     };
     Some(if zh { cn } else { en }.to_string())
+}
+
+/// Lower-case a host and drop the root label's trailing dot.
+///
+/// DNS names are case-insensitive and `example.com.` is the same name, so a
+/// policy that matched the raw text would be trivially walked around.
+fn normalize_host(host: &str) -> String {
+    host.trim_end_matches('.').to_ascii_lowercase()
 }
 
 /// Make a path absolute and remove `.` and `..` components.

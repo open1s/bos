@@ -23,8 +23,8 @@ use serde_json::Value;
 use super::declarative;
 use super::{
     dedup_capabilities, manifest_error, manifest_string, read_json, resolve_package_path,
-    Capability, Extension, ExtensionDetails, ExtensionError, ExtensionStandard, LoadedPackage,
-    Refusal, RefusedFeature,
+    Capability, CodexInterface, Extension, ExtensionDetails, ExtensionError, ExtensionStandard,
+    LoadedPackage, Refusal, RefusedFeature,
 };
 
 const STANDARD: ExtensionStandard = ExtensionStandard::Codex;
@@ -65,7 +65,10 @@ pub fn load(root: &Path) -> Result<LoadedPackage, ExtensionError> {
         .map(str::to_string)
         .or(package_description);
 
-    let mut details = ExtensionDetails::default();
+    let mut details = ExtensionDetails {
+        interface: Some(parse_interface(interface)),
+        ..ExtensionDetails::default()
+    };
     let icon = interface
         .and_then(|interface| {
             interface
@@ -136,7 +139,7 @@ pub fn load(root: &Path) -> Result<LoadedPackage, ExtensionError> {
                 RefusedFeature::McpServer,
                 Some(mcp_path.clone()),
                 format!(
-                    "the plugin declares MCP server '{}', which needs an external MCP process this shim does not start",
+                    "the plugin declares MCP server '{}'. This shim starts no process, so the server is not connected here; a host with an MCP pool starts the SAME declaration, and only for a package the reader has TRUSTED, because the server's command is arbitrary code",
                     server
                 ),
             ));
@@ -151,7 +154,7 @@ pub fn load(root: &Path) -> Result<LoadedPackage, ExtensionError> {
                 RefusedFeature::ExternalApp,
                 Some(apps_path.clone()),
                 format!(
-                    "the plugin declares external app connector '{}', which this shim does not connect",
+                    "the plugin declares external app connector '{}'. An app connector is an OAuth grant to a hosted service the vendor operates, not a local process any host can start; connecting one needs the vendor's own consent flow, which no extension substrate can supply",
                     connector
                 ),
             ));
@@ -169,6 +172,54 @@ pub fn load(root: &Path) -> Result<LoadedPackage, ExtensionError> {
     Ok(LoadedPackage::new(extension, refusals))
 }
 
+/// Read the Codex `interface` block into the substrate's own type.
+///
+/// Every field is optional in the reference's own schema, and each shipped
+/// manifest declares a different subset, so an absent field stays absent here
+/// rather than being defaulted into a lie.
+fn parse_interface(interface: Option<&serde_json::Map<String, Value>>) -> CodexInterface {
+    let Some(interface) = interface else {
+        return CodexInterface::default();
+    };
+    let string = |key: &str| {
+        interface
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let strings = |key: &str| -> Vec<String> {
+        interface
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    CodexInterface {
+        display_name: string("displayName"),
+        short_description: string("shortDescription"),
+        long_description: string("longDescription"),
+        developer_name: string("developerName"),
+        category: string("category"),
+        capabilities: strings("capabilities"),
+        default_prompt: strings("defaultPrompt"),
+        brand_color: string("brandColor"),
+        brand_color_dark: string("brandColorDark"),
+        composer_icon: string("composerIcon"),
+        logo: string("logo"),
+        logo_dark: string("logoDark"),
+        screenshots: strings("screenshots"),
+        website_url: string("websiteURL"),
+        privacy_policy_url: string("privacyPolicyURL"),
+        terms_of_service_url: string("termsOfServiceURL"),
+        support_url: string("supportURL"),
+    }
+}
 fn mcp_servers(
     root: &Path,
     value: &Value,

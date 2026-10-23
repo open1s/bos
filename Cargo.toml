@@ -53,6 +53,23 @@ argon2 = "0.6.0"
 chacha20poly1305 = "0.11.0"
 zeroize = "1.9.1"
 rand = "0.10.3"
+# The ONE sandbox implementation. heel builds macOS SBPL profiles (sandbox-exec),
+# Linux Landlock + Seccomp and Windows AppContainer, and its model is the one
+# bsh now follows: the working directory is the only writable place, nothing
+# writable is executable, reads are opt-in above a baseline, and network goes
+# through a policy.
+#
+# Pinned to an exact COMMIT, not the `dev` branch. The crate published no
+# release that matches the measured API (0.5.1 is the dev tip), so a branch
+# reference would let the build change under this repo without a diff here; a
+# commit makes every dependency bump an explicit edit.
+#
+# Supply chain, stated plainly: this is a young crate (created 2026-10-23, zero
+# stars, a fork of lexoliu/heel) whose API changed the same day it was measured.
+# Pinning removes drift, not trust: review the diff before moving the commit.
+# The `heel-sandbox` feature in `agent` is what turns it on, and the build
+# stays green with that feature off, where the seatbelt profile is the boundary.
+heel = { git = "https://github.com/open1s/heel", rev = "6db173aa0baf48ef06c3e946b9b074e7ae81ac9c", default-features = false }
 
 [workspace.package]
 version = "3.0.2"

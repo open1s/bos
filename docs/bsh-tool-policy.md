@@ -108,12 +108,41 @@ own ceiling, which is what the generated read-only module reads.
 
     startswith(concat("", [path, "/"]), data.workspace_prefix)
 
-The egress allowlist is a file, not a settings screen:
+The egress rules are a file, not a settings screen:
 
     <workspace>/.bsh/egress-allowlist
 
-One exact address or CIDR range per line; blank lines and `#` comments are
-ignored. A missing file is an empty list, which denies all egress.
+One rule per line; blank lines and `#` comments are ignored. A line is
+classified by what it can be:
+
+- a bare integer is a destination **port** (`443`). No port lines means any
+  port; one or more means only those, and a request whose port is unknown is
+  refused rather than waved through;
+- something that parses as an address or a CIDR range is an **address** rule
+  (`203.0.113.7`, `10.0.0.0/8`). This is the strong door: the decision is made
+  on the resolved address, so a DNS rebind cannot ride it;
+- anything else is a **hostname** rule (`api.example.com`, `*.crates.io`,
+  lower-cased). This is the weaker door - the name is what the policy saw, so a
+  rebind survives it - and it exists for a policy that names a service rather
+  than an address.
+
+A missing file declares nothing, which denies all egress.
+
+Every network path is decided by the policy, at two points:
+
+1. **Before a process exists.** The shell tool reads the endpoints a command
+   line literally names (`curl`, `wget`, `ssh`, `scp`, `sftp`, `rsync`, `nc`,
+   `ping`, and `git` with a fetching subcommand), resolves each name, and asks
+   the policy about every resolved address. A refusal names its rule and no
+   process runs. This tier is also the only network gate in the
+   `heel-sandbox`-off build.
+2. **On every connection.** With heel on, the shell runs under a proxy that asks
+   the same policy per request with the host, the resolved address AND the
+   port. Under no allowlist at all heel starts no proxy and the kernel refuses
+   outbound traffic outright.
+
+The shell tool's result reports which of these applies as `network`:
+`deny-all`, `allowlist` or `unrestricted`.
 
 ## Composition is intersection
 
@@ -122,8 +151,8 @@ narrow the baseline, never widen it: saying `allow` for a path the baseline
 denies still denies, because the baseline's `verdict` is evaluated too. Deny
 wins; the first denying module in source order supplies the rule and reason.
 
-The allowlist is the one widening control: a workspace policy cannot add an
-address the allowlist does not name. Edit `.bsh/egress-allowlist`.
+The egress file is the one widening control: a workspace policy cannot add an
+address, host or port the file does not name. Edit `.bsh/egress-allowlist`.
 
 ## Preset authority
 
@@ -164,9 +193,12 @@ explicit empty list mounts nothing:
 - read and write are workspace-relative roots. None inherits the workspace;
   an empty list allows nothing. deny always wins and is unioned with the
   baseline .git/.bsh rules.
-- egress is a second allowlist. None inherits the workspace .bsh/egress-allowlist;
-  an empty list denies all egress; entries are intersected with the workspace
-  list. web_search overrides the hosted web-search setting.
+- egress is a second allowlist of ADDRESSES. None inherits the workspace
+  .bsh/egress-allowlist; an empty list denies all egress; entries are
+  intersected with the workspace list. Because the preset's list is address
+  based, a hostname rule in the workspace file is only reachable while the
+  preset's egress scope is unrestricted. web_search overrides the hosted
+  web-search setting.
 - plugins gates the core bundles; a selected preset with an empty list mounts
   none.
 - tools, skills, mcps, mcp_tools and extensions are allowlists. Absent means

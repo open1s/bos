@@ -11,7 +11,7 @@ use crate::tools::Tool;
 use super::{
     codex, dsh, Capability, Contribution, ContributionKind, Extension, ExtensionError,
     ExtensionStandard, HookContribution, PromptContribution, ProviderContribution, Refusal,
-    SkillContribution, SkillDirContribution,
+    SkillContribution, SkillDirContribution, Trust,
 };
 
 /// A parsed package: the extension plus every part the shim refused.
@@ -21,6 +21,14 @@ pub struct LoadedPackage {
     pub extension: Extension,
     /// Explicit refusals for parts that need a runtime this build does not have.
     pub refusals: Vec<Refusal>,
+    /// The live bridge session, when a TRUSTED package's host entry ran.
+    ///
+    /// It is the only handle that keeps the plugin's process alive, so a host
+    /// that wants the tools it registered to stay CALLABLE must hold it: drop it
+    /// and the process exits and every bridged tool starts failing. A package
+    /// with no imperative entry, or an untrusted one, carries `None` and never
+    /// held a process at all.
+    pub session: Option<std::sync::Arc<std::sync::Mutex<super::bridge::BridgeSession>>>,
 }
 
 impl LoadedPackage {
@@ -29,6 +37,7 @@ impl LoadedPackage {
         Self {
             extension,
             refusals,
+            session: None,
         }
     }
 
@@ -101,6 +110,35 @@ impl ExtensionRegistry {
         }
     }
 
+    /// Parse the package at `root`, reading its declared parts and deciding
+    /// whether its imperative entry may be EXECUTED.
+    ///
+    /// This is the one entry point both trust states share. An
+    /// [`Trust::Untrusted`] package is parsed exactly like [`Self::load`]:
+    /// its declarative contributions load, its entry is refused by name, and
+    /// no process starts. A [`Trust::Trusted`] package's entry runs in the
+    /// bridge and its registrations land in the same contribution list.
+    pub fn load_with_trust(root: &Path, trust: Trust) -> Result<LoadedPackage, ExtensionError> {
+        match ExtensionStandard::detect(root)? {
+            ExtensionStandard::DeepSeekHarness => dsh::load_with_trust(root, trust),
+            // The Codex standard has no imperative entry in its manifest, so
+            // trust changes nothing about how it is read; the decision still
+            // gates the MCP servers it declares, which the host applies.
+            ExtensionStandard::Codex => codex::load(root),
+        }
+    }
+
+    /// Parse, register, and return the extension at `root`, honouring `trust`.
+    pub fn install_package_with_trust(
+        &mut self,
+        root: &Path,
+        trust: Trust,
+    ) -> Result<&Extension, ExtensionError> {
+        let package = Self::load_with_trust(root, trust)?;
+        let id = package.extension.id.clone();
+        self.install(package)?;
+        self.get_required(&id)
+    }
     /// Parse the package at `root` as `standard`.
     ///
     /// A package that is actually the other standard is refused with

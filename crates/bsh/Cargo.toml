@@ -15,6 +15,15 @@ path = "src/lib.rs"
 name = "bsh"
 path = "src/main.rs"
 
+[features]
+# The shell tool's sandbox. This crate consumes the ONE `SandboxSpec` seam from
+# `agent` for both the shell tool and the terminal pane, and never depends on
+# heel itself, so the workspace has exactly one dependency entry for it.
+# ON by default because the adoption is the point; `--no-default-features` is
+# the supported build where the in-tree seatbelt profile is the boundary.
+default = ["heel-sandbox"]
+heel-sandbox = ["agent/heel-sandbox"]
+
 [dependencies]
 arrow =  { version = "60.0.0"}
 parquet = { version = "60.0.0", features = ["arrow"] }
@@ -32,7 +41,10 @@ parquet = { version = "60.0.0", features = ["arrow"] }
 gpui-kit = { version = "=0.7.3", features = ["tree-sitter-languages"] }
 
 # The BOS framework, used directly (no intermediate shell crate).
-agent = { path = "../agent" }
+#
+# `default-features = false` so this crate's own `heel-sandbox` feature decides
+# whether the shell tool runs on heel or on the in-tree seatbelt profile.
+agent = { path = "../agent", default-features = false }
 react = { path = "../react" }
 logging = { path = "../logging" }
 config = { path = "../config" }

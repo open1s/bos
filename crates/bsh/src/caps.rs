@@ -297,6 +297,40 @@ pub(crate) struct CapInfo {
     pub(crate) category: String,
 }
 
+/// The process-wide plugin bridge pool.
+///
+/// A bridged tool is only callable while its plugin's process is alive, and a
+/// build re-reads the package on every turn, so the session cannot live in the
+/// build. It lives here instead: one child per (package, root), reused across
+/// turns, and torn down by the reconcile below when a package stops being asked
+/// for.
+///
+/// This mirrors the MCP pool's shape for the same reason - a connection is the
+/// expensive part and a turn must not pay it again - with one difference that
+/// matters: an MCP connection is a socket, and this is a process running code the
+/// reader approved, so every spawn is behind the trust gate.
+static BRIDGE_POOL: std::sync::OnceLock<std::sync::Mutex<agent::extensions::bridge::BridgePool>> =
+    std::sync::OnceLock::new();
+
+/// Run `f` against the process-wide bridge pool.
+fn with_bridge_pool<T>(f: impl FnOnce(&mut agent::extensions::bridge::BridgePool) -> T) -> T {
+    let pool = BRIDGE_POOL
+        .get_or_init(|| std::sync::Mutex::new(agent::extensions::bridge::BridgePool::new()));
+    match pool.lock() {
+        Ok(mut guard) => f(&mut guard),
+        Err(poisoned) => f(&mut poisoned.into_inner()),
+    }
+}
+
+/// Stop every bridged plugin process.
+///
+/// Called when the shell tears down, so no child outlives the app that started
+/// it. Nothing else depends on the timing: the sessions are also reconciled on
+/// every build and reaped by `Drop` if the process exits first.
+pub(crate) fn stop_bridge_pool() {
+    with_bridge_pool(|pool| pool.stop_all());
+}
+
 /// A built agent together with the plugins its tools came from.
 pub(crate) struct BuiltAgent {
     /// The agent the shell runs turns against.
@@ -564,18 +598,22 @@ fn build_agent_for_session_inner(
                 timeout_secs: eff.shell_timeout_secs,
                 ..Default::default()
             };
-            let mut bash = BashTool::new("bash")
+            // ONE sandbox spec for the shell and the terminal pane: the grants
+            // are the policy's own answers, asked once per candidate, so the
+            // confinement is not a profile this file wrote down. Full access
+            // derives an unconfined spec, which spawns a bare shell - the same
+            // release the permission already means.
+            let spec = Arc::new(agent::sandbox::SandboxSpec::for_policy(
+                &policy,
+                &permission,
+                agent::sandbox::Principal::new("bash", session, preset.clone()),
+            ));
+            let bash = BashTool::new("bash")
                 .with_config(config)
                 .with_policy(policy.clone(), session, preset.clone())
                 .with_jobs(jobs.clone(), session)
-                .with_background(gates.background_spawn);
-            // Workspace Write confines shell writes per syscall through Seatbelt
-            // when the host has it; Full access deliberately does not.
-            if confined {
-                if let Some(root) = &root {
-                    bash = bash.with_sandbox(root.clone());
-                }
-            }
+                .with_background(gates.background_spawn)
+                .with_sandbox_spec(spec);
             shell_tools.push(Arc::new(bash));
         }
         // The job tools share the shell bundle but each has its own gate: a
@@ -707,6 +745,11 @@ fn build_agent_for_session_inner(
     // declared MCP servers are handled by the MCP pool below.
     let mut extensions = agent::extensions::ExtensionRegistry::new();
     let mut installed_extensions: Vec<(String, String)> = Vec::new();
+    // The packages this build actually asked for, as (id, root). The bridge
+    // reconcile below uses it to stop the process of a package that was disabled,
+    // uninstalled, distrusted, or repointed: a plugin whose tools are no longer
+    // offered must not keep running.
+    let mut wanted: Vec<(String, PathBuf)> = Vec::new();
     for entry in &settings.global.extensions {
         if eff
             .preset_extensions
@@ -732,7 +775,17 @@ fn build_agent_for_session_inner(
         else {
             continue;
         };
-        match agent::extensions::ExtensionRegistry::load(&expand_path(raw)) {
+        // TRUST IS THE GATE. Only a package the reader approved at THIS path may
+        // have its host entry executed; an untrusted one is parsed declaratively
+        // and its entry refused by name, which is what `load_with_trust` does
+        // without starting a process.
+        let trust = if entry.is_trusted() {
+            agent::extensions::Trust::Trusted
+        } else {
+            agent::extensions::Trust::Untrusted
+        };
+        let root = expand_path(raw);
+        match agent::extensions::ExtensionRegistry::load_with_trust(&root, trust) {
             Ok(package) => {
                 for refusal in &package.refusals {
                     // The shim declines to own MCP processes; the MCP pool
@@ -743,6 +796,16 @@ fn build_agent_for_session_inner(
                     warn!("extension refused a part: {refusal}");
                 }
                 let package_id = package.extension.id.clone();
+                // A trusted entry that RAN left a live session behind. Adopt it
+                // into the process-wide pool so its tools stay callable after
+                // this build returns: the pool is the only owner that outlives
+                // the parse.
+                if let Some(session) = package.session.clone() {
+                    with_bridge_pool(|pool| {
+                        pool.adopt(&package_id, root.clone(), Arc::clone(&session));
+                    });
+                    wanted.push((package_id.clone(), root.clone()));
+                }
                 if let Err(error) = extensions.install(package) {
                     warn!("extension '{}' was not installed: {error}", entry.id);
                 } else {
@@ -755,6 +818,17 @@ fn build_agent_for_session_inner(
             Err(error) => warn!("extension '{}' could not be loaded: {error}", entry.id),
         }
     }
+    // A plugin process outlives the build that started it, so the reconcile has
+    // to be here: every package the pool holds but this build did not ask for is
+    // stopped now. Without it, disabling or untrusting a package would leave its
+    // process running with its tools still on the agent.
+    with_bridge_pool(|pool| {
+        pool.retain(|id, root| {
+            wanted
+                .iter()
+                .any(|(wanted_id, wanted_root)| wanted_id == id && wanted_root == root)
+        });
+    });
     if !extensions.is_empty() {
         if let Err(error) = extensions.apply_to_agent(&mut agent) {
             warn!("extensions could not be applied to the agent: {error}");
@@ -1439,7 +1513,13 @@ fn build_policy(settings: &Settings, eff: &Effective, root: Option<&Path>) -> Po
         // preset's ceiling alone and never the requested mode.
         .with_permission(eff.permission.effective.clone());
     if let Some(root) = root {
-        data = data.with_egress_allowlist(read_egress_allowlist(root));
+        // One file, three rule shapes: addresses (the strong door), hostnames
+        // (the weak door) and ports (a constraint on both).
+        let rules = read_egress_rules(root);
+        data = data
+            .with_egress_allowlist(rules.addresses)
+            .with_egress_hosts(rules.hosts)
+            .with_egress_ports(rules.ports);
         let read_roots = eff
             .preset_read
             .as_ref()
@@ -1662,21 +1742,54 @@ fn preset_scope_roots(root: &std::path::Path, items: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// The addresses this workspace allows egress to, one per line.
+/// The egress rules this workspace declares.
 ///
-/// The file is `<workspace>/.bsh/egress-allowlist`: an exact address or a
-/// CIDR range, with `#` comments and blank lines ignored. A missing file means
-/// an empty list, which denies all egress - the baseline's documented default.
-fn read_egress_allowlist(root: &Path) -> Vec<String> {
+/// One file, `<workspace>/.bsh/egress-allowlist`, with `#` comments and blank
+/// lines ignored. Each line is one of three shapes, decided by what it can be:
+///
+/// - a bare integer is a destination PORT (`443`). No port lines means any
+///   port; one or more means only those.
+/// - something that parses as an address or as a CIDR range is an ADDRESS rule
+///   (`203.0.113.7`, `10.0.0.0/8`). This is the strong door: the policy decides
+///   on the resolved address, so a DNS rebind cannot ride it.
+/// - anything else is a HOSTNAME rule (`api.example.com`, `*.crates.io`). This
+///   is the weaker door - it survives a rebind - and it exists for a policy that
+///   names a service rather than an address.
+///
+/// A missing file means no rules at all, which denies all egress: the
+/// baseline's documented default.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct EgressRules {
+    pub(crate) addresses: Vec<String>,
+    pub(crate) hosts: Vec<String>,
+    pub(crate) ports: Vec<u16>,
+}
+
+fn read_egress_rules(root: &Path) -> EgressRules {
     let path = root.join(".bsh").join("egress-allowlist");
     let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
+        return EgressRules::default();
     };
-    text.lines()
-        .map(|line| line.split('#').next().unwrap_or("").trim())
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect()
+    let mut rules = EgressRules::default();
+    for line in text.lines() {
+        let entry = line.split('#').next().unwrap_or("").trim();
+        if entry.is_empty() {
+            continue;
+        }
+        if let Ok(port) = entry.parse::<u16>() {
+            rules.ports.push(port);
+            continue;
+        }
+        let base = entry.split('/').next().unwrap_or(entry);
+        let is_address = entry.parse::<std::net::IpAddr>().is_ok()
+            || (entry.contains('/') && base.parse::<std::net::IpAddr>().is_ok());
+        if is_address {
+            rules.addresses.push(entry.to_string());
+        } else {
+            rules.hosts.push(entry.to_ascii_lowercase());
+        }
+    }
+    rules
 }
 
 /// Ask the policy about one concrete path before a tool touches it.
@@ -1938,8 +2051,8 @@ fn open_memory(settings: &Settings) -> Option<Arc<dyn MemoryStore>> {
 mod tests {
     use super::{
         agent_messages, allows_writes, build_agent, compactable_span, is_confined,
-        plugin_provider_node, refresh_plugin_providers, surfaced_capabilities, tool_gates_for,
-        BuiltAgent, FULL_ACCESS, READ_ONLY, WORKSPACE_WRITE,
+        plugin_provider_node, read_egress_rules, refresh_plugin_providers, surfaced_capabilities,
+        tool_gates_for, with_bridge_pool, BuiltAgent, FULL_ACCESS, READ_ONLY, WORKSPACE_WRITE,
     };
     use crate::settings::global::{ModelEntry, Preset};
     use crate::settings::resolve::SessionChoice;
@@ -1947,6 +2060,37 @@ mod tests {
     use crate::vault::Vault;
     use agent::policy::{Action, PolicyInput, Target};
 
+    /// The egress file carries three rule shapes, and a line is classified by
+    /// what it can be: a port number, an address, or a hostname.
+    #[test]
+    fn egress_rules_are_classified_by_what_they_can_be() {
+        let root = std::env::temp_dir().join(format!("bsh-egress-rules-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".bsh")).expect(".bsh");
+        std::fs::write(
+            root.join(".bsh").join("egress-allowlist"),
+            "# the workspace's egress rules\n\
+             203.0.113.7\n\
+             10.0.0.0/8   # a range\n\
+             API.Example.test\n\
+             *.crates.io\n\
+             443\n",
+        )
+        .expect("the allowlist");
+        let rules = read_egress_rules(&root);
+        assert_eq!(rules.addresses, vec!["203.0.113.7", "10.0.0.0/8"]);
+        assert_eq!(
+            rules.hosts,
+            vec!["api.example.test", "*.crates.io"],
+            "hostnames are lower-cased, ranges stay addresses"
+        );
+        assert_eq!(rules.ports, vec![443]);
+
+        // A missing file declares nothing at all, which denies all egress.
+        let empty = read_egress_rules(&root.join("nowhere"));
+        assert!(empty.addresses.is_empty() && empty.hosts.is_empty() && empty.ports.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
     /// A transcript with `turns` exchanges, so the gate has history to fold.
     fn turns(count: usize) -> Vec<crate::model::ChatMessage> {
         let mut messages = Vec::new();
@@ -2110,6 +2254,224 @@ mod tests {
     /// The web-tools switch reaches the agent config, and the hosted tool only
     /// appears when the protocol can carry it.
     ///
+    /// A TRUSTED DSH package's host entry runs during a real build, and the tool
+    /// it registers is CALLABLE from the agent the shell would actually run.
+    ///
+    /// This is the end-to-end claim. `an_installed_extension_reaches_the_turn`
+    /// covers the DECLARATIVE path; this covers the IMPERATIVE one, which is how
+    /// every shipped DSH package delivers its payload. The assertion is the CALL,
+    /// and the expected value is what the fixture's own `execute` returns, so a
+    /// build that registered a name without a live process behind it cannot pass.
+    ///
+    /// The fixture is copied to a scratch root first: the trusted half runs its
+    /// JavaScript, and a test must not have a child writing into the repository.
+    #[test]
+    fn a_trusted_dsh_entry_reaches_the_turn_through_the_bridge() {
+        if agent::extensions::bridge::find_interpreter().is_none() {
+            eprintln!("skipped: no Node interpreter");
+            return;
+        }
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../agent/tests/fixtures/extensions/dsh-bridge");
+        let root = std::env::temp_dir().join(format!("bsh-bridge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("scratch root");
+        for entry in std::fs::read_dir(&source).expect("fixture") {
+            let entry = entry.expect("entry");
+            std::fs::copy(entry.path(), root.join(entry.file_name())).expect("copy");
+        }
+
+        let mut settings = bare();
+        let record = crate::settings::global::InstalledExtension {
+            id: "dsh-bridge".to_string(),
+            path: Some(root.to_string_lossy().to_string()),
+            trusted: true,
+            trusted_path: Some(root.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        assert!(record.is_trusted(), "the premise: the record is trusted");
+        settings.global.extensions.push(record);
+
+        let built = build(&settings);
+        let tool = built
+            .agent
+            .registry()
+            .expect("tool registry")
+            .get("dsh_bridge_echo")
+            .expect("the bridged tool reached the turn");
+        let output = tool
+            .run(&serde_json::json!({ "value": "turn" }))
+            .expect("the bridged tool runs inside the build");
+        assert_eq!(output["echoed"], "turn", "{output}");
+        // The config came from the package's own bundle patch, so the manifest's
+        // config reached the plugin and this is not a hardcoded default.
+        assert_eq!(output["plugin"], "fixture", "{output}");
+
+        // The process is alive AFTER the build returned, which is what makes the
+        // tool usable across turns rather than for exactly one call.
+        let again = tool
+            .run(&serde_json::json!({ "value": "second" }))
+            .expect("the session outlives the build that created it");
+        assert_eq!(again["echoed"], "second", "{again}");
+
+        // A build that no longer asks for the package offers no tool from it.
+        let without = build(&bare());
+        assert!(
+            without
+                .agent
+                .registry()
+                .expect("tool registry")
+                .get("dsh_bridge_echo")
+                .is_none(),
+            "a package nobody lists contributes no tool"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An UNTRUSTED DSH package contributes no tool in a real build, and its
+    /// entry never runs: the trust gate at the build boundary.
+    ///
+    /// The fixture records execution by writing a marker on its module's first
+    /// line, so the assertion is about EXECUTION and not merely about a missing
+    /// registration. It is copied to a scratch root first: a test must never let a
+    /// child write into the repository, and a marker left in the fixture by an
+    /// earlier run would silently invert what this test proves.
+    #[test]
+    fn an_untrusted_dsh_entry_contributes_no_tool_to_the_turn() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../agent/tests/fixtures/extensions/dsh-untrusted");
+        let root = std::env::temp_dir().join(format!("bsh-untrusted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("scratch root");
+        for entry in std::fs::read_dir(&source).expect("fixture") {
+            let entry = entry.expect("entry");
+            let name = entry.file_name();
+            assert!(
+                !name.to_string_lossy().ends_with(".marker"),
+                "the fixture carries {name:?}: a previous run left execution evidence behind"
+            );
+            std::fs::copy(entry.path(), root.join(name)).expect("copy");
+        }
+
+        let mut settings = bare();
+        settings
+            .global
+            .extensions
+            .push(crate::settings::global::InstalledExtension {
+                id: "dsh-untrusted".to_string(),
+                path: Some(root.to_string_lossy().to_string()),
+                ..Default::default()
+            });
+        let built = build(&settings);
+        assert!(
+            built
+                .agent
+                .registry()
+                .expect("tool registry")
+                .get("dsh_untrusted_echo")
+                .is_none(),
+            "an untrusted package's entry never registers anything"
+        );
+        assert!(
+            !root.join("executed.marker").exists(),
+            "and it never ran: no marker, so no process"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The pool reconciles: a package that stops being asked for loses its child.
+    ///
+    /// This is the lifecycle half of the trust story. A plugin process outlives
+    /// the build that spawned it, so without `retain` a reader who unticks a
+    /// package - or withdraws trust - would leave its code running invisibly.
+    /// The witness is the pid: `kill(pid, 0)` succeeds while pooled and fails
+    /// once the pool has reconciled it away.
+    #[test]
+    fn the_bridge_pool_stops_a_package_the_build_no_longer_asks_for() {
+        if agent::extensions::bridge::find_interpreter().is_none() {
+            eprintln!("skipped: no Node interpreter");
+            return;
+        }
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../agent/tests/fixtures/extensions/dsh-bridge");
+        let root = std::env::temp_dir().join(format!("bsh-pool-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("scratch root");
+        for entry in std::fs::read_dir(&source).expect("fixture") {
+            let entry = entry.expect("entry");
+            std::fs::copy(entry.path(), root.join(entry.file_name())).expect("copy");
+        }
+        let mut settings = bare();
+        settings
+            .global
+            .extensions
+            .push(crate::settings::global::InstalledExtension {
+                id: "dsh-bridge".to_string(),
+                path: Some(root.to_string_lossy().to_string()),
+                trusted: true,
+                trusted_path: Some(root.to_string_lossy().to_string()),
+                ..Default::default()
+            });
+
+        // A build that names the package starts a child and pools it.
+        let built = build(&settings);
+        let tool = built
+            .agent
+            .registry()
+            .expect("tool registry")
+            .get("dsh_bridge_echo")
+            .expect("the bridged tool");
+        let pid = with_bridge_pool(|pool| {
+            pool.session("@local/dsh-bridge", &root)
+                .expect("the pool holds the session")
+                .lock()
+                .expect("lock")
+                .pid()
+        });
+        assert!(process_alive(pid), "the child runs while pooled");
+        // Dropping the agent must not stop it: another turn may still hold it.
+        drop(tool);
+        drop(built);
+        assert!(
+            process_alive(pid),
+            "the pool owns the process, not the build that adopted it"
+        );
+
+        // A build that no longer asks for the package stops it.
+        let _ = build(&bare());
+        assert!(
+            with_bridge_pool(|pool| pool.loaded()).is_empty(),
+            "the pool keeps no package this build did not ask for"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert!(
+            !process_alive(pid),
+            "reconciling the pool reaps the child rather than leaking it"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Whether a process with this pid exists, without executing a new one.
+    ///
+    /// `kill(pid, 0)` is the POSIX existence probe: it sends no signal and
+    /// reports through `errno`, so it cannot itself be mistaken for the child
+    /// under test.
+    #[cfg(unix)]
+    fn process_alive(pid: u32) -> bool {
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        // SAFETY: `kill` with signal 0 performs the permission and existence
+        // check and delivers nothing; the pid is one the OS issued us.
+        unsafe { kill(pid as i32, 0) == 0 }
+    }
+
+    #[cfg(not(unix))]
+    fn process_alive(pid: u32) -> bool {
+        let _ = pid;
+        false
+    }
+
     /// The setting is the reader's half of the decision; the engine holds the
     /// other half, so this pins that the value arrives and that a chat-protocol
     /// provider is not handed a hosted tool it would reject.

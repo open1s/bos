@@ -15444,16 +15444,20 @@ fn the_pane_says_the_shell_exited(cx: &mut TestAppContext) {
             cx.notify();
         });
     });
+    // The pane's terminal clock is what notices a shell that exited: a
+    // sandboxed shell's reader does not see EOF (the pane keeps a slave
+    // description open), so the child is the authority and the clock polls it.
+    // A test that asserts liveness has to drive the same clock.
     let mut stopped = false;
     for _ in 0..120 {
         stopped = cx.update(|_, cx| {
-            shell
-                .read(cx)
-                .right
-                .terminal
-                .as_ref()
-                .map(|t| !t.is_running())
-                .unwrap_or(false)
+            shell.update(cx, |this, _| {
+                let Some(terminal) = this.right.terminal.as_mut() else {
+                    return false;
+                };
+                terminal.poll();
+                !terminal.is_running()
+            })
         });
         if stopped {
             break;

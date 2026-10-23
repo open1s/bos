@@ -15,11 +15,12 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use super::bridge;
 use super::declarative;
 use super::{
     dedup_capabilities, manifest_error, manifest_string, read_json, read_prefix,
     resolve_package_path, Capability, ClientManifest, Contribution, Extension, ExtensionDetails,
-    ExtensionError, ExtensionStandard, LoadedPackage, Refusal, RefusedFeature, UiPanel,
+    ExtensionError, ExtensionStandard, LoadedPackage, Refusal, RefusedFeature, Trust, UiPanel,
 };
 
 const STANDARD: ExtensionStandard = ExtensionStandard::DeepSeekHarness;
@@ -43,8 +44,29 @@ const CLIENT_MARKERS: &[(&str, Capability)] = &[
     ("ctx.slots.inject", Capability::Panels),
 ];
 
+/// Load one DeepSeek Harness package directory, deciding whether its host
+/// entry may be EXECUTED.
+///
+/// This is the one load path both trust states share, and the difference is
+/// exactly one fact: an untrusted package's entry is refused with a named
+/// [`Refusal`] and NO process is started, while a trusted package's entry runs
+/// in the bridge and every registration it makes becomes a real contribution in
+/// the same registry the declarative files feed.
+///
+/// A trusted package whose entry throws, times out, or cannot be reached
+/// yields ONE named [`Refusal`] and NOTHING registered: the load is
+/// all-or-nothing, so a half-loaded plugin is impossible. Its declarative
+/// files are still read, because they are facts about the package that do not
+/// depend on the script.
+pub fn load_with_trust(root: &Path, trust: Trust) -> Result<LoadedPackage, ExtensionError> {
+    load_inner(root, trust)
+}
 /// Load one DeepSeek Harness package directory.
 pub fn load(root: &Path) -> Result<LoadedPackage, ExtensionError> {
+    load_inner(root, Trust::Untrusted)
+}
+
+fn load_inner(root: &Path, trust: Trust) -> Result<LoadedPackage, ExtensionError> {
     let manifest_path = root.join("package.json");
     if !manifest_path.is_file() {
         return Err(ExtensionError::WrongStandard {
@@ -82,6 +104,9 @@ pub fn load(root: &Path) -> Result<LoadedPackage, ExtensionError> {
     let mut contributions = Vec::new();
     let mut refusals = Vec::new();
     let mut details = ExtensionDetails::default();
+    // Set only when a TRUSTED host entry ran; the handle keeps the plugin's
+    // process alive so the tools it registered stay callable.
+    let mut host_session = None;
 
     if let Some(raw) = dsh.get("manifestVersion") {
         let version = raw.as_u64().ok_or_else(|| {
@@ -240,12 +265,37 @@ pub fn load(root: &Path) -> Result<LoadedPackage, ExtensionError> {
         for capability in &found {
             capabilities.insert(*capability);
         }
-        refusals.push(Refusal::new(
-            &id,
-            RefusedFeature::ImperativeHostEntry,
-            Some(entry),
-            imperative_reason("host entry", &found),
-        ));
+        if trust.permits_execution() {
+            // A trusted package's entry runs in the bridge and every registration
+            // it makes lands in this same contribution list. A failure is ONE
+            // named refusal and contributes nothing: a half-loaded plugin is not
+            // a state this loader can produce.
+            match bridge::load_entry(root, &entry, STANDARD, serde_json::json!({})) {
+                Ok(bridged) => {
+                    for contribution in &bridged.contributions {
+                        capabilities.insert(capability_for(contribution.kind()));
+                    }
+                    contributions.extend(bridged.contributions);
+                    refusals.extend(bridged.refusals);
+                    // The session must outlive the parse for the tools to be
+                    // callable; a host that wants to call them keeps this handle.
+                    host_session = Some(bridged.session);
+                }
+                Err(error) => {
+                    refusals.push(bridge::refusal_for(&id, &entry, &error));
+                }
+            }
+            // The bundled client module is browser JavaScript for the DSH web
+            // renderer; this host has none, so it stays refused whether or not the
+            // host entry ran.
+        } else {
+            refusals.push(Refusal::new(
+                &id,
+                RefusedFeature::ImperativeHostEntry,
+                Some(entry),
+                imperative_reason("host entry", &found),
+            ));
+        }
     }
 
     if details.client.is_some() {
@@ -282,9 +332,27 @@ pub fn load(root: &Path) -> Result<LoadedPackage, ExtensionError> {
     if let Some(description) = description {
         extension = extension.with_description(description);
     }
-    Ok(LoadedPackage::new(extension, refusals))
+    let mut package = LoadedPackage::new(extension, refusals);
+    package.session = host_session;
+    Ok(package)
 }
 
+/// The capability a contribution delivers, for the declaration list.
+///
+/// A bridged registration and a declarative file both arrive as the same
+/// [`Contribution`] variants, so ONE mapping serves both paths: the declared
+/// capability set cannot drift from what loaded.
+fn capability_for(kind: super::ContributionKind) -> Capability {
+    match kind {
+        super::ContributionKind::Tool => Capability::Tools,
+        super::ContributionKind::Hook => Capability::Hooks,
+        super::ContributionKind::Command => Capability::Commands,
+        super::ContributionKind::Skill | super::ContributionKind::SkillDir => Capability::Skills,
+        super::ContributionKind::Panel => Capability::Panels,
+        super::ContributionKind::Prompt => Capability::Prompts,
+        super::ContributionKind::Provider => Capability::Models,
+    }
+}
 struct PatchRow {
     id: String,
     mcp: bool,

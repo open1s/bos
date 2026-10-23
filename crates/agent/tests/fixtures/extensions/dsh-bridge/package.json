@@ -1,0 +1,12 @@
+{
+  "name": "@local/dsh-bridge",
+  "version": "0.1.0",
+  "description": "A DSH fixture whose whole payload is its apply(ctx, config) host entry.",
+  "main": "index.js",
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

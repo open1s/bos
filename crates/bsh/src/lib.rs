@@ -45,4 +45,10 @@ pub fn run() {
     std::fs::create_dir_all(&dir).ok();
     logging::auto_init_tracing_in(dir, "bsh");
     ui::run(ui::Startup::from_args());
+    // The window closed, so no plugin process may outlive it. A bridged plugin is
+    // a child this app started; leaving it running would be a leaked process the
+    // reader never asked for and cannot see. The sessions are also reconciled on
+    // every agent build and reaped by their own `Drop`, so this is the belt to
+    // that pair of braces rather than the only guarantee.
+    caps::stop_bridge_pool();
 }

@@ -1,0 +1,8 @@
+{
+  "name": "@local/dsh-throwing",
+  "version": "0.1.0",
+  "main": "index.js",
+  "dsh": {
+    "manifestVersion": 1
+  }
+}
