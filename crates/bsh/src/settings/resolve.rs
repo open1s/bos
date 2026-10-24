@@ -179,35 +179,64 @@ pub(crate) const PRESET_SANDBOX_WIDENS: &str = "preset-sandbox-widens";
 /// full access. Anything narrower resolves to `heel` and records
 /// [`PRESET_SANDBOX_WIDENS`]; the resolution is then refused at send, and a
 /// build that is reached anyway still runs the shell confined.
+///
+/// The MASTER SWITCH is a fourth input and it wins over every preset arm: when
+/// it is off, heel is not applied to the shell or the terminal for ANY preset,
+/// including one declaring `sandbox = "heel"`. A preset's `none` is untouched
+/// (it was already unconfined), and a permission that already released the shell
+/// is untouched too - there the switch changed nothing, so it must not claim the
+/// release.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SandboxResolution {
     /// The preset's declaration, or none for "inherit".
     pub(crate) declared: Option<SandboxChoice>,
     /// Whether shell commands run under heel after resolution.
     pub(crate) heel: bool,
+    /// Whether the SETTINGS master switch is off, independent of whether it
+    /// changed this turn's confinement.
+    ///
+    /// `off_by_settings` answers "did the switch release THIS shell?", which is
+    /// false when the permission had already released it. The UI needs the raw
+    /// switch too: the cards and the permission menu must say the shell is
+    /// unconfined while the switch is off even where the attribution stays the
+    /// permission's. Keeping both facts here is what stops either surface from
+    /// recomputing the switch on its own.
+    pub(crate) switch_off: bool,
     /// The shell is unconfined because the preset asked for it (not because
     /// the permission released it). This is the state the UI must label.
     pub(crate) off_by_preset: bool,
+    /// The shell is unconfined because the READER switched the sandbox off in
+    /// the settings. True only when that switch actually changed this turn's
+    /// confinement: a permission already at full access had released it, so the
+    /// release keeps its own attribution instead.
+    pub(crate) off_by_settings: bool,
     /// The rule of a refused declaration; the shell then stays confined.
     pub(crate) refusal: Option<&'static str>,
 }
 
 impl SandboxResolution {
-    /// Resolve one preset declaration against its ceiling and the permission in
-    /// force.
+    /// Resolve the master switch, one preset declaration, its ceiling and the
+    /// permission in force.
+    ///
+    /// `sandbox_enabled` is the settings master switch and comes FIRST because
+    /// it outranks everything else: with it off, no arm below can turn heel
+    /// back on.
     pub(crate) fn resolve(
+        sandbox_enabled: bool,
         declared: Option<SandboxChoice>,
         preset_ceiling: Option<&str>,
         effective_permission: &str,
     ) -> Self {
         let heel = !is_full_access(effective_permission);
-        match declared {
+        let mut resolved = match declared {
             // Inherit: today's behaviour, unchanged. An absent field can never
             // widen, because the permission alone decides confinement.
             None => Self {
                 declared,
                 heel,
+                switch_off: !sandbox_enabled,
                 off_by_preset: false,
+                off_by_settings: false,
                 refusal: None,
             },
             // The narrowing arm: heel is a ceiling on the shell, so it applies
@@ -215,7 +244,9 @@ impl SandboxResolution {
             Some(SandboxChoice::Heel) => Self {
                 declared,
                 heel: true,
+                switch_off: !sandbox_enabled,
                 off_by_preset: false,
+                off_by_settings: false,
                 refusal: None,
             },
             Some(SandboxChoice::Off) => {
@@ -224,11 +255,56 @@ impl SandboxResolution {
                 Self {
                     declared,
                     heel: !permitted,
+                    switch_off: !sandbox_enabled,
                     off_by_preset: permitted,
+                    off_by_settings: false,
                     refusal: (!permitted).then_some(PRESET_SANDBOX_WIDENS),
                 }
             }
+        };
+        // The switch overrides the ARM, never the guard: a declaration the
+        // widening guard refuses stays refused (it is a statement about the
+        // declaration, and nothing here makes it sendable).
+        if !sandbox_enabled && resolved.heel {
+            resolved.heel = false;
+            resolved.off_by_settings = true;
         }
+        resolved
+    }
+
+    /// The shell runs unconfined because a POLICY said so - a preset's own arm
+    /// or the settings master switch - rather than because the permission
+    /// released it.
+    ///
+    /// This is what decides the channel (the bare spec, with the workspace root
+    /// kept as the working directory) and which reason an unconfined result
+    /// carries.
+    pub(crate) fn off_by_policy(&self) -> bool {
+        self.off_by_preset || self.off_by_settings
+    }
+
+    /// The master switch is currently overriding a preset that asked for heel.
+    ///
+    /// The one fact the preset card and the confirmation gate name: a
+    /// declaration is still read and still says `heel`, but it is not applied.
+    pub(crate) fn overrides_preset(&self) -> bool {
+        self.off_by_settings && self.declared == Some(SandboxChoice::Heel)
+    }
+}
+
+/// The reason an unconfined result carries, in precedence order.
+///
+/// The settings switch wins over a preset's arm (it is the control that turns
+/// confinement off everywhere), a preset's arm wins over the permission's
+/// release, and the release is what remains. `None` means nothing in this turn
+/// released the shell, so a tool that runs confined reports no reason at all.
+pub(crate) fn sandbox_off_reason(sandbox: &SandboxResolution) -> Option<&'static str> {
+    if sandbox.off_by_settings {
+        Some(agent::tools::bash::SANDBOX_SETTINGS_OFF_REASON)
+    } else if sandbox.off_by_preset {
+        Some(agent::tools::bash::PRESET_SANDBOX_OFF_REASON)
+    } else {
+        None
     }
 }
 
@@ -317,9 +393,22 @@ pub(crate) struct Resolution {
     /// The workspace root the tools are confined to.
     pub(crate) root: String,
     /// The preset id in effect, after the user default has been applied.
+    ///
+    /// None when presets are DISABLED as well as when none is selected: the
+    /// id is the authority half of every preset contribution, so an inert
+    /// selection must not reach a build through it. The selection itself stays
+    /// in the settings (`default_preset` and `Session::agent_preset`), which is
+    /// what makes switching presets back on restore it.
     pub(crate) preset_id: Option<String>,
     /// The preset it resolved to, once found.
     pub(crate) preset: Option<Preset>,
+    /// Whether the master switch is off, so NO preset applies.
+    ///
+    /// Every preset field below is then absent/empty and the permission, the
+    /// sandbox, the egress and the tool gates read the session's own mode. The
+    /// flag is carried so the audit can say WHY a restriction was absent,
+    /// instead of leaving "no preset" indistinguishable from "none chosen".
+    pub(crate) presets_disabled: bool,
     /// Permission ceiling, or none to inherit the session's permission.
     pub(crate) preset_permission: Option<String>,
     /// Read roots; none inherits the workspace, empty allows nothing.
@@ -350,6 +439,12 @@ pub(crate) struct Resolution {
     pub(crate) preset_extensions: Option<Vec<String>>,
     /// The preset's LLM persona, or none for the workspace prompt.
     pub(crate) preset_system_prompt: Option<String>,
+    /// Whether the persona in force IS the whole system prompt.
+    ///
+    /// A preset persona's own `complete` flag when the preset ships one,
+    /// otherwise the workspace persona's flag. Resolved here, once, so the
+    /// build, the prompt composer and the settings summary cannot disagree.
+    pub(crate) persona_complete: bool,
     /// The Rego module the resolved preset contributes.
     pub(crate) preset_policy: Option<String>,
     /// Whether the resolved preset's policy is trusted to apply.
@@ -475,6 +570,10 @@ pub(crate) fn resolve_with_catalogue(
 ) -> Resolution {
     let model = choose_model(global, session.model.as_ref());
 
+    // The master switch is read ONCE, before the selection: with presets off
+    // the selection is kept in the settings but contributes nothing, so the
+    // name is still resolved (for the retained id) and then dropped.
+    let presets_disabled = !global.general.presets_active();
     // The session's own preset wins; one that names none takes the user's
     // default, which is the reference's selectedDefault over its deployment
     // default of standard.
@@ -485,7 +584,11 @@ pub(crate) fn resolve_with_catalogue(
         .filter(|id| !id.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| global.default_preset.trim().to_string());
-    let (preset, preset_missing) = if named.is_empty() {
+    // A disabled preset is INERT, not deleted: the files still parse and
+    // validate at load, and the selection stays where the reader put it. So
+    // nothing is reported MISSING either - a stale id cannot refuse a turn
+    // while it applies nothing.
+    let (preset, preset_missing) = if presets_disabled || named.is_empty() {
         (None, None)
     } else {
         let found = global.preset(&named);
@@ -500,7 +603,11 @@ pub(crate) fn resolve_with_catalogue(
         .as_ref()
         .map(|p| p.plugins.clone())
         .unwrap_or_default();
-    let preset_id = if named.is_empty() { None } else { Some(named) };
+    let preset_id = if presets_disabled || named.is_empty() {
+        None
+    } else {
+        Some(named)
+    };
 
     // The model node describes the model; the workspace says what it wants here.
     let declared_effort = match &model {
@@ -520,8 +627,20 @@ pub(crate) fn resolve_with_catalogue(
     );
     // The sandbox choice is a POLICY decision, and the widening guard lives
     // beside the permission minimum because it depends on the same ceiling.
+    // The MASTER SWITCH comes first: with it off no preset arm can confine.
     let preset_sandbox = preset.as_ref().and_then(|preset| preset.sandbox);
+    // The complete-persona flag follows the persona in force: a preset that
+    // ships its own persona owns the flag; a preset that ships none leaves the
+    // workspace persona (and its flag) in charge.
+    let persona_complete = match preset
+        .as_ref()
+        .and_then(|preset| preset.system_prompt.as_deref())
+    {
+        Some(_) => preset.as_ref().is_some_and(|preset| preset.complete),
+        None => workspace.agent.complete,
+    };
     let sandbox = SandboxResolution::resolve(
+        global.general.sandbox_active(),
         preset_sandbox,
         preset
             .as_ref()
@@ -534,6 +653,7 @@ pub(crate) fn resolve_with_catalogue(
         name: entry.map(|e| e.name.clone()).unwrap_or_default(),
         root: entry.map(|e| e.root.clone()).unwrap_or_default(),
         preset_id,
+        presets_disabled,
         preset_permission: preset.as_ref().and_then(|preset| preset.permission.clone()),
         preset_read: preset.as_ref().and_then(|preset| preset.read.clone()),
         preset_write: preset.as_ref().and_then(|preset| preset.write.clone()),
@@ -568,6 +688,7 @@ pub(crate) fn resolve_with_catalogue(
         preset_missing,
         plugins,
         system_prompt: workspace.agent.system_prompt.clone(),
+        persona_complete,
         reasoning_effort: workspace.agent.reasoning_effort.clone().or(declared_effort),
         temperature: workspace.agent.temperature,
         max_tokens: workspace.agent.max_tokens,
@@ -1424,6 +1545,155 @@ mcp_servers = [
         assert!(r.refusal().is_none());
     }
 
+    /// The master switch removes EVERY preset contribution while keeping the
+    /// selection, and turning it back on restores the same preset with the same
+    /// facts. A read-only preset capping a workspace-write session is the cap
+    /// the switch lifts, asserted so "no preset" is proven on the widening axis.
+    #[test]
+    fn turning_presets_off_resolves_no_preset_and_restores_the_selection() {
+        let mut global = global();
+        // Every kind of contribution the build reads, so the probe covers the
+        // fields rather than only the id.
+        global.presets.insert(
+            "guarded".to_string(),
+            Preset {
+                permission: Some("read-only".to_string()),
+                read: Some(vec![".".to_string()]),
+                write: Some(Vec::new()),
+                deny: vec![".env".to_string()],
+                egress: Some(Vec::new()),
+                web_search: Some(false),
+                tools: Some(vec!["read_file".to_string()]),
+                plugins: vec!["files".to_string()],
+                builtin_policy: vec!["no-shell".to_string()],
+                policy_mode: Some(PolicyMode::Required),
+                system_prompt: Some("guarded".to_string()),
+                ..Preset::default()
+            },
+        );
+        let ws = workspace();
+        // The provider/model pair resolves, so no model refusal can mask the
+        // preset assertions below.
+        let mut session_choice = choice("nvidia", "glm");
+        session_choice.preset = Some("guarded".to_string());
+        let on = resolve(&global, &ws, Some(&entry()), &session_choice);
+        assert!(!on.presets_disabled);
+        assert_eq!(on.preset_id.as_deref(), Some("guarded"));
+        assert_eq!(
+            on.permission.effective, "read-only",
+            "the premise: the preset caps the workspace-write session"
+        );
+
+        // Off: nothing of the preset reaches the resolution...
+        global.general.presets_enabled = Some(false);
+        let off = resolve(&global, &ws, Some(&entry()), &session_choice);
+        assert!(off.presets_disabled);
+        assert_eq!(off.preset_id, None, "no preset is the authority");
+        assert!(off.preset.is_none());
+        assert_eq!(
+            off.permission.effective, "workspace-write",
+            "the session's own mode, with no ceiling above it"
+        );
+        assert_eq!(off.permission.preset_ceiling, None);
+        assert!(off.preset_read.is_none() && off.preset_write.is_none());
+        assert!(off.preset_deny.is_empty(), "no deny scope applies");
+        assert!(
+            off.preset_egress.is_none(),
+            "no egress intersection applies"
+        );
+        assert_eq!(off.preset_web_search, None);
+        assert_eq!(off.preset_tools, None);
+        assert!(off.preset_builtin_policy.is_empty());
+        assert_eq!(off.preset_policy_mode, None);
+        assert!(off.preset_policy.is_none());
+        assert!(!off.preset_trusted);
+        assert!(off.preset_system_prompt.is_none(), "no persona applies");
+        assert!(off.plugins.is_empty(), "no bundle switching applies");
+        assert!(off.preset_missing.is_none(), "an inert id never refuses");
+        assert!(off.refusal().is_none());
+        // ...and the selection itself is untouched, which is what restore reads.
+        assert_eq!(
+            session_choice.preset.as_deref(),
+            Some("guarded"),
+            "the session's choice is kept while it is inert"
+        );
+        assert_eq!(global.default_preset, "standard");
+        assert_eq!(
+            global.preset("guarded").map(|p| p.plugins),
+            Some(vec!["files".to_string()])
+        );
+        // The DEFAULT selection is kept too: a session that names nothing
+        // resolves no preset while off, and the default again once on.
+        let default_choice = choice("nvidia", "glm");
+        let default_off = resolve(&global, &ws, Some(&entry()), &default_choice);
+        assert_eq!(default_off.preset_id, None);
+        assert!(default_off.plugins.is_empty());
+
+        // On again: the same preset, with the same effective facts.
+        global.general.presets_enabled = None;
+        let back = resolve(&global, &ws, Some(&entry()), &session_choice);
+        assert!(!back.presets_disabled);
+        assert_eq!(back.preset_id.as_deref(), Some("guarded"));
+        assert_eq!(back.permission.effective, on.permission.effective);
+        assert_eq!(back.preset_permission, on.preset_permission);
+        assert_eq!(back.preset_read, on.preset_read);
+        assert_eq!(back.preset_write, on.preset_write);
+        assert_eq!(back.preset_deny, on.preset_deny);
+        assert_eq!(back.preset_egress, on.preset_egress);
+        assert_eq!(back.preset_builtin_policy, on.preset_builtin_policy);
+        assert_eq!(back.plugins, on.plugins);
+        assert_eq!(back.preset_system_prompt, on.preset_system_prompt);
+        // Both retained selections are restored: the session's own preset for a
+        // session that names one, and the global default for one that does not.
+        let default_back = resolve(&global, &ws, Some(&entry()), &default_choice);
+        assert_eq!(default_back.preset_id.as_deref(), Some("standard"));
+        assert_eq!(
+            default_back.plugins,
+            vec!["shell".to_string(), "files".to_string(), "plan".to_string()],
+            "the DEFAULT preset is restored as well, not silently cleared"
+        );
+    }
+
+    /// A preset that forced heel under a full-access session no longer forces
+    /// it once presets are off: the sandbox arm is a preset contribution like
+    /// every other one, and the session's own mode decides again.
+    #[test]
+    fn a_disabled_heel_preset_no_longer_confines_the_shell() {
+        let mut global = global();
+        global.presets.insert(
+            "heel".to_string(),
+            Preset {
+                permission: Some("danger-full-access".to_string()),
+                sandbox: Some(SandboxChoice::Heel),
+                plugins: vec!["shell".to_string(), "files".to_string()],
+                ..Preset::default()
+            },
+        );
+        let mut ws = workspace();
+        ws.agent.permission = "danger-full-access".to_string();
+        let mut choice = choice("nvidia", "glm");
+        choice.preset = Some("heel".to_string());
+        let on = resolve(&global, &ws, Some(&entry()), &choice);
+        assert!(
+            on.sandbox.heel,
+            "heel confines even at full access, which is why it is a restriction"
+        );
+        assert_eq!(on.permission.effective, "danger-full-access");
+
+        global.general.presets_enabled = Some(false);
+        let off = resolve(&global, &ws, Some(&entry()), &choice);
+        assert!(
+            !off.sandbox.heel,
+            "with no preset, full access releases the shell exactly as it always does"
+        );
+        assert!(
+            !off.sandbox.off_by_preset,
+            "and no preset released it either"
+        );
+        assert_eq!(off.permission.effective, "danger-full-access");
+        assert!(off.preset_builtin_policy.is_empty());
+    }
+
     #[test]
     fn a_declaration_replaces_the_shipped_preset_outright() {
         let text = "[presets.standard]\nplugins = [\"shell\"]\n";
@@ -1627,17 +1897,124 @@ mcp_servers = [
             ),
         ];
         for (declared, ceiling, effective_permission, heel, off_by_preset, refusal) in rows {
-            let resolved = SandboxResolution::resolve(declared, ceiling, effective_permission);
+            let resolved =
+                SandboxResolution::resolve(true, declared, ceiling, effective_permission);
             assert_eq!(
                 resolved.heel, heel,
                 "heel for declared={declared:?} ceiling={ceiling:?} effective={effective_permission}"
             );
             assert_eq!(resolved.off_by_preset, off_by_preset);
+            assert!(!resolved.off_by_settings, "the switch is on in this table");
             assert_eq!(resolved.refusal, refusal);
             assert!(
                 resolved.heel || resolved.off_by_preset || resolved.declared.is_none(),
                 "a preset's explicit off must resolve to heel when refused"
             );
         }
+    }
+
+    /// The master switch is the FIRST input and it outranks every preset arm.
+    ///
+    /// Off means heel is not applied for ANY declaration, the refusal guard is
+    /// untouched, and the attribution follows what actually changed: a release
+    /// the permission already made keeps its own reason, a preset's `none` keeps
+    /// its own, and only a confinement the switch removed claims the switch.
+    #[test]
+    fn the_sandbox_switch_overrides_every_preset_arm() {
+        let none: Option<SandboxChoice> = None;
+        // Every declaration that would otherwise confine, at the tier that
+        // confines by itself: the switch removes it and says so.
+        for declared in [none, Some(SandboxChoice::Heel)] {
+            let on = SandboxResolution::resolve(true, declared, None, "workspace-write");
+            let off = SandboxResolution::resolve(false, declared, None, "workspace-write");
+            assert!(
+                on.heel,
+                "{declared:?}: the premise, workspace-write confines"
+            );
+            assert!(!off.heel, "{declared:?}: the switch turns heel off");
+            assert!(!off.off_by_preset, "{declared:?}: and no preset did it");
+            assert!(
+                off.off_by_settings,
+                "{declared:?}: the switch is what removed it"
+            );
+            assert_eq!(
+                sandbox_off_reason(&off),
+                Some(agent::tools::bash::SANDBOX_SETTINGS_OFF_REASON),
+                "{declared:?}: exactly one reason, and it names the switch"
+            );
+            assert_eq!(
+                off.refusal, None,
+                "{declared:?}: the switch refuses no declaration"
+            );
+        }
+
+        // A preset's own `none` was ALREADY unconfined: the switch changes
+        // nothing there, so the preset keeps the attribution.
+        let preset_off = SandboxResolution::resolve(
+            false,
+            Some(SandboxChoice::Off),
+            Some("danger-full-access"),
+            "danger-full-access",
+        );
+        assert!(!preset_off.heel);
+        assert!(preset_off.off_by_preset);
+        assert!(
+            !preset_off.off_by_settings,
+            "the switch did not release this one"
+        );
+        assert_eq!(
+            sandbox_off_reason(&preset_off),
+            Some(agent::tools::bash::PRESET_SANDBOX_OFF_REASON)
+        );
+
+        // A heel preset under full access: the switch overrides the arm, and
+        // the override is visible as its own fact.
+        let heel = Some(SandboxChoice::Heel);
+        let on = SandboxResolution::resolve(
+            true,
+            heel,
+            Some("danger-full-access"),
+            "danger-full-access",
+        );
+        let off = SandboxResolution::resolve(
+            false,
+            heel,
+            Some("danger-full-access"),
+            "danger-full-access",
+        );
+        assert!(on.heel, "the premise: heel confines even at full access");
+        assert!(!on.overrides_preset(), "nothing is overridden while on");
+        assert!(!off.heel);
+        assert!(off.overrides_preset(), "the preset's arm is overridden");
+        assert_eq!(
+            sandbox_off_reason(&off),
+            Some(agent::tools::bash::SANDBOX_SETTINGS_OFF_REASON)
+        );
+
+        // Full access with no heel preset: the permission had already released
+        // the shell, so the switch changed nothing and must not claim it.
+        let released = SandboxResolution::resolve(false, None, None, "danger-full-access");
+        assert!(!released.heel);
+        assert!(
+            !released.off_by_settings,
+            "no false attribution: the release is the permission's"
+        );
+        assert!(
+            sandbox_off_reason(&released).is_none(),
+            "the tool reports the release itself"
+        );
+        assert!(!released.overrides_preset());
+
+        // The widening guard is a statement about the DECLARATION and survives
+        // the switch: a refused arm stays refused, and heel resolves off.
+        let refused = SandboxResolution::resolve(
+            false,
+            Some(SandboxChoice::Off),
+            Some("workspace-write"),
+            "workspace-write",
+        );
+        assert_eq!(refused.refusal, Some(PRESET_SANDBOX_WIDENS));
+        assert!(!refused.heel);
+        assert!(refused.off_by_settings);
     }
 }

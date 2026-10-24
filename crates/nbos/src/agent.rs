@@ -543,6 +543,9 @@ impl From<PyAgentConfig> for AgentConfig {
             base_url: value.base_url,
             api_key: value.api_key,
             system_prompt: value.system_prompt,
+            // The Python surface has no complete-persona flag yet; a host sets
+            // it on the AgentConfig it builds directly.
+            persona_complete: false,
             temperature: value.temperature,
             max_tokens: value.max_tokens,
             timeout_secs: value.timeout_secs,

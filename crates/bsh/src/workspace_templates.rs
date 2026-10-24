@@ -3,8 +3,9 @@
 //! Three inert files, written beside the files they describe:
 //!
 //! - .bsh/policy.rego.tpl - a complete, valid workspace Rego policy: the
-//!   input/data vocabulary, the rule-id convention, and four worked refusals
-//!   (path, egress port, egress host, tool) behind one switch.
+//!   input/data vocabulary, the rule-id convention, and five worked refusals
+//!   (path, egress port, egress host, tool, unconfined spawn) behind one
+//!   switch.
 //! - .bsh/egress-allowlist.tpl - the Policy pane's own allowlist template,
 //!   with the tri-state explained and every rule shape shown.
 //! - .bsh/terminal-policy.rego.tpl - the interactive terminal gate's policy:
@@ -85,6 +86,19 @@ pub(crate) const POLICY_TEMPLATE: &str = r##"# =================================
 #                                                 "workspace-write" or
 #                                                 "danger-full-access"
 #   data.preset / data.preset_permission          preset in force, its ceiling
+#   data.sandbox_enabled                          the settings master switch:
+#                                                 true = the switch is on, false
+#                                                 = it is off for every preset.
+#   data.sandbox_confined                         the RESOLVED answer: true only
+#                                                 while heel actually confines
+#                                                 this turn. False with the switch
+#                                                 off AND at full access (where
+#                                                 the permission releases the
+#                                                 shell, unless a preset forces
+#                                                 heel). A policy that REQUIRES
+#                                                 confinement reads THIS key; the
+#                                                 spawn question is still asked,
+#                                                 so it can refuse (example 5).
 #   data.egress_unrestricted                      true when the workspace has NO
 #                                                 .bsh/egress-allowlist file
 #   data.egress_allowlist / data.egress_hosts / data.egress_ports
@@ -126,6 +140,10 @@ verdict := {"allow": false, "rule": "workspace-deny-path", "reason": "the path i
 } else := {"allow": false, "rule": "workspace-deny-tool", "reason": "this workspace does not offer this tool"} if {
     examples
     denied_tool(input)
+# rule: workspace-require-sandbox
+} else := {"allow": false, "rule": "workspace-require-sandbox", "reason": "this workspace requires the sandbox; turn it back on to run commands"} if {
+    examples
+    denied_unconfined_spawn(input)
 # rule: workspace-allow
 } else := {"allow": true, "rule": "workspace-allow"}
 
@@ -229,6 +247,27 @@ deny_tools := [
 denied_tool(input) if {
     some tool in deny_tools
     input.tool == tool
+}
+
+# -----------------------------------------------------------------------------
+# 5. Require the sandbox for shell spawns.
+#
+# data.sandbox_confined is the RESOLVED answer: true only while heel actually
+# confines this turn. It is the key to require, because the master switch alone
+# is not enough - at full access the permission releases the shell with the
+# switch still on, and a preset's `sandbox = "heel"` confines a full-access
+# session, which this key follows. The spawn question is asked even for an
+# unconfined shell, so a workspace that REQUIRES confinement can refuse it
+# here: the call fails before a process exists. Set require_sandbox to true to
+# make confinement a floor rather than a release. The interactive terminal is
+# a separate seam with its own .bsh/terminal-policy.rego gate.
+# -----------------------------------------------------------------------------
+require_sandbox := false
+
+denied_unconfined_spawn(input) if {
+    require_sandbox
+    not data.sandbox_confined
+    input.action == "spawn"
 }
 "##;
 
@@ -371,9 +410,30 @@ mod tests {
     /// Egress is left UNRESTRICTED so a refusal in these tests can only come
     /// from the template: the baseline's own allowlist is not what is under test.
     fn compile(root: &Path, rego: &str) -> PolicySet {
+        compile_with_sandbox(root, rego, true)
+    }
+
+    /// The same compile, with the settings switch and the resolved
+    /// confinement as data.
+    ///
+    /// `compile_with_sandbox` keeps them consistent (switch off => released),
+    /// which is the ordinary case; `compile_with` spells the full-access and
+    /// preset-heel cases where the switch and the resolved answer differ.
+    fn compile_with_sandbox(root: &Path, rego: &str, sandbox_enabled: bool) -> PolicySet {
+        compile_with(root, rego, sandbox_enabled, sandbox_enabled)
+    }
+
+    fn compile_with(
+        root: &Path,
+        rego: &str,
+        sandbox_enabled: bool,
+        sandbox_confined: bool,
+    ) -> PolicySet {
         let data = agent::policy::PolicyData::new(root.to_path_buf())
             .with_permission(crate::caps::WORKSPACE_WRITE)
-            .with_egress_unrestricted(true);
+            .with_egress_unrestricted(true)
+            .with_sandbox_enabled(sandbox_enabled)
+            .with_sandbox_confined(sandbox_confined);
         PolicySet::compile(
             [
                 agent::policy::baseline_source(),
@@ -416,6 +476,13 @@ mod tests {
         assert!(policy.contains("Copy this file to\n# .bsh/policy.rego"));
         assert!(policy.contains("A workspace policy can only NARROW"));
         assert!(policy.contains("examples := false"));
+        assert!(
+            policy.contains("data.sandbox_enabled")
+                && policy.contains("data.sandbox_confined")
+                && policy.contains("not data.sandbox_confined")
+                && policy.contains("require_sandbox := false"),
+            "the vocabulary teaches the switch AND the resolved key, and the example is inert"
+        );
         assert!(allowlist.contains(".bsh/egress-allowlist"));
         assert!(allowlist.starts_with("# ====="));
         assert!(allowlist.contains("The file is TRI-STATE"));
@@ -506,7 +573,7 @@ mod tests {
         assert!(set.check(&write).is_allowed());
     }
 
-    /// The four worked examples compile and refuse when the switch is flipped:
+    /// The worked examples compile and refuse when the switch is flipped:
     /// a template whose examples do not run is a trap, not a template.
     #[test]
     fn the_worked_examples_refuse_when_switched_on() {
@@ -560,6 +627,75 @@ mod tests {
             Target::host("example.com", "203.0.113.10"),
         ));
         assert!(other.is_allowed(), "{other:?}");
+    }
+
+    /// A workspace policy can read the RESOLVED sandbox state and refuse an
+    /// unconfined spawn.
+    ///
+    /// The worked example requires `data.sandbox_confined`, so the same module
+    /// answers differently for every arm that changes confinement: allowed while
+    /// heel applies, denied with the switch off, denied at full access with the
+    /// switch still on (the permission released the shell), and allowed again
+    /// for a preset-forced heel at full access. That is the answer to "can a
+    /// workspace deny an unconfined shell": yes, the spawn question is asked.
+    #[test]
+    fn a_workspace_policy_can_read_the_sandbox_switch_and_refuse_a_spawn() {
+        let root = std::fs::canonicalize(scratch("policy-sandbox-switch")).expect("a root");
+        let active = POLICY_TEMPLATE
+            .replace("examples := false", "examples := true")
+            .replace("require_sandbox := false", "require_sandbox := true");
+        assert_ne!(active, POLICY_TEMPLATE, "the anchors moved");
+
+        let spawn = || ask("bash", Action::Spawn, Target::path(root.clone()));
+
+        // Switch on, heel applies.
+        let on = compile_with_sandbox(&root, &active, true);
+        assert!(on.error().is_none(), "{:?}", on.error());
+        let allowed = on.check(&spawn());
+        assert!(
+            allowed.is_allowed(),
+            "with the sandbox on, the spawn is allowed: {allowed:?}"
+        );
+
+        // Switch off: released.
+        let off = compile_with_sandbox(&root, &active, false);
+        assert!(off.error().is_none(), "{:?}", off.error());
+        let denied = off.check(&spawn());
+        assert!(
+            denied.is_denied(),
+            "the same workspace policy refuses an unconfined spawn: {denied:?}"
+        );
+        assert_eq!(
+            denied.rule.as_deref(),
+            Some("workspace-require-sandbox"),
+            "the refusal names the rule that decided it"
+        );
+        assert!(
+            off.check(&ask(
+                "read_file",
+                Action::Read,
+                Target::path(root.join("notes.txt")),
+            ))
+            .is_allowed(),
+            "the rule is about spawns, not reads"
+        );
+
+        // Switch ON, but full access released the shell: the resolved key sees
+        // it where the switch alone would not.
+        let released = compile_with(&root, &active, true, false);
+        assert!(
+            released.check(&spawn()).is_denied(),
+            "a full-access release is refused even with the switch on"
+        );
+
+        // Switch ON and a preset forces heel at full access: confined again, so
+        // the same rule allows it.
+        let forced = compile_with(&root, &active, true, true);
+        assert!(
+            forced.check(&spawn()).is_allowed(),
+            "a preset-forced heel is confined, not refused: {:?}",
+            forced.check(&spawn())
+        );
     }
 
     /// The loader reads the exact .rego name: the .tpl beside it is ignored, and

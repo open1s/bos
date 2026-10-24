@@ -159,6 +159,15 @@ const TOOLCHAIN_PATHS: &[ToolchainPath] = &[
     ToolchainPath::home(".local/bin", true),
     ToolchainPath::home(".bun/bin", true),
     ToolchainPath::home(".nvm", true),
+    // Version managers. Their shims sit on PATH and exec a real binary under
+    // one of these roots, so granting the shim alone leaves the command
+    // resolvable but unrunnable: mise keeps Rust under
+    // ~/.local/share/mise/installs, outside the baseline.
+    ToolchainPath::home(".local/share/mise", true),
+    ToolchainPath::home(".asdf", true),
+    ToolchainPath::home(".volta", true),
+    ToolchainPath::home("Library/pnpm", true),
+    ToolchainPath::home(".local/share/pnpm", true),
     ToolchainPath::absolute("/opt/homebrew", true),
     ToolchainPath::absolute("/opt/local", true),
     ToolchainPath::absolute("/usr/local", true),
@@ -195,13 +204,18 @@ impl ToolchainPath {
     }
 }
 
-/// Environment variables the sandbox must set, never inherit.
+/// Environment variables a sandbox sets, and that nothing else may inherit.
 ///
 /// TMPDIR is the sandbox's own scratch and a forwarded value would point it
 /// back at a directory the policy denies. The proxy variables are the
 /// confinement's egress path: an inherited HTTP_PROXY would route around the
 /// sandbox's own proxy and the policy behind it.
-const RESERVED_ENV: &[&str] = &[
+///
+/// Public because a process that deliberately runs OUTSIDE the sandbox - the
+/// Browser pane's engine, which has its own egress gate and must not inherit
+/// heel's proxy - has to know the same list. One list, two readers, so the
+/// scrub cannot drift from the reservation.
+pub const RESERVED_ENV: &[&str] = &[
     "TMPDIR",
     "TEMP",
     "TMP",
@@ -612,6 +626,45 @@ impl SandboxSpec {
                 spec.executable.push(path);
             } else {
                 spec.readable.push(path);
+            }
+        }
+
+        // 5b. Every directory on the reader's PATH. A version manager puts the
+        //     directory its shim resolves into there, and that path is not one a
+        //     static list can know (mise installs per tool version). A directory
+        //     the reader chose to run commands from is an execution grant, not a
+        //     read of the home tree, so the same narrowing rule applies: only a
+        //     policy refusal removes it. The home directory and its ancestors are
+        //     never candidates - a PATH entry of / or ~ would hand back the tree
+        //     the sandbox exists to close.
+        let path_var = crate::shell_env::login_environment()
+            .get("PATH")
+            .cloned()
+            .or_else(|| std::env::var("PATH").ok());
+        let home = dirs::home_dir();
+        for dir in path_var
+            .as_deref()
+            .map(std::env::split_paths)
+            .into_iter()
+            .flatten()
+        {
+            if !dir.is_absolute() || !dir.is_dir() {
+                continue;
+            }
+            if home.as_ref().is_some_and(|home| home.starts_with(&dir)) {
+                continue;
+            }
+            let path = canonical(&dir);
+            if spec.executable.contains(&path)
+                || spec.readable.contains(&path)
+                || spec.writable.contains(&path)
+            {
+                continue;
+            }
+            let decision = spec.ask(policy, Action::Read, Target::path(&path));
+            spec.record(GrantKind::Toolchain, path.clone(), &decision);
+            if !narrowed_read(&decision) {
+                spec.executable.push(path);
             }
         }
 
@@ -1360,6 +1413,9 @@ impl SandboxSpec {
         let mut process = std::process::Command::new("sh");
         process.args(["-c", command]);
         process.current_dir(cwd);
+        // Not the app's accidental environment: the reader's login shell.
+        process.env_clear();
+        process.envs(tool_environment());
         configure_plain(&mut process);
         let child = process.spawn().map_err(|error| error.to_string())?;
         Ok(SandboxedChild {
@@ -1376,14 +1432,9 @@ impl SandboxSpec {
     /// from outliving the call that made them.
     fn spawn_heel(&self, command: &str, cwd: &Path) -> Result<SandboxedChild, String> {
         let engine = futures::executor::block_on(build_engine(self, false))?;
-        // The interface a sandboxed process gets, minus what the sandbox owns.
-        let envs: Vec<(String, String)> = std::env::vars()
-            .filter(|(key, _)| {
-                !RESERVED_ENV
-                    .iter()
-                    .any(|reserved| reserved.eq_ignore_ascii_case(key))
-            })
-            .collect();
+        // The interface a sandboxed process gets, minus what the sandbox owns,
+        // overlayed with the reader's login shell (see shell_env).
+        let envs = tool_environment();
         let child = match &engine {
             Engine::Deny(sandbox) => {
                 spawn_heel_command(sandbox.command("/bin/sh"), command, cwd, envs)
@@ -1403,6 +1454,26 @@ impl SandboxSpec {
             backend: "heel",
         })
     }
+}
+
+/// The environment a command runs with: the app's own, overlayed with the
+/// reader's login shell.
+///
+/// The reserved keys stay the sandbox's (a proxy or temp redirect it sets must
+/// not be undone by a profile that exports one), and `shell_env` keeps the
+/// capturing shell's own state out of the result.
+fn tool_environment() -> Vec<(String, String)> {
+    let reserved = |key: &str| {
+        RESERVED_ENV
+            .iter()
+            .any(|entry| entry.eq_ignore_ascii_case(key))
+    };
+    // The filter runs on both sides: a profile that exports HTTPS_PROXY must
+    // not override the proxy the sandbox itself installed.
+    crate::shell_env::inherit(std::env::vars().filter(|(key, _)| !reserved(key)))
+        .into_iter()
+        .filter(|(key, _)| !reserved(key))
+        .collect()
 }
 
 /// Configure the streams every spawned command shares.

@@ -55,6 +55,7 @@ link_opening = "sidebar"       # sidebar | new-tab
 composer_enter = "queue"       # queue | steer
 performance_usage = "detailed" # compact | detailed
 developer_tools = true
+sandbox_enabled = false        # absent = heel applies; false = shell and terminal unconfined
 session_sort = ""
 active_workspace = "<id>"      # registry-level pointer
 active_session = "<id>"        # the session last on screen (window state)
@@ -74,6 +75,8 @@ plugins = ["shell", "files"]   # the complete mounted set; [] mounts nothing
 name = "..."                   # optional; a shipped preset publishes none
 description = "..."            # optional
 order = 0                      # optional roster order
+system_prompt = "…"            # optional persona; unset keeps the workspace prompt
+complete = false               # true: that persona IS the whole system prompt
 
 [[extentions]]                 # the installed inventory
 id = "shell"
@@ -86,6 +89,19 @@ created_at = 1792158733
 updated_at = 1792158733
 ```
 
+### The persona and its `complete` flag
+
+`system_prompt` fills the persona SLOT by default: the harness identity opens
+the prompt, the workflow guidance closes it, and per-tool rules are appended for
+the tools the build actually registers. `complete = true` is the reference's
+`minimal`-preset arm (its persona row's `complete: true`): the prompt is the
+persona text ALONE, with no identity, workflow or tool guidance. It is off by
+default, it applies only while the persona is non-empty (an empty persona under
+`complete` falls back to the default composition), and a preset's own complete
+persona outranks the workspace one. The runtime-context message is NOT
+suppressed: unlike the reference's `includeRuntimeContext: false`, BSH's
+snapshot is the model's one source of sandbox, permission and preset truth.
+
 ### Providers
 
 - The provider node owns the connection (`base_url`, `api_key`); the leaf owns
@@ -93,6 +109,62 @@ updated_at = 1792158733
 - An `[[extentions]]` id the binary does not ship is shown **unavailable**.
   A builtin the binary ships but the list omits is shown **installable** —
   installing is writing a name, because the code is already compiled in.
+
+### Web search
+
+The local `web_search` tool the model calls is configured here, beside the
+machine facts it shares the file with. Its credential is NOT here: the tool
+reads the vault entry `web_search:api_key`, written from Settings > Web search.
+
+```toml
+[web_search]
+base_url = "https://api.deepseek.com/v1/tools"  # the endpoint base, no operation
+results_per_search = 10                          # 1..=50
+method = "post"                                  # post (JSON body) | get (query string)
+path = "search"                                  # appended to the base
+query_key = "query"                              # request field carrying the query
+count_key = "count"                              # request field carrying the budget; "" omits it
+results_key = "results"                          # response array holding the hits
+url_key = "url"                                  # hit field carrying the URL (required)
+title_key = "title"                              # hit field carrying a title; "" omits
+snippet_key = "snippet"                          # hit field carrying a snippet; "" omits
+date_key = "date"                                # hit field carrying a date; "" omits
+
+[web_search.body]                                # static extra fields merged into every request
+need_content = false
+```
+
+Every field's default is the DeepSeek Search API's wire, so a file that names
+none of them speaks exactly the shipped shape. Two other providers as spelled
+sections:
+
+```toml
+# Tavily: POST https://api.tavily.com/search, Bearer key, no count field,
+# snippets under `content`, dates under `published_date`.
+[web_search]
+base_url = "https://api.tavily.com"
+method = "post"
+count_key = ""
+snippet_key = "content"
+date_key = "published_date"
+results_per_search = 10
+
+[web_search.body]
+search_depth = "advanced"
+
+# SearXNG (self-hosted): GET with the query in the URL.
+[web_search]
+base_url = "http://127.0.0.1:8888"
+method = "get"
+query_key = "q"
+count_key = ""
+snippet_key = "content"
+date_key = "publishedDate"
+```
+
+The search is LOCAL network access: the workspace egress allowlist and the
+preset's own `egress` decide whether the tool may reach the endpoint, and the
+read-only preset declines search for exactly that reason.
 
 **Implementation note, found while writing the parser.** A model leaf sits
 *directly* under its provider, so the model map is `#[serde(flatten)]`ed rather
@@ -136,6 +208,7 @@ schema_version = 1
 
 [agent]
 system_prompt = "…"
+complete = false               # true: system_prompt IS the whole system prompt
 temperature = 0.3              # ABSENT means inherit. 0.0 is a real value.
 reasoning_effort = "high"      # absent inherits; the model node may declare one
 permission = "workspace-write" # read-only | workspace-write | danger-full-access

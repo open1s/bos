@@ -289,12 +289,13 @@ impl ResolvedPresetScope {
     }
 }
 
-/// One consequence a widening preset carries, named in the dialog.
+/// One consequence a preset change carries, named in the dialog.
 ///
-/// The words are the same facts the audit and the bash result use:
-/// `danger-full-access` for the tier, `PRESET_SANDBOX_OFF_REASON` for the
-/// released shell, the egress allowlist for the closed network and the
-/// recorded refusal for an advisory policy.
+/// The first four are what a TARGET preset adds when it widens; the `Loses*`
+/// arm is what turning every preset off takes away. The words are the same
+/// facts the audit and the bash result use: `danger-full-access` for the tier,
+/// `PRESET_SANDBOX_OFF_REASON` for the released shell, the egress allowlist for
+/// the closed network and the recorded refusal for an advisory policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RiskFact {
     /// The preset's ceiling is `danger-full-access`.
@@ -305,6 +306,112 @@ pub(crate) enum RiskFact {
     EgressDeniedAll,
     /// The preset's own policy refusals are advisory.
     AdvisoryPolicy,
+    /// DISABLING PRESETS: the ceiling that caps the session stops applying.
+    LosesPermissionCeiling,
+    /// DISABLING PRESETS: the read/write/deny scopes stop applying.
+    LosesPathScope,
+    /// DISABLING PRESETS: the shell the preset forced into heel is released.
+    LosesSandbox,
+    /// DISABLING PRESETS: the preset's egress restriction stops applying.
+    LosesEgress,
+    /// DISABLING PRESETS: the preset's bundles, tools, skills, MCP servers and
+    /// extensions stop being selected.
+    LosesToolSet,
+    /// DISABLING PRESETS: the preset's policy modules stop being compiled.
+    LosesPolicyModules,
+    /// TURNING THE SANDBOX OFF: shell and terminal commands lose the kernel's
+    /// filesystem confinement.
+    SandboxOffFilesystem,
+    /// TURNING THE SANDBOX OFF: shell and terminal commands lose the sandbox
+    /// egress proxy and the allowlist it enforces.
+    SandboxOffEgress,
+    /// TURNING THE SANDBOX OFF: every preset's `sandbox = "heel"` arm is
+    /// overridden, so a preset can ask for confinement and not get it.
+    SandboxOffOverridesPresets,
+}
+
+/// The consequences switching the SANDBOX master switch OFF takes away.
+///
+/// The switch is a widening with a fixed shape - the two losses are the same for
+/// every harness - so the base facts are always the pair. The override fact is
+/// added only when some preset actually declares `sandbox = "heel"`, because a
+/// reader confirming a change that overrides nothing should not be told it did.
+///
+/// Empty means the switch changes NOTHING: at full access with no heel preset
+/// the permission has already released the shell, so the switch applies without
+/// a confirmation rather than pretending it widened something.
+pub(crate) fn sandbox_off_facts(
+    preset: Option<&Preset>,
+    effective_permission: &str,
+    presets_declaring_heel: bool,
+) -> Vec<RiskFact> {
+    let on = crate::settings::resolve::SandboxResolution::resolve(
+        true,
+        preset.and_then(|preset| preset.sandbox),
+        preset.and_then(|preset| preset.permission.as_deref()),
+        effective_permission,
+    );
+    if !on.heel {
+        return Vec::new();
+    }
+    let mut facts = vec![RiskFact::SandboxOffFilesystem, RiskFact::SandboxOffEgress];
+    if presets_declaring_heel {
+        facts.push(RiskFact::SandboxOffOverridesPresets);
+    }
+    facts
+}
+
+/// The consequences turning presets OFF actually removes for `current`.
+///
+/// Only what is really lost is named: a preset that inherits the ceiling and
+/// declares no scope, sandbox, egress, tool set or policy contributes nothing
+/// to lose, and the switch then needs no confirmation. `session_permission` is
+/// the mode the session asked for, because a ceiling only narrows that mode
+/// and heel only confines a session that would otherwise be released.
+pub(crate) fn disabling_facts(current: Option<&Preset>, session_permission: &str) -> Vec<RiskFact> {
+    use crate::settings::resolve::{is_full_access, permission_rank};
+    let Some(preset) = current else {
+        return Vec::new();
+    };
+    let mut facts = Vec::new();
+    // A ceiling is only lost when it actually caps today: a preset that names
+    // the session's own mode (or a wider one) confines nothing here.
+    let ceiling_caps = preset
+        .permission
+        .as_deref()
+        .is_some_and(|ceiling| permission_rank(ceiling) < permission_rank(session_permission));
+    if ceiling_caps {
+        facts.push(RiskFact::LosesPermissionCeiling);
+    }
+    if preset.read.is_some() || preset.write.is_some() || !preset.deny.is_empty() {
+        facts.push(RiskFact::LosesPathScope);
+    }
+    // heel confines a full-access session, so losing it releases the shell
+    // exactly when the session's own mode would. A narrower session stays
+    // confined by the permission, and the fact would be false.
+    if preset.sandbox == Some(SandboxChoice::Heel) && is_full_access(session_permission) {
+        facts.push(RiskFact::LosesSandbox);
+    }
+    if preset.egress.is_some() {
+        facts.push(RiskFact::LosesEgress);
+    }
+    let core_bundles = ["shell", "files", "plan"];
+    let selects_bundles = core_bundles
+        .iter()
+        .any(|bundle| !preset.plugins.iter().any(|plugin| plugin == bundle));
+    if selects_bundles
+        || preset.tools.is_some()
+        || preset.skills.is_some()
+        || preset.mcps.is_some()
+        || preset.extensions.is_some()
+        || preset.mcp_tools.is_some()
+    {
+        facts.push(RiskFact::LosesToolSet);
+    }
+    if !preset.builtin_policy.is_empty() || preset.policy.is_some() {
+        facts.push(RiskFact::LosesPolicyModules);
+    }
+    facts
 }
 
 /// Every risk fact one declaration carries, whether or not it widens anything.
@@ -428,8 +535,8 @@ mod tests {
         assert_eq!(read_only.write, ScopeReach::None);
         assert_eq!(read_only.egress, EgressReach::DenyAll);
         assert!(
-            read_only.web_search,
-            "hosted search still runs on the provider"
+            !read_only.web_search,
+            "search is local access, so the deny-all preset declines it"
         );
     }
 
@@ -517,6 +624,112 @@ mod tests {
         assert!(
             widening_facts(Some(&wide), &standard).is_empty(),
             "coming back down never prompts"
+        );
+    }
+
+    /// Turning presets off names what the preset IN FORCE actually contributes:
+    /// the ceiling only when it caps, the sandbox only when it confines this
+    /// session, and each other axis only when it restricts something. A preset
+    /// that inherits everything has nothing to lose, so it never prompts.
+    #[test]
+    fn disabling_presets_names_only_the_facts_that_are_actually_lost() {
+        // read-only under a workspace-write session: every axis is lost.
+        let facts = disabling_facts(Some(&shipped("read-only")), "workspace-write");
+        for fact in [
+            RiskFact::LosesPermissionCeiling,
+            RiskFact::LosesPathScope,
+            RiskFact::LosesEgress,
+            RiskFact::LosesToolSet,
+            RiskFact::LosesPolicyModules,
+        ] {
+            assert!(facts.contains(&fact), "missing {fact:?}: {facts:?}");
+        }
+        assert!(
+            !facts.contains(&RiskFact::LosesSandbox),
+            "read-only declares no sandbox, and workspace-write confines the shell anyway"
+        );
+
+        // The ceiling is only named when it caps the mode in force.
+        let inheriting = Preset {
+            plugins: vec!["shell".to_string(), "files".to_string(), "plan".to_string()],
+            ..Preset::default()
+        };
+        assert!(
+            disabling_facts(Some(&inheriting), "workspace-write").is_empty(),
+            "a preset that only inherits has nothing to lose"
+        );
+        let capped = Preset {
+            permission: Some("workspace-write".to_string()),
+            ..Preset::default()
+        };
+        assert!(
+            !disabling_facts(Some(&capped), "workspace-write")
+                .contains(&RiskFact::LosesPermissionCeiling),
+            "a ceiling equal to the session mode caps nothing today"
+        );
+
+        // heel is a restriction only where the permission would release it.
+        let heel = Preset {
+            permission: Some("danger-full-access".to_string()),
+            sandbox: Some(SandboxChoice::Heel),
+            ..Preset::default()
+        };
+        assert!(
+            disabling_facts(Some(&heel), "danger-full-access").contains(&RiskFact::LosesSandbox)
+        );
+        assert!(
+            !disabling_facts(Some(&heel), "workspace-write").contains(&RiskFact::LosesSandbox),
+            "a narrower session is confined without the preset"
+        );
+
+        // No preset selected at all: nothing was applied, so nothing is lost.
+        assert!(disabling_facts(None, "danger-full-access").is_empty());
+    }
+
+    /// The SANDBOX switch's facts: the two losses always, the preset override
+    /// only when a preset actually declares heel, and NOTHING at all when heel
+    /// was not going to apply anyway.
+    #[test]
+    fn switching_the_sandbox_off_names_the_two_losses_and_the_override() {
+        let plain = Preset {
+            plugins: vec!["shell".to_string(), "files".to_string()],
+            ..Preset::default()
+        };
+        let facts = sandbox_off_facts(Some(&plain), "workspace-write", false);
+        assert_eq!(
+            facts,
+            vec![RiskFact::SandboxOffFilesystem, RiskFact::SandboxOffEgress],
+            "both losses are always named, and no override when nothing asks for heel"
+        );
+        let with_heel = sandbox_off_facts(Some(&plain), "workspace-write", true);
+        assert!(
+            with_heel.contains(&RiskFact::SandboxOffOverridesPresets),
+            "a heel declaration elsewhere on the roster is named: {with_heel:?}"
+        );
+
+        // At full access with no heel preset, heel was not applied: the switch
+        // changes nothing and must not open a gate for it.
+        assert!(
+            sandbox_off_facts(Some(&plain), "danger-full-access", false).is_empty(),
+            "the permission had already released the shell"
+        );
+        // A heel preset at full access is exactly when it does matter.
+        let heel = Preset {
+            permission: Some("danger-full-access".to_string()),
+            sandbox: Some(SandboxChoice::Heel),
+            ..Preset::default()
+        };
+        let facts = sandbox_off_facts(Some(&heel), "danger-full-access", true);
+        assert_eq!(facts.len(), 3, "two losses and the override: {facts:?}");
+        // A preset's own `none` was already unconfined: nothing is lost.
+        let already_off = Preset {
+            permission: Some("danger-full-access".to_string()),
+            sandbox: Some(SandboxChoice::Off),
+            ..Preset::default()
+        };
+        assert!(
+            sandbox_off_facts(Some(&already_off), "danger-full-access", true).is_empty(),
+            "the shell was already unconfined"
         );
     }
 }

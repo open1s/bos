@@ -273,16 +273,45 @@ impl gpui::EntityInputHandler for Shell {
 
     fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
 
-    /// A committed composition is the only text the shell should see; the
-    /// marked preview belongs to the IME's own candidate window, not the PTY.
+    /// A committed composition is the only text either surface should see; the
+    /// marked preview belongs to the IME's own candidate window.
+    ///
+    /// Which surface receives it is decided by FOCUS. The page's handler exists
+    /// for two reasons: it routes non-printable commands (Backspace, arrows,
+    /// Delete) back to the key listener, which AppKit otherwise swallows, and
+    /// it receives the text of a printable key. Because the key listener ALSO
+    /// types that character (a real keydown plus char, so the page sees the
+    /// key), the echo is recognised and dropped - MEASURED: without that,
+    /// `rust` became `ruusstt`. A commit that DIFFERS from the just-typed key
+    /// supersedes it (one Backspace, then the commit), which is the route a
+    /// synthetic Unicode keystroke and a real IME conversion take.
     fn replace_text_in_range(
         &mut self,
         _range: Option<std::ops::Range<usize>>,
         text: &str,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if text.is_empty() {
+            return;
+        }
+        if self.browser_focus.is_focused(window) {
+            if let Some(engine) = self.state.browser.engine() {
+                let recent = self
+                    .browser_typed
+                    .take()
+                    .filter(|(at, _)| at.elapsed() <= std::time::Duration::from_millis(300));
+                if let Some((_, typed)) = recent {
+                    let mut chars = text.chars();
+                    if chars.next() == Some(typed) && chars.next().is_none() {
+                        cx.notify();
+                        return;
+                    }
+                    let _ = engine.press("backspace");
+                }
+                let _ = engine.insert_text(text);
+            }
+            cx.notify();
             return;
         }
         if let Some(terminal) = self.right.terminal.as_mut() {
@@ -981,7 +1010,7 @@ impl Shell {
                             // where a pane without a chip of its own would be
                             // picked.
                             .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.right.tab = None;
+                                this.browser_pane_closed();
                                 cx.notify();
                             })),
                     )
@@ -1093,7 +1122,7 @@ impl Shell {
                     .hover(|s| s.bg(rgb(theme::hover())))
                     .child(icon(IconName::X, 12.0, theme::faint()))
                     .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.right.tab = None;
+                        this.browser_pane_closed();
                         cx.notify();
                     })),
             )
@@ -1154,7 +1183,7 @@ impl Shell {
             .child(icon(IconName::PanelRightClose, 14.0, theme::muted()))
             .on_click(cx.listener(|this, _event, _window, cx| {
                 this.right.open = false;
-                this.right.tab = None;
+                this.browser_pane_closed();
                 cx.notify();
             }))
     }
@@ -1271,9 +1300,46 @@ impl Shell {
                         .min_w_0()
                         .child(Input::new(&self.browser_url).appearance(false).h(px(26.0))),
                 )
-                .child(self.browser_go_control(cx)),
+                .child(self.browser_go_control(cx))
+                .child(self.browser_network_mode_chip()),
         );
-        pane.child(self.browser_body(view, cx))
+        let live = self.state.browser.engine_ready();
+        if live {
+            pane.child(self.browser_live_body(cx))
+        } else {
+            // The text view is the fallback, and a render failure is said
+            // ABOVE it in the engine's own words: never a blank rectangle and
+            // never a silent downgrade.
+            pane.child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .child(self.browser_engine_notice())
+                    .child(self.browser_body(view, cx)),
+            )
+        }
+    }
+
+    /// The active network mode, named in the toolbar.
+    ///
+    /// The pane says which trade is in force instead of leaving the reader to
+    /// infer it: `Proxied` allows https (authorized at host and port) and
+    /// `Strict` refuses it, because this pane does not terminate TLS and will
+    /// not pretend a path rule inside an encrypted page was enforced.
+    fn browser_network_mode_chip(&self) -> impl IntoElement {
+        let mode = self.state.settings.browser_network_mode();
+        let label = self.state.lang.tr(mode.label_key());
+        div()
+            .debug_selector(|| String::from("browser-network-mode"))
+            .flex_none()
+            .px(px(6.0))
+            .py(px(2.0))
+            .rounded(px(6.0))
+            .bg(rgb(theme::new_session_fill()))
+            .child(txt(label, theme::RIGHT_HINT_SIZE, theme::muted()))
     }
 
     /// One navigation control: a glyph that dims when the action cannot run.
@@ -1439,7 +1505,19 @@ impl Shell {
                     .font_weight(FontWeight::MEDIUM),
             )
             .child(
-                txt(failure.message.clone(), theme::CHIP_SIZE, theme::text()).line_height(px(16.0)),
+                // A Strict-mode refusal is the reader's own setting talking, so
+                // the sentence is localized; every other failure is the
+                // producer's own prose.
+                txt(
+                    if failure.rule.as_deref() == Some(crate::browser::engine::gate::STRICT_RULE) {
+                        lang.tr("right.browser.strictRefused").to_string()
+                    } else {
+                        failure.message.clone()
+                    },
+                    theme::CHIP_SIZE,
+                    theme::text(),
+                )
+                .line_height(px(16.0)),
             );
         if let Some(rule) = failure.rule.clone() {
             note = note.child(txt(
@@ -1910,10 +1988,42 @@ impl Shell {
         // other ways instead: the shell's own BSH_SANDBOX, and this line while
         // the pane has something to report (below).
         let mut parts: Vec<String> = Vec::new();
-        // A preset that turned the sandbox off is a standing security fact, not
-        // a transient error: say it while the shell runs, not only after exit.
-        if terminal.sandbox_off_by_preset {
-            parts.push(lang.tr("right.terminal.sandboxOff"));
+        // A policy that turned the sandbox off is a standing security fact, not
+        // a transient error: say it while the shell runs, not only after exit,
+        // and name WHICH policy - the settings master switch or the preset in
+        // force, because the reader reverses them with different controls.
+        match terminal.sandbox_off {
+            Some(crate::terminal::SandboxOff::Settings) => {
+                parts.push(lang.tr("right.terminal.sandboxOffSettings"));
+            }
+            Some(crate::terminal::SandboxOff::Preset) => {
+                parts.push(lang.tr("right.terminal.sandboxOff"));
+            }
+            None => {}
+        }
+        // A terminal SPAWNS once and keeps that spec. A later flip of the
+        // master switch - OR a change of the session permission - does not
+        // rewrite a running process, so when the pane's spawn-time confinement
+        // class differs from the one a terminal opened NOW would get, say so
+        // instead of letting the silence read as "it changed with the switch".
+        //
+        // The class is three-valued and cheap: no fresh spec is built on a
+        // render, because deriving one probes the policy for every grant.
+        let spawned = terminal_confinement(terminal.sandbox_off, terminal.sandbox_label());
+        let eff = self.state.effective();
+        let current = if eff.sandbox.off_by_settings || eff.sandbox.off_by_preset {
+            TerminalConfinement::PolicyReleased
+        } else if crate::settings::resolve::is_full_access(&eff.permission.effective)
+            && !eff.sandbox.heel
+        {
+            // Full access with no preset asking for heel: the permission
+            // releases the shell, and a new terminal would report "full-access".
+            TerminalConfinement::PermissionReleased
+        } else {
+            TerminalConfinement::Confined
+        };
+        if spawned != current {
+            parts.push(lang.tr("right.terminal.keepsSpawnSpec"));
         }
         if let Some(error) = terminal.policy_error() {
             parts.push(format!(
@@ -1958,9 +2068,9 @@ impl Shell {
             }
             // A pane that is already speaking says what the spec answered too:
             // the refusal to confine, or the tier the shell actually ran under.
-            // The preset-off sentence was already added above; it is not a
+            // The policy-off sentence was already added above; it is not a
             // backend limitation and must not be dressed as one.
-            if !terminal.sandbox_off_by_preset {
+            if terminal.sandbox_off.is_none() {
                 if let Some(note) = terminal.sandbox_note() {
                     text.push_str(" \u{b7} ");
                     text.push_str(&format!(
@@ -3388,6 +3498,187 @@ impl Shell {
     }
 }
 
+/// The last press inside the page, for counting a double or triple click.
+///
+/// gpui's [`gpui::ClickEvent::click_count`] exists, but the pane receives raw
+/// down/move/up and has to time the count itself: the count must ride the CDP
+/// `mousePressed`/`mouseReleased` (that is what becomes the page's
+/// `event.detail`), and a move beyond the slop has to reset it as well as the
+/// interval.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BrowserClick {
+    /// When the press happened.
+    at: std::time::Instant,
+    /// Where it happened, in PAGE coordinates.
+    page: (f32, f32),
+    /// 1 for a single click, 2 for a double, 3 for a triple.
+    count: u32,
+}
+
+/// The platform's double-click interval.
+///
+/// macOS' default `NSEvent.doubleClickInterval` is 500 ms, which is also the
+/// Windows default; gpui exposes no query for the user's preference, so the
+/// pane uses the platform default rather than a shorter window that would turn
+/// an ordinary double click into two singles.
+pub(crate) const BROWSER_CLICK_MS: u64 = 500;
+
+/// How far a press may drift from the previous one and still be the same
+/// multi-click, in PAGE pixels.
+pub(crate) const BROWSER_CLICK_SLOP: f32 = 4.0;
+
+impl BrowserClick {
+    /// Count a press at `page` happening `now`, relative to the previous one.
+    ///
+    /// A press within the interval and the slop advances the count (2, then 3,
+    /// and 3 for any further rapid press); anything else starts over at 1.
+    pub(crate) fn next(
+        previous: Option<&BrowserClick>,
+        now: std::time::Instant,
+        page: (f32, f32),
+    ) -> Self {
+        let continues = previous.is_some_and(|previous| {
+            now.saturating_duration_since(previous.at)
+                <= std::time::Duration::from_millis(BROWSER_CLICK_MS)
+                && (page.0 - previous.page.0).abs() <= BROWSER_CLICK_SLOP
+                && (page.1 - previous.page.1).abs() <= BROWSER_CLICK_SLOP
+        });
+        let count = match previous {
+            Some(previous) if continues => (previous.count + 1).min(3),
+            _ => 1,
+        };
+        Self {
+            at: now,
+            page,
+            count,
+        }
+    }
+
+    /// The count this press carried.
+    pub(crate) fn count(&self) -> u32 {
+        self.count
+    }
+
+    /// Whether `page` is still within the slop of this press.
+    pub(crate) fn near(&self, page: (f32, f32)) -> bool {
+        (page.0 - self.page.0).abs() <= BROWSER_CLICK_SLOP
+            && (page.1 - self.page.1).abs() <= BROWSER_CLICK_SLOP
+    }
+}
+
+/// Map a window point to PAGE coordinates inside `bounds`.
+///
+/// `clamp` is the captured-pointer case: a release that lands outside the
+/// frame is still a release the page must see, at the frame's edge, so the
+/// gesture ends where the pointer left the page rather than staying pressed
+/// forever. Without it an outside point is `None` (the press was not the
+/// page's).
+fn page_point(
+    bounds: Bounds<Pixels>,
+    viewport: (u32, u32),
+    position: Point<Pixels>,
+    clamp: bool,
+) -> Option<(f32, f32)> {
+    let width = bounds.size.width.as_f32().max(1.0);
+    let height = bounds.size.height.as_f32().max(1.0);
+    let mut x = position.x.as_f32() - bounds.origin.x.as_f32();
+    let mut y = position.y.as_f32() - bounds.origin.y.as_f32();
+    if clamp {
+        x = x.clamp(0.0, (width - 1.0).max(0.0));
+        y = y.clamp(0.0, (height - 1.0).max(0.0));
+    } else if x < 0.0 || y < 0.0 || x > width || y > height {
+        return None;
+    }
+    Some((
+        x * viewport.0 as f32 / width,
+        y * viewport.1 as f32 / height,
+    ))
+}
+
+/// The CDP modifier mask for a keystroke.
+///
+/// The protocol's bits are Alt 1, Ctrl 2, Meta 4, Shift 8. The pane forwards
+/// the physical modifiers it received, which is why Cmd on macOS becomes Meta
+/// and Ctrl elsewhere becomes Ctrl without a platform branch here.
+fn chord_modifiers(modifiers: &gpui::Modifiers) -> u32 {
+    let mut bits = 0;
+    if modifiers.alt {
+        bits |= crate::browser::engine::cdp::ALT;
+    }
+    if modifiers.control {
+        bits |= crate::browser::engine::cdp::CTRL;
+    }
+    if modifiers.platform {
+        bits |= crate::browser::engine::cdp::META;
+    }
+    if modifiers.shift {
+        bits |= crate::browser::engine::cdp::SHIFT;
+    }
+    bits
+}
+
+/// Handle the editing chords the pane owns: Cmd/Ctrl+C, +V, +X, +A, +Z and
+/// +F.
+///
+/// Returns whether the chord belonged to the page, so the caller stops before
+/// treating the letter as text. This is the ONLY place bsh touches the
+/// clipboard: paste reads it because the reader pressed paste and hands the
+/// string to the page's own paste event, and copy/cut write the page's own
+/// selection back. Nothing is injected at any other moment.
+fn browser_shortcut(
+    keystroke: &Keystroke,
+    engine: &crate::browser::engine::Engine,
+    cx: &mut Context<Shell>,
+) -> bool {
+    let modifiers = keystroke.modifiers;
+    if !modifiers.secondary() || modifiers.alt {
+        return false;
+    }
+    let bits = chord_modifiers(&modifiers);
+    match keystroke.key.as_str() {
+        "c" => {
+            if let Ok(Some(text)) = engine.copy(bits) {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            true
+        }
+        "x" => {
+            if let Ok(Some(text)) = engine.cut(bits) {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            true
+        }
+        "v" => {
+            let text = cx
+                .read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default();
+            let _ = engine.paste(&text, bits);
+            true
+        }
+        "a" => {
+            // Cmd-Shift-A is the application's Archive session binding; leave
+            // it alone rather than turning it into a second select-all.
+            if modifiers.shift {
+                return false;
+            }
+            let _ = engine.select_all(bits);
+            true
+        }
+        "z" => {
+            let _ = engine.undo(bits);
+            true
+        }
+        "f" => {
+            // No find bar exists in this pane; the page's own Cmd-F handler is
+            // what receives the chord.
+            let _ = engine.find(bits);
+            true
+        }
+        _ => false,
+    }
+}
+
 impl Shell {
     /// Fold or unfold the panel, the way the header's left control folds the
     /// sidebar. A fold keeps the pane, so reopening lands where the reader was.
@@ -3441,6 +3732,9 @@ impl Shell {
         if tab == RightTab::Files && self.files.roots.is_empty() && self.files.tabs.is_empty() {
             self.refresh_files(cx);
         }
+        if tab == RightTab::Browser {
+            self.browser_prewarm(cx);
+        }
         if tab == RightTab::Terminal && self.right.terminal.is_none() {
             let cwd = self.state.workspace_root().unwrap_or_default();
             // The SAME spec the shell tool runs under, derived from the live
@@ -3448,16 +3742,31 @@ impl Shell {
             // by it today - heel cannot host a caller-owned PTY - so the
             // terminal records that answer and the status line says it.
             let spec = self.state.sandbox_spec("terminal");
-            let off_by_preset = self.state.effective().sandbox.off_by_preset;
-            // The note is passed BEFORE the spawn: it overrides BSH_SANDBOX to
-            // "none" for the shell itself, not only the status line.
-            let note = off_by_preset.then(|| self.state.lang.tr("right.terminal.sandboxOff"));
-            self.right.terminal = Some(match note {
-                Some(note) => crate::terminal::Terminal::new_with_sandbox_note(
+            // The policy that released it, in the same precedence the build
+            // applies: the settings master switch wins over a preset's arm, and
+            // a permission release sets neither. The sentence is passed BEFORE
+            // the spawn, because it overrides BSH_SANDBOX to "none" for the
+            // shell itself and not only the status line.
+            let sandbox = self.state.effective().sandbox;
+            let off = if sandbox.off_by_settings {
+                Some((
+                    crate::terminal::SandboxOff::Settings,
+                    self.state.lang.tr("right.terminal.sandboxOffSettings"),
+                ))
+            } else if sandbox.off_by_preset {
+                Some((
+                    crate::terminal::SandboxOff::Preset,
+                    self.state.lang.tr("right.terminal.sandboxOff"),
+                ))
+            } else {
+                None
+            };
+            self.right.terminal = Some(match off {
+                Some(off) => crate::terminal::Terminal::new_with_sandbox_note(
                     cwd,
                     self.state.lang,
                     spec.as_deref(),
-                    Some(note),
+                    Some(off),
                 ),
                 None => crate::terminal::Terminal::new_with_sandbox(
                     cwd,
@@ -3527,11 +3836,12 @@ impl Shell {
         // The GPUI background executor, not the runner's tokio runtime: this is
         // work the window started, and it is the executor the test scheduler
         // can drive deterministically.
+        let mode = self.state.settings.browser_network_mode();
         let task = cx.background_executor().spawn({
             let handle = handle.clone();
             let gate = gate.clone();
             let url = url.clone();
-            async move { crate::browser::load(&handle, &gate, &url, seq) }
+            async move { crate::browser::load(&handle, &gate, &url, seq, mode) }
         });
         cx.spawn(async move |this, cx| {
             let outcome = task.await;
@@ -3544,6 +3854,37 @@ impl Shell {
                         this.state.notice(failure.tool_message());
                     }
                 }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Start the rendered engine when the Browser tab is first shown.
+    ///
+    /// MEASURED: launching Obscura (process + CDP handshake + V8 + the font
+    /// scan) takes ~0.16 s here and 2-3 s on a cold filesystem. A pre-warm
+    /// moves that cost to the moment the pane appears, so the FIRST navigation
+    /// does not pay it. The engine is left with no capture pump (the pump
+    /// starts on the first painted frame), so a pane that is shown and never
+    /// used costs an idle process and nothing else; closing the pane stops it.
+    pub(crate) fn browser_prewarm(&mut self, cx: &mut Context<Self>) {
+        if self.state.browser.engine_ready() || self.state.browser.engine_error().is_some() {
+            return;
+        }
+        let gate = self.browser_gate("browser_prewarm");
+        let mode = self.state.settings.browser_network_mode();
+        let handle = self.state.browser.clone();
+        let task = cx
+            .background_executor()
+            .spawn(async move { handle.ensure_engine(&gate, mode).map(|_| ()) });
+        cx.spawn(async move |this, cx| {
+            let outcome = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.browser_refresh_pane();
+                // A pre-warm that failed is not the reader's action: the named
+                // engine notice draws it, and a later Go retries the launch.
+                let _ = outcome;
                 cx.notify();
             });
         })
@@ -3606,6 +3947,23 @@ impl Shell {
     /// Called from render, so it only costs an atomic read on a frame that did
     /// not change the browser; the clone of a page's text happens once per
     /// change, not once per frame.
+    /// The Browser pane is going away: stop the engine and forget the frame.
+    ///
+    /// A tab SWITCH only hides the pane (the pump stops, the process stays);
+    /// closing the tab is the reader saying the page is done, so the process
+    /// goes with it rather than idling behind a pane nobody can see.
+    pub(crate) fn browser_pane_closed(&mut self) {
+        self.right.tab = None;
+        self.state.browser.stop_engine();
+        self.browser_render = None;
+        self.browser_frame_seq = 0;
+        self.browser_bounds.set(None);
+        // A gesture belongs to the page that was on screen; closing it must
+        // not leave the pane thinking a press is still down.
+        self.browser_pressed = false;
+        self.browser_click = None;
+    }
+
     pub(crate) fn browser_refresh_pane(&mut self) {
         let revision = self.state.browser.revision();
         if self.browser_pane.is_some() && revision == self.browser_rev {
@@ -3614,6 +3972,408 @@ impl Shell {
         let view = self.state.browser.read(|browser| browser.pane_view());
         self.browser_pane = Some(view);
         self.browser_rev = revision;
+    }
+
+    /// Keep the rendered page's viewport, capture rate and frame tied to what
+    /// is on screen.
+    ///
+    /// This runs on the window's own clock, not per frame: a capture is a
+    /// JPEG decode on the engine's pump thread, and the pane only builds a
+    /// @@RenderImage@@ from bytes that already exist. A hidden tab stops the
+    /// pump entirely, so a page nobody is looking at costs nothing.
+    pub(crate) fn sync_browser(&mut self, cx: &mut Context<Self>) {
+        let browser = self.state.browser.clone();
+        let live = browser.engine_ready();
+        let visible = self.right.open && matches!(self.right.tab, Some(RightTab::Browser));
+        let mut dirty = false;
+        if live {
+            if let Some(engine) = browser.engine() {
+                engine.set_streaming(visible);
+                if visible {
+                    // The viewport follows the geometry the frame is actually
+                    // drawn in, so the page reflows instead of being upscaled.
+                    if let Some(bounds) = self.browser_bounds.get() {
+                        let width = bounds.size.width.as_f32().round().max(0.0) as u32;
+                        let height = bounds.size.height.as_f32().round().max(0.0) as u32;
+                        if width >= 320
+                            && height >= 240
+                            && engine.viewport() != (width, height)
+                            && engine.resize((width, height)).is_ok()
+                        {
+                            dirty = true;
+                        }
+                    }
+                }
+            }
+        } else if self.browser_render.take().is_some() {
+            dirty = true;
+        }
+        let revision = browser.revision();
+        if self.browser_pane.is_none() || revision != self.browser_rev {
+            let view = browser.read(|browser| browser.pane_view());
+            self.browser_pane = Some(view);
+            self.browser_rev = revision;
+            dirty = true;
+        }
+        let seq = browser.frames().seq();
+        if seq != self.browser_frame_seq {
+            self.browser_frame_seq = seq;
+            if let Some(frame) = browser.frames().latest() {
+                if let Some(render) = render_frame(&frame) {
+                    self.browser_frame_size = (frame.width, frame.height);
+                    self.browser_render = Some(std::sync::Arc::new(render));
+                    dirty = true;
+                }
+            }
+        }
+        if dirty {
+            cx.notify();
+        }
+    }
+
+    /// The live page inside the pane: the frame, its pointer, its wheel and its
+    /// keys, or the named reason the text view is what is on screen.
+    fn browser_live_body(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(render) = self.browser_render.clone() else {
+            return self.browser_engine_notice();
+        };
+        let refusal = crate::browser::engine_refusal(&self.state.browser);
+        let bounds = self.browser_bounds.clone();
+        let tracked = bounds.clone();
+        // Non-printable keys (Backspace, the arrows, Delete) reach AppKit's input
+        // context BEFORE gpui's key listeners, and a view with no text input
+        // handler never gets them back: MEASURED, Backspace was swallowed and a
+        // field could not be edited. This canvas installs a handler so those
+        // commands are routed back to the key listener. It does not type: a
+        // printable key's character is already sent by the listener as a real
+        // keydown plus char, and inserting it here too would double it.
+        let command_focus = self.browser_focus.clone();
+        let command_shell = cx.entity();
+        let mut column = div().flex_1().min_h_0().w_full().flex().flex_col();
+        if let Some(refusal) = refusal {
+            // A page can load with one resource refused; say so rather than
+            // letting a missing image look like a broken renderer.
+            column = column.child(
+                div()
+                    .debug_selector(|| String::from("browser-seam-refused"))
+                    .flex_none()
+                    .w_full()
+                    .px(px(theme::RIGHT_PAD))
+                    .py(px(4.0))
+                    .bg(rgb(theme::hover()))
+                    .child(
+                        txt(refusal, theme::CHIP_SIZE, theme::muted())
+                            .line_height(px(15.0))
+                            .truncate(),
+                    ),
+            );
+        }
+        column
+            .child(
+                div()
+                    .on_children_prepainted(move |children, _, _| {
+                        tracked.set(children.first().copied());
+                    })
+                    .id("browser-live")
+                    .debug_selector(|| String::from("browser-render-frame"))
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .relative()
+                    .overflow_hidden()
+                    .track_focus(&self.browser_focus)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            // A press enters the page: keys go there from now on.
+                            window.focus(&this.browser_focus, cx);
+                            this.browser_pointer_down(event.position);
+                            cx.notify();
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                        // Hover updates :hover; a held button turns the same
+                        // event into a drag. Both reach the page now, so a
+                        // reader can hover a link and select text.
+                        this.browser_pointer_move(event.position, event.pressed_button.is_some());
+                        cx.notify();
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                            this.browser_pointer_up(event.position);
+                            cx.notify();
+                        }),
+                    )
+                    .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                        this.browser_scroll(event);
+                        cx.notify();
+                    }))
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                        this.browser_key(event, cx);
+                        cx.notify();
+                    }))
+                    .child(
+                        img(ImageSource::Render(render))
+                            .w(relative(1.0))
+                            .h(relative(1.0)),
+                    )
+                    .child(
+                        canvas(
+                            |_bounds, _window, _cx| (),
+                            move |bounds, _, window, cx| {
+                                window.handle_input(
+                                    &command_focus,
+                                    gpui::ElementInputHandler::new(bounds, command_shell.clone()),
+                                    cx,
+                                );
+                            },
+                        )
+                        .absolute()
+                        .top(px(0.0))
+                        .left(px(0.0))
+                        .size_full(),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The engine's own sentence when the text view is what is drawn.
+    ///
+    /// A blank rectangle is not an acceptable state: if the rendered engine
+    /// could not start, the pane says why in the engine's own words, with the
+    /// install hint, above the text view.
+    fn browser_engine_notice(&self) -> AnyElement {
+        let Some(error) = self.state.browser.engine_error() else {
+            return div().into_any_element();
+        };
+        let selector = format!("browser-engine-{}", error.kind());
+        div()
+            .debug_selector(move || selector.clone())
+            .flex_none()
+            .w_full()
+            .px(px(theme::RIGHT_PAD))
+            .py(px(8.0))
+            .bg(rgb(theme::hover()))
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .child(txt(error.message(), theme::CHIP_SIZE, theme::error()).line_height(px(16.0)))
+            .child(txt(error.hint(), theme::CHIP_SIZE, theme::muted()).line_height(px(15.0)))
+            .into_any_element()
+    }
+
+    /// Map a window point inside the frame to PAGE coordinates.
+    ///
+    /// The frame is drawn scaled to the pane's geometry, so the point a reader
+    /// pressed and the point the page receives are related by the viewport
+    /// ratio. None means the press was outside the frame (a clipped edge).
+    fn browser_page_point(&self, position: Point<Pixels>) -> Option<(f32, f32)> {
+        let bounds = self.browser_bounds.get()?;
+        let engine = self.state.browser.engine()?;
+        page_point(bounds, engine.viewport(), position, false)
+    }
+
+    /// Map a window point to the page, CLAMPED into the frame.
+    ///
+    /// This is the captured-pointer mapping: a move or release that leaves the
+    /// pane still belongs to the gesture, at the page's edge.
+    fn browser_page_point_clamped(&self, position: Point<Pixels>) -> Option<(f32, f32)> {
+        let bounds = self.browser_bounds.get()?;
+        let engine = self.state.browser.engine()?;
+        page_point(bounds, engine.viewport(), position, true)
+    }
+
+    /// A press inside the page: focus the pane, then HOLD the button down.
+    ///
+    /// The press also counts the click: a second press within the platform
+    /// interval at nearly the same point becomes `clickCount: 2`, a third 3,
+    /// so the page's `dblclick` and the word/line selection have a count to
+    /// work from.
+    fn browser_pointer_down(&mut self, position: Point<Pixels>) {
+        let Some((x, y)) = self.browser_page_point(position) else {
+            return;
+        };
+        let click = BrowserClick::next(
+            self.browser_click.as_ref(),
+            std::time::Instant::now(),
+            (x, y),
+        );
+        let count = click.count();
+        self.browser_click = Some(click);
+        if let Some(engine) = self.state.browser.engine() {
+            // Only a press the page actually received is a held gesture; a pane
+            // with no engine has nothing to release later.
+            self.browser_pressed = true;
+            let _ = engine.pointer_down(x, y, count);
+        }
+    }
+
+    /// A move: hover when no button is held, a drag while one is.
+    ///
+    /// Hover moves are throttled to one forwarded event per ~16 ms. Every one
+    /// is a CDP round trip on the UI thread, and a page only needs enough of
+    /// them to update :hover; a drag is never throttled, because every point
+    /// is part of the selection. A move beyond the click slop also ends the
+    /// multi-click window, so a press after it starts again at one.
+    fn browser_pointer_move(&mut self, position: Point<Pixels>, pressed: bool) {
+        let dragging = pressed && self.browser_pressed;
+        let now = std::time::Instant::now();
+        if !dragging {
+            if let Some(last) = self.browser_last_move {
+                if now.duration_since(last) < std::time::Duration::from_millis(16) {
+                    return;
+                }
+            }
+        }
+        self.browser_last_move = Some(now);
+        let Some((x, y)) = self.browser_page_point(position) else {
+            return;
+        };
+        if let Some(click) = self.browser_click {
+            if !click.near((x, y)) {
+                self.browser_click = None;
+            }
+        }
+        if let Some(engine) = self.state.browser.engine() {
+            let _ = engine.pointer_move(x, y);
+        }
+    }
+
+    /// A drag move that left the frame.
+    ///
+    /// The frame's own move handler stops firing at its edge (gpui routes a
+    /// move by hit test), so the window's move handler calls this with the
+    /// clamped edge point while the press is held. A move that is still inside
+    /// the frame is left to the frame, so a drag point is never sent twice.
+    pub(crate) fn browser_drag_outside(&mut self, position: Point<Pixels>) {
+        if !self.browser_pressed || self.browser_page_point(position).is_some() {
+            return;
+        }
+        let Some((x, y)) = self.browser_page_point_clamped(position) else {
+            return;
+        };
+        if let Some(engine) = self.state.browser.engine() {
+            let _ = engine.pointer_move(x, y);
+        }
+    }
+
+    /// The release that completes a press.
+    fn browser_pointer_up(&mut self, position: Point<Pixels>) {
+        if !self.browser_pressed {
+            return;
+        }
+        self.browser_pressed = false;
+        let count = self.browser_click.map_or(1, |click| click.count());
+        let Some((x, y)) = self.browser_page_point_clamped(position) else {
+            return;
+        };
+        if let Some(engine) = self.state.browser.engine() {
+            let _ = engine.pointer_up(x, y, count);
+        }
+    }
+
+    /// The release that completed a press but landed outside the frame.
+    ///
+    /// This is the captured-pointer half of the gesture: the page gets a last
+    /// drag move and a real `mouseReleased` at the frame's clamped edge, so its
+    /// drag state clears instead of staying pressed forever. Called from the
+    /// window's own mouse-up listeners; a release inside the frame was already
+    /// handled by `browser_pointer_up`, which clears the pressed flag first.
+    pub(crate) fn browser_release_outside(&mut self, position: Point<Pixels>) {
+        if !self.browser_pressed {
+            return;
+        }
+        self.browser_pressed = false;
+        let count = self.browser_click.map_or(1, |click| click.count());
+        let Some((x, y)) = self.browser_page_point_clamped(position) else {
+            return;
+        };
+        if let Some(engine) = self.state.browser.engine() {
+            let _ = engine.pointer_move(x, y);
+            let _ = engine.pointer_up(x, y, count);
+        }
+    }
+
+    /// Forward a wheel event.
+    fn browser_scroll(&mut self, event: &ScrollWheelEvent) {
+        let Some(bounds) = self.browser_bounds.get() else {
+            return;
+        };
+        let width = bounds.size.width.as_f32().max(1.0);
+        let height = bounds.size.height.as_f32().max(1.0);
+        let x = (event.position.x.as_f32() - bounds.origin.x.as_f32()).max(0.0);
+        let y = (event.position.y.as_f32() - bounds.origin.y.as_f32()).max(0.0);
+        let delta = match event.delta {
+            ScrollDelta::Pixels(delta) => delta.y.as_f32(),
+            ScrollDelta::Lines(lines) => lines.y * 40.0,
+        };
+        let Some(engine) = self.state.browser.engine() else {
+            return;
+        };
+        let viewport = engine.viewport();
+        let (x, y) = (
+            x * viewport.0 as f32 / width,
+            y * viewport.1 as f32 / height,
+        );
+        let _ = engine.scroll(x, y, delta);
+    }
+
+    /// Forward a key: printable text as text, the named keys as keys.
+    fn browser_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.browser.engine() else {
+            return;
+        };
+        let keystroke = &event.keystroke;
+        if browser_shortcut(keystroke, &engine, cx) {
+            return;
+        }
+        let named = match keystroke.key.as_str() {
+            "enter" => Some("enter"),
+            "tab" => Some(if keystroke.modifiers.shift {
+                "shift+tab"
+            } else {
+                "tab"
+            }),
+            "escape" => Some("escape"),
+            "up" => Some("arrowup"),
+            "down" => Some("arrowdown"),
+            "left" => Some("arrowleft"),
+            "right" => Some("arrowright"),
+            "backspace" => Some("backspace"),
+            "delete" => Some("delete"),
+            "home" => Some("home"),
+            "end" => Some("end"),
+            "pageup" => Some("pageup"),
+            "pagedown" => Some("pagedown"),
+            _ => None,
+        };
+        if let Some(named) = named {
+            let _ = engine.press(named);
+            return;
+        }
+        // A shortcut this pane does not own (Cmd-S, Cmd-T, ...) belongs to the
+        // application; a control or alt chord is not text in any browser.
+        if keystroke.modifiers.control || keystroke.modifiers.platform || keystroke.modifiers.alt {
+            return;
+        }
+        let Some(text) = &keystroke.key_char else {
+            return;
+        };
+        if text.chars().count() == 1 && !text.chars().all(char::is_control) {
+            // One printable character: a real browser's keydown plus char, so
+            // a page listening for keydown sees the key AND the field receives
+            // exactly that character once.
+            let _ = engine.type_key(text, chord_modifiers(&keystroke.modifiers));
+            if let Some(ch) = text.chars().next() {
+                self.browser_typed = Some((std::time::Instant::now(), ch));
+            }
+        } else {
+            // A composition (CJK/IME) or an input source's multi-character
+            // commit: insert it as text, the route that does not pretend to be
+            // a key this keyboard does not have.
+            let _ = engine.insert_text(text);
+        }
     }
 
     /// Re-read the workspace policy when the file on disk changed.
@@ -5199,11 +5959,66 @@ impl Shell {
     }
 }
 
+/// Build the image the pane draws from one captured frame.
+///
+/// The buffer was decoded on the engine's pump thread, so this copies bytes and
+/// builds a GPUI image; it does not decode anything on the render path.
+///
+/// The one channel transform lives here, at the GPUI boundary: GPUI's
+/// `RenderImage` wants BGRA and a capture is RGBA. MEASURED: handing RGBA over
+/// unchanged draws a blue heading orange and a red box blue, which looks like a
+/// renderer bug and is a byte-order one.
+fn render_frame(frame: &crate::browser::engine::Frame) -> Option<gpui_kit::RenderImage> {
+    let mut pixels = (*frame.rgba).clone();
+    for pixel in pixels.as_chunks_mut::<4>().0 {
+        pixel.swap(0, 2);
+    }
+    let buffer = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_raw(
+        frame.width,
+        frame.height,
+        pixels,
+    )?;
+    Some(gpui_kit::RenderImage::new([image::Frame::new(buffer)]))
+}
+
+/// How one terminal's shell is confined, at spawn time or now.
+///
+/// Three classes, because they are reversed by three different controls: a
+/// policy release (the sandbox switch or a preset), the full-access permission
+/// release, and confinement itself. Comparing the classes catches a permission
+/// change while a shell runs, which the spawn-time policy id alone does not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalConfinement {
+    /// A policy turned the sandbox off for this shell.
+    PolicyReleased,
+    /// The full-access permission released it (no preset asked for heel).
+    PermissionReleased,
+    /// Heel applies, whether or not this backend can host the pane's tty.
+    Confined,
+}
+
+/// The class recorded by the facts a terminal kept at spawn.
+fn terminal_confinement(
+    off: Option<crate::terminal::SandboxOff>,
+    label: Option<&'static str>,
+) -> TerminalConfinement {
+    if off.is_some() {
+        TerminalConfinement::PolicyReleased
+    } else if label == Some("full-access") {
+        TerminalConfinement::PermissionReleased
+    } else {
+        TerminalConfinement::Confined
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use gpui_kit::{FontStyle, FontWeight, Keystroke, Modifiers};
+    use gpui_kit::{point, px, size, Bounds, FontStyle, FontWeight, Keystroke, Modifiers};
 
-    use super::{anchor_line, grid_fonts, terminal_key_bytes};
+    use super::{
+        anchor_line, grid_fonts, page_point, terminal_key_bytes, BrowserClick, BROWSER_CLICK_MS,
+        BROWSER_CLICK_SLOP,
+    };
 
     fn key(key: &str, key_char: Option<&str>) -> Keystroke {
         Keystroke {
@@ -5294,5 +6109,95 @@ mod tests {
         let mut chord = key("p", Some("p"));
         chord.modifiers.platform = true;
         assert_eq!(terminal_key_bytes(&chord), None);
+    }
+
+    /// The click count is timing plus slop, because the CDP press has to carry
+    /// it: a second press in the interval and near the first is a double, a
+    /// third a triple, and anything else starts over.
+    #[test]
+    fn a_press_counts_double_and_triple_clicks_by_time_and_slop() {
+        let start = std::time::Instant::now();
+        let first = BrowserClick::next(None, start, (10.0, 10.0));
+        assert_eq!(first.count(), 1);
+        let second = BrowserClick::next(
+            Some(&first),
+            start + std::time::Duration::from_millis(120),
+            (12.0, 11.0),
+        );
+        assert_eq!(second.count(), 2);
+        let third = BrowserClick::next(
+            Some(&second),
+            start + std::time::Duration::from_millis(240),
+            (9.0, 12.0),
+        );
+        assert_eq!(third.count(), 3);
+        assert_eq!(
+            BrowserClick::next(
+                Some(&third),
+                start + std::time::Duration::from_millis(300),
+                (10.0, 10.0)
+            )
+            .count(),
+            3,
+            "a fourth rapid press stays on triple-click selection"
+        );
+        assert_eq!(
+            BrowserClick::next(
+                Some(&third),
+                start + std::time::Duration::from_millis(240 + BROWSER_CLICK_MS + 1),
+                (10.0, 10.0)
+            )
+            .count(),
+            1,
+            "the interval resets the count"
+        );
+        assert_eq!(
+            BrowserClick::next(
+                Some(&second),
+                start + std::time::Duration::from_millis(200),
+                (12.0 + BROWSER_CLICK_SLOP + 1.0, 11.0)
+            )
+            .count(),
+            1,
+            "a press beyond the slop is a new click"
+        );
+    }
+
+    /// A move beyond the slop ends the multi-click window, which is what makes
+    /// two separate clicks never read as one double click.
+    #[test]
+    fn a_move_beyond_the_slop_ends_the_click_window() {
+        let click = BrowserClick::next(None, std::time::Instant::now(), (10.0, 10.0));
+        assert!(click.near((13.0, 13.0)));
+        assert!(!click.near((10.0 + BROWSER_CLICK_SLOP + 0.5, 10.0)));
+    }
+
+    /// The captured release maps an outside point to the page's edge; an
+    /// ordinary press outside the frame maps to nothing.
+    #[test]
+    fn an_outside_release_maps_to_the_page_edge_only_when_clamped() {
+        let bounds = Bounds {
+            origin: point(px(100.0), px(50.0)),
+            size: size(px(200.0), px(100.0)),
+        };
+        let viewport = (1000, 500);
+        assert_eq!(
+            page_point(bounds, viewport, point(px(200.0), px(100.0)), false),
+            Some((500.0, 250.0)),
+            "an inside point maps the same either way"
+        );
+        assert_eq!(
+            page_point(bounds, viewport, point(px(0.0), px(0.0)), false),
+            None,
+            "a press outside the frame is not the page's"
+        );
+        assert_eq!(
+            page_point(bounds, viewport, point(px(0.0), px(0.0)), true),
+            Some((0.0, 0.0))
+        );
+        let (x, y) = page_point(bounds, viewport, point(px(400.0), px(300.0)), true)
+            .expect("an outside point clamps into the frame");
+        assert!((x - 995.0).abs() < 0.001, "the last page column: {x}");
+        assert!((y - 495.0).abs() < 0.001, "the last page row: {y}");
     }
 }

@@ -206,10 +206,15 @@ pub(crate) fn allows_writes(permission: &str) -> bool {
 ///   PRESET asked for heel is built as Workspace Write: the permission released
 ///   confinement, and the preset narrowed it back, so the grants and the egress
 ///   proxy come from the policy exactly as they do for a confined session.
-/// - off (permitted only at full access) is `bare(FullAccess)`: it spawns a
-///   bare shell and the tool result reports `sandbox: "none"`.
+/// - off - because a preset asked, or because the settings master switch is
+///   off - is `bare(FullAccess)`: it spawns a bare shell and the tool result
+///   reports `sandbox: "none"` with the reason that released it.
 /// - an absent field at full access keeps the permission's own full-access
 ///   spec, which is byte-for-byte today's behaviour.
+///
+/// The master switch is already folded into `eff.sandbox` by the resolution, so
+/// this function has no second copy of it: `off_by_policy` is the one predicate
+/// for "a policy released the shell", and the bare spec is its channel.
 pub(crate) fn sandbox_spec_for(
     policy: &Arc<PolicySet>,
     eff: &Effective,
@@ -228,7 +233,7 @@ pub(crate) fn sandbox_spec_for(
         Arc::new(agent::sandbox::SandboxSpec::for_policy(
             policy, tier, principal,
         ))
-    } else if eff.sandbox.declared == Some(crate::settings::global::SandboxChoice::Off) {
+    } else if eff.sandbox.off_by_policy() {
         Arc::new(agent::sandbox::SandboxSpec::bare(
             agent::sandbox::SandboxMode::FullAccess,
             policy.data().workspace_root.clone(),
@@ -405,6 +410,12 @@ pub(crate) struct BuiltAgent {
     /// caller.
     #[allow(dead_code)]
     pub(crate) policy: Arc<PolicySet>,
+    /// The one resolution this build used.
+    ///
+    /// The turn's runtime-context snapshot is rendered from THIS value rather
+    /// than from a second `effective_for` call, so the facts the model reads
+    /// and the facts the tools enforce cannot diverge.
+    pub(crate) effective: Effective,
 }
 
 /// Build the agent for one session.
@@ -543,12 +554,22 @@ fn build_agent_for_session_inner(
     } else {
         format!("{}/{}", eff.provider, eff.model)
     };
+    // The persona is a SLOT by default (identity < persona < workflow). A
+    // persona that sets `complete` is the reference's sole-section arm: its
+    // text is the whole prompt, so tool guidance is suppressed below too. An
+    // empty persona under `complete` falls back to the default composition,
+    // because an empty system prompt is never what a persona meant.
+    let persona_complete = eff.persona_complete && !eff.llm_system_prompt().trim().is_empty();
     let mut config = AgentConfig {
         name: "bsh".to_string(),
         model,
         base_url: eff.base_url.clone(),
         api_key,
-        system_prompt: eff.llm_system_prompt().to_string(),
+        system_prompt: agent::prompts::compose_system_prompt_with(
+            eff.llm_system_prompt(),
+            persona_complete,
+        ),
+        persona_complete,
         temperature: eff.temperature,
         // The composer's "Off" level is stored as the literal `off` so it can
         // beat the model's declared effort; on the wire it means NO effort field
@@ -575,10 +596,13 @@ fn build_agent_for_session_inner(
     // whole truth for this shell. The model's declared protocol arrives through
     // the settings instead, so the pane and the wire agree by construction.
     config.api_mode = eff.api_mode.clone();
-    // The hosted web-search tool. The engine still requires the Responses
-    // protocol before it offers the tool, because a chat or anthropic endpoint
-    // would reject the object; the setting decides whether the reader wants it.
-    config.web_search = eff.preset_web_search.unwrap_or(eff.web_tools_enabled);
+    // Search is a LOCAL tool here (see `crate::web`), so the framework's hosted
+    // `web_search` object stays withdrawn: it is a Responses-only capability and
+    // two tools named `web_search` on one request would collide. The preset's
+    // own declaration still decides whether the reader gets search at all, which
+    // is the same precedence the hosted switch used.
+    config.web_search = false;
+    let web_search_on = eff.preset_web_search.unwrap_or(eff.web_tools_enabled);
 
     let mut agent = Agent::from_config(config);
     // Canonicalise once: `resolve_path` canonicalises every target, so the
@@ -663,7 +687,7 @@ fn build_agent_for_session_inner(
                 // baseline's `spawn-shell-full-access` arm is for. A path-only
                 // policy would refuse every command here before a process
                 // existed, which is exactly the bug this arm fixes.
-                workspace_root: if shell_confined || eff.sandbox.off_by_preset {
+                workspace_root: if shell_confined || eff.sandbox.off_by_policy() {
                     root.as_ref().map(|r| r.to_string_lossy().to_string())
                 } else {
                     None
@@ -684,8 +708,11 @@ fn build_agent_for_session_inner(
                 .with_jobs(jobs.clone(), session)
                 .with_background(gates.background_spawn)
                 .with_sandbox_spec(spec);
-            if eff.sandbox.off_by_preset {
-                bash = bash.with_sandbox_reason(agent::tools::bash::PRESET_SANDBOX_OFF_REASON);
+            // ONE attribution for both spawn paths: the settings switch wins
+            // over a preset's arm, and a permission release sets nothing here so
+            // the tool's own fallback names it.
+            if let Some(reason) = crate::settings::resolve::sandbox_off_reason(&eff.sandbox) {
+                bash = bash.with_sandbox_reason(reason);
             }
             shell_tools.push(Arc::new(bash));
         }
@@ -940,6 +967,7 @@ fn build_agent_for_session_inner(
                 root.as_ref()
                     .map(|path| path.to_string_lossy().to_string())
                     .unwrap_or_default(),
+                crate::context::RuntimeFacts::from_effective(&eff),
             );
             attach_subagent_tool(&mut agent, context);
         }
@@ -955,8 +983,30 @@ fn build_agent_for_session_inner(
             policy: policy.clone(),
             session: session.to_string(),
             preset: preset.clone(),
+            network_mode: settings.browser_network_mode(),
         },
     );
+
+    // The local web-search tool. It asks the SAME policy the browser and the
+    // shell ask, and it is offered only when the reader (or the preset) wants
+    // search: a tool the pane says is off must not be in the request.
+    if web_search_on && !off_tool("web_search") {
+        crate::web::attach(
+            &mut agent,
+            crate::web::Tools {
+                config: web_search_config(settings, vault),
+                policy: policy.clone(),
+                session: session.to_string(),
+                preset: preset.clone(),
+            },
+        );
+    }
+
+    // The prompt names a tool only when the request actually carries it. This
+    // runs after every attachment (bundles, MCP, extensions, browser, search,
+    // subagent) and before the meter prices the request, so the two cannot
+    // disagree.
+    crate::prompts::append_tool_guidance(&mut agent);
 
     // The meter's tools bucket follows the request's own tool array, so it is
     // priced from the registry that request will serialize.
@@ -971,6 +1021,7 @@ fn build_agent_for_session_inner(
         tools_schema_chars,
         credential_error,
         policy,
+        effective: eff,
     }
 }
 
@@ -1151,6 +1202,43 @@ pub(crate) fn tools_schema_chars(registry: &agent::tools::ToolRegistry) -> usize
 }
 
 /// The capabilities the agent exposes, for the tools-and-skills pane.
+/// The web-search configuration a build would carry.
+///
+/// One derivation for the build and the tests: the pane's fields and the
+/// requests the tool sends cannot disagree, because both read this.
+pub(crate) fn web_search_config(settings: &Settings, vault: &Vault) -> crate::web::Config {
+    let section = &settings.global.web_search;
+    let shape = crate::web::Shape {
+        method: crate::web::Method::parse(&section.method),
+        path: section.path.trim().to_string(),
+        query_key: section.query_key.trim().to_string(),
+        count_key: section.count_key.trim().to_string(),
+        body: section.body.clone(),
+        results_key: if section.results_key.trim().is_empty() {
+            "results".to_string()
+        } else {
+            section.results_key.trim().to_string()
+        },
+        url_key: if section.url_key.trim().is_empty() {
+            "url".to_string()
+        } else {
+            section.url_key.trim().to_string()
+        },
+        title_key: section.title_key.trim().to_string(),
+        snippet_key: section.snippet_key.trim().to_string(),
+        date_key: section.date_key.trim().to_string(),
+    };
+    crate::web::Config::with_shape(
+        shape,
+        section.base_url.clone(),
+        vault
+            .resolve(crate::vault::WEB_SEARCH_KEY)
+            .map(|secret| secret.as_str().to_string())
+            .unwrap_or_default(),
+        section.results_per_search,
+    )
+}
+
 pub(crate) fn capabilities(agent: &Agent) -> Vec<CapInfo> {
     let mut caps = Vec::new();
     if let Some(registry) = agent.registry() {
@@ -1236,36 +1324,6 @@ pub(crate) fn policy_for_effective(settings: &Settings, eff: &Effective) -> Arc<
     let root = workspace_root(eff).map(|path| path.canonicalize().unwrap_or(path));
     Arc::new(build_policy(settings, eff, root.as_deref()))
 }
-/// The capability guidance appended to a turn that carries the subagent tool.
-///
-/// The tool description is per-call; this is the standing rule that makes a
-/// model split a large decomposable job instead of doing every part serially in
-/// one context.
-const SUBAGENT_GUIDANCE: &str = "## Delegating with subagents
-
-A big job that can be split into independent parts should be split. When a request
-spans several files or modules, several questions, or independent review and
-verification passes, use the subagent tool for each self-contained part instead
-of doing every part serially in this context.
-
-Use subagents when:
-- the work can be divided into two or more independent workstreams;
-- a part needs a focused deep pass and can return a concise result;
-- the parts can be investigated or implemented in parallel.
-
-Do NOT use them for one trivial step, or for steps that must share tight
-sequential state with this turn.
-
-Pattern:
-1. State a short plan naming the independent parts.
-2. Call subagent once per part with a complete prompt: goal, relevant paths and
-   context, constraints, expected output format, and what to report.
-3. Run at most three children at once; put additional parts in later waves.
-4. Read each result, reconcile conflicts, and do the final verification yourself.
-
-A child has its own context and the same tools; it does not see this conversation
-unless the prompt contains the needed context.";
-
 /// The factory one parent turn hands to its subagent tool.
 ///
 /// It snapshots the parent's LLM config and tool registry at build time, so a
@@ -1286,6 +1344,11 @@ pub(crate) struct SubagentContext {
     preset: String,
     /// The workspace root the child runs in.
     root: String,
+    /// The resolved facts the child turn's runtime snapshot states.
+    ///
+    /// Captured from the parent build's one `Effective`, so a child reports the
+    /// same sandbox, permission and preset the tools it inherits enforce.
+    runtime: crate::context::RuntimeFacts,
 }
 
 impl SubagentContext {
@@ -1300,6 +1363,7 @@ impl SubagentContext {
         policy: Arc<PolicySet>,
         preset: impl Into<String>,
         root: impl Into<String>,
+        runtime: crate::context::RuntimeFacts,
     ) -> Self {
         let (sync_tools, async_tools) = match agent.registry() {
             Some(registry) => {
@@ -1325,6 +1389,7 @@ impl SubagentContext {
             policy,
             preset: preset.into(),
             root: root.into(),
+            runtime,
         }
     }
 
@@ -1383,8 +1448,10 @@ impl SubagentContext {
                 self.policy.clone(),
                 self.preset.clone(),
                 self.root.clone(),
+                self.runtime.clone(),
             );
             attach_subagent_tool(&mut child, nested);
+            crate::prompts::append_subagent_guidance(&mut child);
         }
         child
     }
@@ -1398,7 +1465,11 @@ pub(crate) fn child_transcript(child: &Agent) -> Vec<crate::subagent::SubagentMe
         let row = match message {
             react::llm::LlmMessage::System { .. } => None,
             react::llm::LlmMessage::User { content } => {
-                Some(("user", content.as_text().unwrap_or("").to_string(), None))
+                let text = content.as_text().unwrap_or("").to_string();
+                // The per-turn runtime snapshot and workspace instructions are
+                // harness injections, not something the child or its caller
+                // said; the read-only view shows the child's work.
+                (!crate::context::is_injected_user_text(&text)).then_some(("user", text, None))
             }
             react::llm::LlmMessage::Assistant { content } => {
                 Some(("assistant", content.clone(), None))
@@ -1434,7 +1505,11 @@ pub(crate) async fn stream_child(
     prompt: String,
     registry: Arc<crate::subagent::SubagentRegistry>,
     id: &str,
+    context: &crate::context::TurnContext,
 ) -> Result<(String, (u64, u64)), String> {
+    // The child turn carries the same two per-turn messages a parent turn
+    // does, rendered with the delegation context added.
+    context.inject(child);
     let mut stream = child.stream(prompt);
     let mut text = String::new();
     while let Some(item) = stream.next().await {
@@ -1531,6 +1606,8 @@ pub(crate) fn attach_subagent_tool(agent: &mut Agent, context: SubagentContext) 
                     &prompt,
                 );
                 let child = context.child(&id);
+                let turn_context =
+                    crate::context::TurnContext::from_facts(&context.runtime, true);
                 let result = tokio::time::timeout(
                     std::time::Duration::from_secs(600),
                     stream_child(
@@ -1538,6 +1615,7 @@ pub(crate) fn attach_subagent_tool(agent: &mut Agent, context: SubagentContext) 
                         prompt,
                         context.registry.clone(),
                         &id,
+                        &turn_context,
                     ),
                 )
                 .await
@@ -1572,13 +1650,6 @@ pub(crate) fn attach_subagent_tool(agent: &mut Agent, context: SubagentContext) 
             }
         },
     );
-    if !agent
-        .config()
-        .system_prompt
-        .contains("## Delegating with subagents")
-    {
-        agent.append_system_prompt(SUBAGENT_GUIDANCE);
-    }
     if let Err(error) = agent.try_add_async_tool(Arc::new(tool)) {
         warn!("subagent tool was not registered: {error}");
     }
@@ -1593,6 +1664,16 @@ pub(crate) fn attach_subagent_tool(agent: &mut Agent, context: SubagentContext) 
 fn build_policy(settings: &Settings, eff: &Effective, root: Option<&Path>) -> PolicySet {
     let mut data = PolicyData::new(root.map(Path::to_path_buf).unwrap_or_default())
         .with_preset(eff.preset_id.clone())
+        // WHY no preset applied, recorded beside the id: empty means either
+        // "none chosen" or "the master switch is off", and the audit has to be
+        // able to tell a later reader which one it was.
+        .with_presets_disabled(eff.presets_disabled)
+        // The master switch is DATA, and so is the RESOLVED answer beside it:
+        // a policy that requires confinement reads `data.sandbox_confined`,
+        // which is false for a full-access release even when the switch is on
+        // and true for a preset's heel at full access.
+        .with_sandbox_enabled(settings.global.general.sandbox_active())
+        .with_sandbox_confined(eff.sandbox.heel)
         .with_preset_permission(eff.preset_permission.clone().unwrap_or_default())
         // The capability query and every action rule read the EFFECTIVE
         // permission (session mode capped by the preset ceiling), not the
@@ -2338,10 +2419,11 @@ fn open_memory(settings: &Settings) -> Option<Arc<dyn MemoryStore>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_messages, allows_writes, build_agent, compactable_span, egress_allowlist_path,
-        is_confined, plugin_provider_node, read_egress_rules, refresh_plugin_providers,
-        sandbox_spec_for, surfaced_capabilities, tool_gates_for, with_bridge_pool, BuiltAgent,
-        WorkspaceEgress, EGRESS_ALLOWLIST_TEMPLATE, FULL_ACCESS, READ_ONLY, WORKSPACE_WRITE,
+        agent_messages, allows_writes, build_agent, check_spawn, compactable_span,
+        egress_allowlist_path, is_confined, plugin_provider_node, read_egress_rules,
+        refresh_plugin_providers, sandbox_spec_for, surfaced_capabilities, tool_gates_for,
+        web_search_config, with_bridge_pool, BuiltAgent, WorkspaceEgress,
+        EGRESS_ALLOWLIST_TEMPLATE, FULL_ACCESS, READ_ONLY, WORKSPACE_WRITE,
     };
     use crate::settings::global::{ModelEntry, Preset};
     use crate::settings::resolve::SessionChoice;
@@ -3024,7 +3106,14 @@ mod tests {
             with_bridge_pool(|pool| pool.loaded()).is_empty(),
             "the pool keeps no package this build did not ask for"
         );
-        std::thread::sleep(std::time::Duration::from_millis(400));
+        // Reaping is the OS's to finish, and a loaded suite can schedule the
+        // child's exit well after the pool asked for it. Poll for the death
+        // instead of pinning one scheduler-latency number; the assertion is
+        // still "the child is gone", not "it will be gone eventually".
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while process_alive(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
         assert!(
             !process_alive(pid),
             "reconciling the pool reaps the child rather than leaking it"
@@ -3053,16 +3142,17 @@ mod tests {
         false
     }
 
-    /// The setting is the reader's half of the decision; the engine holds the
-    /// other half, so this pins that the value arrives and that a chat-protocol
-    /// provider is not handed a hosted tool it would reject.
+    /// The switch is the reader's half of the decision and the REGISTRY is the
+    /// other half, so this pins that the local `web_search` tool is offered
+    /// exactly when the switch is on - and that the hosted flag stays off on
+    /// every build, because two tools named `web_search` would collide.
     ///
     /// The preset is cleared first, on purpose: `Settings::default()` ships the
-    /// STANDARD preset, which now declares `web_search = true` and therefore
+    /// STANDARD preset, which declares `web_search = true` and therefore
     /// OVERRIDES this switch (that precedence is the resolver's own -
-    /// `preset_web_search.unwrap_or(web_tools_enabled)` - and is older than this
-    /// change, which only extended it to Standard). With the preset cleared the
-    /// switch is the only thing deciding, which is what this test is about.
+    /// `preset_web_search.unwrap_or(web_tools_enabled)`). With the preset
+    /// cleared the switch is the only thing deciding, which is what this test
+    /// is about.
     #[test]
     fn the_web_tools_switch_reaches_the_agent() {
         let mut settings = bare();
@@ -3071,16 +3161,342 @@ mod tests {
             settings.workspace.agent.web_tools_enabled,
             "the shipped default offers web search"
         );
+        let names = build_tool_names(&settings);
         assert!(
-            build(&settings).agent.config().web_search,
-            "the setting reaches the agent config"
+            names.iter().any(|name| name == "web_search"),
+            "the switch offers the local search tool: {names:?}"
+        );
+        assert!(
+            !build(&settings).agent.config().web_search,
+            "the hosted object is never sent beside the local tool"
         );
 
         settings.workspace.agent.web_tools_enabled = false;
+        let names = build_tool_names(&settings);
         assert!(
-            !build(&settings).agent.config().web_search,
-            "switching it off withdraws the tool"
+            !names.iter().any(|name| name == "web_search"),
+            "switching it off withdraws the tool: {names:?}"
         );
+    }
+
+    /// Every tool name one build registered, sorted.
+    fn build_tool_names(settings: &Settings) -> Vec<String> {
+        tool_names(&build(settings))
+    }
+
+    /// Every tool name a finished build registered, sorted.
+    fn tool_names(built: &BuiltAgent) -> Vec<String> {
+        let mut names = built
+            .agent
+            .registry()
+            .map(|registry| registry.list())
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// An EMPTY persona is "the framework's default", not "no persona": a
+    /// workspace that never typed a prompt (and a preset that publishes none)
+    /// still sends the agentic default, while a typed prompt and a preset
+    /// persona both win over it.
+    #[test]
+    fn an_empty_persona_inherits_the_framework_default() {
+        let mut settings = bare();
+        settings.global.default_preset = String::new();
+        assert!(
+            settings.workspace.agent.system_prompt.trim().is_empty(),
+            "the premise: the workspace ships no prompt"
+        );
+        let built = build(&settings);
+        assert!(
+            built
+                .agent
+                .config()
+                .system_prompt
+                .starts_with(agent::DEFAULT_SYSTEM_PROMPT),
+            "the shipped default persona reaches the request"
+        );
+
+        // A typed workspace prompt fills the persona slot.
+        settings.workspace.agent.system_prompt = "workspace persona".to_string();
+        let built = build(&settings);
+        let prompt = &built.agent.config().system_prompt;
+        assert!(
+            prompt.starts_with(agent::HARNESS_IDENTITY),
+            "the harness identity still opens the prompt"
+        );
+        let identity = prompt.find(agent::HARNESS_IDENTITY).expect("identity");
+        let persona = prompt.find("workspace persona").expect("the typed persona");
+        let workflow = prompt
+            .find(agent::WORKFLOW_GUIDANCE)
+            .expect("the workflow guidance");
+        assert!(
+            identity < persona && persona < workflow,
+            "identity, then the persona slot, then the workflow guidance"
+        );
+
+        // A preset's own persona wins over BOTH.
+        settings.workspace.agent.system_prompt = String::new();
+        settings.global.default_preset = "ptc".to_string();
+        let built = build(&settings);
+        assert_ne!(
+            built.agent.config().system_prompt,
+            agent::DEFAULT_SYSTEM_PROMPT,
+            "the preset persona is not the default"
+        );
+        let prompt = &built.agent.config().system_prompt;
+        assert!(
+            prompt.contains(crate::prompts::PTC_PERSONA),
+            "and it is the preset's own persona, in the persona slot"
+        );
+        assert!(
+            prompt.find(agent::HARNESS_IDENTITY) < prompt.find(crate::prompts::PTC_PERSONA),
+            "the persona slot follows the identity"
+        );
+        assert!(
+            built
+                .agent
+                .config()
+                .system_prompt
+                .contains(agent::WORKFLOW_GUIDANCE),
+            "the preset does not replace the standing workflow guidance"
+        );
+    }
+
+    /// The reference's `complete: true` arm over a real build: the persona is
+    /// EXACTLY the system prompt - no identity, no workflow, no tool guidance -
+    /// while the tool registry is untouched. Off stays the slot composition.
+    #[test]
+    fn a_complete_persona_replaces_the_whole_prompt() {
+        let mut settings = bare();
+        settings.global.default_preset = String::new();
+        settings.workspace.agent.system_prompt =
+            "You are a helpful software engineer assistant.".to_string();
+        settings.workspace.agent.complete = true;
+        let built = build(&settings);
+        assert_eq!(
+            built.agent.config().system_prompt,
+            "You are a helpful software engineer assistant.",
+            "a complete persona is the whole prompt"
+        );
+        assert!(
+            built.agent.config().persona_complete,
+            "the build records the flag it applied"
+        );
+        // complete is a PROMPT fact, not a tool gate.
+        let names = tool_names(&built);
+        assert!(names.iter().any(|name| name == "bash"), "{names:?}");
+        assert!(names.iter().any(|name| name == "read_file"), "{names:?}");
+        // The stale-tool guard still runs over the complete prompt.
+        assert_eq!(
+            crate::prompts::stale_tool_reference(&built.agent.config().system_prompt),
+            None
+        );
+
+        // A complete PRESET persona wins over the workspace prompt, and it
+        // suppresses the guidance of every tool the build carries.
+        settings.global.presets.insert(
+            "minimal".to_string(),
+            Preset {
+                system_prompt: Some("You are terse.".to_string()),
+                complete: true,
+                ..Preset::default()
+            },
+        );
+        settings.global.default_preset = "minimal".to_string();
+        let built = build(&settings);
+        assert_eq!(built.agent.config().system_prompt, "You are terse.");
+        assert!(!built
+            .agent
+            .config()
+            .system_prompt
+            .contains(agent::HARNESS_IDENTITY));
+        assert!(!built
+            .agent
+            .config()
+            .system_prompt
+            .contains(agent::WORKFLOW_GUIDANCE));
+        assert!(!built
+            .agent
+            .config()
+            .system_prompt
+            .contains(crate::prompts::READ_FILE));
+        assert!(!built
+            .agent
+            .config()
+            .system_prompt
+            .contains(agent::prompts::TOOL_BASH));
+
+        // The default stays the slot: identity < persona < workflow, and tool
+        // guidance still follows registration.
+        settings.workspace.agent.complete = false;
+        settings.global.default_preset = String::new();
+        settings.workspace.agent.system_prompt = "workspace persona".to_string();
+        let built = build(&settings);
+        let prompt = &built.agent.config().system_prompt;
+        assert!(prompt.starts_with(agent::HARNESS_IDENTITY));
+        assert!(prompt.contains("workspace persona"));
+        assert!(prompt.contains(agent::WORKFLOW_GUIDANCE));
+        assert!(
+            prompt.find("workspace persona") < prompt.find(agent::WORKFLOW_GUIDANCE),
+            "identity < persona < workflow"
+        );
+        assert!(prompt.contains(crate::prompts::READ_FILE));
+        assert!(!built.agent.config().persona_complete);
+
+        // A complete persona that names a tool BSH does not register is still
+        // caught by the guard; complete changes what is sent, not what may be
+        // said.
+        settings.workspace.agent.complete = true;
+        settings.workspace.agent.system_prompt = "Use the grep tool.".to_string();
+        let built = build(&settings);
+        assert_eq!(
+            crate::prompts::stale_tool_reference(&built.agent.config().system_prompt),
+            Some("the grep tool")
+        );
+
+        // An EMPTY persona under complete falls back to the framework default
+        // composition, never an empty system prompt, and it is an ordinary
+        // build again: tool guidance follows registration.
+        settings.workspace.agent.system_prompt = "   ".to_string();
+        let built = build(&settings);
+        assert!(
+            built
+                .agent
+                .config()
+                .system_prompt
+                .starts_with(agent::DEFAULT_SYSTEM_PROMPT),
+            "{}",
+            built.agent.config().system_prompt
+        );
+        assert!(
+            built
+                .agent
+                .config()
+                .system_prompt
+                .contains(crate::prompts::READ_FILE),
+            "the fallback build keeps its guidance"
+        );
+        assert!(!built.agent.config().persona_complete);
+    }
+
+    /// The prompt and the request carry the same tool set: every guidance
+    /// section is present exactly when its tool is registered. A preset that
+    /// removes the shell takes the bash rule with it, and the reverse cannot
+    /// happen either.
+    #[test]
+    fn the_prompt_names_a_tool_only_when_the_build_carries_it() {
+        let cases: Vec<(&str, BuiltAgent)> = vec![
+            ("default", build(&bare())),
+            ("no-shell", {
+                let mut settings = bare();
+                settings.workspace.agent.bash_enabled = false;
+                build(&settings)
+            }),
+            ("read-only", {
+                let mut settings = bare();
+                settings.workspace.agent.permission = READ_ONLY.to_string();
+                build(&settings)
+            }),
+        ];
+        for (label, built) in cases {
+            let names = built
+                .agent
+                .registry()
+                .map(|registry| registry.list())
+                .unwrap_or_default();
+            let prompt = &built.agent.config().system_prompt;
+            assert!(
+                prompt.starts_with(agent::HARNESS_IDENTITY),
+                "{label}: the prompt opens with the harness identity"
+            );
+            assert!(
+                prompt.contains(agent::WORKFLOW_GUIDANCE),
+                "{label}: the workflow guidance is always present"
+            );
+            for (tool, text) in agent::prompts::TOOL_GUIDANCE
+                .iter()
+                .chain(crate::prompts::TOOL_GUIDANCE.iter())
+            {
+                assert_eq!(
+                    prompt.contains(text),
+                    names.iter().any(|name| name == tool),
+                    "{label}: guidance for {tool} follows registration"
+                );
+            }
+        }
+
+        // The negative half is explicit, so a prompt that always carries the
+        // shell rule cannot pass by accident.
+        let mut no_shell = bare();
+        no_shell.workspace.agent.bash_enabled = false;
+        let built = build(&no_shell);
+        assert!(
+            !built
+                .agent
+                .config()
+                .system_prompt
+                .contains(agent::prompts::TOOL_BASH),
+            "no bash tool, no bash rule"
+        );
+        assert!(
+            built
+                .agent
+                .config()
+                .system_prompt
+                .contains(crate::prompts::READ_FILE),
+            "the file rule stays"
+        );
+    }
+
+    /// The shipped personas are the pinned constants, and their bullets survive
+    /// an edit: a deleted line is a changed persona, not a cosmetic diff.
+    #[test]
+    fn the_shipped_personas_are_pinned_and_keep_their_bullets() {
+        let roster: [(&str, &str, &[&str]); 3] = [
+            (
+                "ptc",
+                crate::prompts::PTC_PERSONA,
+                &[
+                    "Plan the batches first",
+                    "Never serialize what can be batched",
+                    "Let the tools do the work",
+                    "Hold the same engineering discipline",
+                ],
+            ),
+            (
+                "creator",
+                crate::prompts::CREATOR_PERSONA,
+                &[
+                    "Read before writing",
+                    "Ship the smallest package",
+                    "Follow the shipped formats exactly",
+                    "Keep every change reversible",
+                    "Prove it loads",
+                ],
+            ),
+            (
+                "read-only",
+                crate::prompts::READ_ONLY_PERSONA,
+                &[
+                    "Ground every claim in something you read",
+                    "Search the web when the workspace cannot answer",
+                    "Verify by reading more",
+                    "End concrete",
+                ],
+            ),
+        ];
+        for (id, persona, bullets) in roster {
+            let preset = crate::settings::global::built_in_preset(id).expect("a shipped preset");
+            assert_eq!(
+                preset.system_prompt.as_deref(),
+                Some(persona),
+                "{id} uses the pinned persona"
+            );
+            for bullet in bullets {
+                assert!(persona.contains(bullet), "{id} keeps: {bullet}");
+            }
+        }
     }
 
     /// Standard and PTC ALLOW NETWORK AND WEB SEARCH BY DEFAULT. Proved through
@@ -3115,7 +3531,7 @@ mod tests {
             settings.workspace.agent.web_tools_enabled = true;
             let built = build(&settings);
             assert!(
-                built.agent.config().web_search,
+                tool_names(&built).iter().any(|name| name == "web_search"),
                 "{id} offers web search by default"
             );
             // Network reach: no `egress` field, so the preset inherits the
@@ -3451,7 +3867,7 @@ mod tests {
         settings.workspace.agent.web_tools_enabled = false;
         let built = build(&settings);
         assert!(
-            built.agent.config().web_search,
+            tool_names(&built).iter().any(|name| name == "web_search"),
             "Standard's own grant survives the workspace switch"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -4994,9 +5410,12 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             vec!["read_file".to_string()],
             "the tool allowlist wins"
         );
-        assert_eq!(
-            built.agent.config().system_prompt,
-            "You are terse.".to_string(),
+        assert!(
+            built
+                .agent
+                .config()
+                .system_prompt
+                .contains("You are terse."),
             "the preset persona reaches the model"
         );
         assert_eq!(
@@ -5041,9 +5460,12 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             preset: Some("scoped".to_string()),
         };
         let built = build_agent(&settings, &Vault::disabled(), &session_choice, &mcp);
-        assert_eq!(
-            built.agent.config().system_prompt,
-            "You are terse.".to_string(),
+        assert!(
+            built
+                .agent
+                .config()
+                .system_prompt
+                .contains("You are terse."),
             "a session's preset also carries the persona"
         );
         let mut session_tools: Vec<String> = built
@@ -5150,9 +5572,13 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             !decide(&built, Action::Write, &root.join(".git/config")),
             "docs must not write Git internals"
         );
-        assert_eq!(
-            built.agent.config().system_prompt,
-            "You edit documentation only. Preserve frontmatter and code fences, and do not change code or configuration."
+        assert!(
+            built
+                .agent
+                .config()
+                .system_prompt
+                .contains("You edit documentation only. Preserve frontmatter and code fences, and do not change code or configuration."),
+            "the workspace persona leads the composed prompt"
         );
 
         // The session may be Full access; read-only still caps it at read-only
@@ -5179,9 +5605,15 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             !decide(&built, Action::Write, &root.join("docs/guide.md")),
             "a Full-access session cannot write through read-only"
         );
+        // Search is LOCAL access now: read-only denies egress and keeps no
+        // search tool, which is the honest reading of its own deny-all.
         assert!(
-            built.agent.config().web_search,
-            "read-only allows web search"
+            !tool_names(&built).iter().any(|name| name == "web_search"),
+            "read-only offers no local search tool"
+        );
+        assert!(
+            !built.agent.config().web_search,
+            "and the hosted object stays withdrawn"
         );
 
         // A read-only ceiling is a Rego source even when the preset declares no
@@ -5209,13 +5641,16 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             built.agent.config().parallel_tool_calls,
             "PTC enables parallel calls"
         );
-        assert!(built.agent.config().web_search, "PTC keeps web search");
+        assert!(
+            tool_names(&built).iter().any(|name| name == "web_search"),
+            "PTC keeps web search"
+        );
         assert!(
             built
                 .agent
                 .config()
                 .system_prompt
-                .contains("programmatic tool calling"),
+                .contains(crate::prompts::PTC_PERSONA),
             "PTC carries its batch-call persona"
         );
 
@@ -5223,7 +5658,11 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         settings.global.default_preset = "creator".to_string();
         let built = build(&settings);
         assert!(
-            built.agent.config().system_prompt.contains("extend bsh"),
+            built
+                .agent
+                .config()
+                .system_prompt
+                .contains(crate::prompts::CREATOR_PERSONA),
             "Creator carries its extension-authoring persona"
         );
 
@@ -5287,6 +5726,152 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             egress.refusal_for(&choice),
             Some("composer.presetPolicyUntrusted")
         );
+    }
+
+    /// The master switch removes EVERY preset contribution from the built turn:
+    /// no preset module is compiled, the effective permission is the session's
+    /// own mode, the deny the preset added stops denying, and a bundle only the
+    /// preset withheld comes back. The policy DATA says why, and turning the
+    /// switch back on restores the same preset with the same modules and facts.
+    #[test]
+    fn presets_off_builds_no_preset_contribution_and_the_switch_back_restores_it() {
+        use agent::policy::{Action, PolicyInput, PolicyOrigin, Target};
+
+        let root = scratch("presets-off");
+        std::fs::create_dir_all(root.join("src")).expect("src");
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").expect("main");
+        std::fs::write(root.join(".env"), "SECRET=1\n").expect("env");
+
+        let mut settings = rooted(&root);
+        settings.workspace.agent.permission = WORKSPACE_WRITE.to_string();
+        // A preset that narrows on every axis the build reads.
+        settings.global.presets.insert(
+            "guarded".to_string(),
+            Preset {
+                name: Some("guarded".to_string()),
+                permission: Some(READ_ONLY.to_string()),
+                read: Some(vec![".".to_string()]),
+                write: Some(Vec::new()),
+                deny: vec![".env".to_string()],
+                egress: Some(Vec::new()),
+                web_search: Some(false),
+                plugins: vec!["files".to_string()],
+                tools: Some(vec!["read_file".to_string(), "list_dir".to_string()]),
+                // The generated preset-permission module is the one this probe
+                // wants, so the declaration does NOT name builtin:read-only
+                // (naming it would replace the generated module).
+                builtin_policy: vec![
+                    "deny-secrets".to_string(),
+                    "no-shell".to_string(),
+                    "no-egress".to_string(),
+                ],
+                ..Preset::default()
+            },
+        );
+        settings.global.default_preset = "guarded".to_string();
+        let choice = SessionChoice::default();
+        let read_env = |built: &BuiltAgent| {
+            built
+                .policy
+                .check(&PolicyInput::new(
+                    "probe",
+                    Action::Read,
+                    Target::path(root.join(".env")),
+                ))
+                .is_allowed()
+        };
+
+        let on = build_for(&settings, &choice);
+        assert_eq!(on.policy.data().preset, "guarded");
+        assert!(!on.policy.data().presets_disabled);
+        let on_modules: Vec<String> = on.policy.modules().into_iter().map(|m| m.id).collect();
+        for id in [
+            "builtin:preset-scope",
+            "builtin:preset-egress",
+            "builtin:preset-permission",
+            "builtin:deny-secrets",
+            "builtin:no-shell",
+            "builtin:no-egress",
+        ] {
+            assert!(
+                on_modules.iter().any(|module| module == id),
+                "the premise: {id} is compiled while presets apply: {on_modules:?}"
+            );
+        }
+        assert_eq!(on.policy.data().permission, READ_ONLY);
+        assert!(
+            !tool_names(&on).iter().any(|name| name == "bash"),
+            "the premise: the preset withholds the shell bundle"
+        );
+        assert!(!read_env(&on), "the premise: the preset denies .env");
+
+        // OFF: the floor only. Every id and every origin is asserted, so a
+        // preset module cannot hide behind a name this test did not list.
+        settings.global.general.presets_enabled = Some(false);
+        let off = build_for(&settings, &choice);
+        assert_eq!(off.policy.data().preset, "");
+        assert!(
+            off.policy.data().presets_disabled,
+            "the audit records WHY no preset applied"
+        );
+        let modules = off.policy.modules();
+        assert_eq!(
+            modules.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["builtin:baseline", "builtin:session-permission"],
+            "no preset-contributed module is compiled"
+        );
+        assert!(
+            modules
+                .iter()
+                .all(|module| module.origin == PolicyOrigin::Builtin),
+            "and no non-builtin source was added: {modules:?}"
+        );
+        assert_eq!(
+            off.policy.data().permission,
+            WORKSPACE_WRITE,
+            "the effective permission is the session's own mode"
+        );
+        assert!(
+            !off.policy.data().preset_read_restricted
+                && !off.policy.data().preset_write_restricted
+                && off.policy.data().preset_deny_roots.is_empty()
+                && off.policy.data().preset_deny_globs.is_empty(),
+            "no read/write/deny scope applies"
+        );
+        assert!(
+            !off.policy.data().preset_egress_restricted,
+            "no preset egress intersection applies"
+        );
+        assert!(
+            tool_names(&off).iter().any(|name| name == "bash"),
+            "a bundle only the preset switched away comes back"
+        );
+        assert!(
+            tool_names(&off).iter().any(|name| name == "write_file"),
+            "a tool only the preset's allowlist removed comes back"
+        );
+        assert!(read_env(&off), "the deny the preset added no longer denies");
+
+        // ON again: the same preset, the same modules, the same facts.
+        settings.global.general.presets_enabled = None;
+        let back = build_for(&settings, &choice);
+        assert_eq!(back.policy.data().preset, "guarded");
+        assert!(!back.policy.data().presets_disabled);
+        assert_eq!(
+            back.policy
+                .modules()
+                .into_iter()
+                .map(|m| m.id)
+                .collect::<Vec<_>>(),
+            on_modules,
+            "the previous preset's modules are back"
+        );
+        assert_eq!(back.policy.data().permission, READ_ONLY);
+        assert!(
+            !tool_names(&back).iter().any(|name| name == "bash"),
+            "and its bundle selection is back"
+        );
+        assert!(!read_env(&back), "and its deny list is back");
     }
 
     /// The parent turn gets the subagent tool; an ordinary build (the one the
@@ -6276,6 +6861,355 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The SANDBOX master switch, both directions, proved on the filesystem.
+    ///
+    /// Off: a command that assembles its target in a variable writes OUTSIDE the
+    /// workspace, because heel is not applied - and the result names the SETTINGS
+    /// switch, not a preset's arm and not the permission's release. On: the SAME
+    /// command is refused by heel and leaves no marker.
+    #[test]
+    fn the_sandbox_switch_off_releases_the_shell_and_names_itself() {
+        let root = scratch("sandbox-switch-shell");
+        let outside_dir = scratch("sandbox-switch-shell-out");
+        let outside = outside_dir.join(format!("escaped-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&outside);
+        let command = format!("T=\"{}\"; printf escaped > \"$T\"", outside.display());
+
+        // ON: the premise, and the confinement the switch takes away.
+        let mut settings = rooted(&root);
+        let resolved = settings.effective();
+        assert!(
+            resolved.sandbox.heel,
+            "the premise: workspace-write confines"
+        );
+        assert!(!resolved.sandbox.off_by_settings);
+        let built = build(&settings);
+        let result = bash_result(&built, &command);
+        assert_eq!(result["sandbox"], serde_json::json!("heel"), "{result}");
+        assert!(
+            !result["success"].as_bool().unwrap_or(true),
+            "heel refused the outside write: {result}"
+        );
+        assert!(!outside.exists(), "the sandbox let the write escape");
+
+        // OFF: the same tree, one field.
+        settings.global.general.sandbox_enabled = Some(false);
+        let resolved = settings.effective();
+        assert!(
+            !resolved.sandbox.heel,
+            "heel is not applied while the switch is off"
+        );
+        assert!(resolved.sandbox.off_by_settings);
+        assert!(
+            resolved.sandbox.refusal.is_none(),
+            "the switch refuses no declaration"
+        );
+        assert_eq!(
+            crate::settings::resolve::sandbox_off_reason(&resolved.sandbox),
+            Some(agent::tools::bash::SANDBOX_SETTINGS_OFF_REASON)
+        );
+        let built = build(&settings);
+        let result = bash_result(&built, &command);
+        assert_eq!(result["sandbox"], serde_json::json!("none"), "{result}");
+        assert_eq!(
+            result["sandbox_reason"],
+            serde_json::json!(agent::tools::bash::SANDBOX_SETTINGS_OFF_REASON),
+            "the result names the SETTINGS switch, not the preset or the release: {result}"
+        );
+        assert!(
+            result["success"].as_bool().unwrap_or(false),
+            "an unsandboxed command reached its outside target: {result}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).expect("the outside file"),
+            "escaped"
+        );
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The master switch overrides EVERY preset's sandbox arm: the four shipped
+    /// presets and a custom `heel` one, each resolved heel=false with
+    /// the settings reason while off, and its declared arm again while on.
+    ///
+    /// The preset keeps applying everywhere else - it is still the authority, its
+    /// bundles still mount and its ceiling still caps - which is what keeps this
+    /// switch from being a second "presets off".
+    #[test]
+    fn the_sandbox_switch_overrides_every_preset_arm() {
+        let root = scratch("sandbox-switch-presets");
+        let mut settings = rooted(&root);
+        settings.global.presets.insert(
+            "heel-probe".to_string(),
+            Preset {
+                permission: Some(FULL_ACCESS.to_string()),
+                sandbox: Some(crate::settings::global::SandboxChoice::Heel),
+                plugins: vec!["shell".to_string(), "files".to_string()],
+                ..Preset::default()
+            },
+        );
+        for id in ["standard", "ptc", "creator", "read-only", "heel-probe"] {
+            settings.global.default_preset = id.to_string();
+            settings.global.general.sandbox_enabled = None;
+            let on = settings.effective();
+            assert_eq!(
+                on.preset_id, id,
+                "{id}: the preset is the authority while on"
+            );
+            assert!(
+                on.sandbox.heel,
+                "{id}: its declared arm confines while the switch is on"
+            );
+            assert!(!on.sandbox.off_by_settings, "{id}");
+
+            settings.global.general.sandbox_enabled = Some(false);
+            let off = settings.effective();
+            assert!(
+                !off.sandbox.heel,
+                "{id}: no preset can confine while the switch is off"
+            );
+            assert!(
+                off.sandbox.off_by_settings,
+                "{id}: the switch is what removed the confinement"
+            );
+            assert_eq!(
+                crate::settings::resolve::sandbox_off_reason(&off.sandbox),
+                Some(agent::tools::bash::SANDBOX_SETTINGS_OFF_REASON),
+                "{id}: exactly one reason, and it names the switch"
+            );
+            // The preset still applies: same authority, same bundles, same cap.
+            assert_eq!(off.preset_id, id, "{id}: the preset is NOT inert");
+            assert_eq!(
+                off.preset_plugins, on.preset_plugins,
+                "{id}: its bundles still mount"
+            );
+            assert_eq!(
+                off.permission.effective, on.permission.effective,
+                "{id}: its ceiling still caps the session"
+            );
+        }
+
+        // At FULL access the heel declaration is the only thing confining, so it
+        // is the sharpest proof that the switch overrides the ARM itself.
+        settings.workspace.agent.permission = FULL_ACCESS.to_string();
+        settings.global.default_preset = "heel-probe".to_string();
+        settings.global.general.sandbox_enabled = None;
+        assert!(
+            settings.effective().sandbox.heel,
+            "heel narrows a full-access session, which is why overriding it matters"
+        );
+        settings.global.general.sandbox_enabled = Some(false);
+        let off = settings.effective();
+        assert!(!off.sandbox.heel);
+        assert!(off.sandbox.off_by_settings);
+        assert!(
+            off.sandbox.overrides_preset(),
+            "the override is a visible fact, not an implicit one"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Full access plus the switch off changes NOTHING, so the attribution stays
+    /// the permission's release. A switch that claimed the release would make the
+    /// reader think a setting they did not touch had widened the turn.
+    #[test]
+    fn full_access_with_the_sandbox_off_in_settings_keeps_the_release_reason() {
+        let root = scratch("sandbox-switch-full-access");
+        let mut settings = rooted(&root);
+        settings.workspace.agent.permission = FULL_ACCESS.to_string();
+        settings.global.default_preset = "standard".to_string();
+        settings.global.general.sandbox_enabled = Some(false);
+        let resolved = settings.effective();
+        assert!(
+            !resolved.sandbox.heel,
+            "the permission had already released it"
+        );
+        assert!(
+            !resolved.sandbox.off_by_settings,
+            "no false attribution: the switch changed nothing here"
+        );
+        assert!(!resolved.sandbox.overrides_preset());
+        assert_eq!(
+            crate::settings::resolve::sandbox_off_reason(&resolved.sandbox),
+            None,
+            "the tool falls back to the release reason"
+        );
+        let built = build(&settings);
+        let result = bash_result(&built, "echo hi");
+        assert_eq!(result["sandbox"], serde_json::json!("none"), "{result}");
+        assert_eq!(
+            result["sandbox_reason"],
+            serde_json::json!(agent::tools::bash::SANDBOX_RELEASED_REASON),
+            "the release keeps its own reason: {result}"
+        );
+        assert!(
+            result["success"].as_bool().unwrap_or(false),
+            "a released command still runs: {result}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A workspace policy can see the RESOLVED sandbox state and refuse the
+    /// spawn on every unconfined arm.
+    ///
+    /// `data.sandbox_confined` is installed from the resolved `heel` answer on
+    /// every build, so it is false both when the switch is off AND when full
+    /// access releases the shell with the switch still on - the case the switch
+    /// alone would miss. This is the honest answer to "can a workspace deny an
+    /// unconfined shell": yes - the spawn question is still asked, and a denial
+    /// refuses the call before a process exists.
+    #[test]
+    fn a_workspace_policy_can_refuse_an_unconfined_shell_spawn() {
+        let root = scratch("policy-requires-sandbox");
+        std::fs::create_dir_all(root.join(".bsh")).expect(".bsh");
+        std::fs::write(
+            root.join(".bsh").join("policy.rego"),
+            r#"package policy.workspace
+
+# rule: require-sandbox
+verdict := {"allow": false, "rule": "require-sandbox", "reason": "this workspace requires the sandbox"} if {
+    not data.sandbox_confined
+    input.action == "spawn"
+} else := {"allow": true, "rule": "workspace-allow"}
+"#,
+        )
+        .expect("the workspace policy");
+
+        let mut settings = rooted(&root);
+        let on = settings.effective();
+        let policy = crate::caps::policy_for_effective(&settings, &on);
+        assert!(
+            policy.data().sandbox_enabled && policy.data().sandbox_confined,
+            "the absent switch mirrors as enabled and confined"
+        );
+        assert!(
+            check_spawn(&policy, "bash", "session", "", &root.to_string_lossy()).is_ok(),
+            "with heel applicable the spawn is allowed"
+        );
+
+        settings.global.general.sandbox_enabled = Some(false);
+        let off = settings.effective();
+        let policy = crate::caps::policy_for_effective(&settings, &off);
+        assert!(
+            !policy.data().sandbox_enabled && !policy.data().sandbox_confined,
+            "the committed switch reaches both data keys"
+        );
+        let refusal = check_spawn(&policy, "bash", "session", "", &root.to_string_lossy())
+            .expect_err("the workspace requires confinement");
+        assert!(
+            refusal.contains("requires the sandbox"),
+            "the refusal is the module's own reason: {refusal}"
+        );
+
+        // Switch ON, full access: released, and the resolved key says so while
+        // the switch alone would still read true.
+        settings.global.general.sandbox_enabled = None;
+        settings.workspace.agent.permission = FULL_ACCESS.to_string();
+        let released = settings.effective();
+        let policy = crate::caps::policy_for_effective(&settings, &released);
+        assert!(
+            policy.data().sandbox_enabled,
+            "the switch is on in this arm, so the switch key is not the answer"
+        );
+        assert!(
+            !policy.data().sandbox_confined,
+            "full access released the shell, and the resolved key follows"
+        );
+        assert!(
+            check_spawn(&policy, "bash", "session", "", &root.to_string_lossy()).is_err(),
+            "the workspace refuses the released spawn even with the switch on"
+        );
+
+        // Switch ON, full access, a preset that forces heel: confined again and
+        // allowed, so the resolved key does not over-refuse.
+        settings.global.presets.insert(
+            "heel-probe".to_string(),
+            Preset {
+                permission: Some(FULL_ACCESS.to_string()),
+                sandbox: Some(crate::settings::global::SandboxChoice::Heel),
+                plugins: vec!["shell".to_string(), "files".to_string()],
+                ..Preset::default()
+            },
+        );
+        settings.global.default_preset = "heel-probe".to_string();
+        let forced = settings.effective();
+        assert!(forced.sandbox.heel, "the premise: the preset confines");
+        let policy = crate::caps::policy_for_effective(&settings, &forced);
+        assert!(policy.data().sandbox_confined);
+        assert!(
+            check_spawn(&policy, "bash", "session", "", &root.to_string_lossy()).is_ok(),
+            "a preset-forced heel is confined, not refused: {:?}",
+            check_spawn(&policy, "bash", "session", "", &root.to_string_lossy())
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The switch is a SANDBOX switch, not a preset switch: a read-only preset
+    /// still withholds the shell and a write-scope preset still refuses an
+    /// out-of-scope path while heel is off.
+    #[test]
+    fn the_sandbox_switch_keeps_the_presets_in_force() {
+        let root = scratch("sandbox-switch-presets-apply");
+        std::fs::create_dir_all(root.join("src")).expect("src");
+        std::fs::create_dir_all(root.join("docs")).expect("docs");
+        let mut settings = rooted(&root);
+        settings.global.general.sandbox_enabled = Some(false);
+        settings.global.default_preset = "read-only".to_string();
+        let built = build(&settings);
+        assert!(
+            built
+                .agent
+                .registry()
+                .expect("registry")
+                .get("bash")
+                .is_none(),
+            "a read-only preset still withholds the shell while the sandbox is off"
+        );
+
+        settings.global.presets.insert(
+            "docs-only".to_string(),
+            Preset {
+                permission: Some(WORKSPACE_WRITE.to_string()),
+                plugins: vec!["shell".to_string(), "files".to_string()],
+                write: Some(vec!["docs/**".to_string()]),
+                ..Preset::default()
+            },
+        );
+        settings.global.default_preset = "docs-only".to_string();
+        let resolved = settings.effective();
+        assert!(resolved.sandbox.off_by_settings, "the premise: heel is off");
+        let built = build(&settings);
+        let outside = root.join("src").join("new.rs");
+        let error = built
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": outside.to_string_lossy(),
+                    "content": "fn main() {}",
+                }),
+            )
+            .expect_err("the preset write scope still refuses the path");
+        assert!(error.to_string().contains("preset-write-scope"), "{error}");
+        assert!(!outside.exists());
+        // And the same tier still allows a write inside the declared scope.
+        built
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": root.join("docs").join("note.md").to_string_lossy(),
+                    "content": "ok",
+                }),
+            )
+            .expect("the declared glob allows the write");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The inherited FULL-ACCESS arm as a user meets it: PTC declares no sandbox
     /// field, so the shell is handed `workspace_root: None` and its cwd is the
     /// app's launch directory, NOT the workspace. The policy must permit that
@@ -6960,13 +7894,15 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// `web_search = false` reaches the agent's request switch, so the hosted
-    /// tool is not offered - the same removal `egress = []` performs for the
-    /// network. The engine's own test pins the request's tool array.
+    /// A preset's own search grant decides whether the LOCAL tool is
+    /// registered, the same precedence the hosted switch used: `false` withdraws
+    /// the tool even with the workspace switch on, and `true` offers it even
+    /// with the workspace switch off.
     #[test]
-    fn web_search_false_withdraws_the_hosted_tool_at_the_build() {
+    fn a_presets_search_grant_decides_the_local_tool() {
         let root = scratch("preset-web-search");
         let mut settings = rooted(&root);
+        settings.workspace.agent.web_tools_enabled = true;
         settings.global.presets.insert(
             "no-search".to_string(),
             Preset {
@@ -6977,8 +7913,12 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         settings.global.default_preset = "no-search".to_string();
         let built = build(&settings);
         assert!(
+            !tool_names(&built).iter().any(|name| name == "web_search"),
+            "the preset's refusal withdraws the local tool"
+        );
+        assert!(
             !built.agent.config().web_search,
-            "the built agent asks the provider for no hosted web search"
+            "and no hosted object is sent either"
         );
 
         settings.global.presets.insert(
@@ -6989,9 +7929,55 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             },
         );
         settings.global.default_preset = "search".to_string();
+        settings.workspace.agent.web_tools_enabled = false;
         let built = build(&settings);
-        assert!(built.agent.config().web_search, "the positive case");
+        assert!(
+            tool_names(&built).iter().any(|name| name == "web_search"),
+            "the preset's own grant offers the tool against the switch"
+        );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The tool's requests carry the endpoint, key and budget the settings
+    /// pane writes - and the key comes from the vault, never the file.
+    #[test]
+    fn the_search_config_is_derived_from_the_settings_and_the_vault() {
+        let mut settings = bare();
+        settings.global.web_search.base_url = "https://search.internal/v1/tools".to_string();
+        settings.global.web_search.results_per_search = 25;
+        let vault = Vault::new(std::env::temp_dir().join("bsh-caps-websearch-absent"));
+        let config = web_search_config(&settings, &vault);
+        assert_eq!(config.base_url, "https://search.internal/v1/tools");
+        assert_eq!(config.results, 25);
+        assert!(config.api_key.is_empty(), "no entry means no key");
+
+        settings.global.web_search.results_per_search = 500;
+        let config = web_search_config(&settings, &vault);
+        assert_eq!(
+            config.results,
+            crate::web::MAX_RESULTS,
+            "an out-of-range budget clamps to the API's own ceiling"
+        );
+
+        // A provider whose wire is not the shipped shape: every shape field
+        // the section carries reaches the request, and an unknown method
+        // spelling falls back to POST rather than switching the wire silently.
+        settings.global.web_search.method = "GET".to_string();
+        settings.global.web_search.query_key = "q".to_string();
+        settings.global.web_search.count_key = String::new();
+        settings.global.web_search.snippet_key = "content".to_string();
+        let config = web_search_config(&settings, &vault);
+        assert_eq!(config.shape.method, crate::web::Method::Get);
+        assert_eq!(config.shape.query_key, "q");
+        assert!(config.shape.count_key.is_empty(), "empty means omitted");
+        assert_eq!(config.shape.snippet_key, "content");
+        settings.global.web_search.method = "PATCH".to_string();
+        let config = web_search_config(&settings, &vault);
+        assert_eq!(
+            config.shape.method,
+            crate::web::Method::Post,
+            "an unknown verb is the default, never a refusal the reader cannot fix"
+        );
     }
 
     /// One preset whose own policy refuses writes, in both modes: advisory

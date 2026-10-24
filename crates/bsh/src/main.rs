@@ -10,7 +10,7 @@ fn main() {
         .any(|arg| arg == "--help" || arg == "-h")
     {
         println!(
-            "bsh - BOS Harness\n\nUSAGE: bsh [--settings[=SECTION]]\n\n  --settings  open the settings dialog on launch\n  SECTION     the rail's six cells - account | vault | general | models |\n              plugins | agent-presets - or a hosted view: plugin-inventory |\n              shell | agent-loop | tools | mcp | archived-sessions |\n              presentation | workspaces | context | automation (default: account)"
+            "bsh - BOS Harness\n\nUSAGE: bsh [--settings[=SECTION]] [--browser=URL]\n\n  --settings  open the settings dialog on launch\n  SECTION     the rail's six cells - account | vault | general | models |\n              plugins | agent-presets - or a hosted view: plugin-inventory |\n              shell | agent-loop | tools | mcp | archived-sessions |\n              presentation | workspaces | context | automation (default: account)\n  --browser   open the Browser pane on URL (http or https)"
         );
         return;
     }

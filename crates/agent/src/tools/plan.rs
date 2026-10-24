@@ -126,12 +126,14 @@ impl Tool for PlanTool {
     }
 
     fn description(&self) -> String {
-        "Track a multi-step task by replacing the whole working plan. \
-         Pass `items` as the COMPLETE list of steps — each `{text, status}` \
-         with status `pending`, `in_progress`, or `completed` — because every \
-         call overwrites the previous plan. Keep at most a handful of steps, \
-         mark exactly one step `in_progress`, and pass an empty list when the \
-         plan no longer applies. The plan is shown to the user and persisted."
+        "Record and update a task list to plan multi-step work and show progress; \
+         skip it for trivial single-step tasks. Add one item per concrete step \
+         before you start. Pass `items` as the COMPLETE list of steps — each \
+         `{text, status}` with status `pending`, `in_progress`, or `completed` — \
+         because every call overwrites the previous plan. While work remains, keep \
+         exactly one item `in_progress`. Mark each item `completed` as soon as it \
+         is done, and pass an empty list when the plan no longer applies. The plan \
+         is shown to the user and persisted."
             .to_string()
     }
 
@@ -270,6 +272,21 @@ mod tests {
             .expect("run");
         let items = tool.store().items();
         assert_eq!(items[0].text.len(), MAX_TEXT);
+    }
+
+    /// The description carries the reference todo guidance, with BSH's tool
+    /// name and single-active-item rule. This is the behavioural instruction
+    /// the model reads on every request, so it is pinned exactly.
+    #[test]
+    fn the_description_carries_the_todo_guidance() {
+        let description = tool().description();
+        assert!(description.starts_with(
+            "Record and update a task list to plan multi-step work and show progress; skip it for trivial single-step tasks. Add one item per concrete step before you start."
+        ));
+        assert!(description.contains("While work remains, keep exactly one item `in_progress`"));
+        assert!(description.contains("Mark each item `completed` as soon as it is done"));
+        assert!(description.contains("Pass `items` as the COMPLETE list of steps"));
+        assert!(!description.contains("todo_write"));
     }
 
     #[test]

@@ -1667,7 +1667,9 @@ impl Shell {
         // the session-level effective preset. The row resolves the id through
         // the same catalogue the composer chip and the settings pane use, so a
         // named preset reads by its display name.
-        let preset = self.state.preset_label(&verdict.preset);
+        // The cell also says WHY it is empty: "none (presets are off)" is a
+        // different fact from a preset that was never chosen.
+        let preset = self.state.preset_cell(&verdict.preset);
         let row = |label: String, value: String| {
             div()
                 .debug_selector(|| format!("policy-row-{label}"))

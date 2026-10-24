@@ -725,6 +725,39 @@ fn gate_with(policy: PolicySet, resolver: Arc<dyn Resolver>) -> Arc<EgressGate> 
     ))
 }
 
+/// The path door: a plain-HTTP request names a path, and a path rule refuses
+/// the URL while the same host on another path still gets through. Without the
+/// second half the refusal would be indistinguishable from a host refusal.
+#[test]
+fn a_path_rule_refuses_one_url_and_allows_another_on_the_same_host() {
+    let policy = PolicySet::compile_baseline(
+        PolicyData::new("/tmp")
+            .with_egress_hosts(["origin.test"])
+            .with_egress_ports([80])
+            .with_egress_deny_paths(["/secret/"]),
+    );
+    let gate = gate_with(
+        policy,
+        Arc::new(FakeResolver::default().with("origin.test", "127.0.0.1:9".parse().expect("addr"))),
+    );
+    let denial = gate
+        .authorize_path("origin.test", 80, "/secret/notes.txt")
+        .expect_err("the path rule must refuse");
+    assert_eq!(
+        denial.decision.rule.as_deref(),
+        Some("egress-path-denied"),
+        "{denial:?}"
+    );
+    assert!(
+        gate.authorize_path("origin.test", 80, "/public/index.html")
+            .is_ok(),
+        "an allowed path on the SAME host must get through"
+    );
+    // The host check alone still passes: the path rule is the narrower door,
+    // not a second way to spell the host rule.
+    assert!(gate.authorize("origin.test", 80).is_ok());
+}
+
 #[test]
 fn a_denied_egress_never_connects() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener");

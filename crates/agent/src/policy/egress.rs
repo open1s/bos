@@ -225,6 +225,47 @@ impl EgressGate {
         Ok(allowed)
     }
 
+    /// Resolve, allow the addresses, then decide the URL PATH as well.
+    ///
+    /// This is the plain-HTTP door: a forward-proxy request carries the
+    /// absolute URI, so the transport can hand the path to the SAME policy the
+    /// address check asked. It is deliberately a separate entry point rather
+    /// than a parameter on [`EgressGate::authorize`], because a caller that does
+    /// not see a path must not pretend it enforced one.
+    ///
+    /// The address decision is the cached one; the path decision is not cached,
+    /// because it is a fact about one URL rather than about a host. A policy
+    /// with no path rule performs no second evaluation at all.
+    pub fn authorize_path(
+        &self,
+        host: &str,
+        port: u16,
+        path: &str,
+    ) -> Result<Vec<SocketAddr>, EgressDenial> {
+        let addrs = self.authorize(host, port)?;
+        if self.policy.data().egress_deny_paths.is_empty() {
+            return Ok(addrs);
+        }
+        for addr in &addrs {
+            let input = PolicyInput::new(
+                self.tool.clone(),
+                Action::Egress,
+                Target::host_path_on(host, addr.ip().to_string(), port, path),
+            )
+            .with_session(self.session.clone())
+            .with_preset(self.preset.clone());
+            let decision = self.policy.check(&input);
+            if decision.is_denied() {
+                return Err(EgressDenial {
+                    decision,
+                    host: host.to_string(),
+                    ip: Some(addr.ip().to_string()),
+                });
+            }
+        }
+        Ok(addrs)
+    }
+
     /// Open a TCP connection to the first address the policy allowed.
     ///
     /// The socket targets the validated address, not the name, so a resolver

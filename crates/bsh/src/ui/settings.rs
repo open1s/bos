@@ -24,7 +24,7 @@ use crate::theme;
 
 /// The rail, in display order; the index is the section number narrowest the
 /// state stores. Public within the crate so the command line can deep-link.
-pub(crate) const SECTIONS: [&str; 16] = [
+pub(crate) const SECTIONS: [&str; 17] = [
     "settings.account",
     "settings.vault",
     "settings.general",
@@ -41,6 +41,7 @@ pub(crate) const SECTIONS: [&str; 16] = [
     "settings.plugins",
     "settings.automation",
     "settings.policy",
+    "settings.web-search",
 ];
 
 /// The rail's cells: the reference's five, plus the Vault.
@@ -102,11 +103,17 @@ pub(crate) struct SettingsInputs {
     output_cap: Entity<InputState>,
     pub(crate) max_steps: Entity<InputState>,
     max_tokens: Entity<InputState>,
+    /// The local web-search endpoint (the Search API base).
+    pub(crate) web_search_base: Entity<InputState>,
+    /// Results one search asks for.
+    pub(crate) web_search_results: Entity<InputState>,
+    /// The API key being staged for the vault. Never read into the draft.
+    web_search_key: Entity<InputState>,
 }
 
 impl SettingsInputs {
     /// Build the fields.
-    pub(crate) fn new(window: &mut Window, cx: &mut Context<Shell>) -> Self {
+    pub(crate) fn new(window: &mut Window, lang: Lang, cx: &mut Context<Shell>) -> Self {
         Self {
             system_prompt: cx.new(|cx| InputState::new(window, cx)),
             budget: cx.new(|cx| InputState::new(window, cx)),
@@ -114,6 +121,13 @@ impl SettingsInputs {
             output_cap: cx.new(|cx| InputState::new(window, cx)),
             max_steps: cx.new(|cx| InputState::new(window, cx)),
             max_tokens: cx.new(|cx| InputState::new(window, cx)),
+            web_search_base: cx.new(|cx| InputState::new(window, cx)),
+            web_search_results: cx.new(|cx| InputState::new(window, cx)),
+            web_search_key: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .masked(true)
+                    .placeholder(tr(lang, "settings.webSearchKeyPlaceholder"))
+            }),
         }
     }
 
@@ -149,6 +163,18 @@ impl SettingsInputs {
             window,
             cx,
         );
+        set(
+            &self.web_search_base,
+            settings.global.web_search.base_url.clone(),
+            window,
+            cx,
+        );
+        set(
+            &self.web_search_results,
+            settings.global.web_search.results_per_search.to_string(),
+            window,
+            cx,
+        );
     }
 
     /// Write the fields back into the draft.
@@ -175,6 +201,20 @@ impl SettingsInputs {
             settings.workspace.agent.max_tokens = None;
         } else if let Some(parsed) = parse_capacity(&tokens) {
             settings.workspace.agent.max_tokens = Some(parsed.min(u32::MAX as usize) as u32);
+        }
+        let base = self.web_search_base.read(cx).value().trim().to_string();
+        settings.global.web_search.base_url = if base.is_empty() {
+            crate::web::DEFAULT_BASE_URL.to_string()
+        } else {
+            base
+        };
+        let results = self.web_search_results.read(cx).value().trim().to_string();
+        // An empty or unparseable count keeps the stored one: a cleared field
+        // is "no opinion", not "one result", and the shipped default is what a
+        // reader who clears it expects to come back.
+        if let Ok(parsed) = results.parse::<usize>() {
+            settings.global.web_search.results_per_search =
+                parsed.clamp(1, crate::web::MAX_RESULTS);
         }
     }
 }
@@ -369,17 +409,26 @@ fn font_size_action(shell: &mut Shell, delta: i32, cx: &mut Context<Shell>) {
 ///
 /// The network clause reads the WORKSPACE floor only: this row picks a default
 /// for future sessions, whose preset is not chosen yet, so no preset reach can
-/// be stated here without inventing one.
+/// be stated here without inventing one. The SHELL release is not invented: it
+/// is the committed heel switch, which applies to those future sessions too. A
+/// row that claimed "writes and commands stay in this workspace" while heel is
+/// off would describe a confinement the session does not get.
 fn permission_option_text(
     lang: Lang,
     permission: &str,
+    sandbox_on: bool,
     network: &super::permission::NetworkFacts<'_>,
 ) -> String {
     let mode = super::permission::Mode::from_permission(permission);
+    let release = if sandbox_on {
+        super::permission::ShellRelease::None
+    } else {
+        super::permission::ShellRelease::Settings
+    };
     format!(
         "{} · {}",
         mode.label(lang),
-        mode.consequence(lang, false, network)
+        mode.consequence(lang, false, release, network)
     )
 }
 
@@ -405,33 +454,118 @@ pub(crate) fn widening_sentence(
     previous: &str,
     facts: &[crate::preset_catalogue::RiskFact],
 ) -> String {
-    use crate::preset_catalogue::RiskFact;
-    let separator = if lang == Lang::Zh { "；" } else { "; " };
-    let clauses: Vec<String> = facts
-        .iter()
-        .map(|fact| match fact {
-            RiskFact::FullAccess => tr(lang, "settings.presetRiskFullAccess"),
-            RiskFact::SandboxOff => tr_args(
-                lang,
-                "settings.presetRiskSandboxOff",
-                &[(
-                    "reason",
-                    agent::tools::bash::PRESET_SANDBOX_OFF_REASON.to_string(),
-                )],
-            ),
-            RiskFact::EgressDeniedAll => tr(lang, "settings.presetRiskEgressDenied"),
-            RiskFact::AdvisoryPolicy => tr(lang, "settings.presetRiskAdvisory"),
-        })
-        .collect();
+    let clauses: Vec<String> = facts.iter().map(|fact| fact_clause(lang, *fact)).collect();
     tr_args(
         lang,
         "settings.presetRiskDescription",
         &[
             ("name", name.to_string()),
             ("previous", previous.to_string()),
-            ("facts", clauses.join(separator)),
+            ("facts", clauses.join(clause_separator(lang))),
         ],
     )
+}
+
+/// The sentence the master preset switch draws before it turns everything off.
+///
+/// Its facts are the restrictions the preset IN FORCE contributes, so the
+/// reader confirms a concrete loss rather than a level number: the ceiling that
+/// capped the mode, the paths, the forced sandbox, the network reach, the tool
+/// set and the policy modules.
+pub(crate) fn presets_off_sentence(
+    lang: Lang,
+    facts: &[crate::preset_catalogue::RiskFact],
+) -> String {
+    let clauses: Vec<String> = facts.iter().map(|fact| fact_clause(lang, *fact)).collect();
+    tr_args(
+        lang,
+        "settings.presetsOffDescription",
+        &[("facts", clauses.join(clause_separator(lang)))],
+    )
+}
+
+/// The sentence the master SANDBOX switch draws before it turns heel off.
+///
+/// Its facts are the two losses every turn would take - the kernel filesystem
+/// confinement and the egress proxy with its allowlist - plus, when a preset
+/// declares a heel sandbox, that those declarations are overridden. Nothing here
+/// mentions a preset being switched off, because presets keep applying.
+pub(crate) fn sandbox_off_sentence(
+    lang: Lang,
+    facts: &[crate::preset_catalogue::RiskFact],
+) -> String {
+    let clauses: Vec<String> = facts.iter().map(|fact| fact_clause(lang, *fact)).collect();
+    tr_args(
+        lang,
+        "settings.sandboxOffDescription",
+        &[("facts", clauses.join(clause_separator(lang)))],
+    )
+}
+
+/// The Use-in-this-chat label, and whether that action is available at all.
+///
+/// The reasons are ordered by what the reader can act on first: the master
+/// switch (nothing below it applies while it is off), then a sandbox the guard
+/// refused, then an untrusted required policy, then the two normal states.
+pub(crate) fn preset_use_action(
+    lang: Lang,
+    in_chat: bool,
+    blocked: bool,
+    sandbox_widens: bool,
+    presets_on: bool,
+) -> (String, bool) {
+    if !presets_on {
+        return (tr(lang, "settings.presetsOffAction"), false);
+    }
+    if sandbox_widens {
+        return (tr(lang, "settings.presetSandboxWidensAction"), false);
+    }
+    if blocked {
+        return (tr(lang, "settings.presetTrustToUse"), false);
+    }
+    if in_chat {
+        return (tr(lang, "settings.presetInUse"), false);
+    }
+    (tr(lang, "settings.presetUseInChat"), true)
+}
+
+/// How the clauses of one confirmation sentence are joined.
+fn clause_separator(lang: Lang) -> &'static str {
+    if lang == Lang::Zh {
+        "；"
+    } else {
+        "; "
+    }
+}
+
+/// One consequence, in the reader's words.
+///
+/// Shared by the preset-widening sentence and the presets-off sentence so the
+/// same fact can never be described two ways.
+fn fact_clause(lang: Lang, fact: crate::preset_catalogue::RiskFact) -> String {
+    use crate::preset_catalogue::RiskFact;
+    match fact {
+        RiskFact::FullAccess => tr(lang, "settings.presetRiskFullAccess"),
+        RiskFact::SandboxOff => tr_args(
+            lang,
+            "settings.presetRiskSandboxOff",
+            &[(
+                "reason",
+                agent::tools::bash::PRESET_SANDBOX_OFF_REASON.to_string(),
+            )],
+        ),
+        RiskFact::EgressDeniedAll => tr(lang, "settings.presetRiskEgressDenied"),
+        RiskFact::AdvisoryPolicy => tr(lang, "settings.presetRiskAdvisory"),
+        RiskFact::LosesPermissionCeiling => tr(lang, "settings.presetsOffPermissionCeiling"),
+        RiskFact::LosesPathScope => tr(lang, "settings.presetsOffPathScope"),
+        RiskFact::LosesSandbox => tr(lang, "settings.presetsOffSandbox"),
+        RiskFact::LosesEgress => tr(lang, "settings.presetsOffEgress"),
+        RiskFact::LosesToolSet => tr(lang, "settings.presetsOffToolSet"),
+        RiskFact::LosesPolicyModules => tr(lang, "settings.presetsOffPolicyModules"),
+        RiskFact::SandboxOffFilesystem => tr(lang, "settings.sandboxOffFilesystem"),
+        RiskFact::SandboxOffEgress => tr(lang, "settings.sandboxOffEgress"),
+        RiskFact::SandboxOffOverridesPresets => tr(lang, "settings.sandboxOffOverridesPresets"),
+    }
 }
 
 /// Write one of the General pane's string preferences.
@@ -463,12 +597,41 @@ fn developer_tools_action(shell: &mut Shell, on: bool, cx: &mut Context<Shell>) 
     cx.notify();
 }
 
-/// Offer or withdraw the hosted web-search tool.
+/// Flip the master preset switch from the Agent presets pane.
 ///
-/// Nothing local executes it - the provider runs the search - so the switch
-/// writes the setting and the engine decides whether the protocol can carry it.
+/// Turning presets OFF is a widening, so it takes the same parked confirmation
+/// a wider preset change takes, with the lost facts named; turning them back ON
+/// only restores restrictions, so it applies at once.
+fn presets_enabled_action(shell: &mut Shell, on: bool, cx: &mut Context<Shell>) {
+    shell.request_presets_enabled(on, cx);
+}
+
+/// Flip the master SANDBOX switch from the Agent presets pane.
+///
+/// Turning the sandbox OFF is a widening - two losses and, when a preset asks
+/// for heel, its confinement - so it takes the same parked confirmation a wider
+/// preset change takes. Turning it back ON only restores confinement, so it
+/// applies at once.
+fn sandbox_enabled_action(shell: &mut Shell, on: bool, cx: &mut Context<Shell>) {
+    shell.request_sandbox_enabled(on, cx);
+}
+
+/// Offer or withdraw the web-search tool.
+///
+/// The switch is the workspace half of the decision; the pane below carries
+/// what every search request asks, and the build registers the local tool.
 fn web_tools_action(shell: &mut Shell, on: bool, cx: &mut Context<Shell>) {
     shell.state.draft_mut().workspace.agent.web_tools_enabled = on;
+    cx.notify();
+}
+
+/// Which HTTP verb the local search request is sent with.
+///
+/// The value is stored as written ("post" | "get"); an unknown spelling reads
+/// and saves as POST, which is what the tool itself falls back to, so the pane
+/// and the request cannot disagree about what the field means.
+fn web_search_method_action(shell: &mut Shell, key: &str, cx: &mut Context<Shell>) {
+    shell.state.draft_mut().global.web_search.method = key.to_string();
     cx.notify();
 }
 
@@ -509,6 +672,16 @@ fn composer_enter_action(shell: &mut Shell, key: &str, cx: &mut Context<Shell>) 
     preference_action(
         shell,
         |settings| &mut settings.global.general.composer_enter,
+        key,
+        cx,
+    );
+}
+
+/// What the rendered Browser may put on the wire: proxied or strict.
+fn browser_network_action(shell: &mut Shell, key: &str, cx: &mut Context<Shell>) {
+    preference_action(
+        shell,
+        |settings| &mut settings.global.general.browser_network_mode,
         key,
         cx,
     );
@@ -560,6 +733,10 @@ enum Field {
     Budget,
     /// The cap on completion tokens per turn.
     MaxTokens,
+    /// The local web-search endpoint.
+    WebSearchBase,
+    /// Results one search asks for.
+    WebSearchResults,
 }
 
 impl Field {
@@ -577,6 +754,8 @@ impl Field {
                 .max_tokens
                 .map(|tokens| tokens.to_string())
                 .unwrap_or_default(),
+            Field::WebSearchBase => default.global.web_search.base_url.clone(),
+            Field::WebSearchResults => default.global.web_search.results_per_search.to_string(),
         }
     }
 }
@@ -817,6 +996,10 @@ struct PresetCardData {
     permission: Option<String>,
     sandbox: Option<crate::settings::global::SandboxChoice>,
     sandbox_widens: bool,
+    /// Whether the settings master switch applies heel. Off does not switch
+    /// the PRESET off - every other field still applies - but it overrides the
+    /// card heel arm declared in the preset, and the card says so.
+    sandbox_on: bool,
     egress: Option<Vec<String>>,
     parallel_tool_calls: Option<bool>,
     mcp_tools: Option<Vec<String>>,
@@ -833,6 +1016,10 @@ struct PresetCardData {
     is_default: bool,
     in_chat: bool,
     has_chat: bool,
+    /// Whether the master switch lets presets apply. When it is off the card is
+    /// dimmed and its selection actions are refused with a reason, while its
+    /// details, trust and editor stay usable (the FILES still load).
+    presets_on: bool,
     details_open: bool,
     /// Whether the card's Advanced block is open. Mode details starts with it
     /// collapsed, so the card leads with the one mode decision.
@@ -941,6 +1128,8 @@ impl Shell {
             12 => self.section_agent_presets(cx),
             13 => self.section_builtin_plugins(cx),
             14 => self.section_automation(cx),
+            15 => self.section_policy(cx),
+            16 => self.section_web_search(cx),
             _ => self.section_policy(cx),
         };
 
@@ -1841,6 +2030,9 @@ impl Shell {
         // the row laid out reporting the effective mode; a kit Button carries no
         // debug selector of its own.
         let network = super::permission::NetworkFacts::for_workspace(&self.state);
+        // The COMMITTED heel switch is a fact about every future session, so
+        // the permission options must state the release it resolves to.
+        let sandbox_on = self.state.settings.global.general.sandbox_active();
         let permission_row = div()
             .debug_selector(move || permission_selector)
             .child(self.select_row_with_value(
@@ -1852,15 +2044,30 @@ impl Shell {
                     options: vec![
                         (
                             crate::caps::READ_ONLY,
-                            permission_option_text(lang, crate::caps::READ_ONLY, &network),
+                            permission_option_text(
+                                lang,
+                                crate::caps::READ_ONLY,
+                                sandbox_on,
+                                &network,
+                            ),
                         ),
                         (
                             crate::caps::WORKSPACE_WRITE,
-                            permission_option_text(lang, crate::caps::WORKSPACE_WRITE, &network),
+                            permission_option_text(
+                                lang,
+                                crate::caps::WORKSPACE_WRITE,
+                                sandbox_on,
+                                &network,
+                            ),
                         ),
                         (
                             crate::caps::FULL_ACCESS,
-                            permission_option_text(lang, crate::caps::FULL_ACCESS, &network),
+                            permission_option_text(
+                                lang,
+                                crate::caps::FULL_ACCESS,
+                                sandbox_on,
+                                &network,
+                            ),
                         ),
                     ],
                     action: permission_action,
@@ -1871,6 +2078,12 @@ impl Shell {
             .into_any_element();
         let mut rows = vec![
             permission_row,
+            // The one sandbox switch lives at the top of Agent presets, where
+            // a reader looks for "what confines every chat". General keeps a
+            // pointer that reports the COMMITTED value and opens that pane; a
+            // second switch here would be a second mirror of one committed
+            // fact, and the two could disagree.
+            self.sandbox_pointer_row(self.state.settings.global.general.sandbox_active(), cx),
             self.select_row(
                 SelectRow {
                     id: "set-lang",
@@ -2535,17 +2748,317 @@ impl Shell {
         cx.notify();
     }
 
+    /// Flip the master preset switch, opening the widening gate when it turns
+    /// presets OFF.
+    ///
+    /// Nothing is written while the dialog is open: [`Self::set_presets_enabled`]
+    /// runs on Confirm only, so Cancel leaves every preset enabled.
+    pub(crate) fn request_presets_enabled(&mut self, on: bool, cx: &mut Context<Self>) {
+        if !on {
+            if let Some(pending) = self.state.presets_off_pending() {
+                self.state.pending_preset = Some(pending);
+                cx.notify();
+                return;
+            }
+        }
+        self.set_presets_enabled(on, cx);
+    }
+
+    /// Commit the master preset switch and report a refused write.
+    ///
+    /// The write goes through [`AppState::commit_presets_enabled`], which saves
+    /// exactly this field and rebakes the live policy, so the cards, the chip,
+    /// the terminal and the audit change in the same frame. Turning presets
+    /// back on names the preset that returned, because a restore that silently
+    /// landed somewhere else would be a second fallback.
+    pub(crate) fn set_presets_enabled(&mut self, on: bool, cx: &mut Context<Self>) {
+        let lang = self.state.lang;
+        match self.state.commit_presets_enabled(on) {
+            Ok(()) => {
+                if on {
+                    let restored = self.state.effective().preset_id;
+                    if !restored.is_empty() {
+                        let mut text = tr_args(
+                            lang,
+                            "settings.presetsRestored",
+                            &[("name", self.state.preset_label(&restored))],
+                        );
+                        // A turn that is already streaming was built with NO
+                        // preset, so the restored one reaches only the next.
+                        if let Some(id) = self.state.active_id.clone() {
+                            if self.state.is_streaming(&id) {
+                                text = format!("{text} {}", tr(lang, "settings.presetsNextTurn"));
+                            }
+                        }
+                        self.state.notice(text);
+                    }
+                }
+            }
+            Err(error) => {
+                self.state.notice(format!(
+                    "{} {error}",
+                    tr(lang, "settings.presetsSaveFailed")
+                ));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Flip the master sandbox switch, opening the widening gate when it turns
+    /// heel OFF.
+    ///
+    /// Nothing is written while the dialog is open: [`Self::set_sandbox_enabled`]
+    /// runs on Confirm only, so Cancel leaves the sandbox on. A switch that
+    /// costs nothing - full access with no heel preset, where the permission
+    /// already released the shell - has no facts to confirm and flips at once,
+    /// which is what keeps the gate about a real loss.
+    pub(crate) fn request_sandbox_enabled(&mut self, on: bool, cx: &mut Context<Self>) {
+        if !on {
+            if let Some(pending) = self.state.sandbox_off_pending() {
+                self.state.pending_preset = Some(pending);
+                cx.notify();
+                return;
+            }
+        }
+        self.set_sandbox_enabled(on, cx);
+    }
+
+    /// Commit the master sandbox switch and report a refused write.
+    ///
+    /// The write goes through [`AppState::commit_sandbox_enabled`], which saves
+    /// exactly this field and rebakes the live policy, so the preset cards, the
+    /// composer and the terminal change in the same frame. A turn that is
+    /// already streaming keeps the spec it was spawned with, and the notice says
+    /// so rather than letting "off" imply the running turn was released.
+    pub(crate) fn set_sandbox_enabled(&mut self, on: bool, cx: &mut Context<Self>) {
+        let lang = self.state.lang;
+        match self.state.commit_sandbox_enabled(on) {
+            Ok(()) => {
+                let mut text = tr(
+                    lang,
+                    if on {
+                        "settings.sandboxOnApplied"
+                    } else {
+                        "settings.sandboxOffApplied"
+                    },
+                );
+                if let Some(id) = self.state.active_id.clone() {
+                    if self.state.is_streaming(&id) {
+                        text = format!("{text} {}", tr(lang, "settings.presetsNextTurn"));
+                    }
+                }
+                self.state.notice(text);
+            }
+            Err(error) => {
+                self.state.notice(format!(
+                    "{} {error}",
+                    tr(lang, "settings.sandboxSaveFailed")
+                ));
+            }
+        }
+        cx.notify();
+    }
+
+    /// The heel master switch, at the TOP of the Agent presets pane.
+    ///
+    /// One line: what the switch does, what it means in the state it is in, and
+    /// the switch itself. It sits on a tinted, bordered band while the preset
+    /// master below it is a plain row, because the two govern different facts:
+    /// this one confines the shell and terminal for EVERY preset, and the one
+    /// below decides whether presets apply at all. The consequence names both
+    /// losses while it is off and says presets still apply, so the cost is on
+    /// the row rather than only inside the confirmation.
+    fn sandbox_master_row(&self, on: bool, cx: &mut Context<Shell>) -> AnyElement {
+        let lang = self.state.lang;
+        let consequence = if on {
+            tr(lang, "settings.sandboxEnabledConsequence")
+        } else {
+            tr(lang, "settings.sandboxOffConsequence")
+        };
+        div()
+            .debug_selector(|| "sandbox-master-row".to_string())
+            // The pane's height is load-bearing: this header sits above the
+            // whole roster, and the custom section's edit control must stay in
+            // the harness viewport. The tinted band is the distinction, not
+            // extra padding.
+            .mb(px(2.0))
+            .px(px(12.0))
+            .py(px(3.0))
+            .rounded(px(10.0))
+            .border_1()
+            .border_color(rgb(theme::border_soft()))
+            .bg(rgb(theme::new_session_fill()))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(10.0))
+            .child(
+                div()
+                    .debug_selector(|| "sandbox-master-text".to_string())
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        txt(
+                            tr(lang, "settings.sandboxEnabledTitle"),
+                            13.0,
+                            theme::text(),
+                        )
+                        .debug_selector(|| "sandbox-master-title".to_string())
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .flex_none(),
+                    )
+                    .child(
+                        txt(consequence, 11.0, theme::faint())
+                            .debug_selector(|| "sandbox-master-consequence".to_string())
+                            .min_w_0()
+                            .truncate(),
+                    ),
+            )
+            .child(self.switch("sandbox-enabled", on, true, sandbox_enabled_action, cx))
+            .into_any_element()
+    }
+
+    /// General's pointer to the ONE sandbox switch, which lives in Agent presets.
+    ///
+    /// The row reports the committed value and opens that pane. It is
+    /// deliberately not a second switch: two controls for one committed fact can
+    /// disagree, and the reader who looks for the heel master switch finds it
+    /// where the preset masters are.
+    fn sandbox_pointer_row(&self, on: bool, cx: &mut Context<Shell>) -> AnyElement {
+        let lang = self.state.lang;
+        let text = tr(
+            lang,
+            if on {
+                "settings.sandboxPointerOn"
+            } else {
+                "settings.sandboxPointerOff"
+            },
+        );
+        hairline_bottom(
+            div()
+                .debug_selector(|| "sandbox-pointer".to_string())
+                .id("sandbox-pointer")
+                .py(px(12.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .border_color(rgb(theme::border_soft()))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(theme::hover())))
+                .child(txt(text, 13.0, theme::muted()).flex_1().min_w_0())
+                .child(icon(IconName::ChevronRight, 12.0, theme::faint()))
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.state.settings_section = section_index("agent-presets").unwrap_or(12);
+                    cx.notify();
+                })),
+        )
+        .into_any_element()
+    }
+
+    /// The Apply presets consequence, derived from the sandbox master state.
+    ///
+    /// The sandbox is one of the things a preset can cap, so it belongs in the
+    /// sentence exactly while the heel master switch leaves preset sandbox arms
+    /// applicable. With that switch off no preset confines the shell, so a
+    /// sentence that still claimed a sandbox cap would be false.
+    pub(crate) fn presets_apply_consequence(lang: Lang, sandbox_on: bool) -> String {
+        tr(
+            lang,
+            if sandbox_on {
+                "settings.presetsEnabledConsequence"
+            } else {
+                "settings.presetsEnabledConsequenceNoSandbox"
+            },
+        )
+    }
+
+    /// The master preset switch, below the heel switch.
+    ///
+    /// One row: what the switch does, what it means right now, and the switch
+    /// itself (the same measured control every other row uses). The consequence
+    /// line changes with the state, and the "on" sentence asks the SAME sandbox
+    /// master state the switch above it writes: it names the sandbox only while
+    /// a preset can actually apply one.
+    fn presets_enabled_row(&self, on: bool, cx: &mut Context<Shell>) -> AnyElement {
+        let lang = self.state.lang;
+        let sandbox_on = self.state.settings.global.general.sandbox_active();
+        let consequence = if on {
+            Self::presets_apply_consequence(lang, sandbox_on)
+        } else {
+            tr(lang, "settings.presetsOffConsequence")
+        };
+        // The selector names the sentence's own state, so a test proves the
+        // RENDERED sentence changed with the heel switch rather than only the
+        // helper behind it.
+        let consequence_selector = if sandbox_on {
+            "presets-consequence-sandbox"
+        } else {
+            "presets-consequence-no-sandbox"
+        };
+        // ONE line, not a two-line preference row: this pane already carries
+        // more content than the dialog's height, so a taller master row would
+        // push the Custom cards' footers out of reach without a scroll.
+        hairline_bottom(
+            div()
+                .debug_selector(|| "presets-master-row".to_string())
+                .py(px(8.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(16.0))
+                .border_color(rgb(theme::border_soft()))
+                .child(
+                    div()
+                        .debug_selector(|| "presets-master-text".to_string())
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .flex_1()
+                        .min_w_0()
+                        .child(
+                            txt(
+                                tr(lang, "settings.presetsEnabledTitle"),
+                                13.0,
+                                theme::text(),
+                            )
+                            .debug_selector(|| "presets-master-title".to_string())
+                            .font_weight(FontWeight::MEDIUM)
+                            .flex_none(),
+                        )
+                        .child(
+                            txt(consequence, 11.5, theme::faint())
+                                .debug_selector(move || consequence_selector.to_string())
+                                .min_w_0()
+                                .truncate(),
+                        ),
+                )
+                .child(self.switch("presets-enabled", on, true, presets_enabled_action, cx)),
+        )
+        .into_any_element()
+    }
+
     /// Agent presets: the declarative agent a preset file names.
     ///
     /// DSH-shaped: a Built-in grid of cards and a Custom section. Each card
     /// names the mode, its description, its built-in tag and id, with Mode
-    /// details, trust and Use in this chat in the footer.
+    /// details, trust and Use in this chat in the footer. Two master switches
+    /// lead the pane: the heel switch, which confines shell and terminal for
+    /// every preset, then the preset switch, which decides whether the
+    /// declarations apply at all. Every control below still lists and edits the
+    /// declarations while the preset switch is off.
     fn section_agent_presets(
         &self,
         cx: &mut Context<Shell>,
     ) -> (&'static str, &'static str, Vec<AnyElement>) {
         let lang = self.state.lang;
         let draft = self.state.draft();
+        let presets_on = draft.global.general.presets_active();
         let active = draft.global.default_preset.clone();
         let chat = self.state.active_session_preset();
         let has_chat = self.state.active_id.is_some();
@@ -2556,16 +3069,59 @@ impl Shell {
         let session_permission = draft.workspace.agent.permission.clone();
         let workspace_reach =
             crate::preset_catalogue::workspace_reach(self.state.policy.as_deref());
-        let mut rows: Vec<AnyElement> =
-            vec![
-                txt(tr(lang, "settings.presetScopeHint"), 12.0, theme::muted())
-                    .mb(px(12.0))
-                    .into_any_element(),
-            ];
+        let sandbox_on = self.state.settings.global.general.sandbox_active();
+        let mut rows: Vec<AnyElement> = vec![
+            // The HEEL master leads: it confines the shell and terminal for
+            // every preset below, so it is the switch a reader looking for
+            // "stop the sandbox" must meet first. It is a committed setting and
+            // owns its own save, so it is read from the committed tree.
+            self.sandbox_master_row(sandbox_on, cx),
+            // The preset master follows: it decides whether anything below it
+            // applies at all, and its sentence reads the sandbox state above so
+            // it never claims a cap that is not in force.
+            self.presets_enabled_row(presets_on, cx),
+            txt(tr(lang, "settings.presetScopeHint"), 12.0, theme::muted())
+                .mb(px(10.0))
+                .into_any_element(),
+        ];
 
         // The no-preset choice is a compact row, not a mode card: it inherits
-        // rather than naming a preset.
+        // rather than naming a preset. Its hint states the ACTUAL default - a
+        // card that says "no default" beside another card wearing the default
+        // badge is a pane contradicting itself.
         let no_in_chat = chat.is_none() && has_chat;
+        // With presets off, the row still STATES the retained default but
+        // cannot change it: clearing the selection while nothing applies would
+        // make turning presets back on fall back to the built-in default, which
+        // is the restore this switch promises.
+        let default_inert = !presets_on;
+        // The default row's own Use control follows the same rule: the master
+        // switch first, then "already in this chat", then the action.
+        let default_use_label = if default_inert {
+            tr(lang, "settings.presetsOffAction")
+        } else if no_in_chat {
+            tr(lang, "settings.presetInUse")
+        } else {
+            tr(lang, "settings.presetUseInChat")
+        };
+        let default_use_enabled = !default_inert && !no_in_chat;
+        let default_named = active.trim().to_string();
+        let default_hint = if default_named.is_empty() {
+            tr(lang, "settings.presetDefaultHint").to_string()
+        } else {
+            let display = draft
+                .global
+                .preset(&default_named)
+                .and_then(|preset| preset.name.clone())
+                .unwrap_or_else(|| match default_named.as_str() {
+                    "standard" => tr(lang, "settings.presetStandard").to_string(),
+                    "ptc" => tr(lang, "settings.presetPtc").to_string(),
+                    "creator" => tr(lang, "settings.presetCreator").to_string(),
+                    "read-only" => tr(lang, "settings.presetReadOnly").to_string(),
+                    other => other.to_string(),
+                });
+            tr_args(lang, "settings.presetDefaultSet", &[("name", display)])
+        };
         rows.push(
             div()
                 .debug_selector(|| "preset-default".to_string())
@@ -2579,12 +3135,15 @@ impl Shell {
                 .items_center()
                 .justify_between()
                 .gap(px(8.0))
-                .cursor_pointer()
-                .hover(|style| style.bg(rgb(theme::hover())))
-                .on_click(cx.listener(|this, _event, _window, cx| {
-                    this.state.select_preset("");
-                    cx.notify();
-                }))
+                .when(default_inert, |row| row.opacity(0.55))
+                .when(!default_inert, |row| {
+                    row.cursor_pointer()
+                        .hover(|style| style.bg(rgb(theme::hover())))
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.state.select_preset("");
+                            cx.notify();
+                        }))
+                })
                 .child(
                     div()
                         .flex_col()
@@ -2593,11 +3152,7 @@ impl Shell {
                             txt(tr(lang, "settings.presetDefault"), 12.0, theme::text())
                                 .font_weight(FontWeight::MEDIUM),
                         )
-                        .child(txt(
-                            tr(lang, "settings.presetDefaultHint"),
-                            11.0,
-                            theme::muted(),
-                        )),
+                        .child(txt(default_hint, 11.0, theme::muted())),
                 )
                 .child(
                     div()
@@ -2606,16 +3161,8 @@ impl Shell {
                         .px(px(8.0))
                         .py(px(3.0))
                         .rounded(px(6.0))
-                        .child(txt(
-                            if no_in_chat {
-                                tr(lang, "settings.presetInUse")
-                            } else {
-                                tr(lang, "settings.presetUseInChat")
-                            },
-                            11.0,
-                            theme::muted(),
-                        ))
-                        .when(!no_in_chat, |control| {
+                        .child(txt(default_use_label, 11.0, theme::muted()))
+                        .when(default_use_enabled, |control| {
                             control
                                 .cursor_pointer()
                                 .hover(|style| style.bg(rgb(theme::hover())))
@@ -2678,6 +3225,7 @@ impl Shell {
                 permission: entry.permission,
                 sandbox: entry.sandbox,
                 sandbox_widens: draft.preset_sandbox_widens(&name),
+                sandbox_on: draft.global.general.sandbox_active(),
                 egress: entry.egress,
                 parallel_tool_calls: preset.parallel_tool_calls,
                 mcp_tools: preset.mcp_tools,
@@ -2696,6 +3244,7 @@ impl Shell {
                 is_default: name == active,
                 in_chat: chat.as_deref() == Some(name.as_str()),
                 has_chat,
+                presets_on,
                 details_open: self.preset_details.as_deref() == Some(name.as_str()),
                 advanced_open: self.preset_advanced.as_deref() == Some(name.as_str()),
                 slot: index.to_string(),
@@ -2889,8 +3438,10 @@ impl Shell {
                 );
             // Focus mode: while a buffer is open the roster yields the pane to
             // it, so the code well and its Cancel/Save are on screen without
-            // scrolling. Cancel/Save brings the roster straight back.
-            rows.truncate(1);
+            // scrolling. Both master switches stay: the sandbox one governs the
+            // editor's own declarations, and the preset one says whether they
+            // apply. Cancel/Save brings the roster straight back.
+            rows.truncate(2);
             rows.push(block.into_any_element());
         }
 
@@ -2968,6 +3519,7 @@ impl Shell {
             permission,
             sandbox,
             sandbox_widens,
+            sandbox_on,
             egress,
             parallel_tool_calls,
             mcp_tools,
@@ -2984,6 +3536,7 @@ impl Shell {
             is_default,
             in_chat,
             has_chat,
+            presets_on,
             details_open,
             advanced_open,
             slot,
@@ -3046,6 +3599,7 @@ impl Shell {
             permission.as_deref(),
         );
         let sandbox_resolution = crate::settings::resolve::SandboxResolution::resolve(
+            sandbox_on,
             sandbox,
             permission.as_deref(),
             &resolved.permission,
@@ -3082,16 +3636,23 @@ impl Shell {
             crate::preset_catalogue::ScopeReach::Entries(items) => items.join(", "),
         };
         let egress_text = resolved_egress_text(&resolved.egress, lang);
-        // The sandbox text is an ADVANCED fact now. Only the refusal - which
-        // keeps the preset unusable - stays on the card, because that is where
-        // the reader can act on it.
-        let sandbox_text = preset_sandbox_text(sandbox, sandbox_widens, lang);
+        // The sandbox text is an ADVANCED fact now, with two exceptions that
+        // stay on the card because they change what the preset actually gets:
+        // a refusal (which keeps the preset unusable) and the master switch
+        // overriding a declared heel.
+        // Asked of the RESOLUTION, not of the declaration and the switch
+        // separately: the same predicate the confirmation gate and the policy
+        // use answers whether the arm is actually being overridden today.
+        let sandbox_overridden = sandbox_resolution.overrides_preset();
+        let sandbox_text = preset_sandbox_text(sandbox, sandbox_widens, sandbox_overridden, lang);
         let sandbox_ink = if sandbox_widens {
             theme::error()
+        } else if sandbox_overridden {
+            theme::warn()
         } else {
             theme::muted()
         };
-        let sandbox_body = sandbox_widens;
+        let sandbox_body = sandbox_widens || sandbox_overridden;
         let sandbox_slot = slot.clone();
 
         let header = div()
@@ -3253,30 +3814,23 @@ impl Shell {
         if has_chat {
             let picked = id.clone();
             let use_slot = slot.clone();
-            // Two independent reasons a preset cannot be used here: an
-            // untrusted required policy, and a sandbox widening the guard
-            // refused. The sandbox reason is drawn first because it names the
-            // field the reader can fix (permission = danger-full-access).
-            let refused = blocked || sandbox_widens;
-            let label = if sandbox_widens {
-                tr(lang, "settings.presetSandboxWidensAction").to_string()
-            } else if blocked {
-                tr(lang, "settings.presetTrustToUse").to_string()
-            } else if in_chat {
-                tr(lang, "settings.presetInUse").to_string()
-            } else {
-                tr(lang, "settings.presetUseInChat").to_string()
-            };
-            let ink = if in_chat || refused {
-                theme::muted()
-            } else {
+            // Three independent reasons a preset cannot be used here: the
+            // master switch is off, an untrusted required policy, or a sandbox
+            // widening the guard refused. One helper decides the word, so the
+            // card, the composer chip and a test cannot describe the same
+            // refusal differently.
+            let (label, usable) =
+                preset_use_action(lang, in_chat, blocked, sandbox_widens, presets_on);
+            let ink = if usable {
                 theme::accent()
+            } else {
+                theme::muted()
             };
             let mut use_link = div()
                 .debug_selector(move || format!("preset-use-{use_slot}"))
                 .id(SharedString::from(format!("preset-use-{slot}")))
                 .child(txt(label, 11.0, ink));
-            if in_chat || refused {
+            if !usable {
                 use_link = use_link
                     .cursor_default()
                     .on_click(cx.listener(|_this, _event, _window, cx| cx.stop_propagation()));
@@ -3339,12 +3893,19 @@ impl Shell {
             .border_1()
             .border_color(rgb(edge))
             .when(is_default, |element| element.bg(rgb(theme::selected_row())))
-            .cursor_pointer()
-            .hover(|style| style.bg(rgb(theme::hover())))
-            .on_click(cx.listener(move |this, _event, _window, cx| {
-                this.state.select_preset(&pick_default);
-                cx.notify();
-            }))
+            // Inert, not hidden: the declaration still loads, validates and can
+            // be edited, but selecting it would promise a preset the build will
+            // not apply while the master switch is off.
+            .when(!presets_on, |element| element.opacity(0.55))
+            .when(presets_on, |element| {
+                element
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(theme::hover())))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.state.select_preset(&pick_default);
+                        cx.notify();
+                    }))
+            })
             .child(header)
             // One line of mode: the readable grade and the RESOLVED
             // consequence. It takes the one line the old description held, so
@@ -5566,6 +6127,193 @@ impl Shell {
         ("settings.tools", "settings.toolsHint", rows)
     }
 
+    /// Web search: the local tool the model calls.
+    ///
+    /// One switch (the same workspace fact the Tools pane carries), the
+    /// endpoint and budget the search asks, and the key the vault holds. The
+    /// key writes on its own press, not with the dialog's Save: it goes to the
+    /// vault, and a secret staged into a draft would be one accidental save
+    /// away from a settings file.
+    fn section_web_search(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> (&'static str, &'static str, Vec<AnyElement>) {
+        let lang = self.state.lang;
+        let web = self.state.draft().workspace.agent.web_tools_enabled;
+        let configured = self.state.vault.contains(crate::vault::WEB_SEARCH_KEY);
+        let mut rows: Vec<AnyElement> = vec![hairline_bottom(
+            div()
+                .py(px(12.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(24.0))
+                .border_color(rgb(theme::border_soft()))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .gap(px(4.0))
+                        .min_w_0()
+                        .pr(px(48.0))
+                        .child(txt(tr(lang, "settings.webToolsTitle"), 14.0, theme::text()))
+                        .child(txt(
+                            tr(lang, "settings.webSearchToggleHint"),
+                            12.0,
+                            theme::faint(),
+                        )),
+                )
+                .child(self.switch(
+                    "settings-web-search-enabled",
+                    web,
+                    true,
+                    web_tools_action,
+                    cx,
+                )),
+        )
+        .into_any_element()];
+        // The endpoint and the budget: two plain fields, with the shipped
+        // default they reset to.
+        rows.push(self.input_row(
+            "settings.webSearchBaseUrl",
+            &self.settings_inputs.web_search_base,
+            Field::WebSearchBase,
+            cx,
+        ));
+        let draft = self.state.draft();
+        let method = draft.global.web_search.method.trim().to_ascii_lowercase();
+        rows.push(self.select_row(
+            SelectRow {
+                id: "set-web-search-method",
+                title: "settings.webSearchMethod",
+                desc: Some("settings.webSearchMethodHint"),
+                current: method,
+                options: vec![
+                    ("post", String::from("POST (JSON body)")),
+                    ("get", String::from("GET (query string)")),
+                ],
+                action: web_search_method_action,
+            },
+            cx,
+        ));
+        rows.push(self.input_row(
+            "settings.webSearchResults",
+            &self.settings_inputs.web_search_results,
+            Field::WebSearchResults,
+            cx,
+        ));
+        // The key: a masked field and its own save press, with the vault's
+        // state beside them so a locked vault is explained rather than silent.
+        let key_input = self.settings_inputs.web_search_key.clone();
+        let unlocked = self.state.vault.is_unlocked();
+        let key_row = hairline_bottom(
+            div()
+                .debug_selector(|| "field-settings.webSearchKey".to_string())
+                .py(px(12.0))
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .border_color(rgb(theme::border_soft()))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(
+                            txt(tr(lang, "settings.webSearchKey"), 13.0, theme::text())
+                                .font_weight(FontWeight::MEDIUM)
+                                .flex_1()
+                                .min_w_0(),
+                        )
+                        .child(txt(
+                            tr(
+                                lang,
+                                if configured {
+                                    "settings.webSearchKeySet"
+                                } else {
+                                    "settings.webSearchKeyMissing"
+                                },
+                            ),
+                            12.0,
+                            if configured {
+                                theme::success()
+                            } else {
+                                theme::warn()
+                            },
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(hairline_all(
+                            div()
+                                .debug_selector(|| "field-web-search-key".to_string())
+                                .min_h(px(34.0))
+                                .rounded(px(12.0))
+                                .px(px(12.0))
+                                .flex()
+                                .flex_1()
+                                .min_w_0()
+                                .items_center()
+                                .bg(rgb(theme::new_session_fill()))
+                                .border_color(rgb(theme::border()))
+                                .child(
+                                    Input::new(&key_input)
+                                        .appearance(false)
+                                        .content_type(InputContentType::Password)
+                                        .mask_toggle(),
+                                ),
+                        ))
+                        .child(
+                            div()
+                                .id("web-search-key-save")
+                                .debug_selector(|| "web-search-key-save".to_string())
+                                .h(px(34.0))
+                                .px(px(14.0))
+                                .rounded(px(12.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .when(!unlocked, |button| button.opacity(0.5))
+                                .border_1()
+                                .border_color(rgb(theme::border()))
+                                .bg(rgb(theme::page()))
+                                .hover(|style| style.opacity(0.9))
+                                .child(txt(
+                                    tr(lang, "settings.webSearchKeySave"),
+                                    13.0,
+                                    theme::text(),
+                                ))
+                                .on_click(cx.listener(|this, _event, window, cx| {
+                                    this.web_search_key_save(window, cx)
+                                })),
+                        ),
+                ),
+        )
+        .into_any_element();
+        rows.push(key_row);
+        if !unlocked {
+            rows.push(self.settings_note("settings.vaultLockedHint", true));
+        }
+        rows.push(self.settings_note("settings.webSearchNotice", false));
+        if let Some(error) = self.web_search_key_error {
+            rows.insert(
+                0,
+                div()
+                    .debug_selector(|| "web-search-key-error".to_string())
+                    .child(self.market_banner(tr(lang, error)))
+                    .into_any_element(),
+            );
+        }
+        ("settings.webToolsTitle", "settings.webSearchHint", rows)
+    }
+
     /// Agent loop: the step ceiling one turn may reach.
     fn section_agent_loop(
         &self,
@@ -5640,7 +6388,8 @@ impl Shell {
         cx: &mut Context<Shell>,
     ) -> (&'static str, &'static str, Vec<AnyElement>) {
         let inputs = &self.settings_inputs;
-        let rows = vec![
+        let lang = self.state.lang;
+        let mut rows = vec![
             self.input_row(
                 "settings.shellTimeout",
                 &inputs.shell_timeout,
@@ -5654,6 +6403,27 @@ impl Shell {
                 cx,
             ),
         ];
+        // The rendered browser's transport choice lives beside the other shell
+        // limits: it is a machine preference about what may go on the wire. It
+        // reads the DRAFT like every other row in this dialog, so a pick shows
+        // at once and Save is what writes it.
+        let mode = crate::browser::NetworkMode::from_setting(
+            &self.state.draft().global.general.browser_network_mode,
+        );
+        rows.push(self.select_row(
+            SelectRow {
+                id: "set-browser-network",
+                title: "settings.browserNetwork",
+                desc: Some("settings.browserNetworkHint"),
+                current: mode.as_str().to_string(),
+                options: vec![
+                    ("proxied", tr(lang, "settings.browserNetworkProxied")),
+                    ("strict", tr(lang, "settings.browserNetworkStrict")),
+                ],
+                action: browser_network_action,
+            },
+            cx,
+        ));
         ("settings.shell", "settings.shellHint", rows)
     }
 
@@ -6168,17 +6938,52 @@ impl Shell {
         let Some(pending) = self.state.pending_preset.as_ref() else {
             return div().into_any_element();
         };
-        let title = tr(lang, "settings.presetRiskTitle");
-        let description = widening_sentence(
-            lang,
-            &self.state.preset_label(&pending.target),
-            &pending.previous,
-            &pending.facts,
-        );
-        let confirm_label = match pending.apply {
-            crate::state::PresetApply::Default => tr(lang, "settings.presetRiskDefaultConfirm"),
-            crate::state::PresetApply::Save { .. } => tr(lang, "settings.presetRiskSaveConfirm"),
-            crate::state::PresetApply::Session(_) => tr(lang, "settings.presetRiskConfirm"),
+        // One gate, three sentences: a wider preset ADDS permissions, the
+        // master PRESET switch takes every preset restriction away, and the
+        // master SANDBOX switch takes one restriction (heel) away while the
+        // presets keep applying - so the three confirmations must not share
+        // wording that would describe the wrong direction.
+        let (title, description, confirm_label) = match pending.apply {
+            crate::state::PresetApply::DisableSandbox => (
+                tr(lang, "settings.sandboxOffTitle"),
+                sandbox_off_sentence(lang, &pending.facts),
+                tr(lang, "settings.sandboxOffConfirm"),
+            ),
+            crate::state::PresetApply::DisablePresets => (
+                tr(lang, "settings.presetsOffTitle"),
+                presets_off_sentence(lang, &pending.facts),
+                tr(lang, "settings.presetsOffConfirm"),
+            ),
+            crate::state::PresetApply::Default => (
+                tr(lang, "settings.presetRiskTitle"),
+                widening_sentence(
+                    lang,
+                    &self.state.preset_label(&pending.target),
+                    &pending.previous,
+                    &pending.facts,
+                ),
+                tr(lang, "settings.presetRiskDefaultConfirm"),
+            ),
+            crate::state::PresetApply::Save { .. } => (
+                tr(lang, "settings.presetRiskTitle"),
+                widening_sentence(
+                    lang,
+                    &self.state.preset_label(&pending.target),
+                    &pending.previous,
+                    &pending.facts,
+                ),
+                tr(lang, "settings.presetRiskSaveConfirm"),
+            ),
+            crate::state::PresetApply::Session(_) => (
+                tr(lang, "settings.presetRiskTitle"),
+                widening_sentence(
+                    lang,
+                    &self.state.preset_label(&pending.target),
+                    &pending.previous,
+                    &pending.facts,
+                ),
+                tr(lang, "settings.presetRiskConfirm"),
+            ),
         };
         div()
             .debug_selector(|| String::from("preset-risk"))
@@ -7137,8 +7942,8 @@ impl Shell {
     /// The built-in settings rows, mapped onto the panes that actually exist.
     ///
     /// The reference names Subagent, Web search, Agent loop and Shell. Web
-    /// search lives in the Tools pane here (it is the hosted web-tool switch),
-    /// Agent loop and Shell have their own panes, and Subagent has no pane in
+    /// search has its own pane here (the local tool, its endpoint, key and
+    /// budget), Agent loop and Shell have theirs, and Subagent has no pane in
     /// this deployment, so that row is omitted rather than linked nowhere.
     fn builtin_setting_rows(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let lang = self.state.lang;
@@ -7148,7 +7953,7 @@ impl Shell {
                 "web-search",
                 "settings.webToolsTitle",
                 "settings.webToolsDescription",
-                "tools",
+                "web-search",
                 IconName::Globe,
                 theme::accent(),
             ),
@@ -10744,6 +11549,40 @@ impl Shell {
         cx.notify();
     }
 
+    /// Write the Web search pane's key to the vault.
+    ///
+    /// One fixed entry ([`crate::vault::WEB_SEARCH_KEY`]), written the moment
+    /// the reader presses Save rather than staged into the draft: a secret that
+    /// rode the dialog's Save would land in a settings file. An empty field is
+    /// refused with the pane it belongs to.
+    fn web_search_key_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let value = zeroize::Zeroizing::new(
+            self.settings_inputs
+                .web_search_key
+                .read(cx)
+                .value()
+                .trim()
+                .to_string(),
+        );
+        if value.is_empty() {
+            self.web_search_key_error = Some("settings.webSearchKeyRequired");
+            cx.notify();
+            return;
+        }
+        match self.state.vault.put(crate::vault::WEB_SEARCH_KEY, &value) {
+            Ok(()) => {
+                self.web_search_key_error = None;
+                self.settings_inputs
+                    .web_search_key
+                    .update(cx, |state, cx| state.set_value("", window, cx));
+                self.state
+                    .notice(tr(self.state.lang, "settings.webSearchKeySaved").to_string());
+            }
+            Err(error) => self.web_search_key_error = Some(error.locale_key()),
+        }
+        cx.notify();
+    }
+
     /// Copy one entry's value to the clipboard.
     ///
     /// get, not resolve, so a locked or absent entry says why instead of the
@@ -10969,9 +11808,10 @@ impl Shell {
 /// The entries are classified through [`EgressRuleSet`], the same parser the
 /// workspace file and the policy read through, so a hostname entry is shown as a
 /// hostname and a bare port as a port rather than being re-summarised by hand.
-/// Hosted `web search` is a SEPARATE axis - the provider runs it, not this host -
-/// and is named only when the preset grants it, so a reader does not read
-/// \"Deny all\" as \"no search either\".
+/// Web search is named only when the preset grants it, so a reader does not
+/// read \"Deny all\" as \"no search either\" - but since the tool became local,
+/// a grant beside a deny-all would be a lie, so the shipped read-only preset
+/// declines it explicitly.
 fn preset_network_text(
     egress: &Option<Vec<String>>,
     web_search: Option<bool>,
@@ -11048,19 +11888,29 @@ fn resolved_egress_text(reach: &crate::preset_catalogue::EgressReach, lang: Lang
     }
 }
 
-/// The preset card's sandbox line, in the language the pane draws.
+/// The preset card sandbox line, in the language the pane draws.
 ///
-/// The refused state is separate from the three declarations: a `none` that the
-/// guard rejects is not "off" (the shell stays confined) and not "inherit" (the
-/// preset did ask for off), so it gets its own sentence naming the rule.
-fn preset_sandbox_text(
+/// Three states are separate from the plain declarations: a `none` the guard
+/// rejects is not "off" (the shell stays confined) and not "inherit" (the
+/// preset did ask for off), so it names the rule; and a declared `heel` that
+/// the settings master switch overrides is neither applied nor inherited, so it
+/// says so on the card where the declaration was made.
+pub(crate) fn preset_sandbox_text(
     sandbox: Option<crate::settings::global::SandboxChoice>,
     widens: bool,
+    overridden: bool,
     lang: Lang,
 ) -> String {
     use crate::settings::global::SandboxChoice;
     if widens {
         return tr(lang, "settings.presetSandboxWidens").to_string();
+    }
+    if overridden {
+        return format!(
+            "{}: {}",
+            tr(lang, "settings.presetSandboxLabel"),
+            tr(lang, "settings.presetSandboxOverridden")
+        );
     }
     let value = match sandbox {
         Some(SandboxChoice::Heel) => tr(lang, "settings.presetSandboxHeel").to_string(),
@@ -11248,14 +12098,21 @@ mod network_tests {
             Some(Vec::new()),
             "read-only declares an empty reach, not an absent one"
         );
+        // Search is LOCAL access now, so a deny-all preset cannot also claim
+        // it: the grant is declined, not inherited and silently refused.
+        assert_eq!(
+            read_only.web_search,
+            Some(false),
+            "read-only declines the search grant it cannot carry"
+        );
         assert_eq!(
             text(&read_only.egress, read_only.web_search, "en"),
-            "Deny all · Web search",
-            "local egress denied; hosted search is a separate axis"
+            "Deny all",
+            "local egress denied, and no search grant beside it"
         );
         assert_eq!(
             text(&read_only.egress, read_only.web_search, "zh"),
-            "全部拒绝 · 网页搜索"
+            "全部拒绝"
         );
     }
 }

@@ -183,6 +183,12 @@ pub(crate) struct Effective {
     pub(crate) api_key_vault: Option<String>,
     /// System prompt.
     pub(crate) system_prompt: String,
+    /// Whether the persona in force (`llm_system_prompt`) is the WHOLE prompt.
+    ///
+    /// The reference's `complete: true` arm: identity, standing workflow and
+    /// tool guidance are suppressed, and the persona text is sent alone. False
+    /// is the default slot composition.
+    pub(crate) persona_complete: bool,
     /// Sampling temperature.
     pub(crate) temperature: f32,
     /// Reasoning effort.
@@ -231,7 +237,16 @@ pub(crate) struct Effective {
     /// The preset id in effect (empty when no preset is selected). This is the
     /// authority half of a policy principal: a preset may narrow what a turn
     /// may touch, and the policy input has to carry which preset was active.
+    ///
+    /// Empty while the master switch is off as well: no preset applies, so no
+    /// preset may be recorded as the authority.
     pub(crate) preset_id: String,
+    /// Whether the master switch turned every preset off.
+    ///
+    /// The preset fields below are then absent/empty and the turn runs on the
+    /// session's own mode. Carried into the policy data so the audit can name
+    /// the reason a restriction was absent.
+    pub(crate) presets_disabled: bool,
     /// Permission ceiling, or none to inherit the session's permission.
     pub(crate) preset_permission: Option<String>,
     /// The sandbox in force after the widening guard. A refused
@@ -435,6 +450,15 @@ impl Settings {
         read.adopt_legacy_session();
         read.ensure_workspace();
         read
+    }
+
+    /// How the rendered Browser treats the network.
+    ///
+    /// The stored value is a string so an unknown spelling from a future build
+    /// reads as the safe default instead of failing to parse; the browser owns
+    /// the two-value vocabulary (`proxied` | `strict`).
+    pub(crate) fn browser_network_mode(&self) -> crate::browser::NetworkMode {
+        crate::browser::NetworkMode::from_setting(&self.global.general.browser_network_mode)
     }
 
     /// Bring a retired workspace `active_session` into the machine preference.
@@ -796,6 +820,7 @@ impl Settings {
             base_url: connection.map(|c| c.base_url.clone()).unwrap_or_default(),
             api_key_vault: connection.and_then(|c| c.api_key_vault.clone()),
             system_prompt: resolution.system_prompt,
+            persona_complete: resolution.persona_complete,
             temperature: resolution.temperature.unwrap_or(0.7),
             reasoning_effort: resolution.reasoning_effort,
             max_tokens: resolution.max_tokens,
@@ -815,6 +840,7 @@ impl Settings {
             disabled_tools: resolution.disabled_tools,
             preset_plugins: resolution.plugins,
             preset_id: resolution.preset_id.unwrap_or_default(),
+            presets_disabled: resolution.presets_disabled,
             preset_permission: resolution.preset_permission,
             preset_read: resolution.preset_read,
             preset_write: resolution.preset_write,

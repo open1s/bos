@@ -23,7 +23,7 @@ use super::todo_panel::spinner;
 use super::{glyph, icon, txt, DivExt, IconName};
 use crate::i18n::{tr, Lang};
 use crate::model::{ChatMessage, PlanStatus, Role, Session, ToolEvent};
-use crate::settings::TranscriptPolicy;
+use crate::settings::{StepGrouping, TranscriptPolicy};
 use crate::theme;
 
 /// Body-cache kinds: the transcript draws several independent markdown
@@ -112,7 +112,118 @@ pub(crate) fn tool_kind_key(name: &str) -> &'static str {
         "list_dir" => "tool.kind.list",
         "load_skill" => "tool.kind.skill",
         "update_plan" => "tool.kind.plan",
+        "web_search" => "tool.kind.web",
         _ => "tool.kind.other",
+    }
+}
+
+/// The turn-level label one step kind contributes to the collapsed process
+/// group.
+///
+/// The reference's own `message.stepProcess.done.*` table names what a group
+/// DID, past tense, and its join grammar builds "Read files and Ran commands"
+/// from the kinds a turn used. These are those measured strings, mapped onto
+/// this crate's tool families; anything the table has no word for falls back to
+/// the tools label, because "called tools" is always true of a step.
+fn process_kind_key(name: &str) -> &'static str {
+    match name {
+        "bash" | "run_command" | "terminal" => "msg.process.commands",
+        "read_file" => "msg.process.read",
+        "write_file" => "msg.process.write",
+        "edit_file" | "apply_patch" => "msg.process.edit",
+        "list_dir" => "msg.process.search",
+        "update_plan" => "msg.process.plan",
+        "web_search" => "msg.process.web",
+        _ => "msg.process.tools",
+    }
+}
+
+/// The present-progressive label the LIVE group header carries: what the turn
+/// is doing RIGHT NOW.
+///
+/// The first step that has not finished answers the question; its family maps
+/// to the reference's own `message.stepProcess.<activity>` table, measured
+/// beside the done-family one. None when every step has finished, which is
+/// when the done-sentence takes the header back.
+fn process_live_key(tools: &[crate::model::ToolEvent]) -> Option<&'static str> {
+    let running = tools.iter().find(|tool| tool.output.is_none())?;
+    Some(match running.name.as_str() {
+        "bash" | "run_command" | "terminal" => "msg.processLive.commands",
+        "read_file" => "msg.processLive.read",
+        "write_file" => "msg.processLive.write",
+        "edit_file" | "apply_patch" => "msg.processLive.edit",
+        "list_dir" => "msg.processLive.search",
+        "update_plan" => "msg.processLive.plan",
+        "web_search" => "msg.processLive.web",
+        _ => "msg.processLive.tools",
+    })
+}
+
+/// The collapsed process group's title: what the turn's steps DID.
+///
+/// The reference's own grammar (`processTitle`): the first three DISTINCT
+/// kinds, two joined by the pair form, three by the comma, and a longer list
+/// ends with "etc.". The zh labels share a leading 已 that only the first
+/// keeps, and the English labels lowercase every continuation, so both
+/// languages read as one sentence rather than a stack of headings.
+pub(crate) fn process_summary(tools: &[crate::model::ToolEvent], lang: Lang) -> String {
+    let mut kinds: Vec<&'static str> = Vec::new();
+    for tool in tools {
+        let key = process_kind_key(&tool.name);
+        if !kinds.contains(&key) {
+            kinds.push(key);
+        }
+    }
+    let label = |key: &'static str| crate::i18n::tr(lang, key);
+    // The reference lowercases the first letter of every continuation; a no-op
+    // in Chinese, and what makes the English read as a sentence.
+    let continuation = |text: String| match text.chars().next() {
+        Some(head) => head.to_lowercase().collect::<String>() + &text[head.len_utf8()..],
+        None => text,
+    };
+    // The shared-prefix strip is the JOIN-TWO form alone: "已读取文件并搜索代码"
+    // loses the second 已 (both halves carry one), while "执行了命令并已读取文件"
+    // keeps it, because the sentence's first half never carried one. The comma
+    // form keeps every prefix.
+    let prefix = label("msg.process.prefix");
+    let join = |second: String| {
+        let shared = !prefix.is_empty()
+            && kinds
+                .first()
+                .is_some_and(|first| label(first).starts_with(&prefix))
+            && second.starts_with(&prefix);
+        continuation(if shared {
+            second[prefix.len()..].to_string()
+        } else {
+            second
+        })
+    };
+    match (kinds.first(), kinds.get(1), kinds.get(2)) {
+        (None, ..) => label("msg.process.tools"),
+        (Some(first), None, ..) => label(first),
+        (Some(first), Some(second), None) => crate::i18n::tr_args(
+            lang,
+            "msg.process.joinTwo",
+            &[("first", label(first)), ("second", join(label(second)))],
+        ),
+        (Some(first), Some(second), Some(third)) => {
+            let mut title = format!(
+                "{}{}{}",
+                label(first),
+                label("msg.process.comma"),
+                continuation(label(second))
+            );
+            title.push_str(&format!(
+                "{}{}",
+                label("msg.process.comma"),
+                continuation(label(third))
+            ));
+            if kinds.len() > 3 {
+                crate::i18n::tr_args(lang, "msg.process.more", &[("title", title)])
+            } else {
+                title
+            }
+        }
     }
 }
 
@@ -344,16 +455,24 @@ pub(crate) fn output_body(lang: Lang, output: &str) -> String {
         body.push_str("\n\n");
         body.push_str(&tr(lang, "tool.bash.unproxiedNetwork"));
     }
-    // A preset that turned the sandbox off is a cost the result must state, not
+    // A policy that turned the sandbox off is a cost the result must state, not
     // a detail a reader has to infer from `sandbox: "none"`. The sentence names
     // both consequences: no filesystem confinement AND no egress allowlist for
-    // this command. The tool-boundary policy still applied.
-    if json_field_exact(output, "sandbox").as_deref() == Some("none")
-        && json_field_exact(output, "sandbox_reason").as_deref()
-            == Some(agent::tools::bash::PRESET_SANDBOX_OFF_REASON)
-    {
-        body.push_str("\n\n");
-        body.push_str(&tr(lang, "tool.bash.sandboxOff"));
+    // this command, and the tool-boundary policy still applied. WHICH policy did
+    // it is named too, because a preset is revoked by another preset while the
+    // settings switch is revoked in General.
+    if json_field_exact(output, "sandbox").as_deref() == Some("none") {
+        let note = match json_field_exact(output, "sandbox_reason").as_deref() {
+            Some(agent::tools::bash::PRESET_SANDBOX_OFF_REASON) => Some("tool.bash.sandboxOff"),
+            Some(agent::tools::bash::SANDBOX_SETTINGS_OFF_REASON) => {
+                Some("tool.bash.sandboxOffSettings")
+            }
+            _ => None,
+        };
+        if let Some(key) = note {
+            body.push_str("\n\n");
+            body.push_str(&tr(lang, key));
+        }
     }
     body
 }
@@ -1803,7 +1922,7 @@ impl Shell {
         let mut column = div().w_full().flex().flex_col().gap(px(8.0));
 
         if !message.reasoning.is_empty() {
-            column = column.child(self.think_row(index, message, turn.settled, chrome, cx));
+            column = column.child(self.think_row(index, message, chrome, cx));
         }
 
         if message.text.is_empty() && message.error.is_none() {
@@ -1851,8 +1970,30 @@ impl Shell {
             );
         }
 
-        for (tool_index, tool) in message.tools.iter().enumerate() {
-            column = column.child(self.tool_row(index, tool_index, tool, turn.settled, chrome, cx));
+        // The turn's process, at the granularity the General pane's 工作步骤展示
+        // names. The four modes are the reference's own table: the two
+        // collapsed groupings fold the steps under ONE disclosure while the
+        // turn works AND after it settles - a streaming turn is exactly where
+        // eight open step rows are the wall the folding exists to prevent -
+        // while `detailed` lays them out flat so every summary line is
+        // readable without a click, and `verbose` (完全展开) opens every step's
+        // body on top of that.
+        if !message.tools.is_empty() {
+            let grouped = chrome.policy.step_grouping == StepGrouping::Collapsed;
+            if grouped {
+                column = column.child(self.process_group(index, message, turn.settled, chrome, cx));
+            } else {
+                for (tool_index, tool) in message.tools.iter().enumerate() {
+                    column = column.child(self.tool_row(
+                        index,
+                        tool_index,
+                        tool,
+                        turn.settled,
+                        chrome,
+                        cx,
+                    ));
+                }
+            }
         }
 
         // The turn's changed files, as the reference's closing card. It sits after
@@ -1878,6 +2019,140 @@ impl Shell {
 
         column
             .child(self.message_footer(index, message, chrome.compact_usage, cx))
+            .into_any_element()
+    }
+
+    /// The settled turn's process group: one disclosure over every step.
+    ///
+    /// Collapsed it is the shared `DisclosureRow` chrome - a 24px row whose
+    /// leading box carries the wrench and swaps it for a chevron on hover -
+    /// titled by [`process_summary`], the measured sentence of what the steps
+    /// did ("已读取文件并执行了命令"). Open, the step rows render exactly as
+    /// they did before the group existed, each keeping its own fold, so the
+    /// reader who wants one step's arguments still gets one step.
+    fn process_group(
+        &self,
+        index: usize,
+        message: &ChatMessage,
+        settled: bool,
+        chrome: &RowChrome<'_>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let content = chrome.content_size;
+        let row_h = theme::disclosure_row_at(content);
+        let small = theme::small_size_at(content);
+        let quiet = theme::faint();
+        let hover = theme::muted();
+        let open = self.process_open.contains(&index);
+        // The live turn's header is the reference's present-progressive label
+        // for the step still running ("正在搜索网页"), with the turn's own
+        // elapsed time trailing it; once every step has finished the header is
+        // the sentence of what the steps DID.
+        let running = process_live_key(&message.tools);
+        let (title, live) = match (&running, self.state.turn_elapsed()) {
+            (Some(key), Some(elapsed)) => {
+                (format!("{} · {elapsed}", tr(self.state.lang, key)), true)
+            }
+            (Some(key), None) => (tr(self.state.lang, key).to_string(), true),
+            (None, _) => (process_summary(&message.tools, self.state.lang), false),
+        };
+        let group = SharedString::from(format!("process-{index}"));
+        let row = div()
+            .debug_selector(move || format!("process-row-{index}"))
+            .id(SharedString::from(format!("process-row-{index}")))
+            .group(group.clone())
+            .flex_shrink_0()
+            .h(px(row_h))
+            .flex()
+            .flex_row()
+            .items_center()
+            .min_w_0()
+            .cursor_pointer()
+            .child(
+                div()
+                    .debug_selector(move || format!("process-leading-{index}"))
+                    .relative()
+                    .flex_none()
+                    .w(px(theme::DISCLOSURE_LEADING))
+                    .h(px(theme::DISCLOSURE_LEADING))
+                    .mr(px(6.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        icon(IconName::Wrench, theme::DISCLOSURE_GLYPH, quiet)
+                            .group_hover(group.clone(), |style| style.opacity(0.0)),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .w(px(theme::DISCLOSURE_LEADING))
+                            .h(px(theme::DISCLOSURE_LEADING))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .opacity(0.0)
+                            .group_hover(group.clone(), |style| style.opacity(1.0))
+                            .child(icon(
+                                if open {
+                                    IconName::ChevronDown
+                                } else {
+                                    IconName::ChevronRight
+                                },
+                                theme::DISCLOSURE_GLYPH,
+                                hover,
+                            )),
+                    ),
+            )
+            .child(
+                txt(
+                    title.clone(),
+                    small,
+                    if live { theme::muted() } else { quiet },
+                )
+                .debug_selector(move || format!("process-title-{index}"))
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .line_height(px(row_h))
+                .group_hover(group.clone(), |style| style.text_color(rgb(hover))),
+            )
+            .when(live, |head| head.child(glyph("●", 9.0, theme::accent())))
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                if !this.process_open.remove(&index) {
+                    this.process_open.insert(index);
+                }
+                cx.notify();
+            }));
+        if !open {
+            return row.into_any_element();
+        }
+        let mut body = div()
+            .debug_selector(move || format!("process-body-{index}"))
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap(px(6.0));
+        for (tool_index, tool) in message.tools.iter().enumerate() {
+            // A settled turn keeps its steps folded: the group is the reader's
+            // first door, the step's own chevron the second. A LIVE group hands
+            // the steps the same rule the flat path used, so the streaming
+            // bodies still open while the turn works.
+            body = body.child(self.tool_row(index, tool_index, tool, settled, chrome, cx));
+        }
+        div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .child(row)
+            .child(body)
             .into_any_element()
     }
 
@@ -2692,7 +2967,6 @@ impl Shell {
         &self,
         index: usize,
         message: &ChatMessage,
-        folded: bool,
         chrome: &RowChrome<'_>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -2701,11 +2975,13 @@ impl Shell {
         let small = theme::small_size_at(content);
         let quiet = theme::faint();
         let hover = theme::muted();
-        // The reference's preview is `!expanded && summary !== "" && (running ||
-        // policy.settledReasoningPreview)`, so a policy without the preview shows
-        // the settled block's title alone rather than a summary it drops.
-        let open = self.think_open.contains(&index)
-            || (folded && !chrome.policy.settled_reasoning_preview);
+        // The body opens on the reader's click and nothing else. The policy
+        // decides only whether the collapsed row carries its first-line
+        // preview; no policy may expand the body by itself, because reasoning
+        // is the part of a turn a reader opens on purpose - and a policy
+        // without the preview still keeps the one-line summary here rather
+        // than hiding it, so a collapsed row always says what it is about.
+        let open = self.think_open.contains(&index);
         let summary = think_summary(&message.reasoning);
         let group = SharedString::from(format!("think-{index}"));
         let row = div()
@@ -3193,7 +3469,12 @@ impl Shell {
         // click - which is the shape a reader scans a finished trace in. Reading
         // the flag the other way round opened every body of every settled turn,
         // which is what made a long transcript a wall of arguments.
-        let open = self.state.tool_open(message_index, tool_index)
+        // 完全展开 (`stepGrouping: none`) is the one mode whose DEFAULT is open:
+        // every body shows until the reader closes it, so the toggle's stored
+        // state reads as the reader's EXCEPTION to the mode's default rather
+        // than a plain open flag - which is why the default XORs in.
+        let default_open = chrome.policy.step_grouping == StepGrouping::None;
+        let open = default_open != self.state.tool_open(message_index, tool_index)
             || (!folded && chrome.policy.live_process_detail);
         let lang = self.state.lang;
         let size = theme::small_size_at(chrome.content_size);
@@ -3585,8 +3866,19 @@ impl Shell {
 
 #[cfg(test)]
 mod tests {
-    use super::output_body;
+    use super::{output_body, process_summary};
     use crate::i18n::Lang;
+    use crate::model::ToolEvent;
+
+    fn step(name: &str) -> ToolEvent {
+        ToolEvent {
+            name: name.to_string(),
+            args: "{}".to_string(),
+            output: None,
+            ms: None,
+            at: None,
+        }
+    }
 
     /// The measured failure this round explains: ping under Standard/PTC with no
     /// allowlist file, i.e. UNRESTRICTED egress, refused by the kernel because
@@ -3649,5 +3941,61 @@ mod tests {
     #[test]
     fn a_plain_body_is_unchanged() {
         assert_eq!(output_body(Lang::En, "plain text"), "plain text");
+    }
+
+    /// The reference's own grammar, in its own words: two kinds join as a
+    /// sentence, the English continuation lowercased.
+    #[test]
+    fn two_kinds_join_as_one_sentence() {
+        let tools = vec![step("bash"), step("read_file")];
+        assert_eq!(
+            process_summary(&tools, Lang::En),
+            "Ran commands and read files"
+        );
+        // The zh labels share a leading 已 that only the FIRST keeps.
+        assert_eq!(process_summary(&tools, Lang::Zh), "执行了命令并已读取文件");
+    }
+
+    /// Three kinds take the comma form, and the shared prefix still strips.
+    #[test]
+    fn three_kinds_take_the_comma_form() {
+        let tools = vec![step("read_file"), step("list_dir"), step("bash")];
+        assert_eq!(
+            process_summary(&tools, Lang::Zh),
+            "已读取文件，已搜索代码，执行了命令"
+        );
+        assert_eq!(
+            process_summary(&tools, Lang::En),
+            "Read files, searched code, ran commands"
+        );
+    }
+
+    /// A fourth kind ends the title with the reference's own "etc." shape, and
+    /// repeated steps of one kind never repeat their label.
+    #[test]
+    fn a_fourth_kind_ends_with_etc_and_duplicates_collapse() {
+        let tools = vec![
+            step("read_file"),
+            step("read_file"),
+            step("bash"),
+            step("write_file"),
+            step("edit_file"),
+        ];
+        assert_eq!(
+            process_summary(&tools, Lang::En),
+            "Read files, ran commands, wrote files, etc."
+        );
+        assert_eq!(
+            process_summary(&tools, Lang::Zh),
+            "已读取文件，执行了命令，已写入文件等"
+        );
+    }
+
+    /// One kind is the label alone, and a turn with no recognised family falls
+    /// back to the tools label rather than an empty title.
+    #[test]
+    fn one_kind_is_its_label_and_the_unknown_falls_back_to_tools() {
+        assert_eq!(process_summary(&[step("bash")], Lang::Zh), "执行了命令");
+        assert_eq!(process_summary(&[], Lang::En), "Called tools");
     }
 }

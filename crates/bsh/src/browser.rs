@@ -48,6 +48,66 @@ use agent::policy::{EgressGate, FetchError, FetchLimits, FetchedPage, PolicySet,
 use agent::tools::AsyncFunctionTool;
 use agent::{Agent, ToolError};
 
+/// The rendered engine: an external Obscura process spoken to over CDP.
+///
+/// The model below is the ONE surface; this module only changes who produces a
+/// document. A build with no binary installed falls back to the text view and
+/// the pane says why.
+pub(crate) mod engine;
+
+/// What the rendered browser may put on the wire, as a reader's choice.
+///
+/// The engine is a child process behind a loopback proxy. That proxy can see
+/// the absolute request URI of a PLAIN HTTP request, so it enforces the policy
+/// on the full host AND path before connecting. An https page is a CONNECT
+/// tunnel: TLS is not terminated here (that would need a MITM CA the reader has
+/// to trust), so the proxy sees only host:port and a path rule inside the page
+/// cannot be decided at the socket.
+///
+/// That is a limit of the transport, not a gap a control can hide, so it is the
+/// reader's explicit choice:
+///
+/// - [`NetworkMode::Proxied`] (the default) allows https and gates it at
+///   host:port - today's behaviour;
+/// - [`NetworkMode::Strict`] refuses the CONNECT tunnel outright, so nothing
+///   traverses an un-terminated TLS session and every request that does happen
+///   was authorized on its path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum NetworkMode {
+    /// https is allowed and authorized on host:port, like before.
+    #[default]
+    Proxied,
+    /// https is refused, so no un-terminated tunnel carries a request.
+    Strict,
+}
+
+impl NetworkMode {
+    /// Read a stored value; anything but `strict` is the safe default.
+    pub(crate) fn from_setting(value: &str) -> Self {
+        if value.trim().eq_ignore_ascii_case("strict") {
+            NetworkMode::Strict
+        } else {
+            NetworkMode::Proxied
+        }
+    }
+
+    /// The spelling the settings file and a payload carry.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            NetworkMode::Proxied => "proxied",
+            NetworkMode::Strict => "strict",
+        }
+    }
+
+    /// The locale key that names the mode to a reader.
+    pub(crate) fn label_key(self) -> &'static str {
+        match self {
+            NetworkMode::Proxied => "right.browser.networkProxied",
+            NetworkMode::Strict => "right.browser.networkStrict",
+        }
+    }
+}
+
 /// Characters of page text a snapshot returns.
 pub(crate) const TEXT_CAP: usize = 4_000;
 /// Elements a snapshot returns.
@@ -84,6 +144,7 @@ impl Failure {
             "connect" => "right.browser.reasonConnect",
             "scheme" => "right.browser.reasonScheme",
             "redirect" => "right.browser.reasonRedirect",
+            "engine" => "right.browser.reasonEngine",
             _ => "right.browser.reasonBody",
         }
     }
@@ -109,6 +170,7 @@ impl Failure {
             }
             "scheme" => "Only http and https URLs can be opened. Call browser_open with an http(s) URL.",
             "redirect" => "The redirect chain did not settle. Call browser_open with the final URL directly.",
+            "engine" => "The rendered view could not read this page. The text view is the fallback: call browser_snapshot to read it, or install Obscura as docs/bsh-browser-substrate.md describes.",
             _ => "The response body could not be read. Call browser_open again.",
         }
     }
@@ -137,6 +199,19 @@ impl Failure {
             kind,
             message,
             rule,
+            url: url.to_string(),
+        }
+    }
+
+    /// The failure for an engine that could not do what was asked.
+    ///
+    /// The engine's own sentence travels unchanged, with its install hint, so
+    /// the pane and the tool error say the same thing.
+    pub(crate) fn from_engine(error: &engine::EngineError, url: &str) -> Self {
+        Self {
+            kind: "engine",
+            message: format!("{} {}", error.message(), error.hint()),
+            rule: None,
             url: url.to_string(),
         }
     }
@@ -542,6 +617,104 @@ impl Browser {
         true
     }
 
+    /// Settle a page read from the live engine.
+    ///
+    /// Same contract as `land`: a navigation that a newer one replaced settles
+    /// nothing, and the caller reports the replacement rather than a page the
+    /// reader did not ask for.
+    pub(crate) fn land_page(&mut self, seq: u64, page: engine::Page) -> bool {
+        if self.pending.as_ref().map(|pending| pending.seq) != Some(seq) {
+            return false;
+        }
+        self.pending = None;
+        let focused = page.focused;
+        let mut next = self.next_id;
+        let doc = document_from_page(page, &mut next);
+        self.next_id = next;
+        self.adopt(doc, focused);
+        true
+    }
+
+    /// Put a live page on screen.
+    ///
+    /// A page whose URL moved is a NEW history entry, exactly as a navigation
+    /// is; a page re-read at the same URL (a reload, a snapshot, a click that
+    /// only ran script) replaces the entry under the cursor.
+    pub(crate) fn adopt(&mut self, doc: Document, focused: Option<u64>) {
+        let moved = self
+            .doc
+            .as_ref()
+            .map(|current| current.url != doc.url)
+            .unwrap_or(true);
+        self.address = doc.url.clone();
+        self.focused = focused;
+        self.failure = None;
+        self.status = Status::Ready;
+        self.open = true;
+        if moved {
+            let keep = if self.history.is_empty() {
+                0
+            } else {
+                self.at + 1
+            };
+            self.history.truncate(keep);
+            self.history.push(doc);
+            if self.history.len() > HISTORY_CAP {
+                self.history.remove(0);
+            }
+            self.at = self.history.len().saturating_sub(1);
+        } else {
+            self.replace_current(doc, focused);
+            return;
+        }
+        self.doc = self.history.get(self.at).cloned();
+    }
+
+    /// Replace the entry under the cursor, without moving history.
+    pub(crate) fn replace_current(&mut self, doc: Document, focused: Option<u64>) {
+        self.address = doc.url.clone();
+        self.focused = focused;
+        self.failure = None;
+        self.status = Status::Ready;
+        self.open = true;
+        if self.history.is_empty() {
+            self.history.push(doc);
+            self.at = 0;
+        } else {
+            if self.at >= self.history.len() {
+                self.at = self.history.len() - 1;
+            }
+            self.history[self.at] = doc;
+        }
+        self.doc = self.history.get(self.at).cloned();
+    }
+
+    /// Move the history cursor one entry, for a page the ENGINE moved to.
+    ///
+    /// The document on screen is re-read from the live page immediately after,
+    /// so this only decides which slot on the pane's own stack the live page
+    /// belongs to; it never restores stale markup.
+    pub(crate) fn move_history(&mut self, step: isize) -> Result<(), String> {
+        if step < 0 {
+            if !self.can_back() {
+                return Err(String::from(
+                    "There is no earlier page in this pane's history. Call browser_snapshot to read the current page.",
+                ));
+            }
+            self.at -= 1;
+        } else {
+            if !self.can_forward() {
+                return Err(String::from(
+                    "There is no later page in this pane's history. Call browser_snapshot to read the current page.",
+                ));
+            }
+            self.at += 1;
+        }
+        self.focused = None;
+        self.failure = None;
+        Ok(())
+    }
+
     /// Settle a navigation that failed.
     ///
     /// A failed navigation does NOT clear the document already on screen: a
@@ -721,16 +894,52 @@ fn parse_ref(reference: &str) -> Option<u64> {
     reference.trim().strip_prefix('e')?.parse().ok()
 }
 
-/// The shared browser: one state, one revision counter.
+/// Where the rendered engine stands.
+enum EngineState {
+    /// Nothing has been tried yet.
+    Idle,
+    /// A live process and its page.
+    Ready(Arc<engine::Engine>),
+    /// A named failure, kept so a missing binary costs one lookup and not one
+    /// per navigation. Closing the browser returns the slot to `Idle`.
+    Unavailable(engine::EngineError),
+}
+
+/// The shared browser: one state, one revision counter, and the engine that
+/// produces its documents.
 ///
 /// The revision is what lets the pane repaint when a TOOL changed the page -
 /// the tool runs on the turn's runtime and cannot notify a window, so the shell
 /// compares this counter on its own clock instead of holding the lock every
-/// frame.
-#[derive(Debug)]
+/// frame. Frames are separate from the revision: a capture moves eight times a
+/// second and does not change the document, so it has its own sequence.
 pub(crate) struct BrowserHandle {
     state: Mutex<Browser>,
     revision: AtomicU64,
+    engine: Mutex<EngineState>,
+    frames: Arc<engine::FrameSlot>,
+    /// Whether this handle may start an engine at all.
+    ///
+    /// A TEST build defaults this off, so the unit tests of the text view keep
+    /// pinning the text producer even on a machine with Obscura installed; the
+    /// engine's own tests and the shipped binary turn it on. A test that wants
+    /// the engine uses `BrowserHandle::live`.
+    engine_disabled: bool,
+    /// Where an engine started by this handle keeps its pidfile.
+    ///
+    /// None is production (the harness data directory). The engine's own tests
+    /// point it at a scratch path so crash bookkeeping never touches `~/.bos`.
+    engine_state_dir: Option<std::path::PathBuf>,
+}
+
+impl std::fmt::Debug for BrowserHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BrowserHandle")
+            .field("revision", &self.revision())
+            .field("engine", &self.engine_ready())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for BrowserHandle {
@@ -745,7 +954,24 @@ impl BrowserHandle {
         Self {
             state: Mutex::new(Browser::default()),
             revision: AtomicU64::new(1),
+            engine: Mutex::new(EngineState::Idle),
+            frames: Arc::new(engine::FrameSlot::default()),
+            engine_disabled: cfg!(test),
+            engine_state_dir: None,
         }
+    }
+
+    /// A handle that starts the rendered engine, for the engine's own tests.
+    #[cfg(test)]
+    pub(crate) fn live() -> Self {
+        let mut handle = Self::new();
+        handle.engine_disabled = false;
+        handle.engine_state_dir = Some(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target")
+                .join(format!("bsh-browser-state-{}", std::process::id())),
+        );
+        handle
     }
 
     /// Read the state. The lock is held only for the duration of f.
@@ -774,19 +1000,132 @@ impl BrowserHandle {
     pub(crate) fn revision(&self) -> u64 {
         self.revision.load(Ordering::Relaxed)
     }
+
+    /// The live engine, when one is running.
+    pub(crate) fn engine(&self) -> Option<Arc<engine::Engine>> {
+        let slot = self.engine.lock().ok()?;
+        match &*slot {
+            EngineState::Ready(engine) => Some(engine.clone()),
+            _ => None,
+        }
+    }
+
+    /// Whether a rendered engine is running.
+    pub(crate) fn engine_ready(&self) -> bool {
+        self.engine().is_some()
+    }
+
+    /// The named failure that kept the pane on the text view, if any.
+    pub(crate) fn engine_error(&self) -> Option<engine::EngineError> {
+        let slot = self.engine.lock().ok()?;
+        match &*slot {
+            EngineState::Unavailable(error) => Some(error.clone()),
+            _ => None,
+        }
+    }
+
+    /// Where the engine's frames arrive.
+    pub(crate) fn frames(&self) -> &Arc<engine::FrameSlot> {
+        &self.frames
+    }
+
+    /// The live engine, starting one on first use.
+    ///
+    /// `BSH_BROWSER_ENGINE=off` keeps the process from being started at all,
+    /// which is what a machine without the binary wants and what a test that
+    /// must not spawn anything sets.
+    pub(crate) fn ensure_engine(
+        &self,
+        gate: &Arc<EgressGate>,
+        mode: NetworkMode,
+    ) -> Result<Arc<engine::Engine>, engine::EngineError> {
+        let mut slot = self
+            .engine
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let EngineState::Ready(engine) = &*slot {
+            return Ok(engine.clone());
+        }
+        if let EngineState::Unavailable(error) = &*slot {
+            return Err(error.clone());
+        }
+        if self.engine_disabled {
+            // A test of the text view: no process, no notice, no launch attempt.
+            return Err(engine::EngineError::MissingBinary {
+                searched: String::from("a text-only browser handle"),
+                hint: String::new(),
+            });
+        }
+        if std::env::var("BSH_BROWSER_ENGINE")
+            .map(|value| value.eq_ignore_ascii_case("off"))
+            .unwrap_or(false)
+        {
+            let error = engine::EngineError::MissingBinary {
+                searched: String::from("BSH_BROWSER_ENGINE=off"),
+                hint: String::from(
+                    "The rendered view is switched off in this environment; the text view is what the pane shows.",
+                ),
+            };
+            *slot = EngineState::Unavailable(error.clone());
+            return Err(error);
+        }
+        let started =
+            engine::Gate::start(gate.policy().clone(), gate.session(), gate.preset(), mode)
+                .map_err(engine::EngineError::Spawn)
+                .and_then(|gate| match &self.engine_state_dir {
+                    Some(state_dir) => {
+                        engine::Engine::launch_in(gate, self.frames.clone(), (1000, 700), state_dir)
+                    }
+                    None => engine::Engine::launch(gate, self.frames.clone(), (1000, 700)),
+                });
+        match started {
+            Ok(engine) => {
+                let engine = Arc::new(engine);
+                *slot = EngineState::Ready(engine.clone());
+                Ok(engine)
+            }
+            Err(error) => {
+                *slot = EngineState::Unavailable(error.clone());
+                Err(error)
+            }
+        }
+    }
+
+    /// Stop the engine, if one is running, and allow a later open to retry.
+    pub(crate) fn stop_engine(&self) {
+        let previous = self
+            .engine
+            .lock()
+            .ok()
+            .map(|mut slot| std::mem::replace(&mut *slot, EngineState::Idle));
+        // Dropped outside the lock: the engine's own Drop joins its pump and
+        // reaps the child, and that must not happen while a reader waits.
+        drop(previous);
+    }
 }
 
 /// Fetch a URL through the policy and settle the result into the browser.
 ///
 /// One place performs a navigation, so the pane's own Go control and every tool
 /// make the same decision in the same order: ask the gate, then fetch, then show.
+#[cfg(test)]
 pub(crate) fn navigate(
     handle: &BrowserHandle,
     gate: &Arc<EgressGate>,
     url: &str,
 ) -> Result<(), Failure> {
+    navigate_in(handle, gate, url, NetworkMode::Proxied)
+}
+
+/// Navigate under a chosen [`NetworkMode`].
+pub(crate) fn navigate_in(
+    handle: &BrowserHandle,
+    gate: &Arc<EgressGate>,
+    url: &str,
+    mode: NetworkMode,
+) -> Result<(), Failure> {
     let seq = handle.mutate(|browser| browser.begin(url));
-    load(handle, gate, url, seq)
+    load(handle, gate, url, seq, mode)
 }
 
 /// Fetch and settle a navigation that has ALREADY begun.
@@ -799,10 +1138,126 @@ pub(crate) fn load(
     gate: &Arc<EgressGate>,
     url: &str,
     seq: u64,
+    mode: NetworkMode,
 ) -> Result<(), Failure> {
-    let limits = FetchLimits::default();
-    let result = agent::policy::fetch(gate, url, &limits);
-    settle(handle, gate, seq, result)
+    // The scheme rule is the model's, not the engine's: a file: or javascript:
+    // URL is refused with the text view's own "scheme" failure before a
+    // producer is chosen, so the two paths cannot disagree about it.
+    if let Err(FetchError::Scheme(attempted)) = agent::policy::http_host(url) {
+        let failure = Failure {
+            kind: "scheme",
+            message: format!("Only http and https URLs can be opened, and {attempted} is neither."),
+            rule: None,
+            url: url.to_string(),
+        };
+        let applied = handle.mutate(|browser| browser.fail(seq, failure.clone()));
+        return if applied {
+            Err(failure)
+        } else {
+            Err(Failure {
+                kind: "body",
+                message: String::from("A newer navigation replaced this one before it finished."),
+                rule: None,
+                url: String::new(),
+            })
+        };
+    }
+    match handle.ensure_engine(gate, mode) {
+        Ok(engine) => load_live(handle, &engine, gate, url, seq, mode),
+        Err(_error) => {
+            // The text view is the fallback, and it goes through the SAME gate:
+            // the policy decision is identical, only the producer differs.
+            let limits = FetchLimits::default();
+            let result = agent::policy::fetch(gate, url, &limits);
+            settle(handle, gate, seq, result)
+        }
+    }
+}
+
+/// A navigation produced by the live engine.
+fn load_live(
+    handle: &BrowserHandle,
+    engine: &engine::Engine,
+    gate: &Arc<EgressGate>,
+    url: &str,
+    seq: u64,
+    mode: NetworkMode,
+) -> Result<(), Failure> {
+    let replaced = || Failure {
+        kind: "engine",
+        message: String::from("A newer navigation replaced this one before it finished."),
+        rule: None,
+        url: String::new(),
+    };
+    let failure = match engine.navigate(gate, url, mode) {
+        Ok(engine::Navigation::Loaded) => {
+            let start = handle.read(|browser| browser.next_id);
+            match engine.snapshot(start) {
+                Ok(page) => {
+                    let applied = handle.mutate(|browser| browser.land_page(seq, page));
+                    return if applied { Ok(()) } else { Err(replaced()) };
+                }
+                Err(error) => Failure::from_engine(&error, url),
+            }
+        }
+        Ok(engine::Navigation::Refused { rule, message }) => Failure {
+            kind: "policy",
+            message,
+            rule,
+            url: url.to_string(),
+        },
+        Err(error) => Failure::from_engine(&error, url),
+    };
+    let applied = handle.mutate(|browser| browser.fail(seq, failure.clone()));
+    if applied {
+        Err(failure)
+    } else {
+        Err(replaced())
+    }
+}
+
+/// Turn a live page into the model's document.
+fn document_from_page(page: engine::Page, next_id: &mut u64) -> Document {
+    let total = page.text.chars().count();
+    let text: String = page.text.chars().take(STORE_TEXT_CAP).collect();
+    let elements = page
+        .elements
+        .into_iter()
+        .map(|item| Element {
+            id: item.id,
+            kind: match item.kind {
+                "link" => Kind::Link,
+                "submit" => Kind::Submit,
+                "textarea" => Kind::Textarea,
+                "select" => Kind::Select,
+                "button" => Kind::Button,
+                _ => Kind::Input,
+            },
+            label: item.label,
+            href: item.href,
+            value: item.value,
+            options: item.options,
+            name: None,
+            form: None,
+            input_type: item.input_type,
+        })
+        .collect();
+    // Never go backwards: a document with no stamped elements reports
+    // max_id = start - 1, and a shrunk range must not hand a live ref to a
+    // later page.
+    *next_id = (*next_id).max(page.max_id.saturating_add(1));
+    Document {
+        url: page.url,
+        title: page.title,
+        text,
+        text_total_chars: total,
+        elements,
+        forms: Vec::new(),
+        raw: String::new(),
+        status: 200,
+        body_truncated: false,
+        max_id: page.max_id,
+    }
 }
 
 /// Settle a fetch into the browser, reporting a superseded load as its own
@@ -858,6 +1313,8 @@ pub(crate) struct Tools {
     pub(crate) session: String,
     /// The preset a decision is recorded under.
     pub(crate) preset: String,
+    /// How the rendered browser treats the network: the reader's setting.
+    pub(crate) network_mode: NetworkMode,
 }
 
 impl Tools {
@@ -891,7 +1348,14 @@ impl Tools {
         } else {
             "allowlist"
         };
-        serde_json::json!({ "sandbox": "none", "network": network })
+        serde_json::json!({
+            "sandbox": "none",
+            "network": network,
+            // The reader's choice, so a caller can tell what the transport
+            // actually enforced: https is gated at host:port under Proxied and
+            // refused outright under Strict.
+            "network_mode": self.network_mode.as_str(),
+        })
     }
 
     /// Merge the confinement facts into a result object.
@@ -906,18 +1370,7 @@ impl Tools {
 
     /// The snapshot payload every navigation tool answers with.
     fn snapshot_result(&self, action: &'static str) -> Result<serde_json::Value, ToolError> {
-        let snapshot = self.browser.read(|browser| browser.snapshot());
-        let Some(snapshot) = snapshot else {
-            return Err(ToolError::Failed(String::from(
-                "No page is open. Call browser_open with a URL first.",
-            )));
-        };
-        let mut object = serde_json::json!({
-            "action": action,
-            "title": snapshot.title,
-            "url": snapshot.url,
-            "snapshot": snapshot.to_json(),
-        });
+        let mut object = snapshot_payload(&self.browser, action)?;
         self.stamp(&mut object);
         Ok(object)
     }
@@ -947,6 +1400,286 @@ impl Tools {
         self.stamp(&mut object);
         Ok(object)
     }
+}
+
+/// The snapshot payload, without the confinement facts.
+///
+/// Free so the live-engine helpers below can answer with the same object the
+/// text path does: the payload shape is the surface, and it does not depend on
+/// which producer filled it.
+fn snapshot_payload(
+    handle: &BrowserHandle,
+    action: &'static str,
+) -> Result<serde_json::Value, ToolError> {
+    let snapshot = handle.read(|browser| browser.snapshot());
+    let Some(snapshot) = snapshot else {
+        return Err(ToolError::Failed(String::from(
+            "No page is open. Call browser_open with a URL first.",
+        )));
+    };
+    Ok(serde_json::json!({
+        "action": action,
+        "title": snapshot.title,
+        "url": snapshot.url,
+        "snapshot": snapshot.to_json(),
+    }))
+}
+
+/// What the request seam refused, in the policy's own words.
+///
+/// The document pre-flight cannot see a subresource: an image, a script or a
+/// stylesheet the policy refused is reported here, with its rule, so a page
+/// that loaded with a piece missing says which piece and why.
+pub(crate) fn engine_refusal(handle: &BrowserHandle) -> Option<String> {
+    let engine = handle.engine()?;
+    let describe = |rule: &Option<String>, message: &str| match rule {
+        Some(rule) => format!("{message} (rule {rule})"),
+        None => message.to_string(),
+    };
+    if let Some(denial) = engine.gate().last() {
+        return Some(describe(&denial.rule, &denial.message));
+    }
+    let refusals = engine.client().shared().refusals();
+    refusals
+        .last()
+        .map(|refusal| describe(&refusal.rule, &refusal.message))
+}
+
+/// The tool error an engine failure becomes: what happened, then the hint.
+fn engine_error(error: &engine::EngineError) -> ToolError {
+    ToolError::Failed(format!("{} {}", error.message(), error.hint()))
+}
+
+/// Re-read the live page into the entry under the cursor.
+fn refresh_live(handle: &BrowserHandle) -> Result<(), ToolError> {
+    let Some(engine) = handle.engine() else {
+        return Ok(());
+    };
+    let start = handle.read(|browser| browser.next_id);
+    let page = engine
+        .snapshot(start)
+        .map_err(|error| engine_error(&error))?;
+    let focused = page.focused;
+    handle.mutate(|browser| {
+        let mut next = browser.next_id;
+        let doc = document_from_page(page, &mut next);
+        browser.next_id = next;
+        browser.replace_current(doc, focused);
+    });
+    Ok(())
+}
+
+/// Re-read the live page, letting a changed URL open a history entry.
+fn settle_live(handle: &BrowserHandle) -> Result<(), ToolError> {
+    let Some(engine) = handle.engine() else {
+        return Ok(());
+    };
+    let start = handle.read(|browser| browser.next_id);
+    let page = engine
+        .snapshot(start)
+        .map_err(|error| engine_error(&error))?;
+    let focused = page.focused;
+    handle.mutate(|browser| {
+        let mut next = browser.next_id;
+        let doc = document_from_page(page, &mut next);
+        browser.next_id = next;
+        browser.adopt(doc, focused);
+    });
+    Ok(())
+}
+
+/// `browser_click` against the live page.
+pub(crate) fn click_live(
+    handle: &BrowserHandle,
+    reference: &str,
+) -> Result<serde_json::Value, ToolError> {
+    let engine = handle
+        .engine()
+        .ok_or_else(|| ToolError::Failed(String::from("No rendered engine is running.")))?;
+    // The ref is resolved against the model FIRST, so a stale one gets the
+    // same sentence the text view gives rather than the engine's own wording.
+    handle
+        .read(|browser| browser.resolve(reference))
+        .map_err(ToolError::Failed)?;
+    match engine
+        .click(reference)
+        .map_err(|error| engine_error(&error))?
+    {
+        engine::cdp::Activation::Focused {
+            reference,
+            kind,
+            label,
+            via,
+        } => {
+            if let Some(id) = parse_ref(&reference) {
+                handle.mutate(|browser| browser.focused = Some(id));
+            }
+            Ok(serde_json::json!({
+                "focused": reference,
+                "kind": kind,
+                "label": label,
+                // "pointer" is a synthesized mouse event at the element's real
+                // box; "script" is the DOM's own click(), used only when the
+                // element genuinely has no box to hit.
+                "via": via,
+                "next": "Call browser_type with this ref and the text to enter, then browser_press Enter if it is inside a form."
+            }))
+        }
+        engine::cdp::Activation::Clicked { via } => {
+            settle_live(handle)?;
+            let mut payload = snapshot_payload(handle, "navigated")?;
+            payload["via"] = serde_json::json!(via);
+            Ok(payload)
+        }
+    }
+}
+
+/// `browser_type` against the live page.
+pub(crate) fn type_live(
+    handle: &BrowserHandle,
+    reference: &str,
+    text: &str,
+) -> Result<serde_json::Value, ToolError> {
+    let engine = handle
+        .engine()
+        .ok_or_else(|| ToolError::Failed(String::from("No rendered engine is running.")))?;
+    handle
+        .read(|browser| browser.resolve(reference))
+        .map_err(ToolError::Failed)?;
+    let typed = engine
+        .type_into(reference, text)
+        .map_err(|error| engine_error(&error))?;
+    if let Some(error) = &typed.error {
+        if error == "not-an-option" {
+            let shown: Vec<String> = typed.offered.iter().take(8).cloned().collect();
+            return Err(ToolError::Failed(format!(
+                "'{}' is not an option of {}. Its options are {:?}; call browser_type with one of them.",
+                text, typed.reference, shown
+            )));
+        }
+        return Err(ToolError::Failed(format!(
+            "{} is not on this page. Call browser_snapshot.",
+            typed.reference
+        )));
+    }
+    refresh_live(handle)?;
+    let value = if typed.secret {
+        String::from("(hidden)")
+    } else {
+        typed.value.clone()
+    };
+    let mut payload = serde_json::json!({
+        "ref": typed.reference,
+        "kind": typed.kind,
+        "value": value,
+    });
+    if typed.secret {
+        payload["hidden"] = serde_json::json!(true);
+        payload["note"] = serde_json::json!(
+            "The field is a password: its value is stored but never returned, so you cannot read a secret back out of the page."
+        );
+    }
+    Ok(payload)
+}
+
+/// `browser_press` against the live page.
+pub(crate) fn press_live(
+    handle: &BrowserHandle,
+    key: &str,
+) -> Result<serde_json::Value, ToolError> {
+    let engine = handle
+        .engine()
+        .ok_or_else(|| ToolError::Failed(String::from("No rendered engine is running.")))?;
+    if key == "enter" && handle.read(|browser| browser.focused).is_none() {
+        return Err(ToolError::Failed(String::from(
+            "No element is focused, so Enter has nothing to activate. Call browser_click on an element (or browser_press Tab to focus the first one), then press Enter.",
+        )));
+    }
+    let focused = engine.press(key).map_err(|error| engine_error(&error))?;
+    match focused {
+        Some((reference, label)) => {
+            if let Some(id) = parse_ref(&reference) {
+                handle.mutate(|browser| browser.focused = Some(id));
+            }
+            Ok(focused_payload(&format!("{reference} {label}")))
+        }
+        None if key == "escape" => {
+            handle.mutate(|browser| browser.focused = None);
+            Ok(serde_json::json!({
+                "focused": serde_json::Value::Null,
+                "next": "Nothing is focused. Call browser_click on a field to focus it."
+            }))
+        }
+        None => {
+            let before = handle.read(|browser| browser.address.clone());
+            settle_live(handle)?;
+            let after = handle.read(|browser| browser.address.clone());
+            snapshot_payload(
+                handle,
+                if before == after {
+                    "pressed"
+                } else {
+                    "navigated"
+                },
+            )
+        }
+    }
+}
+
+/// `browser_back`/`browser_forward` against the live page.
+pub(crate) fn history_live(
+    handle: &BrowserHandle,
+    step: isize,
+) -> Result<serde_json::Value, ToolError> {
+    let engine = handle
+        .engine()
+        .ok_or_else(|| ToolError::Failed(String::from("No rendered engine is running.")))?;
+    let moved = if step < 0 {
+        engine.back()
+    } else {
+        engine.forward()
+    }
+    .map_err(|error| engine_error(&error))?;
+    if !moved {
+        let sentence = if step < 0 {
+            "There is no earlier page in this pane's history. Call browser_snapshot to read the current page."
+        } else {
+            "There is no later page in this pane's history. Call browser_snapshot to read the current page."
+        };
+        return Err(ToolError::Failed(String::from(sentence)));
+    }
+    handle
+        .mutate(|browser| browser.move_history(step))
+        .map_err(ToolError::Failed)?;
+    refresh_live(handle)?;
+    snapshot_payload(handle, "restored")
+}
+
+/// `browser_reload` against the live page.
+pub(crate) fn reload_live(
+    handle: &BrowserHandle,
+    gate: &Arc<EgressGate>,
+    mode: NetworkMode,
+) -> Result<serde_json::Value, ToolError> {
+    let engine = handle
+        .engine()
+        .ok_or_else(|| ToolError::Failed(String::from("No rendered engine is running.")))?;
+    engine
+        .reload(gate, mode)
+        .map_err(|error| engine_error(&error))?;
+    refresh_live(handle)?;
+    snapshot_payload(handle, "reloaded")
+}
+
+/// `browser_snapshot` against the live page: the text a script wrote is text.
+pub(crate) fn snapshot_live(handle: &BrowserHandle) -> Result<serde_json::Value, ToolError> {
+    refresh_live(handle)?;
+    snapshot_payload(handle, "snapshot")
+}
+
+/// `browser_close`: stop the page target and the process behind it.
+pub(crate) fn close_live(handle: &BrowserHandle) {
+    handle.stop_engine();
 }
 
 /// Run a blocking fetch on a runtime thread that may block.
@@ -998,7 +1731,7 @@ pub(crate) fn attach(agent: &mut Agent, tools: Tools) {
 
     add(AsyncFunctionTool::from_fn(
         "browser_open",
-        "Open an http(s) URL in the built-in Browser pane and return its title, final URL and a structured snapshot of the readable text plus every interactive element. The workspace policy decides reachability BEFORE any request, so a refused URL names the rule that refused it and makes no network request. Only http and https are accepted. The returned snapshot is the same payload browser_snapshot returns, so one call is usually enough.",
+        "Open an http(s) URL in the built-in Browser pane and return its title, final URL and a structured snapshot of the readable text plus every interactive element. The navigation waits for the page to go network-idle (500 ms with at most two requests in flight, capped by the timeout), so content a late subresource writes is usually already in the returned snapshot. The workspace policy decides reachability BEFORE any request, so a refused URL names the rule that refused it and makes no network request. Only http and https are accepted. The returned snapshot is the same payload browser_snapshot returns, so one call is usually enough.",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -1028,7 +1761,9 @@ pub(crate) fn attach(agent: &mut Agent, tools: Tools) {
                     let gate = tools.gate("browser_open");
                     let handle = tools.browser.clone();
                     let target = url.clone();
-                    let loaded = blocking(move || navigate(&handle, &gate, &target)).await?;
+                    let mode = tools.network_mode;
+                    let loaded =
+                        blocking(move || navigate_in(&handle, &gate, &target, mode)).await?;
                     loaded.map_err(|failure| ToolError::Failed(failure.tool_message()))?;
                     tools.snapshot_result("open")
                 }
@@ -1038,7 +1773,7 @@ pub(crate) fn attach(agent: &mut Agent, tools: Tools) {
 
     add(AsyncFunctionTool::from_fn(
         "browser_snapshot",
-        "Return the page on screen as a bounded structured view: title, final URL, readable text capped at 4000 characters (the cap and the total are stated in the payload) and every interactive element with a short stable ref such as e3. Refs stay valid while this document is on screen; any navigation mints new ones, and an old ref then returns an error telling you to snapshot again. This one call carries everything needed to decide the next action; no page scripts run in this view. Pass html=true only when the markup itself matters.",
+        "Return the page on screen as a bounded structured view: title, final URL, readable text capped at 4000 characters (the cap and the total are stated in the payload) and every interactive element with a short stable ref such as e3. Refs stay valid while this document is on screen; any navigation mints new ones, and an old ref then returns an error telling you to snapshot again. When the rendered engine is available this reads the LIVE DOM, so text a page script wrote is included; without it the fetched text is used. Pass html=true only when the markup itself matters.",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -1059,6 +1794,13 @@ pub(crate) fn attach(agent: &mut Agent, tools: Tools) {
                         .unwrap_or(false);
                     if html {
                         tools.html_result()
+                    } else if tools.browser.engine_ready() {
+                        // The rendered engine re-reads the LIVE DOM here, so a
+                        // string a page script wrote is text the model can see.
+                        let handle = tools.browser.clone();
+                        let mut value = blocking(move || snapshot_live(&handle)).await??;
+                        tools.stamp(&mut value);
+                        Ok(value)
                     } else {
                         tools.snapshot_result("snapshot")
                     }
@@ -1069,7 +1811,7 @@ pub(crate) fn attach(agent: &mut Agent, tools: Tools) {
 
     add(AsyncFunctionTool::from_fn(
         "browser_click",
-        "Activate an element by the ref its snapshot gave you. A link navigates and the response carries the new snapshot, so no follow-up call is needed. An input, textarea or select takes focus for browser_type. A submit control submits its form with GET. A ref that is no longer on screen returns an error naming the page change and asking for a fresh snapshot - it never silently succeeds. A button that only acts through page JavaScript refuses and says so.",
+        "Activate an element by the ref its snapshot gave you. A link navigates and the response carries the new snapshot, so no follow-up call is needed. An input, textarea or select takes focus for browser_type. A submit control submits its form with GET. A ref that is no longer on screen returns an error naming the page change and asking for a fresh snapshot - it never silently succeeds. With the rendered engine available the click is a real input event, so a control that acts through page JavaScript also works; the text view refuses one and says so. The result's via field says which activation ran: 'pointer' is a synthesized mouse event at a real box, and 'script' is the DOM's own click(), used only when the target genuinely has no box to hit.",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -1086,6 +1828,13 @@ pub(crate) fn attach(agent: &mut Agent, tools: Tools) {
                 let tools = tools.clone();
                 async move {
                     let reference = arg_ref(&args)?;
+                    if tools.browser.engine_ready() {
+                        let handle = tools.browser.clone();
+                        let target = reference.clone();
+                        let mut value = blocking(move || click_live(&handle, &target)).await??;
+                        tools.stamp(&mut value);
+                        return Ok(value);
+                    }
                     let act = tools
                         .browser
                         .mutate(|browser| browser.activate(&reference))
@@ -1099,7 +1848,9 @@ pub(crate) fn attach(agent: &mut Agent, tools: Tools) {
                             let gate = tools.gate("browser_click");
                             let handle = tools.browser.clone();
                             let target = url.clone();
-                            let loaded = blocking(move || navigate(&handle, &gate, &target)).await?;
+                            let mode = tools.network_mode;
+                            let loaded =
+                                blocking(move || navigate_in(&handle, &gate, &target, mode)).await?;
                             loaded.map_err(|failure| ToolError::Failed(failure.tool_message()))?;
                             tools.snapshot_result("navigated")
                         }
@@ -1137,6 +1888,14 @@ pub(crate) fn attach(agent: &mut Agent, tools: Tools) {
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("")
                         .to_string();
+                    if tools.browser.engine_ready() {
+                        let handle = tools.browser.clone();
+                        let target = reference.clone();
+                        let mut value =
+                            blocking(move || type_live(&handle, &target, &text)).await??;
+                        tools.stamp(&mut value);
+                        return Ok(value);
+                    }
                     let mut value = tools
                         .browser
                         .mutate(|browser| browser.type_into(&reference, &text))
@@ -1150,7 +1909,7 @@ pub(crate) fn attach(agent: &mut Agent, tools: Tools) {
 
     add(AsyncFunctionTool::from_fn(
         "browser_press",
-        "Press a key on the focused element. Enter activates it: a link navigates, a submit control submits its form, and an input or textarea inside a GET form submits that form with its current values. Tab and ArrowDown focus the next element; Shift+Tab and ArrowUp focus the previous one; Escape clears the focus. Any other key is refused with the list this view supports, because no page script runs here to interpret it.",
+        "Press a key on the focused element. Enter activates it: a link navigates, a submit control submits its form, and an input or textarea inside a GET form submits that form with its current values. Tab and ArrowDown focus the next element; Shift+Tab and ArrowUp focus the previous one; Escape clears the focus. With the rendered engine available the page itself receives the key, and Backspace, Delete, Home, End, PageUp, PageDown and the left/right arrows edit and move within a field too. Any other key is refused with the list this view supports.",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -1172,6 +1931,13 @@ pub(crate) fn attach(agent: &mut Agent, tools: Tools) {
                         .unwrap_or("")
                         .trim()
                         .to_ascii_lowercase();
+                    if tools.browser.engine_ready() {
+                        let handle = tools.browser.clone();
+                        let target = key.clone();
+                        let mut value = blocking(move || press_live(&handle, &target)).await??;
+                        tools.stamp(&mut value);
+                        return Ok(value);
+                    }
                     let act = tools
                         .browser
                         .mutate(|browser| browser.press_key(&key))
@@ -1185,7 +1951,9 @@ pub(crate) fn attach(agent: &mut Agent, tools: Tools) {
                             let gate = tools.gate("browser_press");
                             let handle = tools.browser.clone();
                             let target = url.clone();
-                            let loaded = blocking(move || navigate(&handle, &gate, &target)).await?;
+                            let mode = tools.network_mode;
+                            let loaded =
+                                blocking(move || navigate_in(&handle, &gate, &target, mode)).await?;
                             loaded.map_err(|failure| ToolError::Failed(failure.tool_message()))?;
                             tools.snapshot_result("navigated")
                         }
@@ -1197,13 +1965,19 @@ pub(crate) fn attach(agent: &mut Agent, tools: Tools) {
 
     add(AsyncFunctionTool::from_fn(
         "browser_back",
-        "Go back one document in the Browser pane's history. The page is restored from the pane's own cache, so it makes no network request and asks the policy nothing. Refs are re-minted on restore: take a fresh snapshot before acting. Returns the restored snapshot.",
+        "Go back one document in the Browser pane's history. With the rendered engine available it moves through the page's OWN history; the text view restores its cached copy. Refs are re-minted when a new document appears: take a fresh snapshot before acting. Returns the restored snapshot.",
         serde_json::json!({ "type": "object", "properties": {} }),
         {
             let tools = tools.clone();
             move |_args| {
                 let tools = tools.clone();
                 async move {
+                    if tools.browser.engine_ready() {
+                        let handle = tools.browser.clone();
+                        let mut value = blocking(move || history_live(&handle, -1)).await??;
+                        tools.stamp(&mut value);
+                        return Ok(value);
+                    }
                     tools
                         .browser
                         .mutate(|browser| browser.back())
@@ -1216,13 +1990,19 @@ pub(crate) fn attach(agent: &mut Agent, tools: Tools) {
 
     add(AsyncFunctionTool::from_fn(
         "browser_forward",
-        "Go forward one document in the Browser pane's history, undoing a browser_back. Restored from the pane's cache, so no network request is made. Refs are re-minted: take a fresh snapshot before acting.",
+        "Go forward one document in the Browser pane's history, undoing a browser_back. With the rendered engine available it moves through the page's OWN history; the text view restores its cached copy. Refs are re-minted when a new document appears: take a fresh snapshot before acting.",
         serde_json::json!({ "type": "object", "properties": {} }),
         {
             let tools = tools.clone();
             move |_args| {
                 let tools = tools.clone();
                 async move {
+                    if tools.browser.engine_ready() {
+                        let handle = tools.browser.clone();
+                        let mut value = blocking(move || history_live(&handle, 1)).await??;
+                        tools.stamp(&mut value);
+                        return Ok(value);
+                    }
                     tools
                         .browser
                         .mutate(|browser| browser.forward())
@@ -1242,6 +2022,15 @@ pub(crate) fn attach(agent: &mut Agent, tools: Tools) {
             move |_args| {
                 let tools = tools.clone();
                 async move {
+                    if tools.browser.engine_ready() {
+                        let handle = tools.browser.clone();
+                        let gate = tools.gate("browser_reload");
+                        let mode = tools.network_mode;
+                        let mut value =
+                            blocking(move || reload_live(&handle, &gate, mode)).await??;
+                        tools.stamp(&mut value);
+                        return Ok(value);
+                    }
                     let url = tools
                         .browser
                         .read(|browser| browser.document().map(|doc| doc.url.clone()))
@@ -1253,7 +2042,9 @@ pub(crate) fn attach(agent: &mut Agent, tools: Tools) {
                     let gate = tools.gate("browser_reload");
                     let handle = tools.browser.clone();
                     let target = url.clone();
-                    let loaded = blocking(move || navigate(&handle, &gate, &target)).await?;
+                    let mode = tools.network_mode;
+                    let loaded =
+                        blocking(move || navigate_in(&handle, &gate, &target, mode)).await?;
                     loaded.map_err(|failure| ToolError::Failed(failure.tool_message()))?;
                     tools.snapshot_result("reloaded")
                 }
@@ -1270,6 +2061,10 @@ pub(crate) fn attach(agent: &mut Agent, tools: Tools) {
             move |_args| {
                 let tools = tools.clone();
                 async move {
+                    // The page target and the process go with the document: an
+                    // engine nobody can see is a process the reader never asked
+                    // for.
+                    close_live(&tools.browser);
                     tools.browser.mutate(|browser| browser.close());
                     let mut value = serde_json::json!({
                         "closed": true,
@@ -2265,6 +3060,48 @@ mod tests {
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    /// The network-mode vocabulary is exactly two values, and anything a future
+    /// build might write reads as the SAFE default (Proxied, which still asks
+    /// the policy at host:port) rather than as a silent widening.
+    #[test]
+    fn the_browser_network_mode_vocabulary_has_a_safe_default() {
+        assert_eq!(
+            NetworkMode::from_setting("strict"),
+            NetworkMode::Strict,
+            "the stored spelling must round-trip"
+        );
+        assert_eq!(
+            NetworkMode::from_setting("  STRICT "),
+            NetworkMode::Strict,
+            "the value is compared case-insensitively and trimmed"
+        );
+        assert_eq!(NetworkMode::from_setting("proxied"), NetworkMode::Proxied);
+        assert_eq!(
+            NetworkMode::from_setting("something-new"),
+            NetworkMode::Proxied,
+            "an unknown value must not become Strict or anything else"
+        );
+        assert_eq!(NetworkMode::default(), NetworkMode::Proxied);
+        assert_eq!(NetworkMode::Proxied.as_str(), "proxied");
+        assert_eq!(NetworkMode::Strict.as_str(), "strict");
+        assert_eq!(
+            crate::settings::Settings::default()
+                .global
+                .general
+                .browser_network_mode,
+            "proxied",
+            "a fresh install ships the Proxied default"
+        );
+        assert_eq!(
+            NetworkMode::Proxied.label_key(),
+            "right.browser.networkProxied"
+        );
+        assert_eq!(
+            NetworkMode::Strict.label_key(),
+            "right.browser.networkStrict"
+        );
+    }
 
     /// One local site, counting the requests that reached it.
     struct Site {

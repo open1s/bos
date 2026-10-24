@@ -106,6 +106,99 @@ mod tests {
         assert_eq!(tr(Lang::Zh, "settings.saveFailed"), "无法保存设置：");
     }
 
+    /// The master preset switch's whole vocabulary exists in both languages,
+    /// with its placeholders intact, and the chip reports the owner's own words.
+    #[test]
+    fn the_presets_switch_copy_is_localized_in_both_languages() {
+        let keys = [
+            "settings.presetsEnabledTitle",
+            "settings.presetsEnabledConsequence",
+            "settings.presetsOffConsequence",
+            "settings.presetsOffAction",
+            "settings.presetsOffTitle",
+            "settings.presetsOffDescription",
+            "settings.presetsOffPermissionCeiling",
+            "settings.presetsOffPathScope",
+            "settings.presetsOffSandbox",
+            "settings.presetsOffEgress",
+            "settings.presetsOffToolSet",
+            "settings.presetsOffPolicyModules",
+            "settings.presetsOffConfirm",
+            "settings.presetsOffApplied",
+            "settings.presetsRestored",
+            "settings.presetsSaveFailed",
+            "settings.presetsNextTurn",
+            "input.noPreset",
+            "input.presetsOff",
+            "audit.policy.presetsOff",
+        ];
+        for key in keys {
+            let en = tr(Lang::En, key);
+            let zh = tr(Lang::Zh, key);
+            assert_ne!(en, key, "{key} is missing from en");
+            assert_ne!(zh, key, "{key} is missing from zh");
+            assert!(!en.is_empty() && !zh.is_empty(), "{key} is empty");
+            assert_ne!(en, zh, "{key} fell back to english in zh");
+        }
+        assert!(tr(Lang::En, "settings.presetsOffDescription").contains("{facts}"));
+        assert!(tr(Lang::Zh, "settings.presetsOffDescription").contains("{facts}"));
+        assert!(tr(Lang::En, "settings.presetsRestored").contains("{name}"));
+        assert!(tr(Lang::Zh, "settings.presetsRestored").contains("{name}"));
+        assert_eq!(tr(Lang::En, "input.noPreset"), "No preset");
+        assert_eq!(tr(Lang::Zh, "input.noPreset"), "无预设");
+    }
+
+    /// The sandbox master switch's whole vocabulary exists in both languages,
+    /// with its placeholder intact and the two losses named in both.
+    ///
+    /// This is the copy a reader consents to, so it is pinned: the switch's row,
+    /// the consequence in each state, the confirmation's three facts, the notice
+    /// after a flip, the preset card's override sentence, and the surfaces that
+    /// name the state while it is off (the terminal, the audit row and the
+    /// command's own result note). The permission MENU deliberately carries no
+    /// copy of it: its rows are the label and a short qualifier only.
+    #[test]
+    fn the_sandbox_switch_copy_is_localized_in_both_languages() {
+        let keys = [
+            "settings.sandboxEnabledTitle",
+            "settings.sandboxEnabledConsequence",
+            "settings.sandboxOffConsequence",
+            "settings.sandboxOffTitle",
+            "settings.sandboxOffDescription",
+            "settings.sandboxOffFilesystem",
+            "settings.sandboxOffEgress",
+            "settings.sandboxOffOverridesPresets",
+            "settings.sandboxOffConfirm",
+            "settings.sandboxOffApplied",
+            "settings.sandboxOnApplied",
+            "settings.sandboxSaveFailed",
+            "settings.presetSandboxOverridden",
+            "right.terminal.sandboxOffSettings",
+            "audit.call.sandboxSettingsOffReason",
+            "tool.bash.sandboxOffSettings",
+        ];
+        for key in keys {
+            let en = tr(Lang::En, key);
+            let zh = tr(Lang::Zh, key);
+            assert_ne!(en, key, "{key} is missing from en");
+            assert_ne!(zh, key, "{key} is missing from zh");
+            assert!(!en.is_empty() && !zh.is_empty(), "{key} is empty");
+            assert_ne!(en, zh, "{key} fell back to english in zh");
+        }
+        assert!(tr(Lang::En, "settings.sandboxOffDescription").contains("{facts}"));
+        assert!(tr(Lang::Zh, "settings.sandboxOffDescription").contains("{facts}"));
+        // The consequence states BOTH losses wherever it is read.
+        for (key, filesystem, egress) in [
+            ("settings.sandboxEnabledConsequence", "filesystem", "egress"),
+            ("settings.sandboxOffConsequence", "filesystem", "egress"),
+        ] {
+            assert!(tr(Lang::En, key).contains(filesystem), "{key}");
+            assert!(tr(Lang::En, key).contains(egress), "{key}");
+        }
+        assert!(tr(Lang::Zh, "settings.sandboxEnabledConsequence").contains("文件系统"));
+        assert!(tr(Lang::Zh, "settings.sandboxEnabledConsequence").contains("egress"));
+    }
+
     /// The two locale files carry exactly the same keys.
     ///
     /// `tr` renders a missing key as itself, so a key added to one file and
@@ -324,6 +417,11 @@ mod tests {
             "permission.consequenceWorkspace",
             "permission.consequenceFull",
             "permission.consequenceFullShell",
+            // The composer menu's short qualifiers. Read Only reuses
+            // `permission.consequenceReadOnly`, exactly as `Mode::qualifier_key`
+            // does.
+            "permission.shortWorkspace",
+            "permission.shortFull",
             "permission.cardReadOnly",
             "permission.cardWorkspace",
             "permission.cardFull",

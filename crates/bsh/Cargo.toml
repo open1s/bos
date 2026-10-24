@@ -91,3 +91,39 @@ libc = "0.2"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSImage", "NSResponder"] }
 objc2-foundation = { version = "0.3.2", features = ["NSData"] }
+
+# The Browser pane's rendered engine is Obscura, an EXTERNAL binary spoken to
+# over CDP: no crate is linked for it, so a default build carries no browser
+# engine code and every default gate stays as fast as it was. See
+# docs/bsh-browser-substrate.md for the install recipe (the release tarball is
+# NOT vendored here) and for the measured CDP facts.
+#
+# The one dependency the shim adds is the WebSocket transport. tungstenite is
+# ALREADY in this build's graph through zenoh (agent -> zenoh -> ... ->
+# tokio-tungstenite -> tungstenite 0.24), so naming it directly adds no package
+# to Cargo.lock and no compile unit to the default build. It is the proven
+# RFC 6455 client, and the alternative - hand-rolling masking, fragmentation and
+# the handshake's SHA-1/Base64 - would be more code for the same wire.
+#
+# The blocking flavour is the deliberate choice: the browser's state layer is
+# synchronous and the tools already run it on `spawn_blocking`, so the CDP read
+# loop gets one dedicated OS thread instead of a second async runtime. This is
+# the same shape the terminal's own read loop has.
+[dependencies.tungstenite]
+version = "0.24"
+default-features = false
+features = ["handshake"]
+
+# Decoding a captured PNG/JPEG frame into the RGBA buffer RenderImage takes.
+# gpui-pre already builds against image 0.25, so this unifies onto the one copy
+# in the graph rather than adding a second version.
+[dependencies.image]
+version = "0.25"
+default-features = false
+features = ["png", "jpeg"]
+
+# RenderImage::new takes a SmallVec of frames. The container crate is already in
+# the graph through gpui-pre, so naming it adds no package; the alternative is
+# an array literal, which the trait does not accept for a one-frame image.
+[dependencies.smallvec]
+version = "1"

@@ -73,6 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         base_url: nvidia_cfg.base_url,
         api_key: nvidia_cfg.api_key,
         system_prompt: "You are a helpful assistant.".to_string(),
+        persona_complete: false,
         temperature: 0.7,
         max_tokens: Some(1000),
         timeout_secs: 60,

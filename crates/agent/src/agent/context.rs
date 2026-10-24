@@ -1680,6 +1680,46 @@ mod budget_tests {
         assert_eq!(session.messages()[1..].len(), 2);
     }
 
+    /// The compaction instruction is a fixed contract: every section, in order,
+    /// and the rules a resume depends on. A deleted line fails here before it
+    /// can quietly change how a checkpoint is written.
+    #[test]
+    fn the_compaction_instruction_pins_the_checkpoint_shape() {
+        let sections = [
+            "## Primary Request and Intent",
+            "## Key Technical Concepts",
+            "## Files and Code",
+            "## Errors and Fixes",
+            "## Pending Jobs",
+            "## Current Work",
+            "## Next Step",
+            "## Critical Context",
+        ];
+        let mut cursor = 0;
+        for section in sections {
+            let at = COMPACTION_INSTRUCTION[cursor..]
+                .find(section)
+                .unwrap_or_else(|| panic!("the instruction keeps {section}"));
+            cursor += at + section.len();
+        }
+        for rule in [
+            "Output EXACTLY the Markdown structure below",
+            "Write \"(none)\" for an empty section",
+            "Preserve exact file paths, commands, error strings, identifiers, numeric values, function signatures, and syntax fragments.",
+            "Do NOT mention this summarization request or that the context was compacted.",
+            "Output only the checkpoint text: do not call any tool or take any other action.",
+            "If the conversation already contains a <compacted-summary> block, it is a PRIOR checkpoint.",
+        ] {
+            assert!(
+                COMPACTION_INSTRUCTION.contains(rule),
+                "the instruction keeps the rule: {rule}"
+            );
+        }
+        assert!(CHECKPOINT_PREAMBLE.starts_with(
+            "This is an automatically generated checkpoint condensing an earlier span of the conversation"
+        ));
+    }
+
     #[test]
     fn a_history_inside_the_keep_window_has_nothing_to_fold() {
         let session = chat(4, 16);

@@ -208,11 +208,13 @@ pub(crate) struct AuditCall {
     /// alone.
     pub(crate) sandbox_reason: Option<String>,
     /// The network confinement the call's own result reported, when it did:
-    /// "deny-all", "allowlist" or "unrestricted".
+    /// "deny-all", "allowlist", "unrestricted" or "unconfined".
     ///
     /// Read from the stored result beside [AuditCall::sandbox], so a tool/MCP
     /// egress call and a shell call each show what their own record says rather
-    /// than one global assumption for the session.
+    /// than one global assumption for the session. `unconfined` is NOT
+    /// `unrestricted`: no sandbox proxy existed, so the workspace allowlist was
+    /// never consulted.
     pub(crate) network: Option<String>,
     /// The tool's own stable id for a failure the sandbox's networking explains
     /// rather than the policy: a direct socket or ICMP refused by the kernel
@@ -237,6 +239,72 @@ impl AuditCall {
             agent::tools::bash::UNPROXIED_DIRECT_SOCKET => Some("tool.bash.unproxiedNetwork"),
             _ => None,
         }
+    }
+
+    /// The locale key that explains why this call ran unconfined, when its
+    /// result carried a reason this shell knows.
+    ///
+    /// The three arms are deliberately distinguishable, because each is revoked
+    /// by a different control: the settings master switch (one switch, every
+    /// preset), a preset own widening (another preset), and the full-access
+    /// permission release (the session permission). A reason from a newer build
+    /// is printed verbatim rather than guessed at.
+    pub(crate) fn sandbox_reason_key(&self) -> Option<&'static str> {
+        let reason = self.sandbox_reason.as_deref()?;
+        if reason == agent::tools::bash::PRESET_SANDBOX_OFF_REASON {
+            return Some("audit.call.sandboxOffReason");
+        }
+        if reason == agent::tools::bash::SANDBOX_SETTINGS_OFF_REASON {
+            return Some("audit.call.sandboxSettingsOffReason");
+        }
+        if reason == agent::tools::bash::SANDBOX_RELEASED_REASON {
+            return Some("audit.call.sandboxReleasedReason");
+        }
+        None
+    }
+
+    /// The locale key for a network value this shell renders as prose, when it
+    /// knows one.
+    ///
+    /// `unconfined` is the value that used to read as `unrestricted`: it means
+    /// there was no sandbox proxy at all, so the workspace egress allowlist was
+    /// never consulted. The page and the Markdown export resolve it through
+    /// this one mapping; the stored record stays language-neutral.
+    pub(crate) fn network_key(&self) -> Option<&'static str> {
+        match self.network.as_deref()? {
+            agent::tools::bash::NETWORK_UNCONFINED => Some("audit.call.networkUnconfined"),
+            _ => None,
+        }
+    }
+
+    /// The confinement fact as one Markdown-table cell: the backend, why it was
+    /// released, and the network reach its own result reported.
+    ///
+    /// The three release reasons stay distinguishable because each renders its
+    /// own localized sentence, and a call that reported no confinement keeps
+    /// saying so instead of borrowing the session's tier. The non-Markdown page
+    /// builds the same facts through the same helpers, so the two readings
+    /// cannot disagree.
+    pub(crate) fn confinement_text(&self, lang: crate::i18n::Lang) -> String {
+        let mut text = match self.sandbox.as_deref() {
+            Some(sandbox) => sandbox.to_string(),
+            None => lang.tr("audit.call.noSandbox").to_string(),
+        };
+        if let Some(reason) = self.sandbox_reason.as_deref() {
+            let reason = match self.sandbox_reason_key() {
+                Some(key) => lang.tr(key),
+                None => reason.to_string(),
+            };
+            text = format!("{text} ({reason})");
+        }
+        if let Some(network) = self.network.as_deref() {
+            let network = match self.network_key() {
+                Some(key) => lang.tr(key),
+                None => network.to_string(),
+            };
+            text = format!("{text} · {network}");
+        }
+        text
     }
 }
 
@@ -344,6 +412,13 @@ pub(crate) struct AuditPolicy {
     pub(crate) error: Option<String>,
     /// The preset whose policy data was applied (empty takes the default).
     pub(crate) preset: String,
+    /// Whether every preset was switched off when this policy was compiled.
+    ///
+    /// `preset` is empty in that case as well, so this is what distinguishes
+    /// "no preset applied because none was chosen" from "no preset applied
+    /// because the master switch is off" - the second is the reason a
+    /// restriction the preset usually adds is absent.
+    pub(crate) presets_disabled: bool,
     /// Paths the preset restricts reads to (0 = unrestricted).
     pub(crate) read_scope: usize,
     /// Paths the preset restricts writes to (0 = unrestricted).
@@ -366,6 +441,22 @@ impl AuditPolicy {
     /// The total decisions the policy answered: allowed plus denied.
     pub(crate) fn checks(&self) -> u64 {
         self.allows.total.saturating_add(self.denials_total)
+    }
+
+    /// The applied-preset cell every audit surface prints.
+    ///
+    /// One rule for the page, the call details and the exported markdown: the
+    /// applied id, or the REASON none applied - a switched-off master preset
+    /// switch is a different fact from an unchosen preset, and a later reader
+    /// comparing two audits has to be able to see which one it was.
+    pub(crate) fn preset_cell(&self, lang: crate::i18n::Lang) -> String {
+        if self.presets_disabled {
+            lang.tr("audit.policy.presetsOff").to_string()
+        } else if self.preset.is_empty() {
+            lang.tr("audit.policy.noPreset").to_string()
+        } else {
+            self.preset.clone()
+        }
     }
 }
 
@@ -668,14 +759,7 @@ impl AuditView {
                     lang,
                     "audit.policy.appliedLine",
                     &[
-                        (
-                            "preset",
-                            if self.policy.preset.is_empty() {
-                                lang.tr("audit.policy.noPreset")
-                            } else {
-                                self.policy.preset.clone()
-                            },
-                        ),
+                        ("preset", self.policy.preset_cell(lang)),
                         ("read", self.policy.read_scope.to_string()),
                         ("write", self.policy.write_scope.to_string()),
                         ("deny", self.policy.deny_roots.to_string()),
@@ -734,21 +818,23 @@ impl AuditView {
                 out.push_str(&format!("{}\n\n", lang.tr("audit.noCalls")));
             } else {
                 out.push_str(&format!(
-                    "| {} | {} | {} | {} | {} | {} |\n| --- | --- | --- | --- | --- | --- |\n",
+                    "| {} | {} | {} | {} | {} | {} | {} |\n| --- | --- | --- | --- | --- | --- | --- |\n",
                     lang.tr("audit.table.tool"),
                     lang.tr("audit.table.category"),
                     lang.tr("audit.table.target"),
                     lang.tr("audit.table.outcome"),
+                    lang.tr("audit.table.confinement"),
                     lang.tr("audit.table.ms"),
                     lang.tr("audit.table.preview"),
                 ));
                 for call in &turn.calls {
                     out.push_str(&format!(
-                        "| {} | {} | {} | {} | {} | {} |\n",
+                        "| {} | {} | {} | {} | {} | {} | {} |\n",
                         cell(&call.tool),
                         cell(&lang.tr(call.category.key())),
                         cell(&call.target),
                         cell(&lang.tr(call.outcome.key())),
+                        cell(&call.confinement_text(lang)),
                         cell(&call.ms.map(|ms| ms.to_string()).unwrap_or_default()),
                         cell(&call.preview),
                     ));
@@ -1417,6 +1503,7 @@ mod tests {
             },
             denials_total: 2,
             preset: "review".to_string(),
+            presets_disabled: false,
             read_scope: 2,
             write_scope: 1,
             deny_roots: 3,
@@ -1744,6 +1831,170 @@ mod tests {
             Some(agent::tools::bash::SANDBOX_RELEASED_REASON),
             "a permission release carries its own attribution"
         );
+    }
+
+    /// The THREE unconfined reasons stay distinguishable in the record, the row
+    /// and the export.
+    ///
+    /// The settings switch, a preset's own arm and the full-access release all
+    /// render `sandbox: "none"`; a reader who could not tell them apart would not
+    /// know which control to reverse. Each case asserts the exact constant in the
+    /// exported JSON and its own localized sentence, and that no case picks up
+    /// another arm's wording.
+    #[test]
+    fn the_three_unconfined_reasons_are_told_apart() {
+        let cases = [
+            (
+                agent::tools::bash::SANDBOX_SETTINGS_OFF_REASON,
+                "audit.call.sandboxSettingsOffReason",
+            ),
+            (
+                agent::tools::bash::PRESET_SANDBOX_OFF_REASON,
+                "audit.call.sandboxOffReason",
+            ),
+            (
+                agent::tools::bash::SANDBOX_RELEASED_REASON,
+                "audit.call.sandboxReleasedReason",
+            ),
+        ];
+        let mut session = session_with(1);
+        for (index, (reason, _)) in cases.iter().enumerate() {
+            let output = serde_json::json!({
+                "stdout": "",
+                "stderr": "",
+                "exit_code": 0,
+                "success": true,
+                "sandbox": "none",
+                "sandbox_reason": reason,
+                // No proxy existed, so the allowlist was never consulted; the
+                // export must not report the confined `unrestricted` state.
+                "network": "unconfined",
+            });
+            session.messages[1].tools.push(tool(
+                "bash",
+                &format!("{{\"command\":\"printf {index} > \\\"$T\\\"\"}}"),
+                Some(&output.to_string()),
+                1,
+                1_000 + index as u64,
+            ));
+        }
+        let view = AuditView::build(&session, &[], &[]);
+        let calls = &view.turns[0].calls;
+        assert_eq!(calls.len(), cases.len());
+        for (index, (reason, key)) in cases.iter().enumerate() {
+            let call = &calls[index];
+            assert_eq!(call.sandbox.as_deref(), Some("none"));
+            assert_eq!(call.sandbox_reason.as_deref(), Some(*reason));
+            assert_eq!(
+                call.sandbox_reason_key(),
+                Some(*key),
+                "{reason} resolves to its own sentence"
+            );
+            // The row prints the localized sentence for exactly this arm.
+            let rendered = crate::i18n::tr(crate::i18n::Lang::En, key);
+            assert!(!rendered.is_empty());
+            for (other, other_key) in cases.iter() {
+                if other == reason {
+                    continue;
+                }
+                assert_ne!(key, other_key, "two arms share a key");
+                assert_ne!(
+                    rendered,
+                    crate::i18n::tr(crate::i18n::Lang::En, other_key),
+                    "{reason} must not read like {other}"
+                );
+            }
+        }
+        // The EXPORT carries the same distinction: the JSON keeps each stored
+        // reason verbatim, so the three are separable without the page.
+        let json: serde_json::Value = serde_json::from_str(&view.to_json()).expect("valid JSON");
+        let exported: Vec<String> = json["turns"][0]["calls"]
+            .as_array()
+            .expect("calls")
+            .iter()
+            .map(|call| {
+                call["sandbox_reason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        for (reason, _) in cases {
+            assert_eq!(
+                exported
+                    .iter()
+                    .filter(|entry| entry.as_str() == reason)
+                    .count(),
+                1,
+                "the export carries {reason} exactly once: {exported:?}"
+            );
+        }
+
+        // The MARKDOWN export has its own confinement column, and the three
+        // cases produce three DIFFERENT cells: the backend, the localized
+        // reason, and the unconfined network fact. Without the column the
+        // Markdown reader could not separate them at all.
+        let markdown = view.to_markdown(crate::i18n::Lang::En);
+        assert!(
+            markdown.contains("| Confinement |"),
+            "the table names the column: {markdown}"
+        );
+        let cells: Vec<String> = markdown
+            .lines()
+            .filter(|line| line.starts_with("| bash |"))
+            .map(|line| {
+                line.split('|')
+                    .nth(5)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(cells.len(), cases.len(), "one row per call");
+        for (index, (reason, key)) in cases.iter().enumerate() {
+            let localized = crate::i18n::tr(crate::i18n::Lang::En, key);
+            assert!(
+                cells[index].contains(&localized),
+                "the row for {reason} carries its own sentence: {cells:?}"
+            );
+            assert!(
+                cells[index].contains("no sandbox proxy"),
+                "the row says the allowlist was not enforced: {cells:?}"
+            );
+        }
+        let mut unique = cells.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            cases.len(),
+            "the three release reasons produce three different rows: {cells:?}"
+        );
+
+        // Localized too: the same record in Chinese, not an English-only column.
+        let zh = view.to_markdown(crate::i18n::Lang::Zh);
+        let zh_cells: Vec<String> = zh
+            .lines()
+            .filter(|line| line.starts_with("| bash |"))
+            .map(|line| {
+                line.split('|')
+                    .nth(5)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(zh_cells.len(), cases.len());
+        for (index, (_, key)) in cases.iter().enumerate() {
+            assert!(
+                zh_cells[index].contains(&crate::i18n::tr(crate::i18n::Lang::Zh, key)),
+                "the Chinese row localizes its reason: {zh_cells:?}"
+            );
+            assert!(
+                zh_cells[index].contains("无沙箱代理"),
+                "the Chinese row localizes the unconfined reach: {zh_cells:?}"
+            );
+        }
     }
 
     /// A kernel-refused direct socket under UNRESTRICTED egress is explained

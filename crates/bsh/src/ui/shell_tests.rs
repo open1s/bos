@@ -1966,6 +1966,51 @@ fn the_think_row_takes_the_measured_disclosure_chrome(cx: &mut TestAppContext) {
         "and closes it again"
     );
 }
+
+/// The compact policy removes the settled preview, and that must never become
+/// an expanded body: the reader's own setting may not turn every reasoning
+/// block into full-width prose. Collapsed with the one-line summary is the
+/// whole behaviour, and the click is the only way in.
+#[gpui::test]
+fn the_compact_policy_cannot_expand_a_settled_think_block(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (_harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("think-compact", 1);
+        state.settings.global.general.transcript_view = "compact".to_string();
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id) {
+            session.messages[1].reasoning = "first line of thought\n\nmore **detail**".to_string();
+            session.messages[1].text = "the answer".to_string();
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let shell = cx.update(|_, cx| _harness.read(cx).shell.clone());
+    let policy = cx.update(|_, cx| shell.read(cx).state.effective().transcript_view);
+    assert!(
+        !policy.settled_reasoning_preview,
+        "the premise: this session runs the compact policy"
+    );
+    assert!(
+        cx.debug_bounds("think-summary-1").is_some(),
+        "the collapsed row still carries its one-line summary"
+    );
+    assert!(
+        cx.debug_bounds("think-body-1").is_none(),
+        "and the body is closed: the setting hides the PREVIEW, never opens the block"
+    );
+
+    let hits = cx.debug_bounds("think-row-1").expect("the row bounds");
+    cx.simulate_click(hits.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("think-body-1").is_some(),
+        "the click is the one way in"
+    );
+}
 /// The transcript chrome, from the reference's own `TurnNavigator.module.css` and
 /// `MessageItem.module.css`: a 28px rail parked 12px off the transcript's right edge,
 /// capped at 420 tall and scrolled when the marks overflow, where a mark is a 10px slot
@@ -2781,6 +2826,305 @@ fn agent_loop_pane_loads_the_step_ceiling(cx: &mut TestAppContext) {
     assert_eq!(
         text, "23",
         "the pane must show the ceiling the agent will be built with"
+    );
+}
+
+/// The Web search pane draws the controls the local tool reads, and its switch
+/// writes the same workspace fact the Tools pane's switch writes.
+#[gpui::test]
+fn the_web_search_pane_draws_the_local_tool_controls(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("web-search-pane", 1);
+        let shell =
+            cx.new(|cx| Shell::build_for_test(window, section_index("web-search"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    assert!(
+        cx.debug_bounds("settings-web-search-enabled").is_some(),
+        "the pane's own switch draws"
+    );
+    assert!(
+        cx.debug_bounds("web-search-key-save").is_some(),
+        "the key's own save press draws"
+    );
+    assert!(
+        cx.debug_bounds("builtin-setting-web-search").is_none(),
+        "the built-in row belongs to the plugins pane, not this one"
+    );
+
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let base = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .settings_inputs
+            .web_search_base
+            .read(cx)
+            .value()
+            .to_string()
+    });
+    assert_eq!(
+        base,
+        crate::web::DEFAULT_BASE_URL,
+        "the endpoint loads from the settings"
+    );
+    let results = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .settings_inputs
+            .web_search_results
+            .read(cx)
+            .value()
+            .to_string()
+    });
+    assert_eq!(results, "10", "the shipped per-search budget");
+
+    let track = cx
+        .debug_bounds("settings-web-search-enabled")
+        .expect("the switch to click");
+    cx.simulate_click(track.center(), Modifiers::default());
+    let after = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .draft()
+            .workspace
+            .agent
+            .web_tools_enabled
+    });
+    assert!(!after, "the pane's switch writes the same draft fact");
+}
+
+/// A settled turn with two steps, rendered under one of the four transcript
+/// granularities.
+fn steps_state(label: &str, view: &str) -> AppState {
+    let mut state = state_with_turns(label, 1);
+    state.settings.global.general.transcript_view = view.to_string();
+    let id = state.active_id.clone().expect("an active session");
+    if let Some(session) = state.store.session_mut(&id) {
+        session.messages[1].tools.push(crate::model::ToolEvent {
+            name: "bash".to_string(),
+            args: "{}".to_string(),
+            output: Some("ok".to_string()),
+            ms: Some(3),
+            at: None,
+        });
+        session.messages[1].tools.push(crate::model::ToolEvent {
+            name: "read_file".to_string(),
+            args: "{}".to_string(),
+            output: Some("fn main() {}".to_string()),
+            ms: Some(2),
+            at: None,
+        });
+    }
+    state
+}
+
+/// The General pane's 工作步骤展示 row names four granularities, and the same
+/// settled turn must show four different things:
+///
+/// - 简洁 and 标准 fold the steps under ONE group disclosure, closed;
+/// - 详细 lays the steps out flat, every summary line readable, bodies closed;
+/// - 完全展开 opens every step's body on top of that.
+#[gpui::test]
+fn the_work_step_setting_shows_four_granularities(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    for (view, group, step, body) in [
+        ("compact", true, false, false),
+        ("standard", true, false, false),
+        ("detailed", false, true, false),
+        ("verbose", false, true, true),
+    ] {
+        let label = format!("steps-{view}");
+        let mode = view.to_string();
+        let (harness, cx) = cx.add_window_view(move |window, cx| {
+            let state = steps_state(&label, &mode);
+            let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+            Harness { shell }
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let got_group = cx.debug_bounds("process-row-1").is_some();
+        let got_step = cx.debug_bounds("inspect-1-0").is_some();
+        // The IN block of the first step carries its own copy control, whose
+        // id names the payload length: present only when the body is open.
+        let got_body = cx.debug_bounds("step-copy-IN-2-true").is_some();
+        assert_eq!(
+            (got_group, got_step, got_body),
+            (group, step, body),
+            "{view}: the granularity must name its own display"
+        );
+        let _shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    }
+}
+
+/// A RUNNING turn folds too: under the two collapsed groupings the streaming
+/// steps hide behind one live header that names the step still running (the
+/// reference's present-progressive label), while `detailed` and `verbose` keep
+/// the stream flat exactly as before.
+#[gpui::test]
+fn a_running_turn_folds_under_the_group_too(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    for (view, group) in [
+        ("compact", true),
+        ("standard", true),
+        ("detailed", false),
+        ("verbose", false),
+    ] {
+        let label = format!("live-steps-{view}");
+        let mode = view.to_string();
+        let (harness, cx) = cx.add_window_view(move |window, cx| {
+            let mut state = steps_state(&label, &mode);
+            let id = state.active_id.clone().expect("an active session");
+            assert!(
+                state.begin_turn_in(&id, "search today").is_some(),
+                "the premise: the turn is streaming"
+            );
+            let owned = id.clone();
+            if let Some(session) = state.store.session_mut(&owned) {
+                let last = session.messages.len() - 1;
+                session.messages[last].tools.push(crate::model::ToolEvent {
+                    name: "web_search".to_string(),
+                    args: "{\"query\": \"top news\"}".to_string(),
+                    output: None,
+                    ms: None,
+                    at: None,
+                });
+            }
+            let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+            Harness { shell }
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let got_group = cx.debug_bounds("process-row-3").is_some();
+        let got_step = cx.debug_bounds("inspect-3-0").is_some();
+        assert_eq!(
+            (got_group, got_step),
+            (group, !group),
+            "{view}: a running turn { } the group",
+            if group {
+                "folds under"
+            } else {
+                "streams beside"
+            }
+        );
+        let _shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    }
+}
+
+/// A finished subagent is not a dead end for the composer: with the child's
+/// view open, a submission returns to the PARENT conversation and opens the
+/// turn there, because a finished run has nothing left to steer. (A run with
+/// no reachable process at all - a restart - behaves the same: its row is
+/// gone, so the prompt belongs to the parent.)
+#[gpui::test]
+fn a_finished_subagent_returns_the_prompt_to_the_parent(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("subagent-finished", 1);
+        let parent = state.active_id.clone().expect("a session");
+        let id = state.subagents.begin(
+            &parent,
+            &parent,
+            1,
+            0,
+            "Inspect the files",
+            "List the workspace files",
+        );
+        state.subagents.finish(
+            &id,
+            "the files are listed".to_string(),
+            (1200, 3400),
+            vec![crate::subagent::SubagentMessage {
+                role: "assistant".to_string(),
+                content: "the files are listed".to_string(),
+                tool: None,
+            }],
+        );
+        // NO set_agent call: this run has no live process behind it, which is
+        // exactly the state that used to refuse every send forever.
+        state.show_subagent(&id);
+        // A resolvable model target, so the parent turn OPENS rather than
+        // being refused by the send gate the fixture would otherwise hit. The
+        // request itself fails against the unresolvable endpoint, which no
+        // assertion depends on.
+        // The COMMITTED tree: the send gate reads it, not the dialog draft.
+        state
+            .settings
+            .global
+            .add_provider("work", "", "https://work.example/v1", &[]);
+        let _ = state
+            .settings
+            .global
+            .add_model("work", "fast", "", "gpt-4o-mini", "");
+        if let Some(session) = state.store.session_mut(&parent) {
+            session.provider = Some("work".to_string());
+            session.model = Some("fast".to_string());
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.set_composer_text("pwd", window, cx);
+            this.send(window, cx);
+        });
+    });
+    let (view, draft, last) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        let session = shell
+            .state
+            .active_id
+            .as_deref()
+            .and_then(|id| shell.state.store.session(id))
+            .map(|session| session.messages.len());
+        (
+            shell.state.subagent.is_none(),
+            shell.composer_value.is_empty(),
+            session,
+        )
+    });
+    assert!(view, "the shell returned to the parent conversation");
+    assert!(draft, "the composer was consumed");
+    // The seeded session held 2 rows (user + assistant); the send appended the
+    // prompt's user row and the turn's own streaming assistant row.
+    assert_eq!(
+        last,
+        Some(4),
+        "the prompt opened a turn in the parent: user + assistant rows follow"
+    );
+
+    // This test opens a REAL turn against an unreachable endpoint, so it must
+    // end it here. A runtime event that wakes the GPUI pump after this test's
+    // scheduler has finished is the suite's SIGABRT (gpui-pre asserts the
+    // waking thread, async-task turns the panic into abort()). Parking is the
+    // kit's seam for a test that performs cross-thread I/O; the stop joins the
+    // turn and the two pumps let the pump observe the closed channel.
+    cx.dispatcher.allow_parking();
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            if let Some(id) = this.state.active_id.clone() {
+                this.state.stop(&id);
+            }
+        });
+    });
+    cx.run_until_parked();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_, cx| {
+            let shell = shell.read(cx);
+            shell
+                .state
+                .active_id
+                .as_deref()
+                .is_some_and(|id| shell.state.is_streaming(id))
+        }),
+        "the turn is stopped before the test ends, so no runtime work outlives it"
     );
 }
 
@@ -3887,9 +4231,12 @@ fn a_selected_session_preset_carries_its_persona_into_the_llm_config() {
         &state.mcp,
         &id,
     );
-    assert_eq!(
-        built.agent.config().system_prompt,
-        "You are terse.",
+    assert!(
+        built
+            .agent
+            .config()
+            .system_prompt
+            .contains("You are terse."),
         "the session preset's persona is the prompt the LLM call receives"
     );
 }
@@ -6185,9 +6532,8 @@ fn a_refused_commit_keeps_the_dialog_open() {
 
 /// The web-search switch is a real control: it writes the draft the file gets.
 ///
-/// The hosted tool has no local registrar, so it cannot appear in the capability
-/// list below it; without this row the setting would have no control at all and
-/// the tool would be on with nothing in the window to say so.
+/// The local tool has no registrar entry to list below the switch, so this row
+/// is the one place the Tools pane says search is offered at all.
 #[gpui::test]
 fn the_tools_pane_switches_the_hosted_web_search(cx: &mut TestAppContext) {
     cx.update(gpui_kit::component::init);
@@ -6234,15 +6580,17 @@ fn the_tools_pane_switches_the_hosted_web_search(cx: &mut TestAppContext) {
     let built = cx.update(|_, cx| {
         let mut draft = shell.read(cx).state.draft().clone();
         draft.global.default_preset = String::new();
-        crate::caps::build_agent(
+        let built = crate::caps::build_agent(
             &draft,
             &shell.read(cx).state.vault,
             &crate::settings::resolve::SessionChoice::default(),
             &crate::mcp::McpPool::default(),
-        )
-        .agent
-        .config()
-        .web_search
+        );
+        built
+            .agent
+            .registry()
+            .map(|registry| registry.list().into_iter().any(|name| name == "web_search"))
+            .unwrap_or(false)
     });
     assert!(!built, "the built agent follows the switch");
 }
@@ -7101,7 +7449,7 @@ fn a_builtin_plugin_setting_row_navigates_to_its_pane(cx: &mut TestAppContext) {
     cx.update(|window, cx| window.draw(cx).clear(cx));
 
     for (selector, pane) in [
-        ("builtin-setting-web-search", "tools"),
+        ("builtin-setting-web-search", "web-search"),
         ("builtin-setting-agent-loop", "agent-loop"),
         ("builtin-setting-shell", "shell"),
     ] {
@@ -11043,7 +11391,7 @@ fn the_chip_offers_three_modes_and_marks_the_current_one(cx: &mut TestAppContext
     let rows = cx.update(|_, cx| {
         let shell = shell.read(cx);
         let effective = shell.state.effective();
-        super::permission::permission_rows(Lang::En, &effective, &shell.state)
+        super::permission::permission_rows(Lang::En, &effective)
     });
     assert_eq!(rows.len(), 3, "the chip offers exactly three modes");
     let checked: Vec<&str> = rows
@@ -11139,20 +11487,20 @@ fn the_chip_offers_three_modes_and_marks_the_current_one(cx: &mut TestAppContext
     );
 }
 
-/// The chip's three rows each state the network, as the chip builds them.
+/// The chip's three rows are a label and a SHORT qualifier, in the reference's
+/// order, and none of them mentions the network.
 ///
 /// The popup body is the kit's own menu item, which carries no debug selector,
 /// so the observable is the row list the chip's render path builds
 /// (`permission::permission_rows`) read from the live shell after the chip has
-/// drawn - the same function, the same state. The scratch workspace has NO
-/// `.bsh/egress-allowlist`, so the WRITABLE rows state the unrestricted reach
-/// (a hardcoded allowlist would fail here). Read Only states the session tier's
-/// own refusal instead, which the file cannot change.
+/// drawn - the same function, the same state. The detailed, derived sentence
+/// the rows used to carry is still the Settings pane's
+/// (`Mode::consequence`), and the permission unit tests pin it there.
 #[gpui::test]
-fn the_chips_three_rows_each_carry_a_network_clause(cx: &mut TestAppContext) {
+fn the_chips_three_rows_are_a_label_and_a_short_qualifier(cx: &mut TestAppContext) {
     init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let state = state_with_turns("permission-chip-network", 1);
+        let state = state_with_turns("permission-chip-short", 1);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
     });
@@ -11164,54 +11512,53 @@ fn the_chips_three_rows_each_carry_a_network_clause(cx: &mut TestAppContext) {
     let rows = cx.update(|_, cx| {
         let shell = shell.read(cx);
         let effective = shell.state.effective();
-        super::permission::permission_rows(Lang::En, &effective, &shell.state)
+        super::permission::permission_rows(Lang::En, &effective)
     });
     assert_eq!(rows.len(), 3, "the chip offers exactly three modes");
+    let texts: Vec<&str> = rows.iter().map(|row| row.text.as_str()).collect();
+    assert_eq!(
+        texts,
+        [
+            "Read Only · Nothing written, no commands.",
+            "Workspace Write · Writes stay in this workspace.",
+            "Full access · Writes anywhere.",
+        ],
+        "the menu is scannable: the label plus one short qualifier"
+    );
     for row in &rows {
         assert!(
-            row.text.contains("network available")
-                || row.text.contains("network denied")
-                || row.text.contains("local network"),
-            "every row states the network: {}",
+            row.text.chars().count() <= 48,
+            "the row must stay short: {}",
             row.text
         );
+        let lowered = row.text.to_lowercase();
+        for banned in [
+            "network",
+            "egress",
+            "sandbox",
+            "proxy",
+            "mcp",
+            "browser",
+            "allowlist",
+            "shell",
+            "terminal",
+        ] {
+            assert!(
+                !lowered.contains(banned),
+                "the row must not name {banned:?}: {}",
+                row.text
+            );
+        }
     }
-    let workspace_row = rows
-        .iter()
-        .find(|row| row.mode.value() == crate::caps::WORKSPACE_WRITE)
-        .expect("the Workspace Write row");
-    assert!(
-        workspace_row
-            .text
-            .contains("Commands: network available, unrestricted."),
-        "the absent file is the real state, not a hardcoded allowlist: {}",
-        workspace_row.text
-    );
-    let read_only = rows
-        .iter()
-        .find(|row| row.mode == super::permission::Mode::ReadOnly)
-        .expect("the Read Only row");
-    assert!(
-        read_only.text.contains("Hosted web search works")
-            && read_only.text.contains("refused by Read Only"),
-        "the read-only row states the session refusal, not a file reach: {}",
-        read_only.text
-    );
-    assert!(
-        !read_only.text.contains("workspace allowlist"),
-        "and it never carries the allowlist phrase: {}",
-        read_only.text
-    );
 }
 
-/// NEGATIVE: under a preset that denies every destination, no WRITABLE row the
-/// chip draws reads as an open network. The workspace file is ABSENT here,
-/// which is exactly the state a hardcoded "unrestricted" clause would get
-/// wrong. Read Only is not derived at all: it keeps stating its own session
-/// refusal, since the preset can only narrow a mode whose local egress the
-/// session tier still permits.
+/// NEGATIVE: a preset that denies every destination cannot lengthen a menu row,
+/// because the menu makes no network claim at all. The workspace file is ABSENT
+/// here, which is exactly the state the old hardcoded "unrestricted" clause got
+/// wrong; the deny-all preset's reach is still stated by the DETAILED sentence
+/// in the Settings pane, which the permission unit tests pin.
 #[gpui::test]
-fn a_deny_all_preset_chip_never_reads_as_an_open_network(cx: &mut TestAppContext) {
+fn a_deny_all_preset_leaves_the_menu_rows_short(cx: &mut TestAppContext) {
     init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("permission-chip-deny-all", 1);
@@ -11235,7 +11582,7 @@ fn a_deny_all_preset_chip_never_reads_as_an_open_network(cx: &mut TestAppContext
         let shell = shell.read(cx);
         let effective = shell.state.effective();
         (
-            super::permission::permission_rows(Lang::En, &effective, &shell.state),
+            super::permission::permission_rows(Lang::En, &effective),
             effective.preset_id,
         )
     });
@@ -11244,41 +11591,15 @@ fn a_deny_all_preset_chip_never_reads_as_an_open_network(cx: &mut TestAppContext
         "the premise: the session runs the deny-all preset"
     );
     assert_eq!(rows.len(), 3);
-    for row in &rows {
-        assert!(
-            !row.text.contains("unrestricted"),
-            "no row claims an unrestricted network: {}",
-            row.text
-        );
-    }
-    for row in rows
-        .iter()
-        .filter(|row| row.mode != super::permission::Mode::ReadOnly)
-    {
-        assert!(
-            row.text.contains("network denied"),
-            "the deny-all preset is stated on every writable row: {}",
-            row.text
-        );
-        assert!(
-            row.text.contains("network denied by the preset"),
-            "and it names the preset, not the workspace file: {}",
-            row.text
-        );
-    }
-    let read_only = rows
-        .iter()
-        .find(|row| row.mode == super::permission::Mode::ReadOnly)
-        .expect("the Read Only row");
-    assert!(
-        read_only.text.contains("refused by Read Only"),
-        "Read Only states the session refusal the preset cannot change: {}",
-        read_only.text
-    );
-    assert!(
-        !read_only.text.contains("workspace allowlist"),
-        "and it carries no allowlist phrase: {}",
-        read_only.text
+    let texts: Vec<&str> = rows.iter().map(|row| row.text.as_str()).collect();
+    assert_eq!(
+        texts,
+        [
+            "Read Only · Nothing written, no commands.",
+            "Workspace Write · Writes stay in this workspace.",
+            "Full access · Writes anywhere.",
+        ],
+        "a deny-all preset changes the reach, not the menu copy"
     );
 }
 
@@ -11486,17 +11807,16 @@ fn a_read_only_preset_caps_the_chip_policy_data_and_audit(cx: &mut TestAppContex
     let rows = cx.update(|_, cx| {
         let shell = shell.read(cx);
         let effective = shell.state.effective();
-        super::permission::permission_rows(Lang::En, &effective, &shell.state)
+        super::permission::permission_rows(Lang::En, &effective)
     });
     let full = rows
         .iter()
         .find(|row| row.mode.value() == crate::caps::FULL_ACCESS)
         .expect("the Full access row is still listed");
     assert!(!full.enabled, "a preset ceiling disables the row above it");
-    assert!(
-        full.text.contains("This preset keeps it at Read Only"),
-        "and the row says why it cannot be chosen: {}",
-        full.text
+    assert_eq!(
+        full.text, "Full access · Preset caps at Read Only.",
+        "and the row says why it cannot be chosen"
     );
     assert!(
         cx.debug_bounds("permission-chip-read-only").is_some(),
@@ -15219,6 +15539,14 @@ fn the_inspect_link_opens_the_call_in_the_trajectory(cx: &mut TestAppContext) {
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
 
+    // The chip sits on a step of a settled turn, which the shipped 标准 policy
+    // folds under the process group; opening the group is the reader's flow.
+    let group = cx
+        .debug_bounds("process-row-1")
+        .expect("the settled steps fold under the process group");
+    cx.simulate_click(group.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
     // The chip is on the tool row of message 1, its only call.
     let chip = cx
         .debug_bounds("inspect-1-0")
@@ -15390,6 +15718,13 @@ fn a_write_step_opens_its_change_in_the_diff_pane(cx: &mut TestAppContext) {
         cx.update(|_, cx| !shell.read(cx).right.diff.is_open()),
         "the pane starts empty"
     );
+    // The settled turn's steps live behind the process group under the shipped
+    // 标准 policy; opening the group is the flow a reader performs.
+    let group = cx
+        .debug_bounds("process-row-1")
+        .expect("the settled steps fold under the process group");
+    cx.simulate_click(group.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
     let chip = cx
         .debug_bounds("view-diff-1-0")
         .expect("the step offers its diff");
@@ -16072,6 +16407,12 @@ fn a_file_step_opens_in_the_right_panel_editor(cx: &mut TestAppContext) {
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
 
+    // The settled turn's steps live behind the process group; open it first.
+    let group = cx
+        .debug_bounds("process-row-1")
+        .expect("the settled steps fold under the process group");
+    cx.simulate_click(group.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
     let link = cx
         .debug_bounds("open-file-1-0")
         .expect("the path renders as a link");
@@ -23235,7 +23576,6 @@ fn the_audit_tab_sits_beside_chat_and_keeps_the_chat_position(cx: &mut TestAppCo
         matches!(cx.update(|_, cx| shell.read(cx).state.tab), Tab::Audit)
             && cx.debug_bounds("audit").is_some()
             && cx.debug_bounds("audit-summary").is_some()
-            && cx.debug_bounds("audit-limits").is_some()
     });
 
     let chat = cx.debug_bounds("tab-chat").expect("the Chat tab again");
@@ -23456,7 +23796,7 @@ fn a_shell_call_renders_its_recorded_confinement(cx: &mut TestAppContext) {
         });
     });
     draw_until(cx, "the audit renders the call", DRAW_UNTIL_MAX, |cx| {
-        cx.debug_bounds("audit-turn-1").is_some() && cx.debug_bounds("audit-limits").is_some()
+        cx.debug_bounds("audit-turn-1").is_some()
     });
     let turn = cx.debug_bounds("audit-turn-1").expect("turn 1");
     cx.simulate_click(turn.center(), Modifiers::default());
@@ -23788,6 +24128,7 @@ fn an_audit_refusal_is_drawn_at_its_turn(cx: &mut TestAppContext) {
                 evaluator: "bytecode".to_string(),
                 permission: "read-only".to_string(),
                 preset: "read-only".to_string(),
+                presets_disabled: false,
                 error: None,
                 advisories: Vec::new(),
                 advisories_total: 0,
@@ -25015,6 +25356,113 @@ fn switching_the_preset_or_the_permission_rebakes_the_live_policy() {
     );
 }
 
+/// The master preset switch is a LIVE-policy fact like any other preset
+/// change: turning it off parks the same widening gate, confirming rebakes the
+/// compiled document (and bumps the generation the capability lists read) in
+/// the same call, cancelling compiles nothing, and the selection survives so
+/// turning it back on restores the same preset.
+#[test]
+fn the_master_preset_switch_rebakes_the_live_policy() {
+    let mut state = state_with_turns("presets-off-rebake", 1);
+    let id = state.active_id.clone().expect("a session");
+    state.settings.global.presets.insert(
+        "capped".to_string(),
+        crate::settings::global::Preset {
+            permission: Some(crate::caps::READ_ONLY.to_string()),
+            plugins: vec!["files".to_string()],
+            deny: vec![".env".to_string()],
+            egress: Some(Vec::new()),
+            builtin_policy: vec!["read-only".to_string()],
+            ..Default::default()
+        },
+    );
+    state.settings.global.default_preset = "capped".to_string();
+    state.rebake_policy();
+    let generation = state.policy_generation;
+    assert_eq!(
+        state
+            .policy
+            .as_ref()
+            .expect("the premise: a live policy")
+            .data()
+            .preset,
+        "capped"
+    );
+    assert_eq!(
+        state.policy.as_ref().expect("live").data().permission,
+        crate::caps::READ_ONLY
+    );
+
+    // Off parks a confirmation; cancelling it changes nothing at all.
+    let pending = state
+        .presets_off_pending()
+        .expect("a capping preset loses facts, so the gate opens");
+    state.pending_preset = Some(pending);
+    state.cancel_pending_preset();
+    assert_eq!(
+        state.policy_generation, generation,
+        "cancelling compiles nothing"
+    );
+    assert!(
+        state.settings.global.general.presets_active(),
+        "and keeps presets enabled"
+    );
+
+    // Confirm: the switch is committed and the policy rebaked in the same call.
+    let pending = state.presets_off_pending().expect("still a widening");
+    state.pending_preset = Some(pending);
+    state.apply_pending_preset();
+    assert_eq!(
+        state.settings.global.general.presets_enabled,
+        Some(false),
+        "the switch is committed, not drafted"
+    );
+    assert_eq!(
+        state.policy_generation,
+        generation + 1,
+        "the live policy was recompiled for it"
+    );
+    let policy = state.policy.as_ref().expect("rebaked");
+    assert_eq!(policy.data().preset, "", "no preset is the authority");
+    assert!(policy.data().presets_disabled);
+    assert_eq!(
+        policy.data().permission,
+        crate::caps::WORKSPACE_WRITE,
+        "the session's own mode, uncapped"
+    );
+    assert!(
+        !policy.data().preset_egress_restricted && policy.data().preset_deny_roots.is_empty(),
+        "no preset scope or egress module is compiled"
+    );
+    assert_eq!(
+        state.effective_in(&id).preset_id,
+        "",
+        "the next turn builds with no preset"
+    );
+
+    // The selection is KEPT, and the file the next launch reads agrees.
+    assert_eq!(state.settings.global.default_preset, "capped");
+    let root = state.settings.save_root.clone().expect("a scratch root");
+    let reloaded = crate::settings::global::GlobalSettings::load(&root.join("settings.toml"))
+        .expect("the saved file reloads");
+    assert_eq!(reloaded.general.presets_enabled, Some(false));
+    assert_eq!(reloaded.default_preset, "capped");
+
+    // On again: no gate (it only narrows), and the same preset is back.
+    state
+        .commit_presets_enabled(true)
+        .expect("the switch is saved");
+    let policy = state.policy.as_ref().expect("rebaked");
+    assert_eq!(policy.data().preset, "capped");
+    assert_eq!(policy.data().permission, crate::caps::READ_ONLY);
+    assert!(!policy.data().presets_disabled);
+    assert_eq!(
+        state.effective_in(&id).preset_id,
+        "capped",
+        "the previous selection is restored, not reset to the built-in default"
+    );
+}
+
 /// A steer joins the RUNNING agent, whose permission, sandbox and tool set
 /// were baked at spawn. Once the reader changes the preset or permission the
 /// queue must hold the message for the next (freshly built) turn instead of
@@ -25193,6 +25641,445 @@ fn a_widening_preset_change_waits_for_confirmation(cx: &mut TestAppContext) {
     );
 }
 
+/// The master preset switch, pressed for real: it leads the pane, gates the
+/// widening OFF, leaves every preset enabled on Cancel, and on Confirm turns the
+/// cards inert, records WHY in the live policy and persists the switch.
+#[gpui::test]
+fn the_master_preset_switch_turns_every_preset_off_after_a_gate(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("presets-master-switch", 1);
+        state.settings.global.presets.insert(
+            "guarded".to_string(),
+            crate::settings::global::Preset {
+                name: Some("guarded".to_string()),
+                permission: Some(crate::caps::READ_ONLY.to_string()),
+                read: Some(vec![".".to_string()]),
+                write: Some(Vec::new()),
+                deny: vec![".env".to_string()],
+                egress: Some(Vec::new()),
+                plugins: vec!["files".to_string(), "plan".to_string()],
+                tools: Some(vec!["read_file".to_string(), "list_dir".to_string()]),
+                builtin_policy: vec!["read-only".to_string()],
+                order: Some(-1),
+                ..Default::default()
+            },
+        );
+        state.settings.global.default_preset = "guarded".to_string();
+        // Compile once so the generation probe measures the SWITCH, not the
+        // dialog's own first build.
+        state.rebake_policy();
+        let shell =
+            cx.new(|cx| Shell::build_for_test(window, section_index("agent-presets"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let active = cx.update(|_, cx| shell.read(cx).state.active_id.clone().expect("a session"));
+    let generation = cx.update(|_, cx| shell.read(cx).state.policy_generation);
+
+    let switch = cx
+        .debug_bounds("presets-enabled")
+        .expect("the master switch leads the pane");
+    cx.simulate_click(switch.center(), Modifiers::default());
+    draw_until(cx, "the presets-off gate opens", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("preset-risk").is_some()
+    });
+    let pending = cx
+        .update(|_, cx| shell.read(cx).state.pending_preset.clone())
+        .expect("the switch parked a confirmation");
+    assert!(matches!(
+        pending.apply,
+        crate::state::PresetApply::DisablePresets
+    ));
+    for fact in [
+        crate::preset_catalogue::RiskFact::LosesPermissionCeiling,
+        crate::preset_catalogue::RiskFact::LosesPathScope,
+        crate::preset_catalogue::RiskFact::LosesEgress,
+        crate::preset_catalogue::RiskFact::LosesToolSet,
+        crate::preset_catalogue::RiskFact::LosesPolicyModules,
+    ] {
+        assert!(
+            pending.facts.contains(&fact),
+            "the gate names {fact:?}: {:?}",
+            pending.facts
+        );
+    }
+    let sentence = crate::ui::settings::presets_off_sentence(Lang::En, &pending.facts);
+    assert!(sentence.contains("permission ceiling"), "{sentence}");
+    assert!(sentence.contains("paths"), "{sentence}");
+    assert!(sentence.contains("network"), "{sentence}");
+    assert!(sentence.contains("tools"), "{sentence}");
+    assert!(sentence.contains("policy guards"), "{sentence}");
+    assert!(
+        !sentence.contains("danger-full-access") && !sentence.contains("level"),
+        "the reader does not need the authorization table: {sentence}"
+    );
+    assert_ne!(
+        crate::ui::settings::presets_off_sentence(Lang::Zh, &pending.facts),
+        sentence,
+        "the sentence is localized"
+    );
+    assert!(
+        cx.update(|_, cx| shell
+            .read(cx)
+            .state
+            .settings
+            .global
+            .general
+            .presets_active()),
+        "nothing is committed while the dialog is open"
+    );
+
+    // Cancel keeps presets enabled and changes nothing.
+    let cancel = cx.debug_bounds("preset-risk-cancel").expect("cancel");
+    cx.simulate_click(cancel.center(), Modifiers::default());
+    draw_until(cx, "the gate closes on cancel", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("preset-risk").is_none()
+    });
+    assert!(cx.update(|_, cx| shell
+        .read(cx)
+        .state
+        .settings
+        .global
+        .general
+        .presets_active()));
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).state.policy_generation),
+        generation,
+        "cancelling compiles nothing"
+    );
+
+    // Press it again and confirm.
+    let switch = cx
+        .debug_bounds("presets-enabled")
+        .expect("the master switch");
+    cx.simulate_click(switch.center(), Modifiers::default());
+    draw_until(cx, "the gate reopens", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("preset-risk-confirm").is_some()
+    });
+    let confirm = cx.debug_bounds("preset-risk-confirm").expect("confirm");
+    cx.simulate_click(confirm.center(), Modifiers::default());
+    draw_until(cx, "the gate closes on confirm", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("preset-risk").is_none()
+    });
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).state.settings.global.general.presets_enabled),
+        Some(false),
+        "confirm applies and persists the switch"
+    );
+    assert!(cx.update(|_, cx| shell.read(cx).state.effective().presets_disabled));
+    // The TWO master switches are independent facts: turning presets off must
+    // not touch heel, exactly as the heel switch must not touch this one.
+    assert!(
+        cx.update(|_, cx| shell
+            .read(cx)
+            .state
+            .settings
+            .global
+            .general
+            .sandbox_active()),
+        "the sandbox master switch is a different fact"
+    );
+    let policy = cx.update(|_, cx| shell.read(cx).state.policy.clone().expect("rebaked"));
+    assert_eq!(policy.data().preset, "");
+    assert!(
+        policy.data().presets_disabled,
+        "the live policy records WHY no preset applied"
+    );
+    assert_eq!(policy.data().permission, crate::caps::WORKSPACE_WRITE);
+    assert!(
+        policy
+            .modules()
+            .iter()
+            .all(|module| module.id == "builtin:baseline"
+                || module.id == "builtin:session-permission"),
+        "no preset-contributed module survives: {:?}",
+        policy
+            .modules()
+            .iter()
+            .map(|module| module.id.clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        cx.update(|_, cx| shell.read(cx).state.policy_generation) > generation,
+        "the policy generation bumped in the same frame"
+    );
+
+    // Persisted where a relaunch reads it, and the selection is kept.
+    let reloaded = reloaded_settings(&scratch_home("presets-master-switch"));
+    assert_eq!(reloaded.global.general.presets_enabled, Some(false));
+    assert_eq!(reloaded.global.default_preset, "guarded");
+
+    // The cards are inert: neither the Use action nor the card itself records a
+    // selection while nothing applies.
+    let use_link = cx
+        .debug_bounds("preset-use-0")
+        .expect("the guarded card footer");
+    cx.simulate_click(use_link.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).state.session_choice(&active).preset),
+        None,
+        "Use in this chat is disabled while presets are off"
+    );
+    let card = cx.debug_bounds("preset-0").expect("the guarded card");
+    cx.simulate_click(card.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).state.draft().global.default_preset.clone()),
+        "guarded",
+        "the card cannot change the default while it is inert"
+    );
+
+    // The copy the two surfaces carry.
+    let (reason, usable) =
+        crate::ui::settings::preset_use_action(Lang::En, false, false, false, false);
+    assert_eq!(reason, "Presets are off");
+    assert!(!usable, "the action is refused, not merely relabelled");
+    assert_eq!(
+        crate::ui::composer::preset_chip_label(Lang::En, "", true, false),
+        "No preset"
+    );
+    assert_eq!(
+        crate::ui::composer::preset_chip_label(Lang::En, "guarded", false, false),
+        "guarded"
+    );
+    assert_eq!(
+        crate::ui::composer::preset_chip_label(Lang::En, "", false, false),
+        "Default"
+    );
+
+    // On again: no gate (it only narrows), and the same preset is back.
+    let switch = cx
+        .debug_bounds("presets-enabled")
+        .expect("the master switch");
+    cx.simulate_click(switch.center(), Modifiers::default());
+    draw_until(cx, "presets are back on", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| {
+            shell
+                .read(cx)
+                .state
+                .settings
+                .global
+                .general
+                .presets_active()
+        })
+    });
+    assert!(
+        cx.debug_bounds("preset-risk").is_none(),
+        "turning presets back on only restores restrictions, so it needs no gate"
+    );
+    let policy = cx.update(|_, cx| shell.read(cx).state.policy.clone().expect("rebaked"));
+    assert_eq!(policy.data().preset, "guarded");
+    assert_eq!(policy.data().permission, crate::caps::READ_ONLY);
+    let notice = cx.update(|_, cx| shell.read(cx).state.notice.clone().unwrap_or_default());
+    assert!(
+        notice.contains("guarded"),
+        "the restored preset is named: {notice}"
+    );
+}
+
+/// The heel master switch, pressed for real: it leads the Agent presets pane,
+/// gates the widening OFF, leaves heel applied while the dialog is open, and on
+/// Confirm turns heel off for a preset that asked for it, rebakes the live policy
+/// in the same frame, persists, and shows the state on the ambient surfaces.
+#[gpui::test]
+fn the_master_sandbox_switch_asks_before_it_releases_heel(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("sandbox-master-switch", 1);
+        // A full-access session whose PRESET is the only thing confining the
+        // shell, so the switch is unambiguously what releases it and the
+        // override is the fact the gate has to name.
+        state.settings.workspace.agent.permission = crate::caps::FULL_ACCESS.to_string();
+        state.settings.global.presets.insert(
+            "confined".to_string(),
+            crate::settings::global::Preset {
+                name: Some("confined".to_string()),
+                permission: Some(crate::caps::FULL_ACCESS.to_string()),
+                sandbox: Some(crate::settings::global::SandboxChoice::Heel),
+                plugins: vec!["shell".to_string(), "files".to_string()],
+                ..Default::default()
+            },
+        );
+        state.settings.global.default_preset = "confined".to_string();
+        state.rebake_policy();
+        let shell =
+            cx.new(|cx| Shell::build_for_test(window, section_index("agent-presets"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let generation = cx.update(|_, cx| shell.read(cx).state.policy_generation);
+    assert!(
+        cx.update(|_, cx| shell.read(cx).state.effective().sandbox.heel),
+        "the premise: the preset confines the shell"
+    );
+
+    // The switch parks a widening and commits nothing while it is open.
+    let switch = cx
+        .debug_bounds("sandbox-enabled")
+        .expect("the heel switch leads the presets pane");
+    cx.simulate_click(switch.center(), Modifiers::default());
+    draw_until(cx, "the sandbox-off gate opens", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("preset-risk").is_some()
+    });
+    let pending = cx
+        .update(|_, cx| shell.read(cx).state.pending_preset.clone())
+        .expect("the switch parked a confirmation");
+    assert!(matches!(
+        pending.apply,
+        crate::state::PresetApply::DisableSandbox
+    ));
+    for fact in [
+        crate::preset_catalogue::RiskFact::SandboxOffFilesystem,
+        crate::preset_catalogue::RiskFact::SandboxOffEgress,
+        crate::preset_catalogue::RiskFact::SandboxOffOverridesPresets,
+    ] {
+        assert!(
+            pending.facts.contains(&fact),
+            "the gate names {fact:?}: {:?}",
+            pending.facts
+        );
+    }
+    let sentence = crate::ui::settings::sandbox_off_sentence(Lang::En, &pending.facts);
+    assert!(sentence.contains("filesystem"), "{sentence}");
+    assert!(sentence.contains("egress"), "{sentence}");
+    assert!(
+        sentence.contains("preset"),
+        "the preset override is named, not implied: {sentence}"
+    );
+    assert_ne!(
+        crate::ui::settings::sandbox_off_sentence(Lang::Zh, &pending.facts),
+        sentence,
+        "the sentence is localized"
+    );
+    assert!(
+        cx.update(|_, cx| shell
+            .read(cx)
+            .state
+            .settings
+            .global
+            .general
+            .sandbox_active()),
+        "nothing is committed while the dialog is open"
+    );
+
+    // Cancel: still on, and nothing compiled.
+    let cancel = cx.debug_bounds("preset-risk-cancel").expect("cancel");
+    cx.simulate_click(cancel.center(), Modifiers::default());
+    draw_until(cx, "the gate closes on cancel", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("preset-risk").is_none()
+    });
+    assert!(cx.update(|_, cx| shell
+        .read(cx)
+        .state
+        .settings
+        .global
+        .general
+        .sandbox_active()));
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).state.policy_generation),
+        generation,
+        "cancelling compiles nothing"
+    );
+
+    // Confirm: committed, saved and rebaked in the same frame.
+    let switch = cx.debug_bounds("sandbox-enabled").expect("the switch");
+    cx.simulate_click(switch.center(), Modifiers::default());
+    draw_until(cx, "the gate reopens", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("preset-risk-confirm").is_some()
+    });
+    let confirm = cx.debug_bounds("preset-risk-confirm").expect("confirm");
+    cx.simulate_click(confirm.center(), Modifiers::default());
+    draw_until(cx, "the gate closes on confirm", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("preset-risk").is_none()
+    });
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).state.settings.global.general.sandbox_enabled),
+        Some(false),
+        "confirm applies and persists the switch"
+    );
+    assert!(
+        cx.update(|_, cx| shell.read(cx).state.policy_generation) > generation,
+        "the policy generation bumped in the same frame"
+    );
+    let off = cx.update(|_, cx| shell.read(cx).state.effective().sandbox);
+    assert!(!off.heel, "heel is no longer applied");
+    assert!(off.off_by_settings);
+    assert!(
+        off.overrides_preset(),
+        "the preset's own heel arm is overridden, not silently dropped"
+    );
+    // End to end: the next turn's bash refusal carries the SETTINGS reason, not
+    // the preset's own arm and not the permission's release.
+    assert_eq!(
+        crate::settings::resolve::sandbox_off_reason(&off),
+        Some(agent::tools::bash::SANDBOX_SETTINGS_OFF_REASON),
+        "the reason constant names the settings switch"
+    );
+    // The PRESET still applies: this switch is not a second "presets off".
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).state.effective().preset_id),
+        "confined"
+    );
+    assert!(cx.update(|_, cx| shell
+        .read(cx)
+        .state
+        .settings
+        .global
+        .general
+        .presets_active()));
+
+    // Persisted where a relaunch reads it, and the preset switch is untouched.
+    let reloaded = reloaded_settings(&scratch_home("sandbox-master-switch"));
+    assert_eq!(reloaded.global.general.sandbox_enabled, Some(false));
+    assert_eq!(reloaded.global.default_preset, "confined");
+    assert!(
+        reloaded.global.general.presets_active(),
+        "the preset switch is a different fact"
+    );
+
+    // The affected preset CARD states the override, in both languages.
+    let card_en = crate::ui::settings::preset_sandbox_text(
+        Some(crate::settings::global::SandboxChoice::Heel),
+        false,
+        true,
+        Lang::En,
+    );
+    assert!(
+        card_en.to_lowercase().contains("overridden"),
+        "the card says the switch overrides the declaration: {card_en}"
+    );
+    let card_zh = crate::ui::settings::preset_sandbox_text(
+        Some(crate::settings::global::SandboxChoice::Heel),
+        false,
+        true,
+        Lang::Zh,
+    );
+    assert_ne!(card_en, card_zh, "the card is localized");
+
+    // Ambient: the terminal's own status line names it while the pane runs.
+    // The permission menu deliberately does not: its rows are the label and a
+    // short qualifier, and the sandbox already has the Settings switch row, the
+    // terminal line and each call's audit.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(crate::ui::right_panel::RightTab::Terminal, cx);
+        })
+    });
+    let status = cx.update(|_, cx| shell.read(cx).terminal_status_text());
+    let (text, _) = status.expect("the pane reports the standing fact");
+    assert!(
+        text.contains(&crate::i18n::tr(
+            Lang::En,
+            "right.terminal.sandboxOffSettings"
+        )),
+        "the terminal names the SETTINGS switch, not a preset: {text}"
+    );
+}
+
 /// The policy pane draws one row per compiled module, so the ids the plan
 /// reserves are visible rather than only documented.
 #[gpui::test]
@@ -25320,4 +26207,790 @@ fn a_sandbox_off_widening_names_the_bash_reason_and_cancels(cx: &mut TestAppCont
         None,
         "cancelling keeps the previous preset"
     );
+}
+
+/// The Agent presets pane leads with the TWO master switches: the heel switch
+/// (confinement for every preset) first, then the preset switch (whether presets
+/// apply at all). Both are one line, and the first card's footer stays above the
+/// pane bottom at the harness's own window.
+#[gpui::test]
+fn the_presets_pane_leads_with_heel_then_the_preset_master(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (_harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("preset-master-order", 1);
+        let shell =
+            cx.new(|cx| Shell::build_for_test(window, section_index("agent-presets"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let heel = cx.debug_bounds("sandbox-enabled").expect("the heel master");
+    let presets = cx
+        .debug_bounds("presets-enabled")
+        .expect("the preset master");
+    assert!(
+        heel.origin.y < presets.origin.y,
+        "the heel master must lead the pane: heel={heel:?} presets={presets:?}"
+    );
+    let heel_row = cx.debug_bounds("sandbox-master-row").expect("the heel row");
+    let presets_row = cx
+        .debug_bounds("presets-master-row")
+        .expect("the preset row");
+    assert!(
+        heel_row.size.height < px(48.0),
+        "the heel row is ONE line: {heel_row:?}"
+    );
+    assert!(
+        presets_row.size.height < px(48.0),
+        "the preset row is ONE line: {presets_row:?}"
+    );
+
+    // The consequence is not merely CLIPPED to one line: each state's sentence
+    // fits the width the row ALLOTS it, so "presets still apply" and the losses
+    // are readable rather than hiding behind an ellipsis. The allotted width is
+    // the text block less the title and the 8px gap (a clipped child reports
+    // only the width it was given, so the block and title are the honest source).
+    let heel_block = cx
+        .debug_bounds("sandbox-master-text")
+        .expect("the heel text block");
+    let heel_title = cx
+        .debug_bounds("sandbox-master-title")
+        .expect("the heel title");
+    let presets_block = cx
+        .debug_bounds("presets-master-text")
+        .expect("the preset text block");
+    let presets_title = cx
+        .debug_bounds("presets-master-title")
+        .expect("the preset title");
+    let heel_available = f32::from(heel_block.size.width) - f32::from(heel_title.size.width) - 8.0;
+    let presets_available =
+        f32::from(presets_block.size.width) - f32::from(presets_title.size.width) - 8.0;
+    let (heel_on, heel_off, presets_needed) = cx.update(|window, _| {
+        let shape = |text: String, size: f32| {
+            let run = window.text_style().to_run(text.len());
+            f32::from(
+                window
+                    .text_system()
+                    .shape_line(text.into(), px(size), &[run], None)
+                    .width(),
+            )
+        };
+        (
+            shape(
+                crate::i18n::tr(Lang::En, "settings.sandboxEnabledConsequence"),
+                11.0,
+            ),
+            shape(
+                crate::i18n::tr(Lang::En, "settings.sandboxOffConsequence"),
+                11.0,
+            ),
+            shape(
+                crate::i18n::tr(Lang::En, "settings.presetsEnabledConsequence"),
+                11.5,
+            ),
+        )
+    });
+    assert!(
+        heel_on <= heel_available + 0.5,
+        "the ON heel consequence fits: needs {heel_on}px, has {heel_available}px"
+    );
+    assert!(
+        heel_off <= heel_available + 0.5,
+        "the OFF heel consequence fits: needs {heel_off}px, has {heel_available}px"
+    );
+    assert!(
+        presets_needed <= presets_available + 0.5,
+        "the presets consequence fits: needs {presets_needed}px, has {presets_available}px"
+    );
+
+    // Distinct labels, in both languages; the rendered rows read these keys.
+    let en_heel = crate::i18n::tr(Lang::En, "settings.sandboxEnabledTitle");
+    let en_presets = crate::i18n::tr(Lang::En, "settings.presetsEnabledTitle");
+    assert_ne!(
+        en_heel, en_presets,
+        "the two masters must not share a label"
+    );
+    assert!(
+        en_heel.to_lowercase().contains("sandbox"),
+        "the heel label names the sandbox: {en_heel}"
+    );
+    assert!(
+        en_presets.to_lowercase().contains("preset"),
+        "the preset label names presets: {en_presets}"
+    );
+    let zh_heel = crate::i18n::tr(Lang::Zh, "settings.sandboxEnabledTitle");
+    let zh_presets = crate::i18n::tr(Lang::Zh, "settings.presetsEnabledTitle");
+    assert_ne!(zh_heel, zh_presets, "the labels differ in zh too");
+    assert_ne!(zh_heel, en_heel, "the heel label is localized");
+
+    // The pane still fits: the first card's footer is above the pane bottom.
+    let pane = cx.debug_bounds("settings-pane").expect("the pane");
+    let use0 = cx
+        .debug_bounds("preset-use-0")
+        .expect("the first card footer");
+    assert!(
+        use0.bottom() <= pane.bottom(),
+        "preset-use-0 must stay above the pane bottom: use0={use0:?} pane={pane:?}"
+    );
+    eprintln!(
+        "PRESETS-PANE heel_y={} presets_y={} heel_row_h={} presets_row_h={} use0_top={} use0_bottom={} pane_bottom={} headroom={}",
+        f32::from(heel.origin.y),
+        f32::from(presets.origin.y),
+        f32::from(heel_row.size.height),
+        f32::from(presets_row.size.height),
+        f32::from(use0.origin.y),
+        f32::from(use0.bottom()),
+        f32::from(pane.bottom()),
+        f32::from(pane.bottom() - use0.bottom())
+    );
+}
+
+/// The setting has ONE owner. General carries no sandbox switch, only a pointer
+/// that reports the committed value and opens the pane that owns it.
+#[gpui::test]
+fn the_sandbox_switch_has_one_owner_and_general_points_at_it(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("sandbox-one-owner", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("general"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("sandbox-enabled").is_none(),
+        "General must not carry a second switch for the same fact"
+    );
+    let pointer = cx
+        .debug_bounds("sandbox-pointer")
+        .expect("General's pointer row");
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    assert!(
+        cx.update(|_, cx| shell
+            .read(cx)
+            .state
+            .settings
+            .global
+            .general
+            .sandbox_active()),
+        "the premise: the committed sandbox is on"
+    );
+    let label = crate::i18n::tr(Lang::En, "settings.sandboxPointerOn");
+    assert_eq!(label, "Sandbox: on \u{00b7} manage in Agent presets");
+    assert_ne!(
+        crate::i18n::tr(Lang::Zh, "settings.sandboxPointerOn"),
+        label,
+        "the pointer is localized"
+    );
+
+    // The pointer is navigation, not a control: it opens the ONE pane.
+    cx.simulate_click(pointer.center(), Modifiers::default());
+    draw_until(
+        cx,
+        "the pointer opens Agent presets",
+        DRAW_UNTIL_MAX,
+        |cx| cx.debug_bounds("sandbox-enabled").is_some(),
+    );
+    assert!(
+        cx.debug_bounds("presets-enabled").is_some(),
+        "the pane it opened carries both master switches"
+    );
+    assert!(
+        cx.debug_bounds("sandbox-pointer").is_none(),
+        "the pointer belongs to General only"
+    );
+}
+
+/// The Apply presets sentence is derived from the resolved sandbox state: it
+/// names the sandbox only while the heel switch leaves a preset's sandbox arm
+/// applicable, and both forms are one line.
+#[test]
+fn the_presets_sentence_names_the_sandbox_only_while_it_applies() {
+    let with_sandbox = Shell::presets_apply_consequence(Lang::En, true);
+    let without_sandbox = Shell::presets_apply_consequence(Lang::En, false);
+    assert_ne!(
+        with_sandbox, without_sandbox,
+        "the sentence changes with the sandbox state"
+    );
+    assert!(
+        with_sandbox.contains("sandbox"),
+        "the sandbox is named while it applies: {with_sandbox}"
+    );
+    assert!(
+        !without_sandbox.contains("sandbox"),
+        "and not named while the heel switch is off: {without_sandbox}"
+    );
+    for sentence in [&with_sandbox, &without_sandbox] {
+        assert!(sentence.contains("permission"), "{sentence}");
+        assert!(sentence.contains("paths"), "{sentence}");
+        assert!(sentence.contains("tools"), "{sentence}");
+        assert!(!sentence.contains('\n'), "one line: {sentence}");
+    }
+    assert_ne!(
+        Shell::presets_apply_consequence(Lang::Zh, true),
+        with_sandbox,
+        "the sentence is localized"
+    );
+    assert_ne!(
+        Shell::presets_apply_consequence(Lang::Zh, false),
+        without_sandbox,
+        "the no-sandbox sentence is localized"
+    );
+}
+
+/// The preset master's row keeps its one-line height after the heel switch is
+/// turned off, and the card footer stays reachable in both states.
+#[gpui::test]
+fn the_preset_master_row_stays_one_line_in_both_sandbox_states(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("preset-row-one-line", 1);
+        let shell =
+            cx.new(|cx| Shell::build_for_test(window, section_index("agent-presets"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let on = cx
+        .debug_bounds("presets-master-row")
+        .expect("the preset row while the sandbox is on");
+    assert!(
+        cx.debug_bounds("presets-consequence-sandbox").is_some(),
+        "the rendered sentence names the sandbox while heel applies"
+    );
+    assert!(
+        cx.debug_bounds("presets-consequence-no-sandbox").is_none(),
+        "and not before the switch flips"
+    );
+    let reachable_on = cx.debug_bounds("preset-use-0").expect("the first footer");
+    let pane = cx.debug_bounds("settings-pane").expect("the pane");
+    assert!(
+        reachable_on.bottom() <= pane.bottom(),
+        "sandbox on: {reachable_on:?} vs {pane:?}"
+    );
+
+    shell.update(cx, |this, cx| this.set_sandbox_enabled(false, cx));
+    draw_until(cx, "the sandbox is off", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| {
+            !shell
+                .read(cx)
+                .state
+                .settings
+                .global
+                .general
+                .sandbox_active()
+        })
+    });
+    let off = cx
+        .debug_bounds("presets-master-row")
+        .expect("the preset row while the sandbox is off");
+    assert!(
+        cx.debug_bounds("presets-consequence-no-sandbox").is_some(),
+        "the rendered sentence no longer claims a sandbox cap"
+    );
+    assert!(
+        cx.debug_bounds("presets-consequence-sandbox").is_none(),
+        "the sandbox sentence is gone, not merely hidden behind a twin"
+    );
+    assert_eq!(
+        on.size.height, off.size.height,
+        "the sentence changes but the row keeps its one-line height"
+    );
+    assert!(
+        off.size.height < px(48.0),
+        "and that height is one line: {off:?}"
+    );
+    let reachable_off = cx.debug_bounds("preset-use-0").expect("the first footer");
+    let pane = cx.debug_bounds("settings-pane").expect("the pane");
+    assert!(
+        reachable_off.bottom() <= pane.bottom(),
+        "sandbox off: {reachable_off:?} vs {pane:?}"
+    );
+}
+
+/// A terminal keeps the sandbox it was SPAWNED with when the master switch
+/// flips, and the pane says so; a terminal opened after the flip resolves the
+/// new spec and is unconfined.
+///
+/// Both halves matter: "the sandbox is off" must not be read as having released
+/// the shell that is already running, and a newly opened pane must not inherit
+/// the old confinement either.
+#[gpui::test]
+fn a_flipped_sandbox_reaches_a_new_terminal_but_not_the_open_one(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_workspace_tree("terminal-flip");
+        tests_pin_reference_defaults(&mut state);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_window, cx| {
+        shell.update(cx, |this, cx| {
+            this.right.open = true;
+            this.open_right_tab(RightTab::Terminal, cx);
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // The premise: this terminal was spawned while heel applied. It could not
+    // host the pane's tty, so it records that rather than claiming confinement.
+    let first = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        let terminal = shell.right.terminal.as_ref().expect("the first terminal");
+        (
+            terminal.sandbox_off,
+            terminal.sandbox_label().map(str::to_string),
+        )
+    });
+    assert_eq!(
+        first.0, None,
+        "the first terminal was not released by a policy"
+    );
+    assert!(
+        first.1.is_some() && first.1.as_deref() != Some("none"),
+        "a confined spec records the backend answer, not a policy release: {first:?}"
+    );
+
+    // Flip the master switch off.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| this.set_sandbox_enabled(false, cx));
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let (kept, status) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (
+            shell
+                .right
+                .terminal
+                .as_ref()
+                .expect("the first terminal")
+                .sandbox_off,
+            shell.terminal_status_text(),
+        )
+    });
+    assert_eq!(
+        kept, None,
+        "the open terminal keeps the spec it was spawned with"
+    );
+    let text = status.expect("the pane reports the mismatch").0;
+    assert!(
+        text.contains("keeps the sandbox it started with"),
+        "the notice says the running shell keeps its spawn spec: {text}"
+    );
+
+    // A NEW terminal resolves the flipped setting and is unconfined.
+    cx.update(|_window, cx| {
+        shell.update(cx, |this, cx| {
+            this.right.terminal = None;
+            this.open_right_tab(RightTab::Terminal, cx);
+        });
+    });
+    let second = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        let terminal = shell.right.terminal.as_ref().expect("a new terminal");
+        (
+            terminal.sandbox_off,
+            terminal.sandbox_label().map(str::to_string),
+        )
+    });
+    assert_eq!(
+        second.0,
+        Some(crate::terminal::SandboxOff::Settings),
+        "the new terminal is attributed to the switch"
+    );
+    assert_eq!(
+        second.1.as_deref(),
+        Some("none"),
+        "and the shell's own BSH_SANDBOX says none"
+    );
+}
+
+/// A PERMISSION change also leaves an open terminal on its spawn spec.
+///
+/// The master switch is not the only control that can release a shell: raising
+/// the session to Full access does too. A terminal opened while heel applied
+/// keeps its confined spec, the pane says it keeps it, and only a NEW terminal
+/// resolves the released state.
+#[gpui::test]
+fn a_permission_change_keeps_an_open_terminal_on_its_spawn_spec(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_workspace_tree("terminal-permission");
+        tests_pin_reference_defaults(&mut state);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_window, cx| {
+        shell.update(cx, |this, cx| {
+            this.right.open = true;
+            this.open_right_tab(RightTab::Terminal, cx);
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let before = cx.update(|_, cx| {
+        let terminal = shell
+            .read(cx)
+            .right
+            .terminal
+            .as_ref()
+            .expect("the terminal")
+            .sandbox_label()
+            .map(str::to_string);
+        let status = shell.read(cx).terminal_status_text().map(|(text, _)| text);
+        (terminal, status)
+    });
+    assert!(
+        before.0.as_deref() != Some("full-access"),
+        "the premise: the terminal was spawned confined: {before:?}"
+    );
+
+    // Raise the session to Full access and rebake, the way the permission
+    // control does.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.state.settings.workspace.agent.permission = crate::caps::FULL_ACCESS.to_string();
+            let effective = this.state.effective();
+            let policy = crate::caps::policy_for_effective(&this.state.settings, &effective);
+            this.state.set_policy(policy);
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let (kept, status) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        let terminal = shell.right.terminal.as_ref().expect("the terminal");
+        (
+            terminal.sandbox_label().map(str::to_string),
+            shell.terminal_status_text().map(|(text, _)| text),
+        )
+    });
+    assert_eq!(
+        kept.as_deref(),
+        before.0.as_deref(),
+        "the open terminal keeps the label it spawned with"
+    );
+    let text = status.expect("the pane reports the permission change");
+    assert!(
+        text.contains("keeps the sandbox it started with"),
+        "a permission change is named as a spawn-spec mismatch: {text}"
+    );
+}
+
+/// Boot a shell over a live turn whose pump this test drives, returning the
+/// shell, its context and the event sender.
+///
+/// The pump is the production one; only the channel is the test's, which is
+/// what lets a test decide when a delta arrives, when the stream ends, and when
+/// nothing happens at all.
+fn pumping_live_turn<'a>(
+    cx: &'a mut TestAppContext,
+    label: &'static str,
+) -> (
+    Entity<Shell>,
+    &'a mut VisualTestContext,
+    async_channel::Sender<crate::runner::AgentEvent>,
+) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns(label, 4);
+        let id = state.active_id.clone().expect("an active session");
+        state
+            .begin_turn_in(&id, "a question that waits")
+            .expect("a live turn");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let (tx, rx) = async_channel::unbounded();
+    cx.update(|_, cx| {
+        let id = shell
+            .read(cx)
+            .state
+            .active_id
+            .clone()
+            .expect("an active session");
+        shell.update(cx, |this, cx| this.pump_for_test(id, rx, cx));
+    });
+    for _ in 0..4 {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+    (shell, cx, tx)
+}
+
+/// Advance the test clock by this many milliseconds and report how many frames
+/// the tick cost: a timer that notifies marks the window dirty, which the test
+/// mode draws during the next effect flush.
+fn clock_tick(cx: &mut VisualTestContext, shell: &Entity<Shell>, millis: u64) -> u64 {
+    let before = cx.update(|_, cx| shell.read(cx).frame_no);
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(millis));
+    cx.run_until_parked();
+    let after = cx.update(|_, cx| shell.read(cx).frame_no);
+    after - before
+}
+
+/// A live turn whose content never changes must not repaint on the clock: the
+/// running line only moves once a second, so a tick that leaves that figure
+/// alone owes no frame. When the figure does move, exactly one frame is owed -
+/// and the frame records it, so the ticks after it are quiet again.
+#[gpui::test]
+fn a_silent_live_turn_repaints_only_when_its_elapsed_label_changes(cx: &mut TestAppContext) {
+    let (shell, cx, _tx) = pumping_live_turn(cx, "elapsed-clock");
+    let label =
+        |cx: &mut VisualTestContext| cx.update(|_, cx| shell.read(cx).state.turn_elapsed_seconds());
+    // The real clock has been running since the turn opened, so the figure is
+    // whatever it is; what matters is that this second does not move.
+    let first = label(cx).expect("the running line has a figure");
+    let idle: Vec<u64> = (0..4).map(|_| clock_tick(cx, &shell, 200)).collect();
+    assert_eq!(
+        idle,
+        vec![0, 0, 0, 0],
+        "a tick that leaves the label alone must not repaint: {idle:?}"
+    );
+    // Move the figure well on WITHOUT notifying: the clock is the only thing
+    // that can repaint from here.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.state.turn_started =
+                Some(std::time::Instant::now() - std::time::Duration::from_secs(first + 10));
+        });
+    });
+    assert!(
+        label(cx).expect("a figure") > first,
+        "the premise: the figure moved"
+    );
+    assert_eq!(
+        clock_tick(cx, &shell, 1_100),
+        1,
+        "the new second costs exactly one frame"
+    );
+    let settled: Vec<u64> = (0..4).map(|_| clock_tick(cx, &shell, 300)).collect();
+    assert_eq!(
+        settled,
+        vec![0, 0, 0, 0],
+        "the frame that painted the new second recorded it, so later ticks are quiet: {settled:?}"
+    );
+}
+
+/// A channel that closes without a terminal event is a dead turn, not a running
+/// one: the marker must go (or the composer and the elapsed clock keep claiming
+/// a turn that does not exist), and with the marker gone the clock stops.
+#[gpui::test]
+fn a_channel_that_closes_without_a_terminal_event_ends_the_turn(cx: &mut TestAppContext) {
+    let (shell, cx, tx) = pumping_live_turn(cx, "dead-channel");
+    let streaming =
+        |cx: &mut VisualTestContext| cx.update(|_, cx| shell.read(cx).state.any_streaming());
+    assert!(streaming(cx), "the premise: the turn is live");
+    assert!(
+        cx.update(|_, cx| shell.read(cx).state.turn_elapsed_seconds())
+            .is_some(),
+        "the premise: the running line has a figure"
+    );
+    drop(tx);
+    // The pump's event task sees the closed channel and runs its tail: the
+    // marker goes, the running line is removed by one frame, and the clock's
+    // next wake finds nothing to advance.
+    cx.run_until_parked();
+    assert!(
+        !streaming(cx),
+        "a dropped sender must not leave the turn marked as streaming"
+    );
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).state.turn_elapsed_seconds()),
+        None,
+        "and the running line loses its figure"
+    );
+    assert!(
+        cx.update(|_, cx| shell.read(cx).state.streams.is_empty()),
+        "the stream marker is cleared"
+    );
+    let before = cx.update(|_, cx| shell.read(cx).frame_no);
+    let quiet: Vec<u64> = (0..8).map(|_| clock_tick(cx, &shell, 500)).collect();
+    assert_eq!(
+        quiet,
+        vec![0; 8],
+        "a dead channel must not keep the clock repainting: {quiet:?}"
+    );
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).frame_no),
+        before,
+        "no frame at all once the marker is gone"
+    );
+}
+
+/// A real stream still reaches the transcript and still ends cleanly: a
+/// reasoning delta paints its body, the running line survives while the answer
+/// has no text, and a terminal event stops the clock without losing the body.
+#[gpui::test]
+fn a_real_stream_paints_its_reasoning_and_ends_cleanly(cx: &mut TestAppContext) {
+    let (shell, cx, tx) = pumping_live_turn(cx, "real-stream");
+    let index = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .active_session()
+            .expect("a session")
+            .messages
+            .len()
+            - 1
+    });
+    let body: &'static str = Box::leak(format!("think-body-{index}").into_boxed_str());
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.think_open.insert(index);
+            cx.notify();
+        });
+    });
+    assert!(
+        tx.try_send(crate::runner::AgentEvent::Reasoning(
+            "Let me think about it. ".to_string()
+        ))
+        .is_ok(),
+        "the delta reaches the pump"
+    );
+    cx.run_until_parked();
+    draw_until(
+        cx,
+        "the streamed reasoning body paints",
+        DRAW_UNTIL_MAX,
+        |cx| cx.debug_bounds(body).is_some(),
+    );
+    assert_eq!(
+        cx.update(|_, cx| {
+            shell
+                .read(cx)
+                .state
+                .active_session()
+                .expect("a session")
+                .messages[index]
+                .reasoning
+                .clone()
+        }),
+        "Let me think about it. ".to_string(),
+        "the reasoning delta is in the message the pane draws"
+    );
+    assert!(
+        cx.update(|_, cx| shell.read(cx).state.turn_elapsed_seconds())
+            .is_some(),
+        "the running line is still painted while the answer has no text"
+    );
+    assert!(
+        tx.try_send(crate::runner::AgentEvent::Done).is_ok(),
+        "the terminal event reaches the pump"
+    );
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_, cx| shell.read(cx).state.any_streaming()),
+        "Done ends the stream marker"
+    );
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).state.turn_elapsed_seconds()),
+        None,
+        "and the running line is gone"
+    );
+    let quiet: Vec<u64> = (0..6).map(|_| clock_tick(cx, &shell, 500)).collect();
+    assert_eq!(
+        quiet,
+        vec![0; 6],
+        "a finished turn leaves the clock quiet: {quiet:?}"
+    );
+}
+
+/// The frame trace is off unless asked for, and when it is asked for it writes
+/// exactly one bounded line per painted frame with the documented keys.
+#[gpui::test]
+fn the_frame_trace_is_off_by_default_and_writes_one_line_per_frame(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("frame-trace", 2);
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id) {
+            session.messages[1].reasoning = "first line of thought\n\nsecond line".to_string();
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    for _ in 0..4 {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+    if std::env::var_os("BSH_FRAME_TRACE").is_none() {
+        assert!(
+            cx.update(|_, cx| shell.read(cx).frame_trace.is_none()),
+            "an ordinary launch must not open a trace: the render path only matches None"
+        );
+        let default_path =
+            std::env::temp_dir().join(format!("bsh-frames-{}.log", std::process::id()));
+        assert!(
+            !default_path.exists(),
+            "an unset variable writes no file: {}",
+            default_path.display()
+        );
+    }
+    let path =
+        std::env::temp_dir().join(format!("bsh-frame-trace-shell-{}.log", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.trace_frames_to(&path).expect("the trace opens");
+        });
+    });
+    // Let any parsing from the frames above drain while the trace is open,
+    // then reopen it so the count below measures exactly the frames below.
+    for _ in 0..4 {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.trace_frames_to(&path).expect("the trace reopens");
+        });
+    });
+    for _ in 0..5 {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+    let text = std::fs::read_to_string(&path).expect("the trace is readable");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 5, "one line per painted frame: {text}");
+    for line in &lines {
+        for key in [
+            "frame=",
+            " dt_ms=",
+            " tab=chat",
+            " streaming=",
+            " offset=",
+            " max=",
+            " content=",
+            " rows=",
+            " source=",
+        ] {
+            assert!(line.contains(key), "the line carries {key:?}: {line}");
+        }
+        assert_eq!(
+            line.split(' ').count(),
+            9,
+            "the line is bounded to nine key=value fields: {line}"
+        );
+    }
+    let frames: Vec<u64> = lines
+        .iter()
+        .map(|line| {
+            line.strip_prefix("frame=")
+                .expect("the frame first")
+                .split(' ')
+                .next()
+                .expect("a value")
+                .parse()
+                .expect("a number")
+        })
+        .collect();
+    assert!(
+        frames.windows(2).all(|pair| pair[0] < pair[1]),
+        "frame numbers increase: {frames:?}"
+    );
+    let _ = std::fs::remove_file(&path);
 }

@@ -318,6 +318,34 @@ pub(crate) fn effort_suffix(effort: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The preset chip's label.
+///
+/// The master switch wins over everything: with presets off, NO preset is what
+/// every chat runs, so "No preset" is the honest report even while a selection
+/// is retained for the switch to restore. With presets on the effective id is
+/// shown - annotated with the sandbox refusal where the guard would reject it -
+/// and an empty id is the reference's "Default (no preset)".
+pub(crate) fn preset_chip_label(
+    lang: crate::i18n::Lang,
+    effective: &str,
+    presets_disabled: bool,
+    sandbox_widens: bool,
+) -> String {
+    if presets_disabled {
+        return lang.tr("input.noPreset").to_string();
+    }
+    if effective.trim().is_empty() {
+        return lang.tr("input.defaultPreset").to_string();
+    }
+    if sandbox_widens {
+        return format!(
+            "{effective} · {}",
+            lang.tr("settings.presetSandboxWidensAction")
+        );
+    }
+    effective.to_string()
+}
+
 /// The Effort row's own label: "Effort" with the current level after it, so the
 /// root menu answers "what is it set to" without opening the submenu.
 pub(crate) fn effort_row_label(lang: crate::i18n::Lang, level: Option<&str>) -> String {
@@ -379,7 +407,7 @@ impl Shell {
         // egress facts: the label, the rows and the policy cannot describe
         // different turns. The workspace file's state is the one AppState cached
         // (never read from disk per frame).
-        let permission_rows = super::permission::permission_rows(lang, &effective, &self.state);
+        let permission_rows = super::permission::permission_rows(lang, &effective);
         let permission = effective.permission.clone();
         let label = effective.model_name;
         // The menu rows are nicknames, so the checked row compares against the
@@ -765,26 +793,19 @@ impl Shell {
         // Show the preset the turn ACTUALLY runs, not only the one this chat
         // named: a chat that inherits the global default displays that preset,
         // and the menu's "Default" row still records the inheritance.
-        let effective = self
+        let resolved = self
             .state
             .active_id
             .as_deref()
-            .map(|id| self.state.effective_in(id).preset_id)
-            .unwrap_or_else(|| self.state.effective().preset_id);
+            .map(|id| self.state.effective_in(id))
+            .unwrap_or_else(|| self.state.effective());
+        let effective = resolved.preset_id;
+        let presets_disabled = resolved.presets_disabled;
         // A session that recorded a preset the sandbox guard now refuses must
         // say so at the chip, not only when the next send is rejected.
         let refused_effective =
             !effective.trim().is_empty() && self.state.preset_sandbox_widens(&effective);
-        let label = if effective.trim().is_empty() {
-            lang.tr("input.defaultPreset").to_string()
-        } else if refused_effective {
-            format!(
-                "{effective} · {}",
-                lang.tr("settings.presetSandboxWidensAction")
-            )
-        } else {
-            effective
-        };
+        let label = preset_chip_label(lang, &effective, presets_disabled, refused_effective);
         let listed: Vec<(String, bool)> = self
             .state
             .settings
@@ -823,9 +844,18 @@ impl Shell {
                     let pick_default = shell.clone();
                     let session_default = session.clone();
                     let current = explicit.clone();
+                    // With presets off the menu states WHY it cannot record a
+                    // choice instead of offering rows that would change nothing
+                    // visible: the selection is kept, and the switch that turns
+                    // it back on lives in the Agent presets pane.
+                    if presets_disabled {
+                        menu = menu
+                            .item(PopupMenuItem::new(lang.tr("input.presetsOff")).disabled(true));
+                    }
                     menu = menu.item(
                         PopupMenuItem::new(lang.tr("input.defaultPreset"))
                             .checked(current.is_none())
+                            .disabled(presets_disabled)
                             .on_click(move |_, _window, cx| {
                                 pick_default.update(cx, |this, cx| {
                                     this.state.select_session_preset(&session_default, "");
@@ -838,7 +868,13 @@ impl Shell {
                         let sid = session.clone();
                         let picked = name.clone();
                         let chosen = explicit.as_deref() == Some(name.as_str());
-                        if *widens {
+                        if presets_disabled {
+                            menu = menu.item(
+                                PopupMenuItem::new(name.clone())
+                                    .checked(chosen)
+                                    .disabled(true),
+                            );
+                        } else if *widens {
                             // Disabled AND labelled: a click cannot record a
                             // preset the send gate would refuse, and the reason
                             // is visible where the choice is made.
@@ -878,11 +914,13 @@ impl Shell {
         // builder is `Fn`, so every capture is cloned into it anyway.
         let text = permission_chip_text(lang, &permission);
         let effective = permission.effective.clone();
-        // Three rows, each one line: the label and its consequence - the network
-        // clause included, derived by `permission::rows_for` for a writable
-        // mode and stated by the session tier's own refusal for Read Only. The
-        // check follows the mode in force, and a row a preset ceiling cannot
-        // grant is disabled and says which mode the preset keeps.
+        // Three rows, each one line: the label and a short qualifier, so the
+        // modes can be compared at a glance. The check follows the mode in
+        // force, and a row a preset ceiling cannot grant is disabled and states
+        // which mode the preset keeps. The sandbox state is not drawn here: it
+        // is already in the Settings switch row, the terminal status line and
+        // each call's audit, and a note in this menu was the wordy copy the
+        // owner asked to remove.
         let chip = trigger_chrome(
             Button::new("composer-permission")
                 .ghost()
@@ -904,12 +942,11 @@ impl Shell {
             .child(chip.disabled(streaming).dropdown_menu_with_anchor(
                 Anchor::TopLeft,
                 move |menu, _, _| {
-                    // The row now states its network consequence, so the kit's
-                    // 500px ceiling would wrap - and the fixed 26px item height
-                    // would then clip the very clause that was added. The 330
-                    // minimum stays; the ceiling fits the longest resolved row
-                    // (the preset-confined Full access line) on one line.
-                    let mut menu = menu.min_w(px(330.0)).max_w(px(820.0));
+                    // Short rows fit the kit's own 500px ceiling on one line;
+                    // the 330 minimum is the reference's. No warning line sits
+                    // above them: the menu says what a mode permits and nothing
+                    // else, and the sandbox state has its own surfaces.
+                    let mut menu = menu.min_w(px(330.0));
                     for choice in choices.clone() {
                         let item = PopupMenuItem::new(choice.text).checked(choice.checked);
                         if !choice.enabled {

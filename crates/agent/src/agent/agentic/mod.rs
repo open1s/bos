@@ -75,6 +75,13 @@ pub struct AgentConfig {
     pub api_key: String,
     /// System prompt prepended to every conversation.
     pub system_prompt: String,
+    /// Whether [`Self::system_prompt`] is the WHOLE prompt.
+    ///
+    /// The reference's persona row can carry `complete: true`, which restores
+    /// the persona as the sole prompt section after assembly. When this is set,
+    /// the host must not append tool guidance or any other section: the prompt
+    /// it configured is what the model receives.
+    pub persona_complete: bool,
     /// Sampling temperature.
     pub temperature: f32,
     /// Optional completion token cap.
@@ -121,6 +128,12 @@ pub struct AgentConfig {
     pub fallbacks: Vec<FallbackProvider>,
 }
 
+/// The persona every agent runs with until a host names a better one.
+///
+/// The corpus lives in [`crate::agent::prompts`], where every piece is pinned
+/// by a test; this re-export keeps the historical path working.
+pub use crate::agent::prompts::DEFAULT_SYSTEM_PROMPT;
+
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
@@ -128,7 +141,8 @@ impl Default for AgentConfig {
             model: "gpt-4".to_string(),
             base_url: "https://api.openai.com/v1".to_string(),
             api_key: String::new(),
-            system_prompt: "You are a helpful assistant.".to_string(),
+            system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
+            persona_complete: false,
             temperature: 0.7,
             max_tokens: None,
             timeout_secs: 60,

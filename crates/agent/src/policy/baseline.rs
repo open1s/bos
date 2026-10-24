@@ -95,6 +95,12 @@ verdict := {"allow": true, "rule": "capability-granted"} if {
 } else := {"allow": false, "rule": "egress-port-not-allowed", "reason": "the destination port is outside the egress port list"} if {
     input.action == "egress"
     not port_allowed(input.target.port)
+# rule: egress-path-denied
+# A path rule is only decided where the transport SAW a path. input.target.path
+# is null for a CONNECT tunnel, and the guard keeps a null from matching.
+} else := {"allow": false, "rule": "egress-path-denied", "reason": "the URL path is on the egress deny list"} if {
+    input.action == "egress"
+    path_denied(input.target.path)
 # rule: egress-unrestricted
 } else := {"allow": true, "rule": "egress-unrestricted"} if {
     input.action == "egress"
@@ -188,6 +194,15 @@ port_allowed(_port) if {
 port_allowed(port) if {
     some allowed in data.egress_ports
     allowed == port
+}
+
+# A URL path is denied when it starts with an entry of data.egress_deny_paths.
+# The null guard is the TLS tunnel: a CONNECT request never saw the path, so a
+# path rule must not match it.
+path_denied(path) if {
+    path != null
+    some prefix in data.egress_deny_paths
+    startswith(path, prefix)
 }
 
 # A hostname rule is the WEAKER door and is named as such: it survives a DNS

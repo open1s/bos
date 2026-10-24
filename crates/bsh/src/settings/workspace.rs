@@ -85,6 +85,14 @@ impl WorkspaceGeneral {
 pub(crate) struct AgentSection {
     /// The system prompt.
     pub(crate) system_prompt: String,
+    /// Whether [`Self::system_prompt`] is the WHOLE prompt.
+    ///
+    /// The workspace equivalent of a preset persona's `complete` flag: when
+    /// true the prompt is sent as the sole system prompt, with no harness
+    /// identity, standing workflow or per-tool guidance around it. Off by
+    /// default, because the slot composition is what keeps a workspace prompt
+    /// from silently dropping the agent's operating rules.
+    pub(crate) complete: bool,
     /// Sampling temperature; absent inherits the engine's default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) temperature: Option<f32>,
@@ -133,6 +141,7 @@ impl Default for AgentSection {
     fn default() -> Self {
         Self {
             system_prompt: String::new(),
+            complete: false,
             temperature: None,
             reasoning_effort: None,
             permission: "workspace-write".to_string(),
@@ -285,6 +294,25 @@ extensions = ["plan"]
         let text = "[general]\nprovider = \"nvidia\"\n";
         let settings = WorkspaceSettings::from_toml(text).expect("an old file still parses");
         assert_eq!(settings.general.legacy_pair(), None);
+    }
+
+    /// The complete-persona flag is opt-in: absent is the slot composition,
+    /// and only an explicit `complete = true` makes the prompt the whole prompt.
+    #[test]
+    fn the_complete_persona_flag_is_an_opt_in() {
+        let fresh = WorkspaceSettings::from_toml("").expect("a fresh workspace parses");
+        assert!(!fresh.agent.complete, "the slot composition is the default");
+        let declared =
+            WorkspaceSettings::from_toml("[agent]\ncomplete = true\n").expect("the flag parses");
+        assert!(declared.agent.complete);
+        let text = declared.to_toml().expect("renders");
+        assert!(
+            WorkspaceSettings::from_toml(&text)
+                .expect("round-trips")
+                .agent
+                .complete,
+            "the flag survives a save/load round trip"
+        );
     }
 
     #[test]

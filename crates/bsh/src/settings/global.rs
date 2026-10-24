@@ -254,6 +254,69 @@ pub(crate) struct ModelRef {
     pub(crate) model: String,
 }
 
+/// The local web-search tool's endpoint, budget and request shape.
+///
+/// The tool itself is registered by the build; this section is what it asks.
+/// The endpoint is a MACHINE fact rather than a workspace one - the same
+/// deployment serves every checkout - so it lives in the global file. The
+/// credential is not here: it is a vault entry, named by
+/// [`crate::vault::WEB_SEARCH_KEY`], because the settings tree stores no secret.
+///
+/// The shape fields exist because search providers disagree about the wire:
+/// DeepSeek's Search API and Tavily are both `POST <base>/search` with
+/// `Authorization: Bearer`, but Tavily names no count field, reads snippets
+/// from `content` and dates from `published_date`, and a self-hosted SearXNG
+/// wants GET with `q=`. Every field's default is the DeepSeek Search API, so a
+/// file that names none of them speaks exactly the shipped wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WebSearchSection {
+    /// The Search API base, without the operation path.
+    pub(crate) base_url: String,
+    /// Results one search asks for; the tool clamps it to 1..=50.
+    pub(crate) results_per_search: usize,
+    /// Request method: "post" (JSON body) or "get" (query string).
+    pub(crate) method: String,
+    /// The operation appended to the base URL.
+    pub(crate) path: String,
+    /// The request field carrying the query.
+    pub(crate) query_key: String,
+    /// The request field carrying the result budget; empty omits it.
+    pub(crate) count_key: String,
+    /// Static extra fields merged into every request (e.g. `search_depth`).
+    pub(crate) body: BTreeMap<String, serde_json::Value>,
+    /// The response array holding the hits.
+    pub(crate) results_key: String,
+    /// The hit field carrying the URL.
+    pub(crate) url_key: String,
+    /// The hit field carrying a title; empty omits titles.
+    pub(crate) title_key: String,
+    /// The hit field carrying a snippet; empty omits snippets.
+    pub(crate) snippet_key: String,
+    /// The hit field carrying a publication date; empty omits dates.
+    pub(crate) date_key: String,
+}
+
+impl Default for WebSearchSection {
+    fn default() -> Self {
+        Self {
+            base_url: crate::web::DEFAULT_BASE_URL.to_string(),
+            results_per_search: crate::web::DEFAULT_RESULTS,
+            method: "post".to_string(),
+            path: "search".to_string(),
+            query_key: "query".to_string(),
+            count_key: "count".to_string(),
+            body: BTreeMap::from([("need_content".to_string(), serde_json::Value::Bool(false))]),
+            results_key: "results".to_string(),
+            url_key: "url".to_string(),
+            title_key: "title".to_string(),
+            snippet_key: "snippet".to_string(),
+            date_key: "date".to_string(),
+        }
+    }
+}
+
 /// The global settings file, as `~/.bos/bsh/settings.toml` holds them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -336,6 +399,9 @@ pub(crate) struct GlobalSettings {
     pub(crate) schedules: Vec<super::Schedule>,
     /// The workspace registry.
     pub(crate) workspaces: Vec<WorkspaceRef>,
+    /// The local web-search tool's endpoint and per-search budget.
+    #[serde(default)]
+    pub(crate) web_search: WebSearchSection,
     /// The preset a session takes when it names none. The reference keeps this
     /// as the registry's selectedDefault, resolved over the deployment default.
     #[serde(default = "default_preset")]
@@ -359,6 +425,7 @@ impl Default for GlobalSettings {
             extensions: Vec::new(),
             market_indexes: Vec::new(),
             workspaces: Vec::new(),
+            web_search: WebSearchSection::default(),
             default_preset: default_preset(),
         }
     }
@@ -467,12 +534,56 @@ pub(crate) struct General {
     pub(crate) traj_actual_time: bool,
     /// Where a link in a message opens.
     pub(crate) link_opening: String,
+    /// What the rendered Browser may put on the wire: "proxied" or "strict".
+    ///
+    /// A machine preference, because the limit it names is the transport's, not
+    /// a workspace's: a plain http request is authorized on its full path,
+    /// while an https page is a CONNECT tunnel this pane does not terminate.
+    /// "proxied" (the default) allows https and gates it at host:port;
+    /// "strict" refuses the tunnel so nothing crosses un-terminated.
+    pub(crate) browser_network_mode: String,
     /// What Enter does while a turn streams.
     pub(crate) composer_enter: String,
     /// How much performance and usage detail to show.
     pub(crate) performance_usage: String,
     /// Show the coding view: the trajectory tab and the Agent preset switch.
     pub(crate) developer_tools: bool,
+    /// Whether presets apply at all: the master switch over the whole system.
+    ///
+    /// ABSENT means enabled, so a file written before this field existed keeps
+    /// applying the preset it selects. `Some(false)` keeps the SELECTION - the
+    /// session's own preset and the global default - exactly as it was while
+    /// applying NONE of it: no permission ceiling, no read/write/deny scope, no
+    /// preset egress intersection, no tool, skill, MCP or extension switching,
+    /// no preset sandbox arm and no preset policy module. The declarations are
+    /// still loaded and validated (a broken one is still a load error, so the
+    /// reader can fix it); they are simply inert.
+    ///
+    /// One fact, one switch: the selection is never cleared to apply this, which
+    /// is what makes turning presets back on restore the previous preset rather
+    /// than fall back to the built-in default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) presets_enabled: Option<bool>,
+    /// Whether heel is applied at all: the master switch over the SANDBOX.
+    ///
+    /// ABSENT means enabled, so a file written before this field existed keeps
+    /// confining the shell exactly as it did. `Some(false)` is a WIDENING that
+    /// wins over every preset's `sandbox` arm: the shell and the terminal run
+    /// unconfined (the bare spec), whatever a preset declares, including
+    /// `sandbox = "heel"`. It does NOT switch presets off - the permission
+    /// ceiling, the path scopes, the tool sets, the policy modules and
+    /// `policy_mode` all still apply, the Rego tool boundary still refuses the
+    /// paths and endpoints a command line names, and the browser's own loopback
+    /// gate is untouched because it is not heel.
+    ///
+    /// A preset's `sandbox = "none"` is unaffected: it was already unconfined.
+    /// At full access the switch changes nothing, so the attribution stays the
+    /// permission's release rather than claiming this switch did it.
+    ///
+    /// One fact, one switch, and the same absent-means-on rule the preset switch
+    /// uses, which is what makes an enabled file mirror a fresh one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) sandbox_enabled: Option<bool>,
     /// How the Diff pane presents a comparison: "unified" or "split".
     ///
     /// The reference's review pane carries the same two-way choice
@@ -513,15 +624,44 @@ impl Default for General {
             // every block at the instant it happened.
             traj_actual_time: true,
             link_opening: "sidebar".to_string(),
+            browser_network_mode: "proxied".to_string(),
             composer_enter: "queue".to_string(),
             performance_usage: "detailed".to_string(),
             developer_tools: true,
+            // Absent is enabled: a fresh file and every file written before the
+            // master switch existed apply their preset.
+            presets_enabled: None,
+            // Absent is enabled: a fresh file confines the shell with heel, as
+            // every file written before this switch existed does.
+            sandbox_enabled: None,
             diff_mode: super::DEFAULT_DIFF_MODE.to_string(),
             diff_wrap: false,
             session_sort: String::new(),
             active_workspace: String::new(),
             active_session: String::new(),
         }
+    }
+}
+
+impl General {
+    /// Whether presets apply, with the absent value resolving to enabled.
+    ///
+    /// The ONE reader of the master switch: resolution, the pane and the
+    /// composer chip all ask this instead of comparing `presets_enabled`
+    /// against `Some(true)`, so "absent" cannot mean different things in
+    /// different places.
+    pub(crate) fn presets_active(&self) -> bool {
+        self.presets_enabled.unwrap_or(true)
+    }
+
+    /// Whether heel is applied, with the absent value resolving to enabled.
+    ///
+    /// The ONE reader of the sandbox master switch: resolution, the General row,
+    /// the preset cards, the confirmation gate and the composer all ask this
+    /// instead of comparing `sandbox_enabled` against `Some(true)`, so "absent"
+    /// cannot mean different things in different places.
+    pub(crate) fn sandbox_active(&self) -> bool {
+        self.sandbox_enabled.unwrap_or(true)
     }
 }
 
@@ -904,6 +1044,17 @@ pub(crate) struct Preset {
     /// chats that select this preset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) system_prompt: Option<String>,
+    /// Whether this preset's persona IS the whole system prompt.
+    ///
+    /// The reference's persona row carries the same flag
+    /// (`complete: true`, only its `minimal` preset sets it): the persona is
+    /// restored as the sole prompt section, so the harness identity, the
+    /// standing workflow and every tool-guidance section are suppressed. It is
+    /// off by default, and it applies only when this preset actually ships a
+    /// [`Self::system_prompt`]; otherwise the workspace persona and its own
+    /// complete flag decide.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) complete: bool,
     /// A Rego module this preset contributes as a policy source.
     ///
     /// It may only NARROW the workspace/baseline policy: composition is
@@ -1142,6 +1293,13 @@ impl Preset {
             self.system_prompt.as_deref(),
             "\"You are terse.\"",
         );
+        out.push_str(
+            "# Use the persona as the WHOLE system prompt: the harness identity,\n\
+             # the standing workflow and every tool-guidance section are suppressed,\n\
+             # exactly as the reference's complete persona arm does. Off is the\n\
+             # default slot composition (identity < persona < workflow).\n",
+        );
+        push_optional_bool(&mut out, "complete", self.complete.then_some(true), "true");
         out.push('\n');
 
         out.push_str(
@@ -1276,7 +1434,8 @@ fn preset_deny_paths() -> Vec<String> {
 ///
 /// - `standard` and `ptc` ALLOW NETWORK ACCESS BY DEFAULT: they keep the `shell`
 ///   bundle (`bash` can reach the network through its own client) and the MCP
-///   servers, and both declare `web_search = true`. They declare NO `egress`
+///   servers, and both declare `web_search = true` (the LOCAL search tool -
+///   see `crate::web`). They declare NO `egress`
 ///   field, which INHERITS the workspace allowlist - so the reach is the
 ///   workspace's own decision and the preset does not narrow it. On a FRESH
 ///   workspace there is no allowlist file, and the tri-state reads that as
@@ -1288,11 +1447,10 @@ fn preset_deny_paths() -> Vec<String> {
 ///   egress. A read of the workspace needs no network, and the derived proxy
 ///   set is empty, so the kernel denies outbound traffic with no proxy running.
 ///
-/// The `egress` field governs only LOCAL egress - the shell, MCP and any tool
-/// that opens a socket under this host. Hosted `web_search` runs on the model
-/// provider's own servers and is governed by `web_search`, which is why
-/// `read-only` can deny local egress and still offer hosted search, and why
-/// `standard`/`ptc` state the search grant explicitly.
+/// The `egress` field governs every tool that opens a socket under this host -
+/// the shell, MCP and the local `web_search` tool - and `web_search` decides
+/// only whether the model is offered search at all. That is why `read-only` can
+/// deny egress and stay coherent: it also declines the search grant.
 ///
 /// A preset may also declare its network reach as a non-empty list: entries are
 /// intersected with the workspace allowlist, never unioned with it, so a preset
@@ -1335,9 +1493,7 @@ pub(crate) fn built_in_preset(id: &str) -> Option<Preset> {
             // inheriting the workspace allowlist and narrows nothing.
             web_search: Some(true),
             parallel_tool_calls: Some(true),
-            system_prompt: Some(
-                "You run programmatic tool calling. Batch independent tool calls, then filter, organize, deduplicate, count and summarize the results. Prefer one plan over many tiny round trips.".to_string(),
-            ),
+            system_prompt: Some(crate::prompts::PTC_PERSONA.to_string()),
             order: Some(20),
             ..Preset::default()
         }),
@@ -1350,9 +1506,7 @@ pub(crate) fn built_in_preset(id: &str) -> Option<Preset> {
             // packages through the shell, so it needs the workspace's reach and
             // inherits it.
             web_search: Some(true),
-            system_prompt: Some(
-                "You extend bsh through conversation. Inspect the existing extension and settings formats before writing; create extension packages, skills and presets inside the workspace, and keep changes reversible.".to_string(),
-            ),
+            system_prompt: Some(crate::prompts::CREATOR_PERSONA.to_string()),
             order: Some(40),
             ..Preset::default()
         }),
@@ -1376,10 +1530,10 @@ pub(crate) fn built_in_preset(id: &str) -> Option<Preset> {
             // The empty list is declared, not absent, which is the difference
             // between "no network" and "inherit the workspace"; the derived
             // proxy set is empty, so the kernel denies with no proxy running.
-            // Hosted `web_search` below is the provider's own tool and is not
-            // local egress.
+            // Search is OFF for the same reason: the local `web_search` tool is
+            // local network access, and a preset only ever narrows.
             egress: Some(Vec::new()),
-            web_search: Some(true),
+            web_search: Some(false),
             builtin_policy: vec![
                 "deny-secrets".to_string(),
                 "read-only".to_string(),
@@ -1387,9 +1541,7 @@ pub(crate) fn built_in_preset(id: &str) -> Option<Preset> {
                 "no-egress".to_string(),
             ],
             policy_mode: Some(PolicyMode::Required),
-            system_prompt: Some(
-                "You are a read-only analyst. Read the workspace and search the web when useful, but never modify files, run commands, or claim you did. If a change is needed, propose it and stop.".to_string(),
-            ),
+            system_prompt: Some(crate::prompts::READ_ONLY_PERSONA.to_string()),
             order: Some(50),
             ..Preset::default()
         }),
@@ -2073,6 +2225,107 @@ root = "/tmp/bsh"
         assert!(settings.lookup(&no_provider).is_none());
     }
 
+    /// The master preset switch: absent means ENABLED (so every file written
+    /// before the field existed keeps applying its preset), an explicit false
+    /// survives a save/load restart, and turning it back on writes the field
+    /// away so the file reads exactly like a fresh one.
+    #[test]
+    fn the_presets_switch_defaults_to_enabled_and_survives_a_restart() {
+        let fresh = GlobalSettings::from_toml("").expect("an empty file parses");
+        assert_eq!(fresh.general.presets_enabled, None);
+        assert!(
+            fresh.general.presets_active(),
+            "a fresh settings file defaults to enabled"
+        );
+        // An older file that names no field is enabled for the same reason.
+        let old = GlobalSettings::from_toml("[general]\nlang = \"zh\"\n").expect("parses");
+        assert!(old.general.presets_active());
+
+        let mut switched_off = fresh;
+        switched_off.general.presets_enabled = Some(false);
+        let text = switched_off.to_toml().expect("renders");
+        assert!(
+            text.contains("presets_enabled = false"),
+            "the switch is written where a reader can see it:\n{text}"
+        );
+        let path = scratch("presets-switch").join("settings.toml");
+        switched_off.save(&path).expect("saves");
+        let reloaded = GlobalSettings::load(&path).expect("loads");
+        assert_eq!(reloaded.general.presets_enabled, Some(false));
+        assert!(
+            !reloaded.general.presets_active(),
+            "the flag survives a restart"
+        );
+        // The preset DECLARATIONS are still loaded and validated while off, so
+        // the reader can fix a broken one.
+        assert_eq!(reloaded.default_preset, "standard");
+        assert!(reloaded.preset("read-only").is_some());
+
+        // On again is ABSENT again: the file reads like a fresh install.
+        let mut switched_on = reloaded;
+        switched_on.general.presets_enabled = None;
+        let text = switched_on.to_toml().expect("renders");
+        assert!(
+            !text.contains("presets_enabled"),
+            "an enabled file carries no switch field:\n{text}"
+        );
+        assert_eq!(
+            GlobalSettings::from_toml(&text).expect("re-parses"),
+            switched_on
+        );
+    }
+
+    /// The sandbox master switch, with the same three properties the preset
+    /// switch has: absent means ON, an explicit false survives a restart, and
+    /// turning it back on writes the field away so an enabled file is
+    /// byte-identical in meaning to a fresh one.
+    #[test]
+    fn the_sandbox_switch_defaults_to_on_and_survives_a_restart() {
+        let fresh = GlobalSettings::from_toml("").expect("an empty file parses");
+        assert_eq!(fresh.general.sandbox_enabled, None);
+        assert!(
+            fresh.general.sandbox_active(),
+            "a fresh settings file applies the sandbox"
+        );
+        // An older file that names no field applies it for the same reason.
+        let old = GlobalSettings::from_toml("[general]\nlang = \"zh\"\n").expect("parses");
+        assert!(old.general.sandbox_active());
+
+        let mut switched_off = fresh;
+        switched_off.general.sandbox_enabled = Some(false);
+        let text = switched_off.to_toml().expect("renders");
+        assert!(
+            text.contains("sandbox_enabled = false"),
+            "the switch is written where a reader can see it:\n{text}"
+        );
+        let path = scratch("sandbox-switch").join("settings.toml");
+        switched_off.save(&path).expect("saves");
+        let reloaded = GlobalSettings::load(&path).expect("loads");
+        assert_eq!(reloaded.general.sandbox_enabled, Some(false));
+        assert!(
+            !reloaded.general.sandbox_active(),
+            "the switch survives a restart"
+        );
+        // The PRESET switch is a different fact and is untouched by this one.
+        assert!(
+            reloaded.general.presets_active(),
+            "turning the sandbox off must not turn presets off"
+        );
+
+        // On again is ABSENT again: the file reads like a fresh install.
+        let mut switched_on = reloaded;
+        switched_on.general.sandbox_enabled = None;
+        let text = switched_on.to_toml().expect("renders");
+        assert!(
+            !text.contains("sandbox_enabled"),
+            "an enabled file carries no switch field:\n{text}"
+        );
+        assert_eq!(
+            GlobalSettings::from_toml(&text).expect("re-parses"),
+            switched_on
+        );
+    }
+
     #[test]
     fn the_global_file_round_trips() {
         let settings = GlobalSettings::from_toml(ROOTED).expect("parses");
@@ -2110,6 +2363,8 @@ link_opening = "new-tab"
 composer_enter = "steer"
 performance_usage = "compact"
 developer_tools = false
+presets_enabled = false
+sandbox_enabled = false
 session_sort = "name"
 active_workspace = "w1"
 
@@ -2271,6 +2526,51 @@ updated_at = 2
         );
     }
 
+    /// A provider whose wire is not the shipped shape is a settings edit, not
+    /// a recompile: the Tavily section from the settings spec parses, and the
+    /// fields the tool asks are exactly the ones the section names.
+    #[test]
+    fn a_tavily_web_search_section_parses_and_keeps_its_shape() {
+        let text = r#"
+schema_version = 1
+
+[web_search]
+base_url = "https://api.tavily.com"
+results_per_search = 5
+method = "POST"
+path = "search"
+query_key = "query"
+count_key = ""
+snippet_key = "content"
+date_key = "published_date"
+
+[web_search.body]
+search_depth = "advanced"
+"#;
+        let settings = GlobalSettings::from_toml(text).expect("the section parses");
+        let section = &settings.web_search;
+        assert_eq!(section.base_url, "https://api.tavily.com");
+        assert_eq!(section.results_per_search, 5);
+        assert_eq!(section.method, "POST");
+        assert_eq!(section.count_key, "", "Tavily defines no count field");
+        assert_eq!(section.snippet_key, "content");
+        assert_eq!(section.date_key, "published_date");
+        assert_eq!(
+            section
+                .body
+                .get("search_depth")
+                .and_then(serde_json::Value::as_str),
+            Some("advanced")
+        );
+        // And an absent section is the shipped wire: defaults, not zeros.
+        let defaults = GlobalSettings::from_toml("schema_version = 1").expect("bare parses");
+        assert_eq!(
+            defaults.web_search,
+            WebSearchSection::default(),
+            "a file that names no shape speaks the shipped wire"
+        );
+    }
+
     #[test]
     fn the_global_file_round_trips_through_the_disk() {
         let original = GlobalSettings::from_toml(RICH).expect("the fixture parses");
@@ -2317,6 +2617,7 @@ updated_at = 2
             mcps: Some(vec!["github".to_string()]),
             extensions: Some(vec!["dsh-echo".to_string()]),
             system_prompt: Some("You are terse.\nAnswer briefly.".to_string()),
+            complete: true,
             policy: Some(
                 "package policy.custom\n\n# rule: custom-allow\nverdict := {\"allow\": true, \"rule\": \"custom-allow\"}\n"
                     .to_string(),
@@ -2344,6 +2645,7 @@ updated_at = 2
             "mcp_tools",
             "extensions",
             "system_prompt",
+            "complete",
             "builtin_policy",
             "policy_mode",
             "trusted",
@@ -2392,6 +2694,7 @@ updated_at = 2
             "mcps",
             "extensions",
             "system_prompt",
+            "complete",
             "policy",
         ] {
             assert!(

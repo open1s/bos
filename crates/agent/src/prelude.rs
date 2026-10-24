@@ -9,7 +9,7 @@ pub use crate::agent::context::{
     SteerMessage, MAX_STEER_DEPTH,
 };
 pub use crate::agent::hooks::{AgentHook, HookContext, HookEvent, HookRegistry};
-pub use crate::agent::{Agent, AgentConfig, FallbackProvider};
+pub use crate::agent::{Agent, AgentConfig, FallbackProvider, DEFAULT_SYSTEM_PROMPT};
 pub use crate::bus::{AgentCallableServer, AgentCallerTool, AgentRpcClient};
 pub use crate::error::{AgentError, LlmError, ToolError};
 pub use crate::mcp::{

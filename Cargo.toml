@@ -34,7 +34,7 @@ futures = "0.3"
 tokio-stream = "0.1.19"
 async-stream = "0.3"
 chrono = { version = "0.4.45", features = ["serde"] }
-reqwest = { version = "0.13.5", features = ["json"] }
+reqwest = { version = "0.13.5", features = ["json", "query"] }
 zenoh = "1.10.1"
 rkyv = { version = "0.8.18", features = ["unaligned"] }
 rkyv_derive = "0.8.18"

@@ -336,6 +336,9 @@ impl From<AgentConfig> for agent::AgentConfig {
       base_url: value.base_url,
       api_key: value.api_key,
       system_prompt: value.system_prompt,
+      // The JS surface has no complete-persona flag yet; a host sets it on the
+      // AgentConfig it builds directly.
+      persona_complete: false,
       temperature: value.temperature as f32,
       max_tokens: max_tokens_converted,
       timeout_secs: value.timeout_secs as u64,

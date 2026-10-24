@@ -1938,8 +1938,9 @@ fn record_decision(
 /// sandbox, so the value is the permission tier itself; a backend that cannot
 /// host the pane's tty reports "unsupported-pty" and the pane's status line says
 /// why. The spawn path overrides the value with "none" when the caller passes a
-/// preset-off note (see [`Terminal::new_with_sandbox_note`]), so the shell's own
-/// report matches the tool result.
+/// policy-off note (see [`Terminal::new_with_sandbox_note`]), so the shell's own
+/// report matches the tool result - whether the SETTINGS switch or a preset's
+/// own arm turned it off.
 fn sandbox_env(spec: Option<&agent::sandbox::SandboxSpec>) -> Option<&'static str> {
     match spec {
         None => None,
@@ -1954,6 +1955,20 @@ fn sandbox_env(spec: Option<&agent::sandbox::SandboxSpec>) -> Option<&'static st
 /// Why the pane's shell is not confined, when it is not.
 fn sandbox_reason(spec: Option<&agent::sandbox::SandboxSpec>) -> Option<&'static str> {
     spec.and_then(|spec| spec.terminal().reason())
+}
+
+/// The POLICY that left the pane's shell unconfined, when one did.
+///
+/// Two policies can release it and the shell reports the same `none` either
+/// way, so the pane keeps WHICH one: the settings master switch (which wins over
+/// every preset's arm) or the preset in force. They are reversed by different
+/// controls, and a reader who is told only "not sandboxed" cannot tell which.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SandboxOff {
+    /// The sandbox master switch is off in the settings.
+    Settings,
+    /// The preset in force asked for an unconfined shell.
+    Preset,
 }
 
 /// A running terminal: the pane's one shell, its PTY, the screen, and the gate.
@@ -1975,12 +1990,13 @@ pub(crate) struct Terminal {
     sandbox_env: Option<&'static str>,
     /// Why this shell is not inside the turn's sandbox, when it is not.
     pub(crate) sandbox_note: Option<String>,
-    /// The shell is unconfined because a PRESET turned the sandbox off.
+    /// The POLICY that released this shell, when one did.
     ///
     /// Distinct from a full-access release and from a backend that cannot host
-    /// the pane's tty: this is a policy choice the reader can reverse, so the
-    /// status line keeps saying so while the shell runs.
-    pub(crate) sandbox_off_by_preset: bool,
+    /// the pane's tty: both arms here are choices a reader can reverse, so the
+    /// status line keeps naming which one while the shell runs. The settings
+    /// switch wins over a preset's arm, exactly as it does for the tool.
+    pub(crate) sandbox_off: Option<SandboxOff>,
     /// Why the shell is not running, when it is not.
     pub(crate) failure: Option<String>,
     /// The gate refused the start, so no process was ever created.
@@ -2207,18 +2223,19 @@ impl Terminal {
         Self::start(cwd, lang, spec, None)
     }
 
-    /// The same spawn, with the attribution a preset's off needs.
+    /// The same spawn, with the attribution a policy release needs.
     ///
-    /// The note is passed BEFORE the spawn so the shell's own `BSH_SANDBOX`
-    /// reports "none"; setting it afterwards would leave a running shell
-    /// claiming "full-access" while the status line said a preset turned it off.
+    /// `off` is the POLICY that released the shell and the sentence naming it.
+    /// It is passed BEFORE the spawn so the shell's own `BSH_SANDBOX` reports
+    /// "none"; setting it afterwards would leave a running shell claiming
+    /// "full-access" while the status line said the sandbox was off.
     pub(crate) fn new_with_sandbox_note(
         cwd: PathBuf,
         lang: Lang,
         spec: Option<&agent::sandbox::SandboxSpec>,
-        note: Option<String>,
+        off: Option<(SandboxOff, String)>,
     ) -> Self {
-        Self::start(cwd, lang, spec, note)
+        Self::start(cwd, lang, spec, off)
     }
 
     /// Why this shell is not sandboxed, when it is not.
@@ -2228,9 +2245,10 @@ impl Terminal {
 
     /// What the shell sees as BSH_SANDBOX, when there is something to say.
     ///
-    /// "none" is a preset that turned the sandbox off, "full-access" is a
-    /// permission-released turn, a permission tier is a sandboxed shell, and
-    /// "unsupported-pty" is a backend that could not host the pane's terminal.
+    /// "none" is a policy that turned the sandbox off (the settings switch or a
+    /// preset), "full-access" is a permission-released turn, a permission tier
+    /// is a sandboxed shell, and "unsupported-pty" is a backend that could not
+    /// host the pane's terminal.
     pub(crate) fn sandbox_label(&self) -> Option<&'static str> {
         self.sandbox_env
     }
@@ -2240,9 +2258,9 @@ impl Terminal {
         cwd: PathBuf,
         lang: Lang,
         spec: Option<&agent::sandbox::SandboxSpec>,
-        preset_off_note: Option<String>,
+        off: Option<(SandboxOff, String)>,
     ) -> Self {
-        Self::start_with_shell(cwd, lang, spec, None, preset_off_note)
+        Self::start_with_shell(cwd, lang, spec, None, off)
     }
 
     /// Build the terminal with an explicit shell when a test needs one.
@@ -2256,23 +2274,24 @@ impl Terminal {
         lang: Lang,
         spec: Option<&agent::sandbox::SandboxSpec>,
         shell_override: Option<PathBuf>,
-        preset_off_note: Option<String>,
+        off: Option<(SandboxOff, String)>,
     ) -> Self {
         // Asked before the spawn, so the spawn path cannot be edited into
         // assuming a confinement the answer refuses.
         let mut sandbox_env = sandbox_env(spec);
         let mut sandbox_note = sandbox_reason(spec).map(str::to_string);
-        let preset_off = preset_off_note.is_some();
-        if let Some(note) = preset_off_note {
+        let sandbox_off = off.as_ref().map(|(kind, _)| *kind);
+        if let Some((_, note)) = off {
             // The shell reports what the TURN decided, not only the permission
-            // tier: a preset's explicit off is "none", so the pane and the bash
-            // result agree. This must happen BEFORE the spawn.
+            // tier: a policy release (the settings switch or a preset) is
+            // "none", so the pane and the bash result agree. This must happen
+            // BEFORE the spawn.
             sandbox_env = Some("none");
             sandbox_note = Some(note);
         }
         let mut terminal = Self::build(cwd, lang, DEFAULT_COLS, DEFAULT_ROWS);
         terminal.sandbox_env = sandbox_env;
-        terminal.sandbox_off_by_preset = preset_off;
+        terminal.sandbox_off = sandbox_off;
         // Cloned: the shell needs it for its whole life, and the pane's caller
         // holds the same value for the shell tool.
         terminal.sandbox_spec = spec.map(|spec| std::sync::Arc::new(spec.clone()));
@@ -2344,7 +2363,7 @@ impl Terminal {
             sandbox_spec: None,
             sandbox_env: None,
             sandbox_note: None,
-            sandbox_off_by_preset: false,
+            sandbox_off: None,
             failure,
             refused,
             lang,
@@ -4554,29 +4573,75 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A preset's off is passed BEFORE the spawn, so the shell's own
+    /// A policy's off is passed BEFORE the spawn, so the shell's own
     /// BSH_SANDBOX says "none" and cannot be mistaken for a permission release.
+    /// Both policies are proven: a preset's arm, and the settings master switch,
+    /// which the production path passes instead of the preset's note.
     #[test]
-    fn a_preset_off_terminal_reports_none_to_the_shell() {
-        let dir = scratch("sandbox-preset-off");
-        let spec = agent::sandbox::SandboxSpec::bare(agent::sandbox::SandboxMode::FullAccess, &dir);
-        let note = "a preset turned the sandbox off".to_string();
-        let mut terminal =
-            Terminal::new_with_sandbox_note(dir.clone(), Lang::En, Some(&spec), Some(note.clone()));
-        assert!(terminal.sandbox_off_by_preset);
-        assert_eq!(terminal.sandbox_note(), Some(note.as_str()));
-        assert_eq!(
-            terminal.sandbox_label(),
-            Some("none"),
-            "the status and the shell agree"
-        );
-        assert!(terminal.is_running(), "the shell starts");
-        assert!(
-            type_and_wait(&mut terminal, "echo bsh-tier:$BSH_SANDBOX", "bsh-tier:none"),
-            "a preset's off reaches the shell, not only the status line: {:?}",
-            terminal.lines()
-        );
-        let _ = std::fs::remove_dir_all(&dir);
+    fn a_policy_off_terminal_reports_none_to_the_shell() {
+        for (kind, key) in [
+            (SandboxOff::Preset, "right.terminal.sandboxOff"),
+            (SandboxOff::Settings, "right.terminal.sandboxOffSettings"),
+        ] {
+            let dir = scratch(&format!("sandbox-off-{kind:?}"));
+            let spec =
+                agent::sandbox::SandboxSpec::bare(agent::sandbox::SandboxMode::FullAccess, &dir);
+            let note = crate::i18n::tr(Lang::En, key);
+            let mut terminal = Terminal::new_with_sandbox_note(
+                dir.clone(),
+                Lang::En,
+                Some(&spec),
+                Some((kind, note.clone())),
+            );
+            assert_eq!(
+                terminal.sandbox_off,
+                Some(kind),
+                "the pane kept WHICH policy"
+            );
+            assert_eq!(terminal.sandbox_note(), Some(note.as_str()));
+            assert_eq!(
+                terminal.sandbox_label(),
+                Some("none"),
+                "the status and the shell agree"
+            );
+            assert!(terminal.is_running(), "the shell starts");
+            assert!(
+                type_and_wait(&mut terminal, "echo bsh-tier:$BSH_SANDBOX", "bsh-tier:none"),
+                "{kind:?}: the off reaches the shell, not only the status line: {:?}",
+                terminal.lines()
+            );
+
+            // A RESTARTED shell keeps the attribution: a settings flip that
+            // reached only the first spawn would let a reader lose it by
+            // pressing Enter on a dead pane.
+            assert!(
+                type_and_wait(&mut terminal, "exit", "exit"),
+                "{kind:?}: the shell exits"
+            );
+            assert!(
+                wait_until(Duration::from_secs(10), || {
+                    terminal.poll();
+                    !terminal.is_running()
+                }),
+                "{kind:?}: exit ends the shell"
+            );
+            assert!(
+                matches!(terminal.send_key(b"\r"), KeyOutcome::Sent),
+                "{kind:?}: Enter starts a new shell"
+            );
+            assert_eq!(
+                terminal.sandbox_off,
+                Some(kind),
+                "{kind:?}: the restart kept WHICH policy"
+            );
+            assert_eq!(terminal.sandbox_label(), Some("none"), "{kind:?}");
+            assert!(
+                type_and_wait(&mut terminal, "echo again:$BSH_SANDBOX", "again:none"),
+                "{kind:?}: the restarted shell is unconfined for the same reason: {:?}",
+                terminal.lines()
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// A shell restarted by Enter keeps the pane's size: the new PTY used to

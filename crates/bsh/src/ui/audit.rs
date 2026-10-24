@@ -80,6 +80,7 @@ impl Shell {
             AuditPolicy {
                 permission: view.permission.clone(),
                 preset: view.preset.clone(),
+                presets_disabled: view.presets_disabled,
                 evaluator: view.evaluator.clone(),
                 error: view.error.clone(),
                 allows: AuditAllows {
@@ -119,6 +120,7 @@ impl Shell {
         if let Some(live) = self.state.policy.as_ref() {
             let data = live.data();
             policy.preset = data.preset.clone();
+            policy.presets_disabled = data.presets_disabled;
             policy.read_scope = data.preset_read_roots.len();
             policy.write_scope = data.preset_write_roots.len();
             policy.deny_roots = data.preset_deny_roots.len();
@@ -522,14 +524,7 @@ impl Shell {
             lang,
             "audit.policy.appliedLine",
             &[
-                (
-                    "preset",
-                    if policy.preset.is_empty() {
-                        lang.tr("audit.policy.noPreset")
-                    } else {
-                        policy.preset.clone()
-                    },
-                ),
+                ("preset", policy.preset_cell(lang)),
                 ("read", policy.read_scope.to_string()),
                 ("write", policy.write_scope.to_string()),
                 ("deny", policy.deny_roots.to_string()),
@@ -1024,14 +1019,7 @@ impl Shell {
                         "audit.policy.appliedField",
                         &[
                             ("evaluator", policy.evaluator.clone()),
-                            (
-                                "preset",
-                                if policy.preset.is_empty() {
-                                    lang.tr("audit.policy.noPreset")
-                                } else {
-                                    policy.preset.clone()
-                                },
-                            ),
+                            ("preset", policy.preset_cell(lang)),
                         ],
                     );
                     let exec = tr_args(
@@ -1269,25 +1257,27 @@ impl Shell {
             None => lang.tr("audit.call.noSandbox"),
         };
         // `none` alone does not say who released confinement. The bash result
-        // always stores a reason; the two known ones are localized, and an
+        // always stores a reason; the three known ones are localized through
+        // ONE mapping (the record, the page and the export agree), and an
         // id/text from a newer build is printed rather than guessed at.
         if let Some(reason) = call.sandbox_reason.as_deref() {
-            let reason = if reason == agent::tools::bash::PRESET_SANDBOX_OFF_REASON {
-                lang.tr("audit.call.sandboxOffReason")
-            } else if reason == agent::tools::bash::SANDBOX_RELEASED_REASON {
-                lang.tr("audit.call.sandboxReleasedReason")
-            } else {
-                reason.to_string()
+            let reason = match call.sandbox_reason_key() {
+                Some(key) => lang.tr(key),
+                None => reason.to_string(),
             };
             sandbox = format!("{sandbox} ({reason})");
         }
         match call.network.as_deref() {
             Some(network) => {
-                let network = tr_args(
-                    lang,
-                    "audit.call.networkField",
-                    &[("network", network.to_string())],
-                );
+                // `unconfined` is prose, not a policy state: no sandbox proxy
+                // existed, so the workspace allowlist was never consulted. It
+                // resolves through the audit's ONE mapping, the same one the
+                // Markdown export uses.
+                let network = match call.network_key() {
+                    Some(key) => lang.tr(key),
+                    None => network.to_string(),
+                };
+                let network = tr_args(lang, "audit.call.networkField", &[("network", network)]);
                 Some(format!("{sandbox} \u{00b7} {network}"))
             }
             None => Some(sandbox),
@@ -1321,24 +1311,6 @@ impl Shell {
             (None, Some(network)) => Some(network.to_string()),
             (None, None) => None,
         }
-    }
-
-    /// The page's own statement of what it cannot see.
-    fn audit_limits(&self) -> Div {
-        let lang = self.state.lang;
-        div()
-            .debug_selector(|| "audit-limits".to_string())
-            .flex()
-            .flex_col()
-            .gap(px(2.0))
-            .px(px(8.0))
-            .py(px(6.0))
-            .flex_none()
-            .border_t_1()
-            .border_color(rgb(theme::border_soft()))
-            .bg(rgb(theme::new_session_fill()))
-            .child(txt(lang.tr("audit.limits.shell"), 11.0, theme::faint()))
-            .child(txt(lang.tr("audit.limits.network"), 11.0, theme::faint()))
     }
 
     /// The whole tab.
@@ -1437,7 +1409,6 @@ impl Shell {
                     .flex_col()
                     .children(rows),
             )
-            .child(self.audit_limits())
             .into_any_element()
     }
 }

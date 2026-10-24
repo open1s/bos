@@ -131,6 +131,11 @@ impl Runner {
     }
 
     /// Re-seed the agent session from the UI transcript.
+    ///
+    /// Only the stored history is replayed here; the turn's runtime snapshot and
+    /// workspace instructions are injected by [`Runner::spawn`] after
+    /// compaction, immediately before the stream, so the fresh context is never
+    /// folded into the checkpoint it was meant to supersede.
     pub(crate) fn seed_session(agent: &Agent, transcript: &[ChatMessage]) {
         let mut session = agent.session();
         session.restore_messages(Vec::new());
@@ -160,12 +165,14 @@ impl Runner {
     pub(crate) fn rt(&self) -> &Runtime {
         &self.rt
     }
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn(
         &mut self,
         session_id: &str,
         agent: Arc<Agent>,
         input: Content,
         transcript: Vec<ChatMessage>,
+        facts: crate::context::RuntimeFacts,
         auto_retain: Option<usize>,
         tool_output_cap: usize,
     ) -> async_channel::Receiver<AgentEvent> {
@@ -206,6 +213,13 @@ impl Runner {
             if stop_task.load(Ordering::SeqCst) {
                 return;
             }
+            // The turn's own context is rendered HERE, on the runner's blocking
+            // runtime: the snapshot is pure, but instruction discovery stats the
+            // workspace, and the send path must not do file I/O on the UI
+            // thread. It is injected after the checkpoint so the fresh snapshot
+            // cannot be summarized into the history it supersedes.
+            let context = crate::context::TurnContext::from_facts(&facts, false);
+            context.inject(&agent);
             // The terminal event is held back until the mailbox has been handed
             // back: a steer the turn never reached another step for must be
             // restored BEFORE the shell starts the next turn from the queue.
@@ -399,6 +413,14 @@ mod tests {
             agent.clone(),
             react::llm::Content::Text("go".to_string()),
             transcript,
+            crate::context::RuntimeFacts {
+                cwd: String::new(),
+                confined: true,
+                sandbox_reason: None,
+                permission: "workspace-write".to_string(),
+                preset: "standard".to_string(),
+                presets_disabled: false,
+            },
             Some(0),
             1_000,
         );
@@ -445,5 +467,232 @@ mod tests {
             ),
             "the retained tail survives the automatic checkpoint"
         );
+    }
+
+    /// A vendor that records the user rows of the request the engine builds.
+    ///
+    /// Recording the session at the stream call proves the injected context is
+    /// what the provider would receive, not merely a value the shell stored.
+    struct ContextCapturingLlm(Arc<std::sync::Mutex<Vec<String>>>);
+
+    #[async_trait::async_trait]
+    impl agent::LlmClient<agent::agent::AgentSession, agent::agent::AgentReactContext>
+        for ContextCapturingLlm
+    {
+        async fn complete(
+            &self,
+            _persona: Option<String>,
+            _req: react::llm::LlmRequest,
+            _session: &mut agent::agent::AgentSession,
+            _context: &mut agent::agent::AgentReactContext,
+        ) -> react::llm::LlmResponseResult {
+            Ok(summary_response("ok"))
+        }
+
+        async fn stream_complete(
+            &self,
+            _persona: Option<String>,
+            _req: react::llm::LlmRequest,
+            session: &mut agent::agent::AgentSession,
+            _context: &mut agent::agent::AgentReactContext,
+        ) -> Result<react::llm::TokenStream, react::llm::LlmError> {
+            *self.0.lock().unwrap() = session
+                .messages()
+                .iter()
+                .filter_map(|message| match message {
+                    react::LlmMessage::User { content } => content.as_text().map(str::to_string),
+                    _ => None,
+                })
+                .collect();
+            Ok(Box::pin(futures::stream::iter(vec![Ok(
+                react::llm::StreamToken::Done,
+            )])))
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "context-capturing-mock"
+        }
+    }
+
+    fn workspace(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "bsh-runner-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch workspace");
+        dir
+    }
+
+    fn capturing_agent(seen: Arc<std::sync::Mutex<Vec<String>>>) -> Arc<agent::Agent> {
+        let mut provider = agent::agent::agentic::LlmProvider::new();
+        provider.register_vendor("mock".to_string(), Box::new(ContextCapturingLlm(seen)));
+        Arc::new(agent::Agent::new(
+            agent::AgentConfig {
+                model: "mock-model".to_string(),
+                ..Default::default()
+            },
+            Arc::new(provider),
+        ))
+    }
+
+    fn drain(receiver: async_channel::Receiver<AgentEvent>) {
+        futures::executor::block_on(async {
+            while let Ok(event) = receiver.recv().await {
+                if matches!(event, AgentEvent::Done | AgentEvent::Error(_)) {
+                    break;
+                }
+            }
+        });
+    }
+
+    /// The first user message of a turn is the runtime snapshot; the workspace
+    /// instructions follow it; the reader's own line comes last. This is the
+    /// order the reference's loop builds.
+    #[test]
+    fn the_first_user_message_of_a_turn_carries_the_live_facts() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let agent = capturing_agent(seen.clone());
+        let root = workspace("context");
+        std::fs::write(root.join("AGENTS.md"), "workspace rule").expect("the file");
+        let facts = crate::context::RuntimeFacts {
+            cwd: root.to_string_lossy().to_string(),
+            confined: true,
+            sandbox_reason: None,
+            permission: "workspace-write".to_string(),
+            preset: "standard".to_string(),
+            presets_disabled: false,
+        };
+        let mut runner = Runner::new();
+        let receiver = runner.spawn(
+            "context-turn",
+            agent,
+            react::llm::Content::Text("go".to_string()),
+            Vec::new(),
+            facts,
+            None,
+            1_000,
+        );
+        drain(receiver);
+        let rows = seen.lock().unwrap().clone();
+        assert_eq!(rows.len(), 3, "snapshot, instructions, input: {rows:?}");
+        assert!(
+            rows[0].starts_with(crate::context::RUNTIME_CONTEXT_PREAMBLE),
+            "the first user message is the snapshot: {}",
+            rows[0]
+        );
+        assert!(
+            rows[0].contains(&format!("Current working directory: {root:?}.")),
+            "{}",
+            rows[0]
+        );
+        assert!(rows[0].contains("Sandbox: confined to the workspace."));
+        assert!(rows[0].contains("Permission: workspace-write."));
+        assert!(rows[0].contains("Agent preset: standard."));
+        assert!(
+            rows[1].contains("Instructions from: AGENTS.md") && rows[1].contains("workspace rule"),
+            "the instruction message follows the snapshot: {}",
+            rows[1]
+        );
+        assert_eq!(rows[2], "go", "the reader's line is last");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// With no instruction file, only the snapshot and the input are sent -
+    /// never an empty instructions message.
+    #[test]
+    fn a_turn_without_instructions_injects_no_empty_message() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let agent = capturing_agent(seen.clone());
+        let root = workspace("no-context");
+        let facts = crate::context::RuntimeFacts {
+            cwd: root.to_string_lossy().to_string(),
+            confined: true,
+            sandbox_reason: None,
+            permission: "workspace-write".to_string(),
+            preset: "standard".to_string(),
+            presets_disabled: false,
+        };
+        assert_eq!(
+            crate::context::TurnContext::from_facts(&facts, false).instructions,
+            None
+        );
+        let mut runner = Runner::new();
+        let receiver = runner.spawn(
+            "no-context-turn",
+            agent,
+            react::llm::Content::Text("go".to_string()),
+            Vec::new(),
+            facts,
+            None,
+            1_000,
+        );
+        drain(receiver);
+        let rows = seen.lock().unwrap().clone();
+        assert_eq!(rows.len(), 2, "snapshot and input only: {rows:?}");
+        assert!(rows[0].starts_with(crate::context::RUNTIME_CONTEXT_PREAMBLE));
+        assert_eq!(rows[1], "go");
+        assert!(
+            rows.iter().all(|row| !row.is_empty()),
+            "no empty injected message: {rows:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A child turn carries the delegation scope in its snapshot, and the
+    /// read-only child view does NOT show the harness's own injection as a
+    /// conversation row.
+    #[test]
+    fn a_child_turn_carries_the_delegation_context() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let child = capturing_agent(seen.clone());
+        let root = workspace("child-context");
+        let facts = crate::context::RuntimeFacts {
+            cwd: root.to_string_lossy().to_string(),
+            confined: true,
+            sandbox_reason: None,
+            permission: "workspace-write".to_string(),
+            preset: "standard".to_string(),
+            presets_disabled: false,
+        };
+        let context = crate::context::TurnContext::from_facts(&facts, true);
+        let registry = Arc::new(crate::subagent::SubagentRegistry::default());
+        let result = futures::executor::block_on(crate::caps::stream_child(
+            &child,
+            "do the task".to_string(),
+            registry,
+            "child-run",
+            &context,
+        ));
+        assert!(result.is_ok(), "the child turn runs: {result:?}");
+        let rows = seen.lock().unwrap().clone();
+        assert_eq!(rows.len(), 2, "snapshot and input: {rows:?}");
+        assert!(rows[0].starts_with(crate::context::RUNTIME_CONTEXT_PREAMBLE));
+        assert!(
+            rows[0].contains(crate::context::SUBAGENT_CONTEXT),
+            "the child snapshot carries the delegation scope: {}",
+            rows[0]
+        );
+        assert!(rows[0].contains("Permission: workspace-write."));
+        assert_eq!(rows[1], "do the task");
+
+        // The live child transcript is what the pane draws; the injected
+        // snapshot is not a row of the child's own conversation.
+        let transcript = crate::caps::child_transcript(&child);
+        assert!(
+            transcript.iter().all(|row| !row
+                .content
+                .starts_with(crate::context::RUNTIME_CONTEXT_PREAMBLE)),
+            "the injected snapshot is not a child row: {transcript:?}"
+        );
+        assert!(
+            transcript.iter().any(|row| row.content == "do the task"),
+            "the child's own prompt is still shown: {transcript:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

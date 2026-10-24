@@ -163,6 +163,39 @@ pub struct PolicyData {
     pub workspace_root: PathBuf,
     /// The agent preset id in effect, mirrored into Rego as `data.preset`.
     pub preset: String,
+    /// Whether presets are administratively OFF, so no preset contributed.
+    ///
+    /// The id above is empty in two different situations - "the reader chose no
+    /// preset" and "a master switch turned every preset off" - and the audit
+    /// has to tell them apart: the second explains why a restriction the preset
+    /// usually adds is absent. The flag is data only; no module reads it.
+    pub presets_disabled: bool,
+    /// Whether the settings master switch leaves heel applied, mirrored into
+    /// Rego as `data.sandbox_enabled`.
+    ///
+    /// True is the ordinary state: heel confines whenever the effective
+    /// permission is not full access. False means the reader turned the sandbox
+    /// off, so the shell and the terminal run unconfined for EVERY preset. A
+    /// workspace policy can read this to REQUIRE confinement: a module that
+    /// refuses `input.action == "spawn"` while the value is false denies the
+    /// shell call before a process exists.
+    ///
+    /// Defaults to true, matching the settings file's own absent-means-on
+    /// default for a caller that builds the data directly.
+    pub sandbox_enabled: bool,
+    /// Whether heel ACTUALLY confines the shell and terminal this turn,
+    /// mirrored into Rego as `data.sandbox_confined`.
+    ///
+    /// This is the resolved fact, not the switch: false when the master switch
+    /// is off, false when the effective permission is full access and no preset
+    /// asks for heel, and TRUE when a preset's `sandbox = "heel"` confines a
+    /// full-access session. A policy that requires confinement should read THIS
+    /// key; `data.sandbox_enabled` above answers only "is the switch on", which
+    /// is true for a released full-access turn and therefore not enough.
+    ///
+    /// Defaults to true, consistent with the unconfined-by-full-access state
+    /// not being the default for a caller that builds the data directly.
+    pub sandbox_confined: bool,
     /// Resolved addresses egress may reach. An exact address or a CIDR range.
     ///
     /// Empty is the documented default and denies all egress.
@@ -178,6 +211,15 @@ pub struct PolicyData {
     /// Destination ports egress may use. Empty means any port; a non-empty list
     /// refuses a request whose port the caller did not state.
     pub egress_ports: Vec<u16>,
+    /// URL PATH prefixes egress may never reach, decided on the path itself.
+    ///
+    /// Only a transport that can SEE the path may ask this question - a plain
+    /// HTTP forward-proxy request carries the absolute URI, a CONNECT tunnel
+    /// does not - so this is a narrower door than the address and host lists
+    /// rather than a replacement for them. An entry is a literal prefix, so
+    /// `/secret/` denies that directory and everything under it. Empty means
+    /// no path rule at all.
+    pub egress_deny_paths: Vec<String>,
     /// Whether the workspace declared NO egress allowlist file at all.
     ///
     /// The three states of `.bsh/egress-allowlist` are not the two an empty and
@@ -259,9 +301,13 @@ impl PolicyData {
         Self {
             workspace_root,
             preset: String::new(),
+            presets_disabled: false,
+            sandbox_enabled: true,
+            sandbox_confined: true,
             egress_allowlist: Vec::new(),
             egress_hosts: Vec::new(),
             egress_ports: Vec::new(),
+            egress_deny_paths: Vec::new(),
             egress_unrestricted: false,
             preset_read_restricted: false,
             preset_read_roots: Vec::new(),
@@ -283,6 +329,33 @@ impl PolicyData {
     /// Set the preset id in force.
     pub fn with_preset(mut self, preset: impl Into<String>) -> Self {
         self.preset = preset.into();
+        self
+    }
+
+    /// Record that presets were turned off, so no preset contributed.
+    pub fn with_presets_disabled(mut self, disabled: bool) -> Self {
+        self.presets_disabled = disabled;
+        self
+    }
+
+    /// Mirror the settings sandbox switch into the data document.
+    ///
+    /// True keeps heel applicable (the default); false means the reader
+    /// released the shell and the terminal for every preset, and a workspace
+    /// policy may read `data.sandbox_enabled` to refuse an unconfined spawn.
+    pub fn with_sandbox_enabled(mut self, enabled: bool) -> Self {
+        self.sandbox_enabled = enabled;
+        self
+    }
+
+    /// Mirror the RESOLVED confinement into the data document.
+    ///
+    /// `confined` is the answer after the switch, the preset's `heel` arm and
+    /// the effective permission are folded together - the same fact the shell
+    /// tool and the terminal spawn from. A policy that requires confinement
+    /// reads this rather than the master switch.
+    pub fn with_sandbox_confined(mut self, confined: bool) -> Self {
+        self.sandbox_confined = confined;
         self
     }
 
@@ -341,6 +414,22 @@ impl PolicyData {
     /// Allow one destination port.
     pub fn allow_port(mut self, port: u16) -> Self {
         self.egress_ports.push(port);
+        self
+    }
+
+    /// Replace the URL path prefixes egress may never reach.
+    pub fn with_egress_deny_paths<I, S>(mut self, entries: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.egress_deny_paths = entries.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Deny one URL path prefix.
+    pub fn deny_egress_path(mut self, prefix: impl Into<String>) -> Self {
+        self.egress_deny_paths.push(prefix.into());
         self
     }
 
@@ -468,12 +557,28 @@ impl PolicyData {
             Value::from(self.workspace_prefix().as_str()),
         );
         root.insert(Value::from("preset"), Value::from(self.preset.as_str()));
+        root.insert(
+            Value::from("presets_disabled"),
+            Value::from(self.presets_disabled),
+        );
+        root.insert(
+            Value::from("sandbox_enabled"),
+            Value::from(self.sandbox_enabled),
+        );
+        root.insert(
+            Value::from("sandbox_confined"),
+            Value::from(self.sandbox_confined),
+        );
         root.insert(Value::from("egress_allowlist"), Value::from(allowlist));
         root.insert(
             Value::from("egress_hosts"),
             Value::from(roots(&self.egress_hosts)),
         );
         root.insert(Value::from("egress_ports"), Value::from(ports));
+        root.insert(
+            Value::from("egress_deny_paths"),
+            Value::from(roots(&self.egress_deny_paths)),
+        );
         root.insert(
             Value::from("egress_unrestricted"),
             Value::from(self.egress_unrestricted),

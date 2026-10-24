@@ -108,9 +108,10 @@ pub struct BashTool {
     sandbox: Option<Arc<SandboxSpec>>,
     /// A caller-supplied reason the child is unconfined.
     ///
-    /// A PRESET that turned the sandbox off sets this. When it is unset the
-    /// result still carries a reason: [`SANDBOX_RELEASED_REASON`], so
-    /// `sandbox: "none"` is never left bare.
+    /// A PRESET that turned the sandbox off sets this, and so does the settings
+    /// master switch ([SANDBOX_SETTINGS_OFF_REASON]), which wins over the
+    /// preset's arm. When it is unset the result still carries a reason:
+    /// [`SANDBOX_RELEASED_REASON`], so `sandbox: "none"` is never left bare.
     sandbox_reason: Option<String>,
     /// The roster a run_in_background call registers in, when the shell wires
     /// one. Without it the flag is refused rather than silently run foreground.
@@ -254,16 +255,24 @@ impl BashTool {
     }
 
     /// What the command's network could reach, as the spec enforces it.
+    ///
+    /// There are FOUR states, not three. `unconfined` is the one that used to
+    /// hide behind `unrestricted`: with no sandbox there is no proxy and no
+    /// per-connection policy question, so a workspace `.bsh/egress-allowlist`
+    /// was never consulted. Calling that "unrestricted" let a reader conclude
+    /// the allowlist had been read and passed. `unrestricted` now means only
+    /// the confined, allow-all-proxy state (no file declared), which is a real
+    /// policy answer.
     fn network_label(&self) -> &'static str {
         use crate::sandbox::Egress;
         match self.sandbox.as_deref() {
-            Some(spec) if !spec.is_confined() => "unrestricted",
+            Some(spec) if !spec.is_confined() => NETWORK_UNCONFINED,
             Some(spec) => match spec.egress() {
                 Egress::DenyAll => "deny-all",
                 Egress::Unrestricted => "unrestricted",
                 Egress::Allow(_) => "allowlist",
             },
-            None => "unrestricted",
+            None => NETWORK_UNCONFINED,
         }
     }
 
@@ -367,19 +376,25 @@ pub struct BashExecutionResult {
     pub sandbox: String,
     /// Why this command ran WITHOUT the sandbox.
     ///
-    /// `sandbox: "none"` is never left bare: a preset's explicit choice carries
+    /// `sandbox: "none"` is never left bare, and the three arms are told apart:
+    /// the settings master switch carries [`SANDBOX_SETTINGS_OFF_REASON`] (it
+    /// wins over a preset's `heel`), a preset's explicit choice carries
     /// [`PRESET_SANDBOX_OFF_REASON`], and every other unconfined run carries
-    /// [`SANDBOX_RELEASED_REASON`]. The distinction matters because a preset's
-    /// choice can be revoked by selecting another preset, while a full-access
-    /// release follows the session permission.
+    /// [`SANDBOX_RELEASED_REASON`]. The distinction matters because each arm is
+    /// revoked by a different control: the switch, another preset, or the
+    /// session permission.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sandbox_reason: Option<String>,
-    /// What the command's network could reach: "deny-all", "allowlist" or
-    /// "unrestricted".
+    /// What the command's network could reach: "deny-all", "allowlist",
+    /// "unrestricted" or "unconfined".
     ///
     /// Reported beside the backend because a reader asking "did this touch the
     /// network" needs the answer the sandbox enforced, not an inference from the
-    /// command line.
+    /// command line. The last two are DIFFERENT facts: `unrestricted` is a
+    /// confined heel shell running its allow-all proxy (no egress file was
+    /// declared), while `unconfined` means no sandbox proxy existed at all -
+    /// so a workspace `.bsh/egress-allowlist` was never consulted, and no
+    /// allowlist answer can be inferred from this field.
     pub network: String,
     /// Why a failed command was refused by the KERNEL even though its egress was
     /// UNRESTRICTED.
@@ -406,6 +421,23 @@ pub struct BashExecutionResult {
 /// locale table, and the persisted result stays language-neutral.
 pub const UNPROXIED_DIRECT_SOCKET: &str = "unproxied-direct-socket";
 
+/// The network value for a command that ran WITHOUT a sandbox proxy.
+///
+/// Distinct from `"unrestricted"` on purpose. `unrestricted` is a confined
+/// heel shell with no egress file, where the allow-all proxy still exists and
+/// still refuses ICMP and host-local destinations. `unconfined` means the
+/// shell had no sandbox at all: there was no proxy and no per-connection
+/// policy question, so a workspace `.bsh/egress-allowlist` was never
+/// consulted. The two must not read alike, or a reader concludes the allowlist
+/// was checked and passed.
+pub const NETWORK_UNCONFINED: &str = "unconfined";
+
+/// The network value for a confined heel shell with no egress file declared.
+///
+/// Kept as a constant beside its counterpart so the diagnostic can require
+/// exactly this state and never accept [`NETWORK_UNCONFINED`] as its premise.
+pub const NETWORK_UNRESTRICTED: &str = "unrestricted";
+
 /// The reason a bash result carries when a preset turned the sandbox off.
 ///
 /// Plain English rather than an id: the result is read by the model and by the
@@ -414,10 +446,22 @@ pub const UNPROXIED_DIRECT_SOCKET: &str = "unproxied-direct-socket";
 /// same sentence through its locale table, so both readings agree.
 pub const PRESET_SANDBOX_OFF_REASON: &str = "a preset turned the sandbox off";
 
+/// The reason a bash result carries when the reader switched the sandbox off in
+/// the settings.
+///
+/// The third arm, and the one that WINS over a preset's `sandbox = "heel"`: the
+/// master switch is a machine preference, so it applies whatever the preset in
+/// force asks for. Distinct from both other reasons on purpose - a reader who
+/// sees `sandbox: "none"` must be able to tell the settings switch from a
+/// preset's own widening and from the permission tier's release, because only
+/// the first is one control that turns confinement off everywhere.
+pub const SANDBOX_SETTINGS_OFF_REASON: &str = "the sandbox is turned off in settings";
+
 /// The reason a bash result carries when the full-access permission released
 /// the sandbox (no preset asked for it).
 ///
-/// Distinct from [`PRESET_SANDBOX_OFF_REASON`] on purpose: a reader who sees
+/// Distinct from [`PRESET_SANDBOX_OFF_REASON`] and
+/// [`SANDBOX_SETTINGS_OFF_REASON`] on purpose: a reader who sees
 /// `sandbox: "none"` must be able to tell a policy choice from the permission
 /// tier that governs every tool in the turn.
 pub const SANDBOX_RELEASED_REASON: &str = "the full-access permission released the sandbox";
@@ -445,7 +489,9 @@ fn unproxied_direct_socket(
     stderr: &str,
 ) -> Option<&'static str> {
     const SCAN: usize = 8_192;
-    if success || sandbox != "heel" || network != "unrestricted" {
+    // Exactly the CONFINED allow-all state. `unconfined` deliberately does not
+    // qualify: with no sandbox there is no kernel refusal to explain.
+    if success || sandbox != "heel" || network != NETWORK_UNRESTRICTED {
         return None;
     }
     let syscall = ["sendto", "connect", "socket"];
@@ -2215,9 +2261,34 @@ mod tests {
         let plain = BashTool::new("bash")
             .run(&serde_json::json!({ "command": "printf ok" }))
             .expect("the command runs");
-        assert_eq!(plain["network"], serde_json::json!("unrestricted"));
+        assert_eq!(
+            plain["network"],
+            serde_json::json!(NETWORK_UNCONFINED),
+            "no spec means no proxy: this is not the allow-all PROXY state"
+        );
 
+        // The distinction that matters: a policy that DECLARES an allowlist,
+        // paired with an unconfined spec, must not report `allowlist` or
+        // `unrestricted`. Nothing enforced it, so the result says so.
         let dir = sandbox_workspace();
+        let root = dir.path().canonicalize().expect("a canonical root");
+        let policy = sandbox_policy(&root, "workspace-write", &["203.0.113.7"]);
+        let bare = std::sync::Arc::new(crate::sandbox::SandboxSpec::bare(
+            crate::sandbox::SandboxMode::FullAccess,
+            &root,
+        ));
+        let unconfined = BashTool::new("bash")
+            .with_workspace(root.to_str().expect("a utf-8 path"))
+            .with_policy(policy, "session", "preset")
+            .with_sandbox_spec(bare)
+            .run(&serde_json::json!({ "command": "printf ok" }))
+            .expect("the command runs");
+        assert_eq!(unconfined["sandbox"], serde_json::json!("none"));
+        assert_eq!(
+            unconfined["network"],
+            serde_json::json!(NETWORK_UNCONFINED),
+            "an allowlist existed but no proxy consulted it: {unconfined}"
+        );
         let denied = sandboxed_tool(dir.path(), "workspace-write", &[])
             .run(&serde_json::json!({ "command": "printf ok" }))
             .expect("the command runs");

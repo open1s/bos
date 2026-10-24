@@ -303,6 +303,17 @@ mod tests {
         let markdown = std::fs::read_to_string(&markdown_path).expect("the Markdown");
         assert!(markdown.contains("read_file"));
         assert!(markdown.contains("deny-outside"));
+        // The Markdown table carries the confinement column the JSON already
+        // had: the shell's own backend and reach, so a Markdown reader can tell
+        // a confined command from a released one.
+        assert!(
+            markdown.contains("| Confinement |"),
+            "the table names the confinement column: {markdown}"
+        );
+        assert!(
+            markdown.contains("heel") && markdown.contains("deny-all"),
+            "the shell's recorded backend and reach reach the Markdown: {markdown}"
+        );
         let json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&json_path).expect("the JSON"))
                 .expect("valid JSON");

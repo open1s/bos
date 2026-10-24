@@ -295,6 +295,12 @@ pub(crate) struct PolicyAuditView {
     /// trajectory's policy tab takes it from here rather than inferring one
     /// from a tool name, because a `ToolEvent` carries no preset field.
     pub(crate) preset: String,
+    /// Whether every preset was switched off when this policy was compiled.
+    ///
+    /// The `preset` above is empty in that case, exactly as it is when no
+    /// preset was chosen; this flag is what lets the audit say WHY a
+    /// restriction a preset usually adds was absent.
+    pub(crate) presets_disabled: bool,
     /// Why the set is in its failure mode, when it is.
     pub(crate) error: Option<String>,
     /// Advisory refusals: recorded, reported, and NOT blocking.
@@ -313,6 +319,10 @@ pub(crate) enum PresetApply {
     Default,
     /// Record it on one session.
     Session(String),
+    /// Turn the master preset switch OFF, which persists immediately.
+    DisablePresets,
+    /// Turn the master SANDBOX switch OFF, which persists immediately.
+    DisableSandbox,
     /// Write an edited declaration back into the draft.
     Save {
         /// The preset id being edited.
@@ -1686,10 +1696,17 @@ impl AppState {
         self.streams.contains_key(id)
     }
 
-    /// Any session streaming right now.
+    /// The live turn's elapsed whole seconds - the figure its running line paints.
+    ///
+    /// The pane's elapsed clock compares this against the second its last frame
+    /// painted, so the text and the repaint decision come from the same fact.
+    pub(crate) fn turn_elapsed_seconds(&self) -> Option<u64> {
+        Some(self.turn_started?.elapsed().as_secs())
+    }
+
     /// How long the active turn has been streaming, as the reference shows it.
     pub(crate) fn turn_elapsed(&self) -> Option<String> {
-        let seconds = self.turn_started?.elapsed().as_secs();
+        let seconds = self.turn_elapsed_seconds()?;
         Some(if seconds < 60 {
             format!("{seconds}s")
         } else {
@@ -1697,6 +1714,7 @@ impl AppState {
         })
     }
 
+    /// Any session streaming right now.
     pub(crate) fn any_streaming(&self) -> bool {
         !self.streams.is_empty()
     }
@@ -1753,6 +1771,25 @@ impl AppState {
     }
 
     /// Stop the active session's stream.
+    /// Clear a stream marker because the pump's channel ended without a
+    /// terminal event (a dropped sender, not a stop or a Done).
+    ///
+    /// The marker is what `any_streaming()` reports and what keeps the shell's
+    /// elapsed clock alive, so a pump that lost its sender must not leave it
+    /// set. The ticket is the marker this pump started under: a newer turn for
+    /// the same session has a newer timestamp and is never cleared by an older
+    /// pump's tail. Returns whether this call cleared it.
+    pub(crate) fn end_stream(&mut self, id: &str, ticket: Option<u64>) -> bool {
+        if ticket.is_none() || self.streams.get(id) != ticket.as_ref() {
+            return false;
+        }
+        self.streams.remove(id);
+        if self.streams.is_empty() {
+            self.turn_started = None;
+        }
+        true
+    }
+
     pub(crate) fn stop(&mut self, id: &str) {
         self.runner.stop(id);
         self.streams.remove(id);
@@ -3350,6 +3387,31 @@ impl AppState {
         self.effective().preset_id
     }
 
+    /// Whether the policy behind [`Self::applied_preset`] was compiled with
+    /// presets off. The same preference order as that method, so the id and the
+    /// reason it is empty always come from one snapshot.
+    pub(crate) fn applied_presets_disabled(&self) -> bool {
+        if let Some(audit) = self.policy_audit.as_ref() {
+            return audit.presets_disabled;
+        }
+        if let Some(policy) = self.policy.as_ref() {
+            return policy.data().presets_disabled;
+        }
+        self.effective().presets_disabled
+    }
+
+    /// The preset cell a transcript/trajectory/audit surface prints.
+    ///
+    /// An empty id prints "no preset"; while the master switch is off it prints
+    /// the REASON, so a reader comparing two runs can tell a restriction absent
+    /// because nothing was chosen from one absent because nothing applied.
+    pub(crate) fn preset_cell(&self, id: &str) -> String {
+        if id.trim().is_empty() && self.applied_presets_disabled() {
+            return crate::i18n::tr(self.lang, "audit.policy.presetsOff").to_string();
+        }
+        self.preset_label(id)
+    }
+
     /// The label a preset id is shown under.
     ///
     /// One rule for every surface: the preset's declared display name when it
@@ -3379,6 +3441,7 @@ impl AppState {
             evaluator: policy.evaluator().to_string(),
             permission: policy.data().permission.clone(),
             preset: policy.data().preset.clone(),
+            presets_disabled: policy.data().presets_disabled,
             error: policy.error().map(ToString::to_string),
             advisories: policy.advisories(),
             advisories_total: policy.advisories_total(),
@@ -4029,6 +4092,68 @@ impl AppState {
                 self.draft_mut().global.presets.insert(id, *preset);
                 closes_editor = true;
             }
+            // The master switch is a COMMITTED setting, not a draft one: it is
+            // persisted here and the live policy is recompiled in the same
+            // call, so a confirmed widening is real before the next frame. A
+            // refused write leaves every preset enabled and says why.
+            PresetApply::DisableSandbox => {
+                return match self.commit_sandbox_enabled(false) {
+                    Ok(()) => {
+                        // A turn that is already streaming was built with its
+                        // own sandbox spec (it is fixed at spawn), so the switch
+                        // cannot reach it. Say so instead of letting "off"
+                        // imply the running turn was released.
+                        let mut text =
+                            crate::i18n::tr(self.lang, "settings.sandboxOffApplied").to_string();
+                        if let Some(id) = self.active_id.clone() {
+                            if self.is_streaming(&id) {
+                                text = format!(
+                                    "{text} {}",
+                                    crate::i18n::tr(self.lang, "settings.presetsNextTurn")
+                                );
+                            }
+                        }
+                        self.notice(text);
+                        false
+                    }
+                    Err(error) => {
+                        self.notice(format!(
+                            "{} {error}",
+                            crate::i18n::tr(self.lang, "settings.sandboxSaveFailed")
+                        ));
+                        false
+                    }
+                };
+            }
+            PresetApply::DisablePresets => {
+                return match self.commit_presets_enabled(false) {
+                    Ok(()) => {
+                        // A turn that is already streaming was built with the
+                        // preset's tools, ceiling and sandbox (they are fixed at
+                        // spawn), so the switch cannot reach it. Say so instead
+                        // of letting "off" imply the running turn changed.
+                        let mut text =
+                            crate::i18n::tr(self.lang, "settings.presetsOffApplied").to_string();
+                        if let Some(id) = self.active_id.clone() {
+                            if self.is_streaming(&id) {
+                                text = format!(
+                                    "{text} {}",
+                                    crate::i18n::tr(self.lang, "settings.presetsNextTurn")
+                                );
+                            }
+                        }
+                        self.notice(text);
+                        false
+                    }
+                    Err(error) => {
+                        self.notice(format!(
+                            "{} {error}",
+                            crate::i18n::tr(self.lang, "settings.presetsSaveFailed")
+                        ));
+                        false
+                    }
+                };
+            }
         }
         self.notice(crate::i18n::tr_args(
             self.lang,
@@ -4041,6 +4166,168 @@ impl AppState {
     /// Drop the parked change. The previous value is untouched.
     pub(crate) fn cancel_pending_preset(&mut self) {
         self.pending_preset = None;
+    }
+
+    /// The confirmation turning every preset off needs, or none when nothing
+    /// is lost.
+    ///
+    /// Disabling a preset is a WIDENING, so it goes through the same parked
+    /// change the preset pickers use: the facts named are exactly what the
+    /// preset IN FORCE contributes today (the permission ceiling, scopes, the
+    /// forced sandbox, egress, the tool set and its policy modules), read
+    /// against the session's own requested mode. A preset that only inherits
+    /// declarations has nothing to lose, so it yields no pending change and the
+    /// switch applies at once.
+    pub(crate) fn presets_off_pending(&self) -> Option<PresetWidening> {
+        if !self.draft().global.general.presets_active() {
+            return None;
+        }
+        let current = match self.active_id.as_deref() {
+            Some(id) => self.effective_session_preset(id),
+            None => self.effective_default_preset(),
+        };
+        let facts = crate::preset_catalogue::disabling_facts(
+            current.as_ref(),
+            &self.draft().workspace.agent.permission,
+        );
+        if facts.is_empty() {
+            return None;
+        }
+        Some(PresetWidening {
+            // No preset is being applied, so there is no target id to name.
+            target: String::new(),
+            facts,
+            previous: self.preset_label(&self.effective().preset_id),
+            apply: PresetApply::DisablePresets,
+        })
+    }
+
+    /// The confirmation turning the SANDBOX off needs, or none when nothing is
+    /// lost.
+    ///
+    /// The switch is a widening, so it takes the same parked confirmation the
+    /// preset pickers use. Its facts are the two losses every turn would take -
+    /// the kernel filesystem confinement and the egress proxy with its
+    /// allowlist - plus, when any preset declares a heel sandbox, that those
+    /// declarations are being overridden. At full access with no heel preset the
+    /// permission has already released the shell, so nothing is lost, no gate
+    /// opens and the switch flips at once.
+    pub(crate) fn sandbox_off_pending(&self) -> Option<PresetWidening> {
+        if !self.draft().global.general.sandbox_active() {
+            return None;
+        }
+        let current = match self.active_id.as_deref() {
+            Some(id) => self.effective_session_preset(id),
+            None => self.effective_default_preset(),
+        };
+        let effective_permission = self.effective().permission.effective;
+        let facts = crate::preset_catalogue::sandbox_off_facts(
+            current.as_ref(),
+            &effective_permission,
+            self.presets_declaring_heel(),
+        );
+        if facts.is_empty() {
+            return None;
+        }
+        Some(PresetWidening {
+            // No preset is being applied, so there is no target id to name.
+            target: String::new(),
+            facts,
+            previous: self.preset_label(&self.effective().preset_id),
+            apply: PresetApply::DisableSandbox,
+        })
+    }
+
+    /// Whether any preset on the roster declares a heel sandbox.
+    ///
+    /// The master switch overrides that arm for EVERY preset, so the
+    /// confirmation names the override when any declaration carries it - not
+    /// only the one in force. A reader who later selects another heel preset
+    /// would otherwise meet a restriction the dialog never mentioned.
+    fn presets_declaring_heel(&self) -> bool {
+        crate::preset_catalogue::catalogue(&self.draft().global)
+            .iter()
+            .any(|entry| entry.sandbox == Some(crate::settings::global::SandboxChoice::Heel))
+    }
+
+    /// Commit the master sandbox switch and recompile the live policy.
+    ///
+    /// The same shape as `Self::commit_presets_enabled`, for the same reason:
+    /// the turn build reads the COMMITTED tree, so a switch written only to the
+    /// draft left the terminal, the audit and the sandbox spec on the old
+    /// setting until Save. Exactly one field is copied across, saved, and then
+    /// the live policy is rebaked - never any other unsaved draft field.
+    ///
+    /// Off is persisted as Some(false); on is written back to ABSENT, which is
+    /// how a fresh file spells an applied sandbox, so a reader who switches it
+    /// back on leaves no trace that would change the meaning of the file.
+    pub(crate) fn commit_sandbox_enabled(&mut self, enabled: bool) -> std::io::Result<()> {
+        let previous = self.settings.global.general.sandbox_enabled;
+        let drafted = self
+            .draft
+            .as_ref()
+            .map(|draft| draft.global.general.sandbox_enabled);
+        let value = (!enabled).then_some(false);
+        self.settings.global.general.sandbox_enabled = value;
+        if let Some(draft) = self.draft.as_mut() {
+            draft.global.general.sandbox_enabled = value;
+        }
+        self.settings.ensure_workspace();
+        match self.settings.save() {
+            Ok(()) => {
+                self.rebake_policy();
+                Ok(())
+            }
+            Err(error) => {
+                self.settings.global.general.sandbox_enabled = previous;
+                if let Some(draft) = self.draft.as_mut() {
+                    if let Some(drafted) = drafted {
+                        draft.global.general.sandbox_enabled = drafted;
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Commit the master preset switch and recompile the live policy.
+    ///
+    /// The same shape as [`Self::commit_permission`], for the same reason: the
+    /// turn build reads the COMMITTED tree, so a switch written only to the
+    /// draft left the terminal, the audit and the sandbox spec on the old
+    /// policy until Save. Exactly one field is copied across, saved, and then
+    /// the live policy is rebaked - never any other unsaved draft field.
+    ///
+    /// Off is persisted as `Some(false)`; on is written back to ABSENT, which
+    /// is how a fresh file spells enabled, so a reader who turns presets back
+    /// on leaves no trace that would change the meaning of the file.
+    pub(crate) fn commit_presets_enabled(&mut self, enabled: bool) -> std::io::Result<()> {
+        let previous = self.settings.global.general.presets_enabled;
+        let drafted = self
+            .draft
+            .as_ref()
+            .map(|draft| draft.global.general.presets_enabled);
+        let value = (!enabled).then_some(false);
+        self.settings.global.general.presets_enabled = value;
+        if let Some(draft) = self.draft.as_mut() {
+            draft.global.general.presets_enabled = value;
+        }
+        self.settings.ensure_workspace();
+        match self.settings.save() {
+            Ok(()) => {
+                self.rebake_policy();
+                Ok(())
+            }
+            Err(error) => {
+                self.settings.global.general.presets_enabled = previous;
+                if let Some(draft) = self.draft.as_mut() {
+                    if let Some(drafted) = drafted {
+                        draft.global.general.presets_enabled = drafted;
+                    }
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Record one session's preset without asking the widening gate.
@@ -4736,7 +5023,8 @@ pub(crate) fn base64_encode(bytes: &[u8]) -> String {
 /// Plan mode is a promise about what the model may DO, so the instruction has
 /// to travel on the request itself: the reader's text stays what the transcript
 /// shows, while the model receives the plan-first preamble.
-pub(crate) const PLAN_DIRECTIVE: &str = "[Plan mode] Inspect what the task needs and reply with a concrete, step-by-step plan. Do not edit files, run mutating commands, or begin the work until the reader approves the plan.";
+/// Re-exported so the UI and the turn builder keep one path to the directive.
+pub(crate) const PLAN_DIRECTIVE: &str = crate::prompts::PLAN_DIRECTIVE;
 
 /// One typed slash command line, parsed the way the reference's command
 /// registry parses it: the name is the first whitespace-delimited token, and

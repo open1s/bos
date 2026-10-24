@@ -57,7 +57,7 @@ pub struct TomlAgentConfig {
 }
 
 fn default_system_prompt() -> String {
-    "You are a helpful assistant.".to_string()
+    crate::agent::agentic::DEFAULT_SYSTEM_PROMPT.to_string()
 }
 
 fn default_temperature() -> f32 {
@@ -76,6 +76,9 @@ impl From<TomlAgentConfig> for AgentConfig {
             base_url: t.base_url,
             api_key: t.api_key,
             system_prompt: t.system_prompt,
+            // The TOML surface has no complete-persona flag; a host that needs
+            // the reference's sole-section arm sets it on the AgentConfig.
+            persona_complete: false,
             temperature: t.temperature,
             max_tokens: t.max_tokens,
             timeout_secs: t.timeout_secs,

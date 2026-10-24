@@ -276,6 +276,13 @@ pub(crate) fn provider_key(provider: &str) -> String {
     format!("provider:{provider}:api_key")
 }
 
+/// The vault entry the local web-search tool reads.
+///
+/// One fixed name, not a configurable reference: there is exactly one search
+/// endpoint, so a pointer to a pointer would only add a control that can be
+/// wrong. The Web search pane writes this entry; the build reads it.
+pub(crate) const WEB_SEARCH_KEY: &str = "web_search:api_key";
+
 impl Vault {
     /// A vault over one path, whether or not the file exists yet.
     ///

@@ -75,6 +75,14 @@ pub enum Target {
         /// The destination port, when the caller knows it. A policy that names
         /// ports refuses a request whose port it cannot see.
         port: Option<u16>,
+        /// The URL path, when the caller can see it (a plain-HTTP request
+        /// through a proxy sees the absolute URI; a TLS tunnel does not).
+        ///
+        /// None is "the transport cannot see the path": a path rule then has no
+        /// subject and cannot match, which is what keeps an https tunnel from
+        /// riding a path rule it never satisfied. The path carries its query
+        /// string when the caller has one.
+        path: Option<String>,
     },
 }
 
@@ -97,6 +105,7 @@ impl Target {
             host: normalize_host(&host.into()),
             ip: ip.into(),
             port: None,
+            path: None,
         }
     }
 
@@ -106,6 +115,33 @@ impl Target {
             host: normalize_host(&host.into()),
             ip: ip.into(),
             port: Some(port),
+            path: None,
+        }
+    }
+
+    /// A host target for a request whose URL PATH is visible too.
+    ///
+    /// Only a transport that sees the request line can build this: a plain
+    /// HTTP forward-proxy request carries the absolute URI, while a CONNECT
+    /// tunnel carries a host and a port and nothing inside TLS. Passing a path
+    /// the transport did not actually see would let the policy believe it
+    /// enforced a rule it never read.
+    pub fn host_path_on(
+        host: impl Into<String>,
+        ip: impl Into<String>,
+        port: u16,
+        path: impl Into<String>,
+    ) -> Self {
+        let path = path.into();
+        Target::Host {
+            host: normalize_host(&host.into()),
+            ip: ip.into(),
+            port: Some(port),
+            path: Some(if path.is_empty() {
+                String::from("/")
+            } else {
+                path
+            }),
         }
     }
 
@@ -141,14 +177,33 @@ impl Target {
         }
     }
 
+    /// The URL path, when the transport could see one.
+    pub fn url_path(&self) -> Option<&str> {
+        match self {
+            Target::Host { path, .. } => path.as_deref(),
+            Target::Path(_) => None,
+        }
+    }
+
     /// One-line rendering for an audit row.
     pub fn display(&self) -> String {
         match self {
             Target::Path(path) => path.display().to_string(),
-            Target::Host { host, ip, port } => match port {
-                Some(port) => format!("{host}:{port} ({ip})"),
-                None => format!("{host} ({ip})"),
-            },
+            Target::Host {
+                host,
+                ip,
+                port,
+                path,
+            } => {
+                let endpoint = match port {
+                    Some(port) => format!("{host}:{port}"),
+                    None => host.clone(),
+                };
+                match path {
+                    Some(path) => format!("{endpoint}{path} ({ip})"),
+                    None => format!("{endpoint} ({ip})"),
+                }
+            }
         }
     }
 
@@ -162,7 +217,12 @@ impl Target {
                     Value::from(path.to_string_lossy().as_ref()),
                 );
             }
-            Target::Host { host, ip, port } => {
+            Target::Host {
+                host,
+                ip,
+                port,
+                path,
+            } => {
                 fields.insert(Value::from("kind"), Value::from("host"));
                 fields.insert(Value::from("host"), Value::from(host.as_str()));
                 fields.insert(Value::from("ip"), Value::from(ip.as_str()));
@@ -172,6 +232,15 @@ impl Target {
                     Value::from("port"),
                     match port {
                         Some(port) => Value::from(*port as u64),
+                        None => Value::Null,
+                    },
+                );
+                // Null when the transport cannot see the path (a TLS tunnel),
+                // so a path rule is undefined rather than falsely satisfied.
+                fields.insert(
+                    Value::from("path"),
+                    match path {
+                        Some(path) => Value::from(path.as_str()),
                         None => Value::Null,
                     },
                 );
@@ -324,6 +393,10 @@ fn reason_for(rule: &str, zh: bool) -> Option<String> {
         "egress-port-not-allowed" => (
             "the destination port is not on the egress port list",
             "目标端口不在出站端口白名单内",
+        ),
+        "egress-path-denied" => (
+            "the URL path is on the egress deny list",
+            "该 URL 路径在出站拒绝列表内",
         ),
         "egress-not-allowlisted" => (
             "the resolved address is not on the egress allowlist",

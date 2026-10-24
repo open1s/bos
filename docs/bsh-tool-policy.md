@@ -93,6 +93,8 @@ The host installs one data document:
       "workspace_prefix": "/workspace/",
       "preset": "<agent preset id>",
       "permission": "workspace-write",
+      "sandbox_enabled": true,
+      "sandbox_confined": true,
       "egress_allowlist": ["127.0.0.1", "10.0.0.0/8"],
       "egress_hosts": [],
       "egress_ports": [],
@@ -105,6 +107,36 @@ The baseline's capability rule reads it, so a read-only turn refuses
 `run_in_background`, `job_output`, `job_kill` and `subagent` in Rego as well
 as in the host's registration matrix. `preset_permission` remains the preset's
 own ceiling, which is what the generated read-only module reads.
+
+Two keys describe the shell's confinement, and they answer different questions:
+
+- `sandbox_enabled` is the **settings master switch**: true while the reader
+  left it on, false once they turned it off. It says nothing about the
+  permission tier.
+- `sandbox_confined` is the **resolved answer**: true only while heel actually
+  confines this turn. It is false with the switch off AND at Full access (where
+  the permission releases the shell with the switch still on), and true for a
+  preset's `sandbox = "heel"` even at Full access.
+
+**Yes - an unconfined shell can be DENIED by policy.** Read
+`data.sandbox_confined`; the spawn question is still asked when no sandbox
+exists, so a workspace that requires confinement refuses the call instead of
+letting it run unconfined:
+
+    package policy.workspace
+
+    # rule: require-sandbox
+    verdict := {"allow": false, "rule": "require-sandbox", "reason": "this workspace requires the sandbox"} if {
+        not data.sandbox_confined
+        input.action == "spawn"
+    } else := {"allow": true, "rule": "workspace-allow"}
+
+The refusal happens before a process exists, so the shell never starts. This one
+rule covers every unconfined arm, including the full-access release a
+switch-only rule would miss, and it does not refuse a preset-forced heel. The
+interactive terminal is a separate seam with its own
+`.bsh/terminal-policy.rego` gate; a workspace that wants both denied adds a
+`start` refusal there too.
 
 `workspace_prefix` is the root with a trailing separator (a root of `/` stays
 `/`), so containment is one comparison:
@@ -172,9 +204,23 @@ Every network path is decided by the policy, at two points:
    PRESENT file runs the policy-backed proxy; a present-but-empty file starts
    no proxy at all and the kernel refuses outbound traffic outright.
 
-The shell tool's result reports which of these applies as `network`:
-`unrestricted` (no file), `deny-all` (present-but-empty, or a preset's `[]`),
-or `allowlist` (rules constrain the reach).
+The shell tool's result reports which of these applies as `network`. There are
+FOUR values, because "no sandbox" is not a policy state:
+
+| value | when | what it means |
+|---|---|---|
+| `deny-all` | a present-but-empty workspace file, or a preset's `egress = []` | the policy denies every destination |
+| `allowlist` | a present file with rules, or a preset list | the reach is what the rules name |
+| `unrestricted` | a CONFINED heel shell and no egress file | the proxy runs heel's allow-all policy; ICMP and host-local destinations are still refused by the kernel |
+| `unconfined` | no sandbox proxy existed (the settings switch is off, a preset's `sandbox = "none"`, or the full-access permission release) | the workspace `.bsh/egress-allowlist` was **not consulted**; no allowlist answer may be inferred |
+
+`unconfined` is deliberately distinct from `unrestricted`. Reporting the first
+as the second let a reader conclude the allowlist had been read and passed, when
+nothing enforced it. It is not "no policy at all" either: the command-tier scan
+still refuses an endpoint the command line literally names before the process
+exists. The audit detail localizes `unconfined` including that caveat (English
+and Chinese), the Markdown export carries it in its confinement column, and the
+JSON export keeps the stored value verbatim.
 
 **`unrestricted` is a policy state, not a pass-through.** The generated profile
 still denies every direct socket and grants only the localhost proxy, so a client
@@ -184,7 +230,9 @@ allows the network. Proxy-aware clients (`curl`, `git`, `npm`) work: they use
 the proxy heel points them at. To tell the two apart, the result carries
 `network_diagnostic: "unproxied-direct-socket"` on exactly that failure (a
 non-zero exit, a confined heel shell, `network == "unrestricted"`, and a network
-syscall beside EPERM/EACCES). The shell renders that id through
+syscall beside EPERM/EACCES). A run reported as `unconfined` never gets this
+diagnostic: there is no sandbox profile to refuse its direct socket, so a
+failure there is the command's own. The shell renders that id through
 `tool.bash.unproxiedNetwork` (English and Chinese) in both the transcript step
 body and the audit row, so the reader learns the kernel refused a path the
 sandbox does not proxy - not that the policy refused the command.
@@ -246,7 +294,10 @@ explicit empty list mounts nothing:
   the preset declares `permission = "danger-full-access"` AND the session is
   full access; under any narrower ceiling the preset is REFUSED with rule
   `preset-sandbox-widens` and the shell stays confined. A malformed value is a
-  load error naming `sandbox`, never a silent default.
+  load error naming `sandbox`, never a silent default. The settings master
+  switch (`sandbox_enabled`, see below) OUTRANKS this field: with it off, heel
+  is not applied for any preset, and a `heel` declaration is shown as
+  overridden on its card rather than silently ignored.
 - read and write are workspace-relative roots. None inherits the workspace;
   an empty list allows nothing. deny always wins and is unioned with the
   baseline .git/.bsh rules.
@@ -334,7 +385,9 @@ Known limits of this slice:
 
 ### What turning the sandbox off means
 
-`sandbox = "none"` is honest about its cost, because the cost is real:
+TWO controls can leave the shell and the terminal unconfined: the settings
+master switch (`sandbox_enabled`, absent means on) and a preset's
+`sandbox = "none"`. Both are honest about their cost, because the cost is real:
 
 - **No filesystem confinement.** The kernel boundary heel installs is gone, so
   a shell command can write outside the workspace (a path assembled in a
@@ -367,13 +420,100 @@ never leave a quietly unconfined shell.
 Two readings are worth stating explicitly. On a session that is already full
 access, `none` is the explicit spelling of today's release and changes
 nothing; the behavioural arm is `heel`, which narrows a full-access session.
-And every unconfined bash result is attributed: a preset's choice records the
-reason `a preset turned the sandbox off`, while a permission-released run
-records `the full-access permission released the sandbox`. For a preset's off,
+And every unconfined bash result is attributed to exactly one of THREE causes:
+the settings master switch (`the sandbox is turned off in settings`), a preset's
+choice (`a preset turned the sandbox off`), or the permission's own release
+(`the full-access permission released the sandbox`). For either policy release
 the audit detail, the terminal status line (and its `BSH_SANDBOX=none`) and the
-transcript's command note all show the consequence; a permission release is
-attributed in the audit detail and the raw result, because it is the ordinary
-full-access state rather than a policy choice.
+transcript's command note all show the consequence and which policy did it; a
+permission release is attributed in the audit detail and the raw result,
+because it is the ordinary full-access state rather than a policy choice.
+
+### The settings master switch, and the three reasons
+
+The settings file carries `sandbox_enabled` (General -> Use the sandbox). It is
+absent when the sandbox applies and written as `false` only when it is off, so an
+enabled file mirrors a fresh one and a restart restores the reader's choice.
+
+The switch turns HEEL off for the shell and the terminal, for EVERY preset. It
+does not turn presets off: nothing about the preset machinery is inert, and the
+shell's unconfined state is the only thing that changes.
+
+It WINS over a preset's `sandbox = "heel"`: a preset may keep declaring heel and
+the declaration is simply not applied. A preset's `sandbox = "none"` is
+unaffected, because it was already unconfined. At full access the switch changes
+nothing, so it does not claim the release.
+
+The precedence table is the whole rule:
+
+| settings switch | preset `sandbox` | effective permission | heel applied | attributed to |
+|---|---|---|---|---|
+| on / absent | absent | read-only or workspace-write | yes | - |
+| on / absent | `heel` | any | yes | - |
+| on / absent | `none` | full access, preset ceiling full access | no | the preset |
+| on / absent | absent | full access | no | the permission release |
+| off | absent | read-only or workspace-write | no | the settings switch |
+| off | `heel` | any, including full access | no; the declaration is overridden | the settings switch |
+| off | `none` | full access, preset ceiling full access | no | the preset (already unconfined) |
+| off | absent | full access | no | the permission release (the switch changed nothing) |
+
+Every unconfined shell result carries exactly ONE of three reasons, and the
+three name three different controls:
+
+| reason | when | reversed by |
+|---|---|---|
+| `the sandbox is turned off in settings` | the master switch is off and heel would otherwise have applied | General -> Use the sandbox |
+| `a preset turned the sandbox off` | the preset declares `sandbox = "none"` at full access | selecting another preset |
+| `the full-access permission released the sandbox` | the session is full access and no preset asks for heel | lowering the permission mode |
+
+The same three are distinguishable in the audit record and its JSON export
+(the stored reason is the constant, and the row localizes it), and the
+transcript's command note names which one applies.
+
+The switch overrides the ARM, never the widening GUARD. A preset declaring
+`sandbox = "none"` under a ceiling narrower than full access is still refused
+with `preset-sandbox-widens` while the switch is off: the rule is a statement
+about the declaration (and about the preset being unusable), and letting the
+switch make it sendable would silently change what a declaration means.
+
+Turning the switch OFF is a widening, so it takes the same confirmation the
+other widenings take. The sentence names both losses - no kernel filesystem
+confinement, and no sandbox egress proxy or allowlist for shell and terminal
+commands - and, when any preset on the roster declares `heel`, that those
+declarations are being overridden. Cancel changes nothing; Confirm saves and
+rebakes the live policy in the same frame. An affected preset's card states the
+override, the terminal status line says the same while its shell runs, and each
+tool result and audit row names it for the call that saw it - the shell itself
+reports `BSH_SANDBOX=none` from a note passed BEFORE the spawn, so the process
+and the status line cannot disagree. The composer's permission menu deliberately
+does not carry the state: its three rows are the mode label and a short
+qualifier, so the sandbox copy stays on those surfaces rather than becoming a
+standing note in the menu.
+
+A spawn spec is SNAPSHOTTED. A turn that is already streaming and a terminal
+that is already open keep the spec they were spawned with: neither turning the
+switch off nor raising the session to Full access rewrites a running process's
+confinement. The terminal status line says so explicitly while the pane's
+spawn-time confinement class differs from the one a terminal opened now would
+get - a policy release (the switch or a preset) OR a permission release ("this
+terminal keeps the sandbox it started with; a new terminal uses the current
+setting") - and the switch's own notice appends that the running turn keeps its
+current build. A terminal opened afterwards resolves the spec again.
+
+What still applies while the switch is off (this is why it is not a second
+"presets off"):
+
+- the preset resolves and applies its permission ceiling, read/write/deny scopes,
+  bundles, tools, skills, MCP servers, extensions, persona and policy modules;
+- the Rego tool-boundary policy still refuses the paths and endpoints a command
+  line names, for every tool; the file tools keep their own permission tier and
+  their own checks;
+- the browser's own loopback gate is untouched, because it is not heel.
+
+What no longer applies: heel's kernel filesystem confinement and heel's egress
+proxy with its allowlist, for the shell and the terminal. A command can write
+outside the workspace and can reach a host the allowlist does not name - the
+cost the confirmation states.
 
 ## Failure is asymmetric
 

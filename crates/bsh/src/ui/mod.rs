@@ -7,6 +7,7 @@ pub(crate) mod audit;
 mod command_menu;
 pub(crate) mod composer;
 pub(crate) mod diff_pane;
+pub(crate) mod frame_trace;
 pub(crate) mod header;
 pub(crate) mod hero;
 pub(crate) mod lane;
@@ -179,22 +180,32 @@ pub(crate) fn hairline_no_bottom<E: Styled>(mut element: E) -> E {
 }
 
 /// What the command line asked the window to do.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct Startup {
     /// Open the settings dialog as the window appears, on this rail index.
     pub(crate) settings: Option<usize>,
+    /// Open the Browser pane on this URL. A deep link, so a reader (or a
+    /// capture) can land on a page without typing into the address bar.
+    pub(crate) browser: Option<String>,
 }
 
 impl Startup {
     /// Read the flags. Unknown flags are ignored here; `--help` is answered
     /// by the binary before the window is built.
     pub(crate) fn from_args() -> Self {
-        let settings = std::env::args().skip(1).find_map(|arg| {
-            let value = arg.strip_prefix("--settings")?;
-            let id = value.strip_prefix('=').unwrap_or("account");
-            Some(settings::section_index(id).unwrap_or(0))
-        });
-        Self { settings }
+        let mut startup = Self::default();
+        for arg in std::env::args().skip(1) {
+            if let Some(value) = arg.strip_prefix("--settings") {
+                let id = value.strip_prefix('=').unwrap_or("account");
+                startup.settings = Some(settings::section_index(id).unwrap_or(0));
+            } else if let Some(value) = arg.strip_prefix("--browser=") {
+                let url = value.trim();
+                if !url.is_empty() {
+                    startup.browser = Some(url.to_string());
+                }
+            }
+        }
+        startup
     }
 }
 
@@ -267,7 +278,19 @@ pub(crate) fn run(startup: Startup) {
                     ..Default::default()
                 },
                 cx,
-                |window, cx| cx.new(|cx| shell::Shell::new(window, startup.settings, cx)),
+                |window, cx| {
+                    let browser = startup.browser.clone();
+                    let shell = cx.new(|cx| shell::Shell::new(window, startup.settings, cx));
+                    if let Some(url) = browser {
+                        // The deep link lands on the pane it names, with the
+                        // same navigation a press of Go performs.
+                        shell.update(cx, |shell, cx| {
+                            shell.open_right_tab(right_panel::RightTab::Browser, cx);
+                            shell.browser_go(url, cx);
+                        });
+                    }
+                    shell
+                },
             )
             .expect("bsh opens its window");
         });

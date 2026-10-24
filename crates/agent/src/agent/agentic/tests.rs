@@ -130,6 +130,65 @@ fn make_llm_provider() -> LlmProvider {
     provider
 }
 
+/// A vendor that records the persona the engine hands it.
+///
+/// The persona is the system prompt in this architecture: the engine passes it
+/// on every request and the vendor turns it into the request's first system
+/// message. Recording it here proves the configured prompt is what the request
+/// actually carries, not a value the agent merely holds.
+struct PersonaCapturingLlm(Arc<std::sync::Mutex<Option<String>>>);
+
+#[async_trait]
+impl LlmClient<AgentSession, AgentReactContext> for PersonaCapturingLlm {
+    async fn complete(
+        &self,
+        persona: Option<String>,
+        _req: LlmRequest,
+        _session: &mut AgentSession,
+        _context: &mut AgentReactContext,
+    ) -> Result<LlmResponse, LlmError> {
+        *self.0.lock().unwrap() = persona;
+        Ok(make_text_response("ok".to_string()))
+    }
+
+    async fn stream_complete(
+        &self,
+        persona: Option<String>,
+        _req: LlmRequest,
+        _session: &mut AgentSession,
+        _context: &mut AgentReactContext,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamToken, LlmError>> + Send>>, LlmError> {
+        *self.0.lock().unwrap() = persona;
+        Ok(Box::pin(futures::stream::iter(vec![Ok(StreamToken::Done)])))
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "persona-capturing-mock"
+    }
+}
+
+/// The system prompt is not merely stored on the config: it is the persona the
+/// request carries, identity first.
+#[tokio::test]
+async fn the_system_prompt_is_the_persona_the_request_carries() {
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let mut provider = LlmProvider::new();
+    provider.register_vendor(
+        "mock".to_string(),
+        Box::new(PersonaCapturingLlm(seen.clone())),
+    );
+    let agent = Agent::new(AgentConfig::default(), Arc::new(provider));
+    let _ = agent.react("task".to_string()).await;
+    let persona = seen
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the request carried a persona");
+    assert_eq!(persona, AgentConfig::default().system_prompt);
+    assert!(persona.starts_with(crate::agent::prompts::HARNESS_IDENTITY));
+    assert!(persona.contains(crate::agent::prompts::WORKFLOW_GUIDANCE));
+}
+
 // =========================================================================
 // AgentConfig Tests
 // =========================================================================
@@ -141,7 +200,10 @@ fn test_agent_config_default() {
     assert_eq!(config.model, "gpt-4");
     assert_eq!(config.base_url, "https://api.openai.com/v1");
     assert_eq!(config.api_key, "");
-    assert_eq!(config.system_prompt, "You are a helpful assistant.");
+    assert_eq!(
+        config.system_prompt,
+        super::super::agentic::DEFAULT_SYSTEM_PROMPT
+    );
     assert_eq!(config.temperature, 0.7);
     assert!(config.max_tokens.is_none());
     assert_eq!(config.timeout_secs, 60);
@@ -1347,6 +1409,42 @@ async fn compact_now_installs_a_model_written_checkpoint() {
             Some(react::LlmMessage::Assistant { content }) if content.starts_with("reply two")
         ),
         "the newest message is kept verbatim"
+    );
+}
+
+/// The overflow request carries the pinned compaction instruction, not a copy
+/// that drifted: the summarizer's final user message is the digest, a
+/// separator, then `COMPACTION_INSTRUCTION` byte for byte.
+#[tokio::test]
+async fn the_compaction_request_carries_the_pinned_instruction() {
+    let (agent, seen) = agent_with_script(Ok("checkpoint".to_string()), 0);
+    {
+        let mut session = agent.session();
+        session.add_user(format!("old one {}", "x".repeat(400)));
+        session.add_assistant(format!("reply one {}", "y".repeat(400)));
+        session.add_user(format!("old two {}", "x".repeat(400)));
+        session.add_assistant(format!("reply two {}", "y".repeat(400)));
+    }
+    let signal = std::sync::atomic::AtomicBool::new(false);
+    let _ = agent
+        .compact_now(0, &signal)
+        .await
+        .expect("the compaction request")
+        .expect("a checkpoint");
+    let prompts = seen.lock().unwrap();
+    assert_eq!(prompts.len(), 1, "one summarizer request");
+    let prompt = &prompts[0];
+    assert!(
+        prompt.ends_with(crate::agent::context::COMPACTION_INSTRUCTION),
+        "the pinned instruction is the request's tail"
+    );
+    assert!(
+        prompt.contains("\n\n---\n\n"),
+        "the digest and the instruction are separated"
+    );
+    assert!(
+        !prompt.starts_with(crate::agent::context::COMPACTION_INSTRUCTION),
+        "the conversation digest comes before the instruction"
     );
 }
 

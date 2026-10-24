@@ -13,18 +13,21 @@ pub(crate) mod assets;
 pub(crate) mod audit;
 pub(crate) mod browser;
 pub(crate) mod caps;
+pub(crate) mod context;
 mod editors;
 pub(crate) mod export;
 pub(crate) mod files;
 pub(crate) mod history;
 pub(crate) mod i18n;
 pub(crate) mod installed;
+pub(crate) mod instructions;
 pub(crate) mod market;
 pub(crate) mod mcp;
 pub(crate) mod model;
 pub(crate) mod notes;
 pub(crate) mod plugins;
 pub(crate) mod preset_catalogue;
+pub(crate) mod prompts;
 pub(crate) mod reference;
 pub(crate) mod runner;
 pub(crate) mod settings;
@@ -36,6 +39,8 @@ pub(crate) mod theme;
 pub(crate) mod trash;
 pub(crate) mod ui;
 pub(crate) mod vault;
+/// The local web-search tool: the model's own search client.
+pub(crate) mod web;
 pub(crate) mod workspace_templates;
 
 /// Launch the BOS Harness desktop window. Blocks until the window closes.

@@ -168,6 +168,17 @@ enum Submit {
     Refused(Vec<crate::state::Attachment>),
 }
 
+/// One foreground task the shell owns, plus how to detach its waker.
+///
+/// Keeping the `Task` makes the future cancellable by the shell's `Drop`;
+/// the optional closer closes the channel it awaits, because cancelling a
+/// `Task` only SCHEDULES the future's drop and a Tokio worker could still call
+/// the waker in between.
+struct ForegroundTask {
+    task: Task<()>,
+    close: Option<Box<dyn Fn()>>,
+}
+
 pub(crate) struct Shell {
     /// The model list the last successful fetch returned, if any.
     pub(crate) models_fetched: Option<Vec<String>>,
@@ -182,6 +193,13 @@ pub(crate) struct Shell {
     pub(crate) models_selected: std::collections::BTreeSet<String>,
     /// All shell state.
     pub(crate) state: AppState,
+    /// Foreground tasks this shell OWNS, so dropping it cancels them.
+    ///
+    /// A task awaiting a channel the Tokio runtime feeds has a waker the runtime
+    /// calls from a worker thread. A detached one outlives this entity, and a
+    /// wake after the test scheduler has finished panics inside the waker; see
+    /// [Shell::keep_task]. Keeping the handles makes the waker this shell's.
+    foreground_tasks: Vec<ForegroundTask>,
     /// The composer's text engine.
     pub(crate) composer: Entity<TextareaState>,
     /// The placeholder key the composer currently carries, so the refresh only
@@ -223,6 +241,39 @@ pub(crate) struct Shell {
     /// window, so the pane compares this counter instead of holding the
     /// browser's lock every frame.
     pub(crate) browser_rev: u64,
+    /// The frame sequence the pane last turned into an image.
+    pub(crate) browser_frame_seq: u64,
+    /// The live page's newest frame, decoded off the render path.
+    pub(crate) browser_render: Option<std::sync::Arc<gpui_kit::RenderImage>>,
+    /// The pixel size of the frame that is drawn.
+    pub(crate) browser_frame_size: (u32, u32),
+    /// Where the page frame was laid out, so a pointer position on the window
+    /// can become a position on the page.
+    pub(crate) browser_bounds: std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
+    /// When the last hover move was forwarded to the page.
+    ///
+    /// A move is a CDP round trip, so the pane throttles hover to ~60 Hz; a
+    /// drag is never throttled.
+    pub(crate) browser_last_move: Option<std::time::Instant>,
+    /// The page frame's keyboard focus. A press takes it, so the page receives
+    /// keys only while the reader is actually in the page.
+    pub(crate) browser_focus: FocusHandle,
+    /// Whether a press that started INSIDE the page frame is still down.
+    ///
+    /// The window, not the frame, owns the rest of that gesture: a drag that
+    /// leaves the pane keeps sending moves, and the release is delivered even
+    /// when the pointer is outside the frame (see `browser_drag_outside` /
+    /// `browser_release_outside`). Without the flag the page kept its drag
+    /// state after a release over the sidebar or outside the window.
+    pub(crate) browser_pressed: bool,
+    /// The last press, for counting a double or triple click.
+    pub(crate) browser_click: Option<super::right_panel::BrowserClick>,
+    /// The last printable character the page received as a KEY.
+    ///
+    /// The page's input handler sees the same character again after the key
+    /// listener typed it (MEASURED: without recognising the echo every typed
+    /// character doubled). A commit that differs from it supersedes the key.
+    pub(crate) browser_typed: Option<(std::time::Instant, char)>,
     /// The preset card whose config details are expanded, if any.
     pub(crate) preset_details: Option<String>,
     /// The preset card whose Advanced block is expanded, if any. Mode details
@@ -385,8 +436,20 @@ pub(crate) struct Shell {
     /// Keyed by (kind, content hash) and capped by age: two bodies with the same
     /// text share one parse, and a body that scrolls away is evicted.
     pub(crate) body_states: std::cell::RefCell<BodyStates>,
+    /// The optional per-frame diagnostic, opened once at assembly when the
+    /// owner asked for it with BSH_FRAME_TRACE. None on every ordinary launch,
+    /// so the render path only matches the option.
+    pub(crate) frame_trace: Option<super::frame_trace::FrameTrace>,
     /// This frame's number, for the body-state cache's age.
     pub(crate) frame_no: u64,
+    /// The elapsed seconds the LAST frame painted under the live turn's
+    /// running line, if it painted one.
+    ///
+    /// The pane's only clock exists to advance that one label, so it compares
+    /// the second it would paint against this value and repaints only when they
+    /// differ. A frame that draws the label records it here; a tick that finds
+    /// the same second owes no frame at all.
+    elapsed_painted: Option<u64>,
     /// The transcript content height as of the last frame. Following the tail
     /// compares against it, so content that grew this frame still counts as
     /// "the reader was at the bottom".
@@ -408,6 +471,10 @@ pub(crate) struct Shell {
     /// session switch closes them all, the way the reference resets a turn's
     /// disclosure state.
     pub(crate) think_open: std::collections::HashSet<usize>,
+    /// The settled turns whose process group the reader has opened, by message
+    /// index. Collapsed is the default; a click is the only way in, and a
+    /// session switch closes them with the reasoning disclosures.
+    pub(crate) process_open: std::collections::HashSet<usize>,
     /// The compaction markers the reader has expanded, by record index.
     ///
     /// Scoped like the reasoning disclosures: a session switch closes them,
@@ -558,6 +625,12 @@ pub(crate) struct Shell {
     /// write is the only place a reader can learn that the switch did not
     /// reach disk: it is drawn in the pane rather than swallowed.
     pub(crate) skills_save_error: Option<String>,
+    /// Why the Web search pane's key write was refused, if it was.
+    ///
+    /// The key goes to the vault on its own press rather than with the dialog's
+    /// Save, so a locked vault or a missing entry is reported where the control
+    /// is instead of looking like a key that was stored.
+    pub(crate) web_search_key_error: Option<&'static str>,
     /// The Skills pane's own sub-view: whether the browse-all list and the
     /// executor-dirs list are open. Both are disclosures over the card grid, so
     /// they are pane state rather than settings.
@@ -1165,7 +1238,7 @@ impl Shell {
         let mcp_command = cx.new(|cx| InputState::new(window, cx));
         let mcp_args = cx.new(|cx| InputState::new(window, cx));
         let mcp_url = cx.new(|cx| InputState::new(window, cx));
-        let settings_inputs = SettingsInputs::new(window, cx);
+        let settings_inputs = SettingsInputs::new(window, state.lang, cx);
         let vault_inputs = VaultInputs::new(window, state.lang, cx);
         // The passphrase fields repaint the strength and mismatch notes as they
         // are typed; the add row validates on its press, not per keystroke.
@@ -1301,6 +1374,7 @@ impl Shell {
         }));
         let mut shell = Self {
             state,
+            foreground_tasks: Vec::new(),
             composer,
             placeholder_key,
             placeholder_fit: None,
@@ -1315,6 +1389,14 @@ impl Shell {
             browser_pane: None,
             browser_shown_url: String::new(),
             browser_rev: 0,
+            browser_frame_seq: 0,
+            browser_render: None,
+            browser_frame_size: (0, 0),
+            browser_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
+            browser_last_move: None,
+            browser_pressed: false,
+            browser_click: None,
+            browser_typed: None,
             preset_details: None,
             preset_advanced: None,
             preset_editor: None,
@@ -1332,6 +1414,7 @@ impl Shell {
             market_install_error: None,
             market_sources_open: false,
             skills_save_error: None,
+            web_search_key_error: None,
             skill_search,
             skill_query: String::new(),
             skill_add_open: false,
@@ -1410,12 +1493,15 @@ impl Shell {
                 super::transcript::TranscriptLayout::default(),
             ),
             body_states: std::cell::RefCell::new(std::collections::BTreeMap::new()),
+            frame_trace: super::frame_trace::FrameTrace::from_env(),
             frame_no: 0,
+            elapsed_painted: None,
             tail_max: None,
             tail_session: None,
             following_tail: true,
             audit_jump_to: None,
             think_open: std::collections::HashSet::new(),
+            process_open: std::collections::HashSet::new(),
             compaction_open: std::collections::HashSet::new(),
             chat_last_offset: 0.0,
             traj_last_offset: 0.0,
@@ -1477,6 +1563,7 @@ impl Shell {
             terminal_snapshot: std::rc::Rc::new(crate::terminal::Snapshot::default()),
             terminal_version: 0,
             terminal_focus: cx.focus_handle(),
+            browser_focus: cx.focus_handle(),
             terminal_frame: std::rc::Rc::new(std::cell::Cell::new(None)),
             right_hover: false,
             right: super::right_panel::RightPanel::default(),
@@ -1550,10 +1637,22 @@ impl Shell {
                     if this.state.subagent.is_some() {
                         this.state.refresh_subagent_preview();
                     }
-                    cx.notify();
+                    this.frame_notify("subagent-clock", cx);
                 })
                 .is_err()
             {
+                break;
+            }
+        })
+        .detach();
+        // The browser's frame clock. Captures arrive on the engine's own pump,
+        // so the pane compares the frame sequence instead of decoding on the
+        // render path; an idle browser costs one atomic read per tick.
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(120))
+                .await;
+            if this.update(cx, |this, cx| this.sync_browser(cx)).is_err() {
                 break;
             }
         })
@@ -1620,6 +1719,7 @@ impl Shell {
             &self.state.vault,
         );
         let (tx, rx) = async_channel::bounded(1);
+        let closer = Self::channel_closer(&rx);
         self.state.runner.rt().spawn(async move {
             let vendor = react::llm::vendor::OpenAiVendor::new(endpoint, model, api_key);
             let _ = tx.send(vendor.fetch_model_ids().await).await;
@@ -1627,7 +1727,7 @@ impl Shell {
         self.models_fetch_failed = false;
         self.models_fetch_needs_base_url = false;
         self.models_fetching = true;
-        cx.spawn(async move |this, cx| {
+        let task = cx.spawn(async move |this, cx| {
             let outcome = rx.recv().await;
             let _ = this.update(cx, |this, cx| {
                 match outcome {
@@ -1645,8 +1745,8 @@ impl Shell {
                 this.models_fetching = false;
                 cx.notify();
             });
-        })
-        .detach();
+        });
+        self.keep_task_closing(task, Some(closer));
     }
 
     /// Tick or untick one fetched model in the picker.
@@ -1837,6 +1937,7 @@ impl Shell {
         self.skill_filter = SkillFilter::All;
         // A write failure belongs to the visit that saw it, like the filter.
         self.skills_save_error = None;
+        self.web_search_key_error = None;
         // A confirmation names the save that produced it, so a fresh visit
         // starts with none: the toast never outlives the action it reports.
         self.settings_toast = None;
@@ -2216,6 +2317,13 @@ impl Shell {
 
     /// Empty the composer after a submission left it.
     /// Continue the selected child run with a follow-up prompt.
+    ///
+    /// A child whose run row is gone (an app restart) or whose live handle no
+    /// longer resolves is NOT a dead end for the reader: a finished run means
+    /// the prompt is for the MAIN agent, so the shell returns to the parent
+    /// conversation and opens the turn there. Only a run that claims to be
+    /// RUNNING with no reachable process refuses, because steering it is
+    /// impossible and queueing to the parent would be the wrong target.
     fn send_to_subagent(
         &mut self,
         id: String,
@@ -2223,20 +2331,32 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(agent) = self.state.subagents.agent(&id) else {
-            self.state
-                .notice(crate::i18n::tr(self.state.lang, "subagents.unavailable").to_string());
-            return;
-        };
-        let Some(run) = self
+        let run = self
             .state
             .subagents
             .snapshot()
             .into_iter()
-            .find(|run| run.id == id)
-        else {
+            .find(|run| run.id == id);
+        let agent = self.state.subagents.agent(&id);
+        // The running flag is read BEFORE the destructuring: the let-else
+        // moves the row, and the refusal branch still needs it.
+        let live = run.as_ref().is_some_and(|run| run.status.is_running());
+        let (Some(agent), Some(run)) = (agent, run) else {
+            if live {
+                self.state
+                    .notice(crate::i18n::tr(self.state.lang, "subagents.unavailable").to_string());
+                return;
+            }
+            self.state.leave_subagent();
             self.state
-                .notice(crate::i18n::tr(self.state.lang, "subagents.unavailable").to_string());
+                .notice(crate::i18n::tr(self.state.lang, "subagents.finishedToParent").to_string());
+            cx.notify();
+            let attachments = std::mem::take(&mut self.state.attachments);
+            match self.submit(prompt, attachments, cx) {
+                Submit::Accepted => self.clear_composer(window, cx),
+                // A refusal leaves the chips where the reader can retry them.
+                Submit::Refused(attachments) => self.state.attachments = attachments,
+            }
             return;
         };
         // A follow-up is another child turn, so it asks the same spawn
@@ -2261,14 +2381,26 @@ impl Shell {
         let registry = self.state.subagents.clone();
         let stream_registry = self.state.subagents.clone();
         let stream_id = id.clone();
+        // A follow-up is a child turn too, so it carries a freshly rendered
+        // snapshot and the delegation context, from the same resolution the
+        // spawn check above used. The facts are pure; the render (and its
+        // instruction stat/read) happens on the runner's own task.
+        let facts = crate::context::RuntimeFacts::from_effective(&eff);
         // The engine awaits a Tokio timer for its LLM timeout; GPUI's executor
         // is not a Tokio runtime, so the child turn must be spawned on the
         // runner's runtime and only its result awaited from the UI task.
         let handle = self.state.runner.spawn_task(async move {
+            let turn_context = crate::context::TurnContext::from_facts(&facts, true);
             let guard = agent.lock().await;
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(600),
-                crate::caps::stream_child(&guard, prompt, stream_registry, &stream_id),
+                crate::caps::stream_child(
+                    &guard,
+                    prompt,
+                    stream_registry,
+                    &stream_id,
+                    &turn_context,
+                ),
             )
             .await
             .map_err(|_| "subagent timed out".to_string())
@@ -2277,7 +2409,7 @@ impl Shell {
             let transcript = crate::caps::child_transcript(&guard);
             (result, usage, transcript)
         });
-        cx.spawn(async move |this, cx| {
+        let task = cx.spawn(async move |this, cx| {
             let outcome = handle.await;
             let _ = this.update(cx, |this, cx| {
                 match outcome {
@@ -2300,8 +2432,8 @@ impl Shell {
                 this.state.persist_subagents();
                 cx.notify();
             });
-        })
-        .detach();
+        });
+        self.keep_task(task);
     }
 
     /// Condense the active session's older history into a model-written
@@ -2458,7 +2590,7 @@ impl Shell {
             .state
             .runner
             .spawn_task(async move { agent.compact_now(retain, &signal).await });
-        cx.spawn(async move |this, cx| {
+        let task = cx.spawn(async move |this, cx| {
             let outcome = handle.await;
             let _ = this.update(cx, |this, cx| {
                 // The shipped taxonomy also distinguishes `changed`, `commit`
@@ -2532,8 +2664,8 @@ impl Shell {
                 this.drain_inbox(&id, cx);
                 cx.notify();
             });
-        })
-        .detach();
+        });
+        self.keep_task(task);
     }
 
     /// Report one `/compact` outcome that never opened a request.
@@ -2625,6 +2757,11 @@ impl Shell {
         }
         self.state.set_tools_schema(built.tools_schema_chars);
         self.state.set_policy(built.policy.clone());
+        // The turn's context facts come from the build's OWN resolution, so the
+        // facts the model reads are the facts the tools enforce. The snapshot
+        // is cheap and pure; the runner renders it (and runs instruction
+        // discovery) inside its own task, off the UI thread.
+        let facts = crate::context::RuntimeFacts::from_effective(&built.effective);
         // The agent below is built for THIS policy generation. A steer that
         // arrives after the reader changes the preset or permission would join
         // this baked build, so the queue compares against this record.
@@ -2658,7 +2795,7 @@ impl Shell {
         let rx = self
             .state
             .runner
-            .spawn(&id, agent, input, transcript, auto_retain, cap);
+            .spawn(&id, agent, input, transcript, facts, auto_retain, cap);
         self.pump(id, rx, cx);
     }
 
@@ -2741,30 +2878,155 @@ impl Shell {
         cx.notify();
     }
 
-    /// Forward runner events into the state until the turn ends.
-    fn pump(&self, id: String, rx: async_channel::Receiver<AgentEvent>, cx: &mut Context<Self>) {
-        // Keep the elapsed-time line moving while the turn streams.
-        cx.spawn(async move |this, cx| loop {
-            let live = this
-                .update(cx, |this, cx| {
-                    if this.state.any_streaming() {
-                        cx.notify();
-                        true
-                    } else {
-                        false
-                    }
-                })
-                .unwrap_or(false);
-            if !live {
-                break;
-            }
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(500))
-                .await;
-        })
-        .detach();
+    /// Own a foreground task so THIS shell's drop cancels it.
+    ///
+    /// A detached task outlives the entity: its waker survives the window, so a
+    /// Tokio worker that wakes it after the test scheduler has finished hits
+    /// gpui-pre's "test is not deterministic" assertion INSIDE the waker, and
+    /// async-task converts that panic into `abort()` - the full-suite SIGABRT
+    /// reproduced in
+    /// `ui::shell_tests::a_finished_subagent_returns_the_prompt_to_the_parent`.
+    /// Holding the handle makes the waker this shell's to cancel: dropping the
+    /// shell drops the `Task`, which cancels the future and removes the waker,
+    /// so a late runtime send finds nobody to wake.
+    ///
+    /// Finished handles are pruned on every push, so a long session keeps only
+    /// the few tasks that are actually pending.
+    fn keep_task(&mut self, task: Task<()>) {
+        self.keep_task_closing(task, None);
+    }
 
-        cx.spawn(async move |this, cx| {
+    /// Own a task and, when it awaits a Tokio-fed channel, the way to close it.
+    ///
+    /// The closer runs in `Drop` before the task handles are cancelled, so the
+    /// waker is detached from the runtime's senders synchronously. Finished
+    /// entries are pruned on every push, so a long session does not accumulate
+    /// one box per turn.
+    fn keep_task_closing(&mut self, task: Task<()>, close: Option<Box<dyn Fn()>>) {
+        self.foreground_tasks.retain(|entry| !entry.task.is_ready());
+        self.foreground_tasks.push(ForegroundTask { task, close });
+    }
+
+    /// The closer for a channel whose receiver a foreground task awaits.
+    fn channel_closer<T: 'static>(rx: &async_channel::Receiver<T>) -> Box<dyn Fn()> {
+        let rx = rx.clone();
+        Box::new(move || {
+            rx.close();
+        })
+    }
+
+    /// The elapsed seconds the frame would paint under the live turn, if any.
+    ///
+    /// The running line is drawn only for the assistant row still being written
+    /// (the last message, live, with no text and no error), and only on the
+    /// Chat tab. The pane's clock derives its work from this value, so a turn
+    /// whose text is already arriving costs the clock no frames at all.
+    fn painted_elapsed_seconds(&self) -> Option<u64> {
+        if self.state.tab != crate::state::Tab::Chat {
+            return None;
+        }
+        let id = self.state.active_id.as_deref()?;
+        if !self.state.is_streaming(id) {
+            return None;
+        }
+        let last = self.state.active_session()?.messages.last()?;
+        if last.role != crate::model::Role::Assistant
+            || !last.text.is_empty()
+            || last.error.is_some()
+        {
+            return None;
+        }
+        self.state.turn_elapsed_seconds()
+    }
+
+    /// Notify with the cause recorded for the optional frame trace.
+    ///
+    /// With the trace off this is exactly a notify: one Option match. The
+    /// source names the requests the shell emits on its own clock, which are
+    /// the ones a flicker report has to tell apart; a click or any other path
+    /// stays "unknown" rather than inheriting a stale reason.
+    fn frame_notify(&mut self, source: &'static str, cx: &mut Context<Self>) {
+        if let Some(trace) = self.frame_trace.as_mut() {
+            trace.mark(source);
+        }
+        cx.notify();
+    }
+
+    /// Forward runner events into the state until the turn ends.
+    ///
+    /// Both spawned tasks are OWNED by the shell (see [Self::keep_task]). That
+    /// is the fix for the cross-test abort: the event task awaits a channel the
+    /// Tokio runtime feeds, so its waker is called from a worker thread. As a
+    /// detached task it outlived the window and the test scheduler; as an owned
+    /// one, dropping the shell cancels it and the late wake has no target.
+    fn pump(
+        &mut self,
+        id: String,
+        rx: async_channel::Receiver<AgentEvent>,
+        cx: &mut Context<Self>,
+    ) {
+        // The closer detaches this receiver's waker before the entity can die,
+        // or a Tokio send that completes after the test body would wake a task
+        // the test scheduler has already finished.
+        let closer = Self::channel_closer(&rx);
+        // The elapsed clock. The running line is the one thing in the pane that
+        // moves without a state change, so this task exists to advance IT and
+        // nothing else: it wakes on the second boundary that line would cross
+        // and repaints only when the second differs from the one the last frame
+        // painted. Notifying unconditionally repainted an idle, silent turn at
+        // the display's cadence and kept doing it after the stream was gone.
+        let clock = cx.spawn(async move |this, cx| loop {
+            let wait = this
+                .update(cx, |this, cx| {
+                    // No stream, no clock. A dead channel clears its marker
+                    // below, which is what lets this loop end.
+                    if !this.state.any_streaming() {
+                        return None;
+                    }
+                    let painted = this.painted_elapsed_seconds();
+                    if let Some(seconds) = painted {
+                        if this.elapsed_painted != Some(seconds) {
+                            this.frame_notify("elapsed-clock", cx);
+                        }
+                    }
+                    Some(match painted {
+                        Some(_) => {
+                            // Wake exactly when the label's second turns over.
+                            let elapsed = this
+                                .state
+                                .turn_started
+                                .map(|started| started.elapsed())
+                                .unwrap_or_default();
+                            let millis = u64::from(elapsed.subsec_millis());
+                            std::time::Duration::from_millis(if millis == 0 {
+                                1_000
+                            } else {
+                                1_000 - millis
+                            })
+                        }
+                        // No running line on screen: nothing to advance. Keep
+                        // watching for a session switch that puts one back; the
+                        // frame that draws it records the second itself.
+                        None => std::time::Duration::from_millis(250),
+                    })
+                })
+                .ok()
+                .flatten();
+            match wait {
+                Some(wait) => cx.background_executor().timer(wait).await,
+                None => break,
+            }
+        });
+        self.keep_task(clock);
+
+        // The stream marker this pump owns. A channel that closes without a
+        // terminal event must clear that marker - otherwise `any_streaming()`
+        // stays true and the clock repaints the pane forever - but it must not
+        // clear a NEWER turn the queue started for the same session. Matching
+        // the marker's timestamp does both.
+        let stream_ticket = self.state.streams.get(&id).copied();
+        let events = cx.spawn(async move |this, cx| {
+            let mut saw_terminal = false;
             while let Ok(event) = rx.recv().await {
                 let done = matches!(&event, AgentEvent::Done);
                 let failed = matches!(&event, AgentEvent::Error(_));
@@ -2772,9 +3034,10 @@ impl Shell {
                 let session_id = id.clone();
                 let _ = this.update(cx, |shell, cx| {
                     shell.state.apply_event(&session_id, event);
-                    cx.notify();
+                    shell.frame_notify("stream-delta", cx);
                 });
                 if terminal {
+                    saw_terminal = true;
                     // The turn is over, so its plan is the session's own now and
                     // whatever waited behind it can start.
                     let _ = this.update(cx, |shell, cx| {
@@ -2795,18 +3058,42 @@ impl Shell {
                     break;
                 }
             }
-            // A stream that ends without a terminal event (a stop) still has to
-            // release its store, or the saved plan would never catch up, and the
-            // queue behind it still belongs to the reader.
+            // A stream that ends without a terminal event (a stop, or a sender
+            // dropped by a failed task) still has to release its store, or the
+            // saved plan would never catch up, and the queue behind it still
+            // belongs to the reader. It also has to end the STREAM: the turn is
+            // not running any more, and leaving the marker would keep the
+            // elapsed clock and the composer's Running state alive forever.
             let _ = this.update(cx, |shell, cx| {
+                if !saw_terminal && shell.state.end_stream(&id, stream_ticket) {
+                    shell.frame_notify("stream-ended", cx);
+                }
                 shell.state.finish_plan(&id);
                 shell.state.persist_subagents();
                 shell.trace_done = false;
                 shell.drain_inbox(&id, cx);
                 cx.notify();
             });
-        })
-        .detach();
+        });
+        self.keep_task_closing(events, Some(closer));
+    }
+
+    /// Install a per-frame trace at an explicit path from a test.
+    #[cfg(test)]
+    pub(crate) fn trace_frames_to(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        self.frame_trace = Some(super::frame_trace::FrameTrace::open(path)?);
+        Ok(())
+    }
+
+    /// Arm the streaming pump from a test with a channel the test owns.
+    #[cfg(test)]
+    pub(crate) fn pump_for_test(
+        &mut self,
+        id: String,
+        rx: async_channel::Receiver<AgentEvent>,
+        cx: &mut Context<Self>,
+    ) {
+        self.pump(id, rx, cx);
     }
 
     /// The reference's chat content width for the column measured on this
@@ -3369,7 +3656,7 @@ impl Shell {
         // repaint without holding the browser's lock on the render path.
         let browser_moved = self.state.browser.revision() != self.browser_rev;
         if live || changed || subagents || expired || browser_moved {
-            cx.notify();
+            self.frame_notify("jobs-clock", cx);
         }
     }
 
@@ -3935,12 +4222,54 @@ impl Shell {
     }
 }
 
+impl Drop for Shell {
+    fn drop(&mut self) {
+        // Close the channels FIRST, then cancel the tasks. Closing is
+        // synchronous and wakes the awaiting task on this thread (allowed by
+        // gpui-pre's scheduler), clearing the listener the Tokio senders would
+        // otherwise call from a worker. Cancelling a `Task` only schedules the
+        // drop of its future, so it cannot close this window on its own.
+        for entry in self.foreground_tasks.drain(..) {
+            if let Some(close) = entry.close {
+                close();
+            }
+        }
+    }
+}
+
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The markdown bodies' cache ages by frame: every body this frame paints
         // is stamped, and the least recently painted is evicted when the cache
         // fills.
         self.frame_no = self.frame_no.wrapping_add(1);
+        // What the running line paints this frame, recorded for the elapsed
+        // clock: it may repaint only when this second differs from the one on
+        // screen. A derived cache, never a reason to notify from render.
+        self.elapsed_painted = self.painted_elapsed_seconds();
+        // The off-by-default frame trace: one bounded line per painted frame.
+        // The None match is the whole cost of an ordinary launch - the facts
+        // are only built when an owner asked for the file.
+        if let Some(trace) = self.frame_trace.as_mut() {
+            let view = f32::from(self.transcript_scroll.bounds().size.height);
+            let max = f32::from(self.transcript_scroll.max_offset().y);
+            trace.record(super::frame_trace::FrameFacts {
+                frame: self.frame_no,
+                tab: match self.state.tab {
+                    crate::state::Tab::Chat => "chat",
+                    crate::state::Tab::Trajectory => "trajectory",
+                    crate::state::Tab::Audit => "audit",
+                },
+                streaming: self.state.any_streaming(),
+                offset: f32::from(self.transcript_scroll.offset().y),
+                max,
+                content: max + view,
+                rows: self
+                    .state
+                    .active_session()
+                    .map_or(0, |session| session.messages.len() + 1),
+            });
+        }
         // The browser pane's view is rebuilt only when the browser moved, which
         // includes a TOOL navigation: the turn's runtime cannot notify a
         // window, so the revision is compared here and on the job clock.
@@ -4053,6 +4382,7 @@ impl Render for Shell {
             self.tail_max = None;
             self.following_tail = true;
             self.think_open.clear();
+            self.process_open.clear();
             self.compaction_open.clear();
             // The audit's folds name turn and call positions in the transcript
             // that just changed, so a switch closes them and starts the list at
@@ -4113,14 +4443,14 @@ impl Render for Shell {
             // empty transcript, or the hero phase) repainted an idle shell at
             // the display's frame rate forever.
             if max <= px(0.0) && self.tail_max.is_none() {
-                cx.notify();
+                self.frame_notify("tail", cx);
             }
         }
         self.tail_max = Some(max);
         // The wheel's easing runs after the tail decision, and asks for the next
         // frame while it is still moving.
         if self.advance_smooth() {
-            cx.notify();
+            self.frame_notify("wheel-ease", cx);
         }
         self.chat_last_offset = f32::from(self.transcript_scroll.offset().y);
         self.traj_last_offset = f32::from(self.traj_scroll.offset().y);
@@ -4214,7 +4544,46 @@ impl Render for Shell {
                 }
                 this.drag_sidebar_width(event.position.x.as_f32(), cx);
                 this.drag_right_panel_width(event.position.x.as_f32(), cx);
+                // The same lost-release guard for a page drag: if a move
+                // arrives with no button held while the page still thinks a
+                // press is down, the up went somewhere this window never heard
+                // about, so end the gesture now rather than leaving the page
+                // stuck in a drag.
+                if event.pressed_button.is_none() && this.browser_pressed {
+                    this.browser_release_outside(event.position);
+                    cx.notify();
+                }
+                // A drag that started in the browser page keeps reaching the
+                // page after it leaves the pane: the frame's own handler stops
+                // at its edge, so the window carries the clamped rest.
+                this.browser_drag_outside(event.position);
             }))
+            // The release that ends a page drag may land anywhere in the
+            // window. A release inside the frame was already delivered to the
+            // page there (which clears the pressed flag); this catches the one
+            // that landed over the sidebar, the transcript, or the header.
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
+                    if this.browser_pressed {
+                        this.browser_release_outside(event.position);
+                        cx.notify();
+                    }
+                }),
+            )
+            // And a release outside the window entirely: the platform still
+            // reports it to the window that took the press, and the root is no
+            // longer hovered, so this capture-phase listener is the one that
+            // sees it.
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
+                    if this.browser_pressed {
+                        this.browser_release_outside(event.position);
+                        cx.notify();
+                    }
+                }),
+            )
             // The reference dismisses its jobs popover on a press outside it.
             // The trigger and the panel stop their own presses, so this only
             // sees a click that landed elsewhere.
