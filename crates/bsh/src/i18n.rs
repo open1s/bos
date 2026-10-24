@@ -330,9 +330,9 @@ mod tests {
             "permission.cardFullShell",
             "permission.cardCapped",
             "permission.keptShort",
-            // The derived network clause: the actors, the two sentence shapes
-            // and the phrasings the five reach states resolve to.
-            "permission.netActorsReadOnly",
+            // The network clause: Read Only's fixed refusal sentence, then the
+            // actors, the two sentence shapes and the five derived reach states.
+            "permission.netReadOnly",
             "permission.netActorsCommands",
             "permission.netActorsTools",
             "permission.netActors",

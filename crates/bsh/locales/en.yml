@@ -712,7 +712,7 @@
 "permission.cardFullShell": "Files open; shell confined."
 "permission.cardCapped": "Preset keeps {mode}."
 "permission.keptShort": "This preset keeps it at {mode}"
-"permission.netActorsReadOnly": "Web search and the browser"
+"permission.netReadOnly": "Hosted web search works; local network (the browser, page fetches, MCP HTTP) is refused by Read Only."
 "permission.netActorsCommands": "Commands"
 "permission.netActorsTools": "Tools"
 "permission.netActors": "{actors}: {reach}."

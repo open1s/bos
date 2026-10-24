@@ -706,7 +706,7 @@
 "permission.cardFullShell": "文件开放；Shell 受限。"
 "permission.cardCapped": "预设上限为{mode}。"
 "permission.keptShort": "此预设限制为{mode}"
-"permission.netActorsReadOnly": "网络搜索与浏览器"
+"permission.netReadOnly": "托管网页搜索可用；仅可查看拒绝本地网络（浏览器、页面抓取、MCP HTTP）。"
 "permission.netActorsCommands": "命令"
 "permission.netActorsTools": "工具"
 "permission.netActors": "{actors}：{reach}。"

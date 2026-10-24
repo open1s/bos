@@ -1790,6 +1790,12 @@ impl Shell {
         let id = existing.unwrap_or_else(|| self.state.adopt_workspace(&name, &root));
         self.state.settings.global.general.active_workspace = id;
         let _ = self.state.settings.save();
+        // The newly active workspace's own facts: re-read its egress file (the
+        // permission chip states its reach) and make sure its authoring
+        // templates are there - including when the folder was already
+        // registered and no adoption wrote them.
+        self.state.refresh_egress_allowlist();
+        self.state.ensure_workspace_templates();
         // A new workspace means a new tree and new notes, and the open file
         // tabs belonged to the old root.
         self.refile_workspace(cx);

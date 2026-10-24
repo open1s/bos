@@ -11145,8 +11145,9 @@ fn the_chip_offers_three_modes_and_marks_the_current_one(cx: &mut TestAppContext
 /// so the observable is the row list the chip's render path builds
 /// (`permission::permission_rows`) read from the live shell after the chip has
 /// drawn - the same function, the same state. The scratch workspace has NO
-/// `.bsh/egress-allowlist`, so the honest clause is the unrestricted one; a
-/// hardcoded allowlist would fail here.
+/// `.bsh/egress-allowlist`, so the WRITABLE rows state the unrestricted reach
+/// (a hardcoded allowlist would fail here). Read Only states the session tier's
+/// own refusal instead, which the file cannot change.
 #[gpui::test]
 fn the_chips_three_rows_each_carry_a_network_clause(cx: &mut TestAppContext) {
     init_test_app(cx);
@@ -11168,8 +11169,10 @@ fn the_chips_three_rows_each_carry_a_network_clause(cx: &mut TestAppContext) {
     assert_eq!(rows.len(), 3, "the chip offers exactly three modes");
     for row in &rows {
         assert!(
-            row.text.contains("network available") || row.text.contains("network denied"),
-            "every row states its network reach: {}",
+            row.text.contains("network available")
+                || row.text.contains("network denied")
+                || row.text.contains("local network"),
+            "every row states the network: {}",
             row.text
         );
     }
@@ -11184,11 +11187,29 @@ fn the_chips_three_rows_each_carry_a_network_clause(cx: &mut TestAppContext) {
         "the absent file is the real state, not a hardcoded allowlist: {}",
         workspace_row.text
     );
+    let read_only = rows
+        .iter()
+        .find(|row| row.mode == super::permission::Mode::ReadOnly)
+        .expect("the Read Only row");
+    assert!(
+        read_only.text.contains("Hosted web search works")
+            && read_only.text.contains("refused by Read Only"),
+        "the read-only row states the session refusal, not a file reach: {}",
+        read_only.text
+    );
+    assert!(
+        !read_only.text.contains("workspace allowlist"),
+        "and it never carries the allowlist phrase: {}",
+        read_only.text
+    );
 }
 
-/// NEGATIVE: under a preset that denies every destination, no row the chip
-/// draws reads as an open network. The workspace file is ABSENT here, which is
-/// exactly the state a hardcoded "unrestricted" clause would get wrong.
+/// NEGATIVE: under a preset that denies every destination, no WRITABLE row the
+/// chip draws reads as an open network. The workspace file is ABSENT here,
+/// which is exactly the state a hardcoded "unrestricted" clause would get
+/// wrong. Read Only is not derived at all: it keeps stating its own session
+/// refusal, since the preset can only narrow a mode whose local egress the
+/// session tier still permits.
 #[gpui::test]
 fn a_deny_all_preset_chip_never_reads_as_an_open_network(cx: &mut TestAppContext) {
     init_test_app(cx);
@@ -11225,8 +11246,18 @@ fn a_deny_all_preset_chip_never_reads_as_an_open_network(cx: &mut TestAppContext
     assert_eq!(rows.len(), 3);
     for row in &rows {
         assert!(
+            !row.text.contains("unrestricted"),
+            "no row claims an unrestricted network: {}",
+            row.text
+        );
+    }
+    for row in rows
+        .iter()
+        .filter(|row| row.mode != super::permission::Mode::ReadOnly)
+    {
+        assert!(
             row.text.contains("network denied"),
-            "the deny-all preset is stated on every row: {}",
+            "the deny-all preset is stated on every writable row: {}",
             row.text
         );
         assert!(
@@ -11234,12 +11265,21 @@ fn a_deny_all_preset_chip_never_reads_as_an_open_network(cx: &mut TestAppContext
             "and it names the preset, not the workspace file: {}",
             row.text
         );
-        assert!(
-            !row.text.contains("unrestricted"),
-            "no row claims an unrestricted network: {}",
-            row.text
-        );
     }
+    let read_only = rows
+        .iter()
+        .find(|row| row.mode == super::permission::Mode::ReadOnly)
+        .expect("the Read Only row");
+    assert!(
+        read_only.text.contains("refused by Read Only"),
+        "Read Only states the session refusal the preset cannot change: {}",
+        read_only.text
+    );
+    assert!(
+        !read_only.text.contains("workspace allowlist"),
+        "and it carries no allowlist phrase: {}",
+        read_only.text
+    );
 }
 
 /// The permission chip's menu writes through the same field the General pane's
@@ -17552,6 +17592,22 @@ fn a_folder_can_be_added_as_a_workspace(cx: &mut TestAppContext) {
     cx.update(|_, cx| {
         shell.update(cx, |this, cx| this.adopt_workspace(&root, cx));
     });
+
+    // The Add workspace path also drops the inert authoring templates into the
+    // folder, and only those: the enforcing files stay absent.
+    for name in [
+        crate::workspace_templates::POLICY_TEMPLATE_NAME,
+        crate::workspace_templates::ALLOWLIST_TEMPLATE_NAME,
+        crate::workspace_templates::TERMINAL_TEMPLATE_NAME,
+    ] {
+        assert!(
+            root.join(".bsh").join(name).is_file(),
+            "{name} is missing after the add"
+        );
+    }
+    assert!(!root.join(".bsh").join("policy.rego").exists());
+    assert!(!root.join(".bsh").join("egress-allowlist").exists());
+    assert!(!root.join(".bsh").join("terminal-policy.rego").exists());
 
     let (active, registered, listed) = cx.update(|_, cx| {
         let shell = shell.read(cx);

@@ -2317,3 +2317,51 @@ menu now sets `.max_w(px(820.0))`. Tests: all three modes x both locales x the
 three file states, the preset-list and deny-all intersections, a negative that a
 deny-all preset never reads as open, and two rendered `draw_until` tests reading
 the rows the chip builds (absent file and deny-all preset).
+Round 172 put two AUTHORING TEMPLATES into every workspace, at the only names
+bsh ignores: `.bsh/policy.rego.tpl` and `.bsh/egress-allowlist.tpl`
+(`workspace_templates.rs`). The enforcing files are still never seeded - a
+present `egress-allowlist` with no rule would deny every destination, and a
+policy is the reader's decision - so registration writes the templates and
+nothing else; the templates are write-if-missing, so an edit survives every
+launch, and a root that is not a directory is skipped rather than recreated.
+They are ensured on Add workspace (state `adopt_workspace` and the shell's
+already-registered path), on a workspace switch, and at launch for the active
+workspace. The policy template is a complete `policy.workspace` module whose
+verdict allows by default and whose four worked refusals (path prefix/segment,
+egress port, egress host, tool) sit behind `examples := false`; tests compile
+it, flip the switch and prove each refusal fires, and copy it to
+`.bsh/policy.rego` through `policy_for_effective` to prove the loader ignores
+the `.tpl` and applies the copy. The allowlist template is the Policy pane's
+own `EGRESS_ALLOWLIST_TEMPLATE` under a copy-instruction header, so its rule
+shapes cannot drift from the file the pane writes. Trap: the Rego comment
+`a "# rule: <id>" comment` terminates an `r#"..."#` literal, so the constant
+uses `r##"`; and a target path is normalised, so a test that injects a scratch
+prefix into the template must canonicalise the root first.
+
+Round 173 added the third authoring template, `.bsh/terminal-policy.rego.tpl`
+(`TERMINAL_TEMPLATE_NAME`), for the interactive terminal gate. That gate was
+real and used - `terminal.rs` reads `.bsh/terminal-policy.rego` for start, input
+and output with redaction, hot reload, a last-good policy on a broken edit, an
+audit ring and fail-closed on a parse error - but nothing pointed a reader at
+it: the pane seeds a bare starter when it opens, and the contract lived only in
+`docs/bsh-terminal-policy.md`. The template is discoverability, not enforcement.
+Its body is NOT a second copy: it is `terminal::WORKSPACE_POLICY_TEMPLATE`, the
+same text the pane seeds, so the file a reader copies and the file the pane
+drops cannot drift (a test asserts `ends_with` on that constant). The body was
+recast in the policy template's style - `package terminal` (the loader adds the
+shipped module as `terminal.rego` and evaluates `data.terminal.verdict`), the
+three input shapes, the boolean / `{allow, reason, redact}` answers, and three
+worked examples (destructive command, output-redaction regex, refused shell)
+guarded by `examples := false` over EMPTY lists, so the switch alone is inert.
+The header carries what the body cannot say about itself: the `.tpl` is not the
+enforced name, absence is OPEN while a file that fails to parse closes all three
+gates and keeps the last good policy with the error recorded, and this gate is
+the INTERACTIVE pane's while `.bsh/policy.rego` covers tool calls. Proven
+through the loader rather than by reading: copying the template to the enforced
+name leaves the start and input decisions equal to a missing file's, and
+`gate_for_workspace` - a `#[cfg(test)]` wrapper on the `open_gate` the pane
+itself calls - distinguishes the shipped `Default` gate from a `File` gate, so
+"the .tpl is ignored" is asserted on the loader, not on file names. Trap:
+`seed_policy` already writes the enforced name when a pane opens, so a test that
+only checks that file's absence proves nothing about the loader.
+

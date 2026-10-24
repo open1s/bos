@@ -1663,40 +1663,128 @@ fn trace_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("BSH_TERM_TRACE").is_some())
 }
 
-/// The policy file written into a workspace the first time its terminal opens.
+/// The policy body written into a workspace the first time its terminal opens,
+/// and the body of the `.bsh/terminal-policy.rego.tpl` authoring template.
 ///
-/// It is a working allow-all policy with the useful rules written out but
-/// commented, so the file is a starting point a reader edits rather than a
-/// blank page: every example below parses as-is once uncommented, and the
-/// contract each one relies on is docs/bsh-terminal-policy.md.
-const WORKSPACE_POLICY_TEMPLATE: &str = r#"package terminal
+/// One source of truth for both, so the file the pane drops and the file a
+/// reader copies can never describe different rules. It must stay a VALID
+/// module as written: a reader who copies it without editing a character must
+/// get a policy that parses, allows, and changes nothing. Every worked example
+/// is guarded by `examples := false` AND reads a list that starts EMPTY, so
+/// flipping the switch on its own changes nothing; a test flips it, injects a
+/// scratch value and proves each refusal fires, so the examples cannot rot.
+pub(crate) const WORKSPACE_POLICY_TEMPLATE: &str = r##"package terminal
 
-# The terminal gate asks this policy at three points, each with its own input:
-#   start  {action: "start",  command, shell, cwd, deny}
-#   input  {action: "input",  command, cwd, deny}
-#   output {action: "output", text, deny}
-# Answer with a boolean, or with {allow, reason, redact} to explain a refusal
-# or to replace a chunk of output instead of dropping it.
+# The terminal gate asks this policy at three points, each with its own input
+# document. Every field is always present; `deny` is bsh's own escape hatch and
+# is always false, so a policy may ignore it.
 #
-# The default is open. Narrow it by uncommenting rules below.
+#   start   {"action": "start",  "command": <shell path>, "shell": <shell path>,
+#            "cwd": <workspace>, "deny": false}
+#           Asked before any process exists. `command` and `shell` are the same
+#           path. A refused start spawns NOTHING: it is the only door that
+#           guarantees no process runs.
+#
+#   input   {"action": "input",  "command": <the submitted line, exactly>,
+#            "cwd": <workspace>, "deny": false}
+#           Asked on Enter, before the submitting carriage return is written.
+#           `cwd` is the directory the terminal STARTED in, so a `cd` the shell
+#           made is invisible here.
+#
+#   output  {"action": "output", "text": <one chunk read from the PTY>,
+#            "deny": false}
+#           Asked once per chunk, before it reaches the grid. `text` is lossy
+#           for a split multibyte sequence, and truncated to 4096 characters.
+#
+# Answer with a BOOLEAN, or with an OBJECT to explain a refusal or to replace
+# output instead of dropping it:
+#
+#   {"allow": true}
+#   {"allow": false, "reason": "<shown in the pane's status line>"}
+#   {"allow": true,  "redact": "<text fed INSTEAD OF the chunk>"}
+#
+# `redact` applies to output only, and a redacted chunk still counts as allowed.
+# An object that omits `allow` reads as false. Telling the three points apart is
+# one test on the action: input.action == "start" / "input" / "output".
+#
+# The default is open. Narrow it by naming what to refuse below.
 default allow := true
 
-# allow := false if {
-#     input.action == "input"
-#     some bad in ["rm -rf", "mkfs", "dd of=/dev/"]
-#     contains(input.command, bad)
-# }
+# -----------------------------------------------------------------------------
+# The switch. Every worked example is guarded by it AND reads a list that starts
+# EMPTY, so flipping it to true on its own changes NOTHING: name what to refuse
+# in the list first, then flip. Flipping it back to false disables all three at
+# once without deleting them.
+# -----------------------------------------------------------------------------
+examples := false
+
+# -----------------------------------------------------------------------------
+# 1. Refuse a destructive input line.
 #
-# decision := {"allow": false, "reason": "this command is on the destructive list"} if {
-#     input.action == "input"
-#     startswith(input.command, "sudo ")
-# }
+# A line containing one of these substrings is refused and never submitted: no
+# carriage return reaches the shell, and Ctrl-U clears what it echoed.
+# -----------------------------------------------------------------------------
+denied_commands := [
+    # "rm -rf",
+    # "mkfs",
+    # "dd of=/dev/",
+]
+
+denied_command(command) if {
+    some needle in denied_commands
+    contains(command, needle)
+}
+
+decision := {"allow": false, "reason": "this command is on the workspace's destructive list"} if {
+    examples
+    input.action == "input"
+    denied_command(input.command)
+}
+
+# -----------------------------------------------------------------------------
+# 2. Redact a secret in output instead of dropping the chunk.
 #
-# decision := {"allow": true, "redact": "[redacted]"} if {
-#     input.action == "output"
-#     regex.match(`AKIA[0-9A-Z]{16}`, input.text)
-# }
-"#;
+# Each entry is a regex the chunk is matched against. A match replaces the WHOLE
+# chunk with the redact text, so this is for short secret-bearing output rather
+# than for a screen's worth of drawing: the chunk's escape sequences go with it.
+# The example is an AWS access-key id; `sk-[A-Za-z0-9]{16}` is the API-key shape.
+# -----------------------------------------------------------------------------
+secret_patterns := [
+    # `AKIA[0-9A-Z]{16}`,
+]
+
+secret_in(text) if {
+    some pattern in secret_patterns
+    regex.match(pattern, text)
+}
+
+decision := {"allow": true, "redact": "[redacted]"} if {
+    examples
+    input.action == "output"
+    secret_in(input.text)
+}
+
+# -----------------------------------------------------------------------------
+# 3. Refuse to start one shell.
+#
+# The start gate is the hard boundary: a refusal leaves the pane with no process
+# at all. `shell` is the shell's path, and it is the same value as `command`.
+# -----------------------------------------------------------------------------
+deny_shells := [
+    # "/bin/bash",
+]
+
+denied_shell(shell) if {
+    some refused in deny_shells
+    shell == refused
+}
+
+decision := {"allow": false, "reason": "this shell is not used in this workspace"} if {
+    examples
+    input.action == "start"
+    denied_shell(input.shell)
+}
+"##;
 
 fn policy_path(cwd: &Path) -> PathBuf {
     cwd.join(".bsh").join("terminal-policy.rego")
@@ -1747,6 +1835,32 @@ fn read_policy(path: &Path) -> PolicyRead {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => PolicyRead::Missing,
         Err(error) => PolicyRead::Broken(format!("{}: {error}", path.display())),
     }
+}
+
+/// The gate a policy path produces, and the parse error that closed it.
+///
+/// A path with no name has no workspace to confine, so it gets the shipped
+/// allow-all gate; a file that does not parse closes the gate and names its
+/// error, which is what the pane reports.
+fn open_gate(path: &Path) -> (Gate, Option<String>) {
+    if path.as_os_str().is_empty() {
+        return (Gate::allow_all(), None);
+    }
+    match read_policy(path) {
+        PolicyRead::Loaded(gate) => (*gate, None),
+        PolicyRead::Missing => (Gate::allow_all(), None),
+        PolicyRead::Broken(error) => (Gate::closed(PolicySource::File, error.clone()), Some(error)),
+    }
+}
+
+/// The gate a workspace's terminal policy file produces, without a pane.
+///
+/// The authoring-template tests need exactly what the loader does - the exact
+/// `.bsh/terminal-policy.rego` name, and the parse-or-fail-closed rule - without
+/// opening a real PTY. Used only by tests.
+#[cfg(test)]
+pub(crate) fn gate_for_workspace(root: &Path) -> Gate {
+    open_gate(&policy_path(root)).0
 }
 
 /// Keep at most cap characters of a subject, on a character boundary.
@@ -2212,17 +2326,7 @@ impl Terminal {
         if !path.as_os_str().is_empty() {
             seed_policy(&path);
         }
-        let (gate, policy_error) = if path.as_os_str().is_empty() {
-            (Gate::allow_all(), None)
-        } else {
-            match read_policy(&path) {
-                PolicyRead::Loaded(gate) => (*gate, None),
-                PolicyRead::Missing => (Gate::allow_all(), None),
-                PolicyRead::Broken(error) => {
-                    (Gate::closed(PolicySource::File, error.clone()), Some(error))
-                }
-            }
-        };
+        let (gate, policy_error) = open_gate(&path);
         let stamp = if path.as_os_str().is_empty() {
             None
         } else {

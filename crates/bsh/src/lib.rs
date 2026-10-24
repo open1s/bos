@@ -36,6 +36,7 @@ pub(crate) mod theme;
 pub(crate) mod trash;
 pub(crate) mod ui;
 pub(crate) mod vault;
+pub(crate) mod workspace_templates;
 
 /// Launch the BOS Harness desktop window. Blocks until the window closes.
 pub fn run() {

@@ -879,9 +879,10 @@ impl Shell {
         let text = permission_chip_text(lang, &permission);
         let effective = permission.effective.clone();
         // Three rows, each one line: the label and its consequence - the network
-        // clause included, derived by `permission::rows_for`. The check follows
-        // the mode in force, and a row a preset ceiling cannot grant is disabled
-        // and says which mode the preset keeps.
+        // clause included, derived by `permission::rows_for` for a writable
+        // mode and stated by the session tier's own refusal for Read Only. The
+        // check follows the mode in force, and a row a preset ceiling cannot
+        // grant is disabled and says which mode the preset keeps.
         let chip = trigger_chrome(
             Button::new("composer-permission")
                 .ghost()

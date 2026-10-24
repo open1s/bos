@@ -14,9 +14,10 @@
 //! # The network clause is DERIVED
 //!
 //! A mode line that described files and commands but said nothing about the
-//! network was false by omission: Workspace Write can reach the network, and
-//! Read Only cannot write yet hosted tools still can. The clause is therefore
-//! built from the resolved egress state at the moment the row is drawn:
+//! network was false by omission: Workspace Write can reach the network, while
+//! Read Only cannot write and its session tier refuses local egress. The clause
+//! for a WRITABLE mode is therefore built from the resolved egress state at the
+//! moment the row is drawn:
 //!
 //! - the workspace's `.bsh/egress-allowlist` is TRI-STATE - ABSENT leaves the
 //!   network unrestricted, PRESENT with no rule is a deliberate deny-all, and
@@ -27,6 +28,13 @@
 //! The classification goes through the policy's own parser, so a row cannot
 //! claim an "unrestricted" network a deny-all preset forbids, nor a "bounded"
 //! one when no file and no preset narrows anything.
+//!
+//! Read Only is the ONE exception, and it is deliberately not derived: the
+//! session tier (`session-read-only-egress` in
+//! `agent::policy::SESSION_PERMISSION_REGO`) refuses every local egress at that
+//! mode, so no workspace allowlist can make a local socket reachable. Its row
+//! states that refusal and names hosted web search - which runs on the model
+//! provider and opens no local socket - as the one thing still available.
 
 use crate::caps::WorkspaceEgress;
 use crate::i18n::{tr, tr_args, Lang};
@@ -101,44 +109,51 @@ impl Mode {
         tr(lang, self.label_key())
     }
 
-    /// The network users this mode's line names.
-    fn network_actors_key(self) -> &'static str {
-        match self {
-            Self::ReadOnly => "permission.netActorsReadOnly",
-            Self::WorkspaceWrite => "permission.netActorsCommands",
-            Self::FullAccess => "permission.netActorsTools",
-        }
-    }
-
     /// The one-line consequence in the active language, network included.
     ///
     /// The filesystem and command half is the mode's own sentence; the network
-    /// half is built from `network` so the row cannot state a reach the turn
-    /// does not get. Under Full access a preset that keeps the shell confined
-    /// swaps in the sentence that names that constraint, because it is the fact
-    /// the reader cannot otherwise see.
+    /// half of a WRITABLE mode is built from `network` so the row cannot state
+    /// a reach the turn does not get. Read Only is deliberately NOT derived:
+    /// its local egress is refused by the session tier, so no workspace
+    /// allowlist can make the browser, a page fetch or MCP HTTP reachable.
+    /// Under Full access a preset that keeps the shell confined swaps in the
+    /// sentence that names that constraint, because it is the fact the reader
+    /// cannot otherwise see.
     pub(crate) fn consequence(
         self,
         lang: Lang,
         preset_forces_heel: bool,
         network: &NetworkFacts<'_>,
     ) -> String {
-        let (head, actors) = if self == Self::FullAccess && preset_forces_heel {
+        let head = if self == Self::FullAccess && preset_forces_heel {
+            "permission.consequenceFullShell"
+        } else {
+            self.consequence_key()
+        };
+        let clause = match self {
+            // NOT derived from `network`: the session tier refuses every local
+            // egress at this mode regardless of the workspace allowlist, and
+            // hosted web search never opens a local socket. See the module doc.
+            Self::ReadOnly => tr(lang, "permission.netReadOnly"),
             // With the shell confined by the preset, the shell and the tools
             // share one reach, so the row names the network itself instead of
             // one class of user.
-            ("permission.consequenceFullShell", None)
-        } else {
-            (self.consequence_key(), Some(self.network_actors_key()))
+            Self::FullAccess if preset_forces_heel => network_sentence(network.reach(), None, lang),
+            Self::WorkspaceWrite => network_sentence(
+                network.reach(),
+                Some(tr(lang, "permission.netActorsCommands")),
+                lang,
+            ),
+            Self::FullAccess => network_sentence(
+                network.reach(),
+                Some(tr(lang, "permission.netActorsTools")),
+                lang,
+            ),
         };
         // English joins two sentences with a space; Chinese punctuation carries
         // its own spacing, so the full stops must touch.
         let separator = if lang == Lang::En { " " } else { "" };
-        format!(
-            "{}{separator}{}",
-            tr(lang, head),
-            network_sentence(network.reach(), actors.map(|key| tr(lang, key)), lang)
-        )
+        format!("{}{separator}{clause}", tr(lang, head))
     }
 }
 
@@ -571,11 +586,15 @@ mod tests {
         ));
     }
 
-    /// EVERY row states the network, in both locales, and its clause is the
-    /// resolved state: an absent file is unrestricted, a present file with no
-    /// rule denies all, and a present file with rules is the workspace
+    /// EVERY WRITABLE row states the network, in both locales, and its clause
+    /// is the resolved state: an absent file is unrestricted, a present file
+    /// with no rule denies all, and a present file with rules is the workspace
     /// allowlist. A hardcoded "allowlist" passes one case and lies in the other
     /// two, which is what this discriminates against.
+    ///
+    /// Read Only is excluded on purpose: its row is NOT derived from the file
+    /// (the session tier denies every local egress there), and its own test
+    /// below pins that independent sentence.
     #[test]
     fn every_row_states_the_network_truth_for_the_three_file_states() {
         let none: Vec<String> = Vec::new();
@@ -604,7 +623,7 @@ mod tests {
                 true,
             ),
         ];
-        for mode in MODES {
+        for mode in [Mode::WorkspaceWrite, Mode::FullAccess] {
             for lang in [Lang::En, Lang::Zh] {
                 // The word for an unrestricted network: a deny-all state may
                 // not use it, which is what the negative half discriminates.
@@ -645,9 +664,11 @@ mod tests {
         }
     }
 
-    /// NEGATIVE: a row governed by a deny-all preset neither reads as an open
-    /// network nor hides the preset behind the workspace file. Both workspace
-    /// states are exercised, because the preset wins either way.
+    /// NEGATIVE: a WRITABLE row governed by a deny-all preset neither reads as
+    /// an open network nor hides the preset behind the workspace file. Both
+    /// workspace states are exercised, because the preset wins either way.
+    /// Read Only is exempt because it never states a derived reach: its row
+    /// refuses the local network itself, which is pinned separately.
     #[test]
     fn a_deny_all_preset_is_named_on_every_row() {
         let none: Vec<String> = Vec::new();
@@ -664,7 +685,7 @@ mod tests {
             };
             for (present, list) in [(false, &none), (true, &rules)] {
                 let facts = facts(present, list, Some(&deny));
-                for mode in MODES {
+                for mode in [Mode::WorkspaceWrite, Mode::FullAccess] {
                     let line = mode.consequence(lang, false, &facts);
                     assert!(
                         line.contains(denied),
@@ -683,8 +704,8 @@ mod tests {
         }
     }
 
-    /// A preset's own list is the bound on every row, intersected with the
-    /// workspace's: entries narrow, an empty workspace file still wins.
+    /// A preset's own list is the bound on every WRITABLE row, intersected with
+    /// the workspace's: entries narrow, an empty workspace file still wins.
     #[test]
     fn a_preset_list_bounds_every_row_and_intersects_the_workspace() {
         let none: Vec<String> = Vec::new();
@@ -699,7 +720,7 @@ mod tests {
                 } else {
                     "网络可用，受预设白名单约束"
                 };
-                for mode in MODES {
+                for mode in [Mode::WorkspaceWrite, Mode::FullAccess] {
                     let line = mode.consequence(lang, false, &facts);
                     assert!(
                         line.contains(expected),
@@ -714,6 +735,108 @@ mod tests {
             NetworkReach::DeniedByWorkspace,
             "a workspace deny-all wins over a preset list: egress is intersected, never unioned"
         );
+    }
+
+    /// The Read Only row states the SESSION tier's refusal, not a reach.
+    ///
+    /// `session-read-only-egress` (`SESSION_PERMISSION_REGO` in
+    /// `agent::policy`) refuses every local egress under read-only, so the
+    /// browser's navigation, page fetches and MCP HTTP open no socket. Hosted
+    /// web search runs on the model provider and touches no local network, so
+    /// it is the one thing still available - and the row must say exactly that.
+    ///
+    /// This pins the pair: hosted search named as available, the local network
+    /// named as refused - and the negative that the row carries NO workspace
+    /// allowlist phrase, because that phrase describes the reach a WRITABLE
+    /// tier gets. It also pins non-derivation: the same row in every workspace
+    /// and preset egress state, since neither can widen a read-only session.
+    #[test]
+    fn the_read_only_row_states_the_session_refusal_not_an_allowlist() {
+        let none: Vec<String> = Vec::new();
+        let rules = entries(&["203.0.113.7"]);
+        let preset = entries(&["api.example.com"]);
+        for lang in [Lang::En, Lang::Zh] {
+            let (hosted, refused, browser, pages, mcp, allowlist, open, actor_form) = match lang {
+                Lang::En => (
+                    "Hosted web search works",
+                    "is refused by Read Only",
+                    "the browser",
+                    "page fetches",
+                    "MCP HTTP",
+                    "workspace allowlist",
+                    "network available",
+                    "browser: network",
+                ),
+                Lang::Zh => (
+                    "托管网页搜索可用",
+                    "仅可查看拒绝本地网络",
+                    "浏览器",
+                    "页面抓取",
+                    "MCP HTTP",
+                    "工作区白名单",
+                    "网络可用",
+                    "浏览器：网络",
+                ),
+            };
+            let resolved = resolution(crate::caps::READ_ONLY, None);
+            let mut lines: Vec<String> = Vec::new();
+            for (present, list, preset_list) in [
+                (false, &none, None),
+                (true, &none, None),
+                (true, &rules, None),
+                (false, &none, Some(preset.as_slice())),
+                (true, &rules, Some(preset.as_slice())),
+            ] {
+                let facts = facts(present, list, preset_list);
+                let rows = choices_with_sandbox(lang, &resolved, false, &facts);
+                let row = rows
+                    .iter()
+                    .find(|row| row.mode == Mode::ReadOnly)
+                    .expect("the Read Only row");
+                lines.push(row.text.clone());
+            }
+            let line = &lines[0];
+            for other in &lines[1..] {
+                assert_eq!(
+                    other, line,
+                    "Read Only must not derive its reach from the workspace or preset: {other}"
+                );
+            }
+            assert!(
+                line.starts_with(&Mode::ReadOnly.label(lang)),
+                "the head phrase keeps the mode label: {line}"
+            );
+            assert!(
+                line.contains(&tr(lang, "permission.consequenceReadOnly")),
+                "and the existing head sentence: {line}"
+            );
+            assert!(
+                line.contains(hosted),
+                "{lang:?} must name hosted search as available: {line}"
+            );
+            assert!(
+                line.contains(refused),
+                "{lang:?} must name Read Only as refusing the local network: {line}"
+            );
+            for named in [browser, pages, mcp] {
+                assert!(
+                    line.contains(named),
+                    "{lang:?} must name {named:?} as refused, not omit it: {line}"
+                );
+            }
+            assert!(
+                !line.contains(allowlist),
+                "{lang:?} must not carry the workspace-allowlist phrase for local traffic: {line}"
+            );
+            assert!(
+                !line.contains(open),
+                "{lang:?} must not claim the local network is available: {line}"
+            );
+            assert!(
+                !line.contains(actor_form),
+                "{lang:?} must not keep the old actor clause that claimed reach: {line}"
+            );
+        }
     }
 
     /// Every row carries a one-line consequence, and the current row is the

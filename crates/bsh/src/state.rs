@@ -841,6 +841,10 @@ impl AppState {
         // fresh workspace into a deny-all before its owner asked for one. The
         // pane offers the starter as an explicit action instead.
         state.refresh_egress_allowlist();
+        // The inert authoring templates are the one thing a workspace gains
+        // without a reader action: .tpl files the reader copies. They are
+        // written only when missing, so an edit is never overwritten.
+        state.ensure_workspace_templates();
         state
     }
 
@@ -1121,6 +1125,9 @@ impl AppState {
         // file means the workspace is unrestricted, and the pane's explicit
         // starter action is the only writer.
         self.refresh_egress_allowlist();
+        // A workspace added before the templates existed gains them on its
+        // first open; an existing edit is left alone.
+        self.ensure_workspace_templates();
         if let Some(id) = self.active_id.clone() {
             if let Some(session) = self.store.session_mut(&id) {
                 session.workspace = workspace.to_string();
@@ -1152,10 +1159,12 @@ impl AppState {
     pub(crate) fn adopt_workspace(&mut self, name: &str, root: &str) -> String {
         let id = self.settings.note_workspace(name, root);
         self.sync_store_roots();
-        // Registration writes NOTHING into the new workspace. In particular the
-        // egress allowlist is not seeded: a fresh workspace has no file, which
-        // is the UNRESTRICTED state; auto-writing the starter would turn that
-        // into a deny-all the reader never chose.
+        // Registration never seeds an ENFORCING file: a fresh workspace has no
+        // egress allowlist, which is the UNRESTRICTED state, and auto-writing
+        // the starter would turn that into a deny-all the reader never chose.
+        // What it does write is the three inert .tpl authoring templates, so
+        // the reader has something to copy the moment the workspace exists.
+        self.ensure_templates_at(root);
         id
     }
 
@@ -1257,6 +1266,7 @@ impl AppState {
     pub(crate) fn new_session_in(&mut self, workspace: &str) -> Option<String> {
         self.settings.global.general.active_workspace = workspace.to_string();
         self.refresh_egress_allowlist();
+        self.ensure_workspace_templates();
         self.new_session()
     }
 
@@ -3414,6 +3424,34 @@ impl AppState {
                     .collect()
             })
             .unwrap_or_default();
+    }
+
+    /// Write all three authoring templates into `root/.bsh`, when missing.
+    ///
+    /// They are documentation the reader copies, never a file bsh enforces;
+    /// nothing is overwritten, and a root that is not a directory is skipped.
+    /// A failed write is a warning and not a failed workspace: the templates are
+    /// an aid, and the first turn must not be refused over one.
+    fn ensure_templates_at(&self, root: &str) {
+        if root.trim().is_empty() {
+            return;
+        }
+        if let Err(error) = crate::workspace_templates::ensure(std::path::Path::new(root)) {
+            log::warn!("workspace templates could not be written to {root}: {error}");
+        }
+    }
+
+    /// Ensure the ACTIVE workspace carries its authoring templates.
+    ///
+    /// Launch, a workspace switch and a newly added workspace all call this, so
+    /// an existing workspace gains the templates the first time it is opened.
+    ///
+    /// This never writes an ENFORCING name: `.bsh/egress-allowlist` would deny
+    /// all egress, `.bsh/policy.rego` would decide a tool policy for the reader,
+    /// and `.bsh/terminal-policy.rego` belongs to the pane that opens the gate.
+    pub(crate) fn ensure_workspace_templates(&self) {
+        let root = self.settings.active_workspace_root();
+        self.ensure_templates_at(&root);
     }
 
     /// Add one exact address or CIDR range and persist the file.
@@ -6531,10 +6569,11 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&base);
     }
-    /// Registering a workspace writes NOTHING, and in particular the egress
-    /// allowlist stays ABSENT - the UNRESTRICTED state a fresh workspace has.
-    /// Auto-seeding the starter here would flip that to a deny-all the reader
-    /// never chose. The pane's explicit action is the only writer.
+    /// Registering a workspace never writes an ENFORCING file: the egress
+    /// allowlist stays ABSENT - the UNRESTRICTED state a fresh workspace has -
+    /// and auto-seeding the starter would flip that to a deny-all the reader
+    /// never chose. The pane's explicit action is the only writer of that file.
+    /// Only the inert .tpl authoring templates are written at registration.
     #[test]
     fn registering_a_workspace_leaves_the_allowlist_absent() {
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -6611,6 +6650,103 @@ mod tests {
         assert!(
             agent::policy::EgressRuleSet::parse([bytes.as_str()]).is_empty(),
             "creating the starter IS the deny-all floor (the file exists, empty)"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Adding a workspace writes the three authoring templates and only them:
+    /// the enforcing names stay absent, the workspace's egress state is
+    /// unchanged, an edited template is never overwritten, and a SWITCH to a
+    /// workspace that never had a .bsh gains them on the way in.
+    #[test]
+    fn adding_a_workspace_writes_the_authoring_templates() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/bsh-state-workspace-templates");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("scratch");
+        let mut state =
+            super::AppState::with_store(crate::store::Store::open_at(base.join("store")));
+        let id = state.adopt_workspace("scratch", &base.to_string_lossy());
+        let bsh = base.join(".bsh");
+        for name in [
+            crate::workspace_templates::POLICY_TEMPLATE_NAME,
+            crate::workspace_templates::ALLOWLIST_TEMPLATE_NAME,
+            crate::workspace_templates::TERMINAL_TEMPLATE_NAME,
+        ] {
+            assert!(bsh.join(name).is_file(), "{name} is missing after adoption");
+        }
+        assert!(
+            !bsh.join("policy.rego").exists(),
+            "no policy may be decided for the reader"
+        );
+        assert!(
+            !bsh.join("egress-allowlist").exists(),
+            "no deny-all floor may be seeded"
+        );
+        assert!(
+            !bsh.join("terminal-policy.rego").exists(),
+            "the terminal gate's enforcing file belongs to the pane that opens it"
+        );
+        assert!(
+            !state.egress_allowlist_present,
+            "the templates do not change the workspace's egress state"
+        );
+
+        // An edit survives a later ensure: it is write-if-missing, never
+        // overwrite. The switch path is the one that re-ensures here.
+        let template = bsh.join(crate::workspace_templates::POLICY_TEMPLATE_NAME);
+        std::fs::write(&template, "# edited\n").expect("the edit");
+        state.set_workspace(&id);
+        assert_eq!(
+            std::fs::read_to_string(&template).expect("still there"),
+            "# edited\n"
+        );
+
+        // A workspace switch ensures the folder it lands on, not only the one it
+        // left: a registered root whose .bsh was removed gains all three back.
+        let other = base.join("switched");
+        std::fs::create_dir_all(&other).expect("a second root");
+        let other_id = state.adopt_workspace("switched", &other.to_string_lossy());
+        let _ = std::fs::remove_dir_all(other.join(".bsh"));
+        state.set_workspace(&other_id);
+        for name in [
+            crate::workspace_templates::POLICY_TEMPLATE_NAME,
+            crate::workspace_templates::ALLOWLIST_TEMPLATE_NAME,
+            crate::workspace_templates::TERMINAL_TEMPLATE_NAME,
+        ] {
+            assert!(
+                other.join(".bsh").join(name).is_file(),
+                "{name} is missing after the switch"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Opening a shell state ensures the ACTIVE workspace carries the templates:
+    /// a workspace recorded before they existed gains them on the next launch.
+    #[test]
+    fn opening_ensures_the_active_workspaces_templates() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/bsh-state-workspace-templates-launch");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("store")).expect("scratch");
+        let state = super::AppState::with_store(crate::store::Store::open_at(base.join("store")));
+        let root = std::path::PathBuf::from(state.settings.active_workspace_root());
+        assert!(
+            root.join(".bsh")
+                .join(crate::workspace_templates::POLICY_TEMPLATE_NAME)
+                .is_file(),
+            "launch must ensure the active workspace's policy template: {root:?}"
+        );
+        assert!(root
+            .join(".bsh")
+            .join(crate::workspace_templates::ALLOWLIST_TEMPLATE_NAME)
+            .is_file());
+        assert!(
+            root.join(".bsh")
+                .join(crate::workspace_templates::TERMINAL_TEMPLATE_NAME)
+                .is_file(),
+            "launch ensures the terminal policy template too: {root:?}"
         );
         let _ = std::fs::remove_dir_all(&base);
     }

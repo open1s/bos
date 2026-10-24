@@ -14,6 +14,15 @@ modification time or length changes (once per terminal-clock tick, never per
 frame). There is no settings UI for policies: the file, its reload and the audit
 ring are the management surface for now.
 
+The file is not authored from nothing. Every workspace carries
+`<workspace>/.bsh/terminal-policy.rego.tpl`, written by bsh beside the other two
+authoring templates (`policy.rego.tpl` and `egress-allowlist.tpl`): it states
+the tri-state, documents the three input shapes and the answer shapes, and
+carries worked examples behind one switch. Opening the terminal writes the same
+policy body to `.bsh/terminal-policy.rego` when that file is missing, so the
+gate always has a starter to edit; the `.tpl` is the documented copy. A `.tpl`
+file is never read and never enforced.
+
 ## The decision
 
 The gate reads exactly one rule, `data.terminal.verdict`. A policy may define
@@ -77,8 +86,13 @@ Example rules use the action field to tell the three apart:
 ## Worked examples
 
 A workspace with no policy file is the documented default: everything is
-allowed. Copy one of the modules below into
-`<workspace>/.bsh/terminal-policy.rego`.
+allowed. To enable one, copy `<workspace>/.bsh/terminal-policy.rego.tpl` to
+`<workspace>/.bsh/terminal-policy.rego` and edit it there. The template's three
+worked examples - a destructive-input refusal, a secret redaction and a refused
+shell - sit behind one `examples := false` switch over lists that start EMPTY,
+so flipping the switch alone changes nothing until a list names what to refuse.
+
+The modules below are the same rules, written out one at a time.
 
 ### Deny a destructive command list
 
