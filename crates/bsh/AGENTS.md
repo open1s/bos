@@ -2365,3 +2365,144 @@ itself calls - distinguishes the shipped `Default` gate from a `File` gate, so
 `seed_policy` already writes the enforced name when a pane opens, so a test that
 only checks that file's absence proves nothing about the loader.
 
+
+Round 174 took the file tools from "works" to "fast and robust", measured rather
+than asserted. The four tools now share one path resolver, one write path and one
+read path, and each seam closed a failure the old code could reach:
+
+- **Confinement is the deepest existing ancestor, not the immediate parent.**
+  `resolve_path` normalises `.`/`..` first and then canonicalises the real path of
+  the file (when it exists) or of the deepest ancestor that does (when it does
+  not). The old check canonicalised only `joined.parent()`, so writing
+  `bridge/deeper/new.txt` through a symlink whose `deeper` did not exist yet kept
+  the lexical path, `create_dir_all` followed the link, and the write landed
+  outside the workspace. An existing leaf now resolves to its real path, so a
+  symlink inside the root reads/edits the file it points at and the policy sees
+  that same file.
+- **A read is bounded and can be windowed.** `offset`/`limit` are 1-based lines;
+  a file past 8MiB is refused with the arguments that read a window instead of
+  being loaded (a tool result travels through the request, so an unbounded read
+  is a broken turn, not a slow one). The open is refused for anything that is not
+  a regular file BEFORE opening it, because opening a FIFO hangs the turn.
+  Binary content (a NUL in the head, or anywhere, via `find('\0')`) and invalid
+  UTF-8 are named instead of returning mojibake.
+- **A write is atomic and skips a no-op.** A temp file beside the target plus a
+  rename leaves the old file intact on failure; the existing file's mode is
+  copied onto the temp; a byte-identical write returns `unchanged: true` without
+  moving the mtime, so a build watcher is not woken. Write and edit serialize on
+  a per-path mutex, so two parallel calls cannot both read the original bytes and
+  lose one update.
+- **An edit searches once and explains a miss.** `replace_all` builds the result
+  in one pass with memchr's finder; a miss names the line the first line matched
+  and, for a CRLF file, says so. `old_string == new_string` is refused instead of
+  silently rewriting the file.
+- **A listing uses d_type and is ordered.** `entry.file_type()` answers dir/file
+  with no stat (only a symlink costs one, to say whether it behaves like a dir),
+  names sort bytewise, and 2000 rows are returned with `truncated` for more.
+
+Measured on the debug build (M-series Mac, 5k entries, 4MiB file), through the
+registry so the policy is included:
+
+| call | before | after |
+|---|---|---|
+| read 4MiB | 0.66ms | 0.76-0.84ms |
+| list_dir 5k entries | 45.6ms | 10-13ms |
+| write_file 1MiB (real change) | 0.72ms | 0.85-0.88ms |
+| edit_file 4MiB replace_all (65k matches) | 85.4ms | 52-59ms |
+
+The read/write regressions are the safety: one extra bounded read for the
+identical check, and the UTF-8/NUL diagnosis. A no-op write is much cheaper than
+before (no temp, no rename). `bench_file_tools` is the checked-in manual
+benchmark: `cargo test -p bsh --lib bench_file_tools -- --ignored --nocapture`.
+
+Traps worth keeping: `bytes.iter().position(|b| *b == 0)` cost 10ms on 4MiB
+(`content.find('\0')` is 0.18ms, and `str::lines()` is 5ms where
+`matches('\n')` is 2ms); a lowercased comparison per sort cost 15ms more than a
+plain byte sort on 5k names; `DirEntry::file_type` is free while
+`path().is_dir()` stats every entry. Tests: symlink-bridge escape, missing-tail
+`..` escape, link-out read + link-in resolve, ceiling/window/binary/directory
+reads, identical-write mtime, mode preservation, edit miss hint, identical-edit
+refusal, path-lock serialization, and the ordered listing.
+
+Round 175 added the `glob` tool, the one file tool BSH was missing. It is a
+discovery tool, not a content search: it answers "which files match this path
+pattern" so an agent stops walking directories with `list_dir` and starts from
+a list. The contract is the reference's - a pattern with no separator matches
+the FILE NAME at any depth, a separator anchors it to the search base, `*`
+stops at a separator and `**` crosses directories - and the walk is
+ignore-aware: `.gitignore`/`.ignore`/`.rgignore` are honoured, hidden entries
+are skipped, and the build/dependency trees are not descended. One switch,
+`include_ignored`, lifts hidden + ignore + default-exclusion filtering for a
+call; an explicit `path` is exempt from the default exclusions, so
+`glob("*.rs", path="target")` still works when the reader means it. Results are
+workspace-relative, sorted, capped at 2000 (limit max 1000), and `truncated`
+says when more existed. `.git`/`.jj`/`.bsh` are never returned, symlinks are not
+followed, the pattern is capped at 4 KiB, and the search root is policy-gated
+as a Read before the walk starts.
+
+Which backend, and why not a single dependency called "ripgrep" or
+"zvec-grep": the `ripgrep` crate on crates.io is a binary-only package
+(`autolib = false`, its only target is `rg`, no `[lib]` in the manifest), so
+there is no library to call. Its reusable half - the crate that implements
+`rg --files` and `rg -g` - is `ignore`, and that is what this tool depends on
+(already in the workspace lock): `WalkBuilder` for the ignore-aware,
+non-following walk and `overrides::OverrideBuilder` for the glob. zvec-grep's
+Rust crates were the earlier candidate and are worse: `publish = false`, its
+`file_selection` module is crate-private, and its public `ZvecGrep::files`
+compiles the whole engine (measured: `cargo tree -p zg-engine` = 658 packages,
+with a prebuilt zvec native library, ONNX Runtime, llama.cpp and eight
+tree-sitter grammars). No one-walk tool may charge that to BSH's default build.
+The tool adds only what ripgrep does not: the build/dependency exclusion list
+(taken from zvec-grep's scan policy, minus its content exclusions such as
+`locales`, `logs` and `tmp`, which a file search may legitimately want),
+`.git`/`.jj`/`.bsh` always skipped, and pattern/result bounds.
+
+Traps worth keeping: `Override::matched` returns `Ignore` for a non-match once
+any whitelist exists, so the filter must test `is_whitelist()` rather than
+`is_none()`; a leading `!` is ripgrep's exclusion syntax and a lone exclusion
+would match nothing, so it is refused by name; `ignore` only applies
+`.gitignore` inside a repository unless `require_git(false)` is set, which a
+workspace with the file and no `.git` needs; a `filter_entry` closure sees the
+walk root at depth 0, so skipping by name at every depth would make an explicit
+`path="target"` walk nothing - the root is exempt. Tests: depth/basename/anchored matching, ignore
+and hidden opt-in, default build/dependency skipping with root exemption,
+metadata never returned, symlinked directory not followed, sorted/limited/
+truncated results, invalid/empty/oversized patterns, a file root refused, and
+the registry-level workspace-relative paths plus the outside-workspace policy
+refusal.
+
+Round 176 added `grep`, the content-search half of the pair. It is built on
+ripgrep's own crates through the `grep` facade the `rg` binary is built from:
+`grep::regex::RegexMatcherBuilder` for the pattern, `grep::searcher` for the
+line-oriented scan and binary detection, and the same `ignore` walk the glob
+tool uses (shared through `glob::build_walker`). A hit is
+`{path, line, text}` with a 1-based line number; results are sorted by path and
+line, and every axis is bounded: 4 KiB pattern, 4 MiB per file, 300 characters
+per reported line, 50 hits by default (500 max), plus the glob tool's candidate
+and ignore policy. Case folding is the explicit `case_insensitive` switch;
+`include_ignored` lifts hidden/ignore/default-tree skipping; a file with a NUL
+in its head is skipped, as is a symlinked file (the walk never follows links).
+An empty result carries a hint naming the case sensitivity and the skipped
+ignored files, so "no match" is not read as "not in the workspace".
+
+Why the facade and not a binary: `ripgrep` on crates.io is binary-only, but the
+`grep` crate is the library rg is built from and `ignore` is its walk. Both are
+pure Rust and small; the facade pulls grep-matcher/regex/searcher/printer/cli.
+The tool is registered in the `files` bundle beside glob, gated by the tool
+switch and presets (the shipped read-only preset lists it), and the prompt and
+stale-reference guards were updated so the model is told to use it for contents
+and `glob` for paths - the exact confusion that made `glob hello` look broken
+when `hello` lived only in file contents.
+
+Tests: regex vs literal, case folding opt-in, ignored/hidden opt-in, binary and
+oversized file skipping, bounded hits with `truncated`, invalid regex naming
+itself, symlinked file not searched, the registry-level hit shape, the empty
+hint, and the outside-workspace read refusal. Registry: 618+ tests passed with
+clippy -D warnings clean before this round; the grep tests are in `grep.rs` and
+`caps.rs`.
+
+One cross-round wart: the shared working copy's tungstenite bump (0.24 -> 0.30)
+landed without its code half, so the build failed on `Message::Text(String)`.
+Adapting `browser/engine/cdp/wire.rs` to `Message::Text(.. .into())` is the
+one-line fix needed to compile; it is unrelated to grep and belongs to the
+browser round.

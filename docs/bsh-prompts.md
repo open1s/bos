@@ -248,16 +248,18 @@ Injection order for one turn:
 | jobs rule | `crates/agent/src/agent/prompts.rs:90` | system, when `job_output` registered | DSH's jobs paragraph with `wait_ms` substituted |
 | plan rule | `crates/agent/src/agent/prompts.rs:97` | system, when `update_plan` registered | DSH's todo description with BSH's single active item |
 | plan tool description | `crates/agent/src/tools/plan.rs:128` | tool description | the same todo guidance plus the `{text, status}` contract |
-| read_file | `crates/bsh/src/prompts.rs:17` | system, when registered | `Use the read_file tool — not shell commands like cat — to inspect text files.` |
-| write_file | `crates/bsh/src/prompts.rs:25` | system, when registered | `Read an existing file before overwriting it with write_file, and prefer edit_file for targeted changes.` |
-| edit_file | `crates/bsh/src/prompts.rs:29` | system, when registered | `Read a file before editing it, unless you just created or edited it in this session.` |
-| list_dir | `crates/bsh/src/prompts.rs:36` | system, when registered | `Use list_dir to see what a directory holds before reading or creating files; it reports names and kinds, not contents.` |
-| web_search | `crates/bsh/src/prompts.rs:43` | system, when registered | DSH's no-fetch branch, verbatim |
-| subagent rule | `crates/bsh/src/prompts.rs:50` | system, when `subagent` registered | `## Delegating with subagents` + DSH's delegation sentence + BSH's wave limit and child-prompt pattern |
-| shipped `ptc` persona | `crates/bsh/src/prompts.rs:100` | persona slot | `You execute work in batched steps: …` |
-| shipped `creator` persona | `crates/bsh/src/prompts.rs:103` | persona slot | `You extend this harness through conversation: …` |
-| shipped `read-only` persona | `crates/bsh/src/prompts.rs:106` | persona slot | `You are a read-only analyst: …` |
-| plan directive | `crates/bsh/src/prompts.rs:114` | first user message | `[Plan mode] Inspect what the task needs and reply with a concrete, step-by-step plan. Resolve discoverable facts by inspection instead of asking. Do not edit files, run mutating commands, or begin the work until the reader approves the plan.` |
+| glob | `crates/bsh/src/prompts.rs:17` | system, when registered | `Use the glob tool — not shell find — to discover files by path pattern. It matches paths, not file contents. A pattern with no "/" matches the basename at any depth, so "*" and "*.ts" both search the whole tree; include a separator to anchor the depth. Ignored and hidden files are skipped unless include_ignored is set.` |
+| grep | `crates/bsh/src/prompts.rs:25` | system, when registered | `Use the grep tool — not shell grep or rg — to search file contents. It returns each matching line with its file and line number. Matching is case-sensitive unless case_insensitive is set; ignored and hidden files are skipped unless include_ignored is set. Use read_file on a matched file when you need surrounding context.` |
+| read_file | `crates/bsh/src/prompts.rs:32` | system, when registered | `Use the read_file tool — not shell commands like cat — to inspect text files. Use offset and limit to continue reading large files.` |
+| write_file | `crates/bsh/src/prompts.rs:40` | system, when registered | `Read an existing file before overwriting it with write_file, and prefer edit_file for targeted changes.` |
+| edit_file | `crates/bsh/src/prompts.rs:44` | system, when registered | `Read a file before editing it, unless you just created or edited it in this session.` |
+| list_dir | `crates/bsh/src/prompts.rs:51` | system, when registered | `Use list_dir to see what a directory holds before reading or creating files; it reports names and kinds, not contents.` |
+| web_search | `crates/bsh/src/prompts.rs:58` | system, when registered | DSH's no-fetch branch, verbatim |
+| subagent rule | `crates/bsh/src/prompts.rs:65` | system, when `subagent` registered | `## Delegating with subagents` + DSH's delegation sentence + BSH's wave limit and child-prompt pattern |
+| shipped `ptc` persona | `crates/bsh/src/prompts.rs:148` | persona slot | `You execute work in batched steps: …` |
+| shipped `creator` persona | `crates/bsh/src/prompts.rs:151` | persona slot | `You extend this harness through conversation: …` |
+| shipped `read-only` persona | `crates/bsh/src/prompts.rs:154` | persona slot | `You are a read-only analyst: …` |
+| plan directive | `crates/bsh/src/prompts.rs:162` | first user message | `[Plan mode] Inspect what the task needs and reply with a concrete, step-by-step plan. Resolve discoverable facts by inspection instead of asking. Do not edit files, run mutating commands, or begin the work until the reader approves the plan.` |
 | file-reference guidance | `crates/bsh/src/reference.rs:21` | first user message | DSH's @-reference paragraph + BSH's `#L<start>-L<end>` and `dsh-session:` additions |
 | goal round | `crates/bsh/src/state.rs:5108` | turn input | `<goal_round>…` with objective, round/max, and the continuation/verification rules |
 | compaction instruction | `crates/agent/src/agent/context.rs:295` | summarizer user message | DSH's instruction, byte-for-byte |
@@ -286,11 +288,11 @@ BSH could follow and now does; **n/a** = DSH capability BSH lacks, so no prompt.
 | `keep the todos being worked on in_progress, several only when work runs in parallel.` | `keep exactly one item in_progress` | ALIGN facts — BSH's plan tool enforces one active item |
 | bash exit-marker rule | `exit_code` field rule | ALIGN facts — BSH's bash result is JSON with `exit_code`; there is no `[exit code: N]` marker |
 | jobs paragraph | same with `wait_ms` | ALIGN facts — BSH's `job_output` takes `wait_ms`, not `wait: true` |
-| read rule + offset/limit | read_file rule without offset/limit | ALIGN facts — `read_file` has no range arguments |
+| read rule + offset/limit | read_file rule with `offset`/`limit` | ALIGN facts — `read_file` takes the same 1-based line window |
 | write rule + fs-observation-policy | write_file rule without the parenthetical | KEEP facts — BSH has no observation-policy gate; saying it "requires" the read would be false. The rule stays as discipline |
 | edit rule + policy | edit_file rule without the parenthetical | KEEP facts — same reason |
-| glob rule | none | n/a — BSH registers no glob tool. `list_dir` has its own honest sentence |
-| grep rule | none | n/a — BSH registers no grep tool |
+| glob rule + ignore fact | glob guidance with the basename/separator rule and the include_ignored fact | ALIGN facts — the reference's `Use the glob tool — not shell find —` opening is kept; BSH's walk is ignore-aware and says so instead of promising hidden and ignored paths |
+| grep rule + case/ignore facts | grep guidance with the read_file follow-up, case_insensitive and include_ignored facts | ALIGN facts — the reference's opening is kept; BSH's matcher is ripgrep's regex and the two switches are stated |
 | web_search two branches | no-fetch branch verbatim | ALIGN exact — BSH has no `web_fetch`, so the shipped branch is the no-fetch one |
 | web_fetch rule | none | n/a |
 | subagent sentence | same sentence + BSH wave limit + child contract | ALIGN exact (the sentence) + KEEP (BSH's measured "at most three children") |
@@ -366,8 +368,7 @@ BSH could follow and now does; **n/a** = DSH capability BSH lacks, so no prompt.
 
 | gap | reason | disposition |
 |---|---|---|
-| `glob` / `grep` / `web_fetch` / `present` / `ask_user_question` / `run_code` / `subagent_fork` / `structured_output` | BSH registers none of these tools. Pasting DSH's sentences would tell the model to call a tool that returns `UNKNOWN_TOOL`. | no prompt; the stale-reference tests forbid their names |
-| `read_file` offset/limit | BSH's tool takes `path` only | clause dropped |
+| `web_fetch` / `present` / `ask_user_question` / `run_code` / `subagent_fork` / `structured_output` | BSH registers none of these tools. Pasting DSH's sentences would tell the model to call a tool that returns `UNKNOWN_TOOL`. | no prompt; the stale-reference tests forbid their names |
 | fs-observation policy | BSH has no read-before-write enforcement; the rule is discipline only | parenthetical dropped; rule kept |
 | `todo_write` multi-active policy | BSH's plan enforces one active item | substituted |
 | DSH plan-mode `exit_plan_mode` | BSH plan mode is a per-turn directive approved in conversation | directive says so; the tool is deferred with a written plan (§9) |
@@ -460,7 +461,7 @@ instruction is a red suite, not a silent behaviour change.
 ## 7. What a future editor must not do
 
 1. **Do not paste DSH text that names a tool BSH lacks.** `read`, `write`,
-   `edit`, `glob`, `grep`, `todo_write`, `exit_plan_mode`,
+   `edit`, `todo_write`, `exit_plan_mode`,
    `ask_user_question`, `present`, `web_fetch`, `run_code`,
    `subagent_fork` and `structured_output` are not BSH tool names. The
    stale-reference tests are the tripwire; do not add a name to their allow-list

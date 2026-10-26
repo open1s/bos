@@ -17,6 +17,8 @@ pub(crate) mod context;
 mod editors;
 pub(crate) mod export;
 pub(crate) mod files;
+pub(crate) mod glob;
+pub(crate) mod grep;
 pub(crate) mod history;
 pub(crate) mod i18n;
 pub(crate) mod installed;

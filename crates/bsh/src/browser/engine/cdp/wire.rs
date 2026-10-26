@@ -221,7 +221,7 @@ impl Socket {
     /// Send one text frame.
     pub(crate) fn send(&mut self, text: &str) -> Result<(), String> {
         self.ws
-            .send(Message::Text(text.to_string()))
+            .send(Message::Text(text.to_string().into()))
             .map_err(|error| format!("the engine's socket refused a request: {error}"))
     }
 

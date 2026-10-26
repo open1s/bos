@@ -9,13 +9,28 @@
 
 use agent::Agent;
 
+/// The reference's glob guidance, with BSH's tool name and one added fact.
+///
+/// The reference's glob walks in everything; BSH's walk respects ignore files
+/// and hidden entries unless `include_ignored` is set, so the guidance says so
+/// instead of promising a listing the tool will not produce.
+pub(crate) const GLOB: &str =
+    "Use the glob tool — not shell find — to discover files by path pattern. It matches paths, not file contents. A pattern with no \"/\" matches the basename at any depth, so \"*\" and \"*.ts\" both search the whole tree; include a separator to anchor the depth. Ignored and hidden files are skipped unless include_ignored is set.";
+
+/// The reference's grep guidance, with BSH's tool name.
+///
+/// The reference's "Use read on a matched file" becomes `read_file`, and the
+/// two facts this tool adds are stated: case folding is opt-in and the walk is
+/// ignore-aware unless `include_ignored` is set.
+pub(crate) const GREP: &str =
+    "Use the grep tool — not shell grep or rg — to search file contents. It returns each matching line with its file and line number. Matching is case-sensitive unless case_insensitive is set; ignored and hidden files are skipped unless include_ignored is set. Use read_file on a matched file when you need surrounding context.";
+
 /// The reference's `read` guidance, with BSH's tool name.
 ///
-/// The reference adds "Use offset and limit to continue reading large files."
-/// BSH's `read_file` takes only a path and returns the whole file, so that
-/// clause is omitted rather than describing an argument that does not exist.
+/// The tool takes the reference's `offset`/`limit` window, so the clause that
+/// used to be omitted for describing an argument BSH did not have is back.
 pub(crate) const READ_FILE: &str =
-    "Use the read_file tool — not shell commands like cat — to inspect text files.";
+    "Use the read_file tool — not shell commands like cat — to inspect text files. Use offset and limit to continue reading large files.";
 
 /// The reference's `write` guidance, with BSH's tool name and no policy claim.
 ///
@@ -67,6 +82,8 @@ A child has its own context and the same tools; it does not see this conversatio
 /// The ordered per-tool guidance, ending with the subagent rule so a child
 /// that removes that section removes only its own tail.
 pub(crate) const TOOL_GUIDANCE: &[(&str, &str)] = &[
+    ("glob", GLOB),
+    ("grep", GREP),
     ("read_file", READ_FILE),
     ("write_file", WRITE_FILE),
     ("edit_file", EDIT_FILE),
@@ -82,6 +99,8 @@ pub(crate) const TOOL_GUIDANCE: &[(&str, &str)] = &[
 pub(crate) const KNOWN_TOOLS: &[&str] = &[
     "bash",
     "edit_file",
+    "glob",
+    "grep",
     "job_kill",
     "job_output",
     "list_dir",
@@ -101,8 +120,6 @@ pub(crate) const KNOWN_TOOLS: &[&str] = &[
 /// still scanned.
 #[cfg(test)]
 pub(crate) const STALE_TOOL_REFERENCES: &[&str] = &[
-    "\u{60}glob\u{60}",
-    "\u{60}grep\u{60}",
     "\u{60}todo_write\u{60}",
     "\u{60}exit_plan_mode\u{60}",
     "\u{60}ask_user_question\u{60}",
@@ -113,8 +130,6 @@ pub(crate) const STALE_TOOL_REFERENCES: &[&str] = &[
     "the read tool",
     "the write tool",
     "the edit tool",
-    "the glob tool",
-    "the grep tool",
 ];
 
 /// The first stale reference in a piece of prompt text, when there is one.
@@ -212,6 +227,8 @@ mod tests {
     #[test]
     fn no_guidance_names_a_tool_bsh_does_not_register() {
         let corpus = [
+            GLOB,
+            GREP,
             READ_FILE,
             WRITE_FILE,
             EDIT_FILE,
@@ -244,7 +261,9 @@ mod tests {
     /// changed instruction, not a cosmetic diff.
     #[test]
     fn each_guidance_keeps_its_rule() {
-        let rules: [(&str, &str); 5] = [
+        let rules: [(&str, &str); 7] = [
+            (GLOB, "Use the glob tool"),
+            (GREP, "Use the grep tool"),
             (READ_FILE, "Use the read_file tool"),
             (WRITE_FILE, "Read an existing file before overwriting it"),
             (EDIT_FILE, "Read a file before editing it"),
@@ -262,12 +281,22 @@ mod tests {
     #[test]
     fn a_complete_persona_is_still_scanned_for_stale_tools() {
         assert_eq!(
-            stale_tool_reference("Use \u{60}glob\u{60} to find it."),
-            Some("\u{60}glob\u{60}")
+            stale_tool_reference("Use \u{60}web_fetch\u{60} to read it."),
+            Some("\u{60}web_fetch\u{60}")
         );
         assert_eq!(
-            stale_tool_reference("Use the grep tool."),
-            Some("the grep tool")
+            stale_tool_reference("Use the read tool."),
+            Some("the read tool")
+        );
+        assert_eq!(
+            stale_tool_reference("Use \u{60}glob\u{60} to find it."),
+            None,
+            "glob is registered now, so naming it is not stale"
+        );
+        assert_eq!(
+            stale_tool_reference("Use \u{60}grep\u{60} to find it."),
+            None,
+            "grep is registered now, so naming it is not stale"
         );
         assert_eq!(
             stale_tool_reference("You are a helpful software engineer assistant."),

@@ -61,6 +61,23 @@ portable-pty = { workspace = true }
 regorus = { workspace = true }
 vte = { workspace = true }
 unicode-width = { workspace = true }
+# The edit tool's substring search. memchr is already in the workspace graph
+# through the framework's regex stack, so naming it adds no package; the
+# standard library's str::matches cost about 1us a match on a 4MiB file, and an
+# edit with tens of thousands of matches spent more time searching than writing.
+memchr = "2"
+# The glob tool's walk and matcher are ripgrep's own ignore crate - the engine
+# behind rg --files - which carries both the .gitignore/.ignore walk and the
+# overrides matcher that gives "rg -g" its basename/separator semantics. The
+# ripgrep crate on crates.io is a binary-only package (autolib = false, target
+# rg), so ignore is its reusable half. It is already locked in the workspace
+# graph, so naming it adds no package.
+ignore = "0.4"
+# The grep tool's pattern engine and line searcher are ripgrep's own crates,
+# named through the `grep` facade the rg binary is built from. Its regex
+# matcher, line-oriented searcher and binary detection are the ones rg uses;
+# the facade pulls its sibling crates, all small and pure Rust.
+grep = "0.4"
 
 # The Vault's cryptography. The admin key is derived with Argon2id, the file is
 # sealed with XChaCha20-Poly1305, and every key and plaintext buffer is held in
@@ -110,7 +127,7 @@ objc2-foundation = { version = "0.3.2", features = ["NSData"] }
 # loop gets one dedicated OS thread instead of a second async runtime. This is
 # the same shape the terminal's own read loop has.
 [dependencies.tungstenite]
-version = "0.24"
+version = "0.30.0"
 default-features = false
 features = ["handshake"]
 

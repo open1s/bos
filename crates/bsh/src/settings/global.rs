@@ -1518,6 +1518,8 @@ pub(crate) fn built_in_preset(id: &str) -> Option<Preset> {
             deny: preset_deny_paths(),
             plugins: vec!["files".to_string(), "plan".to_string()],
             tools: Some(vec![
+                "glob".to_string(),
+                "grep".to_string(),
                 "read_file".to_string(),
                 "list_dir".to_string(),
                 "update_plan".to_string(),

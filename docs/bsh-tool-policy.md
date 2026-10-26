@@ -314,8 +314,9 @@ explicit empty list mounts nothing:
   every tool/skill/server/tool/extension the build would otherwise carry; []
   means none. MCP entries are server namespaces (the name the settings entry
   or extension server registers under).
-- The tool vocabulary is `bash`, `read_file`, `write_file`, `edit_file`,
-  `list_dir`, `update_plan`, `job_output`, `job_kill` and `subagent`.
+- The tool vocabulary is `bash`, `glob`, `grep`, `read_file`, `write_file`,
+  `edit_file`, `list_dir`, `update_plan`, `job_output`, `job_kill` and
+  `subagent`.
   `run_in_background` is the shell's own flag, so the `bash` entry gates it;
   it is also its own capability name for a Rego policy. A preset cannot use
   `tools` to widen the permission matrix: the allowlist is intersected with

@@ -27452,7 +27452,7 @@ fn probe_tool_timeline(cx: &mut TestAppContext) {
     let index = cx.update(|_, cx| {
         shell.read(cx).state.active_session().expect("a session").messages.len() - 1
     });
-    let mut dump = |cx: &mut VisualTestContext, label: &str| {
+    let dump = |cx: &mut VisualTestContext, label: &str| {
         let count = cx.update(|_, cx| shell.read(cx).state.active_session().expect("a session").messages.len());
         let mut present = String::new();
         for i in 0..count {

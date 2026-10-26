@@ -7,8 +7,12 @@
 //! Write confines the shell and the file tools to the active workspace, and Full
 //! access releases both.
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use agent::memory::{FileMemory, MemoryStore};
 use agent::policy::{
@@ -740,6 +744,22 @@ fn build_agent_for_session_inner(
     if eff.file_tools_enabled && !off_bundle("files") {
         let files_root = if confined { root.clone() } else { None };
         let mut files: Vec<Arc<dyn agent::tools::Tool>> = Vec::new();
+        if !off_tool("glob") {
+            files.push(Arc::new(glob_tool(
+                files_root.clone(),
+                policy.clone(),
+                session.to_string(),
+                preset.clone(),
+            )));
+        }
+        if !off_tool("grep") {
+            files.push(Arc::new(grep_tool(
+                files_root.clone(),
+                policy.clone(),
+                session.to_string(),
+                preset.clone(),
+            )));
+        }
         if !off_tool("read_file") {
             files.push(Arc::new(read_file_tool(
                 files_root.clone(),
@@ -1286,31 +1306,95 @@ pub(crate) fn expand_path(raw: &str) -> PathBuf {
 }
 
 /// Resolve a tool path against the workspace root, refusing escapes.
-fn resolve_path(root: &Option<PathBuf>, raw: &str) -> Result<PathBuf, String> {
-    let raw_path = PathBuf::from(raw);
-    let joined = if raw_path.is_absolute() {
-        raw_path
-    } else if let Some(root) = root {
-        root.join(raw_path)
-    } else {
-        raw_path
+///
+/// `root` is the turn's canonical workspace root (the build canonicalizes it
+/// once), so a call does not pay for re-canonicalizing it. The path is
+/// normalized lexically first, so `..` cannot climb out, and then its real path
+/// is checked: an existing leaf resolves through its symlinks, and a leaf that
+/// does not exist yet is appended to the real path of its deepest existing
+/// ancestor. That ancestor walk is what stops a symlinked directory from
+/// becoming a bridge to the outside as soon as the intermediate directory is
+/// itself missing, a case a check on the immediate parent lets through.
+///
+/// An existing target resolves to its real path, so a read or an edit through a
+/// symlink reaches the file the link points at and the policy sees that same
+/// file rather than the link's name.
+fn resolve_path(root: Option<&Path>, raw: &str) -> Result<PathBuf, String> {
+    if raw.trim().is_empty() {
+        return Err("path must not be empty".to_string());
+    }
+    let raw_path = Path::new(raw);
+    let Some(root) = root else {
+        return Ok(raw_path.to_path_buf());
     };
-    if let Some(root) = root {
-        let canon_root = root.canonicalize().unwrap_or_else(|_| root.clone());
-        let probe = if joined.exists() {
-            joined.canonicalize().unwrap_or_else(|_| joined.clone())
-        } else {
-            let parent = joined
-                .parent()
-                .map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()))
-                .unwrap_or_default();
-            parent.join(joined.file_name().unwrap_or_default())
-        };
-        if !probe.starts_with(&canon_root) {
-            return Err(format!("path escapes the workspace: {raw}"));
+    let joined = if raw_path.is_absolute() {
+        raw_path.to_path_buf()
+    } else {
+        root.join(raw_path)
+    };
+    let candidate = normalize_path(&joined);
+    // A relative path may only walk within the root. An absolute one may name
+    // the root through another spelling (a symlinked /var on macOS), which the
+    // real-path check below resolves without a lexical exemption.
+    if !raw_path.is_absolute() && !candidate.starts_with(root) {
+        return Err(escape(raw));
+    }
+    let real = real_path(&candidate);
+    if !real.starts_with(root) {
+        return Err(escape(raw));
+    }
+    Ok(real)
+}
+
+/// The refusal every escaping path shares.
+fn escape(raw: &str) -> String {
+    format!("path escapes the workspace: {raw}")
+}
+
+/// Collapse `.` and `..` without touching the filesystem.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::RootDir => out = PathBuf::from(std::path::MAIN_SEPARATOR.to_string()),
+            Component::Prefix(prefix) => out = PathBuf::from(prefix.as_os_str()),
+            Component::Normal(part) => out.push(part),
         }
     }
-    Ok(joined)
+    out
+}
+
+/// The real path of `path`, resolving every component that exists.
+///
+/// The common case is one `canonicalize`. A path the call is about to create
+/// has no real path yet, so its deepest existing ancestor is canonicalized and
+/// the missing tail is re-appended. The tail is already normalized (no `.` or
+/// `..`) and by definition contains no symlink, so appending it lexically
+/// cannot escape the ancestor that was just checked.
+fn real_path(path: &Path) -> PathBuf {
+    if let Ok(real) = path.canonicalize() {
+        return real;
+    }
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = path;
+    while let Some(parent) = cursor.parent() {
+        if let Some(name) = cursor.file_name() {
+            missing.push(name.to_os_string());
+        }
+        if let Ok(real) = parent.canonicalize() {
+            let mut out = real;
+            for part in missing.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        cursor = parent;
+    }
+    path.to_path_buf()
 }
 
 /// Compile a policy for a resolution that already exists.
@@ -2188,6 +2272,645 @@ fn arg_str(args: &serde_json::Value, key: &str) -> Result<String, ToolError> {
         .ok_or_else(|| ToolError::InvalidInput(format!("{key} is required")))
 }
 
+/// A positive integer argument, or none when it is absent.
+fn arg_positive(args: &serde_json::Value, key: &str) -> Result<Option<usize>, ToolError> {
+    let Some(value) = args.get(key).filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let Some(number) = value.as_u64() else {
+        return Err(ToolError::InvalidInput(format!(
+            "{key} must be a positive integer"
+        )));
+    };
+    let number = usize::try_from(number)
+        .map_err(|_| ToolError::InvalidInput(format!("{key} is too large")))?;
+    if number == 0 {
+        return Err(ToolError::InvalidInput(format!("{key} must be at least 1")));
+    }
+    Ok(Some(number))
+}
+
+/// The largest file one `read_file` call returns, in bytes.
+///
+/// A tool result travels through the request and into the transcript, so an
+/// unbounded read is not a slow call, it is a broken turn. A larger file is
+/// refused with the way to read a window instead of being loaded whole.
+const MAX_READ_BYTES: usize = 8 * 1024 * 1024;
+
+/// The largest file `edit_file` rewrites, in bytes.
+///
+/// An edit needs the whole file in memory to prove the match is unique; past
+/// this ceiling the call is refused rather than stalling the turn.
+const MAX_EDIT_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The most bytes one windowed read returns.
+const MAX_WINDOW_BYTES: usize = 8 * 1024 * 1024;
+
+/// The entries one `list_dir` call collects before it stops reading.
+const MAX_LIST_ENTRIES: usize = 10_000;
+
+/// The entries one `list_dir` result returns.
+const MAX_LIST_ROWS: usize = 2_000;
+
+/// One read, as `read_file` reports it.
+struct ReadOutcome {
+    content: String,
+    truncated: bool,
+}
+
+/// One directory listing, as `list_dir` reports it.
+struct Listing {
+    entries: Vec<serde_json::Value>,
+    truncated: bool,
+}
+
+/// One write, as `write_file` reports it.
+struct WriteOutcome {
+    bytes: usize,
+    unchanged: bool,
+}
+
+/// Why one edit could not be applied.
+enum ReplaceError {
+    NotFound,
+    Ambiguous(usize),
+}
+
+/// One edit's result: the new text, or none when the call changed nothing.
+struct EditOutcome {
+    updated: Option<String>,
+    replacements: usize,
+}
+
+/// The tool error one failed filesystem call shares.
+fn failed(target: &Path, error: &std::io::Error) -> ToolError {
+    ToolError::Failed(format!("{}: {error}", target.display()))
+}
+
+/// Open a path that must be a regular file, and its metadata.
+///
+/// The metadata check happens BEFORE the open: opening a FIFO or a device
+/// blocks or has side effects, so a path the model named can never hang the
+/// turn. A refusal that says what the path is beats a call that never returns.
+fn open_regular(target: &Path) -> Result<(fs::File, fs::Metadata), ToolError> {
+    let meta = fs::metadata(target).map_err(|error| failed(target, &error))?;
+    if meta.is_dir() {
+        return Err(ToolError::InvalidInput(format!(
+            "{} is a directory; use list_dir",
+            target.display()
+        )));
+    }
+    if !meta.is_file() {
+        return Err(ToolError::InvalidInput(format!(
+            "{} is not a regular file",
+            target.display()
+        )));
+    }
+    let file = fs::File::open(target).map_err(|error| failed(target, &error))?;
+    Ok((file, meta))
+}
+
+/// Refuse a file past the read ceiling, naming the way to read it anyway.
+fn read_ceiling(target: &Path, size: u64) -> ToolError {
+    ToolError::Failed(format!(
+        "{} is {size} bytes, past the {MAX_READ_BYTES} byte read ceiling; pass offset (1-based line) and limit to read a window",
+        target.display()
+    ))
+}
+
+/// Decode bytes as the file's text, refusing binary content up front.
+///
+/// The classification scans the head first, because a PNG or an object file is
+/// also invalid UTF-8 and "binary file" is the answer a caller can act on. The
+/// tail check uses a char search, which is a memchr: a byte-at-a-time scan of a
+/// multi-megabyte file cost 10ms a read for nothing.
+fn utf8_text(target: &Path, bytes: Vec<u8>) -> Result<String, ToolError> {
+    let head = &bytes[..bytes.len().min(8 * 1024)];
+    if let Some(at) = head.iter().position(|byte| *byte == 0) {
+        return Err(binary(target, at));
+    }
+    let content = String::from_utf8(bytes).map_err(|error| {
+        ToolError::Failed(format!(
+            "{} is not valid UTF-8 (the first invalid byte is at offset {})",
+            target.display(),
+            error.utf8_error().valid_up_to()
+        ))
+    })?;
+    if let Some(at) = content.find('\0') {
+        return Err(binary(target, at));
+    }
+    Ok(content)
+}
+
+/// The refusal binary content shares.
+fn binary(target: &Path, at: usize) -> ToolError {
+    ToolError::Failed(format!(
+        "{} is a binary file (NUL byte at offset {at}); there is no text to read",
+        target.display()
+    ))
+}
+
+/// Read the whole file, bounded by the read ceiling.
+fn read_whole(target: &Path) -> Result<ReadOutcome, ToolError> {
+    let (file, meta) = open_regular(target)?;
+    if meta.len() > MAX_READ_BYTES as u64 {
+        return Err(read_ceiling(target, meta.len()));
+    }
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    file.take(MAX_READ_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| failed(target, &error))?;
+    if bytes.len() > MAX_READ_BYTES {
+        return Err(read_ceiling(target, bytes.len() as u64));
+    }
+    let content = utf8_text(target, bytes)?;
+    Ok(ReadOutcome {
+        content,
+        truncated: false,
+    })
+}
+
+/// Read one line window without loading the rest of the file.
+fn read_window(target: &Path, offset: usize, limit: usize) -> Result<ReadOutcome, ToolError> {
+    let (file, _) = open_regular(target)?;
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
+    let mut line: Vec<u8> = Vec::new();
+    let mut out: Vec<u8> = Vec::new();
+    let mut index = 1_usize;
+    let mut kept = 0_usize;
+    let mut truncated = false;
+    loop {
+        line.clear();
+        let read = reader
+            .read_until(b'\n', &mut line)
+            .map_err(|error| failed(target, &error))?;
+        if read == 0 {
+            break;
+        }
+        if index >= offset {
+            if kept == limit || out.len() + line.len() > MAX_WINDOW_BYTES {
+                truncated = true;
+                break;
+            }
+            out.extend_from_slice(&line);
+            kept += 1;
+        }
+        index += 1;
+    }
+    let content = utf8_text(target, out)?;
+    Ok(ReadOutcome { content, truncated })
+}
+
+/// Read a file for an edit, bounded by the edit ceiling.
+fn read_editable(target: &Path) -> Result<String, ToolError> {
+    let (file, meta) = open_regular(target)?;
+    if meta.len() > MAX_EDIT_BYTES {
+        return Err(ToolError::Failed(format!(
+            "{} is {} bytes, too large to edit (the ceiling is {MAX_EDIT_BYTES} bytes)",
+            target.display(),
+            meta.len()
+        )));
+    }
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    file.take(MAX_EDIT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| failed(target, &error))?;
+    if bytes.len() as u64 > MAX_EDIT_BYTES {
+        return Err(ToolError::Failed(format!(
+            "{} grew past the {MAX_EDIT_BYTES} byte edit ceiling while it was read",
+            target.display()
+        )));
+    }
+    utf8_text(target, bytes)
+}
+
+/// The one temp path a write uses beside its target.
+fn temp_beside(target: &Path) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let stamp = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    target.with_file_name(format!(".{name}.bsh-{}-{stamp}.tmp", std::process::id()))
+}
+
+/// Write bytes atomically, skipping a byte-identical rewrite.
+///
+/// A temp file beside the target plus a rename means a failed write leaves the
+/// old file exactly as it was instead of truncating it and dying halfway. The
+/// identical check keeps an unchanged write from moving the mtime, so a build
+/// watcher or a formatter is not woken by a call that changed nothing.
+fn write_bytes(target: &Path, bytes: &[u8]) -> Result<WriteOutcome, ToolError> {
+    let existing = match fs::metadata(target) {
+        Ok(meta) => {
+            if meta.is_dir() {
+                return Err(ToolError::InvalidInput(format!(
+                    "{} is a directory",
+                    target.display()
+                )));
+            }
+            if meta.is_file() && meta.len() == bytes.len() as u64 {
+                if let Ok(old) = fs::read(target) {
+                    if old == bytes {
+                        return Ok(WriteOutcome {
+                            bytes: bytes.len(),
+                            unchanged: true,
+                        });
+                    }
+                }
+            }
+            Some(meta)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(failed(target, &error)),
+    };
+    if let Some(parent) = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty() && !parent.is_dir())
+    {
+        fs::create_dir_all(parent).map_err(|error| failed(parent, &error))?;
+    }
+    #[cfg(unix)]
+    let mode = existing.as_ref().map(|meta| {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode()
+    });
+    #[cfg(not(unix))]
+    let _ = &existing;
+    let temp = temp_beside(target);
+    let write = (|| -> std::io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(bytes)?;
+        file.flush()
+    })();
+    if let Err(error) = write {
+        let _ = fs::remove_file(&temp);
+        return Err(failed(target, &error));
+    }
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&temp, fs::Permissions::from_mode(mode));
+    }
+    if let Err(error) = fs::rename(&temp, target) {
+        let _ = fs::remove_file(&temp);
+        return Err(failed(target, &error));
+    }
+    Ok(WriteOutcome {
+        bytes: bytes.len(),
+        unchanged: false,
+    })
+}
+
+/// Replace `old` in `text`, in one pass, refusing an ambiguous single replace.
+///
+/// The search is memchr's vectorised substring finder, not the standard
+/// library's `str::matches`: the latter costs about 1us a match, so a
+/// replace_all over a file with tens of thousands of matches spent more time
+/// searching than reading and writing the whole file put together.
+fn replace_text(text: &str, old: &str, new: &str, all: bool) -> Result<EditOutcome, ReplaceError> {
+    if all {
+        let mut matches = memchr::memmem::find_iter(text.as_bytes(), old.as_bytes()).peekable();
+        if matches.peek().is_none() {
+            return Err(ReplaceError::NotFound);
+        }
+        let mut updated = String::with_capacity(text.len());
+        let mut last = 0_usize;
+        let mut replacements = 0_usize;
+        for index in matches {
+            updated.push_str(&text[last..index]);
+            updated.push_str(new);
+            last = index + old.len();
+            replacements += 1;
+        }
+        updated.push_str(&text[last..]);
+        return Ok(EditOutcome {
+            updated: Some(updated),
+            replacements,
+        });
+    }
+    let Some(first) = memchr::memmem::find(text.as_bytes(), old.as_bytes()) else {
+        return Err(ReplaceError::NotFound);
+    };
+    // A second occurrence turns the edit into a question, so it is refused
+    // before anything is rewritten. Counting for the message only happens on
+    // this failure path; the success path never scans the file twice.
+    if memchr::memmem::find(&text.as_bytes()[first + old.len()..], old.as_bytes()).is_some() {
+        let count = memchr::memmem::find_iter(text.as_bytes(), old.as_bytes()).count();
+        return Err(ReplaceError::Ambiguous(count));
+    }
+    let mut updated = String::with_capacity(text.len() + new.len());
+    updated.push_str(&text[..first]);
+    updated.push_str(new);
+    updated.push_str(&text[first + old.len()..]);
+    Ok(EditOutcome {
+        updated: Some(updated),
+        replacements: 1,
+    })
+}
+
+/// A sentence that points at where a missing `old_string` almost matched.
+fn not_found_message(target: &Path, content: &str, old: &str) -> String {
+    let mut message = format!("old_string not found in {}", target.display());
+    if content.contains("\r\n") && !old.contains('\r') {
+        message.push_str("; the file uses CRLF line endings, so old_string must carry them");
+    }
+    if let Some(line) = first_line_match(content, old) {
+        message.push_str(&format!(
+            "; its first line matches line {line}, so check the rest of the block exactly"
+        ));
+    }
+    message
+}
+
+/// The 1-based line whose text contains `old`'s first non-empty line.
+fn first_line_match(content: &str, old: &str) -> Option<usize> {
+    let needle = old.lines().find(|line| !line.trim().is_empty())?.trim();
+    if needle.is_empty() {
+        return None;
+    }
+    content
+        .lines()
+        .position(|line| line.contains(needle))
+        .map(|index| index + 1)
+}
+
+/// One directory's entries, names and kinds, in a stable order.
+fn list_entries(dir: &Path) -> Result<Listing, ToolError> {
+    let reader = fs::read_dir(dir).map_err(|error| failed(dir, &error))?;
+    let mut rows: Vec<(String, &'static str)> = Vec::new();
+    let mut truncated = false;
+    for entry in reader {
+        let Ok(entry) = entry else { continue };
+        if rows.len() >= MAX_LIST_ENTRIES {
+            truncated = true;
+            break;
+        }
+        // The d_type from readdir answers the common case with no stat at all;
+        // only a symlink pays for one, to answer the question the agent is
+        // really asking (does this entry behave like a directory?).
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let kind = if file_type.is_dir() {
+            "dir"
+        } else if file_type.is_symlink() {
+            // `DirEntry::metadata` is an lstat and reports the LINK, so the
+            // follow has to go through the path.
+            match fs::metadata(entry.path()) {
+                Ok(meta) if meta.is_dir() => "dir",
+                _ => "file",
+            }
+        } else {
+            "file"
+        };
+        rows.push((entry.file_name().to_string_lossy().into_owned(), kind));
+    }
+    // Plain byte ordering: a name sort is the cheap, total order the agent
+    // needs, and a case-folding comparison measured 15ms slower on 5k entries.
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    if rows.len() > MAX_LIST_ROWS {
+        rows.truncate(MAX_LIST_ROWS);
+        truncated = true;
+    }
+    let entries = rows
+        .into_iter()
+        .map(|(name, kind)| serde_json::json!({ "name": name, "kind": kind }))
+        .collect();
+    Ok(Listing { entries, truncated })
+}
+
+/// One mutex per path, so two tool calls that read-modify-write one file cannot
+/// both read the original and lose one update.
+fn file_lock(path: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.entry(path.to_path_buf()).or_default().clone()
+}
+
+/// The sentence an empty glob result carries.
+///
+/// A model that reads a path miss as "this text is absent from the workspace"
+/// then stops looking, so the hint names the two facts that mistake needs:
+/// glob matches paths rather than contents, and ignored files were skipped.
+fn glob_empty_hint(pattern: &str, root: &Path, include_ignored: bool) -> String {
+    let literal = !pattern.contains('*')
+        && !pattern.contains('?')
+        && !pattern.contains('[')
+        && !pattern.contains('{');
+    let mut hint = if literal {
+        format!(
+            "no file is named exactly {pattern:?} under {}; glob matches file paths, not file contents. Try \"*{pattern}*\" for part of a name, or search contents with bash (rg -n) or read_file.",
+            root.display()
+        )
+    } else {
+        format!(
+            "no file path matches {pattern:?} under {}; glob matches file paths, not file contents. Search contents with bash (rg -n) or read_file.",
+            root.display()
+        )
+    };
+    if !include_ignored {
+        hint.push_str(
+            " Ignored and hidden files were skipped; include_ignored=true searches them too.",
+        );
+    }
+    hint
+}
+
+/// glob - list the files under a root whose paths match a pattern.
+fn glob_tool(
+    root: Option<PathBuf>,
+    policy: Arc<PolicySet>,
+    session: String,
+    preset: String,
+) -> FunctionTool {
+    FunctionTool::new(
+        "glob",
+        "Find files whose paths match a glob pattern. It matches paths, not file contents. Ignored and hidden files, and dependency or build trees, are skipped unless include_ignored is set. A pattern with no separator matches the file name at any depth; a separator anchors it. Up to limit paths are returned, sorted.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": { "type": "string" },
+                "path": { "type": "string" },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 1000 },
+                "include_ignored": { "type": "boolean" }
+            },
+            "required": ["pattern"]
+        }),
+        move |args| {
+            let pattern = arg_str(args, "pattern")?;
+            let raw = args
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(".")
+                .to_string();
+            let limit = arg_positive(args, "limit")?.unwrap_or(crate::glob::DEFAULT_RESULTS);
+            if limit > crate::glob::MAX_RESULTS {
+                return Err(ToolError::InvalidInput(format!(
+                    "limit must be at most {}",
+                    crate::glob::MAX_RESULTS
+                )));
+            }
+            let include_ignored = args
+                .get("include_ignored")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let search_root =
+                resolve_path(root.as_deref(), &raw).map_err(ToolError::InvalidInput)?;
+            check_path(
+                &policy,
+                &session,
+                &preset,
+                "glob",
+                Action::Read,
+                &search_root,
+            )?;
+            // An anchored pattern is relative to the workspace root when one is
+            // installed, so a narrower path narrows the walk without silently
+            // changing what "src/*.rs" means.
+            let base = root
+                .as_deref()
+                .filter(|workspace| search_root.starts_with(workspace))
+                .unwrap_or(&search_root);
+            let found = crate::glob::search(
+                &search_root,
+                base,
+                &crate::glob::Query {
+                    pattern: &pattern,
+                    include_ignored,
+                    limit,
+                },
+            )
+            .map_err(ToolError::InvalidInput)?;
+            let matches: Vec<String> = found
+                .paths
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect();
+            let empty = matches.is_empty();
+            let mut result = serde_json::json!({
+                "path": search_root.display().to_string(),
+                "pattern": pattern,
+                "matches": matches,
+                "truncated": found.truncated,
+            });
+            if empty {
+                result["hint"] = serde_json::json!(glob_empty_hint(
+                    &pattern,
+                    &search_root,
+                    include_ignored
+                ));
+            }
+            Ok(result)
+        },
+    )
+}
+
+/// grep - search file contents with a ripgrep regular expression.
+fn grep_tool(
+    root: Option<PathBuf>,
+    policy: Arc<PolicySet>,
+    session: String,
+    preset: String,
+) -> FunctionTool {
+    FunctionTool::new(
+        "grep",
+        "Search file contents with a ripgrep regular expression. Returns each matching line with its file and 1-based line number. Ignored and hidden files, and dependency or build trees, are skipped unless include_ignored is set. Matching is case-sensitive unless case_insensitive is set.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": { "type": "string" },
+                "path": { "type": "string" },
+                "case_insensitive": { "type": "boolean" },
+                "include_ignored": { "type": "boolean" },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 500 }
+            },
+            "required": ["pattern"]
+        }),
+        move |args| {
+            let pattern = arg_str(args, "pattern")?;
+            let raw = args
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(".")
+                .to_string();
+            let case_insensitive = args
+                .get("case_insensitive")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let include_ignored = args
+                .get("include_ignored")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let limit = arg_positive(args, "limit")?.unwrap_or(crate::grep::DEFAULT_RESULTS);
+            if limit > crate::grep::MAX_RESULTS {
+                return Err(ToolError::InvalidInput(format!(
+                    "limit must be at most {}",
+                    crate::grep::MAX_RESULTS
+                )));
+            }
+            let search_root =
+                resolve_path(root.as_deref(), &raw).map_err(ToolError::InvalidInput)?;
+            check_path(
+                &policy,
+                &session,
+                &preset,
+                "grep",
+                Action::Read,
+                &search_root,
+            )?;
+            let base = root
+                .as_deref()
+                .filter(|workspace| search_root.starts_with(workspace))
+                .unwrap_or(&search_root);
+            let found = crate::grep::search(
+                &search_root,
+                base,
+                &crate::grep::Query {
+                    pattern: &pattern,
+                    include_ignored,
+                    case_insensitive,
+                    limit,
+                },
+            )
+            .map_err(ToolError::InvalidInput)?;
+            let matches: Vec<serde_json::Value> = found
+                .hits
+                .iter()
+                .map(|hit| {
+                    serde_json::json!({
+                        "path": hit.path.to_string_lossy(),
+                        "line": hit.line,
+                        "text": hit.text,
+                    })
+                })
+                .collect();
+            let empty = matches.is_empty();
+            let mut result = serde_json::json!({
+                "path": search_root.display().to_string(),
+                "pattern": pattern,
+                "matches": matches,
+                "truncated": found.truncated,
+            });
+            if empty {
+                result["hint"] = serde_json::json!(crate::grep::hint(
+                    &pattern,
+                    &search_root,
+                    include_ignored
+                ));
+            }
+            Ok(result)
+        },
+    )
+}
+
 /// read_file - read a UTF-8 file inside the workspace.
 fn read_file_tool(
     root: Option<PathBuf>,
@@ -2197,15 +2920,21 @@ fn read_file_tool(
 ) -> FunctionTool {
     FunctionTool::new(
         "read_file",
-        "Read a UTF-8 text file. Paths may be absolute or relative to the workspace.",
+        "Read a UTF-8 text file. Paths may be absolute or relative to the workspace. A file past the read ceiling is refused; pass offset (1-based line) and limit to read a window of a large file instead.",
         serde_json::json!({
             "type": "object",
-            "properties": { "path": { "type": "string" } },
+            "properties": {
+                "path": { "type": "string" },
+                "offset": { "type": "integer", "minimum": 1 },
+                "limit": { "type": "integer", "minimum": 1 }
+            },
             "required": ["path"]
         }),
         move |args| {
             let raw = arg_str(args, "path")?;
-            let target = resolve_path(&root, &raw).map_err(ToolError::InvalidInput)?;
+            let offset = arg_positive(args, "offset")?;
+            let limit = arg_positive(args, "limit")?;
+            let target = resolve_path(root.as_deref(), &raw).map_err(ToolError::InvalidInput)?;
             check_path(
                 &policy,
                 &session,
@@ -2214,9 +2943,20 @@ fn read_file_tool(
                 Action::Read,
                 &target,
             )?;
-            let content = std::fs::read_to_string(&target)
-                .map_err(|e| ToolError::Failed(format!("{}: {e}", target.display())))?;
-            Ok(serde_json::json!({ "path": target.display().to_string(), "content": content }))
+            let read = match (offset, limit) {
+                (None, None) => read_whole(&target)?,
+                (offset, limit) => {
+                    read_window(&target, offset.unwrap_or(1), limit.unwrap_or(usize::MAX))?
+                }
+            };
+            let ReadOutcome { content, truncated } = read;
+            let bytes = content.len();
+            Ok(serde_json::json!({
+                "path": target.display().to_string(),
+                "content": content,
+                "bytes": bytes,
+                "truncated": truncated,
+            }))
         },
     )
 }
@@ -2230,7 +2970,7 @@ fn write_file_tool(
 ) -> FunctionTool {
     FunctionTool::new(
         "write_file",
-        "Write a UTF-8 text file, creating parent directories as needed.",
+        "Write a UTF-8 text file, creating parent directories as needed. The write is atomic, and a byte-identical write is a no-op, so it cannot wake a build watcher for nothing.",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -2242,7 +2982,7 @@ fn write_file_tool(
         move |args| {
             let raw = arg_str(args, "path")?;
             let content = arg_str(args, "content")?;
-            let target = resolve_path(&root, &raw).map_err(ToolError::InvalidInput)?;
+            let target = resolve_path(root.as_deref(), &raw).map_err(ToolError::InvalidInput)?;
             // The check is BEFORE the parent directory is created: a denied
             // write must not leave the parent's mtime moved as a side effect.
             check_path(
@@ -2253,15 +2993,16 @@ fn write_file_tool(
                 Action::Write,
                 &target,
             )?;
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| ToolError::Failed(format!("{}: {e}", parent.display())))?;
-            }
-            std::fs::write(&target, &content)
-                .map_err(|e| ToolError::Failed(format!("{}: {e}", target.display())))?;
+            // The same path's edit and write calls are serialized, so a pair of
+            // parallel calls cannot interleave a read-modify-write with a
+            // rename and lose one of the two results.
+            let lock = file_lock(&target);
+            let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let outcome = write_bytes(&target, content.as_bytes())?;
             Ok(serde_json::json!({
                 "path": target.display().to_string(),
-                "bytes": content.len(),
+                "bytes": outcome.bytes,
+                "unchanged": outcome.unchanged,
             }))
         },
     )
@@ -2302,11 +3043,16 @@ fn edit_file_tool(
                     "old_string must not be empty".to_string(),
                 ));
             }
+            if old == new {
+                return Err(ToolError::InvalidInput(
+                    "old_string and new_string are identical; there is nothing to replace".to_string(),
+                ));
+            }
             let replace_all = args
                 .get("replace_all")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
-            let target = resolve_path(&root, &raw).map_err(ToolError::InvalidInput)?;
+            let target = resolve_path(root.as_deref(), &raw).map_err(ToolError::InvalidInput)?;
             // Before the read: a denied edit is refused before its content is
             // even observed.
             check_path(
@@ -2317,31 +3063,31 @@ fn edit_file_tool(
                 Action::Write,
                 &target,
             )?;
-            let content = std::fs::read_to_string(&target)
-                .map_err(|e| ToolError::Failed(format!("{}: {e}", target.display())))?;
-            let occurrences = content.matches(&old).count();
-            if occurrences == 0 {
-                return Err(ToolError::Failed(format!(
-                    "old_string not found in {}",
-                    target.display()
-                )));
+            // Held across the read, the splice and the rewrite: an edit is a
+            // read-modify-write, and two of them on one file must not both
+            // start from the original bytes.
+            let lock = file_lock(&target);
+            let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let content = read_editable(&target)?;
+            let outcome = replace_text(&content, &old, &new, replace_all).map_err(|error| {
+                match error {
+                    ReplaceError::NotFound => {
+                        ToolError::Failed(not_found_message(&target, &content, &old))
+                    }
+                    ReplaceError::Ambiguous(count) => ToolError::InvalidInput(format!(
+                        "old_string occurs {count} times in {}; pass replace_all=true to replace every occurrence",
+                        target.display()
+                    )),
+                }
+            })?;
+            let unchanged = outcome.updated.is_none();
+            if let Some(updated) = &outcome.updated {
+                write_bytes(&target, updated.as_bytes())?;
             }
-            if occurrences > 1 && !replace_all {
-                return Err(ToolError::InvalidInput(format!(
-                    "old_string occurs {occurrences} times in {}; pass replace_all=true to replace every occurrence",
-                    target.display()
-                )));
-            }
-            let updated = if replace_all {
-                content.replace(&old, &new)
-            } else {
-                content.replacen(&old, &new, 1)
-            };
-            std::fs::write(&target, &updated)
-                .map_err(|e| ToolError::Failed(format!("{}: {e}", target.display())))?;
             Ok(serde_json::json!({
                 "path": target.display().to_string(),
-                "replacements": if replace_all { occurrences } else { 1 },
+                "replacements": outcome.replacements,
+                "unchanged": unchanged,
             }))
         },
     )
@@ -2356,7 +3102,7 @@ fn list_dir_tool(
 ) -> FunctionTool {
     FunctionTool::new(
         "list_dir",
-        "List a directory's entries (name and kind).",
+        "List a directory's entries (name and kind), sorted by name. Up to 2000 entries are returned; truncated reports a larger directory.",
         serde_json::json!({
             "type": "object",
             "properties": { "path": { "type": "string" } },
@@ -2364,7 +3110,7 @@ fn list_dir_tool(
         }),
         move |args| {
             let raw = arg_str(args, "path")?;
-            let target = resolve_path(&root, &raw).map_err(ToolError::InvalidInput)?;
+            let target = resolve_path(root.as_deref(), &raw).map_err(ToolError::InvalidInput)?;
             check_path(
                 &policy,
                 &session,
@@ -2373,17 +3119,12 @@ fn list_dir_tool(
                 Action::Read,
                 &target,
             )?;
-            let mut entries = Vec::new();
-            let reader = std::fs::read_dir(&target)
-                .map_err(|e| ToolError::Failed(format!("{}: {e}", target.display())))?;
-            for entry in reader.flatten() {
-                let kind = if entry.path().is_dir() { "dir" } else { "file" };
-                entries.push(serde_json::json!({
-                    "name": entry.file_name().to_string_lossy(),
-                    "kind": kind,
-                }));
-            }
-            Ok(serde_json::json!({ "path": target.display().to_string(), "entries": entries }))
+            let listing = list_entries(&target)?;
+            Ok(serde_json::json!({
+                "path": target.display().to_string(),
+                "entries": listing.entries,
+                "truncated": listing.truncated,
+            }))
         },
     )
 }
@@ -3348,11 +4089,11 @@ mod tests {
         // caught by the guard; complete changes what is sent, not what may be
         // said.
         settings.workspace.agent.complete = true;
-        settings.workspace.agent.system_prompt = "Use the grep tool.".to_string();
+        settings.workspace.agent.system_prompt = "Use the read tool.".to_string();
         let built = build(&settings);
         assert_eq!(
             crate::prompts::stale_tool_reference(&built.agent.config().system_prompt),
-            Some("the grep tool")
+            Some("the read tool")
         );
 
         // An EMPTY persona under complete falls back to the framework default
@@ -4101,6 +4842,8 @@ mod tests {
             names("files"),
             vec![
                 "edit_file".to_string(),
+                "glob".to_string(),
+                "grep".to_string(),
                 "list_dir".to_string(),
                 "write_file".to_string(),
             ]
@@ -4297,6 +5040,8 @@ mod tests {
             vec![
                 "bash".to_string(),
                 "edit_file".to_string(),
+                "glob".to_string(),
+                "grep".to_string(),
                 "job_kill".to_string(),
                 "job_output".to_string(),
                 "list_dir".to_string(),
@@ -4310,6 +5055,8 @@ mod tests {
         assert_eq!(
             names(&read_only),
             vec![
+                "glob".to_string(),
+                "grep".to_string(),
                 "list_dir".to_string(),
                 "read_file".to_string(),
                 "update_plan".to_string(),
@@ -5314,6 +6061,604 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         );
     }
 
+    /// The confined build for a test that needs the file tools' root installed.
+    fn confined(root: &std::path::Path) -> Settings {
+        let mut settings = rooted(root);
+        settings.workspace.agent.permission = WORKSPACE_WRITE.to_string();
+        settings
+    }
+
+    /// A write whose leaf does not exist yet under a symlinked directory is
+    /// refused, and nothing is created on the other side.
+    ///
+    /// The bug this pins: canonicalizing only the IMMEDIATE parent checks
+    /// nothing when that parent is missing too, so the fallback kept the
+    /// lexical path, `create_dir_all` followed the link, and the write landed
+    /// outside the workspace.
+    #[test]
+    #[cfg(unix)]
+    fn a_write_through_a_symlinked_directory_cannot_escape() {
+        let root = scratch("policy-symlink-bridge");
+        let outside = scratch("policy-symlink-bridge-outside");
+        std::os::unix::fs::symlink(&outside, root.join("bridge")).expect("symlink");
+        let target = root.join("bridge").join("deeper").join("escaped.txt");
+        let error = build(&confined(&root))
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": target.to_string_lossy(),
+                    "content": "escaped",
+                }),
+            )
+            .expect_err("the symlinked directory is not a way out");
+        assert!(
+            error.to_string().contains("escapes the workspace"),
+            "{error}"
+        );
+        assert!(
+            !outside.join("deeper").exists(),
+            "the refused write created a directory outside the workspace"
+        );
+    }
+
+    /// A `..` that climbs out of the workspace is refused even when the
+    /// directory it names does not exist, which is the case a check that
+    /// canonicalizes only an existing parent cannot see.
+    #[test]
+    fn a_parent_escape_with_a_missing_tail_is_refused() {
+        let root = scratch("policy-missing-tail");
+        let target = root
+            .join("missing")
+            .join("..")
+            .join("..")
+            .join("escaped-missing-tail.txt");
+        let error = build(&confined(&root))
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": target.to_string_lossy(),
+                    "content": "escaped",
+                }),
+            )
+            .expect_err("a lexical escape is still an escape");
+        assert!(
+            error.to_string().contains("escapes the workspace"),
+            "{error}"
+        );
+        assert!(!root.join("..").join("escaped-missing-tail.txt").exists());
+    }
+
+    /// A symlink inside the workspace may not become a read of a file outside
+    /// it, and a symlink that stays inside resolves to the file it points at.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlink_cannot_read_out_and_resolves_in() {
+        let root = scratch("policy-symlink-read");
+        let outside = scratch("policy-symlink-read-outside");
+        std::fs::write(root.join("real.txt"), "inside-content").expect("real");
+        std::os::unix::fs::symlink(root.join("real.txt"), root.join("alias.txt")).expect("alias");
+        let secret = outside.join("secret.txt");
+        std::fs::write(&secret, "outside-secret").expect("secret");
+        std::os::unix::fs::symlink(&secret, root.join("notes.txt")).expect("notes link");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        let inside = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({ "path": root.join("alias.txt").to_string_lossy() }),
+            )
+            .expect("an in-workspace link is readable");
+        assert_eq!(inside["content"], "inside-content");
+        assert!(
+            inside["path"]
+                .as_str()
+                .unwrap_or_default()
+                .ends_with("real.txt"),
+            "a link resolves to its target: {inside}"
+        );
+
+        let error = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({ "path": root.join("notes.txt").to_string_lossy() }),
+            )
+            .expect_err("a link out of the workspace is refused");
+        let message = error.to_string();
+        assert!(message.contains("escapes the workspace"), "{message}");
+        assert!(!message.contains("outside-secret"), "the file was read");
+    }
+
+    /// A file past the ceiling is refused with the arguments that read a
+    /// window; a window returns exactly its lines and says more remain.
+    #[test]
+    fn a_large_read_is_refused_and_a_window_is_exact() {
+        let root = scratch("read-window");
+        let huge = root.join("huge.txt");
+        // Sparse, so the test does not write 9MiB: the ceiling is decided from
+        // the metadata before a byte is read.
+        let file = std::fs::File::create(&huge).expect("huge");
+        file.set_len(9 * 1024 * 1024).expect("len");
+        let lines = root.join("lines.txt");
+        let body: String = (1..=100).map(|number| format!("line {number}\n")).collect();
+        std::fs::write(&lines, &body).expect("lines");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        let error = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({ "path": huge.to_string_lossy() }),
+            )
+            .expect_err("a 9MiB file is past the ceiling");
+        let message = error.to_string();
+        assert!(message.contains("read ceiling"), "{message}");
+        assert!(message.contains("offset"), "{message}");
+
+        let whole = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({ "path": lines.to_string_lossy() }),
+            )
+            .expect("a small file reads whole");
+        assert_eq!(whole["content"], body);
+        assert_eq!(whole["truncated"], false);
+
+        let window = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({
+                    "path": lines.to_string_lossy(),
+                    "offset": 10,
+                    "limit": 3,
+                }),
+            )
+            .expect("a window reads");
+        assert_eq!(window["content"], "line 10\nline 11\nline 12\n");
+        assert_eq!(window["truncated"], true);
+
+        let past = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({
+                    "path": lines.to_string_lossy(),
+                    "offset": 500,
+                }),
+            )
+            .expect("an offset past the end is empty, not an error");
+        assert_eq!(past["content"], "");
+        assert_eq!(past["truncated"], false);
+    }
+
+    /// A binary file and a directory are refused by name instead of being
+    /// pasted into the transcript as mojibake or an IO error.
+    #[test]
+    fn a_binary_read_and_a_directory_read_are_named() {
+        let root = scratch("read-binary");
+        std::fs::write(root.join("blob.bin"), [0x89_u8, b'P', b'N', b'G', 0, 1, 2]).expect("blob");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        let binary = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({ "path": root.join("blob.bin").to_string_lossy() }),
+            )
+            .expect_err("a binary file is refused");
+        let message = binary.to_string();
+        assert!(message.contains("binary file"), "{message}");
+        assert!(message.contains("NUL byte at offset 4"), "{message}");
+
+        let directory = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({ "path": root.to_string_lossy() }),
+            )
+            .expect_err("a directory is refused");
+        assert!(
+            directory.to_string().contains("is a directory"),
+            "{directory}"
+        );
+    }
+
+    /// A byte-identical write does not touch the file: its mtime stays put, so
+    /// a build watcher is not woken, and the result says the call was a no-op.
+    #[test]
+    fn an_identical_write_does_not_touch_the_file() {
+        let root = scratch("write-identical");
+        let file = root.join("same.txt");
+        std::fs::write(&file, "same").expect("seed");
+        let before = std::fs::metadata(&file)
+            .expect("metadata")
+            .modified()
+            .expect("mtime");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        let repeated = registry
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": file.to_string_lossy(),
+                    "content": "same",
+                }),
+            )
+            .expect("an identical write succeeds");
+        assert_eq!(repeated["unchanged"], true);
+        let after = std::fs::metadata(&file)
+            .expect("metadata")
+            .modified()
+            .expect("mtime");
+        assert_eq!(before, after, "the no-op write moved the mtime");
+
+        let changed = registry
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": file.to_string_lossy(),
+                    "content": "different",
+                }),
+            )
+            .expect("a real write succeeds");
+        assert_eq!(changed["unchanged"], false);
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), "different");
+    }
+
+    /// An overwrite keeps the file's mode, which a temp-and-rename write would
+    /// otherwise replace with the umask default.
+    #[test]
+    #[cfg(unix)]
+    fn an_overwrite_keeps_the_files_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("write-mode");
+        let file = root.join("script.sh");
+        std::fs::write(&file, "#!/bin/sh\n").expect("seed");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).expect("mode");
+        build(&confined(&root))
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": file.to_string_lossy(),
+                    "content": "#!/bin/sh\necho changed\n",
+                }),
+            )
+            .expect("overwrite");
+        let mode = std::fs::metadata(&file)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o640, "the write changed the file's mode");
+    }
+
+    /// An edit that misses names the line its first line matched, so the model
+    /// fixes the block instead of rereading the file blindly.
+    #[test]
+    fn a_missing_edit_names_the_line_that_almost_matched() {
+        let root = scratch("edit-hint");
+        let file = root.join("notes.txt");
+        std::fs::write(&file, "alpha\nbeta\ngamma\n").expect("notes");
+        let error = build(&confined(&root))
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "edit_file",
+                &serde_json::json!({
+                    "path": file.to_string_lossy(),
+                    "old_string": "alpha\nBETA",
+                    "new_string": "x",
+                }),
+            )
+            .expect_err("the block does not match");
+        let message = error.to_string();
+        assert!(message.contains("old_string not found"), "{message}");
+        assert!(message.contains("line 1"), "{message}");
+
+        let identical = build(&confined(&root))
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "edit_file",
+                &serde_json::json!({
+                    "path": file.to_string_lossy(),
+                    "old_string": "alpha",
+                    "new_string": "alpha",
+                }),
+            )
+            .expect_err("an identical edit is refused");
+        assert!(identical.to_string().contains("identical"), "{identical}");
+    }
+
+    /// Two edits to one path cannot both start from the original bytes: the
+    /// per-path lock makes the second wait, so neither change is lost.
+    #[test]
+    fn an_edit_waits_for_the_same_paths_lock() {
+        let root = scratch("edit-lock");
+        let file = root.join("shared.txt");
+        std::fs::write(&file, "alpha\nbeta\n").expect("seed");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+        let tool = registry.get("edit_file").expect("edit_file");
+        let target = file.canonicalize().expect("canonical target");
+
+        let held = super::file_lock(&target);
+        let guard = held.lock().expect("lock");
+        let worker = std::thread::spawn(move || {
+            tool.run(&serde_json::json!({
+                "path": target.to_string_lossy(),
+                "old_string": "alpha",
+                "new_string": "ALPHA",
+            }))
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !worker.is_finished(),
+            "the edit did not wait for the path's lock"
+        );
+        drop(guard);
+        worker.join().expect("thread").expect("edit runs");
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("read"),
+            "ALPHA\nbeta\n"
+        );
+    }
+
+    /// The listing is a stable, total order and names a directory-shaped
+    /// symlink by what it behaves like.
+    #[test]
+    #[cfg(unix)]
+    fn the_listing_is_sorted_and_names_kinds() {
+        let root = scratch("list-sorted");
+        std::fs::create_dir_all(root.join("b")).expect("b");
+        std::fs::create_dir_all(root.join("a")).expect("a");
+        std::fs::write(root.join("c.txt"), b"").expect("c");
+        std::fs::write(root.join(".hidden"), b"").expect("hidden");
+        std::os::unix::fs::symlink(root.join("a"), root.join("link")).expect("link");
+        let result = build(&confined(&root))
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "list_dir",
+                &serde_json::json!({ "path": root.to_string_lossy() }),
+            )
+            .expect("list");
+        let entries = result["entries"].as_array().expect("entries");
+        let rows: Vec<(&str, &str)> = entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry["name"].as_str().expect("name"),
+                    entry["kind"].as_str().expect("kind"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (".hidden", "file"),
+                ("a", "dir"),
+                ("b", "dir"),
+                ("c.txt", "file"),
+                ("link", "dir"),
+            ]
+        );
+        assert_eq!(result["truncated"], false);
+    }
+
+    /// The glob tool matches by path, reports workspace-relative paths, and
+    /// keeps the walk's ignore/hidden policy unless asked otherwise.
+    #[test]
+    fn a_glob_lists_matching_files_inside_the_workspace() {
+        let root = scratch("glob-tool");
+        std::fs::create_dir_all(root.join("src").join("deep")).expect("dirs");
+        std::fs::write(root.join("root.rs"), "").expect("root");
+        std::fs::write(root.join("src").join("one.rs"), "").expect("one");
+        std::fs::write(root.join("src").join("deep").join("two.rs"), "").expect("two");
+        std::fs::write(root.join("ignored.rs"), "").expect("ignored");
+        std::fs::write(root.join(".hidden.rs"), "").expect("hidden");
+        std::fs::write(root.join(".gitignore"), "ignored.rs\n").expect("gitignore");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+        let matches = |result: &serde_json::Value| -> Vec<String> {
+            result["matches"]
+                .as_array()
+                .expect("matches")
+                .iter()
+                .filter_map(|entry| entry.as_str().map(str::to_string))
+                .collect()
+        };
+
+        let all = registry
+            .execute("glob", &serde_json::json!({ "pattern": "*.rs" }))
+            .expect("glob runs");
+        assert_eq!(
+            matches(&all),
+            vec!["root.rs", "src/deep/two.rs", "src/one.rs"],
+            "a pattern without a separator matches the basename at any depth"
+        );
+        assert_eq!(all["truncated"], false);
+
+        let narrowed = registry
+            .execute(
+                "glob",
+                &serde_json::json!({ "pattern": "*.rs", "path": "src" }),
+            )
+            .expect("a narrowed walk runs");
+        assert_eq!(
+            matches(&narrowed),
+            vec!["src/deep/two.rs", "src/one.rs"],
+            "paths stay workspace-relative even when the walk starts in a subdirectory"
+        );
+
+        let anchored = registry
+            .execute("glob", &serde_json::json!({ "pattern": "src/*.rs" }))
+            .expect("an anchored pattern runs");
+        assert_eq!(
+            matches(&anchored),
+            vec!["src/one.rs"],
+            "a separator anchors the star to one level"
+        );
+
+        let ignored = registry
+            .execute(
+                "glob",
+                &serde_json::json!({ "pattern": "*.rs", "include_ignored": true }),
+            )
+            .expect("ignored entries are opt-in");
+        let ignored = matches(&ignored);
+        assert!(ignored.contains(&".hidden.rs".to_string()), "{ignored:?}");
+        assert!(ignored.contains(&"ignored.rs".to_string()), "{ignored:?}");
+
+        let limited = registry
+            .execute(
+                "glob",
+                &serde_json::json!({ "pattern": "*.rs", "limit": 1 }),
+            )
+            .expect("a limited glob runs");
+        assert_eq!(matches(&limited).len(), 1);
+        assert_eq!(limited["truncated"], true);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The search root is a read: a path outside the workspace is refused
+    /// before the walk starts, and no name from it leaks.
+    #[test]
+    fn a_glob_outside_the_workspace_is_refused() {
+        let root = scratch("glob-outside");
+        let outside = scratch("glob-outside-elsewhere");
+        std::fs::write(outside.join("secret.rs"), "secret").expect("secret");
+        let built = build(&full_access(&root));
+        let error = built
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "glob",
+                &serde_json::json!({
+                    "pattern": "*.rs",
+                    "path": outside.to_string_lossy(),
+                }),
+            )
+            .expect_err("a walk outside the workspace is a read outside it");
+        let message = error.to_string();
+        assert!(message.contains("read-outside-workspace"), "{message}");
+        assert!(!message.contains("secret.rs"), "the walk leaked a name");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// An empty glob explains itself: a path miss is not "this text is absent
+    /// from the workspace", and a model that reads it that way stops looking.
+    #[test]
+    fn an_empty_glob_points_at_paths_and_contents() {
+        let root = scratch("glob-empty-hint");
+        std::fs::write(root.join("notes.md"), "hello").expect("notes");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        let literal = registry
+            .execute("glob", &serde_json::json!({ "pattern": "hello" }))
+            .expect("glob runs");
+        assert!(literal["matches"].as_array().expect("matches").is_empty());
+        let hint = literal["hint"]
+            .as_str()
+            .expect("an empty result carries a hint");
+        assert!(hint.contains("not file contents"), "{hint}");
+        assert!(hint.contains("*hello*"), "{hint}");
+        assert!(hint.contains("include_ignored"), "{hint}");
+
+        let wildcard = registry
+            .execute("glob", &serde_json::json!({ "pattern": "*.nope" }))
+            .expect("glob runs");
+        let hint = wildcard["hint"].as_str().expect("hint");
+        assert!(hint.contains("no file path matches"), "{hint}");
+
+        let found = registry
+            .execute("glob", &serde_json::json!({ "pattern": "*.md" }))
+            .expect("glob runs");
+        assert!(
+            found.get("hint").is_none(),
+            "a non-empty result needs no lecture: {found}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Grep reports its hits as path, 1-based line and text, and an empty
+    /// result explains itself instead of reading as an absent workspace.
+    #[test]
+    fn a_grep_finds_a_line_and_explains_an_empty_result() {
+        let root = scratch("grep-tool");
+        std::fs::create_dir_all(root.join("src")).expect("src");
+        std::fs::write(
+            root.join("src").join("main.rs"),
+            "fn main() {\n    let bubble = 1;\n}\n",
+        )
+        .expect("main");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        let found = registry
+            .execute("grep", &serde_json::json!({ "pattern": "bubble" }))
+            .expect("grep runs");
+        assert_eq!(found["matches"][0]["path"], "src/main.rs");
+        assert_eq!(found["matches"][0]["line"], 2);
+        assert_eq!(found["matches"][0]["text"], "    let bubble = 1;");
+        assert!(found.get("hint").is_none(), "{found}");
+
+        let empty = registry
+            .execute("grep", &serde_json::json!({ "pattern": "zzz" }))
+            .expect("grep runs");
+        let hint = empty["hint"]
+            .as_str()
+            .expect("an empty result carries a hint");
+        assert!(hint.contains("case-sensitive"), "{hint}");
+        assert!(hint.contains("include_ignored"), "{hint}");
+
+        let invalid = registry
+            .execute("grep", &serde_json::json!({ "pattern": "(" }))
+            .expect_err("an unbalanced group is refused");
+        assert!(invalid.to_string().contains("invalid regex"), "{invalid}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The grep search root is the same Read the glob tool asks: outside the
+    /// workspace is refused before any file is opened.
+    #[test]
+    fn a_grep_outside_the_workspace_is_refused() {
+        let root = scratch("grep-outside");
+        let outside = scratch("grep-outside-elsewhere");
+        std::fs::write(outside.join("secret.txt"), "needle").expect("secret");
+        let error = build(&full_access(&root))
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "grep",
+                &serde_json::json!({
+                    "pattern": "needle",
+                    "path": outside.to_string_lossy(),
+                }),
+            )
+            .expect_err("a content search outside the workspace is a read outside it");
+        let message = error.to_string();
+        assert!(message.contains("read-outside-workspace"), "{message}");
+        assert!(!message.contains("needle"), "the search leaked a match");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
     /// A workspace policy file that does not parse reaches the tools as the
     /// documented failure asymmetry: writes are refused, an in-workspace read
     /// is still allowed, and the refusal names the failure.
@@ -5595,6 +6940,8 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         assert_eq!(
             tools,
             vec![
+                "glob".to_string(),
+                "grep".to_string(),
                 "list_dir".to_string(),
                 "read_file".to_string(),
                 "update_plan".to_string()
@@ -8099,5 +9446,93 @@ verdict := {"allow": false, "rule": "require-sandbox", "reason": "this workspace
             .expect_err("a parent escape is refused");
         assert!(error.to_string().contains("write"), "{error}");
         assert!(error.to_string().contains(".."), "{error}");
+    }
+
+    /// Manual benchmark for the file tools, not a CI assertion.
+    ///
+    ///     cargo test -p bsh --lib bench_file_tools -- --ignored --nocapture
+    ///
+    /// A tool call is dominated by two things a unit test cannot see: the
+    /// policy evaluation and the filesystem work. This splits them so a
+    /// performance change is measured rather than claimed.
+    #[test]
+    #[ignore = "manual benchmark"]
+    fn bench_file_tools() {
+        use std::time::Instant;
+        let root = scratch("bench-file-tools");
+        let many = root.join("many");
+        std::fs::create_dir_all(&many).expect("many");
+        for index in 0..5_000 {
+            std::fs::write(many.join(format!("f{index:05}.txt")), b"").expect("entry");
+        }
+        let line = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n";
+        let mut text = String::new();
+        while text.len() < 4 * 1024 * 1024 {
+            text.push_str(line);
+        }
+        let big = root.join("big.txt");
+        std::fs::write(&big, &text).expect("big");
+
+        let built = build(&rooted(&root));
+        let registry = built.agent.registry().expect("registry");
+        let rounds = 20_u32;
+        let time = |label: &str, f: &mut dyn FnMut()| {
+            let start = Instant::now();
+            for _ in 0..rounds {
+                f();
+            }
+            println!("{label}: {:?} per call", start.elapsed() / rounds);
+        };
+        time("read 4MiB", &mut || {
+            registry
+                .execute(
+                    "read_file",
+                    &serde_json::json!({ "path": big.to_string_lossy() }),
+                )
+                .expect("read");
+        });
+        time("list 5k entries", &mut || {
+            registry
+                .execute(
+                    "list_dir",
+                    &serde_json::json!({ "path": many.to_string_lossy() }),
+                )
+                .expect("list");
+        });
+        let mut stamp = 0_u32;
+        time("write 1MiB", &mut || {
+            stamp += 1;
+            let content = format!("{stamp}\n{}", &text[..1024 * 1024]);
+            registry
+                .execute(
+                    "write_file",
+                    &serde_json::json!({
+                        "path": root.join("written.txt").to_string_lossy(),
+                        "content": content,
+                    }),
+                )
+                .expect("write");
+        });
+        let mut flip = false;
+        time("edit 4MiB replace_all", &mut || {
+            let (old, new) = if flip {
+                ("9876543210", "0123456789")
+            } else {
+                ("0123456789", "9876543210")
+            };
+            flip = !flip;
+            registry
+                .execute(
+                    "edit_file",
+                    &serde_json::json!({
+                        "path": big.to_string_lossy(),
+                        "old_string": old,
+                        "new_string": new,
+                        "replace_all": true,
+                    }),
+                )
+                .expect("edit");
+        });
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
