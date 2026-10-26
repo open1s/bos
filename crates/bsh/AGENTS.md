@@ -2506,3 +2506,92 @@ landed without its code half, so the build failed on `Message::Text(String)`.
 Adapting `browser/engine/cdp/wire.rs` to `Message::Text(.. .into())` is the
 one-line fix needed to compile; it is unrelated to grep and belongs to the
 browser round.
+
+Round 177 turned the right pane's browser from "correct" into the crate's gold
+requirement: EXTREMELY fast, with the correctness it already had left standing.
+Three measured facts drove it, all probed against the real Obscura 0.2.5 binary
+before a line was written (`docs/bsh-browser-substrate.md` carries the numbers):
+
+1. **PNG is 2-9x faster than JPEG on this engine.** `Page.captureScreenshot` at
+   jpeg q72 averaged 16.7 ms on the fixture and 74 ms on a dense page; PNG
+   averaged 8.3 ms and 8 ms, and was SMALLER too (7 KB against 20 KB base64).
+   The pump had been capturing JPEG at q72 with a 120 ms sleep: about eight
+   frames a second no matter what the page did.
+2. **`Page.startScreencast` is NOT a paint pump.** It answers OK and even
+   advertises `obscuraFrameSource: activity-driven`, but it pushes frames only
+   on NAVIGATION activity: a DOM change, a hover, a key, a wheel and a fully
+   idle second all produced ZERO frames (measured). The polling pump stays;
+   what changes is how it polls.
+3. **The engine's own network signals cannot settle a page.** `Network.enable`
+   emits NOTHING for a script-started subresource - a 900 ms-delayed image
+   produced no `requestWillBeSent` at all - and `Page.lifecycleEvent
+   networkIdle` fires WITH the load event while a 200 ms-later image was still
+   in flight. Both were rejected as settle signals, with the measurement
+   recorded in the doc so nobody re-tries them.
+
+What the pane has now: the pump probes with PNG, compares the captured bytes
+with the previous frame (an unchanged page decodes and stores NOTHING), and
+adapts its cadence - a 33 ms BUDGET while the page changes (it sleeps only what
+is left after the work, so a slow decode is never displayed slower than the
+machine can decode it), 120 ms once four unchanged probes have gone by, woken
+instantly by a shared activity stamp that navigation, input, a resize and the
+request seam all bump and the pump's own probes deliberately do not. The budget
+is not a guess dressed up as one: the first version slept a FIXED 33 ms on top
+of the work, and the self-animating proof measured 4 frames in 400 ms in a debug
+build where the frame's PNG decode is the slow half of a cycle; pacing to the
+budget doubled it to 8. A claim about frame rate needs BOTH halves measured -
+the engine's capture (8.7 ms still, 19.1 ms changing) and the local decode. The decode AND the RGBA->BGRA channel swap moved to
+the pump thread, so the pane's render path is a plain copy of ready bytes (the
+swap used to be a full per-pixel pass on the UI thread). The rest of the round
+is latency: the idle window went 500 -> 400 ms with the load event now stamped
+(without that stamp a quiet window that started with the document's own fetch
+could beat a late subresource's stamp to the settle - the repo's own proof
+would have gone flaky), and navigation grew TWO settles behind one seam: a TOOL
+waits the full networkidle window because it reads the page's text, while the
+PANE lands one paint beat after the load event because the frame it shows is
+already live. MEASURED on one engine and page: `tool=443.95 ms pane=153.20 ms`.
+The pane's viewport override also left the render path: a drag changes the
+bounds every frame and each `Emulation.setDeviceMetricsOverride` was a blocking
+round trip on the UI thread, so the want is recorded and applied off-thread at
+most once per 150 ms.
+
+Traps this cost, so the next round is cheap:
+
+- `Engine::navigate` became dead code the moment the model passed a settle
+  explicitly (`cargo build` warned, and `-D warnings` would have failed the
+  gate). The engine now has ONE navigation entry that requires its settle, and
+  every engine test says `Settle::Idle` out loud - which is exactly the
+  documentation the wrapper was hiding.
+- A model-level parameter named `settle` SHADOWS the module's own `settle()`
+  function (the text-fallback path), and the error is `E0618: expected
+  function, found Settle` at the far-away call site. The function is
+  `settle_fetch` now.
+- The pump must NOT bump its own activity stamp: `dispatch` bumps for every
+  command, so a naive version made the pump's own captureScreenshot count as
+  page activity and pinned the cadence at 33 ms forever. The exception is
+  explicit and commented.
+- Instrumenting the pump's cadence needs the FrameSlot HANDLE, and the shared
+  `engine()` test helper builds one internally; the two pump proofs construct
+  the engine directly with `launch_in` and their own `Arc<FrameSlot>`.
+- Proving "an unchanged page publishes nothing" against a freshly navigated
+  page races the first few renders (layout and fonts settle over a few probes),
+  so the proof waits for the sequence to go STILL first - asserting immediately
+  fails for the right reason on a loaded machine.
+- The BGRA proof has to discriminate on the same byte it asserts: a red page
+  arrives `[0, 0, 255, 255]` and turns blue as `[255, 0, 0, 255]`, so a
+  missing swap fails the first assert and a mis-ordered copy fails the second.
+- `cargo fmt` rewrites these files between reads, so an `edit` whose anchor was
+  read before a fmt run is refused with "file changed since it was read" -
+  re-read the region, then retry. It also reformats UNRELATED files in the crate
+  (the whole of shell_tests.rs, in this round): restore those with
+  `jj restore <path>` so the change set stays the round's own. Check that a
+  "modified" file you never edited is only formatting BEFORE restoring it -
+  `jj file show -r @- <path> | rustfmt --emit stdout` and a diff against the
+  working copy proves it.
+- This sandbox blocks `ps`, `sandbox-exec` and every confined shell, so 26 tests
+  fail here for that reason alone and NOT because of a code change: the 2
+  `browser::engine::reap` tests (the reaper shells out to `ps`, which answers
+  rc=126), 7 `caps` tests and 14 `terminal` + 3 terminal-pane tests
+  (`sandbox-exec: sandbox_apply: Operation not permitted`, exit 71). Prove it
+  from the failed assertion's own stderr before touching any of that code.
+

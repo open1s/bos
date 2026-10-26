@@ -52,9 +52,25 @@ const LOAD_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long after the load event a snapshot waits, so a script that runs on
 /// `DOMContentLoaded` lands before the text is read.
 const SETTLE: Duration = Duration::from_millis(120);
-/// The capture cadence: about eight frames a second, enough for a page view and
-/// cheap enough to leave the engine responsive.
-const FRAME_INTERVAL: Duration = Duration::from_millis(120);
+/// The frame budget while the page is changing: about thirty frames a second,
+/// and a BUDGET rather than a sleep.
+///
+/// MEASURED on this engine: a PNG capture of a STILL page costs ~8 ms and of a
+/// CHANGING one ~19 ms (min 6, max 161), and a still page's captures are
+/// byte-identical, which is what makes the comparison worth doing. The decode
+/// of the frame is the other half of a cycle and is the slow part in a debug
+/// build, so the pump sleeps only what is LEFT of this budget after the work
+/// it just did: a fixed sleep on top would make the cadence the work plus the
+/// sleep, and a page would be displayed slower than the machine can decode it.
+const FRAME_FAST: Duration = Duration::from_millis(33);
+/// The idle cadence: eight probes a second once the page has been still for a
+/// few probes. Each probe is one round trip whose bytes are compared with the
+/// previous frame; an unchanged page decodes and stores nothing.
+const FRAME_IDLE: Duration = Duration::from_millis(120);
+/// Unchanged probes at the fast cadence before the pump slows down: four is
+/// ~130 ms of stillness, so a settled page stops paying thirty captures a
+/// second and the next burst of activity starts on the very next probe.
+const FRAME_QUIET_TICKS: u32 = 4;
 /// How long a navigation waits before its one retry.
 const RETRY_PAUSE: Duration = Duration::from_millis(150);
 
@@ -199,6 +215,22 @@ impl EngineError {
             ),
         }
     }
+}
+
+/// How long a navigation waits for the page to settle after its load event.
+///
+/// Two callers share one seam with two needs. A TOOL reads the page's text, so
+/// it waits the full networkidle window: a subresource that starts just after
+/// load has to land before the text is read. The PANE reads the frame, which
+/// is already live while that window would run; it lands its state on one
+/// paint beat instead, so the toolbar, the address bar and the history
+/// buttons keep up with what is on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Settle {
+    /// Tools: the full networkidle window (load + quiet).
+    Idle,
+    /// The pane: load + one paint beat.
+    Paint,
 }
 
 /// What a navigation decided.
@@ -367,11 +399,16 @@ impl Engine {
     /// makes a refusal produce no request at all. The process's loopback gate
     /// asks the same policy again for every subresource, which is the part a
     /// document check cannot cover.
-    pub(crate) fn navigate(
+    /// Navigate with an explicit settle: [`Settle::Idle`] for a tool that
+    /// reads the page, [`Settle::Paint`] for the pane whose frame is already
+    /// live while the idle window would run. One entry point, so a caller has
+    /// to say which need it has.
+    pub(crate) fn navigate_settling(
         &self,
         gate: &Arc<EgressGate>,
         url: &str,
         mode: NetworkMode,
+        settle: Settle,
     ) -> Result<Navigation, EngineError> {
         if let Err(denial) = Gate::preflight(gate, url, mode) {
             return Ok(Navigation::Refused {
@@ -384,11 +421,11 @@ impl Engine {
         // allowed.
         self.client.gate().set_mode(mode);
         self.client.gate().set_gate(gate.clone());
-        self.load(url)
+        self.load(url, settle)
     }
 
     /// Navigate and wait for the load event.
-    fn load(&self, url: &str) -> Result<Navigation, EngineError> {
+    fn load(&self, url: &str, settle: Settle) -> Result<Navigation, EngineError> {
         // The request seam's idle clock starts with the navigation, not with
         // the engine's launch: a page that made no request at all is idle as
         // soon as the load event settles.
@@ -418,16 +455,27 @@ impl Engine {
                         });
                     }
                     self.client.wait_load(before, LOAD_TIMEOUT);
-                    // A real networkidle when the Fetch seam is counting: the
-                    // page is settled when no request has been seen for 500 ms
-                    // and at most two are in flight, capped at the navigation
-                    // timeout. Without the counter this is load + settle.
-                    if !self
-                        .client
-                        .shared()
-                        .wait_network_idle(NETWORK_IDLE, LOAD_TIMEOUT)
-                    {
-                        std::thread::sleep(SETTLE);
+                    match settle {
+                        // A tool reads the page's text, so it waits the real
+                        // networkidle when the Fetch seam is counting: the page
+                        // is settled when no request has been seen for
+                        // NETWORK_IDLE and at most two are in flight, capped at
+                        // the navigation timeout. Without the counter this is
+                        // load + settle.
+                        Settle::Idle => {
+                            if !self
+                                .client
+                                .shared()
+                                .wait_network_idle(NETWORK_IDLE, LOAD_TIMEOUT)
+                            {
+                                std::thread::sleep(SETTLE);
+                            }
+                        }
+                        // The pane reads the frame, which is live while the
+                        // idle window would run; one beat lets a script that
+                        // runs on DOMContentLoaded land before the pane's
+                        // state is read.
+                        Settle::Paint => std::thread::sleep(SETTLE),
                     }
                     return Ok(Navigation::Loaded);
                 }
@@ -1042,6 +1090,15 @@ impl Engine {
     }
 
     /// Spawn the capture thread.
+    ///
+    /// The pump PROBES the engine and adapts: a PNG capture is one round trip
+    /// (MEASURED at ~8 ms, two to nine times faster than JPEG on this engine),
+    /// its bytes are compared with the previous frame so a still page costs
+    /// nothing but the probe, and the cadence is fast while the page is
+    /// changing - tracked by the shared activity stamp that input, navigation
+    /// and the request seam all bump - and settles to the idle rate after a
+    /// few unchanged probes. The decode and the channel swap happen here, on
+    /// this thread, so the pane's render path only ever copies ready bytes.
     fn spawn_pump(&self) -> Option<JoinHandle<()>> {
         let stop = self.stop.clone();
         let streaming = self.streaming.clone();
@@ -1050,17 +1107,52 @@ impl Engine {
         std::thread::Builder::new()
             .name(String::from("bsh-browser-pump"))
             .spawn(move || {
+                let mut last: Option<Vec<u8>> = None;
+                let mut seen_activity = client.activity();
+                let mut quiet = FRAME_QUIET_TICKS;
                 while !stop.load(Ordering::Relaxed) {
                     if streaming.load(Ordering::Relaxed) {
-                        if let Ok(bytes) = capture(&client, "jpeg", Some(72)) {
-                            if let Ok(image) = image::load_from_memory(&bytes) {
-                                let rgba = image.to_rgba8();
-                                let (width, height) = rgba.dimensions();
-                                frames.store(Arc::new(rgba.into_raw()), width, height);
+                        let started = std::time::Instant::now();
+                        if client.activity() != seen_activity {
+                            seen_activity = client.activity();
+                            quiet = 0;
+                        }
+                        // A failed probe keeps the previous frame on screen;
+                        // the next probe retries.
+                        if let Ok(bytes) = capture(&client, "png", None) {
+                            if last.as_ref() != Some(&bytes) {
+                                quiet = 0;
+                                if let Ok(image) = image::load_from_memory(&bytes) {
+                                    let rgba = image.to_rgba8();
+                                    let (width, height) = rgba.dimensions();
+                                    // GPUI's RenderImage wants BGRA and a
+                                    // capture is RGBA. MEASURED: handing RGBA
+                                    // over unchanged draws a blue heading
+                                    // orange. The swap is paid HERE, so the
+                                    // pane never touches a pixel.
+                                    let mut bgra = rgba.into_raw();
+                                    for pixel in bgra.as_chunks_mut::<4>().0 {
+                                        pixel.swap(0, 2);
+                                    }
+                                    frames.store(Arc::new(bgra), width, height);
+                                }
+                                last = Some(bytes);
+                            } else {
+                                quiet = quiet.saturating_add(1);
                             }
                         }
+                        // A BUDGET, not a sleep: a cycle that already spent
+                        // the budget long ago (a debug-build decode) gets no
+                        // added delay, so the page is shown as fast as the
+                        // machine can decode it and never slower.
+                        if quiet >= FRAME_QUIET_TICKS {
+                            std::thread::sleep(FRAME_IDLE.saturating_sub(started.elapsed()));
+                        } else {
+                            std::thread::sleep(FRAME_FAST.saturating_sub(started.elapsed()));
+                        }
+                    } else {
+                        std::thread::sleep(FRAME_IDLE);
                     }
-                    std::thread::sleep(FRAME_INTERVAL);
                 }
             })
             .ok()

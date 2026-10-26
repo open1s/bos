@@ -1125,7 +1125,8 @@ pub(crate) fn navigate_in(
     mode: NetworkMode,
 ) -> Result<(), Failure> {
     let seq = handle.mutate(|browser| browser.begin(url));
-    load(handle, gate, url, seq, mode)
+    // A tool reads the page's text, so this path takes the full idle window.
+    load(handle, gate, url, seq, mode, engine::Settle::Idle)
 }
 
 /// Fetch and settle a navigation that has ALREADY begun.
@@ -1133,12 +1134,19 @@ pub(crate) fn navigate_in(
 /// The pane begins the load on the frame that accepted the click, so the
 /// loading state paints before the request exists; the fetch then settles the
 /// same sequence number. A tool that navigates does both in one call.
+///
+/// `settle` is the caller's need, not a tuning knob: a TOOL reads the page's
+/// text and waits the full networkidle window ([`Settle::Idle`]); the PANE
+/// reads the frame, which is live while that window would run, and lands its
+/// state on one paint beat ([`Settle::Paint`]). The model's document is the
+/// same either way - every tool re-reads the live page before it acts.
 pub(crate) fn load(
     handle: &BrowserHandle,
     gate: &Arc<EgressGate>,
     url: &str,
     seq: u64,
     mode: NetworkMode,
+    settle: engine::Settle,
 ) -> Result<(), Failure> {
     // The scheme rule is the model's, not the engine's: a file: or javascript:
     // URL is refused with the text view's own "scheme" failure before a
@@ -1163,13 +1171,13 @@ pub(crate) fn load(
         };
     }
     match handle.ensure_engine(gate, mode) {
-        Ok(engine) => load_live(handle, &engine, gate, url, seq, mode),
+        Ok(engine) => load_live(handle, &engine, gate, url, seq, mode, settle),
         Err(_error) => {
             // The text view is the fallback, and it goes through the SAME gate:
             // the policy decision is identical, only the producer differs.
             let limits = FetchLimits::default();
             let result = agent::policy::fetch(gate, url, &limits);
-            settle(handle, gate, seq, result)
+            settle_fetch(handle, gate, seq, result)
         }
     }
 }
@@ -1182,6 +1190,7 @@ fn load_live(
     url: &str,
     seq: u64,
     mode: NetworkMode,
+    settle: engine::Settle,
 ) -> Result<(), Failure> {
     let replaced = || Failure {
         kind: "engine",
@@ -1189,7 +1198,7 @@ fn load_live(
         rule: None,
         url: String::new(),
     };
-    let failure = match engine.navigate(gate, url, mode) {
+    let failure = match engine.navigate_settling(gate, url, mode, settle) {
         Ok(engine::Navigation::Loaded) => {
             let start = handle.read(|browser| browser.next_id);
             match engine.snapshot(start) {
@@ -1262,7 +1271,10 @@ fn document_from_page(page: engine::Page, next_id: &mut u64) -> Document {
 
 /// Settle a fetch into the browser, reporting a superseded load as its own
 /// failure rather than showing a page the caller did not ask for.
-fn settle(
+///
+/// Named for the fetch it settles: the model-level `load` takes a
+/// [`Settle`](engine::Settle) choice, and that name would shadow this one.
+fn settle_fetch(
     handle: &BrowserHandle,
     gate: &EgressGate,
     seq: u64,

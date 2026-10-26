@@ -285,9 +285,18 @@ pub(crate) struct Shell {
     pub(crate) browser_bounds: std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
     /// When the last hover move was forwarded to the page.
     ///
-    /// A move is a CDP round trip, so the pane throttles hover to ~60 Hz; a
-    /// drag is never throttled.
+    /// A forward is fire-and-forget, but each one is a queued CDP command, so
+    /// the pane still throttles hover to ~60 Hz; a drag is never throttled.
     pub(crate) browser_last_move: Option<std::time::Instant>,
+    /// The viewport the pane wants applied, once a geometry tick saw a
+    /// different one. Applied OFF the UI thread at
+    /// [`BROWSER_RESIZE_EVERY`](super::right_panel::BROWSER_RESIZE_EVERY),
+    /// because a resize is a CDP round trip and a pane drag moves the bounds
+    /// every frame.
+    pub(crate) browser_resize_want: Option<(u32, u32)>,
+    /// When the last viewport override was applied, the rate limit for the
+    /// next one.
+    pub(crate) browser_resize_at: Option<std::time::Instant>,
     /// The page frame's keyboard focus. A press takes it, so the page receives
     /// keys only while the reader is actually in the page.
     pub(crate) browser_focus: FocusHandle,
@@ -1428,6 +1437,8 @@ impl Shell {
             browser_frame_size: (0, 0),
             browser_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
             browser_last_move: None,
+            browser_resize_want: None,
+            browser_resize_at: None,
             browser_pressed: false,
             browser_click: None,
             browser_typed: None,

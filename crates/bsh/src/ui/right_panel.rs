@@ -3527,6 +3527,14 @@ pub(crate) const BROWSER_CLICK_MS: u64 = 500;
 /// multi-click, in PAGE pixels.
 pub(crate) const BROWSER_CLICK_SLOP: f32 = 4.0;
 
+/// The least time between two viewport overrides the pane applies.
+///
+/// A resize is a CDP round trip, so a pane drag must not send one per frame.
+/// 150 ms reflows the page at a rate the eye reads as continuous during a
+/// drag and catches the final size within one window after it stops; the
+/// override itself runs off the UI thread.
+pub(crate) const BROWSER_RESIZE_EVERY: std::time::Duration = std::time::Duration::from_millis(150);
+
 impl BrowserClick {
     /// Count a press at `page` happening `now`, relative to the previous one.
     ///
@@ -3841,7 +3849,20 @@ impl Shell {
             let handle = handle.clone();
             let gate = gate.clone();
             let url = url.clone();
-            async move { crate::browser::load(&handle, &gate, &url, seq, mode) }
+            // The pane reads the frame, which is live while the tool path's
+            // idle window would run: one paint beat after the load event, and
+            // the toolbar, address bar and history buttons keep up with what
+            // is already on screen.
+            async move {
+                crate::browser::load(
+                    &handle,
+                    &gate,
+                    &url,
+                    seq,
+                    mode,
+                    crate::browser::engine::Settle::Paint,
+                )
+            }
         });
         cx.spawn(async move |this, cx| {
             let outcome = task.await;
@@ -3957,6 +3978,10 @@ impl Shell {
         self.state.browser.stop_engine();
         self.browser_render = None;
         self.browser_frame_seq = 0;
+        // A pending resize belongs to the engine that is gone; a new engine
+        // starts at its own default viewport.
+        self.browser_resize_want = None;
+        self.browser_resize_at = None;
         self.browser_bounds.set(None);
         // A gesture belongs to the page that was on screen; closing it must
         // not leave the pane thinking a press is still down.
@@ -3992,15 +4017,33 @@ impl Shell {
                 if visible {
                     // The viewport follows the geometry the frame is actually
                     // drawn in, so the page reflows instead of being upscaled.
+                    // A resize is a CDP round trip, so it must not run on the
+                    // render path: the want is recorded here and applied off
+                    // the UI thread, at most one override per tick window, so
+                    // a pane drag reflows at a bounded rate and a settled pane
+                    // still catches the final size. The pump repaints the
+                    // reflow on its own (a resize bumps the activity stamp),
+                    // so no dirty flag is needed here.
                     if let Some(bounds) = self.browser_bounds.get() {
                         let width = bounds.size.width.as_f32().round().max(0.0) as u32;
                         let height = bounds.size.height.as_f32().round().max(0.0) as u32;
-                        if width >= 320
-                            && height >= 240
-                            && engine.viewport() != (width, height)
-                            && engine.resize((width, height)).is_ok()
-                        {
-                            dirty = true;
+                        if width >= 320 && height >= 240 && engine.viewport() != (width, height) {
+                            self.browser_resize_want = Some((width, height));
+                        }
+                    }
+                    if let Some(want) = self.browser_resize_want {
+                        let due = self
+                            .browser_resize_at
+                            .is_none_or(|at| at.elapsed() >= BROWSER_RESIZE_EVERY);
+                        if due {
+                            self.browser_resize_want = None;
+                            self.browser_resize_at = Some(std::time::Instant::now());
+                            let engine = engine.clone();
+                            cx.background_executor()
+                                .spawn(async move {
+                                    let _ = engine.resize(want);
+                                })
+                                .detach();
                         }
                     }
                 }
@@ -4211,11 +4254,12 @@ impl Shell {
 
     /// A move: hover when no button is held, a drag while one is.
     ///
-    /// Hover moves are throttled to one forwarded event per ~16 ms. Every one
-    /// is a CDP round trip on the UI thread, and a page only needs enough of
-    /// them to update :hover; a drag is never throttled, because every point
-    /// is part of the selection. A move beyond the click slop also ends the
-    /// multi-click window, so a press after it starts again at one.
+    /// Hover moves are throttled to one forwarded event per ~16 ms. A forward
+    /// is fire-and-forget (no reply is waited on), but each one is still a
+    /// queued CDP command, and a page only needs enough of them to update
+    /// :hover; a drag is never throttled, because every point is part of the
+    /// selection. A move beyond the click slop also ends the multi-click
+    /// window, so a press after it starts again at one.
     fn browser_pointer_move(&mut self, position: Point<Pixels>, pressed: bool) {
         let dragging = pressed && self.browser_pressed;
         let now = std::time::Instant::now();
@@ -5961,18 +6005,11 @@ impl Shell {
 
 /// Build the image the pane draws from one captured frame.
 ///
-/// The buffer was decoded on the engine's pump thread, so this copies bytes and
-/// builds a GPUI image; it does not decode anything on the render path.
-///
-/// The one channel transform lives here, at the GPUI boundary: GPUI's
-/// `RenderImage` wants BGRA and a capture is RGBA. MEASURED: handing RGBA over
-/// unchanged draws a blue heading orange and a red box blue, which looks like a
-/// renderer bug and is a byte-order one.
+/// The buffer was decoded AND channel-swapped on the engine's pump thread, so
+/// this copies ready BGRA bytes into the GPUI image; it does not decode
+/// anything and touches no pixel on the render path.
 fn render_frame(frame: &crate::browser::engine::Frame) -> Option<gpui_kit::RenderImage> {
-    let mut pixels = (*frame.rgba).clone();
-    for pixel in pixels.as_chunks_mut::<4>().0 {
-        pixel.swap(0, 2);
-    }
+    let pixels = (*frame.bgra).clone();
     let buffer = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_raw(
         frame.width,
         frame.height,

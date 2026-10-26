@@ -6,7 +6,9 @@ styled, script-running page, produced by an EXTERNAL
 over its standard CDP endpoint. Servo is gone: no crate, no feature, no vendor
 patch, no code.
 
-Measured 2026-10-25 on this machine (arm64 macOS, rustc 1.98.1).
+Measured 2026-10-25 on this machine (arm64 macOS, rustc 1.98.1); the frame
+  pump, the settle split and the idle window re-measured 2026-10-26 (same
+  machine).
 
 ## What the user asked for
 
@@ -238,7 +240,7 @@ shapes were not touched.
 | `browser_back`/`forward` | `Page.getNavigationHistory` + `Page.navigateToHistoryEntry` |
 | `browser_reload` | `Page.reload` |
 | `browser_close` | `Target.closeTarget`, then the child |
-| pane frame | `Page.captureScreenshot` on a 120 ms pump |
+| pane frame | `Page.captureScreenshot` (PNG) probed by an adaptive pump, 33 ms while the page changes and 120 ms once it is still |
 | pane resize | `Emulation.setDeviceMetricsOverride` |
 
 ### Refs
@@ -255,10 +257,23 @@ resolves against the model BEFORE it asks the engine.
 - **networkidle is real now.** Every request that reaches the Fetch seam bumps a
   monotonic activity stamp; the seam is enabled once at bootstrap and its
   `requestPaused`/`continue`/`fail` path keeps an in-flight counter. A
-  navigation is settled when no request has been seen for **500 ms** and at most
-  **2** are in flight, capped by the navigation timeout; if the Fetch domain was
-  refused, the old load + 120 ms settle is the fallback and says nothing it did
-  not measure. Proof: a page whose script starts an `<img>` 300 ms AFTER its
+  TOOL's navigation is settled when no request has been seen for **400 ms** and
+  at most **2** are in flight, capped by the navigation timeout; if the Fetch
+  domain was refused, the old load + 120 ms settle is the fallback and says
+  nothing it did not measure. The load event is stamped too, so the window can
+  never elapse BEFORE the load it follows - that is what keeps the late
+  subresource proof below deterministic at the shorter window. MEASURED: the
+  window was the standard 500 ms; 400 ms keeps a 100 ms margin over the 300 ms
+  late-subresource proof and takes 100 ms off every settled navigation
+  (pre-warm measurement: 447 ms for a whole tool navigation).
+- **Two settles, one seam.** [`Settle::Idle`] is the tool's: a tool reads the
+  page's TEXT, so it waits the window above. [`Settle::Paint`] is the pane's:
+  the pane reads the FRAME, which the pump is already publishing while that
+  window runs, so its Go lands one paint beat (120 ms) after the load event and
+  the toolbar, address bar and history buttons keep up with what is on screen.
+  The model's document is the same either way - every tool re-reads the live
+  page before it acts. MEASURED on one engine and page:
+  `tool=443.95 ms pane=153.20 ms` (`the_pane_settle_lands_before_the_tool_settle`). Proof: a page whose script starts an `<img>` 300 ms AFTER its
   load event is read immediately after `browser_open` and the snapshot already
   contains the text that image's `onload` wrote (`networkidle_reads_content_a_late_subresource_wrote`).
 - **Click hit points**: `getBoundingClientRect()` first, then the union of the
@@ -435,13 +450,34 @@ System Events (`keystroke`, `key code`), which is real input to the app.
   launch (163-185 ms) + navigation (159-163 ms, including the old 120 ms settle);
   pre-warm removes the launch from the navigation, and the idle window is the
   correctness cost of the section above.
-- `Page.captureScreenshot` runs on the engine's own pump at ~8 fps; the JPEG is
-  decoded to RGBA ON THE PUMP THREAD and the GPUI thread only builds a
-  `RenderImage` from bytes that already exist (no decode on the render path).
-- The one channel transform is at the GPUI boundary: `RenderImage` wants BGRA
-  and a capture is RGBA. MEASURED: handing RGBA over unchanged draws a blue
-  heading orange and a red box blue - a byte-order bug that looks like a
-  renderer bug.
+- `Page.captureScreenshot` runs on the engine's own pump. It PROBES and
+  ADAPTS: **PNG**, because it is MEASURED 2-9x faster than JPEG on this engine
+  and smaller too (a STILL page: 8.7 ms against 16.7 ms on the fixture and 74 ms
+  on a dense page; a CHANGING page: 19.1 ms against 12.2 ms, where the render
+  rather than the encoder is the cost). The cadence is a **budget**: 33 ms while
+  the page is changing and 120 ms once it is still (four unchanged probes end a
+  burst), and the pump sleeps only what is LEFT of the budget after the work it
+  just did - a fixed sleep on top would make the cadence work + sleep, so a slow
+  decode (a debug build's PNG decode is the slow half of a cycle) would be
+  displayed slower than the machine could decode it. MEASURED effect of that
+  correction on a self-animating page in a debug build: 8 frames in 400 ms
+  against 4 with a fixed sleep. An unchanged probe decodes and stores NOTHING:
+  the captured bytes are compared with the previous frame first (MEASURED: two
+  captures of a still page are byte-identical), so a perfectly still page costs
+  one cheap round trip per tick. What wakes the fast cadence is the shared
+  activity stamp - navigation, input, a resize and the request seam all bump it,
+  the pump's own probes deliberately do not.
+- The decode AND the channel transform happen on the pump thread: `RenderImage`
+  wants BGRA and a capture is RGBA. MEASURED: handing RGBA over unchanged draws
+  a blue heading orange and a red box blue - a byte-order bug that looks like a
+  renderer bug. The pane's render path is therefore a plain copy of ready
+  bytes, pinned by `the_pump_publishes_bgra_and_only_when_the_page_changes`
+  (a red page arrives `[0, 0, 255, 255]`, and the same first byte moves when
+  the page turns blue).
+- The viewport override is applied OFF the UI thread, at most one per 150 ms: a
+  pane drag changes the bounds every frame, and a per-frame CDP round trip on
+  the render path was the pane's one remaining stall. The pump repaints the
+  reflow itself, because a resize bumps the same activity stamp.
 - Pointer presses/moves, the wheel and typed keys are forwarded in PAGE
   coordinates (window position minus the frame's laid-out bounds, scaled by
   viewport/geometry); a press takes keyboard focus for the pane.
@@ -551,19 +587,26 @@ Its new residuals, stated rather than assumed:
    element box, then client-rect/Range union, and a synthesized pointer event
    whenever any non-zero box exists; `via` reports which path ran, so a caller
    can tell. Residual: for this shape the engine gives no point to hit.
-4. **networkidle is implemented** (500 ms quiet, <= 2 in flight, capped; load +
+4. **networkidle is implemented** (400 ms quiet, <= 2 in flight, capped; load +
    settle fallback when the Fetch domain is unavailable). Residual: the
    `requestPaused` event arrives AFTER the fetch in 0.2.5 (measured), so the
    counter observes activity late; the idle STAMP is what makes the wait real,
-   and the 500 ms window is a bounded guess rather than an event.
+   and the window is a bounded guess rather than an event - a request that
+   starts after the window has elapsed is missed, exactly as a 500 ms window
+   missed one that started after 500 ms. Measured and rejected as a fix: the
+   engine's own `Network` domain emits NOTHING for a script-started
+   subresource (a 900 ms-delayed image produced no `requestWillBeSent` at all)
+   and `Page.lifecycleEvent networkIdle` fires WITH the load event, while a
+   200 ms-later image was still in flight - so neither is a settle signal.
 5. **No CJK without fonts** unless the font directories exist on the host;
    `BSH_OBSCURA_FONT_DIRS=none` reproduces the tofu. Unchanged.
 6. **The engine still cold-starts**, but a shown pane PRE-WARMS it: the launch
    (~0.16-0.23 s measured here; the 2-3 s figure is a cold filesystem) happens
    when the Browser tab appears, not on the first Go. Residual: a
    `--browser=URL` deep link navigates on the same frame it shows the pane, so
-   that first-ever open still shares the launch; and the 500 ms networkidle
-   window is now part of every settled navigation.
+   that first-ever open still shares the launch. The idle window is part of a
+   TOOL's settled navigation only: the pane's own Go lands on the paint settle
+   (153 ms measured against the tool's 444 ms).
 7. **Windowed capture is reproducible, not asserted.** `browser-proof.sh`
    re-captures both images in one command, but no test asserts the GPUI window's
    pixels: the harness cannot photograph its own surface. The assertion stays on

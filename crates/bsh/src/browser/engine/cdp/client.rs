@@ -49,9 +49,15 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 /// How long the request seam must be quiet before a navigation counts as
-/// network-idle. This is the standard 500 ms idle window: a page that starts a
-/// subresource just after its load event resets it, which is the whole point.
-pub(crate) const NETWORK_IDLE: Duration = Duration::from_millis(500);
+/// network-idle.
+///
+/// MEASURED: the repo's own late-subresource proof starts its image 300 ms
+/// after the load event, so the window has to outlast that start for the
+/// completion stamp to reset it. 400 ms keeps a 100 ms margin there while
+/// taking 100 ms off every settled navigation against the standard 500 ms
+/// window, and the load event itself is stamped (see `handle_event`), so the
+/// window can never elapse before the load it follows.
+pub(crate) const NETWORK_IDLE: Duration = Duration::from_millis(400);
 /// Requests that may still be in flight and count as idle. The Fetch pause is
 /// emitted after the fetch in obscura 0.2.5, so this is a ceiling rather than an
 /// exact count.
@@ -111,6 +117,11 @@ pub(crate) struct Shared {
     inflight: AtomicU64,
     /// When the request seam last saw activity, as a monotonic instant.
     last_activity: Mutex<Option<Instant>>,
+    /// Monotonic count of things that may repaint the page: a request at the
+    /// seam, a load event, and every command the client sends (the frame
+    /// pump's own probes excepted). The frame pump reads this to decide
+    /// whether its next capture should be at the fast or the idle cadence.
+    activity: AtomicU64,
     /// Whether `Fetch.enable` succeeded, which is what makes the counter
     /// trustworthy. A build without the domain falls back to load + settle.
     fetch_ready: AtomicBool,
@@ -171,6 +182,15 @@ impl Shared {
         if let Ok(mut slot) = self.last_activity.lock() {
             slot.replace(Instant::now());
         }
+        self.activity.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The activity stamp the frame pump reads: anything that may have
+    /// repainted the page bumps it, so one monotonic counter carries "the
+    /// page may look different now" from the request seam and the command
+    /// path to the capture thread.
+    pub(crate) fn activity(&self) -> u64 {
+        self.activity.load(Ordering::Relaxed)
     }
 
     /// Wait until no request has been seen for `idle`, capped at `cap`.
@@ -522,6 +542,12 @@ impl Client {
         &self.shared
     }
 
+    /// The page-activity stamp the frame pump reads. See
+    /// [`Shared::activity`](Shared::activity).
+    pub(crate) fn activity(&self) -> u64 {
+        self.shared.activity()
+    }
+
     /// The tail of the child's own output, for a failure sentence.
     pub(crate) fn log(&self) -> String {
         let text = self.log.lock().map(|slot| slot.clone()).unwrap_or_default();
@@ -547,6 +573,13 @@ impl Client {
         params: Value,
         session: Option<String>,
     ) -> Result<Value, EngineError> {
+        // Every command may repaint the page: a navigate, an input dispatch,
+        // a resize. The frame pump's own probes are excepted - counting those
+        // would pin the capture cadence at its fast rate on a page that never
+        // changes.
+        if method != "Page.captureScreenshot" {
+            self.shared.activity.fetch_add(1, Ordering::Relaxed);
+        }
         if !self.alive.load(Ordering::Relaxed) {
             return Err(EngineError::Closed(
                 self.shared
@@ -606,6 +639,10 @@ impl Client {
                     .unwrap_or_else(|| String::from("the engine's socket stopped")),
             ));
         }
+        // A fire-and-forget event is page activity exactly like a call: a
+        // hover or a drag move repaints, so the frame pump wakes to the fast
+        // cadence without this path paying for a reply.
+        self.shared.activity.fetch_add(1, Ordering::Relaxed);
         let (reply, _unread) = mpsc::channel();
         self.jobs
             .send(Job {
@@ -762,6 +799,11 @@ fn handle_event(socket: &mut Socket, method: &str, params: &Value, shared: &Shar
     match method {
         "Page.loadEventFired" => {
             shared.loads.fetch_add(1, Ordering::Relaxed);
+            // The load event is network activity too: stamping it means the
+            // idle window can never elapse BEFORE the load it follows, so a
+            // quiet window that started with the document's own fetch cannot
+            // race past a subresource whose stamp lands just after load.
+            shared.touch();
         }
         "Target.attachedToTarget" => {
             if let Some(session) = params.get("sessionId").and_then(Value::as_str) {

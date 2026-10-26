@@ -31,7 +31,7 @@ use agent::policy::{EgressGate, PolicyData, PolicySet, SystemResolver};
 
 use super::cdp::client::{dev_binary, discover_binary};
 use super::gate::{Gate, STRICT_RULE};
-use super::{Engine, FrameSlot, Navigation};
+use super::{Engine, FrameSlot, Navigation, Settle};
 use crate::browser::NetworkMode;
 
 /// How long a proof waits for a subresource the proxy should have refused.
@@ -237,10 +237,11 @@ fn a_live_page_answers_with_script_text_stable_refs_real_input_and_a_styled_capt
         return;
     };
     let navigation = engine
-        .navigate(
+        .navigate_settling(
             &gate_for(&[origin.port]),
             &format!("http://127.0.0.1:{}/", origin.port),
             NetworkMode::Proxied,
+            Settle::Idle,
         )
         .expect("navigate should answer");
     assert_eq!(navigation, Navigation::Loaded);
@@ -354,10 +355,11 @@ fn a_refused_url_makes_no_request_and_an_allowed_one_moves_the_same_counter() {
 
     // The refusal: the pre-flight asks the policy before Page.navigate.
     let navigation = engine
-        .navigate(
+        .navigate_settling(
             &gate_for(&[allowed.port]),
             &format!("http://127.0.0.1:{}/", refused.port),
             NetworkMode::Proxied,
+            Settle::Idle,
         )
         .expect("a refusal is an answer, not a failure");
     match navigation {
@@ -379,10 +381,11 @@ fn a_refused_url_makes_no_request_and_an_allowed_one_moves_the_same_counter() {
     // Discrimination: the SAME counter shape moves for an allowed URL, so the
     // zero above cannot pass by a gate that refuses everything.
     let navigation = engine
-        .navigate(
+        .navigate_settling(
             &gate_for(&[allowed.port]),
             &format!("http://127.0.0.1:{}/", allowed.port),
             NetworkMode::Proxied,
+            Settle::Idle,
         )
         .expect("the allowed page should load");
     assert_eq!(navigation, Navigation::Loaded);
@@ -421,10 +424,11 @@ fn a_refused_subresource_stays_at_zero_while_the_allowed_page_loads() {
         return;
     };
     let navigation = engine
-        .navigate(
+        .navigate_settling(
             &gate_for(&[allowed.port]),
             &format!("http://127.0.0.1:{}/", allowed.port),
             NetworkMode::Proxied,
+            Settle::Idle,
         )
         .expect("the page should load");
     assert_eq!(navigation, Navigation::Loaded);
@@ -464,10 +468,11 @@ fn dropping_the_engine_leaves_no_listener_and_no_child() {
         return;
     };
     engine
-        .navigate(
+        .navigate_settling(
             &gate_for(&[origin.port]),
             &format!("http://127.0.0.1:{}/", origin.port),
             NetworkMode::Proxied,
+            Settle::Idle,
         )
         .expect("the page should load");
     let port = engine.client().port();
@@ -539,7 +544,9 @@ fn the_browser_model_is_fed_by_the_live_engine() {
 /// A pre-warm separates the two costs a first open used to pay together:
 /// launching the engine (process, CDP handshake, V8, the font scan) and
 /// navigating. MEASURED on this machine: launch ~0.16 s and a navigation on an
-/// already-warm engine a fraction of that plus the 500 ms networkidle window.
+/// already-warm engine a fraction of that plus the networkidle window (400 ms,
+/// and part of a TOOL's open; the pane's own Go lands on the paint settle -
+/// see `the_pane_settle_lands_before_the_tool_settle`).
 ///
 /// The assertion is that the warm engine is REUSED: a second navigation keeps
 /// the same process port, so a pane that pre-warms on first show does not pay
@@ -571,10 +578,11 @@ fn a_prewarmed_engine_pays_no_launch_on_its_first_navigation() {
 
     let first = std::time::Instant::now();
     let navigation = engine
-        .navigate(
+        .navigate_settling(
             &gate_for(&[origin.port]),
             &format!("http://127.0.0.1:{}/", origin.port),
             NetworkMode::Proxied,
+            Settle::Idle,
         )
         .expect("navigate answers");
     assert_eq!(navigation, Navigation::Loaded);
@@ -582,10 +590,11 @@ fn a_prewarmed_engine_pays_no_launch_on_its_first_navigation() {
 
     let second = std::time::Instant::now();
     let again = engine
-        .navigate(
+        .navigate_settling(
             &gate_for(&[origin.port]),
             &format!("http://127.0.0.1:{}/?second", origin.port),
             NetworkMode::Proxied,
+            Settle::Idle,
         )
         .expect("navigate answers");
     assert_eq!(again, Navigation::Loaded);
@@ -597,7 +606,7 @@ fn a_prewarmed_engine_pays_no_launch_on_its_first_navigation() {
     );
     assert!(
         first_navigation >= std::time::Duration::from_millis(400),
-        "the networkidle window is part of a settled navigation: {first_navigation:?}"
+        "the tool's networkidle window is part of a settled navigation: {first_navigation:?}"
     );
     eprintln!(
         "MEASURE pre-warm: launch={launch:?} first_navigation={first_navigation:?} second_navigation={second_navigation:?} (launch is paid when the pane appears, not by the navigation)"
@@ -619,10 +628,11 @@ fn a_denied_subresource_path_never_reaches_the_origin() {
     };
     let gate = gate_for_paths(&[origin.port], &["/secret/"]);
     let navigation = engine
-        .navigate(
+        .navigate_settling(
             &gate,
             &format!("http://127.0.0.1:{}/", origin.port),
             NetworkMode::Proxied,
+            Settle::Idle,
         )
         .expect("the page should load");
     assert_eq!(navigation, Navigation::Loaded);
@@ -673,10 +683,11 @@ fn enter_submits_a_focused_form_field() {
         return;
     };
     let navigation = engine
-        .navigate(
+        .navigate_settling(
             &gate_for(&[origin.port]),
             &format!("http://127.0.0.1:{}/form", origin.port),
             NetworkMode::Proxied,
+            Settle::Idle,
         )
         .expect("the form page should load");
     assert_eq!(navigation, Navigation::Loaded);
@@ -724,10 +735,11 @@ fn editing_keys_change_a_field_and_enter_is_a_real_keypress() {
         return;
     };
     let navigation = engine
-        .navigate(
+        .navigate_settling(
             &gate_for(&[origin.port]),
             &format!("http://127.0.0.1:{}/", origin.port),
             NetworkMode::Proxied,
+            Settle::Idle,
         )
         .expect("the page should load");
     assert_eq!(navigation, Navigation::Loaded);
@@ -775,7 +787,14 @@ fn strict_mode_refuses_https_by_rule_and_keeps_http_working() {
     };
     let gate = gate_for(&[origin.port]);
     let refused = engine
-        .navigate(&gate, "https://127.0.0.1/private", NetworkMode::Strict)
+        .navigate_settling(
+            &gate,
+            "https://127.0.0.1/private",
+            NetworkMode::Strict,
+            // A pre-flight refusal does not reach the settle either way; the
+            // tool choice is the one this test states.
+            Settle::Idle,
+        )
         .expect("a refusal is an answer");
     match refused {
         Navigation::Refused { rule, message } => {
@@ -793,10 +812,11 @@ fn strict_mode_refuses_https_by_rule_and_keeps_http_working() {
         "a Strict https refusal must open no request at all"
     );
     let loaded = engine
-        .navigate(
+        .navigate_settling(
             &gate,
             &format!("http://127.0.0.1:{}/", origin.port),
             NetworkMode::Strict,
+            Settle::Idle,
         )
         .expect("http still works in Strict");
     assert_eq!(loaded, Navigation::Loaded);
@@ -821,10 +841,11 @@ fn networkidle_reads_content_a_late_subresource_wrote() {
         return;
     };
     let navigation = engine
-        .navigate(
+        .navigate_settling(
             &gate_for(&[origin.port]),
             &format!("http://127.0.0.1:{}/", origin.port),
             NetworkMode::Proxied,
+            Settle::Idle,
         )
         .expect("the page should load");
     assert_eq!(navigation, Navigation::Loaded);
@@ -853,10 +874,11 @@ fn an_inline_link_reports_the_path_its_click_took() {
         return;
     };
     let navigation = engine
-        .navigate(
+        .navigate_settling(
             &gate_for(&[origin.port]),
             &format!("http://127.0.0.1:{}/", origin.port),
             NetworkMode::Proxied,
+            Settle::Idle,
         )
         .expect("the page should load");
     assert_eq!(navigation, Navigation::Loaded);
@@ -918,10 +940,11 @@ fn editing_chords_reach_the_page_and_paste_inserts_once() {
         return;
     };
     let navigation = engine
-        .navigate(
+        .navigate_settling(
             &gate_for(&[origin.port]),
             &format!("http://127.0.0.1:{}/", origin.port),
             NetworkMode::Proxied,
+            Settle::Idle,
         )
         .expect("the page should load");
     assert_eq!(navigation, Navigation::Loaded);
@@ -1034,10 +1057,11 @@ fn printable_keys_fire_keydown_and_insert_exactly_once() {
         return;
     };
     let navigation = engine
-        .navigate(
+        .navigate_settling(
             &gate_for(&[origin.port]),
             &format!("http://127.0.0.1:{}/", origin.port),
             NetworkMode::Proxied,
+            Settle::Idle,
         )
         .expect("the page should load");
     assert_eq!(navigation, Navigation::Loaded);
@@ -1100,10 +1124,11 @@ fn a_double_click_selects_the_word_and_a_triple_click_the_line() {
         return;
     };
     let navigation = engine
-        .navigate(
+        .navigate_settling(
             &gate_for(&[origin.port]),
             &format!("http://127.0.0.1:{}/", origin.port),
             NetworkMode::Proxied,
+            Settle::Idle,
         )
         .expect("the page should load");
     assert_eq!(navigation, Navigation::Loaded);
@@ -1231,10 +1256,11 @@ fn a_release_at_the_clamped_edge_clears_the_page_drag() {
         return;
     };
     let navigation = engine
-        .navigate(
+        .navigate_settling(
             &gate_for(&[origin.port]),
             &format!("http://127.0.0.1:{}/", origin.port),
             NetworkMode::Proxied,
+            Settle::Idle,
         )
         .expect("the page should load");
     assert_eq!(navigation, Navigation::Loaded);
@@ -1283,4 +1309,226 @@ fn a_release_at_the_clamped_edge_clears_the_page_drag() {
         "no move may be forwarded after the release: {after}"
     );
     eprintln!("PROOF captured release: {after}");
+}
+
+/// Wait until the frame slot holds a frame NEWER than `above`, bounded.
+///
+/// The pump is a real thread on its own cadence, so a proof waits for the
+/// sequence to move instead of sleeping a guessed amount.
+fn wait_for_frame(frames: &FrameSlot, above: u64, budget: Duration) -> Option<super::Frame> {
+    let deadline = std::time::Instant::now() + budget;
+    while std::time::Instant::now() < deadline {
+        if frames.seq() > above {
+            return frames.latest();
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    None
+}
+
+/// Wait until the frame sequence has stopped moving for `idle`.
+///
+/// A freshly navigated page renders over a few probes (layout, fonts), so the
+/// proof first waits for the sequence to go quiet and only then asserts that
+/// an unchanged page publishes nothing.
+fn wait_for_still_frames(frames: &FrameSlot, idle: Duration, budget: Duration) -> u64 {
+    let deadline = std::time::Instant::now() + budget;
+    let mut last_seq = frames.seq();
+    let mut still_since = std::time::Instant::now();
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+        let seq = frames.seq();
+        if seq != last_seq {
+            last_seq = seq;
+            still_since = std::time::Instant::now();
+            continue;
+        }
+        if still_since.elapsed() >= idle {
+            return seq;
+        }
+    }
+    last_seq
+}
+
+/// The pump's two measured promises, in one proof on a real page: a published
+/// frame is in the byte order the pane draws (BGRA), and an unchanged page
+/// publishes nothing while one real change is caught at the fast cadence.
+///
+/// The discrimination is the same two channels on both sides of the assert: a
+/// red page arrives `[0, 0, 255, 255]` (blue first) - which is what makes the
+/// pane's render path a plain copy - and after the page turns blue the SAME
+/// first byte is the one that moved.
+#[test]
+fn the_pump_publishes_bgra_and_only_when_the_page_changes() {
+    let origin = Origin::start(String::from(
+        "<!doctype html><html><body style=\"margin:0;background:#ff0000\">\
+         <p id=\"d\">still</p></body></html>",
+    ));
+    if discover_binary().is_err() {
+        eprintln!("SKIP: no obscura binary (set BSH_OBSCURA_BIN or put obscura on PATH)");
+        return;
+    }
+    let gate = Gate::start(
+        gate_for(&[origin.port]).policy().clone(),
+        "session-test",
+        "preset-test",
+        NetworkMode::Proxied,
+    )
+    .expect("the loopback gate could bind");
+    let frames = Arc::new(FrameSlot::default());
+    let engine = Engine::launch_in(
+        gate.clone(),
+        frames.clone(),
+        (800, 600),
+        &scratch_state("pump"),
+    )
+    .expect("the engine should start");
+    let navigation = engine
+        .navigate_settling(
+            &gate_for(&[origin.port]),
+            &format!("http://127.0.0.1:{}/", origin.port),
+            NetworkMode::Proxied,
+            Settle::Idle,
+        )
+        .expect("navigate answers");
+    assert_eq!(navigation, Navigation::Loaded);
+
+    engine.set_streaming(true);
+    let first = wait_for_frame(&frames, 0, Duration::from_secs(10))
+        .expect("the pump publishes a first frame once it is streaming");
+    assert_eq!(
+        (first.width, first.height),
+        (800, 600),
+        "the frame is the viewport"
+    );
+    assert!(first.bgra.len() >= 4, "a frame has pixels");
+    // Red in BGRA is [0, 0, 255, 255]; an unswapped RGBA frame would put 255
+    // in the first byte and fail exactly here.
+    assert!(
+        first.bgra[0] < 40 && first.bgra[1] < 40 && first.bgra[2] > 200,
+        "the first pixel must arrive BGRA (red is 0,0,255): {:?}",
+        &first.bgra[..4]
+    );
+
+    let still = wait_for_still_frames(&frames, Duration::from_millis(200), Duration::from_secs(5));
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(
+        frames.seq(),
+        still,
+        "an unchanged page must publish no frame at all (no decode, no store)"
+    );
+
+    engine
+        .evaluate("document.body.style.background = '#0000ff'")
+        .expect("the page takes the change");
+    let changed = wait_for_frame(&frames, still, Duration::from_millis(600))
+        .expect("one change is caught at the fast cadence");
+    assert!(
+        changed.bgra[0] > 200 && changed.bgra[2] < 40,
+        "the new frame carries the new colour in the same channel order: {:?}",
+        &changed.bgra[..4]
+    );
+    engine.set_streaming(false);
+}
+
+/// The pane's settle is NOT the tool's, measured on one engine and one page:
+/// the pane lands one paint beat after the load event while a tool waits the
+/// full networkidle window. The margin asserted (150 ms of the 280 ms the two
+/// constants differ by) is what keeps this a proof rather than a stopwatch.
+#[test]
+fn the_pane_settle_lands_before_the_tool_settle() {
+    let origin = Origin::start(page(None));
+    let Some((engine, _gate)) = engine(&[origin.port]) else {
+        return;
+    };
+    let url = format!("http://127.0.0.1:{}/", origin.port);
+
+    let tool_started = std::time::Instant::now();
+    let tool_result = engine
+        .navigate_settling(
+            &gate_for(&[origin.port]),
+            &url,
+            NetworkMode::Proxied,
+            Settle::Idle,
+        )
+        .expect("the tool navigation answers");
+    let tool = tool_started.elapsed();
+    assert_eq!(tool_result, Navigation::Loaded);
+
+    let pane_started = std::time::Instant::now();
+    let pane_result = engine
+        .navigate_settling(
+            &gate_for(&[origin.port]),
+            &format!("{url}?pane"),
+            NetworkMode::Proxied,
+            Settle::Paint,
+        )
+        .expect("the pane navigation answers");
+    let pane = pane_started.elapsed();
+    assert_eq!(pane_result, Navigation::Loaded);
+
+    eprintln!("MEASURE settle: tool={tool:?} pane={pane:?}");
+    assert!(
+        pane + Duration::from_millis(150) < tool,
+        "the pane must not pay the idle window: pane={pane:?} tool={tool:?}"
+    );
+}
+
+/// A page that animates ON ITS OWN is published at the fast cadence.
+///
+/// This is the case the activity stamp cannot help with: nothing is sent to
+/// the engine between probes, so only the pump's own change detection can hold
+/// the rate. MEASURED in a DEBUG build, where the frame's PNG decode is the
+/// slow half of a cycle: eight frames in 400 ms with the budget, against four
+/// before the budget replaced a fixed sleep (a plain 120 ms poll would give at
+/// most three). The assertion is five, which the idle cadence cannot reach and
+/// the fast one clears with margin on the slower of the two builds.
+#[test]
+fn a_self_animating_page_is_published_at_the_fast_cadence() {
+    let origin = Origin::start(String::from(
+        "<!doctype html><html><body style=\"margin:0\"><p>animating</p>\
+         <script>var i = 0; setInterval(function(){ i = (i + 1) % 255;\
+           document.body.style.background = 'rgb(' + i + ',' + (255 - i) + ',64)';\
+         }, 25);</script></body></html>",
+    ));
+    if discover_binary().is_err() {
+        eprintln!("SKIP: no obscura binary (set BSH_OBSCURA_BIN or put obscura on PATH)");
+        return;
+    }
+    let gate = Gate::start(
+        gate_for(&[origin.port]).policy().clone(),
+        "session-test",
+        "preset-test",
+        NetworkMode::Proxied,
+    )
+    .expect("the loopback gate could bind");
+    let frames = Arc::new(FrameSlot::default());
+    let engine = Engine::launch_in(
+        gate.clone(),
+        frames.clone(),
+        (800, 600),
+        &scratch_state("animated-pump"),
+    )
+    .expect("the engine should start");
+    let navigation = engine
+        .navigate_settling(
+            &gate_for(&[origin.port]),
+            &format!("http://127.0.0.1:{}/", origin.port),
+            NetworkMode::Proxied,
+            Settle::Idle,
+        )
+        .expect("navigate answers");
+    assert_eq!(navigation, Navigation::Loaded);
+
+    engine.set_streaming(true);
+    wait_for_frame(&frames, 0, Duration::from_secs(10)).expect("a first frame");
+    let before = frames.seq();
+    std::thread::sleep(Duration::from_millis(400));
+    let published = frames.seq() - before;
+    eprintln!("MEASURE animated pump: {published} frames in 400 ms");
+    assert!(
+        published >= 5,
+        "a page that moves on its own must be published at the fast cadence, not the idle one: {published} frames in 400 ms (the idle cadence gives at most three)"
+    );
+    engine.set_streaming(false);
 }

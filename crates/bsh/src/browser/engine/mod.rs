@@ -21,9 +21,11 @@
 //! # Frames
 //!
 //! `FrameSlot` is the one-way mailbox from the engine's capture pump to the
-//! pane. The pump decodes a JPEG into RGBA on its own thread, so the GPUI
-//! thread only ever builds a `RenderImage` from bytes that already exist -
-//! never a decode of a multi-megabyte PNG on the render path.
+//! pane. The pump probes the engine with a PNG capture, decodes it and swaps
+//! the channels to BGRA on its own thread, so the GPUI thread only ever builds
+//! a `RenderImage` from ready bytes - never a decode or a per-pixel pass on
+//! the render path. A still page is probed without a decode at all, and the
+//! cadence adapts: fast while the page changes, idle once it does not.
 
 pub(crate) mod cdp;
 pub(crate) mod gate;
@@ -32,7 +34,7 @@ pub(crate) mod reap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-pub(crate) use cdp::{Engine, EngineError, Navigation, Page};
+pub(crate) use cdp::{Engine, EngineError, Navigation, Page, Settle};
 pub(crate) use gate::Gate;
 
 /// One decoded frame, addressed by a sequence number.
@@ -42,8 +44,10 @@ pub(crate) struct Frame {
     pub(crate) width: u32,
     /// Pixel height.
     pub(crate) height: u32,
-    /// RGBA8, row-major.
-    pub(crate) rgba: Arc<Vec<u8>>,
+    /// BGRA8, row-major - the byte order GPUI's `RenderImage` draws. The
+    /// channel swap from the capture's RGBA was paid on the pump thread, so
+    /// the pane's frame build is a copy of ready bytes.
+    pub(crate) bgra: Arc<Vec<u8>>,
 }
 
 /// The newest frame, and the sequence that says whether it is new.
@@ -55,13 +59,13 @@ pub(crate) struct FrameSlot {
 
 impl FrameSlot {
     /// Publish a frame.
-    pub(crate) fn store(&self, rgba: Arc<Vec<u8>>, width: u32, height: u32) {
+    pub(crate) fn store(&self, bgra: Arc<Vec<u8>>, width: u32, height: u32) {
         self.seq.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut slot) = self.frame.lock() {
             slot.replace(Frame {
                 width,
                 height,
-                rgba,
+                bgra,
             });
         }
     }
