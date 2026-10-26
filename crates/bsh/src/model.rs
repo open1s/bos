@@ -318,6 +318,23 @@ pub(crate) struct MessageMeta {
     pub(crate) timing: Option<MessageTiming>,
 }
 
+/// One segment of a turn, in the order the stream produced it.
+///
+/// A turn interleaves reasoning, visible text and tool calls - the model thinks,
+/// writes, calls a tool, then thinks again - and the transcript draws them in
+/// that order. Segments are recorded as they land; a session written before
+/// this timeline existed carries none and draws in the older
+/// reasoning-then-text-then-steps order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum TurnPart {
+    /// This many bytes of `reasoning`, consumed in order by Thinking parts.
+    Thinking(usize),
+    /// This many bytes of `text`, consumed in order by Content parts.
+    Content(usize),
+    /// The tool call at this index of `tools`.
+    Tool(usize),
+}
+
 /// One message in a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ChatMessage {
@@ -331,6 +348,13 @@ pub(crate) struct ChatMessage {
     /// Tool calls made while producing the response.
     #[serde(default)]
     pub(crate) tools: Vec<ToolEvent>,
+    /// The order this turn's thinking, text and tool calls arrived in.
+    ///
+    /// Empty for a session written before the timeline existed, and for user
+    /// messages: the transcript then draws reasoning, text and steps in the
+    /// order the older pane did.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) parts: Vec<TurnPart>,
     /// Attached images, each a data URL.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) images: Vec<String>,
@@ -367,6 +391,7 @@ impl ChatMessage {
             text: text.into(),
             reasoning: String::new(),
             tools: Vec::new(),
+            parts: Vec::new(),
             images: Vec::new(),
             error: None,
             meta: None,
@@ -389,11 +414,41 @@ impl ChatMessage {
             text: String::new(),
             reasoning: String::new(),
             tools: Vec::new(),
+            parts: Vec::new(),
             images: Vec::new(),
             error: None,
             meta: None,
             steering: false,
         }
+    }
+
+    /// Fold a reasoning delta into the timeline, extending the Thinking segment
+    /// the stream is still writing.
+    pub(crate) fn note_thinking(&mut self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        match self.parts.last_mut() {
+            Some(TurnPart::Thinking(len)) => *len += bytes,
+            _ => self.parts.push(TurnPart::Thinking(bytes)),
+        }
+    }
+
+    /// Fold a visible-text delta into the timeline the same way.
+    pub(crate) fn note_content(&mut self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        match self.parts.last_mut() {
+            Some(TurnPart::Content(len)) => *len += bytes,
+            _ => self.parts.push(TurnPart::Content(bytes)),
+        }
+    }
+
+    /// Note a tool call at its place in the timeline.
+    pub(crate) fn note_tool(&mut self) {
+        let index = self.tools.len().saturating_sub(1);
+        self.parts.push(TurnPart::Tool(index));
     }
 
     /// This message's turn timing, when the record carries one.
@@ -711,8 +766,51 @@ impl Session {
 mod tests {
     use super::{
         price_block, price_system_prompt, price_tools, ChatMessage, ContextBreakdown, MessageUsage,
-        Session, ToolEvent, UsageSummary,
+        Session, ToolEvent, TurnPart, UsageSummary,
     };
+    /// The timeline keeps the ORDER the stream produced, merging only runs of
+    /// the same kind: thinking, the reply, a tool, then thinking again is four
+    /// segments, not three buckets.
+    #[test]
+    fn the_timeline_orders_and_merges_stream_segments() {
+        let mut message = ChatMessage::assistant();
+        message.note_thinking(4);
+        message.note_thinking(3);
+        assert_eq!(message.parts, vec![TurnPart::Thinking(7)], "a run merges");
+        message.note_content(2);
+        message.tools.push(ToolEvent {
+            name: "bash".to_string(),
+            args: "{}".to_string(),
+            output: None,
+            ms: None,
+            at: None,
+        });
+        message.note_tool();
+        message.note_thinking(5);
+        message.note_content(1);
+        message.note_thinking(0);
+        assert_eq!(
+            message.parts,
+            vec![
+                TurnPart::Thinking(7),
+                TurnPart::Content(2),
+                TurnPart::Tool(0),
+                TurnPart::Thinking(5),
+                TurnPart::Content(1),
+            ],
+            "thinking, content and the tool keep their arrival order"
+        );
+    }
+
+    /// A message written before the timeline round-trips with no segments, so
+    /// an old session file loads and draws in the older shape.
+    #[test]
+    fn a_message_without_a_timeline_still_loads() {
+        let message: ChatMessage =
+            serde_json::from_str(r#"{"role":"assistant","text":"kept"}"#).expect("an old message");
+        assert_eq!(message.text, "kept");
+        assert!(message.parts.is_empty());
+    }
 
     /// A session file written before the model was recorded still loads.
     #[test]

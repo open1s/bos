@@ -34,6 +34,12 @@ pub(crate) struct FrameFacts<'a> {
     pub(crate) content: f32,
     /// The transcript's child count (the timestamp row plus the messages).
     pub(crate) rows: usize,
+    /// How long the PREVIOUS painted frame took, from the start of its render to
+    /// the end of its paint, in milliseconds. Zero on the first traced frame.
+    pub(crate) frame_ms: f32,
+    /// Bytes of reasoning text in the live assistant row: the markdown body a
+    /// streaming turn has to re-render. Zero when no turn is streaming.
+    pub(crate) body: usize,
 }
 
 /// How many lines one trace writes before it stops, plus a final notice.
@@ -48,6 +54,11 @@ pub(crate) struct FrameTrace {
     /// The last instrumented request that asked for the frame, if any. Reset
     /// after every line, so a stale reason is never attributed to a click.
     source: Option<&'static str>,
+    /// The previous frame's work in milliseconds, written by the frame clock at
+    /// the end of that frame's paint.
+    frame_ms: std::rc::Rc<std::cell::Cell<f32>>,
+    /// Stream events folded since the last painted line.
+    deltas: usize,
 }
 
 impl FrameTrace {
@@ -99,7 +110,22 @@ impl FrameTrace {
             lines: 0,
             cap: cap.max(1),
             source: None,
+            frame_ms: std::rc::Rc::new(std::cell::Cell::new(0.0)),
+            deltas: 0,
         })
+    }
+
+    /// The cell the frame clock writes this frame's work into.
+    ///
+    /// Cloning the `Rc` is how the render path can hand the clock to the element
+    /// that paints last without borrowing the trace for the rest of the frame.
+    pub(crate) fn frame_clock(&self) -> std::rc::Rc<std::cell::Cell<f32>> {
+        self.frame_ms.clone()
+    }
+
+    /// Fold a batch of stream events into the next line's `deltas` field.
+    pub(crate) fn count_deltas(&mut self, deltas: usize) {
+        self.deltas = self.deltas.saturating_add(deltas);
     }
 
     /// Name the request that asked for the next frame, when it is known.
@@ -129,10 +155,14 @@ impl FrameTrace {
         let now = std::time::Instant::now();
         let dt = now.duration_since(self.previous).as_secs_f64() * 1_000.0;
         let source = self.source.take().unwrap_or("unknown");
+        let deltas = std::mem::take(&mut self.deltas);
         let _ = writeln!(
             self.file,
-            "frame={} dt_ms={dt:.1} tab={} streaming={} offset={:.1} max={:.1} content={:.1} rows={} source={source}",
+            "frame={} dt_ms={dt:.1} frame_ms={:.1} deltas={} body={} tab={} streaming={} offset={:.1} max={:.1} content={:.1} rows={} source={source}",
             facts.frame,
+            facts.frame_ms,
+            deltas,
+            facts.body,
             facts.tab,
             if facts.streaming { "yes" } else { "no" },
             facts.offset,
@@ -168,6 +198,8 @@ mod tests {
             max: 480.0,
             content: 1_300.0,
             rows: 7,
+            frame_ms: 12.5,
+            body: 204_800,
         }
     }
 
@@ -197,6 +229,10 @@ mod tests {
             lines[0]
         );
         for key in [
+            " dt_ms=",
+            " frame_ms=12.5 ",
+            " deltas=0 ",
+            " body=204800 ",
             " tab=chat ",
             " streaming=yes ",
             " offset=-120.0 ",
@@ -216,6 +252,46 @@ mod tests {
             "a reason is never reused by the next frame: {}",
             lines[1]
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The batch counter belongs to the NEXT line only: 40 deltas folded
+    /// between two painted frames are reported once, and the frame after them
+    /// reports none instead of inheriting the 40.
+    #[test]
+    fn a_line_reports_the_deltas_folded_since_the_last_one() {
+        let path = scratch("deltas");
+        {
+            let mut trace = FrameTrace::open(&path).expect("the trace opens");
+            trace.count_deltas(40);
+            trace.record(facts(1));
+            trace.record(facts(2));
+        }
+        let text = std::fs::read_to_string(&path).expect("the trace is readable");
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(
+            lines[0].contains(" deltas=40 "),
+            "the line counts the batch it painted: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains(" deltas=0 "),
+            "a delta-free frame reports zero deltas: {}",
+            lines[1]
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The frame clock is what makes `frame_ms` measurable: the render path
+    /// hands the trailing element a shared cell, and the value it writes is
+    /// reported on the NEXT line.
+    #[test]
+    fn the_frame_clock_is_shared_with_the_render_path() {
+        let path = scratch("clock");
+        let trace = FrameTrace::open(&path).expect("the trace opens");
+        let clock = trace.frame_clock();
+        clock.set(27.5);
+        assert_eq!(clock.get(), 27.5, "the render path writes the one cell");
         let _ = std::fs::remove_file(&path);
     }
 

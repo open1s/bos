@@ -18,21 +18,111 @@ fn open_link(url: &SharedString, _event: &ClickEvent, _window: &mut Window, cx: 
 use gpui_kit::*;
 use std::sync::Arc;
 
-use super::shell::{ChangesHover, Shell};
+use super::shell::{BodySlot, ChangesHover, Shell};
 use super::todo_panel::spinner;
 use super::{glyph, icon, txt, DivExt, IconName};
 use crate::i18n::{tr, Lang};
-use crate::model::{ChatMessage, PlanStatus, Role, Session, ToolEvent};
+use crate::model::{ChatMessage, PlanStatus, Role, Session, ToolEvent, TurnPart};
 use crate::settings::{StepGrouping, TranscriptPolicy};
 use crate::theme;
 
 /// Body-cache kinds: the transcript draws several independent markdown
 /// surfaces, and each keeps its own parsed entry.
 const BODY: u8 = 0;
-const THINK: u8 = 1;
+/// The reasoning body's kind. Named in the slot a parsed body is keyed by, and
+/// by the tests that read a painted body back.
+pub(crate) const THINK: u8 = 1;
 const COMPACTION: u8 = 2;
-const STEP: u8 = 3;
 
+/// How much of a STREAMING reasoning body the pane paints.
+///
+/// A reasoning body is one markdown document laid out in a single vertical
+/// flow, so a frame that paints a 200 KB thought re-shapes every one of its
+/// blocks: the frame's cost grows with the thought, and the tail stutters once
+/// the body is long. While a turn still runs only the newest text is on screen
+/// (the transcript follows the tail), so the live body paints its last
+/// [THINK_STREAM_WINDOW] bytes; the moment the turn settles the COMPLETE body is
+/// painted again, exactly as it was before.
+///
+/// The trade, stated: while a turn streams, reasoning older than the window is
+/// not laid out, so a reader who scrolls up mid-thought stops at the window's
+/// start instead of the beginning, and the full body is laid out once when the
+/// turn completes. In exchange a streaming frame costs the same at 2 KB and at
+/// 200 KB, which is what the flicker was about. The window is cut in half-window
+/// steps, so the painted text usually EXTENDS the previous paint (the kit then
+/// parses only the new tail) and slides once per step.
+const THINK_STREAM_WINDOW: usize = 4 * 1024;
+
+/// The text a live reasoning body paints: the newest window of the thought.
+///
+/// Returns `None` when the body already fits, so a short thought paints its
+/// whole text and nothing is cut. The cut lands on a line boundary, so a list or
+/// a heading does not start in the middle of its own marker; when the cut lands
+/// INSIDE a fenced code block the window begins with a fence opener, because the
+/// tail is code and without the opener the rest of the thought would be parsed
+/// as one unterminated fence. The fence test counts backtick fences in the
+/// elided prefix; it is a byte scan, not a parse, and it cannot know about
+/// indented fences or fences of more than three backticks.
+pub(crate) fn think_stream_tail(text: &str) -> Option<std::borrow::Cow<'_, str>> {
+    if text.len() <= THINK_STREAM_WINDOW {
+        return None;
+    }
+    let step = THINK_STREAM_WINDOW / 2;
+    let mut start = ((text.len() - THINK_STREAM_WINDOW) / step) * step;
+    // The cut is a byte index, and a reasoning body is usually not ASCII.
+    while start > 0 && !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    if let Some(newline) = text[start..].find('\n') {
+        start += newline + 1;
+    }
+    let inside_fence = text[..start].matches("```").count() % 2 == 1;
+    let tail = &text[start..];
+    Some(if inside_fence {
+        std::borrow::Cow::Owned(format!("```\n{tail}"))
+    } else {
+        std::borrow::Cow::Borrowed(tail)
+    })
+}
+
+/// Whether a message's timeline still describes its text.
+///
+/// Redaction can change a body's length after the segments were recorded, and a
+/// hand-edited session file can carry anything. A timeline whose byte lengths do
+/// not add up, or that names a tool call that is gone, is not used: the older
+/// reasoning-then-text-then-steps order is the honest fallback, and it cannot
+/// slice out of bounds.
+fn timeline_is_consistent(message: &ChatMessage) -> bool {
+    if message.parts.is_empty() {
+        return false;
+    }
+    let mut reasoning = 0usize;
+    let mut text = 0usize;
+    for part in &message.parts {
+        match *part {
+            TurnPart::Thinking(bytes) => reasoning += bytes,
+            TurnPart::Content(bytes) => text += bytes,
+            TurnPart::Tool(index) => {
+                if index >= message.tools.len() {
+                    return false;
+                }
+            }
+        }
+    }
+    reasoning == message.reasoning.len() && text == message.text.len()
+}
+/// A debug selector for one Thinking segment.
+///
+/// The first segment keeps the unsuffixed name the disclosure tests already
+/// use; a later segment carries its part index so two rows of the same message
+/// stay distinguishable.
+fn think_selector(prefix: &str, index: usize, part: usize) -> String {
+    if part == 0 {
+        format!("{prefix}-{index}")
+    } else {
+        format!("{prefix}-{index}-{part}")
+    }
+}
 /// A reasoning block's collapsed summary: the first line, with the emphasis
 /// markers stripped.
 ///
@@ -41,6 +131,29 @@ const STEP: u8 = 3;
 /// per-paragraph streaming state, so the settled rule is the drawn one.
 pub(crate) fn think_summary(text: &str) -> String {
     text.lines().next().unwrap_or_default().replace("**", "")
+}
+
+/// The summary a LIVE reasoning row carries: the first line of the paragraph the
+/// thought has reached.
+///
+/// The reference shows the last completed paragraph's first line while a block
+/// streams, so the collapsed row keeps saying where the thought IS rather than
+/// where it started. bsh keeps no per-paragraph streaming state, so the current
+/// paragraph's first line is the closest stable reading: it moves when the
+/// thought opens a new paragraph, not on every token.
+pub(crate) fn think_summary_live(text: &str) -> String {
+    let mut current: Option<&str> = None;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            current = None;
+        } else if current.is_none() {
+            current = Some(line);
+        }
+    }
+    match current {
+        Some(line) => line.replace("**", ""),
+        None => think_summary(text),
+    }
 }
 
 /// Cap one rail preview the way the reference does: join the parts with a
@@ -1013,6 +1126,21 @@ struct RowChrome<'a> {
     style: &'a TextViewStyle,
 }
 
+/// One step body to draw: what it says, and where it sits.
+///
+/// The slot is what keys its parsed markdown, so it has to travel with the text
+/// that fills it (see [super::shell::BodySlot]).
+struct StepBody<'a> {
+    /// The message and tool this body belongs to, and whether it is the output.
+    slot: BodySlot,
+    /// The measured IN / OUT label.
+    label: &'static str,
+    /// The payload to paint.
+    text: &'a str,
+    /// The code language, when the step carries one.
+    lang: Option<&'static str>,
+}
+
 /// The state of the TURN one transcript row belongs to.
 ///
 /// A turn can hold two assistant rows when a steer landed mid-turn, so "is this
@@ -1921,79 +2049,13 @@ impl Shell {
 
         let mut column = div().w_full().flex().flex_col().gap(px(8.0));
 
-        if !message.reasoning.is_empty() {
-            column = column.child(self.think_row(index, message, chrome, cx));
-        }
-
-        if message.text.is_empty() && message.error.is_none() {
-            // An empty segment of a steered turn contributes no body: the turn
-            // holds one row before the steer and one after it, and only the
-            // newest is writing.
-            if !turn.settled && turn.writing {
-                column = column.child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(6.0))
-                        .child(glyph("●", 9.0, theme::accent()))
-                        .child(txt(
-                            match self.state.turn_elapsed() {
-                                Some(elapsed) => {
-                                    format!("{} · {elapsed}", self.state.lang.tr("msg.running"))
-                                }
-                                None => self.state.lang.tr("msg.running").to_string(),
-                            },
-                            theme::body_size_at(
-                                self.state.draft().global.general.content_font_size,
-                            ),
-                            theme::muted(),
-                        )),
-                );
-            }
+        // A turn whose timeline still adds up draws its parts in the order they
+        // arrived; a session from before the timeline, or one redaction
+        // re-lengthned, draws the older shape.
+        if timeline_is_consistent(message) {
+            column = self.timeline_column(column, index, message, turn, chrome, cx);
         } else {
-            column = column.child(
-                {
-                    let body = self.body_state(BODY, &message.text, cx);
-                    TextView::new(&body)
-                }
-                .on_link_click(open_link)
-                // Selectable, so the reader can quote a reply and so the
-                // shell's copy-on-selection can take it from the clipboard
-                // seam. The reference is a web page where every glyph is
-                // selectable; a native text view has to say so.
-                .selectable(true)
-                .style(chrome.style.clone())
-                .line_height(px(theme::body_line_at(chrome.content_size)))
-                .text_size(px(theme::body_size_at(chrome.content_size)))
-                .text_color(rgb(theme::text())),
-            );
-        }
-
-        // The turn's process, at the granularity the General pane's 工作步骤展示
-        // names. The four modes are the reference's own table: the two
-        // collapsed groupings fold the steps under ONE disclosure while the
-        // turn works AND after it settles - a streaming turn is exactly where
-        // eight open step rows are the wall the folding exists to prevent -
-        // while `detailed` lays them out flat so every summary line is
-        // readable without a click, and `verbose` (完全展开) opens every step's
-        // body on top of that.
-        if !message.tools.is_empty() {
-            let grouped = chrome.policy.step_grouping == StepGrouping::Collapsed;
-            if grouped {
-                column = column.child(self.process_group(index, message, turn.settled, chrome, cx));
-            } else {
-                for (tool_index, tool) in message.tools.iter().enumerate() {
-                    column = column.child(self.tool_row(
-                        index,
-                        tool_index,
-                        tool,
-                        turn.settled,
-                        chrome,
-                        cx,
-                    ));
-                }
-            }
+            column = self.legacy_column(column, index, message, turn, chrome, cx);
         }
 
         // The turn's changed files, as the reference's closing card. It sits after
@@ -2851,7 +2913,11 @@ impl Shell {
                     .py(px(4.0))
                     .child(
                         {
-                            let body = self.body_state(COMPACTION, &record.summary, cx);
+                            let body = self.body_state(
+                                BodySlot::Row(COMPACTION, index),
+                                &record.summary,
+                                cx,
+                            );
                             TextView::new(&body)
                         }
                         .style(chrome.style.clone())
@@ -2963,10 +3029,225 @@ impl Shell {
             )
     }
 
+    /// The markdown body of one content segment.
+    ///
+    /// Selectable, so the reader can quote a reply and so the shell's
+    /// copy-on-selection can take it from the clipboard seam. The reference is a
+    /// web page where every glyph is selectable; a native text view has to say
+    /// so.
+    fn body_view(
+        &self,
+        slot: BodySlot,
+        text: &str,
+        chrome: &RowChrome<'_>,
+        cx: &mut Context<Self>,
+    ) -> TextView {
+        let body = self.body_state(slot, text, cx);
+        TextView::new(&body)
+            .on_link_click(open_link)
+            .selectable(true)
+            .style(chrome.style.clone())
+            .line_height(px(theme::body_line_at(chrome.content_size)))
+            .text_size(px(theme::body_size_at(chrome.content_size)))
+            .text_color(rgb(theme::text()))
+    }
+
+    /// The pre-timeline order: reasoning, then text, then the steps.
+    ///
+    /// A session written before turn segments existed has no order to replay, so
+    /// it keeps the shape every earlier round drew and every existing test pins:
+    /// one reasoning block above the reply, then the reply, then the process.
+    fn legacy_column(
+        &self,
+        mut column: Div,
+        index: usize,
+        message: &ChatMessage,
+        turn: RowTurn,
+        chrome: &RowChrome<'_>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        if !message.reasoning.is_empty() {
+            column = column.child(self.think_row(
+                index,
+                0,
+                &message.reasoning,
+                turn.writing,
+                chrome,
+                cx,
+            ));
+        }
+
+        if message.text.is_empty() && message.error.is_none() {
+            // An empty segment of a steered turn contributes no body: the turn
+            // holds one row before the steer and one after it, and only the
+            // newest is writing.
+            if !turn.settled && turn.writing {
+                column = column.child(self.running_line());
+            }
+        } else {
+            column =
+                column.child(self.body_view(BodySlot::Row(BODY, index), &message.text, chrome, cx));
+        }
+
+        // The turn's process, at the granularity the General pane's 工作步骤展示
+        // names. The four modes are the reference's own table: the two
+        // collapsed groupings fold the steps under ONE disclosure while the
+        // turn works AND after it settles - a streaming turn is exactly where
+        // eight open step rows are the wall the folding exists to prevent -
+        // while `detailed` lays them out flat so every summary line is
+        // readable without a click, and `verbose` (完全展开) opens every step's
+        // body on top of that.
+        if !message.tools.is_empty() {
+            let grouped = chrome.policy.step_grouping == StepGrouping::Collapsed;
+            if grouped {
+                column = column.child(self.process_group(index, message, turn.settled, chrome, cx));
+            } else {
+                for (tool_index, tool) in message.tools.iter().enumerate() {
+                    column = column.child(self.tool_row(
+                        index,
+                        tool_index,
+                        tool,
+                        turn.settled,
+                        chrome,
+                        cx,
+                    ));
+                }
+            }
+        }
+        column
+    }
+
+    /// The turn's parts, in the order the stream produced them.
+    ///
+    /// DSH draws a running turn as a chronological list - a Think row, the text
+    /// it wrote, a Code row, the next Think row - so the transcript follows the
+    /// same order instead of hoisting all reasoning above all text and all
+    /// steps. A folded process policy still groups the step rows, but the group
+    /// takes the position of the FIRST step instead of the end of the turn.
+    fn timeline_column(
+        &self,
+        mut column: Div,
+        index: usize,
+        message: &ChatMessage,
+        turn: RowTurn,
+        chrome: &RowChrome<'_>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        // A running turn keeps its steps ungrouped while the live-process
+        // setting asks for that (the reference's own `liveProcessDetail`); a
+        // compact mode folds them even while it runs, and a settled turn always
+        // follows the step-grouping policy.
+        let grouped = chrome.policy.step_grouping == StepGrouping::Collapsed
+            && (!turn.writing || !chrome.policy.live_process_detail);
+        let mut reasoning_at = 0usize;
+        let mut content_at = 0usize;
+        let mut grouped_drawn = false;
+        for (part, segment) in message.parts.iter().enumerate() {
+            match *segment {
+                TurnPart::Thinking(bytes) => {
+                    let start = reasoning_at.min(message.reasoning.len());
+                    let end = (reasoning_at + bytes).min(message.reasoning.len());
+                    reasoning_at = end;
+                    if start == end {
+                        continue;
+                    }
+                    let live = turn.writing && part + 1 == message.parts.len();
+                    column = column.child(self.think_row(
+                        index,
+                        part,
+                        &message.reasoning[start..end],
+                        live,
+                        chrome,
+                        cx,
+                    ));
+                }
+                TurnPart::Content(bytes) => {
+                    let start = content_at.min(message.text.len());
+                    let end = (content_at + bytes).min(message.text.len());
+                    content_at = end;
+                    if start == end {
+                        continue;
+                    }
+                    column = column.child(
+                        div()
+                            .debug_selector({
+                                let selector = format!("msg-part-{index}-{part}");
+                                move || selector.clone()
+                            })
+                            .w_full()
+                            .child(self.body_view(
+                                BodySlot::Segment(BODY, index, part),
+                                &message.text[start..end],
+                                chrome,
+                                cx,
+                            )),
+                    );
+                }
+                TurnPart::Tool(tool_index) => {
+                    let Some(tool) = message.tools.get(tool_index) else {
+                        continue;
+                    };
+                    if grouped {
+                        if !grouped_drawn {
+                            grouped_drawn = true;
+                            column = column.child(self.process_group(
+                                index,
+                                message,
+                                turn.settled,
+                                chrome,
+                                cx,
+                            ));
+                        }
+                    } else {
+                        column = column.child(self.tool_row(
+                            index,
+                            tool_index,
+                            tool,
+                            turn.settled,
+                            chrome,
+                            cx,
+                        ));
+                    }
+                }
+            }
+        }
+        // The running line, while the turn works and no text has landed yet.
+        if message.text.is_empty() && message.error.is_none() && turn.writing && !turn.settled {
+            column = column.child(self.running_line());
+        }
+        column
+    }
+
+    /// The reference's live "Running · 12s" line.
+    fn running_line(&self) -> Div {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .child(glyph("●", 9.0, theme::accent()))
+            .child(txt(
+                match self.state.turn_elapsed() {
+                    Some(elapsed) => format!("{} · {elapsed}", self.state.lang.tr("msg.running")),
+                    None => self.state.lang.tr("msg.running").to_string(),
+                },
+                theme::body_size_at(self.state.draft().global.general.content_font_size),
+                theme::muted(),
+            ))
+    }
+
+    /// One reasoning disclosure: one Thinking segment of a turn.
+    ///
+    /// A turn can think, call a tool and think again, so the row names the
+    /// segment it draws (`part`) as well as the message row. The segment's text
+    /// is sliced from the message by the timeline; `live` marks the one the
+    /// stream is still writing, which paints its newest window.
     fn think_row(
         &self,
         index: usize,
-        message: &ChatMessage,
+        part: usize,
+        text: &str,
+        live: bool,
         chrome: &RowChrome<'_>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -2981,12 +3262,22 @@ impl Shell {
         // is the part of a turn a reader opens on purpose - and a policy
         // without the preview still keeps the one-line summary here rather
         // than hiding it, so a collapsed row always says what it is about.
-        let open = self.think_open.contains(&index);
-        let summary = think_summary(&message.reasoning);
-        let group = SharedString::from(format!("think-{index}"));
+        let key = (index, part);
+        let open = self.think_open.contains(&key);
+        // A live row says where the thought IS; a settled one keeps the line it
+        // started on.
+        let summary = if live {
+            think_summary_live(text)
+        } else {
+            think_summary(text)
+        };
+        let group = SharedString::from(format!("think-{index}-{part}"));
         let row = div()
-            .debug_selector(move || format!("think-row-{index}"))
-            .id(SharedString::from(format!("think-row-{index}")))
+            .debug_selector({
+                let selector = think_selector("think-row", index, part);
+                move || selector.clone()
+            })
+            .id(SharedString::from(format!("think-row-{index}-{part}")))
             .group(group.clone())
             .flex_shrink_0()
             .h(px(row_h))
@@ -2997,7 +3288,10 @@ impl Shell {
             .cursor_pointer()
             .child(
                 div()
-                    .debug_selector(move || format!("think-leading-{index}"))
+                    .debug_selector({
+                        let selector = think_selector("think-leading", index, part);
+                        move || selector.clone()
+                    })
                     .relative()
                     .flex_none()
                     .w(px(theme::DISCLOSURE_LEADING))
@@ -3035,7 +3329,10 @@ impl Shell {
             )
             .child(
                 txt(self.state.lang.tr("msg.thinking"), small, quiet)
-                    .debug_selector(move || format!("think-title-{index}"))
+                    .debug_selector({
+                        let selector = think_selector("think-title", index, part);
+                        move || selector.clone()
+                    })
                     .flex_none()
                     .line_height(px(row_h))
                     .group_hover(group.clone(), |style| style.text_color(rgb(hover))),
@@ -3048,7 +3345,10 @@ impl Shell {
         } else {
             row.child(
                 div()
-                    .debug_selector(move || format!("think-dot-{index}"))
+                    .debug_selector({
+                        let selector = think_selector("think-dot", index, part);
+                        move || selector.clone()
+                    })
                     .flex_none()
                     .w(px(2.0))
                     .h(px(2.0))
@@ -3058,7 +3358,10 @@ impl Shell {
             )
             .child(
                 div()
-                    .debug_selector(move || format!("think-summary-{index}"))
+                    .debug_selector({
+                        let selector = think_selector("think-summary", index, part);
+                        move || selector.clone()
+                    })
                     .flex_1()
                     .min_w_0()
                     .overflow_hidden()
@@ -3076,22 +3379,30 @@ impl Shell {
             .flex()
             .flex_col()
             .child(row.on_click(cx.listener(move |this, _event, _window, cx| {
-                if !this.think_open.remove(&index) {
-                    this.think_open.insert(index);
+                if !this.think_open.remove(&key) {
+                    this.think_open.insert(key);
                 }
                 cx.notify();
             })));
         if open {
             root = root.child(
                 div()
-                    .debug_selector(move || format!("think-body-{index}"))
+                    .debug_selector({
+                        let selector = think_selector("think-body", index, part);
+                        move || selector.clone()
+                    })
                     .min_w_0()
                     .pt(px(4.0))
                     .pb(px(4.0))
                     .pl(px(22.0 + theme::delta_at(content)))
                     .child(
                         {
-                            let body = self.body_state(THINK, &message.reasoning, cx);
+                            // A live thought paints its newest window; a
+                            // settled one paints its complete text.
+                            let window = if live { think_stream_tail(text) } else { None };
+                            let painted = window.as_deref().unwrap_or(text);
+                            let body =
+                                self.body_state(BodySlot::Segment(THINK, index, part), painted, cx);
                             TextView::new(&body)
                         }
                         .on_link_click(open_link)
@@ -3757,14 +4068,33 @@ impl Shell {
                 } else {
                     args.clone()
                 };
-                row = row.child(self.step_block("IN", &in_text, lang_key, true, chrome, cx));
+                row = row.child(self.step_block(
+                    StepBody {
+                        slot: BodySlot::Step {
+                            message: message_index,
+                            tool: tool_index,
+                            out: false,
+                        },
+                        label: "IN",
+                        text: &in_text,
+                        lang: lang_key,
+                    },
+                    chrome,
+                    cx,
+                ));
             }
             if let Some(output) = output.clone() {
                 row = row.child(self.step_block(
-                    "OUT",
-                    &output_body(lang, &output),
-                    None,
-                    false,
+                    StepBody {
+                        slot: BodySlot::Step {
+                            message: message_index,
+                            tool: tool_index,
+                            out: true,
+                        },
+                        label: "OUT",
+                        text: &output_body(lang, &output),
+                        lang: None,
+                    },
                     chrome,
                     cx,
                 ));
@@ -3777,13 +4107,19 @@ impl Shell {
     /// highlighted as code when the step carries a language, plain otherwise.
     fn step_block(
         &self,
-        label: &'static str,
-        text: &str,
-        lang: Option<&'static str>,
-        is_input: bool,
+        body: StepBody<'_>,
         chrome: &RowChrome<'_>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let StepBody {
+            slot,
+            label,
+            text,
+            lang,
+        } = body;
+        // The slot already says which body this is, so the tone follows it
+        // rather than a second flag that could disagree.
+        let is_input = matches!(slot, BodySlot::Step { out: false, .. });
         let payload = text.to_string();
         let copy_id = format!("step-copy-{label}-{}-{is_input}", payload.len());
 
@@ -3823,7 +4159,7 @@ impl Shell {
             );
         let body = match lang {
             Some(lang) => {
-                let body = self.body_state(STEP, &format!("```{lang}\n{text}\n```"), cx);
+                let body = self.body_state(slot, &format!("```{lang}\n{text}\n```"), cx);
                 TextView::new(&body)
             }
             .style(chrome.style.clone())
@@ -3866,9 +4202,11 @@ impl Shell {
 
 #[cfg(test)]
 mod tests {
-    use super::{output_body, process_summary};
+    use super::{
+        output_body, process_summary, think_stream_tail, think_summary_live, timeline_is_consistent,
+    };
     use crate::i18n::Lang;
-    use crate::model::ToolEvent;
+    use crate::model::{ChatMessage, ToolEvent, TurnPart};
 
     fn step(name: &str) -> ToolEvent {
         ToolEvent {
@@ -3878,6 +4216,132 @@ mod tests {
             ms: None,
             at: None,
         }
+    }
+
+    /// A live reasoning row says where the thought is, not where it started: the
+    /// current paragraph's first line, with the emphasis markers stripped.
+    #[test]
+    fn a_live_summary_follows_the_current_paragraph() {
+        assert_eq!(
+            think_summary_live("first line\nstill the first paragraph"),
+            "first line"
+        );
+        assert_eq!(
+            think_summary_live("opening line\n\n**second** paragraph starts here\nand continues"),
+            "second paragraph starts here"
+        );
+        assert_eq!(think_summary_live(""), "", "an empty block has no summary");
+        assert_eq!(
+            think_summary_live("one line\n\nanother\n"),
+            "another",
+            "the newest paragraph wins"
+        );
+    }
+
+    /// A timeline is only used while its byte lengths describe the bodies it
+    /// slices: a redacted or hand-edited message falls back to the older order
+    /// instead of reading the wrong range.
+    #[test]
+    fn a_timeline_that_does_not_add_up_is_not_used() {
+        let mut message = ChatMessage::assistant();
+        message.reasoning = "think".to_string();
+        message.text = "say".to_string();
+        message.parts = vec![TurnPart::Thinking(4), TurnPart::Content(2)];
+        assert!(
+            !timeline_is_consistent(&message),
+            "lengths that disagree are refused"
+        );
+        message.parts = vec![TurnPart::Thinking(5), TurnPart::Content(3)];
+        assert!(
+            timeline_is_consistent(&message),
+            "the recorded lengths describe the bodies"
+        );
+        message.parts.push(TurnPart::Tool(0));
+        assert!(
+            !timeline_is_consistent(&message),
+            "a tool part with no tool is refused"
+        );
+        assert!(
+            !timeline_is_consistent(&ChatMessage::assistant()),
+            "no timeline, no claim"
+        );
+    }
+    /// A body that already fits is painted whole: the cap never cuts a short
+    /// thought.
+    #[test]
+    fn a_short_reasoning_body_is_painted_whole() {
+        assert!(think_stream_tail("weigh the options").is_none());
+        let just_fits = "x".repeat(super::THINK_STREAM_WINDOW);
+        assert!(think_stream_tail(&just_fits).is_none());
+    }
+
+    /// A long body paints a bounded tail, and the tail is the END of the
+    /// thought: the newest text is what a following reader is looking at.
+    #[test]
+    fn a_long_reasoning_body_paints_a_bounded_tail() {
+        let body: String = (0..40_000)
+            .map(|i| format!("line {i} of a long thought\n"))
+            .collect();
+        let tail = think_stream_tail(&body).expect("the body is windowed");
+        assert!(
+            tail.len() <= super::THINK_STREAM_WINDOW * 2,
+            "the window is bounded: {} bytes",
+            tail.len()
+        );
+        assert!(
+            body.ends_with(tail.as_ref()),
+            "the window is the END of the body"
+        );
+    }
+
+    /// The cut lands on a line boundary, so the window does not open with half
+    /// of a marker or half of a multi-byte character.
+    #[test]
+    fn the_cut_lands_on_a_character_and_line_boundary() {
+        let body = "列车进站，车门打开。车厢里坐着一个女孩。\n".repeat(4_000);
+        let tail = think_stream_tail(&body).expect("the body is windowed");
+        let head: String = tail.chars().take(8).collect();
+        assert!(
+            tail.starts_with("列车进站"),
+            "the window starts at a line: {head:?}"
+        );
+    }
+
+    /// A cut inside a code fence keeps the opaque region opaque: the window
+    /// opens with an opener, because otherwise the closing fence would swallow
+    /// the rest of the thought.
+    #[test]
+    fn a_cut_inside_a_code_fence_keeps_the_code_block() {
+        let prose = "thinking about the shape\n".repeat(300);
+        let body = format!(
+            "{prose}```rust\n{}",
+            "let total = rows.sum();\n".repeat(900)
+        );
+        let tail = think_stream_tail(&body).expect("the body is windowed");
+        assert!(
+            tail.starts_with("```\n"),
+            "the window opens with a fence: {:?}",
+            &tail[..12]
+        );
+    }
+
+    /// Between two lengths inside one window step, the later tail EXTENDS the
+    /// earlier one: that is what lets the kit append-parse instead of
+    /// re-parsing the window on every delta.
+    #[test]
+    fn the_window_extends_within_a_step_and_slides_between_steps() {
+        let body: String = (0..30_000).map(|i| format!("word{i} ")).collect();
+        let early = think_stream_tail(&body[..20_000]).expect("windowed");
+        let later = think_stream_tail(&body[..20_100]).expect("windowed");
+        assert!(
+            later.as_ref().starts_with(early.as_ref()),
+            "a delta inside one step extends the painted text"
+        );
+        let slid = think_stream_tail(&body[..24_000]).expect("windowed");
+        assert!(
+            !slid.as_ref().starts_with(early.as_ref()),
+            "a step boundary slides the window"
+        );
     }
 
     /// The measured failure this round explains: ping under Standard/PTC with no

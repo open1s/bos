@@ -1348,6 +1348,9 @@ fn message_schema() -> Arc<Schema> {
         // Appended with steering; a file written before it decodes every row
         // as a turn prompt, which is what those rows were.
         Field::new("steering", DataType::Boolean, false),
+        // Appended with the turn timeline; an older file decodes every row with
+        // no segments, which draws in the older order.
+        Field::new("parts", DataType::Utf8, false),
     ]))
 }
 
@@ -1465,6 +1468,7 @@ fn message_batch(messages: &[ChatMessage], base: usize) -> Result<RecordBatch> {
     let mut tools = StringBuilder::new();
     let mut images = StringBuilder::new();
     let mut steering = BooleanBuilder::new();
+    let mut parts = StringBuilder::new();
     for (offset, message) in messages.iter().enumerate() {
         index.append_value((base + offset) as i64);
         role.append_value(match message.role {
@@ -1484,6 +1488,7 @@ fn message_batch(messages: &[ChatMessage], base: usize) -> Result<RecordBatch> {
         tools.append_value(serde_json::to_string(&message.tools)?);
         images.append_value(serde_json::to_string(&message.images)?);
         steering.append_value(message.steering);
+        parts.append_value(serde_json::to_string(&message.parts)?);
     }
     Ok(RecordBatch::try_new(
         message_schema(),
@@ -1497,6 +1502,7 @@ fn message_batch(messages: &[ChatMessage], base: usize) -> Result<RecordBatch> {
             Arc::new(tools.finish()),
             Arc::new(images.finish()),
             Arc::new(steering.finish()),
+            Arc::new(parts.finish()),
         ],
     )?)
 }
@@ -1565,6 +1571,9 @@ fn decode_messages(batch: &RecordBatch) -> Result<Vec<ChatMessage>> {
     let steering = (batch.num_columns() > 8)
         .then(|| column::<BooleanArray>(batch, 8))
         .transpose()?;
+    let parts = (batch.num_columns() > 9)
+        .then(|| column::<StringArray>(batch, 9))
+        .transpose()?;
     let mut rows = Vec::with_capacity(batch.num_rows());
     for index in 0..batch.num_rows() {
         rows.push(ChatMessage {
@@ -1587,6 +1596,11 @@ fn decode_messages(batch: &RecordBatch) -> Result<Vec<ChatMessage>> {
                 .then(|| serde_json::from_str::<MessageMeta>(meta.value(index)).ok())
                 .flatten(),
             steering: steering.as_ref().is_some_and(|column| column.value(index)),
+            // A file written before the timeline had no column: its rows draw
+            // in the older reasoning-then-text-then-steps order.
+            parts: parts
+                .and_then(|column| serde_json::from_str(column.value(index)).ok())
+                .unwrap_or_default(),
         });
     }
     Ok(rows)
@@ -1623,7 +1637,7 @@ fn column<T: 'static>(batch: &RecordBatch, index: usize) -> Result<&T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ToolEvent;
+    use crate::model::{ToolEvent, TurnPart};
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("bsh-history-{name}-{}", std::process::id()));
@@ -1661,6 +1675,20 @@ mod tests {
             // An even index is a user row; make one of them a steering row so
             // the round trip proves the flag survives the log.
             steering: index == 2,
+            // An assistant row carries a timeline so the round trip proves the
+            // ORDER travels with the log, not only the text.
+            parts: if index.is_multiple_of(2) {
+                Vec::new()
+            } else {
+                let mut parts = vec![
+                    TurnPart::Thinking(format!("why {index}").len()),
+                    TurnPart::Content(format!("turn {index} text").len()),
+                ];
+                if index.is_multiple_of(3) {
+                    parts.push(TurnPart::Tool(0));
+                }
+                parts
+            },
         }
     }
 
@@ -1835,6 +1863,10 @@ mod tests {
                 assert_eq!(
                     row.steering, expected.steering,
                     "the steering flag survives the log"
+                );
+                assert_eq!(
+                    row.parts, expected.parts,
+                    "the turn timeline survives the log"
                 );
             }
         }

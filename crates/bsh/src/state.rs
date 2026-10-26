@@ -3060,12 +3060,17 @@ impl AppState {
                 AgentEvent::Text(text) => {
                     if let Some(message) = session.messages.last_mut() {
                         message.text.push_str(&text);
+                        // The timeline, so the transcript draws the reply in the
+                        // order it arrived instead of all thinking, then all text,
+                        // then all steps.
+                        message.note_content(text.len());
                         note_first_output(message, at);
                     }
                 }
                 AgentEvent::Reasoning(text) => {
                     if let Some(message) = session.messages.last_mut() {
                         message.reasoning.push_str(&text);
+                        message.note_thinking(text.len());
                         note_first_output(message, at);
                     }
                 }
@@ -3078,6 +3083,7 @@ impl AppState {
                             ms: None,
                             at: Some(at),
                         });
+                        message.note_tool();
                         note_first_output(message, at);
                     }
                 }

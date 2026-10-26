@@ -26842,7 +26842,7 @@ fn a_real_stream_paints_its_reasoning_and_ends_cleanly(cx: &mut TestAppContext) 
     let body: &'static str = Box::leak(format!("think-body-{index}").into_boxed_str());
     cx.update(|_, cx| {
         shell.update(cx, |this, cx| {
-            this.think_open.insert(index);
+            this.think_open.insert((index, 0));
             cx.notify();
         });
     });
@@ -26960,6 +26960,9 @@ fn the_frame_trace_is_off_by_default_and_writes_one_line_per_frame(cx: &mut Test
         for key in [
             "frame=",
             " dt_ms=",
+            " frame_ms=",
+            " deltas=",
+            " body=",
             " tab=chat",
             " streaming=",
             " offset=",
@@ -26972,8 +26975,8 @@ fn the_frame_trace_is_off_by_default_and_writes_one_line_per_frame(cx: &mut Test
         }
         assert_eq!(
             line.split(' ').count(),
-            9,
-            "the line is bounded to nine key=value fields: {line}"
+            12,
+            "the line is bounded to twelve key=value fields: {line}"
         );
     }
     let frames: Vec<u64> = lines
@@ -26993,4 +26996,534 @@ fn the_frame_trace_is_off_by_default_and_writes_one_line_per_frame(cx: &mut Test
         "frame numbers increase: {frames:?}"
     );
     let _ = std::fs::remove_file(&path);
+}
+
+/// Split a streamed reply into deltas of a few KB, the way a provider streams
+/// one, and return the chunk the test sends.
+fn reasoning_chunk() -> String {
+    let base = "We need to consider the shape of the transcript row. The body is a markdown document, so every delta re-enters the parse path.\n\n```rust\nlet total = rows.iter().map(|row| row.height()).sum::<f32>();\n```\n\n";
+    base.repeat(4)
+}
+
+/// The MEDIAN of a set of frame times, which a single slow frame cannot move.
+fn median_ms(mut samples: Vec<f64>) -> f64 {
+    samples.sort_by(|a, b| a.partial_cmp(b).expect("finite frame times"));
+    let middle = samples.len() / 2;
+    if samples.len().is_multiple_of(2) {
+        (samples[middle - 1] + samples[middle]) / 2.0
+    } else {
+        samples[middle]
+    }
+}
+
+/// A live turn whose reasoning grows past 200 KB must keep its PER-DELTA cost
+/// flat, and must not re-parse the whole thought for every delta.
+///
+/// Measured on the old body cache (keyed by a hash of the text) at 2 / 20 /
+/// 200 KB: 4 / 34 / 110 TextViewState parses for 4 / 30 / 110 deltas, ~2 draws
+/// per delta once the body passed the kit's 4 KB synchronous-parse limit, and
+/// 3.1 / 6.7 / 285.1 ms per painted frame (worst 1074.7 ms). Every delta built a
+/// fresh state and re-parsed and re-laid-out the whole body - the stutter.
+#[gpui::test]
+fn a_streaming_long_thought_keeps_its_frame_cost_flat(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("long-thought", 2);
+        let id = state.active_id.clone().expect("an active session");
+        state
+            .begin_turn_in(&id, "think hard about this")
+            .expect("a live turn");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let last = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .active_session()
+            .expect("a session")
+            .messages
+            .len()
+            - 1
+    });
+    // The owner's repro shape: the thinking row EXPANDED and follow-tail ON.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.think_open.insert((last, 0));
+            this.following_tail = true;
+            cx.notify();
+        });
+    });
+    let (tx, rx) = async_channel::unbounded();
+    cx.update(|_, cx| {
+        let id = shell
+            .read(cx)
+            .state
+            .active_id
+            .clone()
+            .expect("an active session");
+        shell.update(cx, |this, cx| this.pump_for_test(id, rx, cx));
+    });
+    for _ in 0..4 {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+
+    let chunk = reasoning_chunk();
+    let chunk_len = chunk.len();
+    // One tick = one delta folded, then one painted frame timed. The pump, the
+    // markdown parse and the tail-scroll settle get their chance to land, which
+    // is the worst case a real stream can produce.
+    let tick = |cx: &mut VisualTestContext| -> f64 {
+        tx.try_send(crate::runner::AgentEvent::Reasoning(chunk.clone()))
+            .expect("the channel accepts");
+        cx.run_until_parked();
+        let started = std::time::Instant::now();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        started.elapsed().as_secs_f64() * 1e3
+    };
+
+    let mut sent = 0usize;
+    let mut small: Vec<f64> = Vec::new();
+    while sent < 2 * 1024 {
+        small.push(tick(cx));
+        sent += chunk_len;
+    }
+    let small_ms = median_ms(small);
+    // The first delta is what creates the body's parsed state; from here on a
+    // growing thought must not create another one.
+    let parsed_before = crate::ui::shell::bodies_parsed();
+
+    // Grow the same body to the owner's size: > 200 KB, several thousand
+    // pixels tall, with a code fence in it.
+    let mut huge: Vec<f64> = Vec::new();
+    while sent < 205 * 1024 {
+        // Every delta is sampled; the median below makes a single window-slide
+        // frame irrelevant without excusing a curve that follows the body.
+        huge.push(tick(cx));
+        sent += chunk_len;
+    }
+    let huge_ms = median_ms(huge.clone());
+    let (bytes, height) = cx.update(|_, cx| {
+        let this = shell.read(cx);
+        let message = this
+            .state
+            .active_session()
+            .expect("a session")
+            .messages
+            .last()
+            .expect("a row");
+        (
+            message.reasoning.len(),
+            f32::from(this.transcript_scroll.max_offset().y),
+        )
+    });
+    eprintln!("LONG THOUGHT small={small_ms:.2}ms huge={huge_ms:.2}ms bytes={bytes} height={height:.0}px parsed={parsed_before}->{}", crate::ui::shell::bodies_parsed());
+
+    assert!(
+        bytes > 200 * 1024,
+        "the repro reaches the owner's size: {bytes} bytes"
+    );
+    // The painted row is the streaming window, not the 200 KB body: the full
+    // body lays out to six figures of pixels.
+    assert!(
+        height < 20_000.0,
+        "a streaming thought paints a bounded window, not the whole body: {height:.0}px"
+    );
+    // One parse, not one per delta: the body keeps its parsed document and
+    // appends only the new tail.
+    assert_eq!(
+        crate::ui::shell::bodies_parsed(),
+        parsed_before,
+        "a streaming thought must reuse its parsed body instead of rebuilding it per delta"
+    );
+    // Frame cost must not follow the body. The margin is generous: the ratio
+    // to the 2 KB frame plus an absolute allowance, because a debug build's
+    // paint time moves by a millisecond between runs.
+    assert!(
+        huge_ms <= small_ms * 3.0 + 6.0,
+        "a 200 KB thought painted {huge_ms:.2}ms a frame against {small_ms:.2}ms at 2 KB"
+    );
+
+    // Done: the COMPLETE thought is painted again, with nothing truncated.
+    tx.try_send(crate::runner::AgentEvent::Done)
+        .expect("the channel accepts");
+    cx.run_until_parked();
+    for _ in 0..4 {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+    let reasoning = cx.update(|_, cx| {
+        let this = shell.read(cx);
+        this.state
+            .active_session()
+            .expect("a session")
+            .messages
+            .last()
+            .expect("a row")
+            .reasoning
+            .clone()
+    });
+    assert_eq!(reasoning.len(), bytes, "the turn's own text is never cut");
+    let painted = cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.body_state(
+                crate::ui::shell::BodySlot::Segment(crate::ui::transcript::THINK, last, 0),
+                &reasoning,
+                cx,
+            )
+        })
+    });
+    draw_until(cx, "the complete thought is painted", 60, |cx| {
+        cx.update(|_, cx| painted.read(cx).rendered_text().source() == reasoning)
+    });
+    let painted_source = cx.update(|_, cx| painted.read(cx).rendered_text().source().len());
+    assert_eq!(
+        painted_source,
+        reasoning.len(),
+        "after Done the painted markdown body is the complete thought"
+    );
+    // And the row is the whole thought again, not the streaming window.
+    draw_until(cx, "the settled row is the whole thought", 60, |cx| {
+        cx.update(|_, cx| f32::from(shell.read(cx).transcript_scroll.max_offset().y) > 20_000.0)
+    });
+}
+
+/// A burst of stream deltas that arrives inside one frame is ONE relayout: the
+/// pump drains everything already queued before it notifies, and the trace's
+/// `deltas` field names the batch size. Five deltas and fifty deltas cost the
+/// same drawings, which is the amplification guard.
+#[gpui::test]
+fn a_burst_of_stream_deltas_is_one_relayout(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("burst-deltas", 2);
+        let id = state.active_id.clone().expect("an active session");
+        state
+            .begin_turn_in(&id, "think hard about this")
+            .expect("a live turn");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let last = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .active_session()
+            .expect("a session")
+            .messages
+            .len()
+            - 1
+    });
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.think_open.insert((last, 0));
+            this.following_tail = true;
+            cx.notify();
+        });
+    });
+    let (tx, rx) = async_channel::unbounded();
+    cx.update(|_, cx| {
+        let id = shell
+            .read(cx)
+            .state
+            .active_id
+            .clone()
+            .expect("an active session");
+        shell.update(cx, |this, cx| this.pump_for_test(id, rx, cx));
+    });
+    for _ in 0..4 {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+    let path = std::env::temp_dir().join(format!("bsh-burst-{}.log", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.trace_frames_to(&path).expect("the trace opens")
+        });
+    });
+    let chunk = reasoning_chunk();
+    // Send a burst with NO yield between the sends, then let the pump run once
+    // and paint. The frames this costs are the whole cost of the burst.
+    let burst = |cx: &mut VisualTestContext, count: usize| -> u64 {
+        for _ in 0..count {
+            tx.try_send(crate::runner::AgentEvent::Reasoning(chunk.clone()))
+                .expect("the channel accepts");
+        }
+        let before = cx.update(|_, cx| shell.read(cx).frame_no);
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|_, cx| shell.read(cx).frame_no) - before
+    };
+    let five = burst(cx, 5);
+    // The owner's shape: 200+ deltas into one long thought.
+    let many = burst(cx, 250);
+    let text = std::fs::read_to_string(&path).expect("the trace is readable");
+    let max_deltas = text
+        .lines()
+        .filter_map(|line| {
+            line.split(' ')
+                .find_map(|field| field.strip_prefix("deltas="))
+                .and_then(|value| value.parse::<usize>().ok())
+        })
+        .max()
+        .expect("the trace records deltas");
+    let body = text
+        .lines()
+        .filter_map(|line| {
+            line.split(' ')
+                .find_map(|field| field.strip_prefix("body="))
+                .and_then(|value| value.parse::<usize>().ok())
+        })
+        .max()
+        .expect("the trace records the body size");
+    eprintln!("BURST five={five} many={many} max_deltas={max_deltas} body={body}");
+    assert!(
+        max_deltas >= 250,
+        "a 250-delta burst is folded as ONE batch, not replayed per delta: {max_deltas}"
+    );
+    assert!(
+        body > 0,
+        "the trace reports the live reasoning body: {body}"
+    );
+    assert!(
+        many <= five + 2,
+        "fifty times the deltas in one burst must not cost more draws: {five} -> {many}"
+    );
+    assert!(
+        many <= 6,
+        "a burst paints a bounded number of frames: {many}"
+    );
+    // One draw per delta would make the 250-delta burst paint 250 frames.
+    assert!(
+        many * 5 <= 250,
+        "250 deltas must not cost a draw each: they painted {many} frames"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A turn that thought, wrote, called a tool and thought again draws those
+/// segments in that order - DSH's chronological running turn - instead of one
+/// Think block above the reply and a step list below it.
+///
+/// While the turn is LIVE its steps stay ungrouped (the reference's live
+/// process detail); once it settles, the default collapsed policy folds the
+/// steps into one disclosure AT THE POSITION of the first step, so the second
+/// thought still follows it.
+#[gpui::test]
+fn a_turn_draws_thinking_content_and_tools_in_the_order_they_arrived(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("turn-timeline", 1);
+        let id = state.active_id.clone().expect("a session");
+        state
+            .begin_turn_in(&id, "plan the change")
+            .expect("a live turn");
+        let first = "First: read the row.\n\n";
+        let reply = "Here is the reply.";
+        let second = "Second: after the tool.";
+        if let Some(message) = state
+            .store
+            .session_mut(&id)
+            .and_then(|session| session.messages.last_mut())
+        {
+            message.reasoning = format!("{first}{second}");
+            message.text = reply.to_string();
+            message.tools = vec![ToolEvent {
+                name: "bash".to_string(),
+                args: "{\"command\": \"ls\"}".to_string(),
+                output: Some("done".to_string()),
+                ms: Some(40),
+                at: Some(crate::state::now_ms()),
+            }];
+            message.parts = vec![
+                crate::model::TurnPart::Thinking(first.len()),
+                crate::model::TurnPart::Content(reply.len()),
+                crate::model::TurnPart::Tool(0),
+                crate::model::TurnPart::Thinking(second.len()),
+            ];
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    for _ in 0..3 {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+    let y = |cx: &mut VisualTestContext, selector: &'static str| -> f32 {
+        cx.debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} renders"))
+            .origin
+            .y
+            .into()
+    };
+    let thought_one = y(cx, "think-row-3");
+    let reply = y(cx, "msg-part-3-1");
+    let tool = y(cx, "tool-3-0");
+    let thought_two = y(cx, "think-row-3-3");
+    assert!(
+        thought_one < reply,
+        "the first thought is above the reply: {thought_one} vs {reply}"
+    );
+    assert!(
+        reply < tool,
+        "the reply sits above the tool it introduced: {reply} vs {tool}"
+    );
+    assert!(
+        tool < thought_two,
+        "the second thought follows the tool: {tool} vs {thought_two}"
+    );
+
+    // Done: the default collapsed policy folds the steps into ONE disclosure,
+    // and that disclosure keeps the step's place in the order.
+    let id = cx.update(|_, cx| shell.read(cx).state.active_id.clone().expect("a session"));
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.state.apply_event(&id, crate::runner::AgentEvent::Done);
+        });
+    });
+    for _ in 0..3 {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+    assert!(
+        cx.debug_bounds("tool-3-0").is_none(),
+        "a settled turn folds its steps under one disclosure"
+    );
+    let folded_reply = y(cx, "msg-part-3-1");
+    let group = y(cx, "process-row-3");
+    let folded_thought = y(cx, "think-row-3-3");
+    assert!(
+        folded_reply < group,
+        "the folded process sits where the first step was: {folded_reply} vs {group}"
+    );
+    assert!(
+        group < folded_thought,
+        "the second thought still follows the folded steps: {group} vs {folded_thought}"
+    );
+}
+/// The stream records its timeline as the events land: reasoning, text, a tool
+/// call, then reasoning again are four segments in that order, so a restored
+/// session draws the same chronology the live turn did.
+#[test]
+fn a_stream_records_the_order_of_its_parts() {
+    let mut state = AppState::with_store(scratch_store("stream-timeline"));
+    let id = state.active_id.clone().expect("a session");
+    state.begin_turn_in(&id, "go").expect("a live turn");
+    state.apply_event(
+        &id,
+        crate::runner::AgentEvent::Reasoning("think".to_string()),
+    );
+    state.apply_event(&id, crate::runner::AgentEvent::Text("say".to_string()));
+    state.apply_event(
+        &id,
+        crate::runner::AgentEvent::ToolCall {
+            name: "bash".to_string(),
+            args: "{}".to_string(),
+        },
+    );
+    state.apply_event(
+        &id,
+        crate::runner::AgentEvent::Reasoning("more".to_string()),
+    );
+    let message = state
+        .active_session()
+        .expect("a session")
+        .messages
+        .last()
+        .expect("a row");
+    assert_eq!(message.reasoning, "thinkmore");
+    assert_eq!(message.text, "say");
+    assert_eq!(
+        message.parts,
+        vec![
+            crate::model::TurnPart::Thinking(5),
+            crate::model::TurnPart::Content(3),
+            crate::model::TurnPart::Tool(0),
+            crate::model::TurnPart::Thinking(4),
+        ],
+        "the events keep their arrival order"
+    );
+}
+
+/// PROBE ONLY: what does a streamed turn with tools look like?
+#[gpui::test]
+fn probe_tool_timeline(cx: &mut TestAppContext) {
+    let (shell, cx, tx) = pumping_live_turn(cx, "probe-tools");
+    let index = cx.update(|_, cx| {
+        shell.read(cx).state.active_session().expect("a session").messages.len() - 1
+    });
+    let mut dump = |cx: &mut VisualTestContext, label: &str| {
+        let count = cx.update(|_, cx| shell.read(cx).state.active_session().expect("a session").messages.len());
+        let mut present = String::new();
+        for i in 0..count {
+            for name in ["think-row", "tool-head"] {
+                let sel: &'static str = Box::leak(format!("{name}-{i}").into_boxed_str());
+                if cx.debug_bounds(sel).is_some() { present.push_str(&format!(" {sel}")); }
+            }
+            let sel: &'static str = Box::leak(format!("tool-{i}-0").into_boxed_str());
+            if cx.debug_bounds(sel).is_some() { present.push_str(&format!(" {sel}")); }
+        }
+        let transcript = cx.debug_bounds("transcript");
+        eprintln!("PRESENT index={index} count={count} transcript={:?}{present}", transcript.map(|b| (f32::from(b.origin.y), f32::from(b.size.height))));
+        let selectors: Vec<String> = vec![
+            format!("think-row-{index}"),
+            format!("think-body-{index}"),
+            format!("tool-{index}-0"),
+            format!("tool-{index}-1"),
+            format!("tool-head-{index}-0"),
+            format!("process-row-{index}"),
+            format!("msg-part-{index}-0"),
+            format!("msg-part-{index}-1"),
+            format!("msg-part-{index}-2"),
+            format!("msg-part-{index}-3"),
+        ];
+        let mut out = String::new();
+        for selector in selectors {
+            let leaked: &'static str = Box::leak(selector.into_boxed_str());
+            if let Some(bounds) = cx.debug_bounds(leaked) {
+                out.push_str(&format!("\n  {leaked}: y={:.0} h={:.0}", f32::from(bounds.origin.y), f32::from(bounds.size.height)));
+            }
+        }
+        let (parts, tools, text, reasoning) = cx.update(|_, cx| {
+            let this = shell.read(cx);
+            let m = this.state.active_session().expect("a session").messages.last().expect("a row");
+            (format!("{:?}", m.parts), m.tools.len(), m.text.clone(), m.reasoning.clone())
+        });
+        eprintln!("DUMP {label}: parts={parts} tools={tools} text={text:?} reasoning={reasoning:?}{out}");
+    };
+    for _ in 0..3 { cx.update(|window, cx| window.draw(cx).clear(cx)); }
+
+    let steps = [
+        crate::runner::AgentEvent::Reasoning("I should look at the crate layout.\n\n".to_string()),
+        crate::runner::AgentEvent::ToolCall {
+            name: "read_file".to_string(),
+            args: "{\"path\":\"AGENTS.md\"}".to_string(),
+        },
+        crate::runner::AgentEvent::ToolResult {
+            name: "read_file".to_string(),
+            output: "AGENTS contents".to_string(),
+            ms: 40,
+        },
+        crate::runner::AgentEvent::Reasoning("The layout is clear now.\n\n".to_string()),
+        crate::runner::AgentEvent::ToolCall {
+            name: "bash".to_string(),
+            args: "{\"command\":\"cargo test -p bsh\"}".to_string(),
+        },
+        crate::runner::AgentEvent::ToolResult {
+            name: "bash".to_string(),
+            output: "ok".to_string(),
+            ms: 900,
+        },
+        crate::runner::AgentEvent::Text("The tests pass.".to_string()),
+    ];
+    for (step, event) in steps.into_iter().enumerate() {
+        tx.try_send(event).expect("send");
+        cx.run_until_parked();
+        for _ in 0..2 { cx.update(|window, cx| window.draw(cx).clear(cx)); }
+        dump(cx, &format!("after event {step}"));
+    }
+    tx.try_send(crate::runner::AgentEvent::Done).expect("done");
+    cx.run_until_parked();
+    for _ in 0..3 { cx.update(|window, cx| window.draw(cx).clear(cx)); }
+    dump(cx, "after Done");
 }

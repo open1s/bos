@@ -58,9 +58,42 @@ pub(crate) fn bodies_parsed() -> usize {
     BODIES_PARSED.with(|parsed| parsed.get())
 }
 
+/// Which painted body a parsed markdown state belongs to.
+///
+/// A body is identified by the SLOT it is painted in, not by its bytes. The
+/// cache used to key on a hash of the text, which meant a streaming body got a
+/// new key on every delta: the entry never matched, so each frame built a fresh
+/// [TextViewState] and re-parsed the whole body. A slot key makes a growing body
+/// hit one entry, so the kit's own append path runs - parse only the tail block,
+/// splice only the appended blocks into the list, keep every measured height -
+/// instead of re-parsing and re-measuring everything the reader can see.
+///
+/// The trade: two rows that happen to carry identical text now parse twice
+/// instead of sharing one state. Bodies are identified by where they are
+/// painted, and a row is a cheap thing to keep a parse for.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) enum BodySlot {
+    /// A message-level body: the kind tag (`BODY`, `THINK`, `COMPACTION`) and
+    /// the index of the message row the body is painted in.
+    Row(u8, usize),
+    /// A tool step's code body: the message index, the tool index within it,
+    /// and whether this is the step's output rather than its arguments.
+    Step {
+        /// The message row the step sits in.
+        message: usize,
+        /// The tool call's index within that row.
+        tool: usize,
+        /// Whether this body is the step's output (rather than its call).
+        out: bool,
+    },
+    /// One segment of a turn's timeline: the kind tag, the message row, and the
+    /// part index within it.
+    Segment(u8, usize, usize),
+}
+
 /// The parsed markdown bodies still in use: text, the frame that last drew it,
 /// and the state that parsed it.
-type BodyStates = std::collections::BTreeMap<(u8, u64), (String, u64, Entity<TextViewState>)>;
+type BodyStates = std::collections::BTreeMap<BodySlot, (String, u64, Entity<TextViewState>)>;
 
 /// How many parsed markdown bodies the shell keeps, in age order.
 ///
@@ -467,10 +500,11 @@ pub(crate) struct Shell {
     /// element. It waits for one mounted Chat frame so the rows have bounds,
     /// then the next frame's prepaint applies it.
     pub(crate) audit_jump_to: Option<(usize, u8)>,
-    /// The reasoning disclosures the reader has opened, by message index. A
-    /// session switch closes them all, the way the reference resets a turn's
-    /// disclosure state.
-    pub(crate) think_open: std::collections::HashSet<usize>,
+    /// The reasoning disclosures the reader has opened, keyed by the message
+    /// row and the Thinking segment within it: a turn that thinks, calls a
+    /// tool and thinks again has more than one. A session switch closes them
+    /// all, the way the reference resets a turn's disclosure state.
+    pub(crate) think_open: std::collections::HashSet<(usize, usize)>,
     /// The settled turns whose process group the reader has opened, by message
     /// index. Collapsed is the default; a click is the only way in, and a
     /// session switch closes them with the reasoning disclosures.
@@ -2952,6 +2986,20 @@ impl Shell {
         cx.notify();
     }
 
+    /// Fold one batch's stream-event count into the frame trace.
+    ///
+    /// With the trace off this is a single `Option` match per batch, and no
+    /// per-event bookkeeping: the count is only kept when someone asked for the
+    /// file. It is what turns "one draw per delta?" into a measured line.
+    fn count_stream_deltas(&mut self, deltas: usize) {
+        if deltas == 0 {
+            return;
+        }
+        if let Some(trace) = self.frame_trace.as_mut() {
+            trace.count_deltas(deltas);
+        }
+    }
+
     /// Forward runner events into the state until the turn ends.
     ///
     /// Both spawned tasks are OWNED by the shell (see [Self::keep_task]). That
@@ -3027,20 +3075,46 @@ impl Shell {
         let stream_ticket = self.state.streams.get(&id).copied();
         let events = cx.spawn(async move |this, cx| {
             let mut saw_terminal = false;
-            while let Ok(event) = rx.recv().await {
-                let done = matches!(&event, AgentEvent::Done);
-                let failed = matches!(&event, AgentEvent::Error(_));
-                let terminal = done || failed;
+            while let Ok(first) = rx.recv().await {
+                // Coalesce everything that has already arrived. A delta that
+                // wakes this task with more queued behind it is ONE transcript
+                // relayout and ONE draw, not one per event: the state mutation is
+                // the cost, and repeating it per event inside the same frame
+                // bought nothing a single pass does not.
+                let mut batch = vec![first];
+                loop {
+                    match rx.try_recv() {
+                        Ok(next) => batch.push(next),
+                        Err(async_channel::TryRecvError::Empty) => break,
+                        Err(async_channel::TryRecvError::Closed) => break,
+                    }
+                }
                 let session_id = id.clone();
+                let mut terminal: Option<bool> = None;
+                let mut deltas = 0usize;
                 let _ = this.update(cx, |shell, cx| {
-                    shell.state.apply_event(&session_id, event);
-                    shell.frame_notify("stream-delta", cx);
-                });
-                if terminal {
-                    saw_terminal = true;
+                    for event in batch {
+                        // Events behind the terminal one belong to the next
+                        // turn, exactly as they did when this loop applied one
+                        // event per wake and broke on the terminal.
+                        if terminal.is_some() {
+                            break;
+                        }
+                        let failed = matches!(&event, AgentEvent::Error(_));
+                        let done = matches!(&event, AgentEvent::Done);
+                        shell.state.apply_event(&session_id, event);
+                        if failed || done {
+                            terminal = Some(failed);
+                        } else {
+                            deltas += 1;
+                        }
+                    }
+                    shell.count_stream_deltas(deltas);
                     // The turn is over, so its plan is the session's own now and
-                    // whatever waited behind it can start.
-                    let _ = this.update(cx, |shell, cx| {
+                    // whatever waited behind it can start. Doing this in the same
+                    // update as the deltas means the settled frame is the only
+                    // frame the batch asks for.
+                    if let Some(failed) = terminal {
                         shell.state.finish_plan(&session_id);
                         shell.state.persist_subagents();
                         // A finished turn can append trajectory rows, so a page
@@ -3054,7 +3128,18 @@ impl Shell {
                         } else {
                             shell.continue_goal(&session_id, cx);
                         }
-                    });
+                    }
+                    shell.frame_notify(
+                        if terminal.is_some() {
+                            "stream-ended"
+                        } else {
+                            "stream-delta"
+                        },
+                        cx,
+                    );
+                });
+                if terminal.is_some() {
+                    saw_terminal = true;
                     break;
                 }
             }
@@ -4089,32 +4174,31 @@ impl Shell {
         cx.notify();
     }
 
-    /// The parsed body for one text, created once and reused while it matches.
+    /// The parsed body for one slot, reused while its text matches.
     ///
-    /// The identity is (kind, hash of the text): two bodies with identical text
-    /// genuinely render identically, so sharing one parse costs nothing and
-    /// saves a second one. The stored text is compared on a hit, so a hash
-    /// collision only costs a reparse, never a wrong body.
+    /// The identity is the SLOT, not the text: see [BodySlot]. A streaming body
+    /// occupies one slot for the whole turn, so a growing text hits the same
+    /// entry and [TextViewState::set_text] takes its append path - the parsed
+    /// document and every measured block height survive, and only the new tail
+    /// is parsed. The stored text is compared on every hit, so a body whose whole
+    /// text was replaced (a session switch reusing an index) is reparsed rather
+    /// than painted stale.
     pub(crate) fn body_state(
         &self,
-        kind: u8,
+        slot: BodySlot,
         text: &str,
         cx: &mut Context<Self>,
     ) -> Entity<TextViewState> {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        text.hash(&mut hasher);
-        let key = (kind, hasher.finish());
         let frame = self.frame_no;
         let mut states = self.body_states.borrow_mut();
-        if let Some((snapshot, used, state)) = states.get_mut(&key) {
+        if let Some((snapshot, used, state)) = states.get_mut(&slot) {
             if snapshot != text {
+                // Reuse the snapshot's allocation, then hand the new text
+                // straight to the kit: it recognises a prefix and appends only
+                // the delta instead of re-parsing the whole body.
                 snapshot.clear();
                 snapshot.push_str(text);
-                let next = snapshot.clone();
-                // The streaming path: a body that grew keeps its parsed
-                // document and appends only the new tail.
-                state.update(cx, |state, cx| state.set_text(&next, cx));
+                state.update(cx, |state, cx| state.set_text(text, cx));
             }
             *used = frame;
             return state.clone();
@@ -4122,13 +4206,13 @@ impl Shell {
         #[cfg(test)]
         BODIES_PARSED.with(|parsed| parsed.set(parsed.get() + 1));
         let state = cx.new(|cx| TextViewState::markdown(text, cx));
-        states.insert(key, (text.to_string(), frame, state.clone()));
+        states.insert(slot, (text.to_string(), frame, state.clone()));
         // Bound the cache: drop the body that has gone longest without a paint.
         if states.len() > BODY_STATES_MAX {
             let oldest = states
                 .iter()
                 .min_by_key(|(_, (_, used, _))| *used)
-                .map(|(key, _)| *key);
+                .map(|(slot, _)| *slot);
             if let Some(oldest) = oldest {
                 states.remove(&oldest);
             }
@@ -4250,9 +4334,21 @@ impl Render for Shell {
         // The off-by-default frame trace: one bounded line per painted frame.
         // The None match is the whole cost of an ordinary launch - the facts
         // are only built when an owner asked for the file.
+        //
+        // The frame clock is the trailing canvas this frame appends: it records
+        // how long the frame took at the end of its paint, which the NEXT line
+        // reports as `frame_ms`. Reading the cell before the record below is
+        // what attributes the PREVIOUS frame's work to this line.
+        let frame_clock = self
+            .frame_trace
+            .as_ref()
+            .map(|trace| (std::time::Instant::now(), trace.frame_clock()));
+        let previous_frame_ms = frame_clock.as_ref().map_or(0.0, |(_, clock)| clock.get());
         if let Some(trace) = self.frame_trace.as_mut() {
             let view = f32::from(self.transcript_scroll.bounds().size.height);
             let max = f32::from(self.transcript_scroll.max_offset().y);
+            let streaming = self.state.any_streaming();
+            let session = self.state.active_session();
             trace.record(super::frame_trace::FrameFacts {
                 frame: self.frame_no,
                 tab: match self.state.tab {
@@ -4260,14 +4356,22 @@ impl Render for Shell {
                     crate::state::Tab::Trajectory => "trajectory",
                     crate::state::Tab::Audit => "audit",
                 },
-                streaming: self.state.any_streaming(),
+                streaming,
                 offset: f32::from(self.transcript_scroll.offset().y),
                 max,
                 content: max + view,
-                rows: self
-                    .state
-                    .active_session()
-                    .map_or(0, |session| session.messages.len() + 1),
+                rows: session.map_or(0, |session| session.messages.len() + 1),
+                // The reasoning body a live turn is filling in. That is the one
+                // markdown document whose size grows while the reader watches,
+                // so it is the size a flicker report is about.
+                body: if streaming {
+                    session
+                        .and_then(|session| session.messages.last())
+                        .map_or(0, |message| message.reasoning.len())
+                } else {
+                    0
+                },
+                frame_ms: previous_frame_ms,
             });
         }
         // The browser pane's view is rebuilt only when the browser moved, which
@@ -4659,6 +4763,16 @@ impl Render for Shell {
             .when_some(confirm_trust, |root, confirm| root.child(confirm))
             .when_some(confirm_vault_delete, |root, confirm| root.child(confirm))
             .when_some(trash, |root, panel| root.child(panel))
+            // The frame clock: a zero-size canvas painted last, so the value it
+            // records covers this frame's render, layout, prepaint and paint.
+            // Appended only while the trace is open; with it off this is one
+            // Option match and the tree is exactly what it was.
+            .when_some(frame_clock, |root, (started, clock)| {
+                root.child(gpui_kit::canvas(
+                    |_, _, _| (),
+                    move |_, _, _, _| clock.set(started.elapsed().as_secs_f32() * 1_000.0),
+                ))
+            })
     }
 }
 
