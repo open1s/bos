@@ -25052,14 +25052,16 @@ fn the_browser_pane_renders_loading_and_the_loaded_page(cx: &mut TestAppContext)
     assert_eq!(site.hits(), 1, "exactly one request");
 }
 
-/// A refused navigation is shown with its rule, and the listener sees nothing.
+/// A navigation the workspace policy would refuse is still attempted: the
+/// browser is DIRECT (the owner's decision), so the allowlist gates the shell
+/// and MCP transports rather than this pane.
 #[gpui::test]
-fn a_refused_navigation_is_shown_and_sends_no_request(cx: &mut TestAppContext) {
+fn a_policy_refused_navigation_is_still_attempted(cx: &mut TestAppContext) {
     let site = pane_site();
     // The allowlist names an address that is not this site's.
     init_test_app(cx);
     let (harness, cx) = cx.add_window_view(|window, cx| {
-        let state = AppState::with_store(scratch_store("browser-pane-refused"));
+        let state = AppState::with_store(scratch_store("browser-pane-direct"));
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
     });
@@ -25078,30 +25080,11 @@ fn a_refused_navigation_is_shown_and_sends_no_request(cx: &mut TestAppContext) {
     cx.update(|_, cx| shell.update(cx, |this, cx| this.browser_go(url, cx)));
     assert_eq!(
         settle_browser(cx, &shell),
-        crate::browser::Status::Failed,
-        "a refused load with no page behind it is the failure state"
+        crate::browser::Status::Ready,
+        "the direct pane loads the host the allowlist does not name"
     );
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-    assert!(
-        cx.debug_bounds("browser-state-failed").is_some(),
-        "the pane draws the failure it holds"
-    );
-    assert!(
-        cx.debug_bounds("browser-failure").is_some(),
-        "and says why on screen"
-    );
-    let view = cx
-        .update(|_, cx| shell.read(cx).browser_pane.clone())
-        .expect("the pane holds a view");
-    let failure = view.failure.expect("the pane explains the failure");
-    assert_eq!(failure.kind, "policy");
-    assert_eq!(
-        failure.rule.as_deref(),
-        Some("egress-not-allowlisted"),
-        "the rule travels to the pane"
-    );
-    assert_eq!(site.hits(), 0, "the listener saw no request at all");
-    // And the refusal is in the audit's own ring, under this tool.
+    assert_eq!(site.hits(), 1, "the request went out");
+    // No denial is recorded, because this path asks no policy at all.
     let denials = cx.update(|_, cx| {
         shell
             .read(cx)
@@ -25112,9 +25095,8 @@ fn a_refused_navigation_is_shown_and_sends_no_request(cx: &mut TestAppContext) {
             .unwrap_or_default()
     });
     assert!(
-        denials.iter().any(|entry| entry.tool == "browser_open"
-            && entry.rule.as_deref() == Some("egress-not-allowlisted")),
-        "the refusal is an audited decision: {denials:?}"
+        !denials.iter().any(|entry| entry.tool == "browser_open"),
+        "the browser is direct, so no decision is audited: {denials:?}"
     );
 }
 
@@ -27526,4 +27508,74 @@ fn probe_tool_timeline(cx: &mut TestAppContext) {
     cx.run_until_parked();
     for _ in 0..3 { cx.update(|window, cx| window.draw(cx).clear(cx)); }
     dump(cx, "after Done");
+}
+
+/// PROBE (temporary): the Audit tab's frame cost, and the split between the
+/// per-frame `AuditView::build` (which re-parses every tool output JSON) and
+/// the per-turn row build.
+#[gpui::test]
+fn probe_audit_frame_cost(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    fn measure(turns: usize, cx: &mut TestAppContext) -> (f64, f64, f64, usize) {
+        let (harness, cx) = cx.add_window_view(move |window, cx| {
+            let mut state = state_with_turns("probe-audit", turns);
+            let id = state.active_id.clone().expect("an active session");
+            if let Some(session) = state.store.session_mut(&id) {
+                for i in (1..session.messages.len()).step_by(2) {
+                    // A realistic tool output: JSON carrying the confinement
+                    // fields the audit reads, plus a body of text.
+                    session.messages[i].tools.push(crate::model::ToolEvent {
+                        name: "bash".to_string(),
+                        args: r#"{"command":"cargo test -p bsh"}"#.to_string(),
+                        output: Some(format!(
+                            r#"{{"stdout":"{}","stderr":"","sandbox":"seatbelt","sandbox_reason":"workspace","network":"direct","network_diagnostic":"ok"}}"#,
+                            "log line ".repeat(200)
+                        )),
+                        ms: Some(40),
+                        at: Some(1_700_000_000_000 + i as u64),
+                    });
+                }
+            }
+            let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+            Harness { shell }
+        });
+        let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+        // The view model alone: AuditView::build per frame.
+        let (build_ms, turns_built) = cx.update(|_, cx| {
+            let this = shell.read(cx);
+            let mut samples = Vec::new();
+            let mut n = 0;
+            for _ in 0..10 {
+                let started = std::time::Instant::now();
+                let view = this.audit_view();
+                samples.push(started.elapsed().as_secs_f64() * 1e3);
+                n = view.turns.len();
+            }
+            (median_ms(samples), n)
+        });
+        cx.update(|_, cx| {
+            shell.update(cx, |this, cx| {
+                this.state.tab = Tab::Audit;
+                cx.notify();
+            });
+        });
+        for _ in 0..4 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        let mut frames = Vec::new();
+        for _ in 0..15 {
+            let started = std::time::Instant::now();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            frames.push(started.elapsed().as_secs_f64() * 1e3);
+        }
+        (build_ms, median_ms(frames), 0.0, turns_built)
+    }
+    let (small_build, small_frame, _, small_turns) = measure(5, cx);
+    eprintln!(
+        "PROBE-A small: {small_turns} turns build={small_build:.2}ms frame={small_frame:.2}ms"
+    );
+    let (huge_build, huge_frame, _, huge_turns) = measure(1000, cx);
+    eprintln!(
+        "PROBE-A huge: {huge_turns} turns build={huge_build:.2}ms frame={huge_frame:.2}ms"
+    );
 }

@@ -376,7 +376,7 @@ impl Engine {
         &self.client
     }
 
-/** Navigate with an explicit settle: [`Settle::Idle`] for a tool that
+    /** Navigate with an explicit settle: [`Settle::Idle`] for a tool that
     reads the page, [`Settle::Paint`] for the pane whose frame is already
     live while the idle window would run. One entry point, so a caller has
     to say which need it has.
@@ -385,7 +385,11 @@ impl Engine {
     before or after the socket. The shell tool and the MCP transport are the
     paths the workspace allowlist governs; this pane reaches the network the
     way any browser does. */
-    pub(crate) fn navigate_settling(&self, url: &str, settle: Settle) -> Result<Navigation, EngineError> {
+    pub(crate) fn navigate_settling(
+        &self,
+        url: &str,
+        settle: Settle,
+    ) -> Result<Navigation, EngineError> {
         self.load(url, settle)
     }
 

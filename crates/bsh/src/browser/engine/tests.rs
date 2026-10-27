@@ -26,7 +26,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-
 use super::cdp::client::{dev_binary, discover_binary};
 use super::{Engine, FrameSlot, Navigation, Settle};
 
@@ -169,10 +168,7 @@ fn a_live_page_answers_with_script_text_stable_refs_real_input_and_a_styled_capt
         return;
     };
     let navigation = engine
-        .navigate_settling(
-            &format!("http://127.0.0.1:{}/", origin.port),
-            Settle::Idle,
-        )
+        .navigate_settling(&format!("http://127.0.0.1:{}/", origin.port), Settle::Idle)
         .expect("navigate should answer");
     assert_eq!(navigation, Navigation::Loaded);
     assert_eq!(
@@ -377,10 +373,7 @@ fn a_prewarmed_engine_pays_no_launch_on_its_first_navigation() {
 
     let first = std::time::Instant::now();
     let navigation = engine
-        .navigate_settling(
-            &format!("http://127.0.0.1:{}/", origin.port),
-            Settle::Idle,
-        )
+        .navigate_settling(&format!("http://127.0.0.1:{}/", origin.port), Settle::Idle)
         .expect("navigate answers");
     assert_eq!(navigation, Navigation::Loaded);
     let first_navigation = first.elapsed();
@@ -472,10 +465,7 @@ fn editing_keys_change_a_field_and_enter_is_a_real_keypress() {
         return;
     };
     let navigation = engine
-        .navigate_settling(
-            &format!("http://127.0.0.1:{}/", origin.port),
-            Settle::Idle,
-        )
+        .navigate_settling(&format!("http://127.0.0.1:{}/", origin.port), Settle::Idle)
         .expect("the page should load");
     assert_eq!(navigation, Navigation::Loaded);
     let snapshot = engine.snapshot(1).expect("the live DOM should read");
@@ -531,10 +521,7 @@ fn networkidle_reads_content_a_late_subresource_wrote() {
         return;
     };
     let navigation = engine
-        .navigate_settling(
-            &format!("http://127.0.0.1:{}/", origin.port),
-            Settle::Idle,
-        )
+        .navigate_settling(&format!("http://127.0.0.1:{}/", origin.port), Settle::Idle)
         .expect("the page should load");
     assert_eq!(navigation, Navigation::Loaded);
     // IMMEDIATELY after open: no extra sleep. load + 120 ms could not have seen
@@ -562,10 +549,7 @@ fn an_inline_link_reports_the_path_its_click_took() {
         return;
     };
     let navigation = engine
-        .navigate_settling(
-            &format!("http://127.0.0.1:{}/", origin.port),
-            Settle::Idle,
-        )
+        .navigate_settling(&format!("http://127.0.0.1:{}/", origin.port), Settle::Idle)
         .expect("the page should load");
     assert_eq!(navigation, Navigation::Loaded);
     let snapshot = engine.snapshot(1).expect("the live DOM should read");
@@ -626,10 +610,7 @@ fn editing_chords_reach_the_page_and_paste_inserts_once() {
         return;
     };
     let navigation = engine
-        .navigate_settling(
-            &format!("http://127.0.0.1:{}/", origin.port),
-            Settle::Idle,
-        )
+        .navigate_settling(&format!("http://127.0.0.1:{}/", origin.port), Settle::Idle)
         .expect("the page should load");
     assert_eq!(navigation, Navigation::Loaded);
     let snapshot = engine.snapshot(1).expect("the live DOM should read");
@@ -741,10 +722,7 @@ fn printable_keys_fire_keydown_and_insert_exactly_once() {
         return;
     };
     let navigation = engine
-        .navigate_settling(
-            &format!("http://127.0.0.1:{}/", origin.port),
-            Settle::Idle,
-        )
+        .navigate_settling(&format!("http://127.0.0.1:{}/", origin.port), Settle::Idle)
         .expect("the page should load");
     assert_eq!(navigation, Navigation::Loaded);
     let snapshot = engine.snapshot(1).expect("the live DOM should read");
@@ -806,10 +784,7 @@ fn a_double_click_selects_the_word_and_a_triple_click_the_line() {
         return;
     };
     let navigation = engine
-        .navigate_settling(
-            &format!("http://127.0.0.1:{}/", origin.port),
-            Settle::Idle,
-        )
+        .navigate_settling(&format!("http://127.0.0.1:{}/", origin.port), Settle::Idle)
         .expect("the page should load");
     assert_eq!(navigation, Navigation::Loaded);
     std::thread::sleep(Duration::from_millis(120));
@@ -936,10 +911,7 @@ fn a_release_at_the_clamped_edge_clears_the_page_drag() {
         return;
     };
     let navigation = engine
-        .navigate_settling(
-            &format!("http://127.0.0.1:{}/", origin.port),
-            Settle::Idle,
-        )
+        .navigate_settling(&format!("http://127.0.0.1:{}/", origin.port), Settle::Idle)
         .expect("the page should load");
     assert_eq!(navigation, Navigation::Loaded);
     std::thread::sleep(Duration::from_millis(120));
@@ -1047,17 +1019,10 @@ fn the_pump_publishes_bgra_and_only_when_the_page_changes() {
         return;
     }
     let frames = Arc::new(FrameSlot::default());
-    let engine = Engine::launch_in(
-        frames.clone(),
-        (800, 600),
-        &scratch_state("pump"),
-    )
-    .expect("the engine should start");
+    let engine = Engine::launch_in(frames.clone(), (800, 600), &scratch_state("pump"))
+        .expect("the engine should start");
     let navigation = engine
-        .navigate_settling(
-            &format!("http://127.0.0.1:{}/", origin.port),
-            Settle::Idle,
-        )
+        .navigate_settling(&format!("http://127.0.0.1:{}/", origin.port), Settle::Idle)
         .expect("navigate answers");
     assert_eq!(navigation, Navigation::Loaded);
 
@@ -1113,20 +1078,14 @@ fn the_pane_settle_lands_before_the_tool_settle() {
 
     let tool_started = std::time::Instant::now();
     let tool_result = engine
-        .navigate_settling(
-            &url,
-            Settle::Idle,
-        )
+        .navigate_settling(&url, Settle::Idle)
         .expect("the tool navigation answers");
     let tool = tool_started.elapsed();
     assert_eq!(tool_result, Navigation::Loaded);
 
     let pane_started = std::time::Instant::now();
     let pane_result = engine
-        .navigate_settling(
-            &format!("{url}?pane"),
-            Settle::Paint,
-        )
+        .navigate_settling(&format!("{url}?pane"), Settle::Paint)
         .expect("the pane navigation answers");
     let pane = pane_started.elapsed();
     assert_eq!(pane_result, Navigation::Loaded);
@@ -1160,17 +1119,10 @@ fn a_self_animating_page_is_published_at_the_fast_cadence() {
         return;
     }
     let frames = Arc::new(FrameSlot::default());
-    let engine = Engine::launch_in(
-        frames.clone(),
-        (800, 600),
-        &scratch_state("animated-pump"),
-    )
-    .expect("the engine should start");
+    let engine = Engine::launch_in(frames.clone(), (800, 600), &scratch_state("animated-pump"))
+        .expect("the engine should start");
     let navigation = engine
-        .navigate_settling(
-            &format!("http://127.0.0.1:{}/", origin.port),
-            Settle::Idle,
-        )
+        .navigate_settling(&format!("http://127.0.0.1:{}/", origin.port), Settle::Idle)
         .expect("navigate answers");
     assert_eq!(navigation, Navigation::Loaded);
 

@@ -2595,3 +2595,52 @@ Traps this cost, so the next round is cheap:
   (`sandbox-exec: sandbox_apply: Operation not permitted`, exit 71). Prove it
   from the failed assertion's own stderr before touching any of that code.
 
+
+Round 178 made the rendered browser DIRECT, by the owner's explicit decision,
+and this note exists because the decision REMOVED an enforcement the previous
+rounds had spent effort proving. What went: the loopback egress proxy
+(`browser/engine/gate.rs`, deleted), the `--proxy` argument on the engine
+launch, the pre-flight `Gate::preflight` before `Page.navigate`, the Fetch
+seam's refusal branch, the `NetworkMode` vocabulary with its Proxied/Strict
+setting and toolbar chip, the four locale keys behind them, `Tools`'
+policy/session/preset fields, the `network_mode` payload fact, the pane's
+`browser-seam-refused` banner and `engine_refusal`, and the four socket-level
+refusal proofs (a refused URL, a refused subresource, a denied path, Strict
+mode) that described a behaviour the pane no longer has.
+
+What replaced them is one honest fact: the pane and every browser tool result
+now say `network: "direct"`, and the substrate doc states the cost in its own
+section - a URL outside the workspace allowlist loads here, and its origin sees
+a real socket. The allowlist still governs the shell tool and the MCP transport,
+which is where its refusals are still recorded and audited.
+
+Traps and seams worth keeping:
+
+- Deleting a seam deletes its proofs, and a proof deleted for the wrong reason is
+  indistinguishable from a test relaxed to get green. Delete the test with the
+  behaviour, name the behaviour in the round note and in the doc, and never
+  leave the assertion behind pointing at something that cannot happen.
+- The Fetch seam was NOT deleted with the gate. `Fetch.enable` is what bumps the
+  navigation idle clock (`shared.touch` on `requestPaused`), so removing it would
+  have silently reverted every settled navigation to load + 120 ms - a timing
+  regression arriving through a security change. It now continues every paused
+  request and refuses none: observation, and the comment says exactly that.
+- `wait_network_idle` keeps its `inflight` ceiling and its counters; only the
+  `failed` counter went (nothing fails a request now).
+- The text view's fallback fetch used `agent::policy::fetch`, which REQUIRES an
+  `EgressGate`. A direct browser needed a direct producer: `fetch_direct` is a
+  small reqwest call driven by a current-thread tokio runtime, built only on that
+  degraded path, and it is what keeps the pane working when the engine binary is
+  absent. It replaces a gate-shaped API call, not a feature.
+- The denial copy that named the reader's own setting (`right.browser.strictRefused`
+  and the rule line) had to go with the setting: with nothing refusing, a failure
+  sentence is always the producer's own prose.
+- `Engine::client()` became test-only (`#[cfg(test)]`) the moment the refusal
+  reader went: the tests still read the seam's counters, and `-D warnings` in a
+  non-test build would otherwise call it dead.
+- A concurrent writer shares this working copy: it committed this round's work
+  mid-flight (the parent change id moved from `ozvmtnwr` to `sqlstmvv` and the
+  edits appeared in `@-`), which shows up first as repeated
+  `file changed since it was read` refusals from the edit tool. Re-read the file,
+  check `jj log`/`jj diff --stat` to see whether the change already landed, and
+  never re-apply a patch blindly over a commit that contains it.

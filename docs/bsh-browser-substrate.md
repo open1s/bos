@@ -13,8 +13,10 @@ Measured 2026-10-25 on this machine (arm64 macOS, rustc 1.98.1); the frame
 ## What the user asked for
 
 A real browser substrate for the built-in browser, replacing the text/DOM view,
-with the egress gate kept. The owner's decision was Obscura over Servo, driven
-DIRECTLY through its CDP endpoint.
+driven DIRECTLY through Obscura's CDP endpoint. Two later owner decisions are
+part of the current state and are stated where they belong below: the browser is
+DIRECT (no egress gate), and its frame pump is adaptive.
+
 
 ## Install (the binary is NOT vendored)
 
@@ -90,9 +92,27 @@ ready file and parses the `CDP server: ws://...` banner as a fallback.
 `--quiet` suppresses the banner entirely, so a banner-only client cannot use
 it.
 
-## The egress gate, and why it is NOT the Fetch domain
+## Direct: no egress gate (the owner's decision)
 
-The Fetch domain LOOKS like the right seam. It is not a gate in 0.2.5:
+The rendered browser is DIRECT. It asks no egress policy, before or after the
+socket: the engine is launched with no `--proxy`, no pre-flight runs before
+`Page.navigate`, and the CDP `Fetch` seam no longer refuses anything. The
+workspace allowlist still governs the SHELL tool and the MCP transport - they
+are the paths whose refusals the audit pane records - and it no longer governs
+this pane.
+
+### What that costs, stated rather than hidden
+
+- a navigation the policy would have refused is now attempted: a URL outside
+  the allowlist loads, and its origin sees a real socket;
+- a subresource likewise: nothing refuses a request by host, port or path;
+- the pane and every browser tool result say `network: "direct"`, so a caller
+  reading the payload cannot mistake this for an enforced mode.
+
+### Why the previous design needed a proxy at all (kept as a measurement)
+
+The Fetch domain LOOKS like the right seam for a gate, and MEASURED on obscura
+0.2.5 it is not:
 
 - `Fetch.enable {patterns:[{"urlPattern":"*"}]}` then `Page.navigate` to a
   page that serves after a 1.2 s delay produced this order:
@@ -101,116 +121,64 @@ The Fetch domain LOOKS like the right seam. It is not a gate in 0.2.5:
   the response was fetched.** A server that never responds produced the socket
   and the request and NO pause at all.
 - Consequence: `Fetch.failRequest` refuses the DELIVERY (the renderer treats it
-  as blocked) but the origin socket already exists. It cannot carry "a refused
-  URL produces zero origin sockets".
+  as blocked) but the origin socket already exists. It could never carry
+  "a refused URL produces zero origin sockets".
 
-The seam that DOES run before the socket is `--proxy`: Obscura's fetcher
-honours it for the document AND every subresource (measured: a page with two
-images, a script and a stylesheet produced four proxied requests and zero direct
-ones). The shim therefore launches the engine with
-`--proxy http://127.0.0.1:<gate-port>` and the gate is a loopback HTTP proxy in
-`browser/engine/gate.rs`:
+That is why the only seam that could enforce before the socket was `--proxy`:
+Obscura's fetcher honours it for the document AND every subresource (measured:
+a page with two images, a script and a stylesheet produced four proxied
+requests and zero direct ones). Both the proxy (`browser/engine/gate.rs`) and
+the Proxied/Strict setting it served are GONE with the decision; the
+measurement stays because it is the reason a future reader will not simply
+reach for the Fetch domain and believe a refusal was enforced.
 
-- a PLAIN HTTP forward-proxy request carries the absolute URI, so it is
-  authorized on `host:port` **and the full path/query** through
-  `EgressGate::authorize_path` - the SAME `PolicySet` the shell tool and the
-  MCP transport ask. `PolicyData::egress_deny_paths` is the policy vocabulary
-  (literal prefixes) and the baseline's `egress-path-denied` rule decides it;
-- a refusal is answered `403 Forbidden` carrying the policy's own rule and prose
-  (HTML, escaped), and opens no origin socket - a path refusal now means zero
-  origin sockets for plain HTTP, not only a failed delivery;
-- a `CONNECT` tunnel (https) is authorized by host:port and then tunnelled: the
-  policy sees the destination, not the individual URLs inside TLS. That is a
-  transport limit, so it is the reader's choice (next section), not a silent one;
-- The CDP `Fetch` seam asks the same path door, so its delivery refusal and
-  the proxy's pre-socket refusal cannot disagree about a URL;
-- `allowed`/`refused` counters and the last refusal are the test's observable.
+### The Fetch seam, kept for one thing
 
-### The network mode: Proxied or Strict
-
-`Settings -> Built-in plugins -> Shell -> Browser network` (the Shell card, or
-`--settings=shell`; en + zh, default **Proxied**) is the explicit choice the
-CONNECT limit requires:
-
-- **Proxied** (default): https is allowed and authorized at host:port; a path
-  rule inside an encrypted page is not enforceable and the setting's hint says
-  so.
-- **Strict**: the CONNECT tunnel is refused before it exists. Navigation
-  pre-flight refuses an https URL with the rule `browser-strict-network` and a
-  sentence saying TLS is not terminated; the loopback proxy answers a
-  `CONNECT` `403` with the same rule, so an https SUBRESOURCE is refused too.
-  Plain http keeps working in Strict, path rules included.
-
-The active mode is named in the Browser pane's toolbar
-(`browser-network-mode`) and every browser tool result carries
-`network_mode` ("proxied" | "strict") beside `sandbox`/`network`. The mode is
-handed to the proxy on each navigation, so a change applies to the NEXT
-navigation; a request a page starts on its own between the change and the next
-navigation still runs under the previously applied mode.
-The refusal's user-facing sentence is localized in the pane; the tool payload's
-message is the engine's English prose, like every other engine failure.
+`Fetch.enable` is still on, and every `requestPaused` is continued. It is
+observation, not control: the pause is what bumps the navigation idle clock,
+and `wait_network_idle` is built on that clock. Remove the seam and every
+settled navigation falls back to load + 120 ms.
 
 ### Sandbox: the browser never runs under heel
 
-The rendered browser is deliberately OUTSIDE the heel sandbox the shell tool and
-the terminal pane use. The engine is a DIRECT child of bsh (not a
-`SandboxSpec` consumer), it reaches the network only through its own loopback
-egress gate, and every browser tool result states `sandbox: "none"` beside the
-network fact. There is no heel profile, no `sandbox-exec` wrapper and no
-turn-level sandbox on this path.
+Unchanged by the decision: the engine is a DIRECT child of bsh (not a
+`SandboxSpec` consumer), it runs no heel profile and no `sandbox-exec` wrapper,
+and every browser tool result states `sandbox: "none"`. The launch still
+removes the sandbox's reserved variables (`RESERVED_ENV` in
+`agent::sandbox`: the proxy family and `TMPDIR`/`TEMP`/`TMP`) so a bsh started
+from a sandboxed shell cannot hand heel's own proxy to a child it never
+granted a scratch to; one list, two readers, so the scrub cannot drift.
 
-One leak was possible and is now closed: a bsh started from a SANDBOXED shell
-inherits heel's environment, and heel's `HTTP(S)_PROXY` would sit in front of
-(or beside) the browser's own gate while its private `TMPDIR` points at a
-scratch the engine was never granted. The launch therefore removes the
-sandbox's reserved variables (`RESERVED_ENV` in `agent::sandbox`: the proxy
-family and `TMPDIR`/`TEMP`/`TMP`) before spawning Obscura, and a unit test
-(`the_engine_launch_removes_the_sandbox_environment`) pins it. One list, two
-readers, so the scrub cannot drift from what the sandbox reserves.
+Residual, stated: an OS-level sandbox around the bsh PROCESS itself is
+inherited by every child it starts, and an unprivileged process cannot leave
+it. Run bsh outside heel when the rendered browser needs the network.
 
-Residual, stated: an OS-level sandbox around the bsh PROCESS itself is inherited
-by every child it starts, and an unprivileged process cannot leave it. Run bsh
-outside heel when the rendered browser needs the network.
-
-The CDP `Fetch` seam is still enabled and every `requestPaused` is handled
-(continue, or fail with `BlockedByClient` and the policy's prose recorded), as a
-second line: it fails the delivery of anything the policy refuses and it records
-the refusal for the pane. It is described as delivery control, not as the gate.
-
-### The proof (live listeners, discrimination)
+### The proof (what is asserted now)
 
 `cargo test -p bsh --lib browser::engine::tests` with the binary installed:
 
-- **refusal**: navigating to `http://127.0.0.1:<refused-port>/` under a policy
-  that allows loopback only on `<allowed-port>` returns `Navigation::Refused`
-  whose rule names the port, and the refused origin's LIVE listener stays at
-  **0 hits**;
-- **discrimination**: the same engine then navigates the allowed URL and the
-  SAME listener counter shape moves to **>= 1** - without this the zero would be
-  meaningless;
-- **subresource**: a page whose `<img>` comes from the refused origin loads its
-  allowed parts (text and layout present) while the refused origin stays at
-  **0 hits**, `gate.refused() >= 1` and `gate.last()` carries the policy prose;
-- **path (plain HTTP)**: the origin records every request path it sees. A page
-  at `/` whose `<img>` points at `/secret/pixel.png` loads its allowed parts
-  while the recorded path list has the document and NO `/secret/` entry -
-  `gate.last().rule == "egress-path-denied"`;
-- **path, without an engine**: `browser::engine::gate::tests` drives the proxy
-  with a raw `GET` and proves `403` + rule + prose + **0 origin sockets** for
-  the denied path and `200` + **1 socket** for an allowed path on the same
-  origin;
-- **strict**: `NetworkMode::Strict` refuses `https://127.0.0.1/...` with
-  `browser-strict-network` before any request, keeps `http` working on the
-  same engine, and the proxy refuses `CONNECT` after the mode is switched (the
-  `Proxied` gate opened it, proving the switch is what refused it);
+- **navigation**: a live page loads, its script-written text is the snapshot's
+  text, its elements get stable `data-bsh-ref` stamps, a real click and a real
+  type reach it, and the capture is a styled page rather than a blank
+  rectangle;
+- **pump**: a published frame is BGRA (the byte order the pane draws), an
+  unchanged page publishes nothing, and a self-animating page is published at
+  the fast cadence;
+- **settle**: the pane lands before the tool path does, and a late subresource
+  is still read;
 - **lifecycle**: after `Drop`, the engine's port refuses connections: the child
   was killed and reaped, not orphaned.
+
+The four socket-level refusals that used to be proved here - a refused URL, a
+refused subresource, a denied path and Strict mode - went with the policy they
+proved. They are not relaxed tests; they describe a behaviour this pane no
+longer has.
+
 
 ## The module map
 
     crates/bsh/src/browser/engine/
       mod.rs        the facade: Engine/EngineError/Navigation/Page, FrameSlot
-      gate.rs       the loopback egress gate (proxy) + preflight + counters
       reap.rs       the orphan reaper: marker, pidfile, ppid==1 + argv check
       cdp/
         mod.rs      the page vocabulary: navigate, snapshot, click, type, press,
@@ -567,19 +535,12 @@ Its new residuals, stated rather than assumed:
   implements none (MEASURED: a drag across document text leaves the selection
   empty). Word/line selection is the counted-click path above.
 
-1. **`Fetch` is still post-fetch** (measured above); it remains delivery
-   control. The SOCKET guarantee for a path refusal is the proxy, and it now
-   covers plain HTTP fully: `host:port:path` is asked before connecting.
-   **Residual:** the human-facing `.bsh/egress-allowlist` file has no PATH
-   syntax yet, so a path rule is expressible through `PolicyData`
-   (`with_egress_deny_paths`) and the preset/compile seam, not by typing a line
-   in that file. No syntax was invented for it in this round.
-2. **`CONNECT`/https is gate-at-host:port, and TLS is NOT terminated.** This is
-   not fixable without a MITM CA the reader must trust, which this round did not
-   add. It is now the reader's explicit **choice**: `Proxied` accepts the
-   host:port granularity for https, `Strict` refuses the tunnel with the rule
-   named. Residual risk in Proxied: a path rule inside an https page is not
-   enforced at the socket; the pane and the setting say so.
+1. **The browser enforces nothing.** It is direct by the owner's decision: no
+   proxy, no pre-flight, no delivery refusal. A URL outside the workspace
+   allowlist loads here, and the allowlist still governs the shell tool and the
+   MCP transport. The pane and every browser tool result say `network: "direct"`
+   rather than hiding it, and the measurement above records why the Fetch domain
+   could never have stood in for the proxy.
 3. **An inline `<a>` still has no usable box in Obscura 0.2.5.** MEASURED after
    the fix: the fixture's inline link reports zero `getBoundingClientRect()` AND
    zero `getClientRects()`/`Range` rects, so `via` is `"script"` there and the

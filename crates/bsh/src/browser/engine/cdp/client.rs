@@ -208,7 +208,6 @@ impl Shared {
     pub(crate) fn session(&self) -> Option<String> {
         self.session.lock().ok().and_then(|slot| slot.clone())
     }
-
 }
 
 /// One queued request for the socket thread.

@@ -134,7 +134,9 @@ impl Failure {
         // reached by this pane any more; the arm stays exhaustive for the type.
         let (kind, message, rule) = match &error {
             FetchError::Scheme(_) => ("scheme", error.to_string(), None),
-            FetchError::Refused(denial) => ("policy", error.to_string(), denial.decision.rule.clone()),
+            FetchError::Refused(denial) => {
+                ("policy", error.to_string(), denial.decision.rule.clone())
+            }
             FetchError::Unresolved(_) => ("dns", error.to_string(), None),
             FetchError::Tls(_) => ("tls", error.to_string(), None),
             FetchError::Connect(_) => ("connect", error.to_string(), None),
@@ -1300,11 +1302,14 @@ fn direct_limits() -> FetchLimits {
 
 /// The direct path's async stack, built once for the process.
 ///
-/// A current-thread runtime per navigation cost about 6 ms (debug build) on
-/// top of a ~2 ms fetch - a fixed tax on the path that only runs when the
-/// engine is missing. Two navigations (the pane's and a tool's) may block on
-/// this one at the same time, so it is multi-threaded with a single worker:
-/// each caller parks its own thread while the worker drives the I/O.
+/// A navigation runs on a worker thread, and this is the one stack it blocks
+/// on. Building a runtime (and a client) per navigation is a fixed cost paid on
+/// the path that must be quickest when the engine is missing - measured at
+/// about 0.17 ms per call here, before a byte moves - and it also discarded the
+/// connection pool, so every page paid a fresh DNS lookup and TLS handshake.
+/// Two navigations (the pane's and a tool's) may block on this runtime at the
+/// same time, so it is multi-threaded with a single worker: each caller parks
+/// its own thread while the worker drives the I/O.
 fn direct_runtime() -> Result<&'static tokio::runtime::Runtime, FetchError> {
     static RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
     RUNTIME
@@ -3162,8 +3167,7 @@ mod tests {
                     let _ = stream.write_all(head.as_bytes());
                     // 48 bytes of prefix, so a cut at 2 MiB lands two bytes
                     // inside a three-byte character.
-                    let mut page =
-                        String::from("<html><head><title>Endless</title></head><body> ");
+                    let mut page = String::from("<html><head><title>Endless</title></head><body> ");
                     page.push_str(&"€".repeat(ENDLESS_BYTES / 3));
                     let _ = stream.write_all(page.as_bytes());
                     let _ = stream.flush();
@@ -3338,6 +3342,23 @@ mod tests {
             "the fetch waited for the whole body: {elapsed:?}"
         );
         assert_eq!(site.hits(), 1, "one request");
+    }
+
+    /// The fetch works from a tokio blocking task, which is where a tool runs it.
+    ///
+    /// `browser_open` reaches this path through `spawn_blocking`, so the shared
+    /// runtime must be enterable from a blocking task of ANOTHER runtime.
+    #[test]
+    fn the_direct_fetch_runs_from_a_blocking_task() {
+        let site = site();
+        let url = site.url("/");
+        let caller = tokio::runtime::Runtime::new().expect("a caller runtime");
+        let page = caller
+            .block_on(async move { tokio::task::spawn_blocking(move || fetch_direct(&url)).await })
+            .expect("the blocking task joins")
+            .expect("the page arrives");
+        assert_eq!(page.status, 200);
+        assert!(page.body.contains("hello from the test server"));
     }
 
     /// A cut tail inside a character is dropped, not replaced.

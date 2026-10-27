@@ -1322,12 +1322,6 @@ impl Shell {
         }
     }
 
-    /// The active network mode, named in the toolbar.
-    ///
-    /// The pane says which trade is in force instead of leaving the reader to
-    /// infer it: `Proxied` allows https (authorized at host and port) and
-    /// `Strict` refuses it, because this pane does not terminate TLS and will
-    /// not pretend a path rule inside an encrypted page was enforced.
     /// One navigation control: a glyph that dims when the action cannot run.
     fn browser_icon(
         &self,
@@ -1493,8 +1487,7 @@ impl Shell {
             .child(
                 // The producer's own prose: with the browser direct there is no
                 // setting of the reader's that could be the thing refusing.
-                txt(failure.message.clone(), theme::CHIP_SIZE, theme::text())
-                    .line_height(px(16.0)),
+                txt(failure.message.clone(), theme::CHIP_SIZE, theme::text()).line_height(px(16.0)),
             );
         if let Some(rule) = failure.rule.clone() {
             note = note.child(txt(
