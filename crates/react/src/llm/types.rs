@@ -312,8 +312,12 @@ pub enum LlmError {
     /// The provider rate-limited the request.
     #[error("Rate limited")]
     RateLimited,
-    /// Any other error.
-    #[error("LLM error: {0}")]
+    /// Any other error, carrying the whole sentence.
+    ///
+    /// The message already names what happened ("Stream error: ...",
+    /// "HTTP 500: ...") and every layer that renders it also names the LLM
+    /// call, so a second "LLM error:" here stacked two labels on one failure.
+    #[error("{0}")]
     Other(String),
 }
 
@@ -945,7 +949,7 @@ impl ReactSession for LlmSession {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_content_parts, ApiMode, Content, ContentPart};
+    use super::{parse_content_parts, ApiMode, Content, ContentPart, LlmError};
 
     #[test]
     fn content_from_json_still_decodes_with_leading_whitespace() {
@@ -964,6 +968,22 @@ mod tests {
         let text = "Explain {a: b} in prose";
         assert!(parse_content_parts(text).is_none());
         assert!(matches!(Content::from(text.to_string()), Content::Text(t) if t == text));
+    }
+
+    /// One failure wears one label.
+    ///
+    /// `LlmError::Other` carries the provider's whole sentence ("Stream error:
+    /// ..."), and the engine's wrapper supplies the only "LLM error:" - the two
+    /// used to stack, so the reader saw the label twice and the cause nowhere.
+    #[test]
+    fn an_llm_failure_is_labelled_once() {
+        let error = crate::engine::ReactError::Llm(LlmError::Other(
+            "Stream error: error decoding response body: operation timed out".to_string(),
+        ));
+        assert_eq!(
+            error.to_string(),
+            "LLM error: Stream error: error decoding response body: operation timed out"
+        );
     }
 
     #[test]

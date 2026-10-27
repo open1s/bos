@@ -109,11 +109,9 @@ objc2 = "0.6"
 objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSImage", "NSResponder"] }
 objc2-foundation = { version = "0.3.2", features = ["NSData"] }
 
-# The Browser pane's rendered engine is Obscura, an EXTERNAL binary spoken to
-# over CDP: no crate is linked for it, so a default build carries no browser
-# engine code and every default gate stays as fast as it was. See
-# docs/bsh-browser-substrate.md for the install recipe (the release tarball is
-# NOT vendored here) and for the measured CDP facts.
+# The Browser pane launches the installed Chrome/Chromium binary and speaks CDP
+# to it. No browser crate is linked, so the default build carries no browser
+# engine code. See docs/bsh-browser-substrate.md for discovery and launch facts.
 #
 # The one dependency the shim adds is the WebSocket transport. tungstenite is
 # ALREADY in this build's graph through zenoh (agent -> zenoh -> ... ->

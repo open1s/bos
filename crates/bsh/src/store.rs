@@ -696,6 +696,10 @@ impl Store {
     /// start would re-fetch the tail the reader already passed.
     pub(crate) fn older_read(&self, id: &str, len: usize) -> Option<OlderRead> {
         let session = self.sessions.iter().find(|session| session.id == id)?;
+        // The floor is where paging has REACHED - the lowest row ever brought
+        // in - not the in-memory window's start: trim_front drops rows the
+        // reader already passed, and flooring at the window's start would
+        // re-fetch that passed region forever (the loop the paging test pins).
         let floor = session.paged_from.unwrap_or(session.loaded_from);
         if floor == 0 {
             return None;
@@ -721,6 +725,8 @@ impl Store {
             return 0;
         };
         let session = &mut self.sessions[at];
+        // Stale against the paging floor, not the window's start: a trimmed
+        // window starts lower than the rows this page would duplicate.
         let floor = session.paged_from.unwrap_or(session.loaded_from);
         if page.rows.is_empty() || page.from >= floor {
             return 0;

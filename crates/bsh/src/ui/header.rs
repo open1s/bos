@@ -1641,9 +1641,6 @@ impl Shell {
                     .line_height(px(16.0)),
                 )
                 .on_click(cx.listener(move |this, _event, _window, cx| {
-                    // The trace tab reads its rows from the Parquet log, so the
-                    // first page is scheduled when the tab is opened - not on
-                    // every frame, and not for a tab nobody is looking at.
                     this.state.tab = this_tab;
                     if this_tab == Tab::Trajectory && this.trace_pages == 0 {
                         this.request_trace_page(cx);

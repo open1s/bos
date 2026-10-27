@@ -913,20 +913,6 @@ pub(crate) fn matches_refusal(refusal: &AuditRefusal, query: &str) -> bool {
     .any(|field| field.to_lowercase().contains(&needle))
 }
 
-/// Does a turn answer the search field (through its own label or any child)?
-pub(crate) fn matches_turn(turn: &AuditTurn, query: &str) -> bool {
-    let needle = query.trim().to_lowercase();
-    if needle.is_empty() {
-        return true;
-    }
-    format!("turn {}", turn.index).contains(&needle)
-        || turn.calls.iter().any(|call| matches_call(call, query))
-        || turn
-            .refusals
-            .iter()
-            .any(|refusal| matches_refusal(refusal, query))
-}
-
 /// The full stored record for a call, read from the session on demand.
 ///
 /// This is deliberately not part of the view model: a caller reaches it only
@@ -2192,11 +2178,12 @@ mod tests {
         };
         let view = AuditView::build(&session, &[denial], &[]);
         let turn = &view.turns[0];
-        assert!(super::matches_turn(turn, ""));
-        assert!(super::matches_turn(turn, "notes"));
-        assert!(super::matches_turn(turn, "passwd"));
-        assert!(super::matches_turn(turn, "turn 1"));
-        assert!(!super::matches_turn(turn, "absent"));
+        assert!(super::matches_call(&turn.calls[0], ""));
+        assert!(super::matches_call(&turn.calls[0], "notes"));
+        assert!(super::matches_call(&turn.calls[0], "read_file"));
+        assert!(super::matches_refusal(&turn.refusals[0], "passwd"));
+        assert!(!super::matches_call(&turn.calls[0], "absent"));
+        assert!(!super::matches_refusal(&turn.refusals[0], "absent"));
         assert!(super::matches_refusal(&turn.refusals[0], "deny-outside"));
         assert!(!super::matches_call(&turn.calls[0], "deny-outside"));
     }

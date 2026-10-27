@@ -2,6 +2,19 @@ use super::*;
 
 use crate::agent::context::CompactionOutcome;
 
+/// A React failure that keeps its LLM kind.
+///
+/// Flattening every failure into `AgentError::Session` put a second, wrong label
+/// on an LLM error ("Session error: LLM error: LLM error: Stream error: ...").
+/// The provider's own sentence is the whole message now, behind one
+/// "LLM error:"; only a non-LLM failure becomes a session sentence.
+fn react_failure(e: react::engine::ReactError) -> AgentError {
+    match e {
+        react::engine::ReactError::Llm(llm) => AgentError::Llm(llm),
+        other => AgentError::Session(other.to_string()),
+    }
+}
+
 /// Owns the session history for one run and puts it back when the run ends.
 ///
 /// Both [`Agent::react`] and [`Agent::stream`] take the message log out of the
@@ -421,7 +434,7 @@ impl Agent {
                     HookDecision::Abort => return Ok("LLM call aborted by hook".to_string()),
                     HookDecision::Continue => {}
                 }
-                Err(AgentError::Session(format!("ReAct run error: {}", e)))
+                Err(react_failure(e))
             }
         }
     }
@@ -737,7 +750,7 @@ impl Agent {
                                 }
                                 HookDecision::Continue => {}
                             }
-                            yield Err(AgentError::Session(e.to_string()));
+                            yield Err(react_failure(e));
                         }
                     }
                 }
@@ -863,5 +876,39 @@ mod web_tool_tests {
             "on, anthropic: refused"
         );
         assert!(!offers_web_search(true, ""), "on, unset protocol: refused");
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::react_failure;
+    use crate::error::{AgentError, LlmError};
+
+    /// An LLM stream failure is reported once, as an LLM error.
+    ///
+    /// The turn used to surface it as `Session error: LLM error: LLM error:
+    /// Stream error: error decoding response body` - two labels for one failure
+    /// and the outer one wrong. The provider's sentence is the whole message
+    /// now, behind the single label `AgentError::Llm` adds.
+    #[test]
+    fn an_llm_stream_failure_carries_one_label() {
+        let error = react_failure(react::engine::ReactError::Llm(LlmError::Other(
+            "Stream error: error decoding response body: operation timed out".to_string(),
+        )));
+        assert_eq!(
+            error.to_string(),
+            "LLM error: Stream error: error decoding response body: operation timed out"
+        );
+        assert!(
+            matches!(error, AgentError::Llm(_)),
+            "and the LLM kind is kept, not flattened into a session sentence"
+        );
+    }
+
+    /// A failure that is not the LLM's stays a session sentence.
+    #[test]
+    fn a_hook_abort_stays_a_session_failure() {
+        let error = react_failure(react::engine::ReactError::HookAbort("stopped".to_string()));
+        assert_eq!(error.to_string(), "Session error: Hook abort: stopped");
     }
 }

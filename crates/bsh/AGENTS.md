@@ -2509,7 +2509,7 @@ browser round.
 
 Round 177 turned the right pane's browser from "correct" into the crate's gold
 requirement: EXTREMELY fast, with the correctness it already had left standing.
-Three measured facts drove it, all probed against the real Obscura 0.2.5 binary
+Three measured facts drove it, all probed against the prior browser engine
 before a line was written (`docs/bsh-browser-substrate.md` carries the numbers):
 
 1. **PNG is 2-9x faster than JPEG on this engine.** `Page.captureScreenshot` at
@@ -2518,10 +2518,10 @@ before a line was written (`docs/bsh-browser-substrate.md` carries the numbers):
    The pump had been capturing JPEG at q72 with a 120 ms sleep: about eight
    frames a second no matter what the page did.
 2. **`Page.startScreencast` is NOT a paint pump.** It answers OK and even
-   advertises `obscuraFrameSource: activity-driven`, but it pushes frames only
-   on NAVIGATION activity: a DOM change, a hover, a key, a wheel and a fully
-   idle second all produced ZERO frames (measured). The polling pump stays;
-   what changes is how it polls.
+   advertised an activity-driven frame source, but it pushed frames only on
+   NAVIGATION activity: a DOM change, a hover, a key, a wheel and a fully idle
+   second all produced ZERO frames (measured). The polling pump stays; what
+   changes is how it polls.
 3. **The engine's own network signals cannot settle a page.** `Network.enable`
    emits NOTHING for a script-started subresource - a 900 ms-delayed image
    produced no `requestWillBeSent` at all - and `Page.lifecycleEvent
@@ -2644,3 +2644,29 @@ Traps and seams worth keeping:
   `file changed since it was read` refusals from the edit tool. Re-read the file,
   check `jj log`/`jj diff --stat` to see whether the change already landed, and
   never re-apply a patch blindly over a commit that contains it.
+
+Browser backend update (2026-10-27): BSH now launches installed Google Chrome
+or Chromium over CDP; Chromium is the supported runtime. Set
+`BSH_CHROMIUM_BIN` only when the executable is outside the normal PATH or macOS
+application paths. The browser profile is temporary and page traffic is direct
+(`--no-proxy-server)); the loopback socket is only the private CDP control
+connection. Integration tests use the installed browser and direct local
+fixtures.
+
+Sidebar row actions (2026-10-27): the session and workspace rows drew their
+hover controls as an ABSOLUTE overlay on the trailing edge, so a long title
+painted straight through them and the session menu sat under its own label. The
+reference does not overlay: `dsh-client-ui-workspace`'s own sheet swaps
+`.time`/`.pinIndicator` for `.rowActions` (`display:none` until `:hover`)
+inside the row's flex line, so the `flex:1` title truncates before them. Both
+rows now carry one `hover_actions` slot - zero wide until the row is hovered,
+then exactly the measured cluster width (20px boxes, the kit's 32px menu button
+in a 4px pad, 2px gaps) - while the age, and the pinned row's 16px rest mark,
+collapse in the same swap. Traps: a hover style that changes LAYOUT only lands
+on a STATEFUL element (group hover on a plain `div` is paint-time only, because
+`request_layout` computes style with `hitbox: None` and reads only the recorded
+`hover_state.group`); a fixed 20px box inside a 0-wide slot came out 12px until
+each box carried `.flex_none()`; and two older tests pressed the pin/ellipsis
+without hovering - those controls are only in the flow under the pointer now, so
+they hover first, as the workspace-row test already did.
+

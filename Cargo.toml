@@ -141,3 +141,37 @@ opt-level = 3
 
 [profile.dev.package.fontdb]
 opt-level = 3
+
+# The Browser pane's frame decode. The pump thread turns each captured frame
+# back into pixels, and that decode was the largest single cost of a frame.
+#
+# MEASURED on the pane's own 800x600 fixture capture, decoding the same real
+# PNG frame:
+#     image at opt-level 0   11.62 ms   <- what target/debug/bsh paid
+#     image at opt-level 3    0.58 ms   (20x faster)
+# and for JPEG at quality 80, 37.50 ms against 0.70 ms (53x). End to end per
+# changed frame that is ~20.5 ms before against ~9.6 ms after, which is the
+# difference between missing and meeting the pane's own 30 fps cadence
+# (`FRAME_FAST` = 33 ms). This is the same bargain the UI stack above takes:
+# the debug binary is the one the round recipes launch, and it costs the
+# release profile nothing.
+[profile.dev.package.image]
+opt-level = 3
+
+# image's own codecs, which hold the actual per-pixel loops. Naming them
+# explicitly matters: a profile override applies to the named package and does
+# NOT cascade to its dependencies.
+[profile.dev.package.png]
+opt-level = 3
+
+[profile.dev.package.fdeflate]
+opt-level = 3
+
+[profile.dev.package.flate2]
+opt-level = 3
+
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+
+[profile.dev.package.zune-jpeg]
+opt-level = 3

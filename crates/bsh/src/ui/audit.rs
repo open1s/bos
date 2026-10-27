@@ -29,7 +29,8 @@ use gpui_kit::*;
 use super::shell::Shell;
 use super::{icon, txt, DivExt, IconName};
 use crate::audit::{
-    self, AuditAllows, AuditCall, AuditOutcome, AuditPolicy, AuditRefusal, AuditTurn, AuditView,
+    self, AuditAllows, AuditCall, AuditCategory, AuditOutcome, AuditPolicy, AuditRefusal,
+    AuditTurn, AuditView,
 };
 use crate::i18n::tr_args;
 use crate::state::Tab;
@@ -410,6 +411,58 @@ impl Shell {
                                 cx.notify();
                             }))
                     })),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(2.0))
+                    .children(
+                        [
+                            (None, "audit.category.all"),
+                            (Some(AuditCategory::FileRead), "audit.category.fileRead"),
+                            (Some(AuditCategory::FileWrite), "audit.category.fileWrite"),
+                            (Some(AuditCategory::Shell), "audit.category.shell"),
+                            (Some(AuditCategory::Network), "audit.category.network"),
+                            (Some(AuditCategory::Browser), "audit.category.browser"),
+                            (Some(AuditCategory::Mcp), "audit.category.mcp"),
+                            (Some(AuditCategory::Subagent), "audit.category.subagent"),
+                            (Some(AuditCategory::Other), "audit.category.other"),
+                        ]
+                        .into_iter()
+                        .map(|(category, key)| {
+                            let label = self.state.lang.tr(key);
+                            let on = self.audit_category == category;
+                            div()
+                                .id(SharedString::from(format!("audit-category-{}", key)))
+                                .h(px(20.0))
+                                .px(px(5.0))
+                                .flex()
+                                .items_center()
+                                .cursor_pointer()
+                                .rounded(px(5.0))
+                                .when(on, |cell| {
+                                    cell.bg(rgb(theme::hover())).child(txt(
+                                        label.clone(),
+                                        10.0,
+                                        theme::text(),
+                                    ))
+                                })
+                                .when(!on, |cell| {
+                                    cell.child(txt(label.clone(), 10.0, theme::faint()))
+                                })
+                                .on_click(cx.listener(move |this, _event, _window, cx| {
+                                    this.audit_category = category;
+                                    this.audit_page = 0;
+                                    this.audit_scroll.set_offset(gpui_kit::point(
+                                        gpui_kit::px(0.0),
+                                        gpui_kit::px(0.0),
+                                    ));
+                                    cx.notify();
+                                }))
+                        }),
+                    ),
             )
             .child(div().flex_1())
             .child(
@@ -1451,6 +1504,7 @@ impl Shell {
         };
         let view = self.audit_view();
         let query = self.audit_query.clone();
+        let category = self.audit_category;
         let filtering = !query.trim().is_empty();
         // One measure ceiling for the frame: a row's share is relative to the
         // largest turn, and asking the view per row re-scanned every turn.
@@ -1462,9 +1516,9 @@ impl Shell {
         // heights belong to the content, so that frame builds them all.
         let collapsed = !filtering && self.audit_turn_open.is_empty() && self.audit_open.is_empty();
         let mut rows: Vec<AnyElement> = if collapsed {
-            self.audit_window(&view, max_weight, cx)
+            self.audit_window(&view, category, max_weight, cx)
         } else {
-            self.audit_rows(&view, &query, filtering, max_weight, cx)
+            self.audit_rows(&view, &query, filtering, category, max_weight, cx)
         };
         if rows.is_empty() {
             rows.push(
@@ -1512,9 +1566,18 @@ impl Shell {
     fn audit_window(
         &self,
         view: &AuditView,
+        category: Option<AuditCategory>,
         max_weight: f32,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
+        let turns: Vec<&AuditTurn> = view
+            .turns
+            .iter()
+            .filter(|turn| {
+                category
+                    .is_none_or(|category| turn.calls.iter().any(|call| call.category == category))
+            })
+            .collect();
         let row_h = Self::TURN_ROW_H;
         let view_h = f32::from(self.audit_scroll.bounds().size.height);
         let view_h = if view_h > 0.0 {
@@ -1523,12 +1586,12 @@ impl Shell {
             AUDIT_FIRST_VIEWPORT
         };
         let view_top = -f32::from(self.audit_scroll.offset().y);
-        let (first, end, leading, trailing) = audit_band(view.turns.len(), row_h, view_top, view_h);
+        let (first, end, leading, trailing) = audit_band(turns.len(), row_h, view_top, view_h);
         let mut rows: Vec<AnyElement> = Vec::with_capacity(2 + end.saturating_sub(first));
         if leading > 0.0 {
             rows.push(audit_spacer(leading));
         }
-        for turn in &view.turns[first..end] {
+        for turn in &turns[first..end] {
             rows.push(self.audit_turn_row(view, turn, max_weight, cx));
         }
         if trailing > 0.0 {
@@ -1545,14 +1608,56 @@ impl Shell {
         view: &AuditView,
         query: &str,
         filtering: bool,
+        category: Option<AuditCategory>,
         max_weight: f32,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let mut rows: Vec<AnyElement> = Vec::new();
-        for turn in &view.turns {
-            if !audit::matches_turn(turn, query) {
-                continue;
-            }
+        let matching_turns: Vec<&AuditTurn> = view
+            .turns
+            .iter()
+            .filter(|turn| {
+                let category_has_calls = category
+                    .is_none_or(|category| turn.calls.iter().any(|call| call.category == category));
+                if !category_has_calls {
+                    return false;
+                }
+                !filtering
+                    || turn.calls.iter().any(|call| {
+                        category.is_none_or(|category| call.category == category)
+                            && audit::matches_call(call, query)
+                    })
+                    || (category.is_none()
+                        && turn
+                            .refusals
+                            .iter()
+                            .any(|refusal| audit::matches_refusal(refusal, query)))
+            })
+            .collect();
+        let pages = matching_turns.len().div_ceil(AUDIT_TURNS_PER_PAGE).max(1);
+        let page = self.audit_page.min(pages - 1);
+        let first_turn = page * AUDIT_TURNS_PER_PAGE;
+        for turn in matching_turns
+            .iter()
+            .skip(first_turn)
+            .take(AUDIT_TURNS_PER_PAGE)
+        {
+            let matching_calls = turn
+                .calls
+                .iter()
+                .enumerate()
+                .filter(|(_, call)| category.is_none_or(|category| call.category == category))
+                .filter(|(_, call)| audit::matches_call(call, query));
+            let matching_count = matching_calls.clone().count();
+            let limit = self
+                .audit_call_limits
+                .get(&turn.index)
+                .copied()
+                .unwrap_or(AUDIT_CALLS_PER_TURN);
+            let calls: Vec<(usize, &AuditCall)> = matching_calls.take(limit).collect();
+            let remaining = matching_count.saturating_sub(calls.len());
+            // Category selection and search are applied before building rows,
+            // so a filtered turn cannot still expand into unrelated calls.
             rows.push(self.audit_turn_row(view, turn, max_weight, cx));
             // A search shows the matching calls even in a collapsed turn, so a
             // hit is never hidden behind the turn's own fold.
@@ -1573,18 +1678,96 @@ impl Shell {
                         .into_any_element(),
                 );
             }
-            for (index, call) in turn.calls.iter().enumerate() {
-                if !audit::matches_call(call, query) {
-                    continue;
-                }
-                rows.push(self.audit_call_row(turn.index, index, call, &view.policy, cx));
+            for (index, call) in &calls {
+                rows.push(self.audit_call_row(turn.index, *index, call, &view.policy, cx));
             }
-            for (index, refusal) in turn.refusals.iter().enumerate() {
-                if !audit::matches_refusal(refusal, query) {
-                    continue;
-                }
+            if remaining > 0 {
+                let turn_index = turn.index;
+                let label = crate::i18n::tr_args(
+                    self.state.lang,
+                    "audit.showMoreCalls",
+                    &[("count", remaining.to_string())],
+                );
+                rows.push(
+                    div()
+                        .id(SharedString::from(format!(
+                            "audit-more-calls-{}",
+                            turn_index
+                        )))
+                        .ml(px(94.0))
+                        .py(px(6.0))
+                        .cursor_pointer()
+                        .child(txt(label, 11.0, theme::accent()))
+                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                            let shown = this
+                                .audit_call_limits
+                                .entry(turn_index)
+                                .or_insert(AUDIT_CALLS_PER_TURN);
+                            *shown = shown.saturating_add(AUDIT_CALLS_PER_TURN);
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                );
+            }
+            for (index, refusal) in
+                turn.refusals.iter().enumerate().filter(|(_, refusal)| {
+                    category.is_none() && audit::matches_refusal(refusal, query)
+                })
+            {
                 rows.push(self.audit_refusal_row(turn, index, refusal));
             }
+        }
+        if pages > 1 {
+            let page_label = crate::i18n::tr_args(
+                self.state.lang,
+                "audit.page",
+                &[
+                    ("page", (page + 1).to_string()),
+                    ("pages", pages.to_string()),
+                ],
+            );
+            let last_page = pages - 1;
+            rows.push(
+                div()
+                    .id("audit-page-controls")
+                    .mt(px(8.0))
+                    .pb(px(8.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(12.0))
+                    .child(
+                        div()
+                            .id("audit-page-prev")
+                            .cursor_pointer()
+                            .child(txt("‹", 16.0, theme::accent()))
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.audit_page = this.audit_page.saturating_sub(1);
+                                this.audit_scroll.set_offset(gpui_kit::point(
+                                    gpui_kit::px(0.0),
+                                    gpui_kit::px(0.0),
+                                ));
+                                cx.notify();
+                            })),
+                    )
+                    .child(txt(page_label, 11.0, theme::muted()))
+                    .child(
+                        div()
+                            .id("audit-page-next")
+                            .cursor_pointer()
+                            .child(txt("›", 16.0, theme::accent()))
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                this.audit_page = (this.audit_page + 1).min(last_page);
+                                this.audit_scroll.set_offset(gpui_kit::point(
+                                    gpui_kit::px(0.0),
+                                    gpui_kit::px(0.0),
+                                ));
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element(),
+            );
         }
         rows
     }
@@ -1599,6 +1782,10 @@ const AUDIT_OVERDRAW: f32 = 480.0;
 /// What the first frame after the tab mounts assumes it can show, before the
 /// scroller has reported its own height.
 const AUDIT_FIRST_VIEWPORT: f32 = 800.0;
+/// Expanded/search audit rendering stays bounded to a short turn page.
+const AUDIT_TURNS_PER_PAGE: usize = 20;
+/// Calls in each expanded turn are revealed in bounded increments.
+const AUDIT_CALLS_PER_TURN: usize = 50;
 
 /// The band of the collapsed page, and the exact height of the rows on either
 /// side of it.

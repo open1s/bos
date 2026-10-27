@@ -48,7 +48,7 @@ use agent::policy::{FetchError, FetchLimits, FetchedPage};
 use agent::tools::AsyncFunctionTool;
 use agent::{Agent, ToolError};
 
-/// The rendered engine: an external Obscura process spoken to over CDP.
+/// The rendered engine: an external Chrome/Chromium process spoken to over CDP.
 ///
 /// The model below is the ONE surface; this module only changes who produces a
 /// document. A build with no binary installed falls back to the text view and
@@ -117,7 +117,7 @@ impl Failure {
             }
             "scheme" => "Only http and https URLs can be opened. Call browser_open with an http(s) URL.",
             "redirect" => "The redirect chain did not settle. Call browser_open with the final URL directly.",
-            "engine" => "The rendered view could not read this page. The text view is the fallback: call browser_snapshot to read it, or install Obscura as docs/bsh-browser-substrate.md describes.",
+            "engine" => "The rendered view could not read this page. The text view is the fallback: call browser_snapshot to read it, or install Google Chrome or Chromium as docs/bsh-browser-substrate.md describes.",
             _ => "The response body could not be read. Call browser_open again.",
         }
     }
@@ -865,10 +865,17 @@ pub(crate) struct BrowserHandle {
     /// Whether this handle may start an engine at all.
     ///
     /// A TEST build defaults this off, so the unit tests of the text view keep
-    /// pinning the text producer even on a machine with Obscura installed; the
+    /// pinning the text producer even on a machine with Chromium installed; the
     /// engine's own tests and the shipped binary turn it on. A test that wants
     /// the engine uses `BrowserHandle::live`.
     engine_disabled: bool,
+    /// Single flight for the launch itself. HELD across `Engine::launch_in`,
+    /// which is MEASURED at 0.18-2.3 s (V8 plus the system font scan, warm
+    /// against cold) - so the engine STATE lock must never be held for it, or
+    /// every `engine_ready()` on the UI thread freezes the window for the
+    /// whole launch. A second caller waits here, then re-reads the state the
+    /// first one wrote.
+    launch_flight: Mutex<()>,
     /// Where an engine started by this handle keeps its pidfile.
     ///
     /// None is production (the harness data directory). The engine's own tests
@@ -901,6 +908,7 @@ impl BrowserHandle {
             engine: Mutex::new(EngineState::Idle),
             frames: Arc::new(engine::FrameSlot::default()),
             engine_disabled: cfg!(test),
+            launch_flight: Mutex::new(()),
             engine_state_dir: None,
         }
     }
@@ -979,15 +987,22 @@ impl BrowserHandle {
     /// which is what a machine without the binary wants and what a test that
     /// must not spawn anything sets.
     pub(crate) fn ensure_engine(&self) -> Result<Arc<engine::Engine>, engine::EngineError> {
-        let mut slot = self
-            .engine
+        // The state-only answer first, under a lock that is never held for a
+        // launch: a reader on the UI thread must never wait out a launch here.
+        // MEASURED on this machine, a cold launch froze every render that asked
+        // `engine_ready` for the whole 2.2 s the engine took to start.
+        if let Some(answer) = self.engine_state() {
+            return answer;
+        }
+        // One launch at a time. A second caller waits here and then re-reads
+        // the state the first one wrote, so one handle never starts two
+        // engines.
+        let _flight = self
+            .launch_flight
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let EngineState::Ready(engine) = &*slot {
-            return Ok(engine.clone());
-        }
-        if let EngineState::Unavailable(error) = &*slot {
-            return Err(error.clone());
+        if let Some(answer) = self.engine_state() {
+            return answer;
         }
         if self.engine_disabled {
             // A test of the text view: no process, no notice, no launch attempt.
@@ -1006,15 +1021,25 @@ impl BrowserHandle {
                     "The rendered view is switched off in this environment; the text view is what the pane shows.",
                 ),
             };
+            let mut slot = self
+                .engine
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             *slot = EngineState::Unavailable(error.clone());
             return Err(error);
         }
+        // The launch itself runs on NO state lock: this is the 0.18-2.3 s the
+        // reader must never wait for behind `engine_ready`.
         let started = match &self.engine_state_dir {
             Some(state_dir) => {
                 engine::Engine::launch_in(self.frames.clone(), (1000, 700), state_dir)
             }
             None => engine::Engine::launch(self.frames.clone(), (1000, 700)),
         };
+        let mut slot = self
+            .engine
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         match started {
             Ok(engine) => {
                 let engine = Arc::new(engine);
@@ -1028,8 +1053,31 @@ impl BrowserHandle {
         }
     }
 
+    /// The answer the current state carries, when no launch is needed. `None`
+    /// means a launch might be required, which is the only case that may take
+    /// the launch flight.
+    fn engine_state(&self) -> Option<Result<Arc<engine::Engine>, engine::EngineError>> {
+        let slot = self
+            .engine
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match &*slot {
+            EngineState::Ready(engine) => Some(Ok(engine.clone())),
+            EngineState::Unavailable(error) => Some(Err(error.clone())),
+            EngineState::Idle => None,
+        }
+    }
+
     /// Stop the engine, if one is running, and allow a later open to retry.
+    ///
+    /// The flight is taken first so a stop waits out an in-flight launch and
+    /// then clears it, exactly as the old single-lock shape did - while every
+    /// reader of the state lock stays wait-free either way.
     pub(crate) fn stop_engine(&self) {
+        let _flight = self
+            .launch_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let previous = self
             .engine
             .lock()
@@ -1331,14 +1379,21 @@ fn direct_client() -> Result<&'static reqwest::Client, FetchError> {
     CLIENT
         .get_or_init(|| {
             let limits = direct_limits();
-            reqwest::Client::builder()
+            let builder = reqwest::Client::builder()
                 .timeout(limits.timeout)
                 // The client follows the hops itself; there is no policy to ask
                 // at each one, which was the only reason the gated path walked
                 // them.
                 .redirect(reqwest::redirect::Policy::limited(usize::from(
                     limits.max_redirects,
-                )))
+                )));
+            // The local HTTP fixtures must reach their listener directly. A
+            // developer or CI proxy can otherwise intercept 127.0.0.1 and
+            // return a successful-looking error page, making the browser land
+            // an empty document. Production keeps reqwest's normal proxy rules.
+            #[cfg(test)]
+            let builder = builder.no_proxy();
+            builder
                 .build()
                 .map_err(|error| format!("the browser's client: {error}"))
         })
@@ -1619,7 +1674,9 @@ pub(crate) fn press_live(
             "No element is focused, so Enter has nothing to activate. Call browser_click on an element (or browser_press Tab to focus the first one), then press Enter.",
         )));
     }
-    let focused = engine.press(key).map_err(|error| engine_error(&error))?;
+    let focused = engine
+        .press(key, false)
+        .map_err(|error| engine_error(&error))?;
     match focused {
         Some((reference, label)) => {
             if let Some(id) = parse_ref(&reference) {

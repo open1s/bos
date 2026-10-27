@@ -2,7 +2,7 @@
 //!
 //! # The shape
 //!
-//! Obscura is an EXTERNAL binary. This module starts it, learns its port, opens
+//! Chromium is an EXTERNAL binary. This module starts it, learns its port, opens
 //! one websocket and then hands the socket to a single dedicated thread: that
 //! thread is the only reader and the only writer, so every request is written
 //! in the order it was queued and every answer is correlated by its `id`
@@ -11,40 +11,27 @@
 //!
 //! # Discovery, in the order it is tried
 //!
-//! 1. `BSH_OBSCURA_BIN` - an explicit path, and a missing one is an ERROR that
+//! 1. `BSH_CHROMIUM_BIN` - an explicit path, and a missing one is an ERROR that
 //!    names the variable rather than silently falling through.
-//! 2. `obscura` on `PATH`.
-//! 3. `target/obscura/obscura` in this checkout - the documented development
-//!    location, which `.gitignore` keeps out of the tree because the release
-//!    tarball is 67 MB and is not vendored.
+//! 2. Chrome/Chromium on `PATH` or in the standard application locations.
 //!
 //! # How the port is learned
 //!
-//! The engine is launched with `--port 0` (the kernel picks a free port) and
-//! `--ready-file`, which Obscura writes ATOMICALLY once it is actually
-//! listening: `{"pid":..,"host":..,"port":..,"websocket_path":..}`. This is
-//! more robust than scraping the banner, and it still works with `--quiet`.
-//! The banner is parsed as a fallback (`CDP server: ws://...`), so a build
-//! without `--ready-file` is not a hard failure.
+//! Chromium is launched with `--remote-debugging-port=0`; it atomically writes
+//! the chosen port to `DevToolsActivePort` in its private profile.
 //!
 //! # What the endpoint can actually do
 //!
-//! MEASURED on obscura 0.2.5: `/json/list` advertises a page target whose own
-//! websocket (`/devtools/page/page-1`) answers EVERY command with
-//! `{"code":-32601,"message":"No page for session"}` - before and after a
-//! page exists. The working route is the BROWSER endpoint
-//! (`/devtools/browser`) plus `Target.createTarget`/`Target.attachToTarget`,
-//! whose `sessionId` every page command must carry. `discover_target` therefore
-//! uses `/json/list` to find the target ID and then speaks on the browser
-//! socket; the page-endpoint URL is deliberately not used.
+//! The client uses the browser websocket and flattened target sessions so page
+//! commands and Fetch events work with Chromium's standard CDP implementation.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -58,9 +45,7 @@ use std::time::{Duration, Instant};
 /// window, and the load event itself is stamped (see `handle_event`), so the
 /// window can never elapse before the load it follows.
 pub(crate) const NETWORK_IDLE: Duration = Duration::from_millis(400);
-/// Requests that may still be in flight and count as idle. The Fetch pause is
-/// emitted after the fetch in obscura 0.2.5, so this is a ceiling rather than an
-/// exact count.
+/// Requests that may still be in flight and count as idle.
 pub(crate) const IDLE_IN_FLIGHT: u64 = 2;
 
 use serde_json::{json, Value};
@@ -82,12 +67,10 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 /// The most stderr/stdout text kept for a failure message.
 const LOG_CAP: usize = 8 * 1024;
 
-/// A counter that makes every launch's scratch paths unique WITHIN one process.
+/// A counter that makes every launch's scratch paths unique within one process.
 ///
-/// MEASURED: a ready-file name built from pid + nanoseconds alone collides when
-/// two tests launch an engine in parallel (same clock tick), and the second
-/// engine then reads the first one's port - which looks like a CDP socket reset
-/// and is a path collision.
+/// The pid and nanosecond clock identify independent launches; the sequence
+/// number covers parallel starts within the same clock tick.
 static LAUNCH_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// State the socket thread publishes and the callers read.
@@ -95,6 +78,8 @@ static LAUNCH_SEQ: AtomicU64 = AtomicU64::new(0);
 pub(crate) struct Shared {
     /// Count of `Page.loadEventFired` events, monotonic.
     loads: AtomicU64,
+    /// Count of `Page.domContentEventFired` events, monotonic.
+    dom_contents: AtomicU64,
     /// Requests the `Fetch` seam paused.
     paused: AtomicU64,
     /// Requests the `Fetch` seam continued.
@@ -103,24 +88,28 @@ pub(crate) struct Shared {
     inflight: AtomicU64,
     /// When the request seam last saw activity, as a monotonic instant.
     last_activity: Mutex<Option<Instant>>,
-    /// Monotonic count of things that may repaint the page: a request at the
-    /// seam, a load event, and every command the client sends (the frame
-    /// pump's own probes excepted). The frame pump reads this to decide
-    /// whether its next capture should be at the fast or the idle cadence.
-    activity: AtomicU64,
     /// Whether `Fetch.enable` succeeded, which is what makes the counter
     /// trustworthy. A build without the domain falls back to load + settle.
     fetch_ready: AtomicBool,
     /// Why the connection ended, when it did.
     closed: Mutex<Option<String>>,
-    /// The session id Obscura attached, learned from the event.
-    session: Mutex<Option<String>>,
+    /// Latest compositor frame delivered by `Page.startScreencast`.
+    screencast_frame: Mutex<Option<String>>,
+    /// Pairs with `screencast_wake` so a frame cannot be missed while waiting.
+    screencast_gate: Mutex<()>,
+    /// Woken when a screencast frame arrives.
+    screencast_wake: Condvar,
 }
 
 impl Shared {
     /// Loads observed so far.
     pub(crate) fn loads(&self) -> u64 {
         self.loads.load(Ordering::Relaxed)
+    }
+
+    /// DOM content events observed so far.
+    pub(crate) fn dom_contents(&self) -> u64 {
+        self.dom_contents.load(Ordering::Relaxed)
     }
 
     /// Requests paused at the Fetch seam.
@@ -160,15 +149,6 @@ impl Shared {
         if let Ok(mut slot) = self.last_activity.lock() {
             slot.replace(Instant::now());
         }
-        self.activity.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// The activity stamp the frame pump reads: anything that may have
-    /// repainted the page bumps it, so one monotonic counter carries "the
-    /// page may look different now" from the request seam and the command
-    /// path to the capture thread.
-    pub(crate) fn activity(&self) -> u64 {
-        self.activity.load(Ordering::Relaxed)
     }
 
     /// Wait until no request has been seen for `idle`, capped at `cap`.
@@ -203,11 +183,6 @@ impl Shared {
     pub(crate) fn closed(&self) -> Option<String> {
         self.closed.lock().ok().and_then(|slot| slot.clone())
     }
-
-    /// The session Obscura attached.
-    pub(crate) fn session(&self) -> Option<String> {
-        self.session.lock().ok().and_then(|slot| slot.clone())
-    }
 }
 
 /// One queued request for the socket thread.
@@ -222,7 +197,7 @@ struct Job {
 pub(crate) struct Client {
     /// The port the engine bound.
     port: u16,
-    /// The target id from `Target.createTarget`.
+    /// The target id the browser advertises.
     target: String,
     /// The session every page command carries.
     session: Mutex<String>,
@@ -284,12 +259,11 @@ impl Client {
             );
         }
         let binary = discover_binary()?;
-        let suffix = unique_suffix();
-        let marker = reap::new_marker(LAUNCH_SEQ.load(Ordering::Relaxed));
-        let ready_file = std::env::temp_dir().join(format!("bsh-obscura-{suffix}.json"));
+        let marker = reap::new_marker(LAUNCH_SEQ.fetch_add(1, Ordering::Relaxed));
         let storage_dir = std::env::temp_dir().join(&marker);
+        let ready_file = storage_dir.join("DevToolsActivePort");
         let log = Arc::new(Mutex::new(String::new()));
-        let mut child = spawn_engine(&binary, &ready_file, &storage_dir)?;
+        let mut child = spawn_engine(&binary, &storage_dir)?;
         // Record the child BEFORE the handshake: a crash during startup is
         // exactly the case a later pass has to be able to reap.
         let pidfile = match reap::write_pidfile(state_dir, child.id(), &marker) {
@@ -313,8 +287,7 @@ impl Client {
         let port = match wait_for_port(&mut child, &ready_file, &log, STARTUP_TIMEOUT) {
             Ok(port) => port,
             Err(error) => {
-                kill_and_wait(&mut child);
-                remove_file(&ready_file);
+                cleanup_failed_launch(&mut child, &ready_file, &storage_dir, pidfile.as_deref());
                 return Err(error);
             }
         };
@@ -323,16 +296,14 @@ impl Client {
         let endpoint = match browser_endpoint(port) {
             Ok(endpoint) => endpoint,
             Err(error) => {
-                kill_and_wait(&mut child);
-                remove_file(&ready_file);
+                cleanup_failed_launch(&mut child, &ready_file, &storage_dir, pidfile.as_deref());
                 return Err(EngineError::Handshake(error));
             }
         };
         let socket = match Socket::connect(&endpoint, CALL_TIMEOUT) {
             Ok(socket) => socket,
             Err(error) => {
-                kill_and_wait(&mut child);
-                remove_file(&ready_file);
+                cleanup_failed_launch(&mut child, &ready_file, &storage_dir, pidfile.as_deref());
                 return Err(EngineError::Handshake(format!(
                     "the websocket at {endpoint} could not be opened: {error}"
                 )));
@@ -341,12 +312,18 @@ impl Client {
         let (jobs, queue) = mpsc::channel::<Job>();
         let thread_shared = shared.clone();
         let thread_alive = alive.clone();
-        let thread = thread::Builder::new()
+        let thread = match thread::Builder::new()
             .name(String::from("bsh-cdp"))
             .spawn(move || run_socket(socket, queue, thread_shared, thread_alive))
-            .map_err(|error| {
-                EngineError::Spawn(format!("the CDP thread did not start: {error}"))
-            })?;
+        {
+            Ok(thread) => thread,
+            Err(error) => {
+                cleanup_failed_launch(&mut child, &ready_file, &storage_dir, pidfile.as_deref());
+                return Err(EngineError::Spawn(format!(
+                    "the CDP thread did not start: {error}"
+                )));
+            }
+        };
 
         let mut client = Self {
             port,
@@ -392,60 +369,30 @@ impl Client {
     /// Find a page target, bind a session and enable the domains.
     fn bootstrap(&mut self, viewport: (u32, u32)) -> Result<(), EngineError> {
         let target = discover_target(self.port)?;
-        // Attaching to the discovered target is tried first, because that is
-        // the contract /json/list advertises. In obscura 0.2.5 that target
-        // does not exist in the engine until Target.createTarget runs, so a
-        // refusal is expected and the create path is the measured one.
-        let attached = self
-            .call_browser(
-                "Target.attachToTarget",
-                json!({ "targetId": target, "flatten": true }),
-            )
-            .ok()
-            .and_then(|result| {
-                result
-                    .get("sessionId")
-                    .and_then(Value::as_str)
-                    .map(String::from)
-            });
-        let (target, session) = match attached {
-            Some(session) => (target, session),
-            None => {
-                let created =
-                    self.call_browser("Target.createTarget", json!({ "url": "about:blank" }))?;
-                let target = created
-                    .get("targetId")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        EngineError::Handshake(String::from(
-                            "Target.createTarget answered without a targetId",
-                        ))
-                    })?
-                    .to_string();
-                // The session arrives as a Target.attachedToTarget event,
-                // which may already have been read by the socket thread.
-                let session = self.wait_session(Duration::from_secs(5)).ok_or_else(|| {
-                    EngineError::Handshake(format!(
-                        "the engine created target {target} but never attached a session"
-                    ))
-                })?;
-                (target, session)
-            }
-        };
+        // Chromium starts one blank page with the headless process. Reuse it
+        // so this process stays a single-page renderer and page state remains
+        // isolated to the browser context owned by this pane.
+        let attached = self.call_browser(
+            "Target.attachToTarget",
+            json!({ "targetId": target, "flatten": true }),
+        )?;
+        let session = attached
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .ok_or_else(|| {
+                EngineError::Handshake(format!(
+                    "Target.attachToTarget answered without a session for page {target}"
+                ))
+            })?;
         self.target = target;
         if let Ok(mut slot) = self.session.lock() {
             *slot = session.clone();
         }
-        if let Ok(mut slot) = self.shared.session.lock() {
-            slot.replace(session);
-        }
-
         self.call("Page.enable", json!({}))?;
         self.call("Runtime.enable", json!({}))?;
-        // The request seam. Interception in 0.2.5 happens AFTER the engine's
-        // own fetch (docs/bsh-browser-substrate.md records the measurement),
-        // so this is delivery control and observation; the SOCKET guarantee is
-        // the loopback gate the process was launched with.
+        // Observe page requests for the navigation idle clock. Every paused
+        // request is continued immediately; browser page traffic stays direct.
         self.call(
             "Fetch.enable",
             json!({ "patterns": [{ "urlPattern": "*" }] }),
@@ -454,20 +401,11 @@ impl Client {
         // refuses it keeps load + settle as its "navigated".
         self.shared.fetch_ready.store(true, Ordering::Relaxed);
         self.shared.touch();
-        self.resize(viewport)?;
+        // The launch starts at 1x: the pane's geometry tick applies the
+        // window's own scale within its first resize window, and the launch
+        // path has no window to read it from.
+        self.resize(viewport, 1.0)?;
         Ok(())
-    }
-
-    /// Wait for the attached-session event the socket thread records.
-    fn wait_session(&self, timeout: Duration) -> Option<String> {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if let Some(session) = self.shared.session() {
-                return Some(session);
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
-        None
     }
 
     /// The session every page command carries.
@@ -493,12 +431,6 @@ impl Client {
         &self.shared
     }
 
-    /// The page-activity stamp the frame pump reads. See
-    /// [`Shared::activity`](Shared::activity).
-    pub(crate) fn activity(&self) -> u64 {
-        self.shared.activity()
-    }
-
     /// The tail of the child's own output, for a failure sentence.
     pub(crate) fn log(&self) -> String {
         let text = self.log.lock().map(|slot| slot.clone()).unwrap_or_default();
@@ -510,6 +442,48 @@ impl Client {
     pub(crate) fn call(&self, method: &str, params: Value) -> Result<Value, EngineError> {
         let session = Some(self.session());
         self.dispatch(method, params, session)
+    }
+
+    /// Ask the page compositor to stream frames as it paints them.
+    pub(crate) fn start_screencast(&self) -> Result<(), EngineError> {
+        self.call("Page.startScreencast", json!({ "format": "png" }))
+            .map(|_| ())
+    }
+
+    /// Stop compositor frame delivery.
+    pub(crate) fn stop_screencast(&self) -> Result<(), EngineError> {
+        self.call("Page.stopScreencast", json!({})).map(|_| ())
+    }
+
+    /// Wait for the latest compositor frame, coalescing frames while the
+    /// consumer is busy.
+    pub(crate) fn wait_screencast_frame(&self, timeout: Duration) -> Option<String> {
+        let deadline = Instant::now() + timeout;
+        let mut gate = self
+            .shared
+            .screencast_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if let Ok(mut frame) = self.shared.screencast_frame.lock() {
+                if let Some(frame) = frame.take() {
+                    return Some(frame);
+                }
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            let (next, result) = self
+                .shared
+                .screencast_wake
+                .wait_timeout(gate, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            gate = next;
+            if result.timed_out() {
+                return None;
+            }
+        }
     }
 
     /// Call a browser-level method (Target.*, Browser.*), with no session.
@@ -524,13 +498,6 @@ impl Client {
         params: Value,
         session: Option<String>,
     ) -> Result<Value, EngineError> {
-        // Every command may repaint the page: a navigate, an input dispatch,
-        // a resize. The frame pump's own probes are excepted - counting those
-        // would pin the capture cadence at its fast rate on a page that never
-        // changes.
-        if method != "Page.captureScreenshot" {
-            self.shared.activity.fetch_add(1, Ordering::Relaxed);
-        }
         if !self.alive.load(Ordering::Relaxed) {
             return Err(EngineError::Closed(
                 self.shared
@@ -590,10 +557,6 @@ impl Client {
                     .unwrap_or_else(|| String::from("the engine's socket stopped")),
             ));
         }
-        // A fire-and-forget event is page activity exactly like a call: a
-        // hover or a drag move repaints, so the frame pump wakes to the fast
-        // cadence without this path paying for a reply.
-        self.shared.activity.fetch_add(1, Ordering::Relaxed);
         let (reply, _unread) = mpsc::channel();
         self.jobs
             .send(Job {
@@ -612,14 +575,25 @@ impl Client {
     }
 
     /// Resize the page viewport, which is also the capture size.
-    pub(crate) fn resize(&self, viewport: (u32, u32)) -> Result<(), EngineError> {
+    ///
+    /// `scale` is the WINDOW's device scale factor, and the capture must match
+    /// it: a 1x capture drawn into a 2x display's pixels is upsampled and the
+    /// page reads blurry (MEASURED: dsf 1 captures 800x600 for a 800x600 point
+    /// viewport, which the GPU stretches over 1600x1200 device pixels; dsf 2
+    /// captures 1600x1200 and draws one texture pixel per screen pixel).
+    pub(crate) fn resize(&self, viewport: (u32, u32), scale: f32) -> Result<(), EngineError> {
         let (width, height) = (viewport.0.clamp(320, 4096), viewport.1.clamp(240, 4096));
+        let scale = if (0.5..=4.0).contains(&scale) {
+            scale
+        } else {
+            1.0
+        };
         self.call(
             "Emulation.setDeviceMetricsOverride",
             json!({
                 "width": width,
                 "height": height,
-                "deviceScaleFactor": 1,
+                "deviceScaleFactor": scale,
                 "mobile": false,
             }),
         )
@@ -637,6 +611,21 @@ impl Client {
                 return false;
             }
             thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    /// Wait until a DOM content event newer than `above` arrives, or the deadline.
+    pub(crate) fn wait_dom_content(&self, above: u64, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if self.shared.dom_contents() > above {
+                return true;
+            }
+            if !self.alive.load(Ordering::Relaxed) {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(2));
         }
         false
     }
@@ -716,8 +705,12 @@ fn run_socket(
                         let _ = reply.send(outcome);
                     }
                 }
-                Ok(Incoming::Event { method, params }) => {
-                    handle_event(&mut socket, &method, &params, &shared);
+                Ok(Incoming::Event {
+                    method,
+                    params,
+                    session,
+                }) => {
+                    handle_event(&mut socket, &method, &params, session.as_deref(), &shared);
                 }
                 Err(error) => {
                     if let Ok(mut slot) = shared.closed.lock() {
@@ -745,8 +738,42 @@ fn run_socket(
 }
 
 /// Route one event.
-fn handle_event(socket: &mut Socket, method: &str, params: &Value, shared: &Shared) {
+fn handle_event(
+    socket: &mut Socket,
+    method: &str,
+    params: &Value,
+    event_session: Option<&str>,
+    shared: &Shared,
+) {
     match method {
+        "Page.screencastFrame" => {
+            if let Some(data) = params.get("data").and_then(Value::as_str) {
+                let gate = shared
+                    .screencast_gate
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Ok(mut frame) = shared.screencast_frame.lock() {
+                    frame.replace(data.to_string());
+                }
+                if let Some(session_id) = params.get("sessionId").and_then(Value::as_i64) {
+                    let mut ack = json!({
+                        "id": 0,
+                        "method": "Page.screencastFrameAck",
+                        "params": { "sessionId": session_id },
+                    });
+                    if let Some(target) = event_session {
+                        ack["sessionId"] = Value::String(target.to_string());
+                    }
+                    let _ = socket.send(&ack.to_string());
+                }
+                shared.screencast_wake.notify_one();
+                drop(gate);
+            }
+        }
+        "Page.domContentEventFired" => {
+            shared.dom_contents.fetch_add(1, Ordering::Relaxed);
+            shared.touch();
+        }
         "Page.loadEventFired" => {
             shared.loads.fetch_add(1, Ordering::Relaxed);
             // The load event is network activity too: stamping it means the
@@ -754,13 +781,6 @@ fn handle_event(socket: &mut Socket, method: &str, params: &Value, shared: &Shar
             // quiet window that started with the document's own fetch cannot
             // race past a subresource whose stamp lands just after load.
             shared.touch();
-        }
-        "Target.attachedToTarget" => {
-            if let Some(session) = params.get("sessionId").and_then(Value::as_str) {
-                if let Ok(mut slot) = shared.session.lock() {
-                    slot.replace(session.to_string());
-                }
-            }
         }
         "Fetch.requestPaused" => {
             shared.paused.fetch_add(1, Ordering::Relaxed);
@@ -774,12 +794,15 @@ fn handle_event(socket: &mut Socket, method: &str, params: &Value, shared: &Shar
             // request is continued. The seam is kept because its pause is the
             // navigation idle clock (`shared.touch`), which is what makes
             // `wait_network_idle` real.
-            let text = json!({
+            let mut text = json!({
                 "id": 0,
                 "method": "Fetch.continueRequest",
                 "params": { "requestId": request_id },
-            })
-            .to_string();
+            });
+            if let Some(session) = event_session {
+                text["sessionId"] = Value::String(session.to_string());
+            }
+            let text = text.to_string();
             let _ = socket.send(&text);
         }
         _ => {}
@@ -813,47 +836,64 @@ fn discover_target(port: u16) -> Result<String, EngineError> {
 
 /// One tiny HTTP GET, for the two discovery endpoints.
 ///
-/// The `Host` header carries the PORT: Obscura answers 403 to a request whose
-/// Host omits it (measured), so a client that sends a bare host would fail at
-/// discovery with a refusal that looks like a policy decision.
+/// Include the port in Host for compatibility with Chromium's DevTools server.
 fn http_get(port: u16, path: &str) -> Result<Value, String> {
     let addr: SocketAddr = format!("127.0.0.1:{port}")
         .to_socket_addrs()
         .map_err(|error| format!("the engine's port {port} did not resolve: {error}"))?
         .next()
         .ok_or_else(|| format!("the engine's port {port} has no address"))?;
-    let mut stream =
-        TcpStream::connect_timeout(&addr, Duration::from_secs(5)).map_err(|error| {
-            format!("the engine's HTTP endpoint at {port} refused the connection: {error}")
-        })?;
+    let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).map_err(|error| {
+        format!("the engine's HTTP endpoint at {port} refused the connection: {error}")
+    })?;
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|error| format!("the engine's HTTP endpoint could not be tuned: {error}"))?;
     let request = format!(
         "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: */*\r\nConnection: close\r\n\r\n"
     );
+    let mut stream = stream;
     stream
         .write_all(request.as_bytes())
         .map_err(|error| format!("the engine's HTTP endpoint refused the request: {error}"))?;
-    let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    reader
+        .read_line(&mut status_line)
         .map_err(|error| format!("the engine's HTTP endpoint did not answer: {error}"))?;
-    let text = String::from_utf8_lossy(&response);
-    let (head, body) = text.split_once("\r\n\r\n").ok_or_else(|| {
-        format!(
-            "the engine's HTTP answer had no body: {}",
-            wire::truncate(&text, 200)
-        )
-    })?;
-    let status = head.lines().next().unwrap_or_default();
-    if !status.contains(" 200 ") {
+    if !status_line.contains(" 200 ") {
+        let status = status_line.trim();
         return Err(format!("the engine answered {path} with {status}"));
     }
-    serde_json::from_str(body).map_err(|error| {
+    let mut content_length = None;
+    loop {
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .map_err(|error| format!("the engine's HTTP headers did not finish: {error}"))?;
+        if line == "\r\n" || line == "\n" {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = value.trim().parse::<usize>().ok();
+            }
+        }
+    }
+    let length = content_length
+        .filter(|length| *length <= 1_048_576)
+        .ok_or_else(|| {
+            format!("the engine's HTTP answer to {path} has no usable Content-Length")
+        })?;
+    let mut body = vec![0; length];
+    reader
+        .read_exact(&mut body)
+        .map_err(|error| format!("the engine's HTTP body for {path} was incomplete: {error}"))?;
+    let body = String::from_utf8_lossy(&body);
+    serde_json::from_str(&body).map_err(|error| {
         format!(
             "the engine's answer to {path} is not JSON ({error}): {}",
-            wire::truncate(body, 200)
+            wire::truncate(&body, 200)
         )
     })
 }
@@ -861,50 +901,55 @@ fn http_get(port: u16, path: &str) -> Result<Value, String> {
 /// The binary to launch, or a failure that names every place it looked.
 pub(crate) fn discover_binary() -> Result<PathBuf, EngineError> {
     let mut searched = Vec::new();
-    if let Some(explicit) = std::env::var_os("BSH_OBSCURA_BIN") {
+    if let Some(explicit) = std::env::var_os("BSH_CHROMIUM_BIN") {
         let path = PathBuf::from(explicit);
-        searched.push(format!("BSH_OBSCURA_BIN={}", path.display()));
+        searched.push(format!("BSH_CHROMIUM_BIN={}", path.display()));
         if path.is_file() {
             return Ok(path);
         }
         return Err(EngineError::MissingBinary {
             searched: searched.join(", "),
             hint: String::from(
-                "BSH_OBSCURA_BIN names a path that is not a file. Point it at the extracted obscura binary.",
+                "BSH_CHROMIUM_BIN names a path that is not a file. Point it at Chrome or Chromium.",
             ),
         });
     }
-    searched.push(String::from("PATH"));
-    if let Some(path) = std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|directory| directory.join("obscura"))
-            .find(|candidate| candidate.is_file())
-    }) {
-        return Ok(path);
+    for name in [
+        "chromium",
+        "chromium-browser",
+        "google-chrome",
+        "google-chrome-stable",
+    ] {
+        searched.push(format!("PATH:{name}"));
+        if let Some(path) = std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|directory| directory.join(name))
+                .find(|candidate| candidate.is_file())
+        }) {
+            return Ok(path);
+        }
     }
-    let dev = dev_binary();
-    searched.push(dev.display().to_string());
-    if dev.is_file() {
-        return Ok(dev);
+    #[cfg(target_os = "macos")]
+    for path in [
+        PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+        PathBuf::from("/Applications/Chromium.app/Contents/MacOS/Chromium"),
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default()
+            .join("Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+    ] {
+        searched.push(path.display().to_string());
+        if path.is_file() {
+            return Ok(path);
+        }
     }
     Err(EngineError::MissingBinary {
         searched: searched.join(", "),
         hint: format!(
-            "Install Obscura 0.2.5 (release obscura-aarch64-macos.tar.gz from https://github.com/h4ckf0r0day/obscura/releases), \
-             extract it, and put obscura on PATH, copy it to {}, or set BSH_OBSCURA_BIN.",
-            dev.display()
+            "Install Google Chrome or Chromium, or set BSH_CHROMIUM_BIN to its executable. Looked in: {}.",
+            searched.join(", ")
         ),
     })
-}
-
-/// Where a development build is looked for: this checkout's `target/obscura`.
-pub(crate) fn dev_binary() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("target")
-        .join("obscura")
-        .join("obscura")
 }
 
 /// Start the process with the measured argument set.
@@ -924,11 +969,7 @@ fn scrub_sandbox_env(command: &mut Command) {
     }
 }
 
-fn spawn_engine(
-    binary: &Path,
-    ready_file: &Path,
-    storage_dir: &Path,
-) -> Result<Child, EngineError> {
+fn spawn_engine(binary: &Path, storage_dir: &Path) -> Result<Child, EngineError> {
     std::fs::create_dir_all(storage_dir).map_err(|error| {
         EngineError::Spawn(format!(
             "the engine's profile directory {} could not be created: {error}",
@@ -937,26 +978,25 @@ fn spawn_engine(
     })?;
     let mut command = Command::new(binary);
     command
-        .arg("serve")
-        .arg("--port")
-        .arg("0")
-        .arg("--ready-file")
-        .arg(ready_file)
-        .arg("--storage-dir")
-        .arg(storage_dir)
-        .arg("--allow-private-network")
+        .arg("--headless=new")
+        .arg("--remote-debugging-port=0")
+        .arg("--remote-debugging-address=127.0.0.1")
+        .arg("--remote-allow-origins=*")
+        .arg(format!("--user-data-dir={}", storage_dir.display()))
+        .arg("--no-first-run")
+        .arg("--no-default-browser-check")
+        .arg("--disable-extensions")
+        .arg("--disable-background-networking")
+        .arg("--no-proxy-server")
+        .arg("--autoplay-policy=no-user-gesture-required")
+        .arg("about:blank")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // No heel: not wrapped, and none of its environment either.
     scrub_sandbox_env(&mut command);
-    // The system fonts, so CJK is not tofu. MEASURED: without --font-dir,
-    // Chinese renders as boxes; with it the same page renders Chinese,
-    // Japanese and Korean.
-    for directory in font_dirs() {
-        command.arg("--font-dir").arg(directory);
-    }
     command.spawn().map_err(|error| {
+        let _ = std::fs::remove_dir_all(storage_dir);
         EngineError::Spawn(format!(
             "{} could not be started: {error}",
             binary.display()
@@ -964,35 +1004,7 @@ fn spawn_engine(
     })
 }
 
-/// The font directories that exist on this host, in the order they are tried.
-///
-/// `BSH_OBSCURA_FONT_DIRS` overrides the list (colon separated; `none` turns
-/// the scan off). The defaults are the measured CJK fix on macOS.
-pub(crate) fn font_dirs() -> Vec<PathBuf> {
-    if let Some(configured) = std::env::var_os("BSH_OBSCURA_FONT_DIRS") {
-        let text = configured.to_string_lossy().to_string();
-        if text == "none" {
-            return Vec::new();
-        }
-        return text
-            .split(':')
-            .filter(|part| !part.is_empty())
-            .map(PathBuf::from)
-            .filter(|path| path.is_dir())
-            .collect();
-    }
-    let mut candidates = vec![
-        PathBuf::from("/System/Library/Fonts"),
-        PathBuf::from("/System/Library/Fonts/Supplemental"),
-        PathBuf::from("/Library/Fonts"),
-        PathBuf::from("/usr/share/fonts"),
-        PathBuf::from("/usr/local/share/fonts"),
-    ];
-    candidates.retain(|path| path.is_dir());
-    candidates
-}
-
-/// Read the ready file until it says which port was bound.
+/// Read DevToolsActivePort until Chromium publishes its selected port.
 fn wait_for_port(
     child: &mut Child,
     ready_file: &Path,
@@ -1002,16 +1014,14 @@ fn wait_for_port(
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if let Ok(text) = std::fs::read_to_string(ready_file) {
-            if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                if let Some(port) = value.get("port").and_then(Value::as_u64) {
-                    if port > 0 && port <= u16::MAX as u64 {
-                        return Ok(port as u16);
-                    }
-                }
+            if let Some(port) = text
+                .lines()
+                .next()
+                .and_then(|line| line.parse::<u16>().ok())
+                .filter(|port| *port > 0)
+            {
+                return Ok(port);
             }
-        }
-        if let Some(port) = banner_port(log) {
-            return Ok(port);
         }
         if let Ok(Some(status)) = child.try_wait() {
             return Err(EngineError::Startup {
@@ -1025,17 +1035,6 @@ fn wait_for_port(
         status: String::from("still starting"),
         log: tail(log),
     })
-}
-
-/// The port from the engine's own banner, when it printed one.
-fn banner_port(log: &Arc<Mutex<String>>) -> Option<u16> {
-    let text = log.lock().ok()?.clone();
-    let marker = "CDP server: ws://";
-    let start = text.find(marker)? + marker.len();
-    let rest = &text[start..];
-    let authority = rest.split('/').next()?;
-    let port = authority.rsplit_once(':')?.1.trim();
-    port.parse().ok()
 }
 
 /// The tail of a captured log.
@@ -1072,6 +1071,21 @@ fn kill_and_wait(child: &mut Child) {
     let _ = child.wait();
 }
 
+/// Remove all per-launch state after startup failed before Client owned it.
+fn cleanup_failed_launch(
+    child: &mut Child,
+    ready_file: &Path,
+    storage_dir: &Path,
+    pidfile: Option<&Path>,
+) {
+    kill_and_wait(child);
+    remove_file(ready_file);
+    if let Some(pidfile) = pidfile {
+        remove_file(pidfile);
+    }
+    let _ = std::fs::remove_dir_all(storage_dir);
+}
+
 /// Remove a scratch file, ignoring the ways that can fail.
 fn remove_file(path: &Path) {
     let _ = std::fs::remove_file(path);
@@ -1086,39 +1100,13 @@ pub(crate) fn default_state_dir() -> PathBuf {
     crate::settings::dir().join("browser")
 }
 
-/// A suffix no other launch in this process can collide with.
-fn unique_suffix() -> String {
-    let seq = LAUNCH_SEQ.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos())
-        .unwrap_or_default();
-    format!("{}-{nanos}-{seq}", std::process::id())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn the_banner_parser_reads_the_measured_line() {
-        let log = Arc::new(Mutex::new(String::from(
-            "\n  Headless Browser v0.2.5\n  CDP server: ws://127.0.0.1:63853/devtools/browser\n",
-        )));
-        assert_eq!(banner_port(&log), Some(63853));
-        assert_eq!(banner_port(&Arc::new(Mutex::new(String::new()))), None);
-    }
-
-    #[test]
-    fn the_dev_location_is_inside_this_checkout() {
-        let dev = dev_binary();
-        assert!(dev.ends_with("target/obscura/obscura"), "{}", dev.display());
-        assert!(dev.is_absolute(), "{}", dev.display());
-    }
-
-    #[test]
     fn the_engine_launch_removes_the_sandbox_environment() {
-        let mut command = Command::new("obscura");
+        let mut command = Command::new("chromium");
         for key in agent::sandbox::RESERVED_ENV {
             command.env(key, "heel-value");
         }
@@ -1148,10 +1136,10 @@ mod tests {
     }
 
     #[test]
-    fn a_launch_suffix_is_unique_even_in_one_tick() {
-        let first = unique_suffix();
-        let second = unique_suffix();
+    fn browser_markers_are_unique_even_in_one_tick() {
+        let first = reap::new_marker(LAUNCH_SEQ.fetch_add(1, Ordering::Relaxed));
+        let second = reap::new_marker(LAUNCH_SEQ.fetch_add(1, Ordering::Relaxed));
         assert_ne!(first, second);
-        assert!(first.starts_with(&std::process::id().to_string()));
+        assert!(first.starts_with("bsh-browser-"));
     }
 }

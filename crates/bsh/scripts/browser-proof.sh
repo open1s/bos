@@ -2,7 +2,7 @@
 # Re-run the Browser pane's pixel proof in ONE command.
 #
 # What this produces, in target/:
-#   bsh-obscura-proof.png   the ENGINE's own capture of a styled page, asserted
+#   bsh-chromium-proof.png  the ENGINE's own capture of a styled page, asserted
 #                           by the engine test (non-blank, blue heading, red box)
 #   bsh-browser-window.png  a screenshot of the REAL GPUI window taken while the
 #                           Browser pane is showing that page
@@ -12,8 +12,8 @@
 # inspect, while the automated assertions stay on the engine image and the live
 # DOM checks in the engine test. See docs/bsh-browser-substrate.md.
 #
-# Requirements: macOS (ocu captures through Accessibility), python3, and the
-# Obscura binary either on PATH or in BSH_OBSCURA_BIN.
+# Requirements: macOS (ocu captures through Accessibility), python3, and an
+# installed Chrome/Chromium executable (or BSH_CHROMIUM_BIN set to its path).
 #
 # Usage:
 #   crates/bsh/scripts/browser-proof.sh
@@ -21,8 +21,7 @@
 #   BSH_PROOF_URL=https://www.baidu.com/ crates/bsh/scripts/browser-proof.sh
 #
 # Environment:
-#   BSH_OBSCURA_BIN            the engine binary (default: `command -v obscura`)
-#   BSH_OBSCURA_FONT_DIRS      forwarded, for the CJK glyphs
+#   BSH_CHROMIUM_BIN           the browser executable (auto-discovered if unset)
 #   BSH_PROOF_SKIP_ENGINE_TEST 1 to skip the engine capture/assertions
 #   BSH_PROOF_SECONDS          seconds to wait for the window to settle (6)
 #   BSH_PROOF_URL              capture THIS url instead of the local fixture,
@@ -37,7 +36,7 @@ TARGET="$ROOT/target"
 FIXTURE="$TARGET/bsh-browser-proof-fixture"
 HOME_DIR="$TARGET/bsh-browser-proof-home"
 WINDOW_PNG="$TARGET/bsh-browser-window.png"
-ENGINE_PNG="$TARGET/bsh-obscura-proof.png"
+ENGINE_PNG="$TARGET/bsh-chromium-proof.png"
 LOG="$TARGET/bsh-browser-proof.log"
 SETTLE="${BSH_PROOF_SECONDS:-6}"
 
@@ -46,11 +45,9 @@ fail() { echo "browser-proof: $*" >&2; exit 1; }
 command -v python3 >/dev/null || fail "python3 is required"
 command -v ocu >/dev/null || fail "ocu (open-computer-use) is required for the window capture"
 
-if [ -z "${BSH_OBSCURA_BIN:-}" ]; then
-  BSH_OBSCURA_BIN="$(command -v obscura || true)"
+if [ -n "${BSH_CHROMIUM_BIN:-}" ]; then
+  [ -x "$BSH_CHROMIUM_BIN" ] || fail "BSH_CHROMIUM_BIN is not executable: $BSH_CHROMIUM_BIN"
 fi
-[ -n "${BSH_OBSCURA_BIN:-}" ] && [ -x "$BSH_OBSCURA_BIN" ] \
-  || fail "no Obscura binary: set BSH_OBSCURA_BIN or put obscura on PATH"
 
 echo "browser-proof: building the shell"
 (cd "$ROOT" && cargo build -p bsh)
@@ -102,7 +99,7 @@ cleanup() {
   [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null || true
   # SIGTERM does not run the shell's Drop, so its engine is now an orphan.
   # Stop it by the pidfile THIS scratch HOME wrote, after checking its own argv
-  # carries that marker: an unrelated Obscura can never match.
+  # carries that marker: an unrelated browser can never match.
   local state="$HOME_DIR/.bos/bsh/browser/engines"
   if [ -d "$state" ]; then
     for file in "$state"/*.pid; do
@@ -148,13 +145,11 @@ sleep 1
 echo "browser-proof: opening $URL"
 # HOME is overridden for THIS process only: the scratch settings must not be
 # inherited by the cargo call at the end (that would move CARGO_HOME).
-if [ -n "${BSH_OBSCURA_FONT_DIRS:-}" ]; then
-  env HOME="$HOME_DIR" BSH_OBSCURA_BIN="$BSH_OBSCURA_BIN" \
-    BSH_OBSCURA_FONT_DIRS="$BSH_OBSCURA_FONT_DIRS" \
+if [ -n "${BSH_CHROMIUM_BIN:-}" ]; then
+  env HOME="$HOME_DIR" BSH_CHROMIUM_BIN="$BSH_CHROMIUM_BIN" \
     "$BIN" --browser="$URL" >"$LOG" 2>&1 &
 else
-  env HOME="$HOME_DIR" BSH_OBSCURA_BIN="$BSH_OBSCURA_BIN" \
-    "$BIN" --browser="$URL" >"$LOG" 2>&1 &
+  env HOME="$HOME_DIR" "$BIN" --browser="$URL" >"$LOG" 2>&1 &
 fi
 BIN_PID=$!
 disown "$BIN_PID" 2>/dev/null || true
@@ -189,8 +184,11 @@ PY
 
 if [ "${BSH_PROOF_SKIP_ENGINE_TEST:-0}" != "1" ]; then
   echo "browser-proof: capturing and asserting the engine image"
-  PATH="$(dirname "$BSH_OBSCURA_BIN"):$PATH" \
+  if [ -n "${BSH_CHROMIUM_BIN:-}" ]; then
+    BSH_CHROMIUM_BIN="$BSH_CHROMIUM_BIN" cargo test -p bsh --lib a_live_page_answers_with_script_text -- --nocapture
+  else
     cargo test -p bsh --lib a_live_page_answers_with_script_text -- --nocapture
+  fi
 fi
 
 echo

@@ -972,7 +972,7 @@ impl ResponsesTransport {
                         text
                     }
                     Err(e) => {
-                        let err = LlmError::Other(format!("Stream error: {}", e));
+                        let err = crate::llm::vendor::stream_error(e);
                         let _ = tx.send(Err(err)).await;
                         return;
                     }

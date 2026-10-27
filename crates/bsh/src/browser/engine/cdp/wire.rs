@@ -12,9 +12,9 @@
 //! # The error shape
 //!
 //! A CDP error is a typed value here, not a string that a caller has to parse:
-//! one refusal from Obscura (`{"code":-32601,"message":"No page for session"}`)
-//! has to be told apart from a transport failure, because the first is a
-//! producer that said no and the second is a socket that died.
+//! one refusal from Chromium (such as `-32601 method not found`) has to be
+//! told apart from a transport failure, because the first is a producer that
+//! said no and the second is a socket that died.
 
 use std::fmt;
 use std::net::{TcpStream, ToSocketAddrs};
@@ -79,6 +79,8 @@ pub(crate) enum Incoming {
         method: String,
         /// The event parameters.
         params: Value,
+        /// Target session for flattened browser-level events.
+        session: Option<String>,
     },
 }
 
@@ -128,6 +130,10 @@ pub(crate) fn decode(text: &str) -> Result<Incoming, String> {
         return Ok(Incoming::Event {
             method: method.to_string(),
             params: value.get("params").cloned().unwrap_or(Value::Null),
+            session: value
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         });
     }
     let Some(id) = value.get("id").and_then(Value::as_u64) else {
@@ -379,12 +385,19 @@ mod tests {
             }
             other => panic!("expected a response, got {other:?}"),
         }
-        let event =
-            decode(r#"{"method":"Page.loadEventFired","params":{"timestamp":1.5}}"#).unwrap();
+        let event = decode(
+            r#"{"method":"Page.loadEventFired","params":{"timestamp":1.5},"sessionId":"target-session"}"#,
+        )
+        .unwrap();
         match event {
-            Incoming::Event { method, params } => {
+            Incoming::Event {
+                method,
+                params,
+                session,
+            } => {
                 assert_eq!(method, "Page.loadEventFired");
                 assert_eq!(params["timestamp"], json!(1.5));
+                assert_eq!(session.as_deref(), Some("target-session"));
             }
             other => panic!("expected an event, got {other:?}"),
         }

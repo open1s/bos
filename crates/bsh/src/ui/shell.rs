@@ -278,11 +278,26 @@ pub(crate) struct Shell {
     pub(crate) browser_frame_seq: u64,
     /// The live page's newest frame, decoded off the render path.
     pub(crate) browser_render: Option<std::sync::Arc<gpui_kit::RenderImage>>,
+    /// Replaced frames whose sprite-atlas entry still has to be released.
+    ///
+    /// GPUI caches one atlas tile per `RenderImage::id`, and
+    /// `RenderImage::new` mints a FRESH id each call - so every captured frame
+    /// is a cache miss that uploads a new tile, and the previous frame's tile
+    /// stays in the atlas until `Window::drop_image` removes it. Without this,
+    /// a live page would keep a full-viewport texture (1.9 MB at 800x600) for
+    /// every frame it ever published. It is a queue rather than one slot because
+    /// a frame can be replaced more than once between two renders; the render
+    /// pass drains it, since only it holds the `Window`.
+    pub(crate) browser_render_stale: Vec<std::sync::Arc<gpui_kit::RenderImage>>,
     /// The pixel size of the frame that is drawn.
     pub(crate) browser_frame_size: (u32, u32),
     /// Where the page frame was laid out, so a pointer position on the window
     /// can become a position on the page.
     pub(crate) browser_bounds: std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
+    /// The window's device scale factor as of the last prepaint, so the
+    /// engine's capture matches the screen one texture pixel to one screen
+    /// pixel. Read where the bounds are read, applied with them.
+    pub(crate) browser_scale: std::rc::Rc<std::cell::Cell<f32>>,
     /// When the last hover move was forwarded to the page.
     ///
     /// A forward is fire-and-forget, but each one is a queued CDP command, so
@@ -293,7 +308,7 @@ pub(crate) struct Shell {
     /// [`BROWSER_RESIZE_EVERY`](super::right_panel::BROWSER_RESIZE_EVERY),
     /// because a resize is a CDP round trip and a pane drag moves the bounds
     /// every frame.
-    pub(crate) browser_resize_want: Option<(u32, u32)>,
+    pub(crate) browser_resize_want: Option<(u32, u32, f32)>,
     /// When the last viewport override was applied, the rate limit for the
     /// next one.
     pub(crate) browser_resize_at: Option<std::time::Instant>,
@@ -308,6 +323,8 @@ pub(crate) struct Shell {
     /// `browser_release_outside`). Without the flag the page kept its drag
     /// state after a release over the sidebar or outside the window.
     pub(crate) browser_pressed: bool,
+    /// The page point where a text-selection drag began.
+    pub(crate) browser_drag_start: Option<(f32, f32)>,
     /// The last press, for counting a double or triple click.
     pub(crate) browser_click: Option<super::right_panel::BrowserClick>,
     /// The last printable character the page received as a KEY.
@@ -379,12 +396,18 @@ pub(crate) struct Shell {
     /// What the audit search field holds, kept beside the entity so the view
     /// can filter without reading it per row.
     pub(crate) audit_query: String,
+    /// Optional category filter for the audit call list.
+    pub(crate) audit_category: Option<crate::audit::AuditCategory>,
+    /// Current page of expanded or searched audit turns.
+    pub(crate) audit_page: usize,
     /// The turns the reader has opened, by 1-based turn number.
     pub(crate) audit_turn_open: BTreeSet<usize>,
     /// The calls the reader has opened, by (turn, call) position.
     pub(crate) audit_open: BTreeSet<(usize, usize)>,
     /// The calls whose full stored text is showing.
     pub(crate) audit_full: BTreeSet<(usize, usize)>,
+    /// Number of matching calls currently exposed for each expanded turn.
+    pub(crate) audit_call_limits: std::collections::BTreeMap<usize, usize>,
     /// The model-id filter on the fetched-model picker.
     pub(crate) picker_search: Entity<InputState>,
     /// The task-name filter on the Automation tasks pane.
@@ -1278,6 +1301,7 @@ impl Shell {
                  cx: &mut Context<Shell>| {
                     if matches!(event, InputEvent::Change) {
                         this.audit_query = this.audit_search.read(cx).value().to_string();
+                        this.audit_page = 0;
                         cx.notify();
                     }
                 },
@@ -1480,12 +1504,15 @@ impl Shell {
             browser_rev: 0,
             browser_frame_seq: 0,
             browser_render: None,
+            browser_render_stale: Vec::new(),
             browser_frame_size: (0, 0),
             browser_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
+            browser_scale: std::rc::Rc::new(std::cell::Cell::new(1.0)),
             browser_last_move: None,
             browser_resize_want: None,
             browser_resize_at: None,
             browser_pressed: false,
+            browser_drag_start: None,
             browser_click: None,
             browser_typed: None,
             preset_details: None,
@@ -1527,9 +1554,12 @@ impl Shell {
             audit_search,
             audit_mode: 0,
             audit_query: String::new(),
+            audit_category: None,
+            audit_page: 0,
             audit_turn_open: BTreeSet::new(),
             audit_open: BTreeSet::new(),
             audit_full: BTreeSet::new(),
+            audit_call_limits: std::collections::BTreeMap::new(),
             picker_search,
             task_search,
             task_name,
@@ -1741,13 +1771,32 @@ impl Shell {
         .detach();
         // The browser's frame clock. Captures arrive on the engine's own pump,
         // so the pane compares the frame sequence instead of decoding on the
-        // render path; an idle browser costs one atomic read per tick.
+        // render path; an idle browser costs one atomic read per tick. This
+        // poll remains the fallback for what no frame announces: a tool that
+        // moved the document from the turn's runtime, and the pane's own
+        // resize want.
         cx.spawn(async move |this, cx| loop {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(120))
                 .await;
             if this.update(cx, |this, cx| this.sync_browser(cx)).is_err() {
                 break;
+            }
+        })
+        .detach();
+        // A published frame wakes that clock NOW. MEASURED on the real shell
+        // with the pane open over an animated page: the 120 ms poll alone
+        // painted the page at 8 frames a second while the pump published
+        // thirty, so two of every three frames were skipped. The channel is
+        // bounded to one and the pump's send is a try, so a burst collapses
+        // into the one sync that reads the newest frame anyway.
+        let (frame_wake, frame_arrived) = async_channel::bounded::<()>(1);
+        shell.state.browser.frames().set_wake(frame_wake);
+        cx.spawn(async move |this, cx| {
+            while frame_arrived.recv().await.is_ok() {
+                if this.update(cx, |this, cx| this.sync_browser(cx)).is_err() {
+                    break;
+                }
             }
         })
         .detach();
@@ -3482,10 +3531,11 @@ impl Shell {
             self.older.reset();
         }
         if self.state.tab == crate::state::Tab::Trajectory {
-            // The trace has its own paging: reaching its top pulls the next page
-            // of the trajectory log, and the rows arrive above what is drawn.
+            // Trajectory events are projected from ChatMessage records. Page
+            // those same records here; loading the separate tool-only Parquet
+            // projection does not change the data this tab renders.
             let at_top = f32::from(self.traj_scroll.offset().y) > -crate::theme::PAGE_TRIGGER;
-            return at_top && self.request_trace_page(cx);
+            return at_top && self.request_older_page(cx);
         }
         if self.following_tail {
             return false;
@@ -4371,6 +4421,15 @@ impl Drop for Shell {
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Release the atlas tiles of browser frames this pane has replaced.
+        // `paint_image` caches a tile per `RenderImage::id` and every captured
+        // frame carries a new one, so a replaced frame's tile would otherwise
+        // stay resident in the sprite atlas for the life of the window. The
+        // render pass owns the release because it is the only place with the
+        // `Window`.
+        for stale in self.browser_render_stale.drain(..) {
+            let _ = window.drop_image(stale);
+        }
         // The markdown bodies' cache ages by frame: every body this frame paints
         // is stamped, and the least recently painted is evicted when the cache
         // fills.

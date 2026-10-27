@@ -7,8 +7,8 @@
 //! test attribute macro, which shadows the builtin one its own expansion emits.
 
 use gpui_kit::{
-    px, AppContext as _, Context, Entity, IntoElement, Modifiers, Render, TestAppContext,
-    VisualTestContext, Window,
+    img, px, relative, AppContext as _, Context, Entity, ImageSource, IntoElement, Modifiers,
+    Render, Styled, TestAppContext, VisualTestContext, Window,
 };
 
 use agent::Tool as _;
@@ -1766,6 +1766,17 @@ fn pinning_an_inactive_row_does_not_open_it(cx: &mut TestAppContext) {
         (active, other)
     });
 
+    // The controls fade in under the pointer, as the reference's do, so the
+    // pointer has to be on the row before its pin can be pressed.
+    let row: &str = Box::leak(format!("session-{other}").into_boxed_str());
+    let row_bounds = cx.debug_bounds(row).expect("the inactive row");
+    cx.simulate_mouse_move(
+        row_bounds.center(),
+        None::<gpui_kit::MouseButton>,
+        Modifiers::default(),
+    );
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
     let selector: &str = Box::leak(format!("pin-{other}").into_boxed_str());
     let bounds = cx
         .debug_bounds(selector)
@@ -1789,7 +1800,6 @@ fn pinning_an_inactive_row_does_not_open_it(cx: &mut TestAppContext) {
     // Positive control: the row body does open the session, so the assertion
     // above really would have caught a click that leaked up to the row.
     cx.update(|window, cx| window.draw(cx).clear(cx));
-    let row: &str = Box::leak(format!("session-{other}").into_boxed_str());
     let row_bounds = cx.debug_bounds(row).expect("the inactive row");
     assert!(
         bounds.center().x > row_bounds.center().x,
@@ -14612,6 +14622,133 @@ fn an_archived_row_is_indented_like_a_live_one(cx: &mut TestAppContext) {
     );
 }
 
+/// A row's hover controls never paint over its title.
+///
+/// The buttons used to be an absolute overlay on the row's trailing edge, so a
+/// long session title ran straight through them - which is how the session menu
+/// came to be buried under its own label. The reference swaps the age for the
+/// buttons in the row's flow instead, and both sidebar rows now do that: under
+/// the pointer the buttons take the age's space and the title is truncated
+/// before them.
+#[gpui::test]
+fn a_long_title_is_truncated_before_its_row_actions(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (_harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = AppState::with_store(scratch_store("row-actions"));
+        // One workspace and one session, each with a literal id so the
+        // selectors below are literals too.
+        if let Some(workspace) = state.settings.global.workspaces.first_mut() {
+            workspace.id = String::from("ws-long");
+            workspace.name = String::from("a workspace whose name is far too long for its row");
+        }
+        state.settings.global.general.active_workspace = String::from("ws-long");
+        let id = state.active_id.clone().expect("a session");
+        if let Some(session) = state.store.session_mut(&id) {
+            session.id = String::from("long-row");
+            session.workspace = String::from("ws-long");
+            session.title =
+                String::from("review right panel browsers, menus and their hover controls");
+        }
+        state.active_id = Some(String::from("long-row"));
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // At rest the age owns the trailing space; the controls wait in a slot that
+    // has given up no width yet.
+    let at_rest = cx
+        .debug_bounds("session-title-long-row")
+        .expect("the row's title")
+        .right();
+
+    let row = cx
+        .debug_bounds("session-long-row")
+        .expect("the session row");
+    cx.simulate_mouse_move(
+        row.center(),
+        None::<gpui_kit::MouseButton>,
+        Modifiers::default(),
+    );
+    draw_until(
+        cx,
+        "the row's actions take the age's space",
+        DRAW_UNTIL_MAX,
+        |cx| {
+            cx.debug_bounds("pin-long-row")
+                .zip(cx.debug_bounds("session-title-long-row"))
+                .is_some_and(|(pin, title)| title.right() <= pin.left())
+        },
+    );
+
+    let title = cx
+        .debug_bounds("session-title-long-row")
+        .expect("the row's title");
+    let pin = cx.debug_bounds("pin-long-row").expect("the pin");
+    let more = cx.debug_bounds("more-long-row").expect("the menu");
+    assert!(
+        f32::from(title.right()) <= f32::from(pin.left()),
+        "the title stops before the pin: title {:.1}..{:.1}, pin {:.1}..{:.1}",
+        f32::from(title.left()),
+        f32::from(title.right()),
+        f32::from(pin.left()),
+        f32::from(pin.right())
+    );
+    assert!(
+        f32::from(title.right()) < f32::from(at_rest) - 60.0,
+        "the pointer moved the title off {:.1}px it used to hold",
+        f32::from(at_rest) - f32::from(title.right())
+    );
+    assert!(
+        (f32::from(pin.size.width) - 20.0).abs() < 0.5,
+        "an action box is the 20px the width is measured from, got {:.1}",
+        f32::from(pin.size.width)
+    );
+    assert!(
+        f32::from(more.right()) <= f32::from(row.right()),
+        "the menu stays inside its row"
+    );
+
+    // The pin control doubles as the row's rest marker, so pressing it parks a
+    // star where the buttons were - the reference's non-interactive
+    // `pinIndicator`, which has to be visible with the pointer elsewhere.
+    cx.simulate_click(pin.center(), Modifiers::default());
+    cx.simulate_mouse_move(
+        gpui_kit::point(px(1.0), px(1.0)),
+        None::<gpui_kit::MouseButton>,
+        Modifiers::default(),
+    );
+    draw_until(
+        cx,
+        "the pinned row shows its star at rest",
+        DRAW_UNTIL_MAX,
+        |cx| {
+            cx.debug_bounds("row-pin-long-row").is_some_and(|mark| {
+                (f32::from(mark.size.width) - crate::ui::sidebar::PIN_MARK_W).abs() < 0.5
+            })
+        },
+    );
+
+    // The workspace header is the same row with the same overlay, so it is the
+    // same assertion.
+    let ws = cx.debug_bounds("ws-ws-long").expect("the workspace row");
+    cx.simulate_mouse_move(
+        ws.center(),
+        None::<gpui_kit::MouseButton>,
+        Modifiers::default(),
+    );
+    draw_until(
+        cx,
+        "the workspace row's actions take its title's space",
+        DRAW_UNTIL_MAX,
+        |cx| {
+            cx.debug_bounds("ws-new-ws-long")
+                .zip(cx.debug_bounds("ws-title-ws-long"))
+                .is_some_and(|(plus, title)| title.right() <= plus.left())
+        },
+    );
+}
+
 /// A mouse notch travels further than a trackpad's own delta, and a trackpad's
 /// precise delta goes through 1:1.
 ///
@@ -18003,6 +18140,16 @@ fn the_session_menu_carries_the_reference_five_actions(cx: &mut TestAppContext) 
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
 
+    // The ellipsis is one of the controls the row reveals under the pointer.
+    let row = cx
+        .debug_bounds("session-menu-target")
+        .expect("the row the menu belongs to");
+    cx.simulate_mouse_move(
+        row.center(),
+        None::<gpui_kit::MouseButton>,
+        Modifiers::default(),
+    );
+    cx.update(|window, cx| window.draw(cx).clear(cx));
     let more = cx
         .debug_bounds("more-menu-target")
         .expect("the row carries its menu control");
@@ -25199,6 +25346,125 @@ fn cmd_t_opens_the_browser_pane(cx: &mut TestAppContext) {
     );
 }
 
+/// A tiny renderable image, the shape the browser pane builds from a capture.
+fn tiny_image(shade: u8) -> gpui_kit::RenderImage {
+    let frame = crate::browser::engine::Frame {
+        width: 2,
+        height: 2,
+        bgra: std::sync::Arc::new(vec![shade; 2 * 2 * 4]),
+    };
+    crate::ui::right_panel::render_frame(frame).expect("a 2x2 frame builds an image")
+}
+
+/// A painted image holds an atlas tile until it is dropped.
+///
+/// This is the GPUI contract the browser pane relies on: `paint_image` caches a
+/// tile per `RenderImage::id`, so a frame that is replaced keeps its texture
+/// resident until `Window::drop_image` removes it. Pinned here so the pane's own
+/// release path is built on a measured fact rather than an assumption.
+#[gpui::test]
+fn a_painted_image_holds_its_atlas_tile_until_it_is_dropped(cx: &mut TestAppContext) {
+    struct Painted(std::sync::Arc<gpui_kit::RenderImage>);
+
+    impl Render for Painted {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            img(ImageSource::Render(self.0.clone()))
+                .w(relative(1.0))
+                .h(relative(1.0))
+        }
+    }
+
+    init_test_app(cx);
+    let image = std::sync::Arc::new(tiny_image(9));
+    let (_, cx) = cx.add_window_view(|_, _| Painted(image.clone()));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.update(|window, _| window.has_image_atlas_entry(&image)),
+        "painting an image inserts its atlas tile"
+    );
+
+    // A full-viewport 2x capture is 1600x1200: exactly what the pane draws
+    // once the capture follows the window's scale, so the paint must survive
+    // that size.
+    let big = std::sync::Arc::new({
+        let frame = crate::browser::engine::Frame {
+            width: 1600,
+            height: 1200,
+            bgra: std::sync::Arc::new(vec![64u8; 1600 * 1200 * 4]),
+        };
+        crate::ui::right_panel::render_frame(frame).expect("a 1600x1200 frame builds")
+    });
+    cx.update(|window, cx| {
+        window.replace_root(cx, |_, _| Painted(big.clone()));
+        let _ = window.draw(cx);
+    });
+    assert!(
+        cx.update(|window, _| window.has_image_atlas_entry(&big)),
+        "painting a 1600x1200 capture inserts its atlas tile"
+    );
+    cx.update(|window, _| {
+        let _ = window.drop_image(image.clone());
+    });
+    assert!(
+        !cx.update(|window, _| window.has_image_atlas_entry(&image)),
+        "drop_image releases the tile"
+    );
+}
+
+/// A replaced browser frame is queued for release, and the render pass drains it.
+///
+/// `RenderImage::new` mints a fresh id on every call, so each captured frame is
+/// a separate atlas entry. Without releasing the frame it replaces, a live page
+/// would keep one full-viewport texture (1.9 MB at 800x600) per frame published.
+#[gpui::test]
+fn a_replaced_browser_frame_is_released_by_the_render_pass(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(|window, cx| {
+        let state = AppState::with_store(scratch_store("browser-atlas-release"));
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    // Two captures arrive the way the pump delivers them.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.state
+                .browser
+                .frames()
+                .store(std::sync::Arc::new(vec![10u8; 2 * 2 * 4]), 2, 2);
+            this.sync_browser(cx);
+        })
+    });
+    let first = cx
+        .update(|_, cx| shell.read(cx).browser_render.clone())
+        .expect("the first frame becomes the pane's image");
+    // The queue is read INSIDE the update: sync_browser notifies, and the draw
+    // that notify schedules is what drains the queue.
+    let queued = cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.state
+                .browser
+                .frames()
+                .store(std::sync::Arc::new(vec![200u8; 2 * 2 * 4]), 2, 2);
+            this.sync_browser(cx);
+            this.browser_render_stale
+                .first()
+                .map(std::sync::Arc::as_ptr)
+        })
+    });
+    assert_eq!(
+        queued,
+        Some(std::sync::Arc::as_ptr(&first)),
+        "the frame that left the screen waits for a render to release it"
+    );
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.update(|_, cx| shell.read(cx).browser_render_stale.is_empty()),
+        "the render pass drains the queue so a frame is released exactly once"
+    );
+}
 /// The reader's actual flow: type a URL into the address bar, press Enter, see
 /// the page. The other pane tests drive the handler; this one drives the FIELD.
 #[gpui::test]
@@ -27432,21 +27698,43 @@ fn a_stream_records_the_order_of_its_parts() {
 fn probe_tool_timeline(cx: &mut TestAppContext) {
     let (shell, cx, tx) = pumping_live_turn(cx, "probe-tools");
     let index = cx.update(|_, cx| {
-        shell.read(cx).state.active_session().expect("a session").messages.len() - 1
+        shell
+            .read(cx)
+            .state
+            .active_session()
+            .expect("a session")
+            .messages
+            .len()
+            - 1
     });
     let dump = |cx: &mut VisualTestContext, label: &str| {
-        let count = cx.update(|_, cx| shell.read(cx).state.active_session().expect("a session").messages.len());
+        let count = cx.update(|_, cx| {
+            shell
+                .read(cx)
+                .state
+                .active_session()
+                .expect("a session")
+                .messages
+                .len()
+        });
         let mut present = String::new();
         for i in 0..count {
             for name in ["think-row", "tool-head"] {
                 let sel: &'static str = Box::leak(format!("{name}-{i}").into_boxed_str());
-                if cx.debug_bounds(sel).is_some() { present.push_str(&format!(" {sel}")); }
+                if cx.debug_bounds(sel).is_some() {
+                    present.push_str(&format!(" {sel}"));
+                }
             }
             let sel: &'static str = Box::leak(format!("tool-{i}-0").into_boxed_str());
-            if cx.debug_bounds(sel).is_some() { present.push_str(&format!(" {sel}")); }
+            if cx.debug_bounds(sel).is_some() {
+                present.push_str(&format!(" {sel}"));
+            }
         }
         let transcript = cx.debug_bounds("transcript");
-        eprintln!("PRESENT index={index} count={count} transcript={:?}{present}", transcript.map(|b| (f32::from(b.origin.y), f32::from(b.size.height))));
+        eprintln!(
+            "PRESENT index={index} count={count} transcript={:?}{present}",
+            transcript.map(|b| (f32::from(b.origin.y), f32::from(b.size.height)))
+        );
         let selectors: Vec<String> = vec![
             format!("think-row-{index}"),
             format!("think-body-{index}"),
@@ -27463,17 +27751,36 @@ fn probe_tool_timeline(cx: &mut TestAppContext) {
         for selector in selectors {
             let leaked: &'static str = Box::leak(selector.into_boxed_str());
             if let Some(bounds) = cx.debug_bounds(leaked) {
-                out.push_str(&format!("\n  {leaked}: y={:.0} h={:.0}", f32::from(bounds.origin.y), f32::from(bounds.size.height)));
+                out.push_str(&format!(
+                    "\n  {leaked}: y={:.0} h={:.0}",
+                    f32::from(bounds.origin.y),
+                    f32::from(bounds.size.height)
+                ));
             }
         }
         let (parts, tools, text, reasoning) = cx.update(|_, cx| {
             let this = shell.read(cx);
-            let m = this.state.active_session().expect("a session").messages.last().expect("a row");
-            (format!("{:?}", m.parts), m.tools.len(), m.text.clone(), m.reasoning.clone())
+            let m = this
+                .state
+                .active_session()
+                .expect("a session")
+                .messages
+                .last()
+                .expect("a row");
+            (
+                format!("{:?}", m.parts),
+                m.tools.len(),
+                m.text.clone(),
+                m.reasoning.clone(),
+            )
         });
-        eprintln!("DUMP {label}: parts={parts} tools={tools} text={text:?} reasoning={reasoning:?}{out}");
+        eprintln!(
+            "DUMP {label}: parts={parts} tools={tools} text={text:?} reasoning={reasoning:?}{out}"
+        );
     };
-    for _ in 0..3 { cx.update(|window, cx| window.draw(cx).clear(cx)); }
+    for _ in 0..3 {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
 
     let steps = [
         crate::runner::AgentEvent::Reasoning("I should look at the crate layout.\n\n".to_string()),
@@ -27501,11 +27808,15 @@ fn probe_tool_timeline(cx: &mut TestAppContext) {
     for (step, event) in steps.into_iter().enumerate() {
         tx.try_send(event).expect("send");
         cx.run_until_parked();
-        for _ in 0..2 { cx.update(|window, cx| window.draw(cx).clear(cx)); }
+        for _ in 0..2 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
         dump(cx, &format!("after event {step}"));
     }
     tx.try_send(crate::runner::AgentEvent::Done).expect("done");
     cx.run_until_parked();
-    for _ in 0..3 { cx.update(|window, cx| window.draw(cx).clear(cx)); }
+    for _ in 0..3 {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
     dump(cx, "after Done");
 }

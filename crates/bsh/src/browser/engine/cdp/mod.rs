@@ -1,4 +1,4 @@
-//! The rendered browser engine: Obscura over CDP.
+//! The rendered browser engine: Chromium over CDP.
 //!
 //! This module is the PRODUCER half of the Browser pane. The model, the nine
 //! `browser_*` tools, the `e1..` refs, the caps and the stale-ref sentence
@@ -8,7 +8,8 @@
 //!
 //! # The operations, and the CDP method behind each
 //!
-//! - navigate: `Page.enable` (once), `Page.navigate`, wait `Page.loadEventFired`.
+//! - navigate: `Page.enable` (once), `Page.navigate`, wait for DOM content in
+//!   the pane or the full load event for tools.
 //! - snapshot: `Runtime.evaluate` over the live DOM, stamping `data-bsh-ref`.
 //! - click: `Input.dispatchMouseEvent` (moved, pressed, released) at the
 //!   element's centre, after `scrollIntoView`.
@@ -45,6 +46,9 @@ use wire::RpcError;
 /// How long a navigation waits for `Page.loadEventFired` before it settles
 /// with whatever the page has.
 const LOAD_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long the pane waits for document structure, without waiting for
+/// images, analytics, fonts or other resources to finish loading.
+const PAINT_READY_TIMEOUT: Duration = Duration::from_millis(250);
 /// How long after the load event a snapshot waits, so a script that runs on
 /// `DOMContentLoaded` lands before the text is read.
 const SETTLE: Duration = Duration::from_millis(120);
@@ -59,14 +63,11 @@ const SETTLE: Duration = Duration::from_millis(120);
 /// it just did: a fixed sleep on top would make the cadence the work plus the
 /// sleep, and a page would be displayed slower than the machine can decode it.
 const FRAME_FAST: Duration = Duration::from_millis(33);
-/// The idle cadence: eight probes a second once the page has been still for a
-/// few probes. Each probe is one round trip whose bytes are compared with the
-/// previous frame; an unchanged page decodes and stores nothing.
+/// Time to wait for the first pushed frame before falling back to capture RPCs.
+const FRAME_START_TIMEOUT: Duration = Duration::from_millis(500);
+/// Bounded wait for a compositor frame, also limiting how long the pump takes
+/// to notice that the preview pane was hidden.
 const FRAME_IDLE: Duration = Duration::from_millis(120);
-/// Unchanged probes at the fast cadence before the pump slows down: four is
-/// ~130 ms of stillness, so a settled page stops paying thirty captures a
-/// second and the next burst of activity starts on the very next probe.
-const FRAME_QUIET_TICKS: u32 = 4;
 /// How long a navigation waits before its one retry.
 const RETRY_PAUSE: Duration = Duration::from_millis(150);
 
@@ -92,7 +93,7 @@ fn is_transport_error(error: &EngineError) -> bool {
     }
 }
 
-/// The words Obscura uses for a dropped connection.
+/// The words Chromium uses for a dropped connection.
 fn is_transport_text(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.contains("connection reset")
@@ -164,7 +165,7 @@ impl EngineError {
     pub(crate) fn message(&self) -> String {
         match self {
             EngineError::MissingBinary { searched, .. } => {
-                format!("The rendered view needs the Obscura binary; it is not at {searched}.")
+                format!("The rendered view needs Chrome or Chromium; it is not at {searched}.")
             }
             EngineError::Spawn(message) => format!("The rendered view could not start: {message}"),
             EngineError::Startup { status, log } => {
@@ -204,7 +205,7 @@ impl EngineError {
         match self {
             EngineError::MissingBinary { hint, .. } => hint.clone(),
             EngineError::Unsupported { .. } => String::from(
-                "This Obscura build speaks a smaller CDP surface than the pane needs; the text view works meanwhile.",
+                "This Chromium build does not support the required CDP method; the text view works meanwhile.",
             ),
             _ => String::from(
                 "The page's text view is still usable. Close the tab and reopen it to start a new engine.",
@@ -225,7 +226,7 @@ impl EngineError {
 pub(crate) enum Settle {
     /// Tools: the full networkidle window (load + quiet).
     Idle,
-    /// The pane: load + one paint beat.
+    /// The pane: DOM content, without waiting for subresources to finish.
     Paint,
 }
 
@@ -318,6 +319,9 @@ pub(crate) struct Engine {
     client: Arc<Client>,
     /// The viewport the page is laid out at.
     viewport: Mutex<(u32, u32)>,
+    /// The device scale factor captures are taken at, which the pane sets to
+    /// its window's own so a frame is one texture pixel per screen pixel.
+    scale: Mutex<f32>,
     /// Where captured frames go.
     frames: Arc<FrameSlot>,
     /// Whether the frame pump should capture.
@@ -360,6 +364,7 @@ impl Engine {
         let engine = Self {
             client,
             viewport: Mutex::new((viewport.0.max(1), viewport.1.max(1))),
+            scale: Mutex::new(1.0),
             frames,
             streaming: Arc::new(AtomicBool::new(false)),
             pump: Mutex::new(None),
@@ -406,7 +411,15 @@ impl Engine {
         let mut last = None;
         for attempt in 0..2 {
             let before = self.client.shared().loads();
-            match self.client.call("Page.navigate", json!({ "url": url })) {
+            let before_dom = self.client.shared().dom_contents();
+            let command = match settle {
+                Settle::Idle => self.client.call("Page.navigate", json!({ "url": url })),
+                // Chromium returns from Page.navigate as soon as navigation
+                // starts; the explicit DOM event wait below keeps this path
+                // responsive while resources continue loading.
+                Settle::Paint => self.client.call("Page.navigate", json!({ "url": url })),
+            };
+            match command {
                 Ok(answer) => {
                     if let Some(error) = answer.get("errorText").and_then(Value::as_str) {
                         if attempt == 0 && is_transport_text(error) {
@@ -423,7 +436,6 @@ impl Engine {
                             },
                         });
                     }
-                    self.client.wait_load(before, LOAD_TIMEOUT);
                     match settle {
                         // A tool reads the page's text, so it waits the real
                         // networkidle when the Fetch seam is counting: the page
@@ -432,6 +444,7 @@ impl Engine {
                         // the navigation timeout. Without the counter this is
                         // load + settle.
                         Settle::Idle => {
+                            self.client.wait_load(before, LOAD_TIMEOUT);
                             if !self
                                 .client
                                 .shared()
@@ -440,11 +453,14 @@ impl Engine {
                                 std::thread::sleep(SETTLE);
                             }
                         }
-                        // The pane reads the frame, which is live while the
-                        // idle window would run; one beat lets a script that
-                        // runs on DOMContentLoaded land before the pane's
-                        // state is read.
-                        Settle::Paint => std::thread::sleep(SETTLE),
+                        // The pane can show the live frame before every
+                        // subresource finishes. Wait only for parsed DOM so
+                        // the text snapshot is useful too, with a short cap
+                        // for pages whose parser is blocked by a resource.
+                        Settle::Paint => {
+                            self.client
+                                .wait_dom_content(before_dom, PAINT_READY_TIMEOUT);
+                        }
                     }
                     return Ok(Navigation::Loaded);
                 }
@@ -533,9 +549,9 @@ impl Engine {
             }
             return Ok(Activation::Clicked { via: "script" });
         }
-        self.mouse("mouseMoved", x, y, None)?;
-        self.mouse("mousePressed", x, y, Some(1))?;
-        self.mouse("mouseReleased", x, y, Some(1))?;
+        self.mouse(false, "mouseMoved", x, y, None, 0)?;
+        self.mouse(false, "mousePressed", x, y, Some(1), 1)?;
+        self.mouse(false, "mouseReleased", x, y, Some(1), 0)?;
         if matches!(kind.as_str(), "input" | "textarea" | "select") {
             // A field takes focus and stops there, which is the behaviour the
             // text view already promised: browser_type is the next call.
@@ -625,8 +641,15 @@ impl Engine {
 
     /// Press one key on the page's focused element.
     ///
-    /// Returns the ref the page focused afterwards, when the key moved focus.
-    pub(crate) fn press(&self, key: &str) -> Result<Option<(String, String)>, EngineError> {
+    /// With `fire` the events are queued and `Ok(None)` returned: the pane
+    /// reads no reply, and a wait per key on the UI thread is the input
+    /// path's whole cost. The blocking form returns the ref the page focused
+    /// afterwards, when the key moved focus - the tool path's answer.
+    pub(crate) fn press(
+        &self,
+        key: &str,
+        fire: bool,
+    ) -> Result<Option<(String, String)>, EngineError> {
         let (name, code, vk) = match key {
             "tab" => ("Tab", "Tab", 9),
             "shift+tab" => ("Tab", "Tab", 9),
@@ -656,7 +679,8 @@ impl Engine {
             }
         };
         let modifiers = i64::from(key == "shift+tab") * 8;
-        self.client.call(
+        self.send(
+            fire,
             "Input.dispatchKeyEvent",
             json!({
                 "type": "keyDown",
@@ -672,7 +696,8 @@ impl Engine {
         // the DOM keydown alone. MEASURED against Baidu: without it the first
         // Enter only closed the suggestion list.
         if let Some(text) = char_text(name) {
-            self.client.call(
+            self.send(
+                fire,
                 "Input.dispatchKeyEvent",
                 json!({
                     "type": "char",
@@ -685,7 +710,8 @@ impl Engine {
                 }),
             )?;
         }
-        self.client.call(
+        self.send(
+            fire,
             "Input.dispatchKeyEvent",
             json!({
                 "type": "keyUp",
@@ -696,6 +722,12 @@ impl Engine {
                 "modifiers": modifiers,
             }),
         )?;
+        if fire {
+            // The events are queued; the focused-ref read below is the tool
+            // path's answer and needs the key to have landed, which a fired
+            // key has not yet.
+            return Ok(None);
+        }
         std::thread::sleep(Duration::from_millis(40));
         if key == "enter" {
             std::thread::sleep(SETTLE);
@@ -772,13 +804,50 @@ impl Engine {
         capture(&self.client, "png", None)
     }
 
-    /// Resize the page viewport.
-    pub(crate) fn resize(&self, viewport: (u32, u32)) -> Result<(), EngineError> {
+    /// Stream compositor frames as they are painted, rather than polling
+    /// `Page.captureScreenshot` after each page update.
+    #[cfg(test)]
+    pub(crate) fn start_screencast(&self) -> Result<(), EngineError> {
+        self.client.start_screencast()
+    }
+
+    /// Stop compositor frame delivery.
+    #[cfg(test)]
+    pub(crate) fn stop_screencast(&self) -> Result<(), EngineError> {
+        self.client.stop_screencast()
+    }
+
+    /// Wait for the latest compositor frame, coalescing intermediate frames.
+    #[cfg(test)]
+    pub(crate) fn wait_screencast_frame(&self, timeout: Duration) -> Option<String> {
+        self.client.wait_screencast_frame(timeout)
+    }
+
+    /// Resize the page viewport and set the capture's device scale factor.
+    ///
+    /// The scale is the window's, so the frame's pixel size is the viewport's
+    /// CSS size times the screen's scale and the pane draws it one texture
+    /// pixel per screen pixel - the difference between a sharp page and a
+    /// blurry one on any scaled display.
+    pub(crate) fn resize(&self, viewport: (u32, u32), scale: f32) -> Result<(), EngineError> {
         let clamped = (viewport.0.clamp(320, 4096), viewport.1.clamp(240, 4096));
+        let scale = if (0.5..=4.0).contains(&scale) {
+            scale
+        } else {
+            1.0
+        };
         if let Ok(mut slot) = self.viewport.lock() {
             *slot = clamped;
         }
-        self.client.resize(clamped)
+        if let Ok(mut slot) = self.scale.lock() {
+            *slot = scale;
+        }
+        self.client.resize(clamped, scale)
+    }
+
+    /// The device scale factor the page is captured at.
+    pub(crate) fn scale(&self) -> f32 {
+        self.scale.lock().map(|slot| *slot).unwrap_or(1.0)
     }
 
     /// The viewport the page is laid out at.
@@ -789,11 +858,38 @@ impl Engine {
             .unwrap_or((1000, 700))
     }
 
+    /// Dispatch one page command, waiting for the answer or not.
+    ///
+    /// The pane's input path passes `fire`: a key, a click or a wheel tick
+    /// never reads a reply, and waiting for one on the UI thread queues behind
+    /// whatever the engine's single worker is doing - MEASURED, a capture at
+    /// the pane's own 30 frames a second is 8-21 ms, so a printable key's
+    /// three round trips could each block a frame. The socket thread writes
+    /// jobs in queue order, so fired events keep their order against each
+    /// other and against blocking calls.
+    fn send(&self, fire: bool, method: &str, params: Value) -> Result<(), EngineError> {
+        if fire {
+            self.client.notify(method, params)
+        } else {
+            self.client.call(method, params).map(|_| ())
+        }
+    }
+
     /// Dispatch one mouse event.
-    fn mouse(&self, kind: &str, x: f64, y: f64, clicks: Option<u32>) -> Result<(), EngineError> {
-        self.client
-            .call("Input.dispatchMouseEvent", mouse_params(kind, x, y, clicks))
-            .map(|_| ())
+    fn mouse(
+        &self,
+        fire: bool,
+        kind: &str,
+        x: f64,
+        y: f64,
+        clicks: Option<u32>,
+        buttons: u32,
+    ) -> Result<(), EngineError> {
+        self.send(
+            fire,
+            "Input.dispatchMouseEvent",
+            mouse_params(kind, x, y, clicks, buttons),
+        )
     }
 
     /// A press at a point: move there, then press and HOLD.
@@ -802,10 +898,16 @@ impl Engine {
     /// is what a click needs, but it makes every drag a burst of clicks and
     /// leaves no way to select text, so the pane forwards the three events it
     /// actually receives.
-    pub(crate) fn pointer_down(&self, x: f32, y: f32, clicks: u32) -> Result<(), EngineError> {
+    pub(crate) fn pointer_down(
+        &self,
+        x: f32,
+        y: f32,
+        clicks: u32,
+        fire: bool,
+    ) -> Result<(), EngineError> {
         let (x, y) = (f64::from(x), f64::from(y));
-        self.mouse("mouseMoved", x, y, None)?;
-        self.mouse("mousePressed", x, y, Some(clicks.max(1)))
+        self.mouse(fire, "mouseMoved", x, y, None, 0)?;
+        self.mouse(fire, "mousePressed", x, y, Some(clicks.max(1)), 1)
     }
 
     /// A pointer move: hover when no button is held, a drag while one is.
@@ -813,14 +915,33 @@ impl Engine {
     /// Fire-and-forget: a move has no answer worth waiting for, and blocking
     /// the UI thread on every ~16 ms of hover would be the input path's whole
     /// cost. Queue order still preserves move-then-press.
-    pub(crate) fn pointer_move(&self, x: f32, y: f32) -> Result<(), EngineError> {
+    pub(crate) fn pointer_move(&self, x: f32, y: f32, pressed: bool) -> Result<(), EngineError> {
         self.client.notify(
             "Input.dispatchMouseEvent",
+            mouse_params(
+                "mouseMoved",
+                f64::from(x),
+                f64::from(y),
+                None,
+                u32::from(pressed),
+            ),
+        )
+    }
+
+    /// Keep a text drag selected on engines whose mouse pipeline reports the
+    /// drag but does not update the page's Selection object itself.
+    pub(crate) fn select_text_between(
+        &self,
+        start: (f32, f32),
+        end: (f32, f32),
+        fire: bool,
+    ) -> Result<(), EngineError> {
+        self.send(
+            fire,
+            "Runtime.evaluate",
             json!({
-                "type": "mouseMoved",
-                "x": f64::from(x),
-                "y": f64::from(y),
-                "button": "none",
+                "expression": text_selection_script(start, end),
+                "returnByValue": true,
             }),
         )
     }
@@ -832,11 +953,24 @@ impl Engine {
     /// also selects the word (or, at three, the line) under the pointer: the
     /// engine fires the click events but implements none of the browser's
     /// DEFAULT selection, which is measured, not assumed.
-    pub(crate) fn pointer_up(&self, x: f32, y: f32, clicks: u32) -> Result<(), EngineError> {
+    pub(crate) fn pointer_up(
+        &self,
+        x: f32,
+        y: f32,
+        clicks: u32,
+        fire: bool,
+    ) -> Result<(), EngineError> {
         let (px, py) = (f64::from(x), f64::from(y));
-        self.mouse("mouseReleased", px, py, Some(clicks.max(1)))?;
+        self.mouse(fire, "mouseReleased", px, py, Some(clicks.max(1)), 0)?;
         if clicks >= 2 {
-            self.evaluate(&select_at_script(px, py, clicks))?;
+            // The selection is made by the page, through a script whose value
+            // the pane never reads: firing it keeps a double click off the
+            // UI thread's wait.
+            self.send(
+                fire,
+                "Runtime.evaluate",
+                json!({ "expression": select_at_script(px, py, clicks), "returnByValue": true, "awaitPromise": true }),
+            )?;
         }
         Ok(())
     }
@@ -849,12 +983,18 @@ impl Engine {
     /// delivered through `Input.insertText` instead, because that is the
     /// composition route and inventing a key identity for it would lie to the
     /// page.
-    pub(crate) fn type_key(&self, text: &str, modifiers: u32) -> Result<(), EngineError> {
+    pub(crate) fn type_key(
+        &self,
+        text: &str,
+        modifiers: u32,
+        fire: bool,
+    ) -> Result<(), EngineError> {
         let Some((key, code, vk)) = printable_identity(text) else {
-            return self.insert_text(text);
+            return self.insert_text(text, fire);
         };
         let modifiers = i64::from(modifiers);
-        self.client.call(
+        self.send(
+            fire,
             "Input.dispatchKeyEvent",
             json!({
                 "type": "rawKeyDown",
@@ -865,7 +1005,8 @@ impl Engine {
                 "modifiers": modifiers,
             }),
         )?;
-        self.client.call(
+        self.send(
+            fire,
             "Input.dispatchKeyEvent",
             json!({
                 "type": "char",
@@ -878,7 +1019,8 @@ impl Engine {
                 "modifiers": modifiers,
             }),
         )?;
-        self.client.call(
+        self.send(
+            fire,
             "Input.dispatchKeyEvent",
             json!({
                 "type": "keyUp",
@@ -893,26 +1035,32 @@ impl Engine {
     }
 
     /// Forward a scroll wheel event.
-    pub(crate) fn scroll(&self, x: f32, y: f32, delta_y: f32) -> Result<(), EngineError> {
-        self.client
-            .call(
-                "Input.dispatchMouseEvent",
-                json!({
-                    "type": "mouseWheel",
-                    "x": f64::from(x),
-                    "y": f64::from(y),
-                    "deltaX": 0.0,
-                    "deltaY": f64::from(delta_y),
-                }),
-            )
-            .map(|_| ())
+    pub(crate) fn scroll(
+        &self,
+        x: f32,
+        y: f32,
+        delta_y: f32,
+        fire: bool,
+    ) -> Result<(), EngineError> {
+        // Wheel events arrive at trackpad momentum rates; a blocking round
+        // trip per tick would stutter the whole window, and no tick's reply
+        // carries information the pane reads.
+        self.send(
+            fire,
+            "Input.dispatchMouseEvent",
+            json!({
+                "type": "mouseWheel",
+                "x": f64::from(x),
+                "y": f64::from(y),
+                "deltaX": 0.0,
+                "deltaY": f64::from(delta_y),
+            }),
+        )
     }
 
     /// Forward typed text.
-    pub(crate) fn insert_text(&self, text: &str) -> Result<(), EngineError> {
-        self.client
-            .call("Input.insertText", json!({ "text": text }))
-            .map(|_| ())
+    pub(crate) fn insert_text(&self, text: &str, fire: bool) -> Result<(), EngineError> {
+        self.send(fire, "Input.insertText", json!({ "text": text }))
     }
 
     /// Send one editing chord as a key event the page can see.
@@ -926,9 +1074,11 @@ impl Engine {
         code: &'static str,
         vk: i64,
         modifiers: u32,
+        fire: bool,
     ) -> Result<(), EngineError> {
         let modifiers = i64::from(modifiers);
-        self.client.call(
+        self.send(
+            fire,
             "Input.dispatchKeyEvent",
             json!({
                 "type": "rawKeyDown",
@@ -939,7 +1089,8 @@ impl Engine {
                 "modifiers": modifiers,
             }),
         )?;
-        self.client.call(
+        self.send(
+            fire,
             "Input.dispatchKeyEvent",
             json!({
                 "type": "keyUp",
@@ -961,7 +1112,7 @@ impl Engine {
     /// then writes to the system clipboard - bsh never reads the clipboard
     /// here, and never invents contents for it.
     pub(crate) fn copy(&self, modifiers: u32) -> Result<Option<String>, EngineError> {
-        self.chord("c", "KeyC", 67, modifiers)?;
+        self.chord("c", "KeyC", 67, modifiers, false)?;
         let value = self.evaluate(COPY_JS)?;
         Ok(value
             .as_str()
@@ -973,7 +1124,7 @@ impl Engine {
     /// (the page's `cut` event may have done it itself; an accepted event is
     /// the one bsh deletes for).
     pub(crate) fn cut(&self, modifiers: u32) -> Result<Option<String>, EngineError> {
-        self.chord("x", "KeyX", 88, modifiers)?;
+        self.chord("x", "KeyX", 88, modifiers, false)?;
         let value = self.evaluate(CUT_JS)?;
         Ok(value
             .as_str()
@@ -990,13 +1141,16 @@ impl Engine {
     /// `Input.insertText`, which is one insertion and therefore cannot double
     /// the field. A page that prevents default owns the insertion itself.
     pub(crate) fn paste(&self, text: &str, modifiers: u32) -> Result<(), EngineError> {
-        self.chord("v", "KeyV", 86, modifiers)?;
+        // Blocking on purpose: the accepted answer decides whether the text is
+        // inserted here, so firing the chord would lose that branch. A paste
+        // is one deliberate chord, not a per-keystroke event.
+        self.chord("v", "KeyV", 86, modifiers, false)?;
         // A JSON string literal is the safe way to embed clipboard text in a
         // script: quotes, newlines and backslashes in the text stay data.
         let json = serde_json::to_string(text).unwrap_or_default();
         let accepted = self.evaluate(&PASTE_JS.replace("%TEXT%", &json))?;
         if accepted.as_bool().unwrap_or(true) {
-            self.insert_text(text)?;
+            self.insert_text(text, false)?;
         }
         Ok(())
     }
@@ -1004,12 +1158,18 @@ impl Engine {
     /// Select the focused field, or the whole document.
     ///
     /// The chord is forwarded first, so a page that implements its own
-    /// select-all sees the key. Obscura implements no default action for a
+    /// select-all sees the key. CDP does not synthesize a default action for a
     /// chord (MEASURED: neither `commands` nor `execCommand` does anything),
     /// so the selection is made here through the DOM.
-    pub(crate) fn select_all(&self, modifiers: u32) -> Result<(), EngineError> {
-        self.chord("a", "KeyA", 65, modifiers)?;
-        self.evaluate(SELECT_ALL_JS)?;
+    pub(crate) fn select_all(&self, modifiers: u32, fire: bool) -> Result<(), EngineError> {
+        self.chord("a", "KeyA", 65, modifiers, fire)?;
+        // The selection is made by the script, whose value the pane never
+        // reads: fired it still runs, in queue order behind the chord.
+        self.send(
+            fire,
+            "Runtime.evaluate",
+            json!({ "expression": SELECT_ALL_JS, "returnByValue": true, "awaitPromise": true }),
+        )?;
         Ok(())
     }
 
@@ -1019,14 +1179,14 @@ impl Engine {
     /// not keep a second copy of the page's text. A page that implements undo
     /// itself receives the chord; a plain field does not undo (stated in the
     /// substrate doc as a residual).
-    pub(crate) fn undo(&self, modifiers: u32) -> Result<(), EngineError> {
-        self.chord("z", "KeyZ", 90, modifiers)
+    pub(crate) fn undo(&self, modifiers: u32, fire: bool) -> Result<(), EngineError> {
+        self.chord("z", "KeyZ", 90, modifiers, fire)
     }
 
     /// Forward the find chord. There is no find bar in this pane; the page's own
     /// handler is what receives it.
-    pub(crate) fn find(&self, modifiers: u32) -> Result<(), EngineError> {
-        self.chord("f", "KeyF", 70, modifiers)
+    pub(crate) fn find(&self, modifiers: u32, fire: bool) -> Result<(), EngineError> {
+        self.chord("f", "KeyF", 70, modifiers, fire)
     }
 
     /// Whether frames are being captured.
@@ -1052,16 +1212,9 @@ impl Engine {
         *slot = self.spawn_pump();
     }
 
-    /// Spawn the capture thread.
-    ///
-    /// The pump PROBES the engine and adapts: a PNG capture is one round trip
-    /// (MEASURED at ~8 ms, two to nine times faster than JPEG on this engine),
-    /// its bytes are compared with the previous frame so a still page costs
-    /// nothing but the probe, and the cadence is fast while the page is
-    /// changing - tracked by the shared activity stamp that input, navigation
-    /// and the request seam all bump - and settles to the idle rate after a
-    /// few unchanged probes. The decode and the channel swap happen here, on
-    /// this thread, so the pane's render path only ever copies ready bytes.
+    /// Spawn the compositor capture thread. Chromium pushes frames as it paints,
+    /// avoiding the screenshot RPC round trip on every frame. Screenshot polling
+    /// remains a fallback for Chromium builds that cannot start a screencast.
     fn spawn_pump(&self) -> Option<JoinHandle<()>> {
         let stop = self.stop.clone();
         let streaming = self.streaming.clone();
@@ -1070,52 +1223,58 @@ impl Engine {
         std::thread::Builder::new()
             .name(String::from("bsh-browser-pump"))
             .spawn(move || {
-                let mut last: Option<Vec<u8>> = None;
-                let mut seen_activity = client.activity();
-                let mut quiet = FRAME_QUIET_TICKS;
+                let mut last: Option<String> = None;
+                let mut active = false;
+                let mut screencast = false;
+                let mut fallback = false;
+                let mut started_at = None;
                 while !stop.load(Ordering::Relaxed) {
-                    if streaming.load(Ordering::Relaxed) {
-                        let started = std::time::Instant::now();
-                        if client.activity() != seen_activity {
-                            seen_activity = client.activity();
-                            quiet = 0;
+                    let wants_frames = streaming.load(Ordering::Relaxed);
+                    if wants_frames != active {
+                        active = wants_frames;
+                        if active {
+                            screencast = client.start_screencast().is_ok();
+                            fallback = !screencast;
+                            started_at = Some(std::time::Instant::now());
+                            last = None;
+                        } else if screencast {
+                            let _ = client.stop_screencast();
+                            screencast = false;
                         }
-                        // A failed probe keeps the previous frame on screen;
-                        // the next probe retries.
-                        if let Ok(bytes) = capture(&client, "png", None) {
-                            if last.as_ref() != Some(&bytes) {
-                                quiet = 0;
-                                if let Ok(image) = image::load_from_memory(&bytes) {
-                                    let rgba = image.to_rgba8();
-                                    let (width, height) = rgba.dimensions();
-                                    // GPUI's RenderImage wants BGRA and a
-                                    // capture is RGBA. MEASURED: handing RGBA
-                                    // over unchanged draws a blue heading
-                                    // orange. The swap is paid HERE, so the
-                                    // pane never touches a pixel.
-                                    let mut bgra = rgba.into_raw();
-                                    for pixel in bgra.as_chunks_mut::<4>().0 {
-                                        pixel.swap(0, 2);
-                                    }
-                                    frames.store(Arc::new(bgra), width, height);
+                    }
+                    if !active {
+                        std::thread::sleep(FRAME_IDLE);
+                        continue;
+                    }
+                    if screencast {
+                        if let Some(text) = client.wait_screencast_frame(FRAME_IDLE) {
+                            started_at = None;
+                            if last.as_ref() != Some(&text) {
+                                if let Some(bytes) = wire::decode_base64(&text) {
+                                    store_captured(&frames, &bytes);
                                 }
-                                last = Some(bytes);
-                            } else {
-                                quiet = quiet.saturating_add(1);
+                                last = Some(text);
+                            }
+                        } else if started_at.is_some_and(|at| at.elapsed() >= FRAME_START_TIMEOUT) {
+                            let _ = client.stop_screencast();
+                            screencast = false;
+                            fallback = true;
+                        }
+                    }
+                    if fallback {
+                        if let Ok(text) = capture_b64(&client, "png", None) {
+                            if last.as_ref() != Some(&text) {
+                                if let Some(bytes) = wire::decode_base64(&text) {
+                                    store_captured(&frames, &bytes);
+                                }
+                                last = Some(text);
                             }
                         }
-                        // A BUDGET, not a sleep: a cycle that already spent
-                        // the budget long ago (a debug-build decode) gets no
-                        // added delay, so the page is shown as fast as the
-                        // machine can decode it and never slower.
-                        if quiet >= FRAME_QUIET_TICKS {
-                            std::thread::sleep(FRAME_IDLE.saturating_sub(started.elapsed()));
-                        } else {
-                            std::thread::sleep(FRAME_FAST.saturating_sub(started.elapsed()));
-                        }
-                    } else {
-                        std::thread::sleep(FRAME_IDLE);
+                        std::thread::sleep(FRAME_FAST);
                     }
+                }
+                if screencast {
+                    let _ = client.stop_screencast();
                 }
             })
             .ok()
@@ -1162,16 +1321,42 @@ impl Drop for Engine {
     }
 }
 
-/// Capture one frame.
-fn capture(client: &Client, format: &str, quality: Option<u32>) -> Result<Vec<u8>, EngineError> {
+/// Decode a captured PNG into the frame slot, paying the channel swap here.
+///
+/// The one decode path for both the pump and a navigation's paint beat: GPUI's
+/// `RenderImage` wants BGRA and a capture is RGBA. MEASURED: handing RGBA over
+/// unchanged draws a blue heading orange.
+fn store_captured(frames: &FrameSlot, bytes: &[u8]) {
+    let Ok(image) = image::load_from_memory(bytes) else {
+        return;
+    };
+    let rgba = image.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    let mut bgra = rgba.into_raw();
+    for pixel in bgra.as_chunks_mut::<4>().0 {
+        pixel.swap(0, 2);
+    }
+    frames.store(Arc::new(bgra), width, height);
+}
+
+/// Capture one frame as the base64 text the engine sends.
+///
+/// The pump compares this TEXT with the previous probe before decoding
+/// anything. A probe is one round trip, and most probes of a page that has
+/// stopped moving return bytes identical to the last ones; decoding those
+/// would spend a measured 0.72 ms and a 17 KB allocation to prove the page is
+/// still. Comparing the text instead costs 0.0007 ms - a thousandth - and only
+/// a capture that actually changed is decoded.
+fn capture_b64(client: &Client, format: &str, quality: Option<u32>) -> Result<String, EngineError> {
     let mut params = json!({ "format": format });
     if let Some(quality) = quality {
         params["quality"] = json!(quality);
     }
     let answer = client.call("Page.captureScreenshot", params)?;
-    let data = answer
+    answer
         .get("data")
         .and_then(Value::as_str)
+        .map(String::from)
         .ok_or_else(|| EngineError::Rpc {
             method: String::from("Page.captureScreenshot"),
             error: RpcError {
@@ -1179,8 +1364,18 @@ fn capture(client: &Client, format: &str, quality: Option<u32>) -> Result<Vec<u8
                 message: String::from("the capture carried no data"),
                 data: None,
             },
-        })?;
-    wire::decode_base64(data).ok_or_else(|| EngineError::Rpc {
+        })
+}
+
+/// Capture one frame, decoded. The path a proof or a saved capture takes,
+/// where the bytes are wanted whatever they cost - so it is test-only, because
+/// the pump deliberately compares text and decodes only a changed capture, and
+/// a capture taken on the navigation thread is MEASURED slower than letting
+/// the pump's woken probe produce the frame.
+#[cfg(test)]
+fn capture(client: &Client, format: &str, quality: Option<u32>) -> Result<Vec<u8>, EngineError> {
+    let text = capture_b64(client, format, quality)?;
+    wire::decode_base64(&text).ok_or_else(|| EngineError::Rpc {
         method: String::from("Page.captureScreenshot"),
         error: RpcError {
             code: 0,
@@ -1191,17 +1386,62 @@ fn capture(client: &Client, format: &str, quality: Option<u32>) -> Result<Vec<u8
 }
 
 /// The parameters of one pointer event.
-fn mouse_params(kind: &str, x: f64, y: f64, clicks: Option<u32>) -> Value {
+fn mouse_params(kind: &str, x: f64, y: f64, clicks: Option<u32>, buttons: u32) -> Value {
     let mut params = json!({
         "type": kind,
         "x": x,
         "y": y,
         "button": if kind == "mouseMoved" { "none" } else { "left" },
+        "buttons": buttons,
     });
     if let Some(count) = clicks {
         params["clickCount"] = json!(count);
     }
     params
+}
+
+/// Set the page selection from the text carets under a drag's endpoints.
+///
+/// Caret APIs use Chromium's rendered text geometry to provide a consistent
+/// selection and copy path across native pointer and captured-frame input.
+fn text_selection_script(start: (f32, f32), end: (f32, f32)) -> String {
+    const SCRIPT: &str = r#"(function(ax, ay, bx, by) {
+  function caret(x, y) {
+    if (typeof document.caretPositionFromPoint === 'function') {
+      var position = document.caretPositionFromPoint(x, y);
+      return position && [position.offsetNode, position.offset];
+    }
+    if (typeof document.caretRangeFromPoint === 'function') {
+      var range = document.caretRangeFromPoint(x, y);
+      return range && [range.startContainer, range.startOffset];
+    }
+    return null;
+  }
+  function editable(node) {
+    var element = node && (node.nodeType === 1 ? node : node.parentElement);
+    while (element) {
+      var tag = element.tagName;
+      if (element.isContentEditable || tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
+        return true;
+      }
+      element = element.parentElement;
+    }
+    return false;
+  }
+  var start = caret(ax, ay);
+  var end = caret(bx, by);
+  if (!start || !end || start[0].nodeType !== 3 || end[0].nodeType !== 3 ||
+      editable(start[0]) || editable(end[0])) return false;
+  var selection = document.getSelection();
+  if (!selection || typeof selection.setBaseAndExtent !== 'function') return false;
+  selection.setBaseAndExtent(start[0], start[1], end[0], end[1]);
+  return String(selection);
+})(%AX%, %AY%, %BX%, %BY%)"#;
+    SCRIPT
+        .replace("%AX%", &start.0.to_string())
+        .replace("%AY%", &start.1.to_string())
+        .replace("%BX%", &end.0.to_string())
+        .replace("%BY%", &end.1.to_string())
 }
 
 /// The text a named key produces, when it produces one.
@@ -1311,7 +1551,7 @@ fn digit_code(digit: char) -> &'static str {
 /// The double-click word selection, or the triple-click line/block selection,
 /// applied at a page point.
 ///
-/// MEASURED on Obscura 0.2.5: `mousePressed` with `clickCount: 2` fires
+/// MEASURED: `mousePressed` with `clickCount: 2` fires
 /// `dblclick` (`event.detail` 2) but the DOM's own selection stays empty, and
 /// a drag never selects text either. That is the engine's gap, so the pane
 /// supplies the DEFAULT selection here - using the engine's own hit testing, a
@@ -1331,7 +1571,7 @@ const SELECT_AT_JS: &str = r#"
   if (field && typeof field.setSelectionRange === 'function') {
     var value = String(field.value == null ? '' : field.value);
     var start = field.selectionStart;
-    // MEASURED: a click focuses an input/textarea but Obscura leaves
+    // MEASURED: a click focuses an input/textarea but the CDP input path leaves
     // selectionStart null, so the click's caret is not observable and there is
     // no offset to expand. Guessing (the end of the value) would select the
     // wrong word, so this returns none and the doc states the residual.
@@ -1545,7 +1785,7 @@ fn snapshot_script(start: u64) -> String {
   const elements = [];
   for (const el of Array.from(document.querySelectorAll(SELECTOR))) {{
     const style = window.getComputedStyle(el);
-    // MEASURED: Obscura's inline layout reports a ZERO rect for an <a>, so
+    // MEASURED: Chromium's inline layout reports a ZERO rect for an <a>, so
     // size cannot be the visibility test or every link would disappear from
     // the model. Only a declared hidden style is.
     if (style.display === 'none' || style.visibility === 'hidden') continue;
@@ -1580,8 +1820,8 @@ fn snapshot_script(start: u64) -> String {
 
 /// The expression that finds one ref's centre, or says why it cannot.
 ///
-/// MEASURED: an inline `<a>` has a zero `getBoundingClientRect()` box in
-/// obscura 0.2.5, so using the element box alone would fall back to
+/// MEASURED: an inline `<a>` can have a zero `getBoundingClientRect()` box,
+/// so using the element box alone would fall back to
 /// `element.click()` for every link. The hit point therefore falls back to the
 /// union of the element's own client rects and a Range over its CONTENTS, which
 /// is where inline text actually lays out when the element box does not. A real
@@ -1781,6 +2021,15 @@ mod tests {
             !script.contains("e3'\"'"),
             "the ref must be escaped: {script}"
         );
+    }
+
+    #[test]
+    fn mouse_move_carries_the_held_button_for_drag_selection() {
+        let drag = mouse_params("mouseMoved", 14.0, 22.0, None, 1);
+        let hover = mouse_params("mouseMoved", 14.0, 22.0, None, 0);
+        assert_eq!(drag["button"], "none");
+        assert_eq!(drag["buttons"], 1);
+        assert_eq!(hover["buttons"], 0);
     }
 
     #[test]

@@ -2,8 +2,8 @@
 //!
 //! # The problem this closes
 //!
-//! Obscura has no parent-death signal: when bsh is killed with SIGKILL (or
-//! SIGTERM it cannot handle), the 70 MB child keeps running, invisible, until
+//! Chromium has no parent-death signal: when bsh is killed with SIGKILL (or
+//! SIGTERM it cannot handle), the browser child keeps running, invisible, until
 //! the machine reboots. `Drop` is a good citizen and cannot run on SIGKILL, so
 //! the only reliable answer is at the NEXT start: find the child, prove it is
 //! ours, and kill it.
@@ -14,10 +14,10 @@
 //! name is the marker:
 //!
 //! ```text
-//! bsh-obscura-<pid>-<nanos>-<seq>
+//! bsh-browser-<pid>-<nanos>-<seq>
 //! ```
 //!
-//! The marker is therefore in the child's argv (`--storage-dir <marker>`), and
+//! The marker is therefore in the child's argv (`--user-data-dir=<marker>`), and
 //! the same name is written to a pidfile under this instance's data directory.
 //! A pidfile records the pid and the marker.
 //!
@@ -41,12 +41,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 /// The prefix every marker starts with.
-pub(crate) const MARKER_PREFIX: &str = "bsh-obscura";
+pub(crate) const MARKER_PREFIX: &str = "bsh-browser";
 
 /// How long a SIGTERM is waited for before SIGKILL.
 ///
-/// MEASURED on obscura 0.2.5: it IGNORES SIGTERM (a manual `kill <pid>` leaves
-/// the process running), so the SIGKILL escalation is what actually stops it.
+/// Chromium may not exit promptly on SIGTERM, so use SIGKILL as the final
+/// escalation after the graceful wait.
 const TERM_GRACE: Duration = Duration::from_secs(2);
 
 /// What a reaping pass did, so a caller can say so instead of guessing.
@@ -427,7 +427,7 @@ mod tests {
         // pidfile cannot be used to kill this pid.
         let path = pid_dir(&dir).join(format!("{marker}.pid"));
         std::fs::create_dir_all(pid_dir(&dir)).expect("a directory");
-        std::fs::write(&path, format!("{pid}\nbsh-obscura-someone-else\n")).expect("a pidfile");
+        std::fs::write(&path, format!("{pid}\nbsh-browser-someone-else\n")).expect("a pidfile");
         let table = FakeParents::new(HashMap::from([(pid, Some(1))]));
         let report = reap_orphans(&dir, &table);
         assert!(report.reaped.is_empty(), "{report:?}");

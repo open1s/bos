@@ -307,9 +307,9 @@ impl gpui::EntityInputHandler for Shell {
                         cx.notify();
                         return;
                     }
-                    let _ = engine.press("backspace");
+                    let _ = engine.press("backspace", true);
                 }
-                let _ = engine.insert_text(text);
+                let _ = engine.insert_text(text, true);
             }
             cx.notify();
             return;
@@ -3640,17 +3640,17 @@ fn browser_shortcut(
             if modifiers.shift {
                 return false;
             }
-            let _ = engine.select_all(bits);
+            let _ = engine.select_all(bits, true);
             true
         }
         "z" => {
-            let _ = engine.undo(bits);
+            let _ = engine.undo(bits, true);
             true
         }
         "f" => {
             // No find bar exists in this pane; the page's own Cmd-F handler is
             // what receives the chord.
-            let _ = engine.find(bits);
+            let _ = engine.find(bits, true);
             true
         }
         _ => false,
@@ -3812,8 +3812,8 @@ impl Shell {
 
     /// Start the rendered engine when the Browser tab is first shown.
     ///
-    /// MEASURED: launching Obscura (process + CDP handshake + V8 + the font
-    /// scan) takes ~0.16 s here and 2-3 s on a cold filesystem. A pre-warm
+    /// MEASURED: launching Chromium (process + CDP handshake) takes ~1.3 s in
+    /// a debug build here. A pre-warm
     /// moves that cost to the moment the pane appears, so the FIRST navigation
     /// does not pay it. The engine is left with no capture pump (the pump
     /// starts on the first painted frame), so a pane that is shown and never
@@ -3903,7 +3903,11 @@ impl Shell {
     pub(crate) fn browser_pane_closed(&mut self) {
         self.right.tab = None;
         self.state.browser.stop_engine();
-        self.browser_render = None;
+        // The frame on screen still owns an atlas tile until a render drops it,
+        // so it is queued rather than forgotten.
+        if let Some(previous) = self.browser_render.take() {
+            self.browser_render_stale.push(previous);
+        }
         self.browser_frame_seq = 0;
         // A pending resize belongs to the engine that is gone; a new engine
         // starts at its own default viewport.
@@ -3913,6 +3917,7 @@ impl Shell {
         // A gesture belongs to the page that was on screen; closing it must
         // not leave the pane thinking a press is still down.
         self.browser_pressed = false;
+        self.browser_drag_start = None;
         self.browser_click = None;
     }
 
@@ -3930,7 +3935,7 @@ impl Shell {
     /// is on screen.
     ///
     /// This runs on the window's own clock, not per frame: a capture is a
-    /// JPEG decode on the engine's pump thread, and the pane only builds a
+    /// PNG decode on the engine's pump thread, and the pane only builds a
     /// @@RenderImage@@ from bytes that already exist. A hidden tab stops the
     /// pump entirely, so a page nobody is looking at costs nothing.
     pub(crate) fn sync_browser(&mut self, cx: &mut Context<Self>) {
@@ -3948,14 +3953,18 @@ impl Shell {
                     // render path: the want is recorded here and applied off
                     // the UI thread, at most one override per tick window, so
                     // a pane drag reflows at a bounded rate and a settled pane
-                    // still catches the final size. The pump repaints the
-                    // reflow on its own (a resize bumps the activity stamp),
-                    // so no dirty flag is needed here.
+                    // still catches the final size. The compositor stream
+                    // publishes the reflow on its next painted frame, so no
+                    // dirty flag is needed here.
                     if let Some(bounds) = self.browser_bounds.get() {
                         let width = bounds.size.width.as_f32().round().max(0.0) as u32;
                         let height = bounds.size.height.as_f32().round().max(0.0) as u32;
-                        if width >= 320 && height >= 240 && engine.viewport() != (width, height) {
-                            self.browser_resize_want = Some((width, height));
+                        let scale = self.browser_scale.get();
+                        if width >= 320
+                            && height >= 240
+                            && (engine.viewport() != (width, height) || engine.scale() != scale)
+                        {
+                            self.browser_resize_want = Some((width, height, scale));
                         }
                     }
                     if let Some(want) = self.browser_resize_want {
@@ -3968,14 +3977,17 @@ impl Shell {
                             let engine = engine.clone();
                             cx.background_executor()
                                 .spawn(async move {
-                                    let _ = engine.resize(want);
+                                    let _ = engine.resize((want.0, want.1), want.2);
                                 })
                                 .detach();
                         }
                     }
                 }
             }
-        } else if self.browser_render.take().is_some() {
+        } else if let Some(previous) = self.browser_render.take() {
+            // The engine is gone, so the last frame leaves the screen - and its
+            // atlas tile is released the same way a replaced one is.
+            self.browser_render_stale.push(previous);
             dirty = true;
         }
         let revision = browser.revision();
@@ -3985,15 +3997,18 @@ impl Shell {
             self.browser_rev = revision;
             dirty = true;
         }
-        let seq = browser.frames().seq();
-        if seq != self.browser_frame_seq {
+        if let Some((seq, frame)) = browser.frames().take_newer(self.browser_frame_seq) {
             self.browser_frame_seq = seq;
-            if let Some(frame) = browser.frames().latest() {
-                if let Some(render) = render_frame(&frame) {
-                    self.browser_frame_size = (frame.width, frame.height);
-                    self.browser_render = Some(std::sync::Arc::new(render));
-                    dirty = true;
+            let size = (frame.width, frame.height);
+            if let Some(render) = render_frame(frame) {
+                self.browser_frame_size = size;
+                // A new frame is a new `RenderImage::id`, so the atlas
+                // caches its tile separately from the one it replaces. The
+                // replaced frame is queued for release on the next render.
+                if let Some(previous) = self.browser_render.replace(std::sync::Arc::new(render)) {
+                    self.browser_render_stale.push(previous);
                 }
+                dirty = true;
             }
         }
         if dirty {
@@ -4018,12 +4033,18 @@ impl Shell {
         // keydown plus char, and inserting it here too would double it.
         let command_focus = self.browser_focus.clone();
         let command_shell = cx.entity();
+        // The window's device scale factor, read at prepaint and carried to the
+        // engine's next resize: a capture at the screen's own scale is what
+        // draws one texture pixel per screen pixel, which is the difference
+        // between a sharp page and a blurry one.
+        let scale = self.browser_scale.clone();
         let column = div().flex_1().min_h_0().w_full().flex().flex_col();
         column
             .child(
                 div()
-                    .on_children_prepainted(move |children, _, _| {
+                    .on_children_prepainted(move |children, window, _| {
                         tracked.set(children.first().copied());
+                        scale.set(window.scale_factor());
                     })
                     .id("browser-live")
                     .debug_selector(|| String::from("browser-render-frame"))
@@ -4156,7 +4177,8 @@ impl Shell {
             // Only a press the page actually received is a held gesture; a pane
             // with no engine has nothing to release later.
             self.browser_pressed = true;
-            let _ = engine.pointer_down(x, y, count);
+            self.browser_drag_start = Some((x, y));
+            let _ = engine.pointer_down(x, y, count, true);
         }
     }
 
@@ -4188,7 +4210,12 @@ impl Shell {
             }
         }
         if let Some(engine) = self.state.browser.engine() {
-            let _ = engine.pointer_move(x, y);
+            let _ = engine.pointer_move(x, y, dragging);
+            if dragging {
+                if let Some(start) = self.browser_drag_start {
+                    let _ = engine.select_text_between(start, (x, y), true);
+                }
+            }
         }
     }
 
@@ -4206,7 +4233,10 @@ impl Shell {
             return;
         };
         if let Some(engine) = self.state.browser.engine() {
-            let _ = engine.pointer_move(x, y);
+            let _ = engine.pointer_move(x, y, true);
+            if let Some(start) = self.browser_drag_start {
+                let _ = engine.select_text_between(start, (x, y), true);
+            }
         }
     }
 
@@ -4221,7 +4251,14 @@ impl Shell {
             return;
         };
         if let Some(engine) = self.state.browser.engine() {
-            let _ = engine.pointer_up(x, y, count);
+            let _ = engine.pointer_up(x, y, count, true);
+            if let Some(start) = self.browser_drag_start.take() {
+                if (x - start.0).abs() > 3.0 || (y - start.1).abs() > 3.0 {
+                    let _ = engine.select_text_between(start, (x, y), true);
+                }
+            }
+        } else {
+            self.browser_drag_start = None;
         }
     }
 
@@ -4242,8 +4279,15 @@ impl Shell {
             return;
         };
         if let Some(engine) = self.state.browser.engine() {
-            let _ = engine.pointer_move(x, y);
-            let _ = engine.pointer_up(x, y, count);
+            let _ = engine.pointer_move(x, y, true);
+            let _ = engine.pointer_up(x, y, count, true);
+            if let Some(start) = self.browser_drag_start.take() {
+                if (x - start.0).abs() > 3.0 || (y - start.1).abs() > 3.0 {
+                    let _ = engine.select_text_between(start, (x, y), true);
+                }
+            }
+        } else {
+            self.browser_drag_start = None;
         }
     }
 
@@ -4268,7 +4312,7 @@ impl Shell {
             x * viewport.0 as f32 / width,
             y * viewport.1 as f32 / height,
         );
-        let _ = engine.scroll(x, y, delta);
+        let _ = engine.scroll(x, y, delta, true);
     }
 
     /// Forward a key: printable text as text, the named keys as keys.
@@ -4301,7 +4345,7 @@ impl Shell {
             _ => None,
         };
         if let Some(named) = named {
-            let _ = engine.press(named);
+            let _ = engine.press(named, true);
             return;
         }
         // A shortcut this pane does not own (Cmd-S, Cmd-T, ...) belongs to the
@@ -4316,7 +4360,7 @@ impl Shell {
             // One printable character: a real browser's keydown plus char, so
             // a page listening for keydown sees the key AND the field receives
             // exactly that character once.
-            let _ = engine.type_key(text, chord_modifiers(&keystroke.modifiers));
+            let _ = engine.type_key(text, chord_modifiers(&keystroke.modifiers), true);
             if let Some(ch) = text.chars().next() {
                 self.browser_typed = Some((std::time::Instant::now(), ch));
             }
@@ -4324,7 +4368,7 @@ impl Shell {
             // A composition (CJK/IME) or an input source's multi-character
             // commit: insert it as text, the route that does not pretend to be
             // a key this keyboard does not have.
-            let _ = engine.insert_text(text);
+            let _ = engine.insert_text(text, true);
         }
     }
 
@@ -5914,10 +5958,10 @@ impl Shell {
 /// Build the image the pane draws from one captured frame.
 ///
 /// The buffer was decoded AND channel-swapped on the engine's pump thread, so
-/// this copies ready BGRA bytes into the GPUI image; it does not decode
-/// anything and touches no pixel on the render path.
-fn render_frame(frame: &crate::browser::engine::Frame) -> Option<gpui_kit::RenderImage> {
-    let pixels = (*frame.bgra).clone();
+/// this moves ready BGRA bytes into the GPUI image; it does not decode
+/// anything or copy a viewport on the render path.
+pub(crate) fn render_frame(frame: crate::browser::engine::Frame) -> Option<gpui_kit::RenderImage> {
+    let pixels = std::sync::Arc::try_unwrap(frame.bgra).unwrap_or_else(|shared| (*shared).clone());
     let buffer = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_raw(
         frame.width,
         frame.height,

@@ -1,4 +1,4 @@
-//! The Browser pane's rendered engine: an external Obscura process over CDP.
+//! The Browser pane's rendered engine: an external Chromium process over CDP.
 //!
 //! # Why an external process
 //!
@@ -50,27 +50,71 @@ pub(crate) struct Frame {
 pub(crate) struct FrameSlot {
     seq: AtomicU64,
     frame: Mutex<Option<Frame>>,
+    /// Coalescing wake for the pane's clock. A published frame asks the UI to
+    /// sync NOW instead of waiting for its next poll: the pump publishes about
+    /// thirty frames a second while a page moves, and a 120 ms poll would show
+    /// eight of them. The channel is bounded to one and the send is a try, so
+    /// a reader slower than the pump collapses a burst into the one sync that
+    /// reads the newest frame anyway.
+    wake: Mutex<Option<async_channel::Sender<()>>>,
 }
 
 impl FrameSlot {
     /// Publish a frame.
     pub(crate) fn store(&self, bgra: Arc<Vec<u8>>, width: u32, height: u32) {
-        self.seq.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut slot) = self.frame.lock() {
             slot.replace(Frame {
                 width,
                 height,
                 bgra,
             });
+            // Publish the sequence only after the corresponding pixels are
+            // readable. Keeping both operations under this lock lets a UI sync
+            // take the matching frame atomically instead of remembering a
+            // sequence whose pixels are not available yet.
+            self.seq.fetch_add(1, Ordering::Relaxed);
+        }
+        // Signalled AFTER the frame is readable, so a woken sync always finds
+        // the frame that woke it - or a newer one.
+        if let Ok(guard) = self.wake.lock() {
+            if let Some(wake) = guard.as_ref() {
+                let _ = wake.try_send(());
+            }
+        }
+    }
+
+    /// Install the wake the pane's clock listens on. The engine never needs
+    /// one: without it a store simply publishes into the slot for the next
+    /// poll, which is what the tests and a hidden pane want.
+    pub(crate) fn set_wake(&self, wake: async_channel::Sender<()>) {
+        if let Ok(mut guard) = self.wake.lock() {
+            *guard = Some(wake);
         }
     }
 
     /// The newest frame, with its sequence.
+    #[cfg(test)]
     pub(crate) fn latest(&self) -> Option<Frame> {
         self.frame.lock().ok().and_then(|slot| slot.clone())
     }
 
+    /// Take a newer frame and its sequence under one lock.
+    ///
+    /// The frame pump publishes both while holding `frame`, so the pane cannot
+    /// observe a new sequence before the matching pixels are available. Taking
+    /// ownership lets it move those pixels into the render image without a
+    /// full viewport copy.
+    pub(crate) fn take_newer(&self, after: u64) -> Option<(u64, Frame)> {
+        let mut slot = self.frame.lock().ok()?;
+        let seq = self.seq.load(Ordering::Relaxed);
+        if seq == after {
+            return None;
+        }
+        Some((seq, slot.take()?))
+    }
+
     /// The newest sequence number, zero before the first capture.
+    #[cfg(test)]
     pub(crate) fn seq(&self) -> u64 {
         self.seq.load(Ordering::Relaxed)
     }

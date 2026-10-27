@@ -84,6 +84,66 @@ fn tree_spacer(height: f32) -> AnyElement {
     div().flex_none().w_full().h(px(height)).into_any_element()
 }
 
+/// One row action's box: a 12px glyph inside the 4px pad that forms its hover
+/// pill.
+const ROW_ACTION_BOX: f32 = 20.0;
+/// The kit's compact icon button, which the row's menu hangs off.
+const MENU_BUTTON: f32 = 32.0;
+/// The menu button's box: the button plus a 4px pad a side.
+const ROW_MENU_BOX: f32 = MENU_BUTTON + 8.0;
+/// Between two action boxes.
+const ROW_ACTION_GAP: f32 = 2.0;
+/// The pinned row's rest marker, the reference's 16x20 non-interactive
+/// `pinIndicator` that the hover actions replace.
+pub(crate) const PIN_MARK_W: f32 = 16.0;
+
+/// How wide a session row's action cluster is: the pin and archive boxes, the
+/// menu button and - only while a turn streams - the stop box.
+fn session_actions_w(streaming: bool) -> f32 {
+    let icons = if streaming { 3.0 } else { 2.0 };
+    icons * (ROW_ACTION_BOX + ROW_ACTION_GAP) + ROW_MENU_BOX
+}
+
+/// How wide the workspace header's cluster is: its plus box and the bare menu
+/// button (the header's menu has no pad of its own).
+const WORKSPACE_ACTIONS_W: f32 = ROW_ACTION_BOX + MENU_BUTTON + ROW_ACTION_GAP;
+
+/// A row's hover controls, in the row's flow instead of on top of its title.
+///
+/// The reference swaps the age for these buttons while a row is hovered, so the
+/// title is truncated before them. As an absolute overlay - what bsh drew - the
+/// menu button sat under the tail of a long title, which is how the session menu
+/// came to be hidden behind its own label. The slot is zero wide until the
+/// pointer arrives and then takes exactly the width its boxes need, so the
+/// title, which is the row's only flexible child, gives up that much and no
+/// more. `width` therefore has to be the cluster's real width: [`session_actions_w`]
+/// and [`WORKSPACE_ACTIONS_W`] are that measurement.
+fn hover_actions(
+    id: SharedString,
+    group: SharedString,
+    width: f32,
+    build: impl FnOnce(Stateful<Div>) -> Stateful<Div>,
+) -> AnyElement {
+    // The id is load bearing, not an anchor: a hover style that changes LAYOUT
+    // is read while the element is laid out, and only a stateful element keeps
+    // the hover bit between the pointer's move and that layout. A plain div
+    // would fade its ink but keep its width.
+    build(
+        div()
+            .id(id)
+            .flex_none()
+            .w(px(0.0))
+            .overflow_hidden()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_end()
+            .gap(px(ROW_ACTION_GAP))
+            .group_hover(group, move |s| s.w(px(width))),
+    )
+    .into_any_element()
+}
+
 impl Shell {
     /// The reference's own DragHandle for the sidebar: an 8px col-resize strip
     /// straddling the seam (margin-left:-4px) at left: cols.sidebar, drawn only
@@ -376,30 +436,32 @@ impl Shell {
                                 .into_any_element()
                         } else {
                             txt(name, theme::CHIP_SIZE, theme::muted())
+                                .debug_selector(|| format!("ws-title-{}", ws_id))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .truncate()
                                 .flex_1()
                                 .into_any_element()
                         })
                         // The row's own controls: a chat in this workspace, and the
-                        // menu the reference hangs off the ellipsis. They overlay the
-                        // right edge and fade in under the pointer, exactly like the
-                        // session rows' actions.
-                        .child(
-                            div()
-                                .absolute()
-                                .right(px(8.0))
-                                .top(px(0.0))
-                                .h(px(28.0))
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap(px(2.0))
-                                .child(
+                        // menu the reference hangs off the ellipsis. They take the
+                        // title's trailing space under the pointer, the way the
+                        // reference swaps them with the age, so a long name cannot
+                        // bury the menu.
+                        .child(hover_actions(
+                            SharedString::from(format!("ws-actions-{}", ws_id)),
+                            row_group.clone(),
+                            WORKSPACE_ACTIONS_W,
+                            |slot| {
+                                slot.child(
                                     div()
                                         .id(SharedString::from(format!("ws-new-{}", add_id)))
                                         .debug_selector(|| format!("ws-new-{}", add_id))
-                                        .px(px(3.0))
+                                        .flex_none()
+                                        .w(px(ROW_ACTION_BOX))
+                                        .h(px(ROW_ACTION_BOX))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
                                         .rounded(px(4.0))
                                         .cursor_pointer()
                                         .opacity(0.0)
@@ -420,6 +482,11 @@ impl Shell {
                                     div()
                                         .id(SharedString::from(format!("ws-more-{}", more_id)))
                                         .debug_selector(|| format!("ws-more-{}", more_id))
+                                        .flex_none()
+                                        .w(px(MENU_BUTTON))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
                                         .opacity(0.0)
                                         .group_hover(row_group, |s| s.opacity(1.0))
                                         .on_click(|_event, _window, cx| {
@@ -450,8 +517,9 @@ impl Shell {
                                                 },
                                             ),
                                         ),
-                                ),
-                        )
+                                )
+                            },
+                        ))
                         .on_click(cx.listener(move |this, _event, _window, cx| {
                             this.state.toggle_collapse(&click_id);
                             cx.notify();
@@ -551,147 +619,210 @@ impl Shell {
                                 .flex_1()
                                 .into_any_element()
                         })
-                        // The actions overlay the right edge and fade in on hover, which
-                        // is what the reference does. In the flow they would take width
-                        // from the title and sit mid-row, which is what they used to do.
+                        // The trailing slot holds the hover actions and the age. Under
+                        // the pointer the buttons take the age's place, as the
+                        // reference swaps them, so the title is truncated before the
+                        // menu instead of painting underneath it.
                         .child(
                             div()
-                                .absolute()
-                                .right(px(12.0))
-                                .top(px(0.0))
-                                .h(px(theme::ROW_H))
+                                .flex_none()
                                 .flex()
                                 .flex_row()
                                 .items_center()
-                                .gap(px(2.0))
-                                .child(
-                                    div()
-                                        .id(SharedString::from(format!("pin-{}", pin_id)))
-                                        .debug_selector(|| format!("pin-{}", pin_id))
-                                        .px(px(4.0))
-                                        .rounded(px(4.0))
-                                        .cursor_pointer()
-                                        .opacity(if pinned { 1.0 } else { 0.0 })
-                                        .group_hover(row_group.clone(), |s| s.opacity(1.0))
-                                        .hover(|s| s.bg(rgb(theme::hover())))
-                                        .child(icon(
-                                            if pinned {
-                                                IconName::StarFill
-                                            } else {
-                                                IconName::Star
-                                            },
-                                            12.0,
-                                            if pinned {
-                                                theme::warn()
-                                            } else {
-                                                theme::faint()
-                                            },
-                                        ))
-                                        .on_click({
-                                            let action_shell = row_shell.clone();
-                                            move |_event, _window, cx| {
-                                                cx.stop_propagation();
-                                                action_shell.update(cx, |this, cx| {
-                                                    this.state.toggle_pin(&pin_id);
-                                                    cx.notify();
-                                                });
-                                            }
-                                        }),
-                                )
-                                .child(
-                                    div()
-                                        .id(SharedString::from(format!("archive-{}", archive_id)))
-                                        .debug_selector(|| format!("archive-{}", archive_id))
-                                        .px(px(4.0))
-                                        .rounded(px(4.0))
-                                        .cursor_pointer()
-                                        .opacity(0.0)
-                                        .group_hover(row_group.clone(), |s| s.opacity(1.0))
-                                        .hover(|s| s.bg(rgb(theme::hover())))
-                                        .child(icon(IconName::Archive, 12.0, theme::faint()))
-                                        .on_click({
-                                            let action_shell = row_shell.clone();
-                                            move |_event, _window, cx| {
-                                                cx.stop_propagation();
-                                                action_shell.update(cx, |this, cx| {
-                                                    this.state.archive_session(&archive_id);
-                                                    cx.notify();
-                                                });
-                                            }
-                                        }),
-                                )
-                                .when(streaming, |row| {
-                                    row.child(
-                                        div()
-                                            .id(SharedString::from(format!("stop-{}", stop_id)))
-                                            .debug_selector(|| format!("stop-{}", stop_id))
-                                            .px(px(4.0))
-                                            .rounded(px(4.0))
-                                            .cursor_pointer()
-                                            .opacity(0.0)
-                                            .group_hover(row_group.clone(), |s| s.opacity(1.0))
-                                            .hover(|s| s.bg(rgb(theme::hover())))
-                                            .child(icon(IconName::Square, 12.0, theme::error()))
-                                            .on_click({
-                                                let action_shell = row_shell.clone();
-                                                move |_event, _window, cx| {
+                                .child(hover_actions(
+                                    SharedString::from(format!("row-actions-{}", id)),
+                                    row_group.clone(),
+                                    session_actions_w(streaming),
+                                    |slot| {
+                                        slot.child(
+                                            div()
+                                                .id(SharedString::from(format!("pin-{}", pin_id)))
+                                                .debug_selector(|| format!("pin-{}", pin_id))
+                                                .flex_none()
+                                                .w(px(ROW_ACTION_BOX))
+                                                .h(px(ROW_ACTION_BOX))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .rounded(px(4.0))
+                                                .cursor_pointer()
+                                                .opacity(if pinned { 1.0 } else { 0.0 })
+                                                .group_hover(row_group.clone(), |s| s.opacity(1.0))
+                                                .hover(|s| s.bg(rgb(theme::hover())))
+                                                .child(icon(
+                                                    if pinned {
+                                                        IconName::StarFill
+                                                    } else {
+                                                        IconName::Star
+                                                    },
+                                                    12.0,
+                                                    if pinned {
+                                                        theme::warn()
+                                                    } else {
+                                                        theme::faint()
+                                                    },
+                                                ))
+                                                .on_click({
+                                                    let action_shell = row_shell.clone();
+                                                    move |_event, _window, cx| {
+                                                        cx.stop_propagation();
+                                                        action_shell.update(cx, |this, cx| {
+                                                            this.state.toggle_pin(&pin_id);
+                                                            cx.notify();
+                                                        });
+                                                    }
+                                                }),
+                                        )
+                                        .child(
+                                            div()
+                                                .id(SharedString::from(format!(
+                                                    "archive-{}",
+                                                    archive_id
+                                                )))
+                                                .debug_selector(|| {
+                                                    format!("archive-{}", archive_id)
+                                                })
+                                                .flex_none()
+                                                .w(px(ROW_ACTION_BOX))
+                                                .h(px(ROW_ACTION_BOX))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .rounded(px(4.0))
+                                                .cursor_pointer()
+                                                .opacity(0.0)
+                                                .group_hover(row_group.clone(), |s| s.opacity(1.0))
+                                                .hover(|s| s.bg(rgb(theme::hover())))
+                                                .child(icon(IconName::Archive, 12.0, theme::faint()))
+                                                .on_click({
+                                                    let action_shell = row_shell.clone();
+                                                    move |_event, _window, cx| {
+                                                        cx.stop_propagation();
+                                                        action_shell.update(cx, |this, cx| {
+                                                            this.state.archive_session(&archive_id);
+                                                            cx.notify();
+                                                        });
+                                                    }
+                                                }),
+                                        )
+                                        .when(streaming, |row| {
+                                            row.child(
+                                                div()
+                                                    .id(SharedString::from(format!(
+                                                        "stop-{}",
+                                                        stop_id
+                                                    )))
+                                                    .debug_selector(|| format!("stop-{}", stop_id))
+                                                    .flex_none()
+                                                    .w(px(ROW_ACTION_BOX))
+                                                    .h(px(ROW_ACTION_BOX))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .rounded(px(4.0))
+                                                    .cursor_pointer()
+                                                    .opacity(0.0)
+                                                    .group_hover(row_group.clone(), |s| {
+                                                        s.opacity(1.0)
+                                                    })
+                                                    .hover(|s| s.bg(rgb(theme::hover())))
+                                                    .child(icon(
+                                                        IconName::Square,
+                                                        12.0,
+                                                        theme::error(),
+                                                    ))
+                                                    .on_click({
+                                                        let action_shell = row_shell.clone();
+                                                        move |_event, _window, cx| {
+                                                            cx.stop_propagation();
+                                                            action_shell.update(cx, |this, cx| {
+                                                                this.state.stop(&stop_id);
+                                                                cx.notify();
+                                                            });
+                                                        }
+                                                    }),
+                                            )
+                                        })
+                                        .child({
+                                            let more_id = id.clone();
+                                            let items_id = id.clone();
+                                            let menu_shell = row_shell.clone();
+                                            let menu_group = row_group.clone();
+                                            div()
+                                                .id(SharedString::from(format!(
+                                                    "more-{}",
+                                                    more_id
+                                                )))
+                                                .debug_selector(|| format!("more-{}", more_id))
+                                                .flex_none()
+                                                .w(px(ROW_MENU_BOX))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .rounded(px(4.0))
+                                                .opacity(0.0)
+                                                .group_hover(menu_group, |s| s.opacity(1.0))
+                                                .on_click(move |_event, _window, cx| {
                                                     cx.stop_propagation();
-                                                    action_shell.update(cx, |this, cx| {
-                                                        this.state.stop(&stop_id);
-                                                        cx.notify();
-                                                    });
-                                                }
-                                            }),
+                                                })
+                                                .child(
+                                                    Button::new(SharedString::from(format!(
+                                                        "session-menu-{}",
+                                                        more_id
+                                                    )))
+                                                    .ghost()
+                                                    .compact()
+                                                    .icon(IconName::Ellipsis)
+                                                    .dropdown_menu_with_anchor(
+                                                        Anchor::TopLeft,
+                                                        move |menu, _, _| {
+                                                            let mut menu = menu;
+                                                            for item in
+                                                                crate::ui::session_menu::session_items(
+                                                                    &items_id,
+                                                                    pinned,
+                                                                    archived,
+                                                                    streaming,
+                                                                    row_lang,
+                                                                    &menu_shell,
+                                                                )
+                                                            {
+                                                                menu = menu.item(item);
+                                                            }
+                                                            menu
+                                                        },
+                                                    ),
+                                                )
+                                        })
+                                    },
+                                ))
+                                // The pinned row's marker: the reference's own
+                                // non-interactive star, which the pointer swaps out
+                                // for the actions.
+                                .when(pinned, |wrapper| {
+                                    wrapper.child(
+                                        div()
+                                            .id(SharedString::from(format!("row-pin-{}", id)))
+                                            .debug_selector(|| format!("row-pin-{}", id))
+                                            .flex_none()
+                                            .w(px(PIN_MARK_W))
+                                            .h(px(ROW_ACTION_BOX))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .group_hover(row_group.clone(), |s| {
+                                                s.w(px(0.0)).overflow_hidden().opacity(0.0)
+                                            })
+                                            .child(icon(IconName::StarFill, 12.0, theme::faint())),
                                     )
                                 })
-                                .child({
-                                    let more_id = id.clone();
-                                    let items_id = id.clone();
-                                    let menu_shell = row_shell.clone();
-                                    let menu_group = row_group.clone();
-                                    div()
-                                        .id(SharedString::from(format!("more-{}", more_id)))
-                                        .debug_selector(|| format!("more-{}", more_id))
-                                        .px(px(4.0))
-                                        .rounded(px(4.0))
-                                        .opacity(0.0)
-                                        .group_hover(menu_group, |s| s.opacity(1.0))
-                                        .on_click(move |_event, _window, cx| {
-                                            cx.stop_propagation();
-                                        })
-                                        .child(
-                                            Button::new(SharedString::from(format!(
-                                                "session-menu-{}",
-                                                more_id
-                                            )))
-                                            .ghost()
-                                            .compact()
-                                            .icon(IconName::Ellipsis)
-                                            .dropdown_menu_with_anchor(
-                                                Anchor::TopLeft,
-                                                move |menu, _, _| {
-                                                    let mut menu = menu;
-                                                    for item in
-                                                        crate::ui::session_menu::session_items(
-                                                            &items_id,
-                                                            pinned,
-                                                            archived,
-                                                            streaming,
-                                                            row_lang,
-                                                            &menu_shell,
-                                                        )
-                                                    {
-                                                        menu = menu.item(item);
-                                                    }
-                                                    menu
-                                                },
-                                            ),
-                                        )
-                                }),
-                        )
-                        .child(
-                            txt(when, theme::CHIP_SIZE, theme::faint())
-                                .group_hover(row_group.clone(), |s| s.opacity(0.0)),
+                                .child(
+                                    txt(when, theme::CHIP_SIZE, theme::faint())
+                                        .id(SharedString::from(format!("row-time-{}", id)))
+                                        .group_hover(row_group.clone(), |s| {
+                                            s.w(px(0.0)).overflow_hidden().opacity(0.0)
+                                        }),
+                                ),
                         )
                         .on_click(cx.listener(move |this, _event, window, cx| {
                             this.open_session(&click_id, window, cx);
