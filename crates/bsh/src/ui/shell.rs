@@ -463,6 +463,13 @@ pub(crate) struct Shell {
     pub(crate) catalogue_open: bool,
     /// The transcript scroll position, so the turn rail can jump within it.
     pub(crate) transcript_scroll: ScrollHandle,
+    /// The rail's turn indices, kept until the session's turn shape changes.
+    pub(crate) turn_index_cache: std::cell::RefCell<TurnIndexCache>,
+    /// The flattened trajectory log, kept until the session's shape changes.
+    ///
+    /// The tab, its lanes and its detail panel all read the same log; the cache
+    /// makes a repaint pay for the rows it paints instead of for the flatten.
+    pub(crate) traj_events: std::cell::RefCell<super::trajectory::EventsCache>,
     /// The measured height of every transcript row, so offscreen rows cost a
     /// spacer instead of a full message element on every frame.
     pub(crate) transcript_layout: std::cell::RefCell<super::transcript::TranscriptLayout>,
@@ -882,6 +889,43 @@ pub(crate) struct ChangesHover {
     pub(crate) file: usize,
     /// The pointer's window position when it arrived.
     pub(crate) at: (f32, f32),
+}
+
+/// The rail's turn indices, kept until the session's turn shape changes.
+///
+/// The rail, the transcript's hover preview and the audit jump all want the same
+/// vector, and each call walked every message; a long session therefore paid
+/// that walk several times per frame. Messages are append-only, so the shape the
+/// cache is keyed on is the session and its message count.
+#[derive(Default)]
+pub(crate) struct TurnIndexCache {
+    key: Option<(String, usize)>,
+    turns: std::rc::Rc<Vec<usize>>,
+}
+
+impl TurnIndexCache {
+    /// The user-message indices of `session`, oldest first.
+    pub(crate) fn get(&mut self, session: &crate::model::Session) -> std::rc::Rc<Vec<usize>> {
+        if self
+            .key
+            .as_ref()
+            .is_some_and(|(id, count)| id == &session.id && *count == session.messages.len())
+        {
+            return self.turns.clone();
+        }
+        let turns: Vec<usize> = session
+            .messages
+            .iter()
+            .enumerate()
+            // A steering row belongs to the turn it interjected into, so it is
+            // not a mark of its own.
+            .filter(|(_, message)| message.role == crate::model::Role::User && !message.steering)
+            .map(|(index, _)| index)
+            .collect();
+        self.key = Some((session.id.clone(), session.messages.len()));
+        self.turns = std::rc::Rc::new(turns);
+        self.turns.clone()
+    }
 }
 
 /// One message's changed-file summary, and the steps it was built from.
@@ -1534,6 +1578,8 @@ impl Shell {
             mcp_args,
             mcp_url,
             transcript_scroll: ScrollHandle::new(),
+            turn_index_cache: std::cell::RefCell::new(TurnIndexCache::default()),
+            traj_events: std::cell::RefCell::new(super::trajectory::EventsCache::default()),
             transcript_layout: std::cell::RefCell::new(
                 super::transcript::TranscriptLayout::default(),
             ),
@@ -4276,23 +4322,11 @@ impl Shell {
     }
 
     /// The message index of every user turn, in order.
-    pub(crate) fn turn_indices(&self) -> Vec<usize> {
-        self.state
-            .active_session()
-            .map(|session| {
-                session
-                    .messages
-                    .iter()
-                    .enumerate()
-                    // A steering row belongs to the turn it interjected into,
-                    // so it is not a mark of its own.
-                    .filter(|(_, message)| {
-                        message.role == crate::model::Role::User && !message.steering
-                    })
-                    .map(|(index, _)| index)
-                    .collect()
-            })
-            .unwrap_or_default()
+    pub(crate) fn turn_indices(&self) -> std::rc::Rc<Vec<usize>> {
+        let Some(session) = self.state.active_session() else {
+            return std::rc::Rc::new(Vec::new());
+        };
+        self.turn_index_cache.borrow_mut().get(session)
     }
 
     /// Keep the active mark in the rail's view unless the pointer is on it.
@@ -4845,6 +4879,39 @@ mod tests {
             &agent::AgentError::Session("join failed".to_string()),
         );
         assert!(other.contains("join failed"), "{other}");
+    }
+
+    /// The rail's turn indices are computed once per session shape, and one
+    /// more message is a new shape.
+    #[test]
+    fn the_turn_indices_are_reused_until_the_session_grows() {
+        let mut session = crate::model::Session::new("w", "turns");
+        session
+            .messages
+            .push(crate::model::ChatMessage::user("one"));
+        session
+            .messages
+            .push(crate::model::ChatMessage::assistant());
+        session
+            .messages
+            .push(crate::model::ChatMessage::user("two"));
+        let mut cache = super::TurnIndexCache::default();
+        let first = cache.get(&session);
+        assert_eq!(*first, vec![0, 2]);
+        let again = cache.get(&session);
+        assert!(
+            std::rc::Rc::ptr_eq(&first, &again),
+            "the same session shape reuses the vector"
+        );
+        session
+            .messages
+            .push(crate::model::ChatMessage::assistant());
+        let grown = cache.get(&session);
+        assert!(
+            !std::rc::Rc::ptr_eq(&first, &grown),
+            "a new message recomputes the indices"
+        );
+        assert_eq!(*grown, vec![0, 2]);
     }
 
     /// Copy-on-selection copies on a DRAG and not on a click.

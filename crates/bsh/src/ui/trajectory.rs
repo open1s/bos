@@ -71,6 +71,7 @@ impl Kind {
 }
 
 /// One line of the log.
+#[derive(Clone)]
 pub(crate) struct Event {
     pub(crate) kind: Kind,
     /// The turn the event belongs to, 1-based, as the reference numbers it.
@@ -464,16 +465,98 @@ pub(crate) fn collapse_turns(
     }
     out
 }
-/// The event log for a session, oldest first.
+/// The facts that decide what the flattened log contains.
+///
+/// Every field is something `events_for` READS, so a frame that changes none of
+/// them draws the same log. The newest message carries its text length, tool
+/// count and tool-output bytes: a stream appends text and fills a tool's output
+/// IN PLACE, and both change what the last rows say.
+#[derive(Clone, PartialEq)]
+pub(crate) struct EventsKey {
+    session: String,
+    messages: usize,
+    last_text: usize,
+    last_tools: usize,
+    /// Total bytes of the newest message's tool outputs, plus one per timed
+    /// call: `ToolResult` fills both on an event already in the list.
+    last_outputs: usize,
+    streaming: bool,
+    lang: Lang,
+    loaded_from: usize,
+    compacted: usize,
+    goal: usize,
+    compactions: usize,
+}
+
+impl EventsKey {
+    /// The key for the session that is active now, if there is one.
+    fn of(shell: &Shell) -> Option<Self> {
+        let session = shell.state.active_session()?;
+        let last = session.messages.last();
+        Some(Self {
+            session: session.id.clone(),
+            messages: session.messages.len(),
+            last_text: last.map(|message| message.text.len()).unwrap_or(0),
+            last_tools: last.map(|message| message.tools.len()).unwrap_or(0),
+            last_outputs: last.map_or(0, |message| {
+                message
+                    .tools
+                    .iter()
+                    .map(|tool| {
+                        tool.output.as_deref().map_or(0, str::len) + usize::from(tool.ms.is_some())
+                    })
+                    .sum()
+            }),
+            streaming: shell.state.is_streaming(&session.id),
+            lang: shell.state.lang,
+            loaded_from: session.loaded_from,
+            compacted: session.compacted,
+            goal: session.goal.as_ref().map_or(0, |goal| goal.objective.len()),
+            compactions: session.compactions.len(),
+        })
+    }
+}
+
+/// The flattened log, kept between frames.
+///
+/// The flatten walks every message, and the view asks for it once per frame; the
+/// cache makes a repaint pay for the rows it paints instead of for the whole
+/// history. The key is derived from the session's shape, so no mutation site has
+/// to remember to invalidate the cache.
+#[derive(Default)]
+pub(crate) struct EventsCache {
+    key: Option<EventsKey>,
+    events: std::rc::Rc<Vec<Event>>,
+}
+
+impl EventsCache {
+    /// The log this frame draws.
+    pub(crate) fn get(&mut self, shell: &Shell) -> std::rc::Rc<Vec<Event>> {
+        let Some(key) = EventsKey::of(shell) else {
+            self.key = None;
+            self.events = std::rc::Rc::new(Vec::new());
+            return self.events.clone();
+        };
+        if self.key.as_ref() != Some(&key) {
+            let events = shell
+                .state
+                .active_session()
+                .map(|session| events_for(session, key.streaming, key.lang))
+                .unwrap_or_default();
+            self.key = Some(key);
+            self.events = std::rc::Rc::new(events);
+        }
+        self.events.clone()
+    }
+}
+
+/// The event log for a session, oldest first, as a copy.
+///
+/// Callers that only read one event (a jump, a test) take this; the frame itself
+/// takes [`Shell::traj_log`], which shares the cached vector instead of copying
+/// it.
 pub(crate) fn events(shell: &Shell) -> Vec<Event> {
-    let Some(session) = shell.state.active_session() else {
-        return Vec::new();
-    };
-    events_for(
-        session,
-        shell.state.is_streaming(&session.id),
-        shell.state.lang,
-    )
+    shell.traj_log().as_ref().clone()
 }
 
 /// One message's recorded turn timing, when the record carries it.
@@ -505,10 +588,16 @@ fn user_wait(session: &Session, index: usize, message: &ChatMessage) -> Option<u
 /// `streaming` says whether this session's turn is in flight: a live row never
 /// reports an invented elapsed time, which is the reference's own rule.
 pub(crate) fn events_for(session: &Session, streaming: bool, lang: Lang) -> Vec<Event> {
+    #[cfg(test)]
+    TRAJ_FLATTENS.with(|flat| flat.set(flat.get() + 1));
     let mut out = Vec::new();
     let mut turn = 0;
     let mut carry: Option<u64> = None;
     let last = session.messages.len().saturating_sub(1);
+    // Calls that may still contain a later one, as (start, end). Pruned to the
+    // earliest start seen, so the list stays as short as the overlap does.
+    let mut open_calls: Vec<(u64, u64)> = Vec::new();
+    let mut earliest = u64::MAX;
     // The goal is context the agent is handed every turn; the reference draws
     // its injected context as CONTEXT lines, and this is the one such item bsh
     // actually keeps.
@@ -647,14 +736,14 @@ pub(crate) fn events_for(session: &Session, streaming: bool, lang: Lang) -> Vec<
             let args = clip(&tool.args, 48);
             // Nested when its start falls inside a call already in flight. `at`
             // and `ms` are the two facts every record carries, so the depth is
-            // derived on read and old logs need no migration.
+            // derived on read and old logs need no migration. The calls still
+            // open are kept in their own short list: scanning the events built so
+            // far made this flatten quadratic in the number of calls, which a
+            // long session paid on every streamed delta.
             let nested = tool.at.is_some_and(|at| {
-                out.iter().any(|event| {
-                    event.kind == Kind::Tool
-                        && event.at.is_some_and(|start| {
-                            start <= at && at < start + event.ms.unwrap_or(1).max(1)
-                        })
-                })
+                open_calls
+                    .iter()
+                    .any(|(start, end)| *start <= at && at < *end)
             });
             let outcome = match tool.output.as_deref().map(str::trim) {
                 Some(output) if !output.is_empty() => clip(first_line(output).as_str(), 72),
@@ -681,6 +770,19 @@ pub(crate) fn events_for(session: &Session, streaming: bool, lang: Lang) -> Vec<
             if tool.at.is_some() {
                 carry = tool.at;
             }
+            // A call that started outside every other call is a PARENT for the
+            // calls after it; a nested one is drawn indented and never parents
+            // anything, which is the rule the old scan encoded by filtering for
+            // `Kind::Tool`.
+            if let Some(at) = tool.at {
+                earliest = earliest.min(at);
+                // Anything that ended before the earliest start seen so far can
+                // never contain a later event, whatever order the clock came in.
+                open_calls.retain(|(_, end)| *end > earliest);
+                if !nested {
+                    open_calls.push((at, at.saturating_add(tool.ms.unwrap_or(1).max(1))));
+                }
+            }
         }
     }
     out
@@ -705,7 +807,107 @@ pub(crate) fn matches(event: &Event, query: &str) -> bool {
         || event.source.to_lowercase().contains(&needle)
 }
 
+/// The scroller's vertical padding: the window's arithmetic and the list's own
+/// padding must be the same number.
+const TRAJ_LIST_PAD_Y: f32 = 6.0;
+/// A log row's exact height: the measured 30px line. Nothing inside the row can
+/// change it, which is what lets the window place a row it does not build.
+const TRAJ_ROW_H: f32 = 30.0;
+/// A collapsed-turn summary row's measured height (20px, not the table's 30).
+const TRAJ_SUMMARY_H: f32 = 20.0;
+/// Rows this close to the viewport are built too, so a small scroll never
+/// reveals an empty frame.
+const TRAJ_OVERDRAW: f32 = 480.0;
+/// What the first frame after the tab mounts assumes it can show, before the
+/// scroller has reported its own height.
+const TRAJ_FIRST_VIEWPORT: f32 = 800.0;
+
+/// A log row's height, exact by construction.
+fn traj_row_height(summary: bool) -> f32 {
+    if summary {
+        TRAJ_SUMMARY_H
+    } else {
+        TRAJ_ROW_H
+    }
+}
+
+/// The window's band, and the exact height of the rows on either side.
+///
+/// Pure so the geometry the two spacers stand in at can be pinned without a
+/// frame: `heights` is one row height per row, and the result is
+/// `(first, end, leading, trailing)` - the rows `[first, end)` are built, and
+/// `leading`/`trailing` are the summed heights of the rows before and after
+/// them, which is exactly what the spacers must occupy.
+fn traj_band(heights: &[f32], view_top: f32, view_h: f32) -> (usize, usize, f32, f32) {
+    let band_top = view_top - TRAJ_OVERDRAW;
+    let band_bottom = view_top + view_h + TRAJ_OVERDRAW;
+    let mut top = TRAJ_LIST_PAD_Y;
+    let mut first: Option<usize> = None;
+    let mut end = 0usize;
+    for (position, height) in heights.iter().enumerate() {
+        if first.is_none() && top + height > band_top {
+            first = Some(position);
+        }
+        if first.is_some() && top < band_bottom {
+            end = position + 1;
+        }
+        top += height;
+    }
+    let first = first.unwrap_or(heights.len());
+    // A view past the end of the log (a search just shrunk it while the reader
+    // was scrolled down) has no row in its band: hand every row to the leading
+    // spacer so the frame paints the list's full height instead of an empty
+    // slice, and the layout pass clamps the offset.
+    let end = end.max(first);
+    let leading: f32 = heights[..first].iter().sum();
+    let trailing: f32 = heights[end..].iter().sum();
+    (first, end, leading, trailing)
+}
+
+/// A row kept at its exact height without building its contents.
+fn traj_spacer(height: f32) -> AnyElement {
+    div()
+        .flex_none()
+        .flex_shrink_0()
+        .w_full()
+        .h(px(height.max(0.0)))
+        .into_any_element()
+}
+
+// How many log rows the last frame actually built, for the performance test.
+#[cfg(test)]
+thread_local! {
+    static TRAJ_ROWS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The trajectory rows built so far on this thread.
+#[cfg(test)]
+pub(crate) fn traj_rows_built() -> usize {
+    TRAJ_ROWS_BUILT.with(|built| built.get())
+}
+
+// How many times the log was flattened on this thread, for the performance
+// test: a repaint that changes nothing must not flatten again.
+#[cfg(test)]
+thread_local! {
+    static TRAJ_FLATTENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times the log was flattened on this thread.
+#[cfg(test)]
+pub(crate) fn traj_flattens() -> usize {
+    TRAJ_FLATTENS.with(|flat| flat.get())
+}
+
 impl Shell {
+    /// The trajectory log this frame draws, shared rather than copied.
+    ///
+    /// The tab, its lanes and its detail panel all read the same vector; only a
+    /// change in its shape (see [`EventsKey`]) rebuilds it.
+    pub(crate) fn traj_log(&self) -> std::rc::Rc<Vec<Event>> {
+        self.traj_events.borrow_mut().get(self)
+    }
+
     /// Open a chat row's file in the right panel's editor.
     ///
     /// The reference turns a file step's path into a link; pressing it opens the
@@ -770,7 +972,11 @@ impl Shell {
         self.traj_select = tool_event(self, message, tool);
         self.traj_tab = 0;
         if let Some(index) = self.traj_select {
-            self.traj_scroll.scroll_to_top_of_item(index);
+            // The window keeps only the band, so the row is addressed by its
+            // exact position in the log, not by a child index.
+            if let Some(offset) = self.traj_offset_of_event(index, false) {
+                self.traj_scroll.set_offset(point(px(0.0), px(-offset)));
+            }
         }
     }
 
@@ -1320,7 +1526,9 @@ impl Shell {
                 // `onRecordSelect`.
                 this.traj_select = Some(index);
                 this.traj_tab = 0;
-                this.traj_scroll.scroll_to_top_of_item(index);
+                if let Some(offset) = this.traj_offset_of_event(index, false) {
+                    this.traj_scroll.set_offset(point(px(0.0), px(-offset)));
+                }
                 cx.notify();
             }))
             .into_any_element()
@@ -1350,6 +1558,7 @@ impl Shell {
             .flex_row()
             .items_center()
             .gap(px(8.0))
+            .flex_shrink_0()
             .when(opens_turn, |row| row.pt(px(4.0)))
             .h(px(20.0))
             .pl(px(36.0))
@@ -1362,10 +1571,14 @@ impl Shell {
             }))
             .when(self.traj_summary_hover, |row| row.bg(rgb(hover)))
             .on_click(cx.listener(move |this, _event, _window, cx| {
-                // Pressing the summary expands the turn it hides.
+                // Pressing the summary expands the turn it hides. The fold has
+                // just changed, so the summary row is gone: land on the turn's
+                // own opening row instead.
                 this.traj_turns_collapsed = false;
                 this.traj_select = None;
-                this.traj_scroll.scroll_to_top_of_item(index);
+                if let Some(offset) = this.traj_offset_of_event(index, false) {
+                    this.traj_scroll.set_offset(point(px(0.0), px(-offset)));
+                }
                 cx.notify();
             }))
             .child(
@@ -1419,6 +1632,10 @@ impl Shell {
             .flex_row()
             .items_center()
             .gap(px(8.0))
+            // The measured height is exact: a long log is a column taller than
+            // its box, and a flex child's default shrink squeezed every row to
+            // 27px once the list overflowed.
+            .flex_shrink_0()
             // A new turn is parted by four pixels of air, not by a rule: the
             // reference's 2px border made a heavy grid with the row hairlines.
             .when(opens_turn, |row| row.pt(px(4.0)))
@@ -1758,9 +1975,126 @@ impl Shell {
             .into_any_element()
     }
 
+    /// Which visible lines open a turn: the first one whose turn differs from
+    /// the line above it.
+    fn traj_opens(visible: &[(usize, &Event)]) -> Vec<bool> {
+        let mut opens = Vec::with_capacity(visible.len());
+        let mut previous: Option<usize> = None;
+        for (_, event) in visible {
+            opens.push(previous != Some(event.turn));
+            previous = Some(event.turn);
+        }
+        opens
+    }
+
+    /// The rows the log draws, decided without building a single element.
+    ///
+    /// A row is `(event index, opens the turn, collapsed summary)`. The summary
+    /// form is one of the fold actions' synthetic row, the only row that is not
+    /// an event of its own.
+    fn traj_plan(
+        &self,
+        visible: &[(usize, &Event)],
+        opens: &[bool],
+    ) -> Vec<(usize, bool, Option<String>)> {
+        if self.traj_turns_collapsed {
+            collapse_turns(visible, opens, self.state.lang)
+        } else if self.traj_calls_collapsed {
+            visible
+                .iter()
+                .zip(opens)
+                .filter(|((_, event), opens_turn)| **opens_turn || event.kind == Kind::Compaction)
+                .map(|((index, _), opens_turn)| (*index, *opens_turn, None))
+                .collect()
+        } else {
+            visible
+                .iter()
+                .zip(opens)
+                .map(|((index, _), opens_turn)| (*index, *opens_turn, None))
+                .collect()
+        }
+    }
+
+    /// The rows this frame builds, with one spacer before and one after.
+    ///
+    /// A log row has an exact height (30px, 20px for a collapsed-turn summary),
+    /// so the rows outside the viewport band can be replaced by two spacers of
+    /// exactly their summed height: the scroller's total height - and therefore
+    /// its thumb - stays the one the whole log would have, while the frame
+    /// builds only the band. Exact heights are why two spacers suffice here; the
+    /// transcript, whose rows are measured, keeps one per row so its child
+    /// indices still name rows.
+    fn traj_window(
+        &self,
+        plan: &[(usize, bool, Option<String>)],
+        events: &[Event],
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let view = self.traj_scroll.bounds();
+        let view_h = f32::from(view.size.height);
+        // The first frame after the tab mounts has no measured viewport: build
+        // the top of the log so it is never blank, then window for real.
+        let view_h = if view_h > 0.0 {
+            view_h
+        } else {
+            TRAJ_FIRST_VIEWPORT
+        };
+        let view_top = -f32::from(self.traj_scroll.offset().y);
+        // The band, and the exact height of the rows on either side of it.
+        let heights: Vec<f32> = plan
+            .iter()
+            .map(|(_, _, summary)| traj_row_height(summary.is_some()))
+            .collect();
+        let (first, end, leading, trailing) = traj_band(&heights, view_top, view_h);
+        let mut rows: Vec<AnyElement> = Vec::with_capacity(2 + end.saturating_sub(first));
+        if leading > 0.0 {
+            rows.push(traj_spacer(leading));
+        }
+        for (index, opens, summary) in &plan[first..end] {
+            if let Some(text) = summary {
+                rows.push(self.traj_summary_row(*index, *opens, text, cx));
+                #[cfg(test)]
+                TRAJ_ROWS_BUILT.with(|built| built.set(built.get() + 1));
+            } else if let Some(event) = events.get(*index) {
+                rows.push(self.traj_row(*index, event, *opens, cx));
+                #[cfg(test)]
+                TRAJ_ROWS_BUILT.with(|built| built.set(built.get() + 1));
+            }
+        }
+        if trailing > 0.0 {
+            rows.push(traj_spacer(trailing));
+        }
+        rows
+    }
+
+    /// Where the log puts an event, in content pixels, if the current filters
+    /// draw it.
+    ///
+    /// The window keeps only the band in the element tree, so a jump from a lane
+    /// block or a collapsed summary row scrolls by this exact offset rather than
+    /// to a child index that no longer names the row.
+    pub(crate) fn traj_offset_of_event(&self, event: usize, summary: bool) -> Option<f32> {
+        let events = self.traj_log();
+        let query = self.traj_query.clone();
+        let visible: Vec<(usize, &Event)> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| matches(item, &query))
+            .collect();
+        let opens = Self::traj_opens(&visible);
+        let mut top = TRAJ_LIST_PAD_Y;
+        for (index, _, folded) in self.traj_plan(&visible, &opens) {
+            if index == event && folded.is_some() == summary {
+                return Some(top);
+            }
+            top += traj_row_height(folded.is_some());
+        }
+        None
+    }
+
     /// The whole tab.
     pub(crate) fn render_trajectory_view(&self, cx: &mut Context<Self>) -> AnyElement {
-        let events = events(self);
+        let events = self.traj_log();
         let query = self.traj_query.clone();
         let visible: Vec<(usize, &Event)> = events
             .iter()
@@ -1773,41 +2107,13 @@ impl Shell {
             .map(|event| self.traj_detail(event, cx));
         // Which lines open a turn: the first one whose turn differs from the
         // line above, computed before the rows so no closure has to carry it.
-        let mut opens: Vec<bool> = Vec::with_capacity(visible.len());
-        let mut previous: Option<usize> = None;
-        for (_, event) in &visible {
-            opens.push(previous != Some(event.turn));
-            previous = Some(event.turn);
-        }
+        let opens = Self::traj_opens(&visible);
         // The collapse actions fold ROWS, not the strip: the picture of the run
         // never lies about what happened, which is the reference's own rule.
         // `Calls` folds a turn to its prompt plus one summary row; `Turns`
         // removes the steps inside a turn without adding a summary line.
-        let rows: Vec<AnyElement> = if self.traj_turns_collapsed {
-            collapse_turns(&visible, &opens, self.state.lang)
-                .into_iter()
-                .filter_map(|(index, opens_turn, summary)| {
-                    let event = events.get(index)?;
-                    Some(match summary {
-                        Some(text) => self.traj_summary_row(index, opens_turn, &text, cx),
-                        None => self.traj_row(index, event, opens_turn, cx),
-                    })
-                })
-                .collect()
-        } else if self.traj_calls_collapsed {
-            visible
-                .iter()
-                .zip(opens)
-                .filter(|((_, event), opens_turn)| *opens_turn || event.kind == Kind::Compaction)
-                .map(|((index, event), opens_turn)| self.traj_row(*index, event, opens_turn, cx))
-                .collect()
-        } else {
-            visible
-                .iter()
-                .zip(opens)
-                .map(|((index, event), opens_turn)| self.traj_row(*index, event, opens_turn, cx))
-                .collect()
-        };
+        let plan = self.traj_plan(&visible, &opens);
+        let rows = self.traj_window(&plan, &events, cx);
         div()
             .debug_selector(|| "trajectory".to_string())
             .id("trajectory")
@@ -1817,7 +2123,7 @@ impl Shell {
             .min_h_0()
             .min_w_0()
             .child(self.traj_toolbar(cx))
-            .child(self.traj_lanes(&events, cx))
+            .child(self.traj_lanes(events.as_slice(), cx))
             .child(
                 div()
                     .flex()
@@ -2265,5 +2571,235 @@ mod tests {
         assert_eq!(log[0].ms, Some(200), "the wait is already measured");
         assert_eq!(log[1].ms, None, "the model span is not closed yet");
         assert!(log[1].live, "and the row says it is running");
+    }
+
+    /// The window keeps the log's own geometry: the built band plus the two
+    /// spacers is exactly every row's height, so the scroller's total (and its
+    /// thumb) is the one the whole log would have.
+    #[test]
+    fn the_window_band_and_spacers_reproduce_the_whole_log() {
+        let heights = vec![super::TRAJ_ROW_H; 100];
+        for (view_top, view_h, first, end) in [
+            (0.0f32, 300.0f32, 0usize, 26usize),
+            (1500.0, 300.0, 33, 76),
+            (2700.0, 300.0, 73, 100),
+        ] {
+            let (got_first, got_end, leading, trailing) =
+                super::traj_band(&heights, view_top, view_h);
+            assert_eq!(
+                (got_first, got_end),
+                (first, end),
+                "the band for a view at {view_top}"
+            );
+            assert_eq!(leading, heights[..got_first].iter().sum::<f32>());
+            assert_eq!(trailing, heights[got_end..].iter().sum::<f32>());
+            let built: f32 = heights[got_first..got_end].iter().sum();
+            assert_eq!(
+                leading + built + trailing,
+                3000.0,
+                "the spacers keep the whole log's height"
+            );
+        }
+    }
+
+    /// A collapsed-turn summary row is 20px, not the table's 30, and the
+    /// window's arithmetic counts it.
+    #[test]
+    fn the_window_counts_a_summary_row_at_its_own_height() {
+        assert_eq!(super::traj_row_height(false), 30.0);
+        assert_eq!(super::traj_row_height(true), 20.0);
+        let heights = vec![30.0, 20.0, 30.0, 20.0];
+        assert_eq!(
+            super::traj_band(&heights, 0.0, 10_000.0),
+            (0, 4, 0.0, 0.0),
+            "a view taller than the log keeps every row"
+        );
+        // An empty log has no band and no spacers.
+        assert_eq!(super::traj_band(&[], 0.0, 300.0), (0, 0, 0.0, 0.0));
+        // A view past the end (a search just shrank the log under a scrolled
+        // reader) has no row in its band: one leading spacer holds the height.
+        assert_eq!(
+            super::traj_band(&[30.0; 10], 10_000.0, 300.0),
+            (10, 10, 300.0, 0.0)
+        );
+        // A view above the log builds nothing and leaves one trailing spacer.
+        assert_eq!(
+            super::traj_band(&[30.0; 10], -10_000.0, 300.0),
+            (0, 0, 0.0, 300.0)
+        );
+    }
+
+    // ---- The frame's window, measured on a real window --------------------
+
+    use crate::state::{AppState, Tab};
+    use crate::store::Store;
+    use crate::ui::shell::Shell;
+    use gpui_kit::{
+        AppContext as _, Context as UiContext, Entity, IntoElement, Render, TestAppContext,
+        VisualTestContext, Window,
+    };
+
+    /// Holds the shell so the window can render an entity the test also keeps.
+    struct Harness {
+        shell: Entity<Shell>,
+    }
+
+    impl Render for Harness {
+        fn render(&mut self, _: &mut Window, _: &mut UiContext<Self>) -> impl IntoElement {
+            self.shell.clone()
+        }
+    }
+
+    /// Boot the kit and bind bsh's own keys, the way `ui::run` does.
+    fn init_test_app(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(crate::ui::bind_global_actions);
+    }
+
+    /// A store rooted in the build directory: a test never touches the home.
+    fn scratch_store(label: &str) -> Store {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("bsh-traj-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Store::open_at(dir)
+    }
+
+    /// A session of `turns` turns, each holding one timed tool call, so the log
+    /// has three events per turn.
+    fn long_session(label: &str, turns: usize) -> AppState {
+        let mut state = AppState::with_store(scratch_store(label));
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id) {
+            for turn in 0..turns {
+                session
+                    .messages
+                    .push(ChatMessage::user(format!("turn {turn}")));
+                session.messages.push(ChatMessage::assistant());
+            }
+            for index in (1..session.messages.len()).step_by(2) {
+                session.messages[index].tools.push(crate::model::ToolEvent {
+                    name: "bash".to_string(),
+                    args: r#"{"command":"cargo test -p bsh"}"#.to_string(),
+                    output: Some("ok".to_string()),
+                    ms: Some(40),
+                    at: Some(1_700_000_000_000 + index as u64),
+                });
+            }
+        }
+        state
+    }
+
+    /// Boot the Trajectory tab over a session of `turns` turns.
+    fn boot<'a>(
+        cx: &'a mut TestAppContext,
+        label: &'static str,
+        turns: usize,
+    ) -> (Entity<Shell>, &'a mut VisualTestContext) {
+        init_test_app(cx);
+        let (harness, cx) = cx.add_window_view(move |window, cx| {
+            let state = long_session(label, turns);
+            let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+            Harness { shell }
+        });
+        let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+        // The tab is set on the SHELL, not on the state handed to the builder:
+        // `assemble` restores the session's own tab, so a pre-set one is lost.
+        cx.update(|_, cx| {
+            shell.update(cx, |this, cx| {
+                this.state.tab = Tab::Trajectory;
+                cx.notify();
+            })
+        });
+        (shell, cx)
+    }
+
+    /// Draw `count` frames and return their median milliseconds.
+    fn median_frame(cx: &mut VisualTestContext, count: usize) -> f64 {
+        let mut frames: Vec<f64> = Vec::new();
+        for _ in 0..count {
+            let started = std::time::Instant::now();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            frames.push(started.elapsed().as_secs_f64() * 1e3);
+        }
+        frames.sort_by(|a, b| a.partial_cmp(b).expect("finite frame times"));
+        frames[frames.len() / 2]
+    }
+
+    /// A long trajectory log paints a window, not the whole history.
+    ///
+    /// MEASURED on a debug build: 1 000 turns / 3 000 events cost ~546 ms a
+    /// frame, and every frame built one row element per event (the flatten was
+    /// ~32 ms of it, the lanes none). The window builds the band around the
+    /// viewport behind two exact-height spacers, so the frame follows the
+    /// viewport while the scroller keeps the whole log's geometry.
+    #[gpui::test]
+    fn a_long_log_paints_a_bounded_window(cx: &mut TestAppContext) {
+        let (_, cx) = boot(cx, "window-small", 4);
+        for _ in 0..4 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        let small_ms = median_frame(cx, 12);
+
+        let (shell, cx) = boot(cx, "window-long", 400);
+        for _ in 0..4 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        let built_before = super::traj_rows_built();
+        let flattens_before = super::traj_flattens();
+        let long_ms = median_frame(cx, 12);
+        let built = (super::traj_rows_built() - built_before) as f64 / 12.0;
+        eprintln!("TRAJ WINDOW small={small_ms:.2}ms long={long_ms:.2}ms built={built:.1}/frame");
+        assert!(
+            built < 60.0,
+            "a 1 200-event log built {built:.0} rows a frame: the window is not bounded"
+        );
+        assert_eq!(
+            super::traj_flattens(),
+            flattens_before,
+            "a repaint that changes nothing must reuse the flattened log"
+        );
+        assert!(
+            long_ms <= small_ms * 3.0 + 20.0,
+            "a 1 200-event log painted {long_ms:.2}ms a frame against {small_ms:.2}ms for twelve"
+        );
+
+        // The scroller's geometry is the whole log's, and the rows it builds
+        // keep the exact 30px stride the spacers stand in at.
+        let rows = cx.update(|_, cx| super::events(shell.read(cx)).len());
+        let last = rows - 1;
+        let offset = cx.update(|_, cx| {
+            shell
+                .read(cx)
+                .traj_offset_of_event(last, false)
+                .expect("the tail is in the log")
+        });
+        cx.update(|_, cx| {
+            shell.update(cx, |this, _| {
+                this.traj_scroll
+                    .set_offset(gpui_kit::point(gpui_kit::px(0.0), gpui_kit::px(-offset)));
+            })
+        });
+        for _ in 0..3 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        let last_selector: &'static str = Box::leak(format!("traj-row-{last}").into_boxed_str());
+        let before_selector: &'static str =
+            Box::leak(format!("traj-row-{}", last - 1).into_boxed_str());
+        let last_bounds = cx
+            .debug_bounds(last_selector)
+            .expect("the last row is built at the tail");
+        let before_bounds = cx
+            .debug_bounds(before_selector)
+            .expect("the row above it is built too");
+        let stride = f32::from(last_bounds.origin.y) - f32::from(before_bounds.origin.y);
+        assert!(
+            (stride - 30.0).abs() < 0.5,
+            "the rows keep their measured 30px stride, not a shrunk one: {stride:.1}px"
+        );
+        assert!(
+            cx.debug_bounds("traj-row-0").is_none(),
+            "the top of the log is a spacer while the reader is at the tail"
+        );
     }
 }

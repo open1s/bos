@@ -3141,10 +3141,29 @@ impl AppState {
             self.restore_orphan_steers(id);
             self.turn_started = None;
             self.refresh_policy_audit();
+            // Bound the live window like a restored one: paging trims at the
+            // same ceiling, but a session that only streams never pages. Done
+            // before the save, so the file carries the bounded window too.
+            self.trim_settled_window(id);
             if let Some(session) = self.store.session(id) {
                 let _ = self.store.save(session);
             }
         }
+    }
+
+    /// Bound one settled session's window to the paging ceiling.
+    ///
+    /// `Store::trim_front` runs when a page of older rows arrives, so a restored
+    /// session is bounded by construction; a live session that streams for days
+    /// never pages and would otherwise keep every row it ever wrote. A settled
+    /// turn is the moment to drop the front: nothing in flight reads it, the log
+    /// still holds it, and paging brings it back.
+    fn trim_settled_window(&mut self, id: &str) -> usize {
+        if self.is_streaming(id) || self.is_compacting(id) {
+            return 0;
+        }
+        self.store
+            .trim_front(id, crate::store::WINDOW * crate::theme::WINDOWS_KEPT)
     }
 
     /// Persist one session.
@@ -6423,6 +6442,66 @@ mod tests {
             user.timing().and_then(|timing| timing.ms),
             None,
             "the user row keeps no span of its own; the view derives its wait"
+        );
+    }
+
+    /// A settled live session is bounded like a restored one.
+    ///
+    /// Paging trims the front at `WINDOW * WINDOWS_KEPT`; a session that only
+    /// streams never pages, so a turn's end is where the ceiling is applied.
+    /// The log keeps every row, so paging can still bring the front back.
+    #[test]
+    fn a_settled_turn_bounds_the_live_window() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("bsh-live-window-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut state = super::AppState::with_store(crate::store::Store::open_at(dir));
+        let id = state.active_id.clone().expect("a session");
+        let ceiling = crate::store::WINDOW * crate::theme::WINDOWS_KEPT;
+        let extra = 60usize;
+        if let Some(session) = state.store.session_mut(&id) {
+            for turn in 0..(ceiling + extra) / 2 {
+                session
+                    .messages
+                    .push(crate::model::ChatMessage::user(format!("turn {turn}")));
+                session
+                    .messages
+                    .push(crate::model::ChatMessage::assistant());
+            }
+        }
+        let before = state
+            .store
+            .session(&id)
+            .expect("the session")
+            .messages
+            .len();
+        assert!(before > ceiling, "the session holds more than the ceiling");
+
+        state.apply_event(&id, super::AgentEvent::Done);
+        let session = state.store.session(&id).expect("the session");
+        assert_eq!(
+            session.messages.len(),
+            ceiling,
+            "the settle bounds the in-memory window"
+        );
+        assert_eq!(
+            session.loaded_from,
+            before - ceiling,
+            "and the window's start moves forward with it"
+        );
+
+        // A second settle finds nothing above the ceiling.
+        state.apply_event(&id, super::AgentEvent::Done);
+        assert_eq!(
+            state
+                .store
+                .session(&id)
+                .expect("the session")
+                .messages
+                .len(),
+            ceiling,
+            "the ceiling is stable across settles"
         );
     }
 
