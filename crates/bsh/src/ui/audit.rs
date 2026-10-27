@@ -35,29 +35,112 @@ use crate::i18n::tr_args;
 use crate::state::Tab;
 use crate::theme;
 
+/// The facts the audit page's view model is built from.
+///
+/// The build walks every message and scans every tool output, so the page keeps
+/// its result until one of these changes: the session's shape, the policy the
+/// page prints, and the namespaces that classify a tool. Messages are
+/// append-only and only the newest one mutates while a turn streams, so the
+/// session's shape is its message count plus that tail.
+#[derive(Clone, PartialEq)]
+struct AuditKey {
+    session: String,
+    messages: usize,
+    /// The newest message's own shape: the only message a live turn changes.
+    /// A tool result FILLS an existing call in place, so the byte count and the
+    /// recorded clocks are part of the shape, not only the call count.
+    last_tools: usize,
+    last_bytes: usize,
+    last_clocks: usize,
+    last_start: Option<u64>,
+    last_ms: Option<u64>,
+    /// The denial ring's shape, and how many of it blocked a call.
+    denials: usize,
+    blocking: usize,
+    denials_total: u64,
+    /// The applied policy, which the page and its export print.
+    policy: AuditPolicy,
+    /// The MCP namespaces, which decide a tools's category.
+    mcp: Vec<String>,
+}
+
+/// The audit page's built view model, kept between frames.
+#[derive(Default)]
+pub(crate) struct AuditCache {
+    key: Option<AuditKey>,
+    view: std::rc::Rc<AuditView>,
+}
+
 impl Shell {
     /// The audit view for the active session, built from persisted records.
     ///
     /// The denial snapshot is the policy pane's own source of truth, so the two
     /// surfaces cannot disagree about what was refused. The live MCP namespaces
     /// let a namespaced tool classify as MCP rather than Other.
-    pub(crate) fn audit_view(&self) -> AuditView {
+    pub(crate) fn audit_view(&self) -> std::rc::Rc<AuditView> {
         let Some(session) = self.state.active_session() else {
-            return AuditView::default();
+            return std::rc::Rc::new(AuditView::default());
         };
-        // ADVISORY refusals are refusals the reader was TOLD about, not ones
-        // that stopped a call: the Audit tab counts what was blocked, while the
-        // Policy pane lists the advisory ring on its own. Mixing them here would
-        // make "refusals" mean two different things on one page.
-        let advisory_free = self.state.policy_audit.as_ref().map(|audit| {
-            audit
-                .denials
-                .iter()
-                .filter(|entry| !entry.advisory)
-                .cloned()
-                .collect::<Vec<_>>()
-        });
-        let denials = advisory_free.as_deref().unwrap_or_default();
+        let mcp = self.mcp_namespaces();
+        let last = session.messages.last();
+        let key = AuditKey {
+            session: session.id.clone(),
+            messages: session.messages.len(),
+            last_tools: last.map_or(0, |message| message.tools.len()),
+            last_bytes: last.map_or(0, |message| {
+                message
+                    .tools
+                    .iter()
+                    .map(|tool| tool.args.len() + tool.output.as_deref().map_or(0, str::len))
+                    .sum()
+            }),
+            last_clocks: last.map_or(0, |message| {
+                message
+                    .tools
+                    .iter()
+                    .map(|tool| usize::from(tool.ms.is_some()) + usize::from(tool.at.is_some()))
+                    .sum()
+            }),
+            last_start: last.and_then(|message| {
+                message
+                    .timing()
+                    .and_then(|timing: &crate::model::MessageTiming| timing.start)
+            }),
+            last_ms: last.and_then(|message| {
+                message
+                    .timing()
+                    .and_then(|timing: &crate::model::MessageTiming| timing.ms)
+            }),
+            denials: self
+                .state
+                .policy_audit
+                .as_ref()
+                .map_or(0, |audit| audit.denials.len()),
+            blocking: self.blocking_denials_count(),
+            denials_total: self
+                .state
+                .policy_audit
+                .as_ref()
+                .map_or(0, |audit| audit.denials_total),
+            policy: self.audit_policy(),
+            mcp: mcp.clone(),
+        };
+        let mut cache = self.audit_cache.borrow_mut();
+        if cache.key.as_ref() != Some(&key) {
+            // ADVISORY refusals are refusals the reader was TOLD about, not ones
+            // that stopped a call: the Audit tab counts what was blocked, while
+            // the Policy pane lists the advisory ring on its own. Mixing them
+            // here would make "refusals" mean two different things on one page.
+            let denials = self.blocking_denials();
+            let view = AuditView::build(session, &denials, &mcp).with_policy(self.audit_policy());
+            cache.key = Some(key);
+            cache.view = std::rc::Rc::new(view);
+        }
+        cache.view.clone()
+    }
+
+    /// The live MCP namespaces, sorted and deduped: the classifier's own input.
+    fn mcp_namespaces(&self) -> Vec<String> {
         let mut mcp: Vec<String> = self
             .state
             .mcp
@@ -66,7 +149,30 @@ impl Shell {
             .collect();
         mcp.sort();
         mcp.dedup();
-        AuditView::build(session, denials, &mcp).with_policy(self.audit_policy())
+        mcp
+    }
+
+    /// The denials that blocked a call: the advisory ring is not one of them.
+    fn blocking_denials(&self) -> Vec<agent::policy::PolicyAuditEntry> {
+        self.state
+            .policy_audit
+            .as_ref()
+            .map(|audit| {
+                audit
+                    .denials
+                    .iter()
+                    .filter(|entry| !entry.advisory)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// How many ring entries blocked a call, without cloning the ring.
+    fn blocking_denials_count(&self) -> usize {
+        self.state.policy_audit.as_ref().map_or(0, |audit| {
+            audit.denials.iter().filter(|entry| !entry.advisory).count()
+        })
     }
 
     /// The policy that was applied and the results it counted.
@@ -197,7 +303,9 @@ impl Shell {
 
     /// Export the audit as Markdown plus JSON through the platform save dialog.
     pub(crate) fn export_audit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let view = self.audit_view();
+        // A copy, not the shared cache: the export runs on the background
+        // executor, which wants an owned, Send value.
+        let view = (*self.audit_view()).clone();
         if view.totals.calls == 0 && view.totals.refusals == 0 {
             let notice = self.state.lang.tr("audit.exportEmpty");
             self.state.notice(notice);
@@ -250,8 +358,9 @@ impl Shell {
     const STAT_CELL_MIN_W: f32 = 96.0;
     /// The height of a summary cell's value line.
     const STAT_VALUE_H: f32 = 22.0;
-    /// The turn row's own height.
-    const TURN_ROW_H: f32 = 38.0;
+    /// The turn row's own height: exact, which is what lets the window place a
+    /// row it does not build.
+    pub(crate) const TURN_ROW_H: f32 = 38.0;
     /// The measure bar's full width.
     const MEASURE_W: f32 = 96.0;
     /// The measure bar's thickness.
@@ -772,11 +881,20 @@ impl Shell {
         &self,
         view: &AuditView,
         turn: &AuditTurn,
+        max_weight: f32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        #[cfg(test)]
+        AUDIT_ROWS_BUILT.with(|built| built.set(built.get() + 1));
         let lang = self.state.lang;
         let open = self.audit_turn_open.contains(&turn.index);
-        let share = view.share(turn, self.audit_mode);
+        // The measure's ceiling is the frame's, passed in: asking the view per
+        // row re-scanned every turn, which is quadratic over the page.
+        let share = if max_weight <= 0.0 {
+            0.0
+        } else {
+            (view.weight(turn, self.audit_mode) / max_weight).clamp(0.0, 1.0)
+        };
         let calls = tr_args(
             lang,
             "audit.turnCalls",
@@ -1334,44 +1452,20 @@ impl Shell {
         let view = self.audit_view();
         let query = self.audit_query.clone();
         let filtering = !query.trim().is_empty();
-        let mut rows: Vec<AnyElement> = Vec::new();
-        for turn in &view.turns {
-            if !audit::matches_turn(turn, &query) {
-                continue;
-            }
-            rows.push(self.audit_turn_row(&view, turn, cx));
-            // A search shows the matching calls even in a collapsed turn, so a
-            // hit is never hidden behind the turn's own fold.
-            let expanded = filtering || self.audit_turn_open.contains(&turn.index);
-            if !expanded {
-                continue;
-            }
-            if turn.calls.is_empty() && turn.refusals.is_empty() {
-                rows.push(
-                    div()
-                        .ml(px(94.0))
-                        .py(px(4.0))
-                        .child(txt(
-                            self.state.lang.tr("audit.noCalls"),
-                            11.0,
-                            theme::faint(),
-                        ))
-                        .into_any_element(),
-                );
-            }
-            for (index, call) in turn.calls.iter().enumerate() {
-                if !audit::matches_call(call, &query) {
-                    continue;
-                }
-                rows.push(self.audit_call_row(turn.index, index, call, &view.policy, cx));
-            }
-            for (index, refusal) in turn.refusals.iter().enumerate() {
-                if !audit::matches_refusal(refusal, &query) {
-                    continue;
-                }
-                rows.push(self.audit_refusal_row(turn, index, refusal));
-            }
-        }
+        // One measure ceiling for the frame: a row's share is relative to the
+        // largest turn, and asking the view per row re-scanned every turn.
+        let max_weight = view.max_weight(self.audit_mode);
+        // The page is windowed only while every turn is collapsed and nothing is
+        // searched: each row is then exactly TURN_ROW_H tall and two spacers
+        // stand in for the rows outside the viewport. An opened turn (or a
+        // search, which opens every turn) grows rows with their calls, whose
+        // heights belong to the content, so that frame builds them all.
+        let collapsed = !filtering && self.audit_turn_open.is_empty() && self.audit_open.is_empty();
+        let mut rows: Vec<AnyElement> = if collapsed {
+            self.audit_window(&view, max_weight, cx)
+        } else {
+            self.audit_rows(&view, &query, filtering, max_weight, cx)
+        };
         if rows.is_empty() {
             rows.push(
                 div()
@@ -1410,5 +1504,379 @@ impl Shell {
                     .children(rows),
             )
             .into_any_element()
+    }
+
+    /// The collapsed page's rows: the band around the viewport is built, and a
+    /// spacer holding every other row's exact height stands in for it, so the
+    /// list's total height - and its thumb - is the whole page's.
+    fn audit_window(
+        &self,
+        view: &AuditView,
+        max_weight: f32,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let row_h = Self::TURN_ROW_H;
+        let view_h = f32::from(self.audit_scroll.bounds().size.height);
+        let view_h = if view_h > 0.0 {
+            view_h
+        } else {
+            AUDIT_FIRST_VIEWPORT
+        };
+        let view_top = -f32::from(self.audit_scroll.offset().y);
+        let (first, end, leading, trailing) = audit_band(view.turns.len(), row_h, view_top, view_h);
+        let mut rows: Vec<AnyElement> = Vec::with_capacity(2 + end.saturating_sub(first));
+        if leading > 0.0 {
+            rows.push(audit_spacer(leading));
+        }
+        for turn in &view.turns[first..end] {
+            rows.push(self.audit_turn_row(view, turn, max_weight, cx));
+        }
+        if trailing > 0.0 {
+            rows.push(audit_spacer(trailing));
+        }
+        rows
+    }
+
+    /// The rows of the expanded or searched page, one element per turn and per
+    /// call. These rows take their height from their content, so they are built
+    /// in full; that is the mode the reader asked for, not the page they land on.
+    fn audit_rows(
+        &self,
+        view: &AuditView,
+        query: &str,
+        filtering: bool,
+        max_weight: f32,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for turn in &view.turns {
+            if !audit::matches_turn(turn, query) {
+                continue;
+            }
+            rows.push(self.audit_turn_row(view, turn, max_weight, cx));
+            // A search shows the matching calls even in a collapsed turn, so a
+            // hit is never hidden behind the turn's own fold.
+            let expanded = filtering || self.audit_turn_open.contains(&turn.index);
+            if !expanded {
+                continue;
+            }
+            if turn.calls.is_empty() && turn.refusals.is_empty() {
+                rows.push(
+                    div()
+                        .ml(px(94.0))
+                        .py(px(4.0))
+                        .child(txt(
+                            self.state.lang.tr("audit.noCalls"),
+                            11.0,
+                            theme::faint(),
+                        ))
+                        .into_any_element(),
+                );
+            }
+            for (index, call) in turn.calls.iter().enumerate() {
+                if !audit::matches_call(call, query) {
+                    continue;
+                }
+                rows.push(self.audit_call_row(turn.index, index, call, &view.policy, cx));
+            }
+            for (index, refusal) in turn.refusals.iter().enumerate() {
+                if !audit::matches_refusal(refusal, query) {
+                    continue;
+                }
+                rows.push(self.audit_refusal_row(turn, index, refusal));
+            }
+        }
+        rows
+    }
+}
+
+/// The list's own vertical padding: the window's arithmetic and the list's
+/// padding must be the same number.
+const AUDIT_LIST_PAD_Y: f32 = 4.0;
+/// Rows this close to the viewport are built too, so a small scroll never
+/// reveals an empty frame.
+const AUDIT_OVERDRAW: f32 = 480.0;
+/// What the first frame after the tab mounts assumes it can show, before the
+/// scroller has reported its own height.
+const AUDIT_FIRST_VIEWPORT: f32 = 800.0;
+
+/// The band of the collapsed page, and the exact height of the rows on either
+/// side of it.
+///
+/// Pure so the geometry the spacers stand in at can be pinned without a frame.
+/// `rows` is the number of turn rows, each exactly `row_h` tall.
+fn audit_band(rows: usize, row_h: f32, view_top: f32, view_h: f32) -> (usize, usize, f32, f32) {
+    let band_top = view_top - AUDIT_OVERDRAW;
+    let band_bottom = view_top + view_h + AUDIT_OVERDRAW;
+    let mut top = AUDIT_LIST_PAD_Y;
+    let mut first: Option<usize> = None;
+    let mut end = 0usize;
+    for index in 0..rows {
+        if first.is_none() && top + row_h > band_top {
+            first = Some(index);
+        }
+        if first.is_some() && top < band_bottom {
+            end = index + 1;
+        }
+        top += row_h;
+    }
+    let first = first.unwrap_or(rows);
+    // A view past the end (the page just shrank under a scrolled reader) has no
+    // row in its band: give the leading spacer every row so the list keeps its
+    // height, and the layout pass clamps the offset.
+    let end = end.max(first);
+    (
+        first,
+        end,
+        first as f32 * row_h,
+        (rows - end) as f32 * row_h,
+    )
+}
+
+/// A row kept at its exact height without building its contents.
+fn audit_spacer(height: f32) -> AnyElement {
+    div()
+        .flex_none()
+        .flex_shrink_0()
+        .w_full()
+        .h(px(height.max(0.0)))
+        .into_any_element()
+}
+
+// How many turn rows the last frame actually built, for the performance test.
+#[cfg(test)]
+thread_local! {
+    static AUDIT_ROWS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The audit turn rows built so far on this thread.
+#[cfg(test)]
+pub(crate) fn audit_rows_built() -> usize {
+    AUDIT_ROWS_BUILT.with(|built| built.get())
+}
+
+#[cfg(test)]
+mod tests {
+    // Named imports: a glob would pull in gpui's re-export of the test attribute
+    // macro, which shadows the builtin one its own expansion emits.
+    use crate::model::{ChatMessage, ToolEvent};
+    use crate::state::{AppState, Tab};
+    use crate::store::Store;
+    use crate::ui::shell::Shell;
+    use gpui_kit::{
+        AppContext as _, Context as UiContext, Entity, IntoElement, Render, TestAppContext,
+        VisualTestContext, Window,
+    };
+
+    /// The page's rows are all the same height, so the window's band and the two
+    /// spacers must reproduce the whole page's height exactly.
+    #[test]
+    fn the_window_band_and_spacers_reproduce_the_whole_page() {
+        let row = 38.0f32;
+        for (view_top, view_h, first, end) in [
+            (0.0f32, 300.0f32, 0usize, 21usize),
+            (1900.0, 300.0, 37, 71),
+            (3500.0, 300.0, 79, 100),
+        ] {
+            let (got_first, got_end, leading, trailing) =
+                super::audit_band(100, row, view_top, view_h);
+            assert_eq!(
+                (got_first, got_end),
+                (first, end),
+                "the band for a view at {view_top}"
+            );
+            assert_eq!(leading, first as f32 * row);
+            assert_eq!(trailing, (100 - end) as f32 * row);
+            let built = (got_end - got_first) as f32 * row;
+            assert_eq!(
+                leading + built + trailing,
+                3800.0,
+                "the spacers keep the whole page's height"
+            );
+        }
+        // A view past the end (or above the top) keeps the page's height with
+        // one spacer and builds nothing.
+        assert_eq!(
+            super::audit_band(100, row, 10_000.0, 300.0),
+            (100, 100, 3800.0, 0.0)
+        );
+        assert_eq!(
+            super::audit_band(100, row, -10_000.0, 300.0),
+            (0, 0, 0.0, 3800.0)
+        );
+        assert_eq!(super::audit_band(0, row, 0.0, 300.0), (0, 0, 0.0, 0.0));
+    }
+
+    /// Holds the shell so the window can render an entity the test also keeps.
+    struct Harness {
+        shell: Entity<Shell>,
+    }
+
+    impl Render for Harness {
+        fn render(&mut self, _: &mut Window, _: &mut UiContext<Self>) -> impl IntoElement {
+            self.shell.clone()
+        }
+    }
+
+    /// Boot the kit and bind bsh's own keys, the way `ui::run` does.
+    fn init_test_app(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(crate::ui::bind_global_actions);
+    }
+
+    /// A store rooted in the build directory: a test never touches the home.
+    fn scratch_store(label: &str) -> Store {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("bsh-audit-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Store::open_at(dir)
+    }
+
+    /// A session of `turns` turns, each with one call whose result is the ~2 KB
+    /// JSON the measurements used.
+    fn long_session(label: &str, turns: usize) -> AppState {
+        let mut state = AppState::with_store(scratch_store(label));
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id) {
+            for turn in 0..turns {
+                session
+                    .messages
+                    .push(ChatMessage::user(format!("turn {turn}")));
+                session.messages.push(ChatMessage::assistant());
+                let call = ToolEvent {
+                    name: "bash".to_string(),
+                    args: r#"{"command":"cargo test -p bsh"}"#.to_string(),
+                    output: Some(format!(
+                        r#"{{"stdout":"{}","stderr":"","sandbox":"seatbelt","sandbox_reason":"workspace","network":"direct","network_diagnostic":"ok"}}"#,
+                        "log line ".repeat(200)
+                    )),
+                    ms: Some(40),
+                    at: Some(1_700_000_000_000 + turn as u64),
+                };
+                session
+                    .messages
+                    .last_mut()
+                    .expect("the assistant row just pushed")
+                    .tools
+                    .push(call);
+            }
+        }
+        state
+    }
+
+    /// Boot the Audit tab over a session of `turns` turns.
+    fn boot<'a>(
+        cx: &'a mut TestAppContext,
+        label: &'static str,
+        turns: usize,
+    ) -> (Entity<Shell>, &'a mut VisualTestContext) {
+        init_test_app(cx);
+        let (harness, cx) = cx.add_window_view(move |window, cx| {
+            let state = long_session(label, turns);
+            let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+            Harness { shell }
+        });
+        let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+        // The tab is set on the SHELL: `assemble` restores the session's own tab,
+        // so a value set on the state handed to the builder is lost.
+        cx.update(|_, cx| {
+            shell.update(cx, |this, cx| {
+                this.state.tab = Tab::Audit;
+                cx.notify();
+            })
+        });
+        (shell, cx)
+    }
+
+    /// Draw `count` frames and return their median milliseconds.
+    fn median_frame(cx: &mut VisualTestContext, count: usize) -> f64 {
+        let mut frames: Vec<f64> = Vec::new();
+        for _ in 0..count {
+            let started = std::time::Instant::now();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            frames.push(started.elapsed().as_secs_f64() * 1e3);
+        }
+        frames.sort_by(|a, b| a.partial_cmp(b).expect("finite frame times"));
+        frames[frames.len() / 2]
+    }
+
+    /// A long audit page paints a window, and its view model survives a repaint.
+    ///
+    /// MEASURED on a debug build before the fix: 242 ms a frame at the restored
+    /// 256-message window and 1 971 ms at 2 000, 88% of it rebuilding the view
+    /// model (95% of THAT the secret scan).
+    #[gpui::test]
+    fn a_long_audit_page_paints_a_bounded_window(cx: &mut TestAppContext) {
+        let (_, cx) = boot(cx, "window-small", 4);
+        for _ in 0..4 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        let small_ms = median_frame(cx, 12);
+
+        let (shell, cx) = boot(cx, "window-long", 400);
+        for _ in 0..4 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        let builds_before = crate::audit::audit_builds();
+        let rows_before = super::audit_rows_built();
+        let long_ms = median_frame(cx, 12);
+        let built = (super::audit_rows_built() - rows_before) as f64 / 12.0;
+        eprintln!("AUDIT WINDOW small={small_ms:.2}ms long={long_ms:.2}ms built={built:.1}/frame");
+        assert!(
+            built < 80.0,
+            "a 400-turn page built {built:.0} rows a frame: the window is not bounded"
+        );
+        assert_eq!(
+            crate::audit::audit_builds(),
+            builds_before,
+            "a repaint that changes nothing must reuse the view model"
+        );
+        assert!(
+            long_ms <= small_ms * 3.0 + 20.0,
+            "a 400-turn page painted {long_ms:.2}ms a frame against {small_ms:.2}ms for four"
+        );
+
+        // The rows keep the exact 38px stride the spacers stand in at.
+        let second = cx
+            .debug_bounds("audit-turn-2")
+            .expect("the second row is built");
+        let first = cx
+            .debug_bounds("audit-turn-1")
+            .expect("the first row is built");
+        let stride = f32::from(second.origin.y) - f32::from(first.origin.y);
+        assert!(
+            (stride - Shell::TURN_ROW_H).abs() < 0.5,
+            "the rows keep their 38px stride: {stride:.1}px"
+        );
+
+        // The tail is reachable, and the top of the page is a spacer there.
+        let turns = cx.update(|_, cx| shell.read(cx).audit_view().turns.len());
+        let last_offset = super::AUDIT_LIST_PAD_Y + (turns - 1) as f32 * Shell::TURN_ROW_H;
+        cx.update(|_, cx| {
+            shell.update(cx, |this, _| {
+                this.audit_scroll.set_offset(gpui_kit::point(
+                    gpui_kit::px(0.0),
+                    gpui_kit::px(-last_offset),
+                ));
+            })
+        });
+        for _ in 0..3 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        let last: &'static str = Box::leak(format!("audit-turn-{turns}").into_boxed_str());
+        assert!(
+            cx.debug_bounds(last).is_some(),
+            "the last turn is built at the tail"
+        );
+        assert!(
+            cx.debug_bounds("audit-turn-1").is_none(),
+            "the top of the page is a spacer while the reader is at the tail"
+        );
+        assert_eq!(
+            crate::audit::audit_builds(),
+            builds_before,
+            "scrolling must not rebuild the view model"
+        );
     }
 }

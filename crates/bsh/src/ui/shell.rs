@@ -545,6 +545,8 @@ pub(crate) struct Shell {
     pub(crate) traj_scroll: ScrollHandle,
     /// The audit list's scroll position.
     pub(crate) audit_scroll: ScrollHandle,
+    /// The audit page's built view model, kept until the facts it reads change.
+    pub(crate) audit_cache: std::cell::RefCell<super::audit::AuditCache>,
     /// The sidebar tree's scroll position, so the wheel, the keys and a test can
     /// all address the same offset.
     pub(crate) side_scroll: ScrollHandle,
@@ -1600,6 +1602,7 @@ impl Shell {
             traj_smooth: super::smooth::Smooth::default(),
             traj_scroll: ScrollHandle::new(),
             audit_scroll: ScrollHandle::new(),
+            audit_cache: std::cell::RefCell::new(super::audit::AuditCache::default()),
             side_scroll: ScrollHandle::new(),
             side_focus: cx.focus_handle(),
             rail_scroll: ScrollHandle::new(),

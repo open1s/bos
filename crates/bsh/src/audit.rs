@@ -471,6 +471,19 @@ pub(crate) struct AuditView {
     pub(crate) turns: Vec<AuditTurn>,
 }
 
+// How many times the page's view model was built on this thread, for the
+// performance test: a repaint that changes nothing must not rebuild it.
+#[cfg(test)]
+thread_local! {
+    static AUDIT_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times the audit view model was built on this thread.
+#[cfg(test)]
+pub(crate) fn audit_builds() -> usize {
+    AUDIT_BUILDS.with(|built| built.get())
+}
+
 impl AuditView {
     /// Build the view from a session's loaded window and the denial ring.
     ///
@@ -482,6 +495,8 @@ impl AuditView {
         denials: &[PolicyAuditEntry],
         mcp_namespaces: &[String],
     ) -> Self {
+        #[cfg(test)]
+        AUDIT_BUILDS.with(|built| built.set(built.get() + 1));
         let mut turns: Vec<AuditTurn> = Vec::new();
         let mut message_turn: Vec<Option<usize>> = vec![None; session.messages.len()];
         for (index, message) in session.messages.iter().enumerate() {
@@ -498,6 +513,8 @@ impl AuditView {
             let turn = turns.len() - 1;
             message_turn[index] = Some(turn);
             for (tool_index, tool) in message.tools.iter().enumerate() {
+                let (sandbox, sandbox_reason, network, diagnostic) =
+                    confinement_of(tool.output.as_deref());
                 turns[turn].calls.push(AuditCall {
                     tool: tool.name.clone(),
                     category: AuditCategory::classify_in(&tool.name, mcp_namespaces),
@@ -512,10 +529,10 @@ impl AuditView {
                     ),
                     message: index,
                     tool_index,
-                    sandbox: result_field(tool.output.as_deref(), "sandbox"),
-                    sandbox_reason: result_field(tool.output.as_deref(), "sandbox_reason"),
-                    network: result_field(tool.output.as_deref(), "network"),
-                    diagnostic: result_field(tool.output.as_deref(), "network_diagnostic"),
+                    sandbox,
+                    sandbox_reason,
+                    network,
+                    diagnostic,
                 });
             }
         }
@@ -664,16 +681,6 @@ impl AuditView {
             .iter()
             .map(|turn| self.weight(turn, mode))
             .fold(0.0f32, f32::max)
-    }
-
-    /// A turn's share of the strip, 0..=1.
-    pub(crate) fn share(&self, turn: &AuditTurn, mode: usize) -> f32 {
-        let max = self.max_weight(mode);
-        if max <= 0.0 {
-            0.0
-        } else {
-            (self.weight(turn, mode) / max).clamp(0.0, 1.0)
-        }
     }
 
     /// The Markdown export: one table row per call, one section per turn.
@@ -966,10 +973,37 @@ fn span_of(message: &ChatMessage) -> (Option<u64>, Option<u64>) {
 /// or that is absent (a call still running, or a record written before the
 /// field existed) yields None - the page then states that absence instead of
 /// fabricating a tier.
-fn result_field(output: Option<&str>, key: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(output?).ok()?;
-    let text = value.get(key)?.as_str()?.trim();
-    (!text.is_empty()).then(|| text.to_string())
+/// The four confinement facts one stored result carries, from ONE parse.
+///
+/// `result_field` parses its input, so asking it four times parsed the same
+/// output four times per call - 55 ms per 1 000 calls on a 2 KB result, on every
+/// view build.
+fn confinement_of(
+    output: Option<&str>,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    let Some(value) = output.and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+    else {
+        return (None, None, None, None);
+    };
+    let field = |key: &str| {
+        value
+            .get(key)
+            .and_then(|item| item.as_str())
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    };
+    (
+        field("sandbox"),
+        field("sandbox_reason"),
+        field("network"),
+        field("network_diagnostic"),
+    )
 }
 
 /// How a stored output reads: the engine prefixes a tool failure with "Error: ",
@@ -1198,16 +1232,25 @@ fn key_at(lower: &[char], at: usize) -> Option<(usize, bool)> {
     if !starts_segment(lower, at) {
         return None;
     }
-    let rest = &lower[at..];
     let mut best: Option<(usize, bool)> = None;
     for key in SECRET_KEYS {
-        let key_chars: Vec<char> = key.chars().collect();
-        if rest.len() >= key_chars.len()
-            && rest[..key_chars.len()] == key_chars[..]
-            && ends_segment(lower, at + key_chars.len())
-            && best.is_none_or(|(length, _)| key_chars.len() > length)
+        // A byte comparison, not a `Vec<char>` per key: this runs at EVERY
+        // character of every preview, and collecting the key for each position
+        // was 4x the scan's remaining cost. The keys are ASCII, so a non-ASCII
+        // character can never equal one of their bytes.
+        let bytes = key.as_bytes();
+        let length = bytes.len();
+        if at + length > lower.len() {
+            continue;
+        }
+        if lower[at..at + length]
+            .iter()
+            .zip(bytes)
+            .all(|(ch, byte)| u32::from(*ch) == u32::from(*byte))
+            && ends_segment(lower, at + length)
+            && best.is_none_or(|(best_length, _)| length > best_length)
         {
-            best = Some((key_chars.len(), key == "bearer"));
+            best = Some((length, key == "bearer"));
         }
     }
     best
@@ -1652,7 +1695,7 @@ mod tests {
         assert!(view.weight(first, 0) > view.weight(second, 0), "duration");
         assert_eq!(view.weight(first, 1), view.weight(second, 1), "turns");
         assert!(view.weight(second, 2) > view.weight(first, 2), "calls");
-        assert_eq!(view.share(first, 1), 1.0);
+        assert_eq!(view.weight(first, 1) / view.max_weight(1), 1.0);
     }
 
     /// A session with no rows is an empty view, not a panic.
@@ -2077,31 +2120,49 @@ mod tests {
         assert!(zh.contains("这不是策略拒绝"));
     }
 
-    /// The reader of a result field never invents one: a missing output, a
+    /// The four confinement facts never invent one: a missing output, a
     /// non-JSON output, a missing key, a non-string value and a blank string all
-    /// yield None.
+    /// yield None, and one parse fills all four.
     #[test]
-    fn a_result_field_is_absent_rather_than_guessed() {
-        assert_eq!(super::result_field(None, "sandbox"), None);
-        assert_eq!(super::result_field(Some("not json"), "sandbox"), None);
-        assert_eq!(super::result_field(Some(r#"{"a":1}"#), "sandbox"), None);
+    fn the_confinement_facts_are_absent_rather_than_guessed() {
+        assert_eq!(super::confinement_of(None), (None, None, None, None));
         assert_eq!(
-            super::result_field(Some(r#"{"sandbox":7}"#), "sandbox"),
-            None
+            super::confinement_of(Some("not json")),
+            (None, None, None, None)
         );
         assert_eq!(
-            super::result_field(Some(r#"{"sandbox":"  "}"#), "sandbox"),
+            super::confinement_of(Some(r#"{"a":1}"#)),
+            (None, None, None, None)
+        );
+        assert_eq!(
+            super::confinement_of(Some(r#"{"sandbox":7}"#)).0,
+            None,
+            "a non-string value is not a tier"
+        );
+        assert_eq!(
+            super::confinement_of(Some(r#"{"sandbox":"  "}"#)).0,
             None,
             "a blank value is not a tier"
         );
         assert_eq!(
-            super::result_field(Some(r#"{"sandbox":"heel"}"#), "sandbox").as_deref(),
-            Some("heel")
-        );
-        assert_eq!(
-            super::result_field(Some(r#"{"sandbox":" heel "}"#), "sandbox").as_deref(),
+            super::confinement_of(Some(r#"{"sandbox":" heel "}"#))
+                .0
+                .as_deref(),
             Some("heel"),
             "the value is trimmed"
+        );
+        let all = super::confinement_of(Some(
+            r#"{"sandbox":"heel","sandbox_reason":"workspace","network":"allowlist","network_diagnostic":"ok"}"#,
+        ));
+        assert_eq!(
+            all,
+            (
+                Some("heel".to_string()),
+                Some("workspace".to_string()),
+                Some("allowlist".to_string()),
+                Some("ok".to_string())
+            ),
+            "one parse fills every fact"
         );
     }
 
