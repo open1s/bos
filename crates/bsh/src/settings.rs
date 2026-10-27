@@ -452,15 +452,6 @@ impl Settings {
         read
     }
 
-    /// How the rendered Browser treats the network.
-    ///
-    /// The stored value is a string so an unknown spelling from a future build
-    /// reads as the safe default instead of failing to parse; the browser owns
-    /// the two-value vocabulary (`proxied` | `strict`).
-    pub(crate) fn browser_network_mode(&self) -> crate::browser::NetworkMode {
-        crate::browser::NetworkMode::from_setting(&self.global.general.browser_network_mode)
-    }
-
     /// Bring a retired workspace `active_session` into the machine preference.
     ///
     /// Which session is on screen is a window fact - several sessions in one

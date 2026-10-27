@@ -65,7 +65,6 @@ pub(crate) const IDLE_IN_FLIGHT: u64 = 2;
 
 use serde_json::{json, Value};
 
-use super::super::gate::Gate;
 use super::super::reap;
 use super::wire::{self, Incoming, Request, Socket};
 use super::EngineError;
@@ -91,17 +90,6 @@ const LOG_CAP: usize = 8 * 1024;
 /// and is a path collision.
 static LAUNCH_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// A policy refusal seen at the engine's own request seam.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Refusal {
-    /// The URL the engine asked for.
-    pub(crate) url: String,
-    /// The rule that refused, when the policy named one.
-    pub(crate) rule: Option<String>,
-    /// The policy's own prose.
-    pub(crate) message: String,
-}
-
 /// State the socket thread publishes and the callers read.
 #[derive(Debug, Default)]
 pub(crate) struct Shared {
@@ -111,8 +99,6 @@ pub(crate) struct Shared {
     paused: AtomicU64,
     /// Requests the `Fetch` seam continued.
     continued: AtomicU64,
-    /// Requests the `Fetch` seam failed.
-    failed: AtomicU64,
     /// Requests paused at the seam and not answered yet.
     inflight: AtomicU64,
     /// When the request seam last saw activity, as a monotonic instant.
@@ -125,8 +111,6 @@ pub(crate) struct Shared {
     /// Whether `Fetch.enable` succeeded, which is what makes the counter
     /// trustworthy. A build without the domain falls back to load + settle.
     fetch_ready: AtomicBool,
-    /// The most recent policy refusals seen at the seam.
-    refusals: Mutex<Vec<Refusal>>,
     /// Why the connection ended, when it did.
     closed: Mutex<Option<String>>,
     /// The session id Obscura attached, learned from the event.
@@ -149,12 +133,6 @@ impl Shared {
     #[cfg(test)]
     pub(crate) fn continued(&self) -> u64 {
         self.continued.load(Ordering::Relaxed)
-    }
-
-    /// Requests failed at the Fetch seam.
-    #[cfg(test)]
-    pub(crate) fn failed(&self) -> u64 {
-        self.failed.load(Ordering::Relaxed)
     }
 
     /// Whether the request counter is trustworthy.
@@ -221,14 +199,6 @@ impl Shared {
         }
     }
 
-    /// The refusals this engine's request seam has recorded.
-    pub(crate) fn refusals(&self) -> Vec<Refusal> {
-        self.refusals
-            .lock()
-            .map(|list| list.clone())
-            .unwrap_or_default()
-    }
-
     /// Why the connection ended, if it did.
     pub(crate) fn closed(&self) -> Option<String> {
         self.closed.lock().ok().and_then(|slot| slot.clone())
@@ -239,14 +209,6 @@ impl Shared {
         self.session.lock().ok().and_then(|slot| slot.clone())
     }
 
-    fn record_refusal(&self, refusal: Refusal) {
-        if let Ok(mut list) = self.refusals.lock() {
-            list.push(refusal);
-            if list.len() > 64 {
-                list.remove(0);
-            }
-        }
-    }
 }
 
 /// One queued request for the socket thread.
@@ -271,8 +233,6 @@ pub(crate) struct Client {
     alive: Arc<AtomicBool>,
     /// What the thread published.
     shared: Arc<Shared>,
-    /// The policy seam the process was started with.
-    gate: Arc<Gate>,
     /// The child. Killed and reaped on drop.
     child: Mutex<Option<Child>>,
     /// The socket thread.
@@ -313,7 +273,6 @@ impl Client {
     /// spawn, because this is the moment a crashed session's orphan can be told
     /// apart from the child about to exist.
     pub(crate) fn launch_at(
-        gate: Arc<Gate>,
         viewport: (u32, u32),
         state_dir: &std::path::Path,
     ) -> Result<Self, EngineError> {
@@ -331,7 +290,7 @@ impl Client {
         let ready_file = std::env::temp_dir().join(format!("bsh-obscura-{suffix}.json"));
         let storage_dir = std::env::temp_dir().join(&marker);
         let log = Arc::new(Mutex::new(String::new()));
-        let mut child = spawn_engine(&binary, &ready_file, &storage_dir, gate.port())?;
+        let mut child = spawn_engine(&binary, &ready_file, &storage_dir)?;
         // Record the child BEFORE the handshake: a crash during startup is
         // exactly the case a later pass has to be able to reap.
         let pidfile = match reap::write_pidfile(state_dir, child.id(), &marker) {
@@ -383,10 +342,9 @@ impl Client {
         let (jobs, queue) = mpsc::channel::<Job>();
         let thread_shared = shared.clone();
         let thread_alive = alive.clone();
-        let thread_gate = gate.clone();
         let thread = thread::Builder::new()
             .name(String::from("bsh-cdp"))
-            .spawn(move || run_socket(socket, queue, thread_shared, thread_gate, thread_alive))
+            .spawn(move || run_socket(socket, queue, thread_shared, thread_alive))
             .map_err(|error| {
                 EngineError::Spawn(format!("the CDP thread did not start: {error}"))
             })?;
@@ -398,7 +356,6 @@ impl Client {
             jobs,
             alive,
             shared,
-            gate,
             child: Mutex::new(Some(child)),
             thread: Mutex::new(Some(thread)),
             ready_file,
@@ -530,11 +487,6 @@ impl Client {
     /// The port the engine bound.
     pub(crate) fn port(&self) -> u16 {
         self.port
-    }
-
-    /// The policy seam this process was launched with.
-    pub(crate) fn gate(&self) -> &Arc<Gate> {
-        &self.gate
     }
 
     /// What the socket thread has seen.
@@ -722,7 +674,6 @@ fn run_socket(
     mut socket: Socket,
     jobs: Receiver<Job>,
     shared: Arc<Shared>,
-    gate: Arc<Gate>,
     alive: Arc<AtomicBool>,
 ) {
     let mut next_id = 1u64;
@@ -767,7 +718,7 @@ fn run_socket(
                     }
                 }
                 Ok(Incoming::Event { method, params }) => {
-                    handle_event(&mut socket, &method, &params, &shared, &gate);
+                    handle_event(&mut socket, &method, &params, &shared);
                 }
                 Err(error) => {
                     if let Ok(mut slot) = shared.closed.lock() {
@@ -795,7 +746,7 @@ fn run_socket(
 }
 
 /// Route one event.
-fn handle_event(socket: &mut Socket, method: &str, params: &Value, shared: &Shared, gate: &Gate) {
+fn handle_event(socket: &mut Socket, method: &str, params: &Value, shared: &Shared) {
     match method {
         "Page.loadEventFired" => {
             shared.loads.fetch_add(1, Ordering::Relaxed);
@@ -814,40 +765,22 @@ fn handle_event(socket: &mut Socket, method: &str, params: &Value, shared: &Shar
         }
         "Fetch.requestPaused" => {
             shared.paused.fetch_add(1, Ordering::Relaxed);
-            let request_id = params.get("requestId").and_then(Value::as_str);
-            if request_id.is_some() {
-                shared.inflight.fetch_add(1, Ordering::Relaxed);
-            }
             shared.touch();
-            let url = params
-                .get("request")
-                .and_then(|request| request.get("url"))
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let denied = gate.authorize_url(url);
-            let (method, payload) = match (denied, request_id) {
-                (Ok(()), Some(request_id)) => {
-                    shared.continued.fetch_add(1, Ordering::Relaxed);
-                    shared.settled();
-                    ("Fetch.continueRequest", json!({ "requestId": request_id }))
-                }
-                (Err(denial), Some(request_id)) => {
-                    shared.failed.fetch_add(1, Ordering::Relaxed);
-                    shared.settled();
-                    shared.record_refusal(Refusal {
-                        url: denial.url,
-                        rule: denial.rule,
-                        message: denial.message,
-                    });
-                    (
-                        "Fetch.failRequest",
-                        json!({ "requestId": request_id, "errorReason": "BlockedByClient" }),
-                    )
-                }
-                (_, None) => return,
+            let Some(request_id) = params.get("requestId").and_then(Value::as_str) else {
+                return;
             };
-            // Events are answered without correlation; the reply is ignored.
-            let text = json!({ "id": 0, "method": method, "params": payload }).to_string();
+            shared.continued.fetch_add(1, Ordering::Relaxed);
+            shared.settled();
+            // Observation, NOT a gate: the browser is direct, so every paused
+            // request is continued. The seam is kept because its pause is the
+            // navigation idle clock (`shared.touch`), which is what makes
+            // `wait_network_idle` real.
+            let text = json!({
+                "id": 0,
+                "method": "Fetch.continueRequest",
+                "params": { "requestId": request_id },
+            })
+            .to_string();
             let _ = socket.send(&text);
         }
         _ => {}
@@ -978,14 +911,14 @@ pub(crate) fn dev_binary() -> PathBuf {
 /// Start the process with the measured argument set.
 /// The engine never runs under the turn's heel sandbox.
 ///
-/// It is a DIRECT child of bsh with its own egress gate, not a consumer of a
+/// It is a DIRECT child of bsh, not a consumer of a
 /// [`agent::sandbox::SandboxSpec`], and its tool results say
 /// `sandbox: "none"`. What this scrub closes is the one way heel could still
 /// reach it: a bsh started from a sandboxed shell inherits heel's environment,
-/// and heel's proxy would sit in front of (or beside) the browser's own gate
-/// while its private TMPDIR points at a scratch the engine was never granted.
-/// Removing the SAME reserved list the sandbox sets - one list, two readers -
-/// is what makes "no heel for the browser" true there too.
+/// and the proxy variables heel sets would route the engine's traffic through
+/// it, while its private TMPDIR points at a scratch the engine was never
+/// granted. Removing the SAME reserved list the sandbox sets - one list, two
+/// readers - is what makes "no heel for the browser" true there too.
 fn scrub_sandbox_env(command: &mut Command) {
     for key in agent::sandbox::RESERVED_ENV {
         command.env_remove(key);
@@ -996,7 +929,6 @@ fn spawn_engine(
     binary: &Path,
     ready_file: &Path,
     storage_dir: &Path,
-    gate_port: u16,
 ) -> Result<Child, EngineError> {
     std::fs::create_dir_all(storage_dir).map_err(|error| {
         EngineError::Spawn(format!(
@@ -1014,8 +946,6 @@ fn spawn_engine(
         .arg("--storage-dir")
         .arg(storage_dir)
         .arg("--allow-private-network")
-        .arg("--proxy")
-        .arg(format!("http://127.0.0.1:{gate_port}"))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

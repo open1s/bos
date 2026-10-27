@@ -677,16 +677,6 @@ fn composer_enter_action(shell: &mut Shell, key: &str, cx: &mut Context<Shell>) 
     );
 }
 
-/// What the rendered Browser may put on the wire: proxied or strict.
-fn browser_network_action(shell: &mut Shell, key: &str, cx: &mut Context<Shell>) {
-    preference_action(
-        shell,
-        |settings| &mut settings.global.general.browser_network_mode,
-        key,
-        cx,
-    );
-}
-
 /// How much performance and usage detail the footer shows.
 fn performance_usage_action(shell: &mut Shell, key: &str, cx: &mut Context<Shell>) {
     preference_action(
@@ -6388,8 +6378,7 @@ impl Shell {
         cx: &mut Context<Shell>,
     ) -> (&'static str, &'static str, Vec<AnyElement>) {
         let inputs = &self.settings_inputs;
-        let lang = self.state.lang;
-        let mut rows = vec![
+        let rows = vec![
             self.input_row(
                 "settings.shellTimeout",
                 &inputs.shell_timeout,
@@ -6403,27 +6392,6 @@ impl Shell {
                 cx,
             ),
         ];
-        // The rendered browser's transport choice lives beside the other shell
-        // limits: it is a machine preference about what may go on the wire. It
-        // reads the DRAFT like every other row in this dialog, so a pick shows
-        // at once and Save is what writes it.
-        let mode = crate::browser::NetworkMode::from_setting(
-            &self.state.draft().global.general.browser_network_mode,
-        );
-        rows.push(self.select_row(
-            SelectRow {
-                id: "set-browser-network",
-                title: "settings.browserNetwork",
-                desc: Some("settings.browserNetworkHint"),
-                current: mode.as_str().to_string(),
-                options: vec![
-                    ("proxied", tr(lang, "settings.browserNetworkProxied")),
-                    ("strict", tr(lang, "settings.browserNetworkStrict")),
-                ],
-                action: browser_network_action,
-            },
-            cx,
-        ));
         ("settings.shell", "settings.shellHint", rows)
     }
 

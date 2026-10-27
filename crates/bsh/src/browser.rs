@@ -33,18 +33,18 @@
 //! element on this page and another on the next, which is exactly the silent
 //! wrong action a model must never get.
 //!
-//! # Policy
+//! # Direct, not gated
 //!
-//! Every navigation asks the SAME EgressGate the shell's shell tool and MCP
-//! transport ask; there is no second allowlist, no bypass and no cached
-//! decision that outlives the policy that produced it. The decision is made
-//! before a request exists, so a refused URL opens no socket and the pane shows
-//! the rule that refused it.
+//! A navigation is DIRECT, by the owner's decision: neither producer - the
+//! rendered engine or the text view - asks an egress policy, before or after
+//! the socket. The paths the workspace allowlist governs are the shell tool and
+//! the MCP transport. Every tool result states this reach as a fact
+//! (`"network": "direct"`), so a reader or a model never has to infer it.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use agent::policy::{EgressGate, FetchError, FetchLimits, FetchedPage, PolicySet, SystemResolver};
+use agent::policy::{FetchError, FetchLimits, FetchedPage};
 use agent::tools::AsyncFunctionTool;
 use agent::{Agent, ToolError};
 
@@ -54,59 +54,6 @@ use agent::{Agent, ToolError};
 /// document. A build with no binary installed falls back to the text view and
 /// the pane says why.
 pub(crate) mod engine;
-
-/// What the rendered browser may put on the wire, as a reader's choice.
-///
-/// The engine is a child process behind a loopback proxy. That proxy can see
-/// the absolute request URI of a PLAIN HTTP request, so it enforces the policy
-/// on the full host AND path before connecting. An https page is a CONNECT
-/// tunnel: TLS is not terminated here (that would need a MITM CA the reader has
-/// to trust), so the proxy sees only host:port and a path rule inside the page
-/// cannot be decided at the socket.
-///
-/// That is a limit of the transport, not a gap a control can hide, so it is the
-/// reader's explicit choice:
-///
-/// - [`NetworkMode::Proxied`] (the default) allows https and gates it at
-///   host:port - today's behaviour;
-/// - [`NetworkMode::Strict`] refuses the CONNECT tunnel outright, so nothing
-///   traverses an un-terminated TLS session and every request that does happen
-///   was authorized on its path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum NetworkMode {
-    /// https is allowed and authorized on host:port, like before.
-    #[default]
-    Proxied,
-    /// https is refused, so no un-terminated tunnel carries a request.
-    Strict,
-}
-
-impl NetworkMode {
-    /// Read a stored value; anything but `strict` is the safe default.
-    pub(crate) fn from_setting(value: &str) -> Self {
-        if value.trim().eq_ignore_ascii_case("strict") {
-            NetworkMode::Strict
-        } else {
-            NetworkMode::Proxied
-        }
-    }
-
-    /// The spelling the settings file and a payload carry.
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            NetworkMode::Proxied => "proxied",
-            NetworkMode::Strict => "strict",
-        }
-    }
-
-    /// The locale key that names the mode to a reader.
-    pub(crate) fn label_key(self) -> &'static str {
-        match self {
-            NetworkMode::Proxied => "right.browser.networkProxied",
-            NetworkMode::Strict => "right.browser.networkStrict",
-        }
-    }
-}
 
 /// Characters of page text a snapshot returns.
 pub(crate) const TEXT_CAP: usize = 4_000;
@@ -180,15 +127,14 @@ impl Failure {
         format!("{} {}", self.message, self.next_step())
     }
 
-    /// The failure for a transport error, in the policy's own words.
-    pub(crate) fn from_fetch(error: FetchError, gate: &EgressGate, url: &str) -> Self {
+    /// The failure for a transport error, in the transport's own words.
+    pub(crate) fn from_fetch(error: FetchError, url: &str) -> Self {
+        // The browser is DIRECT, so there is no policy refusal to explain:
+        // every arm is the transport's own sentence. `Refused` cannot be
+        // reached by this pane any more; the arm stays exhaustive for the type.
         let (kind, message, rule) = match &error {
             FetchError::Scheme(_) => ("scheme", error.to_string(), None),
-            FetchError::Refused(denial) => (
-                "policy",
-                gate.policy().refusal(&denial.decision),
-                denial.decision.rule.clone(),
-            ),
+            FetchError::Refused(denial) => ("policy", error.to_string(), denial.decision.rule.clone()),
             FetchError::Unresolved(_) => ("dns", error.to_string(), None),
             FetchError::Tls(_) => ("tls", error.to_string(), None),
             FetchError::Connect(_) => ("connect", error.to_string(), None),
@@ -527,7 +473,6 @@ impl Status {
 #[derive(Debug, Clone)]
 struct PendingLoad {
     seq: u64,
-    url: String,
 }
 
 /// The browser's whole state.
@@ -570,10 +515,7 @@ impl Browser {
     pub(crate) fn begin(&mut self, url: &str) -> u64 {
         self.seq = self.seq.wrapping_add(1);
         let seq = self.seq;
-        self.pending = Some(PendingLoad {
-            seq,
-            url: url.to_string(),
-        });
+        self.pending = Some(PendingLoad { seq });
         self.status = Status::Loading;
         self.failure = None;
         self.address = url.to_string();
@@ -1034,11 +976,7 @@ impl BrowserHandle {
     /// `BSH_BROWSER_ENGINE=off` keeps the process from being started at all,
     /// which is what a machine without the binary wants and what a test that
     /// must not spawn anything sets.
-    pub(crate) fn ensure_engine(
-        &self,
-        gate: &Arc<EgressGate>,
-        mode: NetworkMode,
-    ) -> Result<Arc<engine::Engine>, engine::EngineError> {
+    pub(crate) fn ensure_engine(&self) -> Result<Arc<engine::Engine>, engine::EngineError> {
         let mut slot = self
             .engine
             .lock()
@@ -1069,15 +1007,12 @@ impl BrowserHandle {
             *slot = EngineState::Unavailable(error.clone());
             return Err(error);
         }
-        let started =
-            engine::Gate::start(gate.policy().clone(), gate.session(), gate.preset(), mode)
-                .map_err(engine::EngineError::Spawn)
-                .and_then(|gate| match &self.engine_state_dir {
-                    Some(state_dir) => {
-                        engine::Engine::launch_in(gate, self.frames.clone(), (1000, 700), state_dir)
-                    }
-                    None => engine::Engine::launch(gate, self.frames.clone(), (1000, 700)),
-                });
+        let started = match &self.engine_state_dir {
+            Some(state_dir) => {
+                engine::Engine::launch_in(self.frames.clone(), (1000, 700), state_dir)
+            }
+            None => engine::Engine::launch(self.frames.clone(), (1000, 700)),
+        };
         match started {
             Ok(engine) => {
                 let engine = Arc::new(engine);
@@ -1104,29 +1039,22 @@ impl BrowserHandle {
     }
 }
 
-/// Fetch a URL through the policy and settle the result into the browser.
+/// Fetch a URL and settle the result into the browser.
 ///
 /// One place performs a navigation, so the pane's own Go control and every tool
-/// make the same decision in the same order: ask the gate, then fetch, then show.
+/// take the same path. The browser is DIRECT (owner decision): no egress policy
+/// is asked, before or after the socket, and the shell tool and the MCP
+/// transport remain the paths the workspace allowlist governs.
 #[cfg(test)]
-pub(crate) fn navigate(
-    handle: &BrowserHandle,
-    gate: &Arc<EgressGate>,
-    url: &str,
-) -> Result<(), Failure> {
-    navigate_in(handle, gate, url, NetworkMode::Proxied)
+pub(crate) fn navigate(handle: &BrowserHandle, url: &str) -> Result<(), Failure> {
+    navigate_in(handle, url)
 }
 
-/// Navigate under a chosen [`NetworkMode`].
-pub(crate) fn navigate_in(
-    handle: &BrowserHandle,
-    gate: &Arc<EgressGate>,
-    url: &str,
-    mode: NetworkMode,
-) -> Result<(), Failure> {
+/// Navigate, settling the way a tool does (load + the networkidle window).
+pub(crate) fn navigate_in(handle: &BrowserHandle, url: &str) -> Result<(), Failure> {
     let seq = handle.mutate(|browser| browser.begin(url));
     // A tool reads the page's text, so this path takes the full idle window.
-    load(handle, gate, url, seq, mode, engine::Settle::Idle)
+    load(handle, url, seq, engine::Settle::Idle)
 }
 
 /// Fetch and settle a navigation that has ALREADY begun.
@@ -1142,10 +1070,8 @@ pub(crate) fn navigate_in(
 /// same either way - every tool re-reads the live page before it acts.
 pub(crate) fn load(
     handle: &BrowserHandle,
-    gate: &Arc<EgressGate>,
     url: &str,
     seq: u64,
-    mode: NetworkMode,
     settle: engine::Settle,
 ) -> Result<(), Failure> {
     // The scheme rule is the model's, not the engine's: a file: or javascript:
@@ -1170,14 +1096,12 @@ pub(crate) fn load(
             })
         };
     }
-    match handle.ensure_engine(gate, mode) {
-        Ok(engine) => load_live(handle, &engine, gate, url, seq, mode, settle),
+    match handle.ensure_engine() {
+        Ok(engine) => load_live(handle, &engine, url, seq, settle),
         Err(_error) => {
-            // The text view is the fallback, and it goes through the SAME gate:
-            // the policy decision is identical, only the producer differs.
-            let limits = FetchLimits::default();
-            let result = agent::policy::fetch(gate, url, &limits);
-            settle_fetch(handle, gate, seq, result)
+            // The text view is the fallback, and it is direct too: the same
+            // reach the rendered engine has, only a different producer.
+            settle_fetch(handle, seq, url, fetch_direct(url))
         }
     }
 }
@@ -1186,10 +1110,8 @@ pub(crate) fn load(
 fn load_live(
     handle: &BrowserHandle,
     engine: &engine::Engine,
-    gate: &Arc<EgressGate>,
     url: &str,
     seq: u64,
-    mode: NetworkMode,
     settle: engine::Settle,
 ) -> Result<(), Failure> {
     let replaced = || Failure {
@@ -1198,7 +1120,7 @@ fn load_live(
         rule: None,
         url: String::new(),
     };
-    let failure = match engine.navigate_settling(gate, url, mode, settle) {
+    let failure = match engine.navigate_settling(url, settle) {
         Ok(engine::Navigation::Loaded) => {
             let start = handle.read(|browser| browser.next_id);
             match engine.snapshot(start) {
@@ -1209,12 +1131,6 @@ fn load_live(
                 Err(error) => Failure::from_engine(&error, url),
             }
         }
-        Ok(engine::Navigation::Refused { rule, message }) => Failure {
-            kind: "policy",
-            message,
-            rule,
-            url: url.to_string(),
-        },
         Err(error) => Failure::from_engine(&error, url),
     };
     let applied = handle.mutate(|browser| browser.fail(seq, failure.clone()));
@@ -1276,8 +1192,8 @@ fn document_from_page(page: engine::Page, next_id: &mut u64) -> Document {
 /// [`Settle`](engine::Settle) choice, and that name would shadow this one.
 fn settle_fetch(
     handle: &BrowserHandle,
-    gate: &EgressGate,
     seq: u64,
+    url: &str,
     result: Result<FetchedPage, FetchError>,
 ) -> Result<(), Failure> {
     let replaced = |url: String| Failure {
@@ -1296,7 +1212,7 @@ fn settle_fetch(
             }
         }
         Err(error) => {
-            let failure = Failure::from_fetch(error, gate, &requested_url(handle, seq));
+            let failure = Failure::from_fetch(error, url);
             let applied = handle.mutate(|browser| browser.fail(seq, failure.clone()));
             if applied {
                 Err(failure)
@@ -1307,66 +1223,172 @@ fn settle_fetch(
     }
 }
 
-/// The URL a still-pending sequence number was started for.
-fn requested_url(handle: &BrowserHandle, seq: u64) -> String {
-    handle.read(|browser| match &browser.pending {
-        Some(pending) if pending.seq == seq => pending.url.clone(),
-        _ => browser.address.clone(),
+/// Fetch one URL directly, with no egress policy.
+///
+/// The text view is what the pane shows when the rendered engine cannot start,
+/// and it is DIRECT like the engine: the browser asks no policy, which is the
+/// owner's decision. The shell tool and the MCP transport remain the paths the
+/// workspace allowlist governs.
+///
+/// Blocking, because its caller is: the navigation runs on a worker. The one
+/// process-wide runtime and client below carry every call, so a page reuses
+/// the connection and TLS session the previous page left instead of paying a
+/// handshake (and a runtime build) per navigation.
+fn fetch_direct(url: &str) -> Result<FetchedPage, FetchError> {
+    let limits = direct_limits();
+    let client = direct_client()?;
+    // Refuse a scheme here, so a file: URL is the model's own sentence and not
+    // a client error with a different wording.
+    if let Err(FetchError::Scheme(attempted)) = agent::policy::http_host(url) {
+        return Err(FetchError::Scheme(attempted));
+    }
+    let runtime = direct_runtime()?;
+    runtime.block_on(async {
+        let mut response = client
+            .get(url)
+            .header(
+                reqwest::header::USER_AGENT,
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) BOS-Harness browser",
+            )
+            .send()
+            .await
+            .map_err(|error| classify_direct(&error))?;
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let final_url = response.url().to_string();
+        // Read to one byte past the cap and stop: `text()` would download and
+        // UTF-8 decode the whole response, so a 500 MB page would cost 500 MB
+        // of RAM and an endless one would never return.
+        let mut bytes = Vec::with_capacity(limits.max_body.min(64 * 1024));
+        while bytes.len() <= limits.max_body {
+            let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|error| FetchError::Body(error.to_string()))?
+            else {
+                break;
+            };
+            let room = limits.max_body + 1 - bytes.len();
+            bytes.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        }
+        let body_truncated = bytes.len() > limits.max_body;
+        bytes.truncate(limits.max_body);
+        Ok(FetchedPage {
+            url: final_url,
+            status,
+            content_type,
+            body: decode_body(&bytes),
+            body_truncated,
+        })
     })
 }
+
+/// How much a direct fetch may read, and how far it may follow.
+///
+/// One client serves every page (that is what keeps the connection warm), and
+/// a client fixes its timeout and redirect budget when it is built, so these
+/// limits are the path's own shape rather than a per-call knob. They are the
+/// values the gated fetch used; the text view has one size.
+fn direct_limits() -> FetchLimits {
+    FetchLimits::default()
+}
+
+/// The direct path's async stack, built once for the process.
+///
+/// A current-thread runtime per navigation cost about 6 ms (debug build) on
+/// top of a ~2 ms fetch - a fixed tax on the path that only runs when the
+/// engine is missing. Two navigations (the pane's and a tool's) may block on
+/// this one at the same time, so it is multi-threaded with a single worker:
+/// each caller parks its own thread while the worker drives the I/O.
+fn direct_runtime() -> Result<&'static tokio::runtime::Runtime, FetchError> {
+    static RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_name("bsh-browser-fetch")
+                .enable_all()
+                .build()
+                .map_err(|error| format!("the browser's fetch runtime: {error}"))
+        })
+        .as_ref()
+        .map_err(|error| FetchError::Connect(error.clone()))
+}
+
+/// The direct path's client, built once so it holds one connection pool.
+fn direct_client() -> Result<&'static reqwest::Client, FetchError> {
+    static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            let limits = direct_limits();
+            reqwest::Client::builder()
+                .timeout(limits.timeout)
+                // The client follows the hops itself; there is no policy to ask
+                // at each one, which was the only reason the gated path walked
+                // them.
+                .redirect(reqwest::redirect::Policy::limited(usize::from(
+                    limits.max_redirects,
+                )))
+                .build()
+                .map_err(|error| format!("the browser's client: {error}"))
+        })
+        .as_ref()
+        .map_err(|error| FetchError::Connect(error.clone()))
+}
+
+/// A body as text, cut on a character boundary.
+///
+/// The cap counts BYTES, so a truncated body can end inside a multi-byte
+/// character. Dropping that partial tail is what keeps the cut from rendering
+/// as U+FFFD, which reads as page content instead of as the end of the page.
+fn decode_body(bytes: &[u8]) -> String {
+    let end = match std::str::from_utf8(bytes) {
+        Ok(_) => bytes.len(),
+        // `None` means the input ended inside a sequence: exactly the cut.
+        Err(error) if error.error_len().is_none() => error.valid_up_to(),
+        // Invalid bytes that are not a truncated tail are content; keep them
+        // and let the lossy decode mark them.
+        Err(_) => bytes.len(),
+    };
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+/// Which transport failure a direct fetch hit, in the vocabulary the pane shows.
+fn classify_direct(error: &reqwest::Error) -> FetchError {
+    if error.is_timeout() {
+        return FetchError::Connect(format!("the request timed out: {error}"));
+    }
+    if error.is_connect() {
+        return FetchError::Connect(format!("the connection failed: {error}"));
+    }
+    FetchError::Body(error.to_string())
+}
+
 /// Everything the browser's tools need to decide and act.
 #[derive(Clone)]
 pub(crate) struct Tools {
     /// The one shared browser.
     pub(crate) browser: Arc<BrowserHandle>,
-    /// The turn's compiled policy: the same set the shell's other tools ask.
-    pub(crate) policy: Arc<PolicySet>,
-    /// The session a decision is recorded under.
-    pub(crate) session: String,
-    /// The preset a decision is recorded under.
-    pub(crate) preset: String,
-    /// How the rendered browser treats the network: the reader's setting.
-    pub(crate) network_mode: NetworkMode,
 }
 
 impl Tools {
-    /// The gate one browser tool asks, named for the audit row it produces.
-    fn gate(&self, tool: &'static str) -> Arc<EgressGate> {
-        Arc::new(EgressGate::new(
-            self.policy.clone(),
-            Arc::new(SystemResolver),
-            self.session.clone(),
-            self.preset.clone(),
-            tool,
-        ))
-    }
-
     /// The honest confinement facts every result carries.
     ///
     /// The audit reads these from the RESULT, so a browser call states its own
     /// reach instead of inheriting the shell tool's. There is no process
-    /// sandbox behind this pane - the request is the app's own client and the
-    /// policy is the gate - and the network fact is the policy's own data.
+    /// sandbox behind this pane - the request is the app's own client - and the
+    /// network fact says "direct" because no policy is consulted.
     fn facts(&self) -> serde_json::Value {
-        let data = self.policy.data();
-        let any_rule = !(data.egress_allowlist.is_empty()
-            && data.egress_hosts.is_empty()
-            && data.egress_ports.is_empty())
-            || data.preset_egress_restricted;
-        let network = if data.egress_unrestricted && !any_rule {
-            "unrestricted"
-        } else if !any_rule {
-            "deny-all"
-        } else {
-            "allowlist"
-        };
         serde_json::json!({
             "sandbox": "none",
-            "network": network,
-            // The reader's choice, so a caller can tell what the transport
-            // actually enforced: https is gated at host:port under Proxied and
-            // refused outright under Strict.
-            "network_mode": self.network_mode.as_str(),
+            // The browser asks no egress policy: state that, rather than a
+            // policy shape it does not consult.
+            "network": "direct",
         })
     }
 
@@ -1442,21 +1464,6 @@ fn snapshot_payload(
 /// The document pre-flight cannot see a subresource: an image, a script or a
 /// stylesheet the policy refused is reported here, with its rule, so a page
 /// that loaded with a piece missing says which piece and why.
-pub(crate) fn engine_refusal(handle: &BrowserHandle) -> Option<String> {
-    let engine = handle.engine()?;
-    let describe = |rule: &Option<String>, message: &str| match rule {
-        Some(rule) => format!("{message} (rule {rule})"),
-        None => message.to_string(),
-    };
-    if let Some(denial) = engine.gate().last() {
-        return Some(describe(&denial.rule, &denial.message));
-    }
-    let refusals = engine.client().shared().refusals();
-    refusals
-        .last()
-        .map(|refusal| describe(&refusal.rule, &refusal.message))
-}
-
 /// The tool error an engine failure becomes: what happened, then the hint.
 fn engine_error(error: &engine::EngineError) -> ToolError {
     ToolError::Failed(format!("{} {}", error.message(), error.hint()))
@@ -1668,17 +1675,11 @@ pub(crate) fn history_live(
 }
 
 /// `browser_reload` against the live page.
-pub(crate) fn reload_live(
-    handle: &BrowserHandle,
-    gate: &Arc<EgressGate>,
-    mode: NetworkMode,
-) -> Result<serde_json::Value, ToolError> {
+pub(crate) fn reload_live(handle: &BrowserHandle) -> Result<serde_json::Value, ToolError> {
     let engine = handle
         .engine()
         .ok_or_else(|| ToolError::Failed(String::from("No rendered engine is running.")))?;
-    engine
-        .reload(gate, mode)
-        .map_err(|error| engine_error(&error))?;
+    engine.reload().map_err(|error| engine_error(&error))?;
     refresh_live(handle)?;
     snapshot_payload(handle, "reloaded")
 }
@@ -1731,9 +1732,10 @@ fn focused_payload(focused: &str) -> serde_json::Value {
 }
 /// Register the browser's tools on an agent.
 ///
-/// Every navigation they perform goes through navigate, which asks the turn's
-/// own policy first, so a model can no more reach a host the workspace refuses
-/// than the shell tool can.
+/// Every navigation they perform goes through navigate, so the pane and the
+/// model cannot drift: one path produces both documents. The browser is direct
+/// (see the module note), so a host the turn's policy refuses is still reachable
+/// here by the owner's decision.
 pub(crate) fn attach(agent: &mut Agent, tools: Tools) {
     let mut add = |tool: AsyncFunctionTool| {
         if let Err(error) = agent.try_add_async_tool(Arc::new(tool)) {
@@ -1770,12 +1772,10 @@ pub(crate) fn attach(agent: &mut Agent, tools: Tools) {
                             "url is required. Call browser_open with an absolute http(s) URL.",
                         )));
                     }
-                    let gate = tools.gate("browser_open");
                     let handle = tools.browser.clone();
                     let target = url.clone();
-                    let mode = tools.network_mode;
                     let loaded =
-                        blocking(move || navigate_in(&handle, &gate, &target, mode)).await?;
+                        blocking(move || navigate_in(&handle, &target)).await?;
                     loaded.map_err(|failure| ToolError::Failed(failure.tool_message()))?;
                     tools.snapshot_result("open")
                 }
@@ -1857,12 +1857,10 @@ pub(crate) fn attach(agent: &mut Agent, tools: Tools) {
                             Ok(value)
                         }
                         Action::Navigate(url) => {
-                            let gate = tools.gate("browser_click");
                             let handle = tools.browser.clone();
                             let target = url.clone();
-                            let mode = tools.network_mode;
                             let loaded =
-                                blocking(move || navigate_in(&handle, &gate, &target, mode)).await?;
+                                blocking(move || navigate_in(&handle, &target)).await?;
                             loaded.map_err(|failure| ToolError::Failed(failure.tool_message()))?;
                             tools.snapshot_result("navigated")
                         }
@@ -1960,12 +1958,10 @@ pub(crate) fn attach(agent: &mut Agent, tools: Tools) {
                             Ok(value)
                         }
                         Action::Navigate(url) => {
-                            let gate = tools.gate("browser_press");
                             let handle = tools.browser.clone();
                             let target = url.clone();
-                            let mode = tools.network_mode;
                             let loaded =
-                                blocking(move || navigate_in(&handle, &gate, &target, mode)).await?;
+                                blocking(move || navigate_in(&handle, &target)).await?;
                             loaded.map_err(|failure| ToolError::Failed(failure.tool_message()))?;
                             tools.snapshot_result("navigated")
                         }
@@ -2036,10 +2032,8 @@ pub(crate) fn attach(agent: &mut Agent, tools: Tools) {
                 async move {
                     if tools.browser.engine_ready() {
                         let handle = tools.browser.clone();
-                        let gate = tools.gate("browser_reload");
-                        let mode = tools.network_mode;
                         let mut value =
-                            blocking(move || reload_live(&handle, &gate, mode)).await??;
+                            blocking(move || reload_live(&handle)).await??;
                         tools.stamp(&mut value);
                         return Ok(value);
                     }
@@ -2051,12 +2045,10 @@ pub(crate) fn attach(agent: &mut Agent, tools: Tools) {
                                 "There is no page to reload. Call browser_open with a URL.",
                             ))
                         })?;
-                    let gate = tools.gate("browser_reload");
                     let handle = tools.browser.clone();
                     let target = url.clone();
-                    let mode = tools.network_mode;
                     let loaded =
-                        blocking(move || navigate_in(&handle, &gate, &target, mode)).await?;
+                        blocking(move || navigate_in(&handle, &target)).await?;
                     loaded.map_err(|failure| ToolError::Failed(failure.tool_message()))?;
                     tools.snapshot_result("reloaded")
                 }
@@ -3073,47 +3065,9 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 
-    /// The network-mode vocabulary is exactly two values, and anything a future
-    /// build might write reads as the SAFE default (Proxied, which still asks
-    /// the policy at host:port) rather than as a silent widening.
-    #[test]
-    fn the_browser_network_mode_vocabulary_has_a_safe_default() {
-        assert_eq!(
-            NetworkMode::from_setting("strict"),
-            NetworkMode::Strict,
-            "the stored spelling must round-trip"
-        );
-        assert_eq!(
-            NetworkMode::from_setting("  STRICT "),
-            NetworkMode::Strict,
-            "the value is compared case-insensitively and trimmed"
-        );
-        assert_eq!(NetworkMode::from_setting("proxied"), NetworkMode::Proxied);
-        assert_eq!(
-            NetworkMode::from_setting("something-new"),
-            NetworkMode::Proxied,
-            "an unknown value must not become Strict or anything else"
-        );
-        assert_eq!(NetworkMode::default(), NetworkMode::Proxied);
-        assert_eq!(NetworkMode::Proxied.as_str(), "proxied");
-        assert_eq!(NetworkMode::Strict.as_str(), "strict");
-        assert_eq!(
-            crate::settings::Settings::default()
-                .global
-                .general
-                .browser_network_mode,
-            "proxied",
-            "a fresh install ships the Proxied default"
-        );
-        assert_eq!(
-            NetworkMode::Proxied.label_key(),
-            "right.browser.networkProxied"
-        );
-        assert_eq!(
-            NetworkMode::Strict.label_key(),
-            "right.browser.networkStrict"
-        );
-    }
+    /// How much the "/endless" page claims to send: twice the body cap, so a
+    /// client that reads to EOF cannot be done before it passes the cap.
+    const ENDLESS_BYTES: usize = 4 * 1024 * 1024;
 
     /// One local site, counting the requests that reached it.
     struct Site {
@@ -3197,6 +3151,28 @@ mod tests {
                     .unwrap_or("/")
                     .to_string();
                 counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if path == "/endless" {
+                    // More bytes than the cap, promised by Content-Length and
+                    // sent for as long as the socket takes them, and then NO
+                    // EOF: only a client that stops at its own cap can return
+                    // from this page.
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {ENDLESS_BYTES}\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    // 48 bytes of prefix, so a cut at 2 MiB lands two bytes
+                    // inside a three-byte character.
+                    let mut page =
+                        String::from("<html><head><title>Endless</title></head><body> ");
+                    page.push_str(&"€".repeat(ENDLESS_BYTES / 3));
+                    let _ = stream.write_all(page.as_bytes());
+                    let _ = stream.flush();
+                    // Wait for the client to hang up, which closes the socket
+                    // under us and lets the accept loop go on.
+                    let mut sink = [0u8; 1024];
+                    let _ = stream.read(&mut sink);
+                    continue;
+                }
                 let body = body_for(&path);
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -3208,21 +3184,6 @@ mod tests {
             }
         });
         Site { addr, hits, stop }
-    }
-
-    /// A gate over a policy that allows exactly one address.
-    fn gate(allowed: &[&str], tool: &'static str) -> Arc<EgressGate> {
-        let policy = Arc::new(PolicySet::compile_baseline(
-            agent::policy::PolicyData::new("/tmp")
-                .with_egress_allowlist(allowed.iter().map(|entry| entry.to_string())),
-        ));
-        Arc::new(EgressGate::new(
-            policy,
-            Arc::new(SystemResolver),
-            "session-test",
-            "preset-test",
-            tool,
-        ))
     }
 
     /// A browser with nothing loaded.
@@ -3252,8 +3213,7 @@ mod tests {
     fn a_ref_from_the_snapshot_clicks_the_right_element() {
         let site = site();
         let handle = browser();
-        let gate = gate(&["127.0.0.1"], "browser_click");
-        navigate(&handle, &gate, &site.url("/")).expect("the page loads");
+        navigate(&handle, &site.url("/")).expect("the page loads");
         let link = refs(&handle, "link").remove(0);
         let act = handle
             .mutate(|browser| browser.activate(&link))
@@ -3262,7 +3222,7 @@ mod tests {
             panic!("a link navigates");
         };
         assert!(url.ends_with("/second"), "the link's own target: {url}");
-        navigate(&handle, &gate, &url).expect("the second page loads");
+        navigate(&handle, &url).expect("the second page loads");
         let snapshot = handle.read(|browser| browser.snapshot()).expect("a page");
         assert_eq!(snapshot.title, "Second Page");
         assert_eq!(site.hits(), 2, "two requests");
@@ -3273,8 +3233,7 @@ mod tests {
     fn typing_into_a_field_shows_the_value_in_the_snapshot() {
         let site = site();
         let handle = browser();
-        let gate = gate(&["127.0.0.1"], "browser_open");
-        navigate(&handle, &gate, &site.url("/")).expect("the page loads");
+        navigate(&handle, &site.url("/")).expect("the page loads");
         let field = refs(&handle, "input").remove(0);
         handle
             .mutate(|browser| browser.type_into(&field, "bos harness"))
@@ -3297,10 +3256,9 @@ mod tests {
     fn a_stale_ref_says_the_page_changed() {
         let site = site();
         let handle = browser();
-        let gate = gate(&["127.0.0.1"], "browser_click");
-        navigate(&handle, &gate, &site.url("/")).expect("the page loads");
+        navigate(&handle, &site.url("/")).expect("the page loads");
         let old = refs(&handle, "link").remove(0);
-        navigate(&handle, &gate, &site.url("/second")).expect("the second page loads");
+        navigate(&handle, &site.url("/second")).expect("the second page loads");
         // The second page has no elements at all, so the old ref cannot name
         // anything on it.
         let error = handle
@@ -3312,7 +3270,7 @@ mod tests {
         );
         // And on a page that DOES have elements, the stale ref still names
         // nothing, because ids are monotonic across documents.
-        navigate(&handle, &gate, &site.url("/")).expect("back to the first page");
+        navigate(&handle, &site.url("/")).expect("back to the first page");
         let fresh = refs(&handle, "link").remove(0);
         assert_ne!(fresh, old, "a reloaded page re-mints its refs");
         let error = handle
@@ -3321,47 +3279,12 @@ mod tests {
         assert!(error.contains("page changed"), "{error}");
     }
 
-    /// A URL outside the allowlist is refused with the rule named, and the
-    /// listener sees nothing at all.
-    #[test]
-    fn a_refused_url_names_the_rule_and_sends_no_request() {
-        let site = site();
-        let handle = browser();
-        // The allowlist names an address that is not this site's, so the policy
-        // refuses 127.0.0.1 before a socket exists.
-        let gate = gate(&["192.0.2.1"], "browser_open");
-        let failure = navigate(&handle, &gate, &site.url("/")).expect_err("the policy refuses it");
-        assert_eq!(failure.kind, "policy", "{failure:?}");
-        assert_eq!(
-            failure.rule.as_deref(),
-            Some("egress-not-allowlisted"),
-            "the refusal names the rule: {failure:?}"
-        );
-        assert!(
-            failure.message.contains("egress-not-allowlisted"),
-            "the prose names it too: {}",
-            failure.message
-        );
-        assert!(
-            failure.tool_message().contains("No request was made"),
-            "{}",
-            failure.tool_message()
-        );
-        assert_eq!(site.hits(), 0, "the listener saw no request");
-        assert_eq!(
-            handle.read(|browser| browser.status()),
-            Status::Failed,
-            "a refused load leaves no page"
-        );
-    }
-
     /// A snapshot's text is capped, and the payload says so.
     #[test]
     fn the_snapshot_text_is_capped_and_the_cap_is_visible() {
         let site = site();
         let handle = browser();
-        let gate = gate(&["127.0.0.1"], "browser_open");
-        navigate(&handle, &gate, &site.url("/long")).expect("the page loads");
+        navigate(&handle, &site.url("/long")).expect("the page loads");
         let snapshot = handle.read(|browser| browser.snapshot()).expect("a page");
         assert_eq!(snapshot.text_cap, TEXT_CAP);
         assert_eq!(
@@ -3381,12 +3304,58 @@ mod tests {
         assert_eq!(json["text_chars"], serde_json::json!(TEXT_CAP));
     }
 
+    /// The direct fetch stops at the byte cap and cuts on a character boundary.
+    ///
+    /// The page promises 4 MiB and never sends EOF, so a fetch that waits for
+    /// the whole body cannot return. Every character is three bytes and the
+    /// prefix is 48, so a cut at the 2 MiB cap lands two bytes inside a
+    /// character: the tail must be dropped, not turned into U+FFFD.
+    #[test]
+    fn the_direct_fetch_stops_at_the_byte_cap_and_cuts_on_a_character() {
+        let site = site();
+        let started = std::time::Instant::now();
+        let page = fetch_direct(&site.url("/endless")).expect("the capped fetch returns");
+        let elapsed = started.elapsed();
+        let cap = FetchLimits::default().max_body;
+        assert!(page.body_truncated, "the cap cut the body");
+        assert!(
+            page.body.len() <= cap,
+            "kept {} bytes of a {cap}-byte cap",
+            page.body.len()
+        );
+        assert_eq!(
+            page.body.len(),
+            cap - 2,
+            "the two bytes of a half-read character are not kept"
+        );
+        assert!(page.body.ends_with('€'), "the last character is whole");
+        assert!(
+            !page.body.contains('\u{FFFD}'),
+            "a partial character became a replacement"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the fetch waited for the whole body: {elapsed:?}"
+        );
+        assert_eq!(site.hits(), 1, "one request");
+    }
+
+    /// A cut tail inside a character is dropped, not replaced.
+    #[test]
+    fn a_cut_tail_inside_a_character_is_dropped() {
+        // The first two bytes of '€' (E2 82 AC): the third never arrived.
+        assert_eq!(decode_body(&[b'a', 0xE2, 0x82]), "a");
+        // A complete one survives.
+        assert_eq!(decode_body(&[b'a', 0xE2, 0x82, 0xAC]), "a€");
+        // Invalid bytes that are not a truncated tail are content.
+        assert_eq!(decode_body(&[b'a', 0xFF, b'b']), "a\u{FFFD}b");
+    }
+
     /// Only http(s) reaches a policy question.
     #[test]
     fn a_non_http_scheme_is_refused_before_any_request() {
         let handle = browser();
-        let gate = gate(&["127.0.0.1"], "browser_open");
-        let failure = navigate(&handle, &gate, "file:///etc/passwd").expect_err("refused");
+        let failure = navigate(&handle, "file:///etc/passwd").expect_err("refused");
         assert_eq!(failure.kind, "scheme", "{failure:?}");
         assert!(
             failure.tool_message().contains("http(s)"),
@@ -3400,11 +3369,10 @@ mod tests {
     fn history_back_restores_the_page_with_new_refs() {
         let site = site();
         let handle = browser();
-        let gate = gate(&["127.0.0.1"], "browser_open");
-        navigate(&handle, &gate, &site.url("/")).expect("the page loads");
+        navigate(&handle, &site.url("/")).expect("the page loads");
         let first = handle.read(|browser| browser.snapshot()).unwrap().title;
         let old_ref = refs(&handle, "link").remove(0);
-        navigate(&handle, &gate, &site.url("/second")).expect("the second page loads");
+        navigate(&handle, &site.url("/second")).expect("the second page loads");
         let hits = site.hits();
         handle
             .mutate(|browser| browser.back())
@@ -3424,8 +3392,7 @@ mod tests {
     fn a_get_form_submits_its_fields() {
         let site = site();
         let handle = browser();
-        let gate = gate(&["127.0.0.1"], "browser_open");
-        navigate(&handle, &gate, &site.url("/")).expect("the page loads");
+        navigate(&handle, &site.url("/")).expect("the page loads");
         let field = refs(&handle, "input").remove(0);
         handle
             .mutate(|browser| browser.type_into(&field, "bos harness"))
@@ -3454,8 +3421,7 @@ mod tests {
     fn a_local_page_arrives_with_its_title_text_and_elements() {
         let site = site();
         let handle = browser();
-        let gate = gate(&["127.0.0.1"], "browser_open");
-        navigate(&handle, &gate, &site.url("/")).expect("the page loads");
+        navigate(&handle, &site.url("/")).expect("the page loads");
         let snapshot = handle.read(|browser| browser.snapshot()).expect("a page");
         assert_eq!(snapshot.title, "Test Page");
         assert!(
@@ -3480,15 +3446,14 @@ mod tests {
         assert_eq!(json["elements_total"], serde_json::json!(3));
         assert_eq!(json["text_truncated"], serde_json::json!(false));
     }
-    /// A real HTTPS page through the same gate. Network-dependent, so it is
+    /// A real HTTPS page through the same direct fetch. Network-dependent, so it is
     /// ignored by default; run it with --ignored when a browser "does not
     /// render" to separate the transport from the pane.
     #[test]
     #[ignore]
     fn probe_https_example_com() {
         let handle = browser();
-        let gate = gate(&["0.0.0.0/0", "::/0"], "browser_open");
-        let outcome = navigate(&handle, &gate, "https://example.com/");
+        let outcome = navigate(&handle, "https://example.com/");
         match outcome {
             Ok(()) => {
                 let snapshot = handle.read(|browser| browser.snapshot()).expect("a page");

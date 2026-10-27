@@ -14,9 +14,6 @@
 //!   websocket and owns the single reader/writer thread.
 //! - `cdp::wire` is JSON-RPC 2.0 plus the RFC 6455 socket.
 //! - `cdp` is the high-level page vocabulary the Browser model consumes.
-//! - `gate` is the egress gate: the loopback proxy the process is launched
-//!   with, which asks the SAME `EgressGate` the tools ask before any origin
-//!   socket exists.
 //!
 //! # Frames
 //!
@@ -28,14 +25,12 @@
 //! cadence adapts: fast while the page changes, idle once it does not.
 
 pub(crate) mod cdp;
-pub(crate) mod gate;
 pub(crate) mod reap;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub(crate) use cdp::{Engine, EngineError, Navigation, Page, Settle};
-pub(crate) use gate::Gate;
 
 /// One decoded frame, addressed by a sequence number.
 #[derive(Debug, Clone)]

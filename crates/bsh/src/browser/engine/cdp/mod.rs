@@ -36,12 +36,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use agent::policy::EgressGate;
 use serde_json::{json, Value};
 
-use crate::browser::NetworkMode;
-
-use super::gate::Gate;
 use super::FrameSlot;
 use client::{Client, NETWORK_IDLE};
 use wire::RpcError;
@@ -238,13 +234,6 @@ pub(crate) enum Settle {
 pub(crate) enum Navigation {
     /// The page loaded.
     Loaded,
-    /// The policy refused the URL before any request existed.
-    Refused {
-        /// The rule that refused, when the policy named one.
-        rule: Option<String>,
-        /// The policy's own prose.
-        message: String,
-    },
 }
 
 /// One element as the live DOM describes it.
@@ -350,13 +339,12 @@ impl std::fmt::Debug for Engine {
 }
 
 impl Engine {
-    /// Start the engine over `gate` and publish its frames into `frames`.
+    /// Start the engine and publish its frames into `frames`.
     pub(crate) fn launch(
-        gate: Arc<Gate>,
         frames: Arc<FrameSlot>,
         viewport: (u32, u32),
     ) -> Result<Self, EngineError> {
-        Self::launch_in(gate, frames, viewport, &client::default_state_dir())
+        Self::launch_in(frames, viewport, &client::default_state_dir())
     }
 
     /// Launch with an explicit pidfile directory.
@@ -364,12 +352,11 @@ impl Engine {
     /// Tests use a scratch path so the engine's crash bookkeeping never touches
     /// `~/.bos`; production uses the harness data directory.
     pub(crate) fn launch_in(
-        gate: Arc<Gate>,
         frames: Arc<FrameSlot>,
         viewport: (u32, u32),
         state_dir: &std::path::Path,
     ) -> Result<Self, EngineError> {
-        let client = Arc::new(Client::launch_at(gate, viewport, state_dir)?);
+        let client = Arc::new(Client::launch_at(viewport, state_dir)?);
         let engine = Self {
             client,
             viewport: Mutex::new((viewport.0.max(1), viewport.1.max(1))),
@@ -383,44 +370,22 @@ impl Engine {
         Ok(engine)
     }
 
-    /// The gate the process was launched with.
-    pub(crate) fn gate(&self) -> &Arc<Gate> {
-        self.client.gate()
-    }
-
-    /// The client, for the request seam's own diagnostics.
+    /// The client. Tests read its own counters; nothing else needs it.
+    #[cfg(test)]
     pub(crate) fn client(&self) -> &Arc<Client> {
         &self.client
     }
 
-    /// Navigate, after asking the policy.
-    ///
-    /// The policy is asked HERE, before `Page.navigate` exists: that is what
-    /// makes a refusal produce no request at all. The process's loopback gate
-    /// asks the same policy again for every subresource, which is the part a
-    /// document check cannot cover.
-    /// Navigate with an explicit settle: [`Settle::Idle`] for a tool that
-    /// reads the page, [`Settle::Paint`] for the pane whose frame is already
-    /// live while the idle window would run. One entry point, so a caller has
-    /// to say which need it has.
-    pub(crate) fn navigate_settling(
-        &self,
-        gate: &Arc<EgressGate>,
-        url: &str,
-        mode: NetworkMode,
-        settle: Settle,
-    ) -> Result<Navigation, EngineError> {
-        if let Err(denial) = Gate::preflight(gate, url, mode) {
-            return Ok(Navigation::Refused {
-                rule: denial.rule,
-                message: denial.message,
-            });
-        }
-        // The proxy this process was launched with follows the same choice, so
-        // a Strict session cannot tunnel a SUBRESOURCE the document check
-        // allowed.
-        self.client.gate().set_mode(mode);
-        self.client.gate().set_gate(gate.clone());
+/** Navigate with an explicit settle: [`Settle::Idle`] for a tool that
+    reads the page, [`Settle::Paint`] for the pane whose frame is already
+    live while the idle window would run. One entry point, so a caller has
+    to say which need it has.
+
+    DIRECT, on purpose (owner decision): the browser asks no egress policy,
+    before or after the socket. The shell tool and the MCP transport are the
+    paths the workspace allowlist governs; this pane reaches the network the
+    way any browser does. */
+    pub(crate) fn navigate_settling(&self, url: &str, settle: Settle) -> Result<Navigation, EngineError> {
         self.load(url, settle)
     }
 
@@ -781,14 +746,8 @@ impl Engine {
         Ok(true)
     }
 
-    /// Reload as a new request, through the policy.
-    pub(crate) fn reload(
-        &self,
-        gate: &Arc<EgressGate>,
-        mode: NetworkMode,
-    ) -> Result<(), EngineError> {
-        self.client.gate().set_mode(mode);
-        self.client.gate().set_gate(gate.clone());
+    /// Reload as a new request. Direct, like every navigation here.
+    pub(crate) fn reload(&self) -> Result<(), EngineError> {
         let before = self.client.shared().loads();
         self.client.call("Page.reload", json!({}))?;
         self.client.wait_load(before, LOAD_TIMEOUT);

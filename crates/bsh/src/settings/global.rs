@@ -534,14 +534,6 @@ pub(crate) struct General {
     pub(crate) traj_actual_time: bool,
     /// Where a link in a message opens.
     pub(crate) link_opening: String,
-    /// What the rendered Browser may put on the wire: "proxied" or "strict".
-    ///
-    /// A machine preference, because the limit it names is the transport's, not
-    /// a workspace's: a plain http request is authorized on its full path,
-    /// while an https page is a CONNECT tunnel this pane does not terminate.
-    /// "proxied" (the default) allows https and gates it at host:port;
-    /// "strict" refuses the tunnel so nothing crosses un-terminated.
-    pub(crate) browser_network_mode: String,
     /// What Enter does while a turn streams.
     pub(crate) composer_enter: String,
     /// How much performance and usage detail to show.
@@ -624,7 +616,6 @@ impl Default for General {
             // every block at the instant it happened.
             traj_actual_time: true,
             link_opening: "sidebar".to_string(),
-            browser_network_mode: "proxied".to_string(),
             composer_enter: "queue".to_string(),
             performance_usage: "detailed".to_string(),
             developer_tools: true,

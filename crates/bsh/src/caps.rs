@@ -993,19 +993,14 @@ fn build_agent_for_session_inner(
         }
     }
 
-    // The built-in browser: its tools act on ONE shared pane and ask the SAME
-    // policy every other tool asks. The handle is the shell's, so a call and the
-    // reader's pane show the same document; a pricing build passes its own.
-    crate::browser::attach(
-        &mut agent,
-        crate::browser::Tools {
-            browser,
-            policy: policy.clone(),
-            session: session.to_string(),
-            preset: preset.clone(),
-            network_mode: settings.browser_network_mode(),
-        },
-    );
+    // The built-in browser: its tools act on ONE shared pane. The handle is the
+    // shell's, so a call and the reader's pane show the same document; a pricing
+    // build passes its own.
+    //
+    // The browser asks NO egress policy (owner decision): it is direct. The
+    // policy, session and preset it once carried for its gate belong to the
+    // shell tool and the MCP transport, which still ask them.
+    crate::browser::attach(&mut agent, crate::browser::Tools { browser });
 
     // The local web-search tool. It asks the SAME policy the browser and the
     // shell ask, and it is offered only when the reader (or the preset) wants

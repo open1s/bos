@@ -1300,8 +1300,7 @@ impl Shell {
                         .min_w_0()
                         .child(Input::new(&self.browser_url).appearance(false).h(px(26.0))),
                 )
-                .child(self.browser_go_control(cx))
-                .child(self.browser_network_mode_chip()),
+                .child(self.browser_go_control(cx)),
         );
         let live = self.state.browser.engine_ready();
         if live {
@@ -1329,19 +1328,6 @@ impl Shell {
     /// infer it: `Proxied` allows https (authorized at host and port) and
     /// `Strict` refuses it, because this pane does not terminate TLS and will
     /// not pretend a path rule inside an encrypted page was enforced.
-    fn browser_network_mode_chip(&self) -> impl IntoElement {
-        let mode = self.state.settings.browser_network_mode();
-        let label = self.state.lang.tr(mode.label_key());
-        div()
-            .debug_selector(|| String::from("browser-network-mode"))
-            .flex_none()
-            .px(px(6.0))
-            .py(px(2.0))
-            .rounded(px(6.0))
-            .bg(rgb(theme::new_session_fill()))
-            .child(txt(label, theme::RIGHT_HINT_SIZE, theme::muted()))
-    }
-
     /// One navigation control: a glyph that dims when the action cannot run.
     fn browser_icon(
         &self,
@@ -1505,19 +1491,10 @@ impl Shell {
                     .font_weight(FontWeight::MEDIUM),
             )
             .child(
-                // A Strict-mode refusal is the reader's own setting talking, so
-                // the sentence is localized; every other failure is the
-                // producer's own prose.
-                txt(
-                    if failure.rule.as_deref() == Some(crate::browser::engine::gate::STRICT_RULE) {
-                        lang.tr("right.browser.strictRefused").to_string()
-                    } else {
-                        failure.message.clone()
-                    },
-                    theme::CHIP_SIZE,
-                    theme::text(),
-                )
-                .line_height(px(16.0)),
+                // The producer's own prose: with the browser direct there is no
+                // setting of the reader's that could be the thing refusing.
+                txt(failure.message.clone(), theme::CHIP_SIZE, theme::text())
+                    .line_height(px(16.0)),
             );
         if let Some(rule) = failure.rule.clone() {
             note = note.child(txt(
@@ -3789,37 +3766,6 @@ impl Shell {
         cx.notify();
     }
 
-    /// The policy a browser navigation asks.
-    ///
-    /// It is the SAME compiled set the turn's tools ask and the audit pane
-    /// reads - deliberately not a fresh compile: a denial recorded here has to
-    /// land in the ring the reader can see, and a second PolicySet would carry
-    /// a second ring. A shell with no compiled policy yet (no turn has been
-    /// priced) compiles one through the same constructor the turn uses, so the
-    /// rules can still not differ; the only thing that is missing in that case
-    /// is a ring to record into.
-    fn browser_policy(&self) -> std::sync::Arc<agent::policy::PolicySet> {
-        match self.state.policy.clone() {
-            Some(policy) => policy,
-            None => {
-                let eff = self.state.effective();
-                crate::caps::policy_for_effective(&self.state.settings, &eff)
-            }
-        }
-    }
-
-    /// The gate one navigation asks, named for the audit row it produces.
-    fn browser_gate(&self, tool: &'static str) -> std::sync::Arc<agent::policy::EgressGate> {
-        let eff = self.state.effective();
-        std::sync::Arc::new(agent::policy::EgressGate::new(
-            self.browser_policy(),
-            std::sync::Arc::new(agent::policy::SystemResolver),
-            self.state.active_id.clone().unwrap_or_default(),
-            eff.preset_id,
-            tool,
-        ))
-    }
-
     /// Navigate from the address bar: the one control a reader presses to open
     /// a page.
     pub(crate) fn browser_submit(&mut self, cx: &mut Context<Self>) {
@@ -3834,7 +3780,6 @@ impl Shell {
 
     /// Start a navigation, showing the loading state on this frame.
     pub(crate) fn browser_go(&mut self, url: String, cx: &mut Context<Self>) {
-        let gate = self.browser_gate("browser_open");
         let handle = self.state.browser.clone();
         // Begin here, not on the worker: the press has to have an answer before
         // the request exists, or the pane looks inert for a frame or two.
@@ -3844,24 +3789,15 @@ impl Shell {
         // The GPUI background executor, not the runner's tokio runtime: this is
         // work the window started, and it is the executor the test scheduler
         // can drive deterministically.
-        let mode = self.state.settings.browser_network_mode();
         let task = cx.background_executor().spawn({
             let handle = handle.clone();
-            let gate = gate.clone();
             let url = url.clone();
             // The pane reads the frame, which is live while the tool path's
             // idle window would run: one paint beat after the load event, and
             // the toolbar, address bar and history buttons keep up with what
             // is already on screen.
             async move {
-                crate::browser::load(
-                    &handle,
-                    &gate,
-                    &url,
-                    seq,
-                    mode,
-                    crate::browser::engine::Settle::Paint,
-                )
+                crate::browser::load(&handle, &url, seq, crate::browser::engine::Settle::Paint)
             }
         });
         cx.spawn(async move |this, cx| {
@@ -3893,12 +3829,10 @@ impl Shell {
         if self.state.browser.engine_ready() || self.state.browser.engine_error().is_some() {
             return;
         }
-        let gate = self.browser_gate("browser_prewarm");
-        let mode = self.state.settings.browser_network_mode();
         let handle = self.state.browser.clone();
         let task = cx
             .background_executor()
-            .spawn(async move { handle.ensure_engine(&gate, mode).map(|_| ()) });
+            .spawn(async move { handle.ensure_engine().map(|_| ()) });
         cx.spawn(async move |this, cx| {
             let outcome = task.await;
             let _ = this.update(cx, |this, cx| {
@@ -4080,7 +4014,6 @@ impl Shell {
         let Some(render) = self.browser_render.clone() else {
             return self.browser_engine_notice();
         };
-        let refusal = crate::browser::engine_refusal(&self.state.browser);
         let bounds = self.browser_bounds.clone();
         let tracked = bounds.clone();
         // Non-printable keys (Backspace, the arrows, Delete) reach AppKit's input
@@ -4092,25 +4025,7 @@ impl Shell {
         // keydown plus char, and inserting it here too would double it.
         let command_focus = self.browser_focus.clone();
         let command_shell = cx.entity();
-        let mut column = div().flex_1().min_h_0().w_full().flex().flex_col();
-        if let Some(refusal) = refusal {
-            // A page can load with one resource refused; say so rather than
-            // letting a missing image look like a broken renderer.
-            column = column.child(
-                div()
-                    .debug_selector(|| String::from("browser-seam-refused"))
-                    .flex_none()
-                    .w_full()
-                    .px(px(theme::RIGHT_PAD))
-                    .py(px(4.0))
-                    .bg(rgb(theme::hover()))
-                    .child(
-                        txt(refusal, theme::CHIP_SIZE, theme::muted())
-                            .line_height(px(15.0))
-                            .truncate(),
-                    ),
-            );
-        }
+        let column = div().flex_1().min_h_0().w_full().flex().flex_col();
         column
             .child(
                 div()

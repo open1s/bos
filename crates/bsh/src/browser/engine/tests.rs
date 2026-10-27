@@ -1,4 +1,4 @@
-//! The engine's own tests: a real Obscura process, a real page, a real gate.
+//! The engine's own tests: a real Obscura process and a real page.
 //!
 //! # Why these tests skip instead of failing
 //!
@@ -6,41 +6,33 @@
 //! in `docs/bsh-browser-substrate.md`). A checkout that has not installed it
 //! still has to pass `cargo test -p bsh --lib`, so a test that needs the binary
 //! returns early with a line on stderr instead of failing. Everything that can
-//! be proved without it - the wire, the base64 decoder, the snapshot parser, the
-//! proxy's request rewriting - is a plain unit test in its own module.
+//! be proved without it - the wire, the base64 decoder, the snapshot parser -
+//! is a plain unit test in its own module.
 //!
 //! # What these prove
 //!
 //! 1. A live page's script-written text is the snapshot's text, its elements get
 //!    stable `data-bsh-ref` stamps, a real click and a real type reach it, and
 //!    a PNG capture is a styled page rather than a blank rectangle.
-//! 2. A refused URL produces ZERO sockets: the refused origin's live listener
-//!    stays at zero while the allowed origin's moves, which is the
-//!    discrimination that makes the zero mean something.
-//! 3. A refused SUBRESOURCE (an image from another origin) is the same zero,
-//!    while the page's allowed parts load.
+//! 2. The browser's model is fed by the live engine: a navigation through the
+//!    shared path lands the page's own text and elements.
+//! 3. Keyboard and pointer input reach the page: Enter submits, the editing keys
+//!    edit, a chord pastes once, and a double click selects a word.
 //! 4. Dropping the engine leaves no listener and no child.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent::policy::{EgressGate, PolicyData, PolicySet, SystemResolver};
 
 use super::cdp::client::{dev_binary, discover_binary};
-use super::gate::{Gate, STRICT_RULE};
 use super::{Engine, FrameSlot, Navigation, Settle};
-use crate::browser::NetworkMode;
 
-/// How long a proof waits for a subresource the proxy should have refused.
-const SETTLE: Duration = Duration::from_millis(700);
-
-/// A loopback origin with a hit counter, serving one body for every path.
+/// A loopback origin that records every path it served, one body for all of them.
 struct Origin {
     port: u16,
-    hits: Arc<AtomicUsize>,
     /// Every request path the origin actually saw, in order. A path-scoped
     /// refusal is proved by a MISSING entry, so the recording is the proof.
     paths: Arc<std::sync::Mutex<Vec<String>>>,
@@ -51,10 +43,8 @@ impl Origin {
     fn start(body: String) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
         let port = listener.local_addr().expect("the port").port();
-        let hits = Arc::new(AtomicUsize::new(0));
         let paths = Arc::new(std::sync::Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
-        let counter = hits.clone();
         let seen = paths.clone();
         let flag = stop.clone();
         std::thread::spawn(move || {
@@ -68,7 +58,6 @@ impl Origin {
                 if read == 0 {
                     continue;
                 }
-                counter.fetch_add(1, Ordering::SeqCst);
                 let request = String::from_utf8_lossy(&buffer[..read]).to_string();
                 let path = request
                     .lines()
@@ -88,16 +77,7 @@ impl Origin {
                 let _ = stream.flush();
             }
         });
-        Self {
-            port,
-            hits,
-            paths,
-            stop,
-        }
-    }
-
-    fn hits(&self) -> usize {
-        self.hits.load(Ordering::SeqCst)
+        Self { port, paths, stop }
     }
 
     /// Whether any request path starts with `prefix`.
@@ -124,40 +104,6 @@ impl Drop for Origin {
     }
 }
 
-/// A gate over a policy that allows loopback only on these ports.
-fn gate_for(ports: &[u16]) -> Arc<EgressGate> {
-    let policy = Arc::new(PolicySet::compile_baseline(
-        PolicyData::new("/tmp")
-            .with_egress_hosts(["127.0.0.1"])
-            .with_egress_ports(ports.iter().copied()),
-    ));
-    Arc::new(EgressGate::new(
-        policy,
-        Arc::new(SystemResolver),
-        "session-test",
-        "preset-test",
-        "browser_open",
-    ))
-}
-
-/// A gate over a policy that allows loopback on these ports AND denies these
-/// URL path prefixes.
-fn gate_for_paths(ports: &[u16], deny_paths: &[&str]) -> Arc<EgressGate> {
-    let policy = Arc::new(PolicySet::compile_baseline(
-        PolicyData::new("/tmp")
-            .with_egress_hosts(["127.0.0.1"])
-            .with_egress_ports(ports.iter().copied())
-            .with_egress_deny_paths(deny_paths.iter().copied()),
-    ));
-    Arc::new(EgressGate::new(
-        policy,
-        Arc::new(SystemResolver),
-        "session-test",
-        "preset-test",
-        "browser_open",
-    ))
-}
-
 /// A scratch directory for the engine's pidfiles, unique per test process and
 /// per call, so two engine tests never clear each other's bookkeeping.
 fn scratch_state(label: &str) -> std::path::PathBuf {
@@ -176,26 +122,18 @@ fn scratch_state(label: &str) -> std::path::PathBuf {
 }
 
 /// Start an engine, or skip the test when the binary is not installed.
-fn engine(ports: &[u16]) -> Option<(Arc<Engine>, Arc<Gate>)> {
+fn engine() -> Option<Arc<Engine>> {
     if discover_binary().is_err() {
         eprintln!("SKIP: no obscura binary (set BSH_OBSCURA_BIN or put obscura on PATH)");
         return None;
     }
-    let gate = Gate::start(
-        gate_for(ports).policy().clone(),
-        "session-test",
-        "preset-test",
-        NetworkMode::Proxied,
-    )
-    .expect("the loopback gate could bind");
     let started = Engine::launch_in(
-        gate.clone(),
         Arc::new(FrameSlot::default()),
         (800, 600),
         &scratch_state("engine"),
     );
     match started {
-        Ok(engine) => Some((Arc::new(engine), gate)),
+        Ok(engine) => Some(Arc::new(engine)),
         Err(error) => {
             // A binary that is present but cannot start is a real failure, not
             // a skip: the message is the engine's own.
@@ -205,42 +143,34 @@ fn engine(ports: &[u16]) -> Option<(Arc<Engine>, Arc<Gate>)> {
 }
 
 /// The page the live tests navigate to.
-fn page(refused_port: Option<u16>) -> String {
-    let image = match refused_port {
-        Some(port) => format!(
-            "<img id=\"remote\" src=\"http://127.0.0.1:{port}/pixel.png\" width=\"20\" height=\"20\">"
-        ),
-        None => String::new(),
-    };
-    format!(
+fn page() -> String {
+    String::from(
         "<!doctype html><html><head><title>Styled Probe</title>\
-         <style>body{{font-family:-apple-system,Helvetica,Arial;margin:0;padding:24px}}\
-         h1{{color:#4176e6;font-size:40px;margin:0 0 12px}}\
-         .box{{width:200px;height:80px;background:#e04141}}\
-         p{{font-size:18px}}</style></head><body>\
+         <style>body{font-family:-apple-system,Helvetica,Arial;margin:0;padding:24px}\
+         h1{color:#4176e6;font-size:40px;margin:0 0 12px}\
+         .box{width:200px;height:80px;background:#e04141}\
+         p{font-size:18px}</style></head><body>\
          <h1 id=\"h\">Styled Heading</h1><div class=\"box\" id=\"box\"></div>\
          <p id=\"out\">script did not run</p>\
          <p>Chinese: 你好，世界！这是中文渲染测试。</p>\
          <a id=\"link\" href=\"/next\">a link</a>\
          <button id=\"btn\">Press me</button>\
          <input id=\"field\" placeholder=\"type here\">\
-         {image}</body>\
+         </body>\
          <script>document.getElementById('out').textContent='FROM SCRIPT 1+2='+(1+2);\
-         document.getElementById('btn').addEventListener('click',function(){{document.getElementById('out').textContent='BUTTON CLICKED';}});</script></html>"
+         document.getElementById('btn').addEventListener('click',function(){document.getElementById('out').textContent='BUTTON CLICKED';});</script></html>",
     )
 }
 
 #[test]
 fn a_live_page_answers_with_script_text_stable_refs_real_input_and_a_styled_capture() {
-    let origin = Origin::start(page(None));
-    let Some((engine, _gate)) = engine(&[origin.port]) else {
+    let origin = Origin::start(page());
+    let Some(engine) = engine() else {
         return;
     };
     let navigation = engine
         .navigate_settling(
-            &gate_for(&[origin.port]),
             &format!("http://127.0.0.1:{}/", origin.port),
-            NetworkMode::Proxied,
             Settle::Idle,
         )
         .expect("navigate should answer");
@@ -346,138 +276,16 @@ fn a_live_page_answers_with_script_text_stable_refs_real_input_and_a_styled_capt
 }
 
 #[test]
-fn a_refused_url_makes_no_request_and_an_allowed_one_moves_the_same_counter() {
-    let allowed = Origin::start(page(None));
-    let refused = Origin::start(String::from("<html><title>refused</title></html>"));
-    let Some((engine, _gate)) = engine(&[allowed.port]) else {
-        return;
-    };
-
-    // The refusal: the pre-flight asks the policy before Page.navigate.
-    let navigation = engine
-        .navigate_settling(
-            &gate_for(&[allowed.port]),
-            &format!("http://127.0.0.1:{}/", refused.port),
-            NetworkMode::Proxied,
-            Settle::Idle,
-        )
-        .expect("a refusal is an answer, not a failure");
-    match navigation {
-        Navigation::Refused { rule, message } => {
-            assert!(
-                rule.as_deref().unwrap_or_default().contains("port")
-                    || message.to_lowercase().contains("port"),
-                "the refusal should name the port rule: {rule:?} {message}"
-            );
-        }
-        Navigation::Loaded => panic!("the refused origin must not load"),
-    }
-    assert_eq!(
-        refused.hits(),
-        0,
-        "a refused URL must produce NO origin socket"
-    );
-
-    // Discrimination: the SAME counter shape moves for an allowed URL, so the
-    // zero above cannot pass by a gate that refuses everything.
-    let navigation = engine
-        .navigate_settling(
-            &gate_for(&[allowed.port]),
-            &format!("http://127.0.0.1:{}/", allowed.port),
-            NetworkMode::Proxied,
-            Settle::Idle,
-        )
-        .expect("the allowed page should load");
-    assert_eq!(navigation, Navigation::Loaded);
-    // A load event settles the page, not the origin's own counter, so the
-    // assertion waits a bounded moment rather than assuming the two orderings.
-    let mut hits = 0;
-    for _ in 0..40 {
-        hits = allowed.hits();
-        if hits >= 1 {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    eprintln!(
-        "PROOF gate: refused origin hits={} allowed origin hits={hits}",
-        refused.hits()
-    );
-    assert!(
-        hits >= 1,
-        "an allowed URL must reach its origin: hits={hits} url={:?} gate(allowed={} refused={}) page={:?}",
-        engine.url(),
-        engine.gate().allowed(),
-        engine.gate().refused(),
-        engine
-            .snapshot(1)
-            .map(|page| page.title)
-            .unwrap_or_default()
-    );
-}
-
-#[test]
-fn a_refused_subresource_stays_at_zero_while_the_allowed_page_loads() {
-    let refused = Origin::start(String::from("<html><title>pixel</title></html>"));
-    let allowed = Origin::start(page(Some(refused.port)));
-    let Some((engine, gate)) = engine(&[allowed.port]) else {
-        return;
-    };
-    let navigation = engine
-        .navigate_settling(
-            &gate_for(&[allowed.port]),
-            &format!("http://127.0.0.1:{}/", allowed.port),
-            NetworkMode::Proxied,
-            Settle::Idle,
-        )
-        .expect("the page should load");
-    assert_eq!(navigation, Navigation::Loaded);
-    let snapshot = engine.snapshot(1).expect("the live DOM should read");
-    assert!(
-        snapshot.text.contains("Styled Heading"),
-        "{:?}",
-        snapshot.text
-    );
-    assert!(allowed.hits() >= 1, "the page itself loaded");
-    std::thread::sleep(SETTLE);
-    assert_eq!(
-        refused.hits(),
-        0,
-        "a refused SUBRESOURCE must produce no socket either"
-    );
-    assert!(
-        gate.refused() >= 1,
-        "the gate must have RECORDED the refusal: allowed={} refused={}",
-        gate.allowed(),
-        gate.refused()
-    );
-    assert!(
-        gate.last().is_some(),
-        "the refusal must carry the policy's own prose"
-    );
-    assert!(
-        engine.client().shared().failed() >= 1,
-        "the Fetch seam should have failed the denied subresource's delivery"
-    );
-}
-
-#[test]
 fn dropping_the_engine_leaves_no_listener_and_no_child() {
-    let origin = Origin::start(page(None));
-    let Some((engine, gate)) = engine(&[origin.port]) else {
+    let origin = Origin::start(page());
+    let Some(engine) = engine() else {
         return;
     };
     engine
-        .navigate_settling(
-            &gate_for(&[origin.port]),
-            &format!("http://127.0.0.1:{}/", origin.port),
-            NetworkMode::Proxied,
-            Settle::Idle,
-        )
+        .navigate_settling(&format!("http://127.0.0.1:{}/", origin.port), Settle::Idle)
         .expect("the page should load");
     let port = engine.client().port();
     assert_ne!(port, 0);
-    drop(gate);
     drop(engine);
     // The port must be closed: the child was killed and reaped, not orphaned.
     let mut closed = false;
@@ -495,15 +303,14 @@ fn dropping_the_engine_leaves_no_listener_and_no_child() {
 }
 #[test]
 fn the_browser_model_is_fed_by_the_live_engine() {
-    let origin = Origin::start(page(None));
+    let origin = Origin::start(page());
     if discover_binary().is_err() {
         eprintln!("SKIP: no obscura binary (set BSH_OBSCURA_BIN or put obscura on PATH)");
         return;
     }
     let handle = crate::browser::BrowserHandle::live();
     let url = format!("http://127.0.0.1:{}/", origin.port);
-    crate::browser::navigate(&handle, &gate_for(&[origin.port]), &url)
-        .expect("the model navigates through the engine");
+    crate::browser::navigate(&handle, &url).expect("the model navigates through the engine");
 
     // The SAME payload shape the text view produces, filled from the live DOM.
     let payload = crate::browser::snapshot_live(&handle).expect("a live snapshot");
@@ -553,21 +360,13 @@ fn the_browser_model_is_fed_by_the_live_engine() {
 /// the launch on its first Go.
 #[test]
 fn a_prewarmed_engine_pays_no_launch_on_its_first_navigation() {
-    let origin = Origin::start(page(None));
+    let origin = Origin::start(page());
     if discover_binary().is_err() {
         eprintln!("SKIP: no obscura binary (set BSH_OBSCURA_BIN or put obscura on PATH)");
         return;
     }
-    let gate = Gate::start(
-        gate_for(&[origin.port]).policy().clone(),
-        "session-test",
-        "preset-test",
-        NetworkMode::Proxied,
-    )
-    .expect("the loopback gate could bind");
     let launched = std::time::Instant::now();
     let engine = Engine::launch_in(
-        gate.clone(),
         Arc::new(FrameSlot::default()),
         (800, 600),
         &scratch_state("prewarm"),
@@ -579,9 +378,7 @@ fn a_prewarmed_engine_pays_no_launch_on_its_first_navigation() {
     let first = std::time::Instant::now();
     let navigation = engine
         .navigate_settling(
-            &gate_for(&[origin.port]),
             &format!("http://127.0.0.1:{}/", origin.port),
-            NetworkMode::Proxied,
             Settle::Idle,
         )
         .expect("navigate answers");
@@ -591,9 +388,7 @@ fn a_prewarmed_engine_pays_no_launch_on_its_first_navigation() {
     let second = std::time::Instant::now();
     let again = engine
         .navigate_settling(
-            &gate_for(&[origin.port]),
             &format!("http://127.0.0.1:{}/?second", origin.port),
-            NetworkMode::Proxied,
             Settle::Idle,
         )
         .expect("navigate answers");
@@ -613,62 +408,6 @@ fn a_prewarmed_engine_pays_no_launch_on_its_first_navigation() {
     );
 }
 
-/// GAP 1 at the engine: the proxied plain-HTTP request is authorized on its
-/// PATH before the origin socket exists. A refused subresource path stays at
-/// ZERO origin hits while the page's allowed parts load - the discrimination
-/// that makes the zero mean something.
-#[test]
-fn a_denied_subresource_path_never_reaches_the_origin() {
-    let html = "<!doctype html><html><body><h1 id=\"h\">allowed page</h1>\
-        <img src=\"/secret/pixel.png\" width=\"20\" height=\"20\">\
-        <p id=\"t\">loaded</p></body></html>";
-    let origin = Origin::start(String::from(html));
-    let Some((engine, _gate)) = engine(&[origin.port]) else {
-        return;
-    };
-    let gate = gate_for_paths(&[origin.port], &["/secret/"]);
-    let navigation = engine
-        .navigate_settling(
-            &gate,
-            &format!("http://127.0.0.1:{}/", origin.port),
-            NetworkMode::Proxied,
-            Settle::Idle,
-        )
-        .expect("the page should load");
-    assert_eq!(navigation, Navigation::Loaded);
-    let snapshot = engine.snapshot(1).expect("the live DOM should read");
-    assert!(
-        snapshot.text.contains("allowed page"),
-        "{:?}",
-        snapshot.text
-    );
-    assert!(
-        origin.saw_path("/"),
-        "the allowed document must reach the origin: {:?}",
-        origin.paths()
-    );
-    std::thread::sleep(SETTLE);
-    assert!(
-        !origin.saw_path("/secret/"),
-        "a path-denied subresource must produce NO origin socket: {:?}",
-        origin.paths()
-    );
-    assert!(
-        engine.gate().refused() >= 1,
-        "the proxy must have RECORDED the path refusal"
-    );
-    assert_eq!(
-        engine
-            .gate()
-            .last()
-            .and_then(|denial| denial.rule)
-            .as_deref(),
-        Some("egress-path-denied"),
-        "{:?}",
-        engine.gate().last()
-    );
-}
-
 /// Enter really submits: a focused field inside a GET form navigates when the
 /// pane's Enter key is forwarded (keyDown + CHAR + keyUp). This is the
 /// deterministic version of the Baidu measurement.
@@ -679,14 +418,12 @@ fn enter_submits_a_focused_form_field() {
         <input name=\"q\" value=\"\"><button id=\"go\">Go</button></form>\
         </body></html>";
     let origin = Origin::start(String::from(html));
-    let Some((engine, _gate)) = engine(&[origin.port]) else {
+    let Some(engine) = engine() else {
         return;
     };
     let navigation = engine
         .navigate_settling(
-            &gate_for(&[origin.port]),
             &format!("http://127.0.0.1:{}/form", origin.port),
-            NetworkMode::Proxied,
             Settle::Idle,
         )
         .expect("the form page should load");
@@ -730,15 +467,13 @@ fn enter_submits_a_focused_form_field() {
 /// keypress). A page's own input handler is the observable.
 #[test]
 fn editing_keys_change_a_field_and_enter_is_a_real_keypress() {
-    let origin = Origin::start(page(None));
-    let Some((engine, _gate)) = engine(&[origin.port]) else {
+    let origin = Origin::start(page());
+    let Some(engine) = engine() else {
         return;
     };
     let navigation = engine
         .navigate_settling(
-            &gate_for(&[origin.port]),
             &format!("http://127.0.0.1:{}/", origin.port),
-            NetworkMode::Proxied,
             Settle::Idle,
         )
         .expect("the page should load");
@@ -777,51 +512,6 @@ fn editing_keys_change_a_field_and_enter_is_a_real_keypress() {
         .expect("Enter dispatches keyDown, char and keyUp");
 }
 
-/// GAP 2 at the engine: Strict refuses an https navigation with the rule named
-/// BEFORE the document request, and plain http on the same engine still loads.
-#[test]
-fn strict_mode_refuses_https_by_rule_and_keeps_http_working() {
-    let origin = Origin::start(page(None));
-    let Some((engine, _gate)) = engine(&[origin.port]) else {
-        return;
-    };
-    let gate = gate_for(&[origin.port]);
-    let refused = engine
-        .navigate_settling(
-            &gate,
-            "https://127.0.0.1/private",
-            NetworkMode::Strict,
-            // A pre-flight refusal does not reach the settle either way; the
-            // tool choice is the one this test states.
-            Settle::Idle,
-        )
-        .expect("a refusal is an answer");
-    match refused {
-        Navigation::Refused { rule, message } => {
-            assert_eq!(rule.as_deref(), Some(STRICT_RULE), "{message}");
-            assert!(
-                message.contains("does not terminate TLS"),
-                "the sentence must say why: {message}"
-            );
-        }
-        Navigation::Loaded => panic!("Strict must not tunnel an https page"),
-    }
-    assert_eq!(
-        origin.hits(),
-        0,
-        "a Strict https refusal must open no request at all"
-    );
-    let loaded = engine
-        .navigate_settling(
-            &gate,
-            &format!("http://127.0.0.1:{}/", origin.port),
-            NetworkMode::Strict,
-            Settle::Idle,
-        )
-        .expect("http still works in Strict");
-    assert_eq!(loaded, Navigation::Loaded);
-}
-
 /// GAP 4: a page that starts a subresource 300 ms after its load event is READ
 /// WITH THAT SUBRESOURCE. `browser_open` waits for networkidle, so the text the
 /// late image's own handler writes is already in the snapshot the open returns.
@@ -837,14 +527,12 @@ fn networkidle_reads_content_a_late_subresource_wrote() {
           img.src = '/late.png';\
         }, 300);</script></body></html>";
     let origin = Origin::start(String::from(html));
-    let Some((engine, _gate)) = engine(&[origin.port]) else {
+    let Some(engine) = engine() else {
         return;
     };
     let navigation = engine
         .navigate_settling(
-            &gate_for(&[origin.port]),
             &format!("http://127.0.0.1:{}/", origin.port),
-            NetworkMode::Proxied,
             Settle::Idle,
         )
         .expect("the page should load");
@@ -869,15 +557,13 @@ fn networkidle_reads_content_a_late_subresource_wrote() {
 /// engine gives its contents a box, and the result says which path ran.
 #[test]
 fn an_inline_link_reports_the_path_its_click_took() {
-    let origin = Origin::start(page(None));
-    let Some((engine, _gate)) = engine(&[origin.port]) else {
+    let origin = Origin::start(page());
+    let Some(engine) = engine() else {
         return;
     };
     let navigation = engine
         .navigate_settling(
-            &gate_for(&[origin.port]),
             &format!("http://127.0.0.1:{}/", origin.port),
-            NetworkMode::Proxied,
             Settle::Idle,
         )
         .expect("the page should load");
@@ -936,14 +622,12 @@ fn editing_chords_reach_the_page_and_paste_inserts_once() {
         ta.addEventListener('cut', function() { window.__counts.cut++; });\
         </script></body></html>";
     let origin = Origin::start(String::from(html));
-    let Some((engine, _gate)) = engine(&[origin.port]) else {
+    let Some(engine) = engine() else {
         return;
     };
     let navigation = engine
         .navigate_settling(
-            &gate_for(&[origin.port]),
             &format!("http://127.0.0.1:{}/", origin.port),
-            NetworkMode::Proxied,
             Settle::Idle,
         )
         .expect("the page should load");
@@ -1053,14 +737,12 @@ fn printable_keys_fire_keydown_and_insert_exactly_once() {
         });\
         </script></body></html>";
     let origin = Origin::start(String::from(html));
-    let Some((engine, _gate)) = engine(&[origin.port]) else {
+    let Some(engine) = engine() else {
         return;
     };
     let navigation = engine
         .navigate_settling(
-            &gate_for(&[origin.port]),
             &format!("http://127.0.0.1:{}/", origin.port),
-            NetworkMode::Proxied,
             Settle::Idle,
         )
         .expect("the page should load");
@@ -1120,14 +802,12 @@ fn a_double_click_selects_the_word_and_a_triple_click_the_line() {
         });\
         </script></body></html>";
     let origin = Origin::start(String::from(html));
-    let Some((engine, _gate)) = engine(&[origin.port]) else {
+    let Some(engine) = engine() else {
         return;
     };
     let navigation = engine
         .navigate_settling(
-            &gate_for(&[origin.port]),
             &format!("http://127.0.0.1:{}/", origin.port),
-            NetworkMode::Proxied,
             Settle::Idle,
         )
         .expect("the page should load");
@@ -1252,14 +932,12 @@ fn a_release_at_the_clamped_edge_clears_the_page_drag() {
         });\
         </script></body></html>";
     let origin = Origin::start(String::from(html));
-    let Some((engine, _gate)) = engine(&[origin.port]) else {
+    let Some(engine) = engine() else {
         return;
     };
     let navigation = engine
         .navigate_settling(
-            &gate_for(&[origin.port]),
             &format!("http://127.0.0.1:{}/", origin.port),
-            NetworkMode::Proxied,
             Settle::Idle,
         )
         .expect("the page should load");
@@ -1368,16 +1046,8 @@ fn the_pump_publishes_bgra_and_only_when_the_page_changes() {
         eprintln!("SKIP: no obscura binary (set BSH_OBSCURA_BIN or put obscura on PATH)");
         return;
     }
-    let gate = Gate::start(
-        gate_for(&[origin.port]).policy().clone(),
-        "session-test",
-        "preset-test",
-        NetworkMode::Proxied,
-    )
-    .expect("the loopback gate could bind");
     let frames = Arc::new(FrameSlot::default());
     let engine = Engine::launch_in(
-        gate.clone(),
         frames.clone(),
         (800, 600),
         &scratch_state("pump"),
@@ -1385,9 +1055,7 @@ fn the_pump_publishes_bgra_and_only_when_the_page_changes() {
     .expect("the engine should start");
     let navigation = engine
         .navigate_settling(
-            &gate_for(&[origin.port]),
             &format!("http://127.0.0.1:{}/", origin.port),
-            NetworkMode::Proxied,
             Settle::Idle,
         )
         .expect("navigate answers");
@@ -1437,8 +1105,8 @@ fn the_pump_publishes_bgra_and_only_when_the_page_changes() {
 /// constants differ by) is what keeps this a proof rather than a stopwatch.
 #[test]
 fn the_pane_settle_lands_before_the_tool_settle() {
-    let origin = Origin::start(page(None));
-    let Some((engine, _gate)) = engine(&[origin.port]) else {
+    let origin = Origin::start(page());
+    let Some(engine) = engine() else {
         return;
     };
     let url = format!("http://127.0.0.1:{}/", origin.port);
@@ -1446,9 +1114,7 @@ fn the_pane_settle_lands_before_the_tool_settle() {
     let tool_started = std::time::Instant::now();
     let tool_result = engine
         .navigate_settling(
-            &gate_for(&[origin.port]),
             &url,
-            NetworkMode::Proxied,
             Settle::Idle,
         )
         .expect("the tool navigation answers");
@@ -1458,9 +1124,7 @@ fn the_pane_settle_lands_before_the_tool_settle() {
     let pane_started = std::time::Instant::now();
     let pane_result = engine
         .navigate_settling(
-            &gate_for(&[origin.port]),
             &format!("{url}?pane"),
-            NetworkMode::Proxied,
             Settle::Paint,
         )
         .expect("the pane navigation answers");
@@ -1495,16 +1159,8 @@ fn a_self_animating_page_is_published_at_the_fast_cadence() {
         eprintln!("SKIP: no obscura binary (set BSH_OBSCURA_BIN or put obscura on PATH)");
         return;
     }
-    let gate = Gate::start(
-        gate_for(&[origin.port]).policy().clone(),
-        "session-test",
-        "preset-test",
-        NetworkMode::Proxied,
-    )
-    .expect("the loopback gate could bind");
     let frames = Arc::new(FrameSlot::default());
     let engine = Engine::launch_in(
-        gate.clone(),
         frames.clone(),
         (800, 600),
         &scratch_state("animated-pump"),
@@ -1512,9 +1168,7 @@ fn a_self_animating_page_is_published_at_the_fast_cadence() {
     .expect("the engine should start");
     let navigation = engine
         .navigate_settling(
-            &gate_for(&[origin.port]),
             &format!("http://127.0.0.1:{}/", origin.port),
-            NetworkMode::Proxied,
             Settle::Idle,
         )
         .expect("navigate answers");
