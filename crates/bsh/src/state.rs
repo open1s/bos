@@ -1833,7 +1833,14 @@ impl AppState {
         if let Some(session) = self.store.session_mut(id) {
             if let Some(message) = session.messages.last_mut() {
                 if message.text.is_empty() && message.error.is_none() {
-                    message.text = "…".to_string();
+                    // A stopped turn is a cancelled turn, not an assistant
+                    // reply that happened to say an ellipsis. Marking it keeps
+                    // it out of the next request and lets the transcript say
+                    // why the turn ended.
+                    message
+                        .meta
+                        .get_or_insert_with(crate::model::MessageMeta::default)
+                        .cancelled = true;
                 }
                 // A stop is terminal too: the turn's measured span ends here.
                 settle_ms(message, stopped);
@@ -2830,7 +2837,19 @@ impl AppState {
         // predates them. Price them too, so the trigger sees the request the
         // turn is actually about to send.
         let appended = crate::model::ContextBreakdown::price(prompt_chars, 0, appended).messages;
-        if priced.total() + appended < budget as u64 {
+        // The reference reserves the reply before it decides: `W - O - B`.
+        // bsh used to compare against the whole window, so a 32k workspace
+        // ceiling let a 31k prompt through even though the request also asked
+        // for up to 12.8k output tokens.
+        let output_reserve = effective
+            .max_tokens
+            .map(|tokens| tokens as usize)
+            .unwrap_or(12_800);
+        let ceiling = budget
+            .saturating_sub(output_reserve.saturating_add(1_024))
+            .min(budget / 5 * 4)
+            .max(1);
+        if priced.total() + appended < ceiling as u64 {
             return None;
         }
         Some((budget as f64 * Self::COMPACT_RETAIN_RATIO) as usize)
@@ -5734,6 +5753,29 @@ mod tests {
         assert!(
             texts.iter().any(|text| text.contains("the answer")),
             "the streamed answer survives the stop: {texts:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stopped turn that produced nothing is CANCELLED, not an assistant
+    /// reply that literally says an ellipsis. The old marker was replayed into
+    /// the next request as if the model had written it.
+    #[test]
+    fn a_stopped_empty_turn_is_cancelled_not_an_ellipsis() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("bsh-stop-cancelled-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut state = super::AppState::with_store(crate::store::Store::open_at(dir.clone()));
+        let id = state.active_id.clone().expect("a session");
+        state.begin_turn_in(&id, "hello").expect("a turn opens");
+        state.stop(&id);
+        let session = state.store.session(&id).expect("the session");
+        let last = session.messages.last().expect("the assistant row");
+        assert!(last.text.is_empty(), "no placeholder text: {:?}", last.text);
+        assert!(
+            last.meta.as_ref().is_some_and(|meta| meta.cancelled),
+            "the row is marked cancelled: {last:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

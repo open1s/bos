@@ -956,6 +956,16 @@ impl ReactSession for AgentSession {
     fn history(&self) -> Option<&[Message]> {
         Some(&self.messages)
     }
+
+    fn estimate_tokens(&self) -> Option<usize> {
+        Some(self.messages.iter().map(estimate_message_tokens).sum())
+    }
+
+    fn compact_mechanical(&mut self, keep_recent: usize, max_summary_chars: usize) -> bool {
+        let before = self.estimate_tokens().unwrap_or(0);
+        self.compact(keep_recent, max_summary_chars);
+        self.estimate_tokens().is_some_and(|after| after < before)
+    }
 }
 
 fn current_timestamp() -> u64 {

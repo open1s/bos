@@ -466,6 +466,45 @@ pub const SANDBOX_SETTINGS_OFF_REASON: &str = "the sandbox is turned off in sett
 /// tier that governs every tool in the turn.
 pub const SANDBOX_RELEASED_REASON: &str = "the full-access permission released the sandbox";
 
+/// Remove ANSI control sequences from captured output.
+///
+/// The model reads these streams as text, not as a terminal: a cargo fmt diff
+/// arrives full of SGR colour codes that cost tokens and obscure the diff. The
+/// stripper covers CSI (ESC [ ... final), charset designation (ESC ( B) and
+/// single-character escapes; it is deliberately small because it runs on every
+/// captured command.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            out.push(ch);
+            continue;
+        }
+        match chars.peek().copied() {
+            Some('[') => {
+                chars.next();
+                // CSI: parameter bytes, then one final byte in @..~.
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            Some('(') | Some(')') => {
+                // Charset designation: ESC ( B, ESC ) 0.
+                chars.next();
+                chars.next();
+            }
+            Some(_) => {
+                chars.next();
+            }
+            None => {}
+        }
+    }
+    out
+}
+
 /// Whether a failed command needs the unproxied-socket explanation.
 ///
 /// Fires only when ALL of these hold, so it can never claim a policy refusal:
@@ -852,8 +891,8 @@ impl Tool for BashTool {
             )));
         }
 
-        let stdout = String::from_utf8_lossy(&stdout).to_string();
-        let stderr = String::from_utf8_lossy(&stderr).to_string();
+        let stdout = strip_ansi(&String::from_utf8_lossy(&stdout));
+        let stderr = strip_ansi(&String::from_utf8_lossy(&stderr));
         let success = status.success();
         let network = self.network_label().to_string();
         let network_diagnostic =
@@ -2553,5 +2592,12 @@ mod tests {
             None,
             "a success must not carry a diagnostic: {quiet}"
         );
+    }
+
+    /// A captured stream is model input, so terminal colour must not reach it.
+    #[test]
+    fn captured_output_loses_ansi_sequences() {
+        let input = "\u{1b}[32m+\u{1b}(B\u{1b}[m plain";
+        assert_eq!(strip_ansi(input), "+ plain");
     }
 }

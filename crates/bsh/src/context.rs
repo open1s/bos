@@ -213,6 +213,25 @@ fn render_layout(root: &Path) -> Option<String> {
     ))
 }
 
+/// Names the layout never advertises.
+///
+/// The baseline deny list makes `.git`, `.bsh`, `.env`, `secrets`, `.ssh` and
+/// `.aws` unreadable, so naming them in the snapshot invites the model to
+/// spend a step on a refusal. The rest are build output that says nothing about
+/// the workspace shape.
+const LAYOUT_HIDDEN: [&str; 10] = [
+    ".git",
+    ".jj",
+    ".bsh",
+    ".env",
+    "secrets",
+    ".ssh",
+    ".aws",
+    "target",
+    "node_modules",
+    "dist",
+];
+
 /// The visible names of one directory, sorted, as (name, is directory).
 ///
 /// The repository directory is dropped: it is not a workspace fact, and every
@@ -222,7 +241,11 @@ fn child_names(dir: &Path) -> Vec<(String, bool)> {
         .map(|entries| {
             entries
                 .filter_map(|entry| entry.ok())
-                .filter(|entry| entry.file_name() != ".git")
+                .filter(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    !LAYOUT_HIDDEN.contains(&name.as_ref())
+                })
                 .map(|entry| {
                     (
                         entry.file_name().to_string_lossy().to_string(),
@@ -297,6 +320,22 @@ mod tests {
             !is_injected_user_text("Please fix the failing test."),
             "a real request still draws as a user row"
         );
+    }
+
+    /// A snapshot never advertises a path the policy will refuse or a build
+    /// directory that says nothing about the workspace shape.
+    #[test]
+    fn the_layout_never_names_a_denied_or_build_directory() {
+        let dir = scratch("layout-hidden");
+        std::fs::create_dir_all(dir.join(".bsh")).expect("the internal dir");
+        std::fs::create_dir_all(dir.join("target")).expect("build output");
+        std::fs::create_dir_all(dir.join("src")).expect("source");
+        std::fs::write(dir.join(".gitignore"), "target").expect("the ignore file");
+        let layout = render_layout(&dir).expect("a layout");
+        assert!(layout.contains("src/"), "{layout}");
+        assert!(layout.contains(".gitignore"), "{layout}");
+        assert!(!layout.contains(".bsh"), "{layout}");
+        assert!(!layout.contains("target"), "{layout}");
     }
 
     fn scratch(label: &str) -> std::path::PathBuf {

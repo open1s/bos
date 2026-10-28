@@ -297,6 +297,7 @@
 "settings.empty": "No capabilities registered yet."
 "pane.goal": "Goal"
 "msg.running": "Running"
+"msg.cancelled": "Stopped by you"
 "turn.count": "turns"
 "turn.tokens": "tokens"
 "status.running": "Running"

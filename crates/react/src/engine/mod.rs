@@ -49,10 +49,121 @@ pub const STEP_GUARD_NOTE: &str = "You have reached this turn's step budget, so 
 /// asks for the two things a harness can act on: a tool call, or an answer.
 pub const EMPTY_ANSWER_NOTE: &str = "Your last reply contained no text and no tool call. Do not think further: call a tool now, or answer the reader in plain text.";
 
+/// What the model is told when the same tool failure repeats three times.
+///
+/// A harness cannot fix an environment that keeps refusing the same call, and
+/// letting the model retry it burns a full LLM round per attempt. The third
+/// identical failure closes the tool loop and asks for a report instead.
+pub const REPEAT_FAILURE_NOTE: &str = "The same tool failure has repeated three times. Stop retrying it. Report the exact error, what you tried, and what must change in the environment; do not call that tool again this turn.";
+
+/// The number of identical failures that closes the tool loop.
+const REPEAT_FAILURE_LIMIT: usize = 3;
+
+/// Counts identical failed tool results so a retry loop cannot run forever.
+#[derive(Default)]
+struct RepeatedFailure {
+    seen: std::collections::HashMap<String, usize>,
+}
+
+impl RepeatedFailure {
+    /// Record one result; true exactly when it crosses the limit.
+    fn note(&mut self, tool: &str, result: &str) -> bool {
+        let Some(signature) = failure_signature(tool, result) else {
+            return false;
+        };
+        let count = self.seen.entry(signature).or_insert(0);
+        *count += 1;
+        *count == REPEAT_FAILURE_LIMIT
+    }
+}
+
+/// The most text one tool result may add to the model context.
+///
+/// A tool that prints a megabyte (a build log, a base64 dump) must not become
+/// the next request. The head and tail are kept because the failure and the
+/// summary usually sit at opposite ends; the middle is the part a model can
+/// ask for again with a narrower call.
+const TOOL_RESULT_CAP: usize = 48 * 1024;
+
+/// Cap one tool result, preserving both ends and naming what was dropped.
+fn cap_tool_result(text: &str) -> String {
+    if text.len() <= TOOL_RESULT_CAP {
+        return text.to_string();
+    }
+    // Reserve room for the omission marker so the cap never grows a result.
+    let half = TOOL_RESULT_CAP.saturating_sub(256) / 2;
+    let mut head_end = half;
+    while head_end > 0 && !text.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = text.len() - half;
+    while tail_start < text.len() && !text.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!(
+        "{}\n\n[... {} bytes omitted; ask for a narrower read or grep ...]\n\n{}",
+        &text[..head_end],
+        tail_start.saturating_sub(head_end),
+        &text[tail_start..]
+    )
+}
+
+/// A normalized signature for a failed tool result, or none for a success.
+///
+/// Digits are dropped (they carry PIDs, timings and line numbers, which differ
+/// between two attempts at the same broken command) and the rest is lowercased
+/// and collapsed to one line. The prefix is bounded so two megabyte failures
+/// still compare cheaply.
+fn failure_signature(tool: &str, result: &str) -> Option<String> {
+    let failed = result.starts_with("Error:") || result.contains("\"success\":false");
+    if !failed {
+        return None;
+    }
+    let mut signature = String::with_capacity(96);
+    signature.push_str(tool);
+    signature.push(':');
+    let prefix = tool.len() + 1;
+    let limit = prefix + 160;
+    for ch in result.chars() {
+        if ch.is_ascii_digit() {
+            continue;
+        }
+        if ch.is_alphanumeric() {
+            signature.push(ch.to_ascii_lowercase());
+        } else if signature.len() > prefix && !signature.ends_with(' ') {
+            signature.push(' ');
+        }
+        if signature.len() >= limit {
+            break;
+        }
+    }
+    Some(signature)
+}
+
+/// The prompt overhead a mid-turn budget must leave room for.
+///
+/// The session history is only one bucket of a request: the persona and the
+/// tool schemas ride outside it. Six thousand tokens covers the shipped BSH
+/// system prompt and its core tool array, so a history at this ceiling still
+/// fits the provider window.
+const MID_TURN_FIXED_RESERVE: usize = 6_000;
+/// The newest messages a mid-turn compaction keeps verbatim.
+const MID_TURN_KEEP_RECENT: usize = 8;
+/// The longest mechanical summary a mid-turn compaction writes.
+const MID_TURN_SUMMARY_CHARS: usize = 4_000;
+
+/// The history ceiling for mid-turn compaction, or none when the budget is off
+/// or too small to leave a usable history window.
+fn mid_turn_ceiling(budget: usize) -> Option<usize> {
+    (budget > MID_TURN_FIXED_RESERVE).then(|| budget - MID_TURN_FIXED_RESERVE)
+}
+
 /// The ReAct loop: LLM calls, tool execution, skills, telemetry, and resilience.
 pub struct ReActEngine<A: ReActApp> {
     llm: Box<dyn LlmClient<A::Session, A::Context> + Send + Sync>,
     tools: Arc<ToolRegistry>,
+    /// Send-side ceiling for one request; 0 disables mid-turn compaction.
+    context_budget: usize,
     /// The step guard, when the caller asks for one. `None` is the harness
     /// contract: a turn ends when the MODEL stops asking for tools, and a
     /// healthy run must not be cut off by a number. The bound exists for
@@ -77,6 +188,7 @@ pub struct ReActEngineBuilder<A: ReActApp> {
     llm: Option<Box<dyn LlmClient<A::Session, A::Context>>>,
     tools: ToolRegistry,
     max_steps: Option<usize>,
+    context_budget: usize,
     parallel_tool_calls: bool,
     telemetry: Telemetry,
     resilience: Option<ReActResilience>,
@@ -159,6 +271,7 @@ impl<A: ReActApp> ReActEngine<A> {
         // One directed retry when a step comes back empty (see
         // EMPTY_ANSWER_NOTE); a second blank reply ends the turn.
         let mut nudged = false;
+        let mut repeated = RepeatedFailure::default();
         'turn: loop {
             if self.max_steps.is_some_and(|bound| steps >= bound) {
                 if closing {
@@ -187,6 +300,8 @@ impl<A: ReActApp> ReActEngine<A> {
                 }
                 HookDecision::Error(msg) => return Err(ReactError::HookAbort(msg)),
             }
+
+            self.ensure_context_fits(session, persona.as_deref());
 
             let mut llm_response = match timeout(
                 Duration::from_secs(self.llm_timeout_secs),
@@ -399,6 +514,14 @@ skill_dir: {}
                                         content: format!("Error: {:?}", result),
                                     });
                                 }
+                                let failure_text = match &result {
+                                    Ok(ret) => ret.to_string(),
+                                    Err(error) => format!("Error: {error:?}"),
+                                };
+                                if repeated.note(&name, &failure_text) {
+                                    closing = true;
+                                    session.push(LlmMessage::user_text(REPEAT_FAILURE_NOTE));
+                                }
                             }
                         }
 
@@ -591,6 +714,14 @@ skill_dir: {}
                                         content: format!("Error: {:?}", result),
                                     });
                                 }
+                                let failure_text = match &result {
+                                    Ok(ret) => ret.to_string(),
+                                    Err(error) => format!("Error: {error:?}"),
+                                };
+                                if repeated.note(&name, &failure_text) {
+                                    closing = true;
+                                    session.push(LlmMessage::user_text(REPEAT_FAILURE_NOTE));
+                                }
                             }
                             ResponsesItem::Message { content, .. } => {
                                 for part in content {
@@ -682,6 +813,9 @@ skill_dir: {}
             let mut closing = false;
             // One directed retry when a step streams nothing at all.
             let mut nudged = false;
+            // The same failed call three times closes the loop and asks for a
+            // report instead of paying one more round.
+            let mut repeated = RepeatedFailure::default();
 
             context.add_tool(load_skill_tool());
 
@@ -720,6 +854,8 @@ skill_dir: {}
                         break;
                     }
                 }
+
+                self.ensure_context_fits(session, persona.as_deref());
 
                 let llm_stream = match self.call_llm_stream(persona.clone(),request.clone(), session, context).await {
                     Ok(s) => s,
@@ -864,6 +1000,15 @@ skill_dir: {}
                                 }
                                 Err(ref e) => format!("Error: {}", e),
                             };
+                            let result_text = cap_tool_result(&result_text);
+
+                            // A failed call is the one line the log was
+                            // missing: policy refusals, broken environments and
+                            // timeouts used to be visible only to the model.
+                            if result.is_err() || result_text.contains("\"success\":false") {
+                                let head: String = result_text.chars().take(240).collect();
+                                log::warn!("tool {name} failed: {head}");
+                            }
 
                             // Surface the finished call to stream observers
                             // (GUI timeline) with its wall-clock duration.
@@ -874,7 +1019,14 @@ skill_dir: {}
                             });
 
                             session.push(LlmMessage::assistant_tool_call(call_id.clone(), name.clone(), Self::strip_call_id(&args)));
-                            session.push(LlmMessage::tool_result(call_id.clone(), result_text));
+                            session.push(LlmMessage::tool_result(call_id.clone(), result_text.clone()));
+                            // A failing command that is retried unchanged is
+                            // the environment refusing, not the model learning:
+                            // three strikes and the turn closes with a report.
+                            if repeated.note(&name, &result_text) {
+                                closing = true;
+                                session.push(LlmMessage::user_text(REPEAT_FAILURE_NOTE));
+                            }
                         }
                         Err(e) => {
                             yield Err(ReactError::Llm(e));
@@ -977,6 +1129,34 @@ skill_dir: {}
         std::time::Duration::from_nanos(self.tool_time_nanos.load(Ordering::Relaxed))
     }
 
+    /// Mechanically condense the history when the next request would exceed
+    /// the send-side budget.
+    ///
+    /// This is the mid-turn counterpart of the host's pre-turn compaction: a
+    /// long tool loop can add tens of kilobytes after the turn opened, and
+    /// without this check the next request pays for a window nobody priced.
+    /// The mechanical summary costs no second model call, which is what makes
+    /// it safe to run at a step boundary.
+    fn ensure_context_fits(&self, session: &mut A::Session, persona: Option<&str>) {
+        let Some(ceiling) = mid_turn_ceiling(self.context_budget) else {
+            return;
+        };
+        let persona_tokens = persona
+            .map(|text| text.chars().count().div_ceil(4))
+            .unwrap_or(0);
+        for _ in 0..4 {
+            let Some(tokens) = session.estimate_tokens() else {
+                return;
+            };
+            if tokens + persona_tokens < ceiling {
+                return;
+            }
+            if !session.compact_mechanical(MID_TURN_KEEP_RECENT, MID_TURN_SUMMARY_CHARS) {
+                return;
+            }
+        }
+    }
+
     /// Set the shared stop flag.
     pub fn set_stop_flag(&mut self, flag: bool) {
         self.stop_flag.store(flag, Ordering::SeqCst);
@@ -996,5 +1176,76 @@ skill_dir: {}
     /// Signal the loop to stop.
     pub fn close(&mut self) {
         self.set_stop_flag(true);
+    }
+}
+
+#[cfg(test)]
+mod repeat_guard_tests {
+    use super::{
+        cap_tool_result, failure_signature, mid_turn_ceiling, RepeatedFailure,
+        MID_TURN_FIXED_RESERVE, REPEAT_FAILURE_LIMIT, TOOL_RESULT_CAP,
+    };
+
+    #[test]
+    fn a_successful_result_has_no_failure_signature() {
+        assert!(failure_signature("bash", "{\"success\":true,\"exit_code\":0}").is_none());
+        assert!(failure_signature("read_file", "{\"content\":\"ok\"}").is_none());
+    }
+
+    #[test]
+    fn digits_and_spacing_do_not_split_one_failure() {
+        let first = "{\"stdout\":\"\",\"stderr\":\"timed out after 30s\",\"exit_code\":1,\"success\":false}";
+        let second = "{\"stdout\":\"\",\"stderr\":\"timed out after 60s\",\"exit_code\":1,\"success\":false}";
+        assert_eq!(
+            failure_signature("bash", first),
+            failure_signature("bash", second)
+        );
+    }
+
+    #[test]
+    fn three_identical_failures_trip_exactly_once() {
+        let result = "{\"stdout\":\"Timed out waiting\",\"success\":false}";
+        let mut guard = RepeatedFailure::default();
+        for _ in 0..REPEAT_FAILURE_LIMIT - 1 {
+            assert!(!guard.note("bash", result));
+        }
+        assert!(guard.note("bash", result), "the third failure trips");
+        assert!(!guard.note("bash", result), "the note is pushed once");
+    }
+
+    #[test]
+    fn a_budget_without_room_for_history_stays_off() {
+        assert_eq!(mid_turn_ceiling(0), None);
+        assert_eq!(mid_turn_ceiling(MID_TURN_FIXED_RESERVE), None);
+        assert_eq!(
+            mid_turn_ceiling(MID_TURN_FIXED_RESERVE + 1),
+            Some(1),
+            "one token of history room is a real window"
+        );
+    }
+
+    #[test]
+    fn a_huge_tool_result_keeps_both_ends_and_names_the_drop() {
+        let text = format!("HEAD{}TAIL", "x".repeat(TOOL_RESULT_CAP));
+        let capped = cap_tool_result(&text);
+        assert!(capped.starts_with("HEAD"));
+        assert!(capped.ends_with("TAIL"));
+        assert!(capped.contains("bytes omitted"));
+        assert!(
+            capped.len() < text.len(),
+            "the cap actually drops bytes: {} vs {}",
+            capped.len(),
+            text.len()
+        );
+    }
+
+    #[test]
+    fn a_different_tool_does_not_share_the_counter() {
+        let result = "{\"success\":false,\"stderr\":\"refused\"}";
+        let mut guard = RepeatedFailure::default();
+        for _ in 0..REPEAT_FAILURE_LIMIT - 1 {
+            guard.note("bash", result);
+        }
+        assert!(!guard.note("read_file", result));
     }
 }

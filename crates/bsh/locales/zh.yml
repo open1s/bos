@@ -293,6 +293,7 @@
 "settings.empty": "尚未注册任何能力。"
 "pane.goal": "目标"
 "msg.running": "正在生成"
+"msg.cancelled": "已由你停止"
 "turn.count": "轮"
 "turn.tokens": "token"
 "status.running": "运行中"

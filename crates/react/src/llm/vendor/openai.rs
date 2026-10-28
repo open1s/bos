@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::{
     llm::vendor::openaicompatible::{
         sse_has_done_signal, ChatCompletionResponse, OpenAIExtractor, StreamToolCallAccumulator,
+        Usage,
     },
     utils::{JsonExtractor, StreamExtractor},
 };
@@ -40,6 +41,61 @@ impl Clone for OpenAiVendor {
     }
 }
 
+/// Log one streamed response's timing and token usage.
+///
+/// The streaming path used to log nothing after the request, so the turn's
+/// first-token latency and billed tokens were invisible.
+fn log_stream_result(
+    started: std::time::Instant,
+    first_token: Option<std::time::Duration>,
+    usage: Option<&Usage>,
+) {
+    let ttft = first_token
+        .map(|elapsed| format!("{}ms", elapsed.as_millis()))
+        .unwrap_or_else(|| "unreported".to_string());
+    match usage {
+        Some(usage) => info!(
+            "Resp: ttft={} total={}ms prompt={} completion={} cached={}",
+            ttft,
+            started.elapsed().as_millis(),
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|details| details.cached_tokens)
+                .unwrap_or(0)
+        ),
+        None => info!(
+            "Resp: ttft={} total={}ms usage=unreported",
+            ttft,
+            started.elapsed().as_millis()
+        ),
+    }
+}
+
+/// Log one request: a one-line summary at INFO, the full payload at TRACE.
+///
+/// The full JSON used to be an INFO line, which put every file body, every
+/// skill and every base64 image into the log for every step.
+fn log_request(request: &OpenAiRequest) {
+    let Ok(json) = serde_json::to_string(request) else {
+        return;
+    };
+    if log::log_enabled!(log::Level::Trace) {
+        log::trace!("Req: {json}");
+    }
+    if log::log_enabled!(log::Level::Info) {
+        info!(
+            "Req: model={} messages={} tools={} chars={}",
+            request.model,
+            request.messages.len(),
+            request.tools.as_ref().map_or(0, Vec::len),
+            json.len()
+        );
+    }
+}
+
 #[derive(Serialize)]
 struct OpenAiRequest {
     model: String,
@@ -58,6 +114,16 @@ struct OpenAiRequest {
     reasoning_effort: Option<crate::llm::ReasoningEffort>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    /// Ask a streaming provider to end the stream with a usage-only chunk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<OpenAiStreamOptions>,
+}
+
+/// The `stream_options` object a streaming request carries.
+#[derive(Serialize, Clone)]
+struct OpenAiStreamOptions {
+    /// End the stream with one chunk whose `usage` is populated.
+    include_usage: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -302,6 +368,7 @@ impl OpenAiVendor {
             max_tokens: Some(max_tokens),
             reasoning_effort: req.reasoning_effort,
             stream: Some(false),
+            stream_options: None,
         }
     }
 
@@ -314,6 +381,11 @@ impl OpenAiVendor {
     ) -> OpenAiRequest {
         let mut openai_req = self.convert_request(persona, req, session, context);
         openai_req.stream = Some(true);
+        // Without this an OpenAI-compatible server streams no usage block, so
+        // every turn's prompt/completion count would be unknown.
+        openai_req.stream_options = Some(OpenAiStreamOptions {
+            include_usage: true,
+        });
         openai_req
     }
 }
@@ -430,13 +502,7 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
 
         let url = format!("{}/chat/completions", endpoint);
 
-        if log::log_enabled!(log::Level::Info) {
-            info!(
-                "Req: {}",
-                serde_json::to_string(&openai_req)
-                    .unwrap_or_else(|_| "Failed to serialize request".into())
-            );
-        }
+        log_request(&openai_req);
 
         let t1 = std::time::Instant::now();
         let response = client
@@ -520,19 +586,13 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
 
         context.notify_request(&request);
 
-        let openai_req = self.build_stream_request(persona, &request, session, context);
+        let mut openai_req = self.build_stream_request(persona, &request, session, context);
 
         let url = format!("{}/chat/completions", endpoint);
 
-        if log::log_enabled!(log::Level::Info) {
-            info!(
-                "Req: {}",
-                serde_json::to_string(&openai_req)
-                    .unwrap_or_else(|_| "Failed to serialize request".into())
-            );
-        }
+        log_request(&openai_req);
 
-        let response = client
+        let mut response = client
             .post(&url)
             .header("Authorization", format!("Bearer {}", api_key))
             .header("Content-Type", "application/json")
@@ -549,15 +609,48 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            let err = LlmError::Other(format!("HTTP {}: {}", status, body));
-            context.notify_error(&err);
-            return Err(err);
+            // `stream_options` is a standard OpenAI field, but an older
+            // compatible gateway can refuse the whole request over it. Usage
+            // reporting is worth one retry, not a broken turn.
+            if status == reqwest::StatusCode::BAD_REQUEST
+                && body.contains("stream_options")
+                && openai_req.stream_options.take().is_some()
+            {
+                log::warn!("provider rejected stream_options; retrying without usage reporting");
+                response = client
+                    .post(&url)
+                    .header("Authorization", format!("Bearer {}", api_key))
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "text/event-stream")
+                    .json(&openai_req)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        let err = LlmError::Other(format!("Request failed: {}", e));
+                        context.notify_error(&err);
+                        err
+                    })?;
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    let err = LlmError::Other(format!("HTTP {}: {}", status, body));
+                    context.notify_error(&err);
+                    return Err(err);
+                }
+            } else {
+                let err = LlmError::Other(format!("HTTP {}: {}", status, body));
+                context.notify_error(&err);
+                return Err(err);
+            }
         }
 
         let (tx, rx) = mpsc::channel(32);
         let on_chunk = context.on_chunk_callback();
+        let started = std::time::Instant::now();
 
         tokio::spawn(async move {
+            let mut first_token: Option<std::time::Duration> = None;
+            let mut last_usage: Option<Usage> = None;
             let mut byte_stream = response.bytes_stream();
             let mut extractor = OpenAIExtractor::new(JsonExtractor::default());
             let mut acc = StreamToolCallAccumulator::new();
@@ -578,6 +671,7 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                                 for choice in chat.choices {
                                     if let Some(content) = &choice.delta.reasoning_content {
                                         if !content.is_empty() {
+                                            first_token.get_or_insert_with(|| started.elapsed());
                                             on_chunk.as_ref().inspect(|cb| cb(content));
                                             let _ = tx
                                                 .send(Ok(StreamToken::ReasoningContent(
@@ -588,6 +682,7 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                                     }
                                     if let Some(content) = &choice.delta.content {
                                         if !content.is_empty() {
+                                            first_token.get_or_insert_with(|| started.elapsed());
                                             on_chunk.as_ref().inspect(|cb| cb(content));
                                             let _ = tx
                                                 .send(Ok(StreamToken::Text(content.clone())))
@@ -612,6 +707,8 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                                             if let Some((n, args_val, id)) =
                                                 acc.push_delta(index, id, name, args_delta)
                                             {
+                                                first_token
+                                                    .get_or_insert_with(|| started.elapsed());
                                                 on_chunk.as_ref().inspect(|cb| cb(&n));
                                                 let _ = tx
                                                     .send(Ok(StreamToken::ToolCall {
@@ -654,6 +751,7 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                                     }
                                 }
                                 if let Some(usage) = &chat.usage {
+                                    last_usage = Some(usage.clone());
                                     let _ = tx.send(Ok(StreamToken::Usage(usage.clone()))).await;
                                 }
                             }
@@ -669,6 +767,7 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                                     }))
                                     .await;
                             }
+                            log_stream_result(started, first_token, last_usage.as_ref());
                             let _ = tx.send(Ok(StreamToken::Done)).await;
                             return;
                         }
@@ -689,6 +788,7 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                     }))
                     .await;
             }
+            log_stream_result(started, first_token, last_usage.as_ref());
             let _ = tx.send(Ok(StreamToken::Done)).await;
         });
 
@@ -816,6 +916,44 @@ mod tests {
 
     use crate::llm::vendor::OpenAiVendor;
     use crate::llm::{Content, LlmClient, LlmContext, LlmRequest, LlmSession};
+
+    #[test]
+    fn a_stream_request_asks_the_provider_for_usage() {
+        let request = super::OpenAiRequest {
+            model: "m".to_string(),
+            messages: Vec::new(),
+            tools: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            max_tokens: None,
+            reasoning_effort: None,
+            stream: Some(true),
+            stream_options: Some(super::OpenAiStreamOptions {
+                include_usage: true,
+            }),
+        };
+        let json = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(json["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn a_non_stream_request_omits_stream_options() {
+        let request = super::OpenAiRequest {
+            model: "m".to_string(),
+            messages: Vec::new(),
+            tools: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            max_tokens: None,
+            reasoning_effort: None,
+            stream: Some(false),
+            stream_options: None,
+        };
+        let json = serde_json::to_value(&request).expect("serialize");
+        assert!(json.get("stream_options").is_none());
+    }
 
     #[test]
     fn serialize_args_converts_null_to_empty_object() {

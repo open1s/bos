@@ -147,6 +147,7 @@ impl Agent {
             .resilience(self.resilience.clone())
             .llm_timeout(self.config.timeout_secs)
             .parallel_tool_calls(self.config.parallel_tool_calls)
+            .context_budget(self.config.compaction_input_tokens)
             .model(self.config.model.clone())
             .app(app);
         // A zero budget is "no budget": the loop ends when the model stops

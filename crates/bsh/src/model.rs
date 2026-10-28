@@ -200,6 +200,13 @@ pub(crate) const CHARS_PER_TOKEN: usize = 4;
 pub(crate) const BLOCK_OVERHEAD: u64 = 4;
 /// Role-field framing overhead added to every priced message.
 pub(crate) const ROLE_OVERHEAD: u64 = 4;
+/// The heuristic price of one attached image.
+///
+/// A provider bills an image by its decoded pixels, not by the length of its
+/// data URL, so pricing the base64 here would overstate a screenshot by an
+/// order of magnitude. A fixed mid-size image price keeps the meter and the
+/// compaction trigger from treating an attachment as free.
+pub(crate) const IMAGE_TOKENS: u64 = 1_500;
 
 /// The heuristic price of one present content block.
 ///
@@ -316,6 +323,13 @@ pub(crate) struct MessageMeta {
     /// When this turn ran, for the trajectory's time axis.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) timing: Option<MessageTiming>,
+    /// The reader stopped this turn before it produced an answer.
+    ///
+    /// A stopped turn is recorded so the transcript can say so; it is not
+    /// replayed into the next request, because an empty assistant row is not a
+    /// thing the model said.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) cancelled: bool,
 }
 
 /// One segment of a turn, in the order the stream produced it.
@@ -467,9 +481,12 @@ impl ChatMessage {
     /// Heuristic tokens this message contributes to the context.
     ///
     /// One price per present content block under the reference's heuristic: the
-    /// visible text and the reasoning trace are text blocks, each tool call is a
-    /// `tool-call` block, and each finished call's output stands for the tool
-    /// result the next request would carry. The role field is priced once.
+    /// visible text is a text block, each tool call is a `tool-call` block, and
+    /// each finished call's output stands for the tool result the next request
+    /// would carry. Reasoning is NOT priced: the engine keeps it for the
+    /// transcript but does not send it back, so charging it here would make
+    /// every turn look larger than the request it sends. An image is priced at
+    /// the fixed [`IMAGE_TOKENS`] estimate. The role field is priced once.
     pub(crate) fn priced_tokens(&self) -> u64 {
         #[cfg(test)]
         PRICED_MESSAGES.with(|priced| priced.set(priced.get() + 1));
@@ -477,9 +494,7 @@ impl ChatMessage {
         if !self.text.is_empty() {
             tokens += price_block(self.text.chars().count());
         }
-        if !self.reasoning.is_empty() {
-            tokens += price_block(self.reasoning.chars().count());
-        }
+        tokens += IMAGE_TOKENS * self.images.len() as u64;
         for tool in &self.tools {
             tokens += price_block(tool.name.chars().count());
             tokens += price_block(tool.args.chars().count());
@@ -769,7 +784,7 @@ impl Session {
 mod tests {
     use super::{
         price_block, price_system_prompt, price_tools, ChatMessage, ContextBreakdown, MessageUsage,
-        Session, ToolEvent, TurnPart, UsageSummary,
+        Session, ToolEvent, TurnPart, UsageSummary, IMAGE_TOKENS, ROLE_OVERHEAD,
     };
     /// The timeline keeps the ORDER the stream produced, merging only runs of
     /// the same kind: thinking, the reply, a tool, then thinking again is four
@@ -906,6 +921,30 @@ mod tests {
         assert!(ContextBreakdown::default().is_empty());
     }
 
+    /// Reasoning is kept for the transcript but never sent back, so charging
+    /// it would make every request look larger than it is.
+    #[test]
+    fn reasoning_is_not_priced_into_the_request() {
+        let mut message = ChatMessage::assistant();
+        message.text = "abcd".to_string();
+        message.reasoning = "x".repeat(4_000);
+        assert_eq!(message.priced_tokens(), ROLE_OVERHEAD + price_block(4));
+    }
+
+    /// An attachment is billed by the provider, so it is not free here either;
+    /// its data URL length is not its token price, hence the fixed estimate.
+    #[test]
+    fn an_attached_image_is_priced_at_the_fixed_estimate() {
+        let mut message = ChatMessage::user("abcd");
+        message
+            .images
+            .push("data:image/png;base64,AAAA".to_string());
+        assert_eq!(
+            message.priced_tokens(),
+            ROLE_OVERHEAD + price_block(4) + IMAGE_TOKENS
+        );
+    }
+
     #[test]
     fn a_session_file_written_before_the_reference_fields_still_loads() {
         let json = r#"{"id":"a","title":"t","created_at":1,"updated_at":2,"workspace":"w"}"#;
@@ -913,11 +952,13 @@ mod tests {
         assert_eq!(session.provider, None);
         assert_eq!(session.model, None);
         assert_eq!(session.agent_preset, None);
-        assert_eq!(
-            session.choice(),
-            crate::settings::resolve::SessionChoice::default(),
-            "a session that names nothing contributes nothing"
-        );
+        // The provider/model/preset are what an older file may lack; the
+        // workspace is a fact the file still names, and the choice carries it
+        // so a chat opened from another workspace keeps running in its own.
+        let choice = session.choice();
+        assert_eq!(choice.model, None);
+        assert_eq!(choice.preset, None);
+        assert_eq!(choice.workspace.as_deref(), Some("w"));
     }
 
     #[test]

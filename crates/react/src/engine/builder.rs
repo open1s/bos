@@ -9,6 +9,7 @@ impl<A: ReActApp> ReActEngineBuilder<A> {
             // No bound by default: a turn ends when the model stops asking
             // for tools, which is the contract the shipped shell relies on.
             max_steps: None,
+            context_budget: 0,
             parallel_tool_calls: false,
             telemetry: Telemetry::new(),
             resilience: None,
@@ -48,6 +49,16 @@ impl<A: ReActApp> ReActEngineBuilder<A> {
     /// never cut off. A caller that needs a ceiling asks for one here.
     pub fn max_steps(mut self, steps: usize) -> Self {
         self.max_steps = (steps > 0).then_some(steps);
+        self
+    }
+
+    /// Set the send-side token ceiling used for mid-turn compaction.
+    ///
+    /// Zero disables it. The budget covers the request history; the engine
+    /// leaves a fixed reserve for the persona and tool schemas. A host that
+    /// already prices a context window passes that ceiling here.
+    pub fn context_budget(mut self, tokens: usize) -> Self {
+        self.context_budget = tokens;
         self
     }
 
@@ -145,6 +156,7 @@ impl<A: ReActApp + Default> ReActEngineBuilder<A> {
             llm,
             tools,
             max_steps: self.max_steps,
+            context_budget: self.context_budget,
             parallel_tool_calls: self.parallel_tool_calls,
             telemetry: self.telemetry,
             llm_timeout_secs: self.llm_timeout_secs,

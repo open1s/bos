@@ -1031,6 +1031,22 @@ fn build_agent_for_session_inner(
         .registry()
         .map(|registry| tools_schema_chars(registry))
         .unwrap_or(0);
+    // A schema this large is re-sent on every step; name it at build time so a
+    // connected MCP server or a wide preset can be seen in the log instead of
+    // felt as latency.
+    let tool_count = agent
+        .registry()
+        .map(|registry| registry.list().len())
+        .unwrap_or(0);
+    log::info!(
+        "build session={session} tools={tool_count} schema_chars={tools_schema_chars} mcp_tools={}",
+        mcp.tools().count()
+    );
+    if tools_schema_chars > 20_000 {
+        log::warn!(
+            "tool schema is {tools_schema_chars} chars; a preset allowlist or a lazy MCP gateway would cut every request"
+        );
+    }
 
     BuiltAgent {
         agent: Arc::new(agent),

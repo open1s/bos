@@ -2390,6 +2390,17 @@ impl Shell {
             );
         }
 
+        // A stopped turn has no assistant text and no error; without this row
+        // it reads as an empty reply. The marker is also what keeps the row out
+        // of the next request (see Runner::seed_session).
+        if message.meta.as_ref().is_some_and(|meta| meta.cancelled) {
+            column = column.child(div().rounded(px(8.0)).px(px(10.0)).py(px(8.0)).child(txt(
+                self.state.lang.tr("msg.cancelled"),
+                theme::CHIP_SIZE,
+                theme::muted(),
+            )));
+        }
+
         column
             .child(self.message_footer(index, message, chrome.compact_usage, cx))
             .into_any_element()

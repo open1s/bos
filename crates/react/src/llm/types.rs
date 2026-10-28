@@ -10,6 +10,21 @@ pub trait ReactSession {
     fn push(&mut self, msg: LlmMessage);
     /// The accumulated messages, if the session keeps any.
     fn history(&self) -> Option<&[LlmMessage]>;
+    /// Estimate the tokens this history contributes to the next request.
+    ///
+    /// `None` means the session cannot price itself; the engine then skips
+    /// mid-turn compaction rather than guessing. The estimate is a heuristic,
+    /// the same way [`crate::engine`] prices a budget.
+    fn estimate_tokens(&self) -> Option<usize> {
+        None
+    }
+    /// Mechanically condense the oldest safe span, keeping the newest messages.
+    ///
+    /// Returns whether the history actually shrank. The default does nothing,
+    /// so a session that cannot compact keeps the pre-existing behaviour.
+    fn compact_mechanical(&mut self, _keep_recent: usize, _max_summary_chars: usize) -> bool {
+        false
+    }
 }
 
 // =============================================================================
@@ -1006,6 +1021,9 @@ pub fn render_skill_catalog(skills: &[Skill], query: &str) -> String {
         "Available skills ({}; call load_skill with a name to read its instructions):\n",
         skills.len()
     );
+    // A listed skill is a candidate, not an instruction: the only installed
+    // skill must not be loaded just because it is the only one.
+    text.push_str("Load a skill only when its description matches the request; being listed is not a reason to load it.\n");
     for index in &described {
         let skill = &skills[*index];
         text.push_str(&format!(

@@ -162,6 +162,15 @@ pub(crate) const READ_ONLY_PERSONA: &str = "You are a read-only analyst: you rea
 /// that instead of naming a tool BSH does not register.
 pub(crate) const PLAN_DIRECTIVE: &str = "[Plan mode] Inspect what the task needs and reply with a concrete, step-by-step plan. Resolve discoverable facts by inspection instead of asking. Do not edit files, run mutating commands, or begin the work until the reader approves the plan.";
 
+/// What BSH tells the model about the app it is running inside.
+///
+/// The shipped prompt names the harness but not the product, so a screenshot of
+/// BSH's own controls reaches a model with no idea that the Stop button exists
+/// or that .bsh/ is internal. This block is the missing product context, and the
+/// routing rules that keep a short UI reference from becoming a speculative
+/// debugging detour.
+pub(crate) const HARNESS_CONTEXT: &str = "## Working inside BSH\n\nYou run inside BSH, the BOS desktop app. A workspace is one folder; a session is one conversation in it; the reader sees your steps, plans and diffs in the same window. The .bsh/ directory holds BSH's own settings, policies and history and is on the deny list: do not read, list or edit it, and do not treat a refusal there as a task to work around.\n\n- An attached image is evidence of what the reader sees, not a task on its own. When a short message points at a control in a screenshot, ask one direct question before acting: is this a bug report about the app, or a request to change code? Do not pick an unrelated tool or skill and start debugging it.\n- A terse request in a workspace with an open file usually means doing it in the code; if it is equally likely to be a plain question, say which you are doing in one sentence instead of answering with a placeholder.\n- Load a skill only when its stated use matches the request. Being the only installed skill is not a reason to load it.\n- Stop after two identical tool failures. Report the exact error and what must change in the environment instead of retrying the same call.";
+
 /// Append guidance for every tool the agent actually carries.
 ///
 /// Registration is the gate: a preset that removes the shell removes the bash
@@ -174,6 +183,11 @@ pub(crate) const PLAN_DIRECTIVE: &str = "[Plan mode] Inspect what the task needs
 pub(crate) fn append_tool_guidance(agent: &mut Agent) {
     if agent.config().persona_complete {
         return;
+    }
+    // The product context is not tied to one tool: it is what makes a
+    // screenshot of BSH's own UI legible to the model.
+    if !agent.config().system_prompt.contains(HARNESS_CONTEXT) {
+        agent.append_system_prompt(HARNESS_CONTEXT);
     }
     let names = agent
         .registry()
@@ -208,6 +222,15 @@ pub(crate) fn append_subagent_guidance(agent: &mut Agent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The product context carries the two facts the logs showed missing: the
+    /// internal directory and the stop-after-two-failures rule.
+    #[test]
+    fn the_harness_context_names_the_internal_directory_and_the_retry_rule() {
+        assert!(HARNESS_CONTEXT.contains(".bsh/"));
+        assert!(HARNESS_CONTEXT.contains("two identical tool failures"));
+        assert!(stale_tool_reference(HARNESS_CONTEXT).is_none());
+    }
 
     #[test]
     fn every_guidance_entry_names_a_known_tool() {

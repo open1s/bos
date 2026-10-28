@@ -248,6 +248,7 @@ Injection order for one turn:
 | complete persona | `agent::prompts::compose_system_prompt_with` via `crates/bsh/src/caps.rs` | system, sole section | the persona text alone: no identity, no workflow, no tool guidance |
 | runtime context snapshot | `crates/bsh/src/context.rs` | first user message, every turn | `Current runtime context. This snapshot supersedes earlier runtime-context snapshots.` + cwd / workspace layout / sandbox / permission / preset (+ delegation context in a child) |
 | skill catalogue | `react::llm::render_skill_catalog` (`crates/react/src/llm/types.rs`), called by the Chat and Responses vendors | system, when skills are registered | `Available skills (<n>; call load_skill with a name to read its instructions):` then up to 8 described skills that match the request's own words, then `- other skills (name only): ...`, capped at 4,096 bytes |
+| harness context | `crates/bsh/src/prompts.rs:172` | system, always (unless a complete persona) | `## Working inside BSH` + the product fact, the `.bsh/` deny rule, the screenshot/terse routing rules, the skill-match gate, and the stop-after-two-failures rule |
 | workspace instructions | `crates/bsh/src/instructions.rs` | second user message, when discovered | `<system-reminder>` + the reference's intro + `Instructions from: AGENTS.md` |
 | bash rule | `crates/agent/src/agent/prompts.rs:87` | system, when `bash` registered | `Check exit_code in every bash result; a non-zero exit is reported, not failed. Investigate the failure before moving on.` |
 | jobs rule | `crates/agent/src/agent/prompts.rs:90` | system, when `job_output` registered | DSH's jobs paragraph with `wait_ms` substituted |
@@ -261,10 +262,10 @@ Injection order for one turn:
 | list_dir | `crates/bsh/src/prompts.rs:51` | system, when registered | `Use list_dir to see what a directory holds before reading or creating files; it reports names and kinds, not contents.` |
 | web_search | `crates/bsh/src/prompts.rs:58` | system, when registered | DSH's no-fetch branch, verbatim |
 | subagent rule | `crates/bsh/src/prompts.rs:65` | system, when `subagent` registered | `## Delegating with subagents` + DSH's delegation sentence + BSH's wave limit and child-prompt pattern |
-| shipped `ptc` persona | `crates/bsh/src/prompts.rs:148` | persona slot | `You execute work in batched steps: …` |
-| shipped `creator` persona | `crates/bsh/src/prompts.rs:151` | persona slot | `You extend this harness through conversation: …` |
-| shipped `read-only` persona | `crates/bsh/src/prompts.rs:154` | persona slot | `You are a read-only analyst: …` |
-| plan directive | `crates/bsh/src/prompts.rs:162` | first user message | `[Plan mode] Inspect what the task needs and reply with a concrete, step-by-step plan. Resolve discoverable facts by inspection instead of asking. Do not edit files, run mutating commands, or begin the work until the reader approves the plan.` |
+| shipped `ptc` persona | `crates/bsh/src/prompts.rs:149` | persona slot | `You execute work in batched steps: …` |
+| shipped `creator` persona | `crates/bsh/src/prompts.rs:152` | persona slot | `You extend this harness through conversation: …` |
+| shipped `read-only` persona | `crates/bsh/src/prompts.rs:155` | persona slot | `You are a read-only analyst: …` |
+| plan directive | `crates/bsh/src/prompts.rs:163` | first user message | `[Plan mode] Inspect what the task needs and reply with a concrete, step-by-step plan. Resolve discoverable facts by inspection instead of asking. Do not edit files, run mutating commands, or begin the work until the reader approves the plan.` |
 | file-reference guidance | `crates/bsh/src/reference.rs:21` | first user message | DSH's @-reference paragraph + BSH's `#L<start>-L<end>` and `dsh-session:` additions |
 | goal round | `crates/bsh/src/state.rs:5108` | turn input | `<goal_round>…` with objective, round/max, and the continuation/verification rules |
 | compaction instruction | `crates/agent/src/agent/context.rs:295` | summarizer user message | DSH's instruction, byte-for-byte |
