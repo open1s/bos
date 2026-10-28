@@ -28,6 +28,8 @@ use std::time::Duration;
 use agent::mcp::{McpClient, McpToolAdapter};
 use agent::policy::{Action, PolicyInput, Target};
 use react::tool::registry::AsyncTool;
+use react::tool::ToolError;
+use serde_json::{json, Value};
 
 use crate::settings::mcp::{McpServer, McpTransport};
 
@@ -35,6 +37,7 @@ use crate::settings::mcp::{McpServer, McpTransport};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// One tool a connected server advertises, ready to register.
+#[derive(Clone)]
 pub(crate) struct McpTool {
     /// The server's namespace; tool names register as `{namespace}_{name}`.
     pub(crate) namespace: String,
@@ -630,6 +633,147 @@ fn connect(
             "connection timed out after {}s",
             CONNECT_TIMEOUT.as_secs()
         )),
+    }
+}
+
+/// How many MCP tools a turn may carry before they collapse behind one gateway.
+///
+/// Below this, separate tools are easier for the model and cost less than the
+/// indirection; above it, the schema tax is the bigger problem.
+pub(crate) const MCP_GATEWAY_THRESHOLD: usize = 12;
+
+/// One small tool that discovers and calls the MCP roster on demand.
+///
+/// A server that advertises forty tools would otherwise put forty schemas in
+/// every request. The gateway keeps one schema in the prompt and returns a
+/// matching tool's own schema only when the model asks for it.
+pub(crate) struct McpGateway {
+    tools: Vec<McpTool>,
+}
+
+impl McpGateway {
+    /// Build a gateway over the tools one turn may use.
+    pub(crate) fn new(tools: Vec<McpTool>) -> Self {
+        Self { tools }
+    }
+
+    fn find(&self, server: &str, tool: &str) -> Option<&McpTool> {
+        self.tools
+            .iter()
+            .find(|candidate| candidate.namespace == server && candidate.name == tool)
+            .or_else(|| {
+                let joined = format!("{server}_{tool}");
+                self.tools.iter().find(|candidate| {
+                    format!("{}_{}", candidate.namespace, candidate.name) == joined
+                })
+            })
+    }
+}
+
+#[async_trait::async_trait]
+impl AsyncTool for McpGateway {
+    fn name(&self) -> &str {
+        "mcp"
+    }
+
+    fn description(&self) -> String {
+        format!(
+            "Discover and call one of the {} configured MCP tools. action=list returns matching tools with their argument schemas; action=call invokes one by server and tool name.",
+            self.tools.len()
+        )
+    }
+
+    fn json_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "call"],
+                    "description": "list matching tools, or call one"
+                },
+                "query": {
+                    "type": "string",
+                    "description": "For list: words to match against server, tool and description"
+                },
+                "server": {
+                    "type": "string",
+                    "description": "For call: the server namespace"
+                },
+                "tool": {
+                    "type": "string",
+                    "description": "For call: the tool name, or the namespaced server_tool"
+                },
+                "arguments": {
+                    "type": "object",
+                    "description": "For call: the tool arguments"
+                }
+            },
+            "required": ["action"]
+        })
+    }
+
+    async fn run(&self, input: &Value) -> Result<Value, ToolError> {
+        match input
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("list")
+        {
+            "list" => {
+                let query = input
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                let mut matches: Vec<&McpTool> = self
+                    .tools
+                    .iter()
+                    .filter(|candidate| {
+                        query.is_empty()
+                            || format!(
+                                "{}_{} {}",
+                                candidate.namespace,
+                                candidate.name,
+                                candidate.adapter.description()
+                            )
+                            .to_ascii_lowercase()
+                            .contains(&query)
+                    })
+                    .collect();
+                matches.truncate(12);
+                let tools: Vec<Value> = matches
+                    .iter()
+                    .map(|candidate| {
+                        json!({
+                            "server": candidate.namespace,
+                            "tool": candidate.name,
+                            "name": format!("{}_{}", candidate.namespace, candidate.name),
+                            "description": candidate.adapter.description(),
+                            "parameters": candidate.adapter.json_schema(),
+                        })
+                    })
+                    .collect();
+                Ok(json!({
+                    "tools": tools,
+                    "matched": tools.len(),
+                    "total": self.tools.len(),
+                }))
+            }
+            "call" => {
+                let server = input.get("server").and_then(Value::as_str).unwrap_or("");
+                let tool = input.get("tool").and_then(Value::as_str).unwrap_or("");
+                let Some(found) = self.find(server, tool) else {
+                    return Err(ToolError::InvalidInput(format!(
+                        "no MCP tool '{server}/{tool}'; call action=list to see the roster"
+                    )));
+                };
+                let arguments = input.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                found.adapter.run(&arguments).await
+            }
+            other => Err(ToolError::InvalidInput(format!(
+                "unknown MCP action '{other}'; use list or call"
+            ))),
+        }
     }
 }
 
@@ -1229,5 +1373,67 @@ verdict := {"allow": false, "rule": "no-mcp-spawn", "reason": "mcp spawns are re
 
         drop(state);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    struct EchoAdapter;
+
+    #[async_trait::async_trait]
+    impl AsyncTool for EchoAdapter {
+        fn name(&self) -> &str {
+            "server_echo"
+        }
+        fn description(&self) -> String {
+            "echo the arguments".to_string()
+        }
+        fn json_schema(&self) -> Value {
+            serde_json::json!({"type":"object","properties":{"text":{"type":"string"}}})
+        }
+        async fn run(&self, input: &Value) -> Result<Value, ToolError> {
+            Ok(serde_json::json!({"echo": input}))
+        }
+    }
+
+    fn gateway() -> McpGateway {
+        McpGateway::new(vec![McpTool {
+            namespace: "server".to_string(),
+            name: "echo".to_string(),
+            adapter: Arc::new(EchoAdapter),
+        }])
+    }
+
+    /// The gateway is the one schema a large roster costs; it returns a tool's
+    /// own schema on demand and forwards the call unchanged.
+    #[tokio::test]
+    async fn the_gateway_lists_schemas_and_forwards_calls() {
+        use react::tool::registry::AsyncTool;
+        let gateway = gateway();
+        let listed = gateway
+            .run(&serde_json::json!({"action": "list", "query": "echo"}))
+            .await
+            .expect("the roster lists");
+        assert_eq!(listed["matched"], 1);
+        assert_eq!(listed["tools"][0]["server"], "server");
+        assert_eq!(listed["tools"][0]["parameters"]["type"], "object");
+
+        let called = gateway
+            .run(&serde_json::json!({
+                "action": "call",
+                "server": "server",
+                "tool": "echo",
+                "arguments": {"text": "hi"}
+            }))
+            .await
+            .expect("the call forwards");
+        assert_eq!(called["echo"]["text"], "hi");
+    }
+
+    #[tokio::test]
+    async fn the_gateway_refuses_an_unknown_tool_with_a_roster_hint() {
+        use react::tool::registry::AsyncTool;
+        let error = gateway()
+            .run(&serde_json::json!({"action": "call", "server": "x", "tool": "y"}))
+            .await
+            .expect_err("an unknown tool is refused");
+        assert!(error.to_string().contains("action=list"), "{error}");
     }
 }

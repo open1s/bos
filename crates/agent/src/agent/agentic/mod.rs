@@ -251,6 +251,12 @@ impl AgentConfig {
 #[rkyv(crate = qserde::rkyv)]
 pub struct Agent {
     config: AgentConfig,
+    /// Send-side history ceiling for mid-turn compaction; 0 disables it.
+    ///
+    /// A runtime policy rather than part of the agent's identity, so it is not
+    /// archived: a host sets it from its own context resolution.
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    context_budget: usize,
     #[rkyv(with = qserde::rkyv::with::Skip)]
     llm: Arc<LlmProvider>,
     #[rkyv(with = qserde::rkyv::with::Skip)]
@@ -315,6 +321,7 @@ impl Agent {
         .with_observer(observer);
         Self {
             config,
+            context_budget: 0,
             llm,
             registry: Some(Arc::new(ToolRegistry::new())),
             skills_dir: None,
@@ -371,6 +378,17 @@ impl Agent {
             llm.register_fallback(provider.model.clone(), vendor);
         }
         Self::new(config, Arc::new(llm))
+    }
+
+    /// Set the send-side history ceiling for mid-turn compaction.
+    ///
+    /// Zero disables it. The host passes the same resolved window it prices a
+    /// turn against; the engine keeps a fixed reserve for the persona and tool
+    /// schemas.
+    #[must_use]
+    pub fn with_context_budget(mut self, tokens: usize) -> Self {
+        self.context_budget = tokens;
+        self
     }
 
     /// Set the bus for tool event publishing.
@@ -1136,6 +1154,7 @@ impl Clone for Agent {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
+            context_budget: self.context_budget,
             llm: self.llm.clone(),
             registry: self.registry.clone(),
             skills_dir: self.skills_dir.clone(),

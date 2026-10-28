@@ -609,8 +609,16 @@ fn build_agent_for_session_inner(
     // is the same precedence the hosted switch used.
     config.web_search = false;
     let web_search_on = eff.preset_web_search.unwrap_or(eff.web_tools_enabled);
+    // A zero context budget disables pressure compaction; it must disable the
+    // mid-turn check too. Otherwise the manual-/compact fallback ceiling would
+    // turn it back on behind the setting's back.
+    let mid_turn_budget = if eff.context_budget == 0 {
+        0
+    } else {
+        config.compaction_input_tokens
+    };
 
-    let mut agent = Agent::from_config(config);
+    let mut agent = Agent::from_config(config).with_context_budget(mid_turn_budget);
     // Canonicalise once: `resolve_path` canonicalises every target, so the
     // policy data and the shell cwd must carry the same spelling of the root or
     // a symlinked workspace would look outside itself.
@@ -828,24 +836,61 @@ fn build_agent_for_session_inner(
     // MCP tools come from the live pool rather than from the document: the
     // connection is the expensive part and it is shared across turns. A name
     // the registry already holds is skipped by the registration itself.
-    for tool in mcp.tools() {
-        // A preset names the MCP server namespaces it wants. None means every
-        // connected server; an empty list means none.
-        if eff
-            .preset_mcps
-            .as_ref()
-            .is_some_and(|servers| !servers.iter().any(|server| server == &tool.namespace))
-        {
-            continue;
+    //
+    // A large roster collapses behind one gateway: forty MCP tools would put
+    // forty schemas in every request, and the model can discover the one it
+    // needs through action=list. Small rosters keep real tools, which cost less
+    // than the indirection.
+    let mcp_tools: Vec<crate::mcp::McpTool> = mcp
+        .tools()
+        .filter(|tool| {
+            // A preset names the MCP server namespaces it wants. None means
+            // every connected server; an empty list means none.
+            if eff
+                .preset_mcps
+                .as_ref()
+                .is_some_and(|servers| !servers.iter().any(|server| server == &tool.namespace))
+            {
+                return false;
+            }
+            if eff.preset_mcp_tools.as_ref().is_some_and(|tools| {
+                let full = format!("{}_{}", tool.namespace, tool.name);
+                !tools.iter().any(|allowed| allowed == &full)
+            }) {
+                return false;
+            }
+            true
+        })
+        .cloned()
+        .collect();
+    if mcp_tools.len() > crate::mcp::MCP_GATEWAY_THRESHOLD {
+        let gateway = crate::mcp::McpGateway::new(mcp_tools.clone());
+        match agent.try_add_async_tool(Arc::new(gateway)) {
+            Ok(()) => log::info!(
+                "mcp: {} tools behind one gateway (threshold {})",
+                mcp_tools.len(),
+                crate::mcp::MCP_GATEWAY_THRESHOLD
+            ),
+            Err(error) => {
+                log::warn!(
+                    "MCP gateway was not registered: {error}; registering tools individually"
+                );
+                for tool in &mcp_tools {
+                    if let Err(error) =
+                        agent.add_mcp_tool(&tool.namespace, &tool.name, tool.adapter.clone())
+                    {
+                        log::warn!("MCP tool '{}' was not registered: {error}", tool.name);
+                    }
+                }
+            }
         }
-        if eff.preset_mcp_tools.as_ref().is_some_and(|tools| {
-            let full = format!("{}_{}", tool.namespace, tool.name);
-            !tools.iter().any(|allowed| allowed == &full)
-        }) {
-            continue;
-        }
-        if let Err(error) = agent.add_mcp_tool(&tool.namespace, &tool.name, tool.adapter.clone()) {
-            log::warn!("MCP tool '{}' was not registered: {error}", tool.name);
+    } else {
+        for tool in &mcp_tools {
+            if let Err(error) =
+                agent.add_mcp_tool(&tool.namespace, &tool.name, tool.adapter.clone())
+            {
+                log::warn!("MCP tool '{}' was not registered: {error}", tool.name);
+            }
         }
     }
 
@@ -1643,9 +1688,13 @@ pub(crate) async fn stream_child(
 /// Install the subagent tool on a parent turn.
 pub(crate) fn attach_subagent_tool(agent: &mut Agent, context: SubagentContext) {
     let context = Arc::new(context);
+    // The collector needs the same registry and session the starter uses. Take
+    // them before the starter closure moves the Arc.
+    let result_registry = context.registry.clone();
+    let result_session = context.session.clone();
     let tool = agent::tools::AsyncFunctionTool::from_fn(
         "subagent",
-        "Delegate ONE self-contained part of a large job to a focused child agent with its own context. Use this whenever the work can be split into independent parts (multi-file changes, parallel research, independent reviews); write a complete prompt and run up to three children at once. Returns the child's final result. Do not use it for a trivial single step or tightly coupled sequential work.",
+        "Delegate ONE self-contained part of a large job to a focused child agent with its own context. Use this whenever the work can be split into independent parts (multi-file changes, parallel research, independent reviews); write a complete prompt and run up to three children at once. Returns immediately with a subagent_id; the child keeps running in the background and you collect it with subagent_result. Do not use it for a trivial single step or tightly coupled sequential work.",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -1674,12 +1723,6 @@ pub(crate) fn attach_subagent_tool(agent: &mut Agent, context: SubagentContext) 
                         "prompt is required and must not be empty".to_string(),
                     ));
                 }
-                if context.registry.running_count() >= 3 {
-                    return Err(ToolError::Failed(
-                        "too many subagents are already running; wait for one to finish"
-                            .to_string(),
-                    ));
-                }
                 // Policy before the child exists: a denied spawn creates no run
                 // row and no child session.
                 context.authorize_spawn()?;
@@ -1697,61 +1740,161 @@ pub(crate) fn attach_subagent_tool(agent: &mut Agent, context: SubagentContext) 
                 // A live estimate for the header before the child reports
                 // usage: prompt bytes plus a small allowance for tools/config.
                 let estimated_tokens = (prompt.chars().count() / 4) as u64 + 2_000;
-                let id = context.registry.begin(
+                let Some(id) = context.registry.try_begin(
                     &context.session,
                     &context.parent,
                     context.depth + 1,
                     estimated_tokens,
                     &title,
                     &prompt,
-                );
+                    crate::subagent::SUBAGENT_SLOTS,
+                ) else {
+                    return Err(ToolError::Failed(
+                        "all subagent slots are running; wait for one to finish".to_string(),
+                    ));
+                };
                 let child = context.child(&id);
                 let turn_context =
                     crate::context::TurnContext::from_facts(&context.runtime, true);
-                // No wall clock around the child: a delegated task ends when
-                // its own model stops asking for tools, the same rule a parent
-                // turn follows. The 600-second cap this replaces aborted real
-                // work mid-investigation and returned "subagent timed out" as
-                // if the task had finished.
-                let result = stream_child(
-                    &child,
-                    prompt,
-                    context.registry.clone(),
-                    &id,
-                    &turn_context,
-                )
-                .await;
-                let usage = child.last_token_usage().unwrap_or((0, 0));
-                let transcript = child_transcript(&child);
-                context.registry.set_agent(
-                    &id,
-                    Arc::new(tokio::sync::Mutex::new(child)),
-                );
-                match result {
-                    Ok((text, usage)) => {
-                        context
-                            .registry
-                            .finish(&id, text.clone(), usage, transcript);
-                        let result: String = text.chars().take(16_000).collect();
-                        Ok(serde_json::json!({
-                            "subagent_id": id,
-                            "result": result,
-                            "prompt_tokens": usage.0,
-                            "completion_tokens": usage.1,
-                        }))
+                let registry = context.registry.clone();
+                let task_id = id.clone();
+                // The child is detached on the runner's runtime: the tool used
+                // to await the whole child turn, which serialized the parent
+                // behind work it had just delegated. The registry is the live
+                // handle the header and subagent_result read.
+                tokio::spawn(async move {
+                    let result = stream_child(
+                        &child,
+                        prompt,
+                        registry.clone(),
+                        &task_id,
+                        &turn_context,
+                    )
+                    .await;
+                    let usage = child.last_token_usage().unwrap_or((0, 0));
+                    let transcript = child_transcript(&child);
+                    registry.set_agent(&task_id, Arc::new(tokio::sync::Mutex::new(child)));
+                    match result {
+                        Ok((text, usage)) => {
+                            registry.finish(&task_id, text, usage, transcript);
+                        }
+                        Err(message) => {
+                            registry.fail(&task_id, message, Some(usage), transcript);
+                        }
                     }
-                    Err(message) => {
-                        context
-                            .registry
-                            .fail(&id, message.clone(), Some(usage), transcript);
-                        Err(ToolError::Failed(message))
-                    }
-                }
+                });
+                Ok(serde_json::json!({
+                    "subagent_id": id,
+                    "status": "running",
+                    "title": title,
+                    "note": "The child runs in the background. Continue useful work; call subagent_result with this id when you need the answer, and before you finish the turn."
+                }))
             }
         },
     );
     if let Err(error) = agent.try_add_async_tool(Arc::new(tool)) {
         warn!("subagent tool was not registered: {error}");
+        return;
+    }
+    attach_subagent_result_tool(agent, result_registry, result_session);
+}
+
+/// Install the collector a background subagent returns through.
+///
+/// Without it the parent has no way to read a detached child's answer: the
+/// child's only durable handle is the registry, and the turn should not have to
+/// end just to learn what a delegated run found.
+fn attach_subagent_result_tool(
+    agent: &mut Agent,
+    registry: Arc<crate::subagent::SubagentRegistry>,
+    session: String,
+) {
+    let tool = agent::tools::AsyncFunctionTool::from_fn(
+        "subagent_result",
+        "Collect a background subagent's result, or list this session's runs. Omit subagent_id to list; pass wait_seconds to block up to 60 seconds. Call this before finishing a turn that started subagents.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "subagent_id": { "type": "string", "description": "The id subagent returned; omit to list runs." },
+                "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 60, "description": "Wait up to this long for a running child; 0 returns immediately." }
+            }
+        }),
+        move |args| {
+            let registry = registry.clone();
+            let session = session.clone();
+            async move {
+                let id = args
+                    .get("subagent_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let wait = args
+                    .get("wait_seconds")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+                    .min(60);
+                if id.is_empty() {
+                    let runs: Vec<serde_json::Value> = registry
+                        .snapshot()
+                        .iter()
+                        .filter(|run| run.session == session)
+                        .map(|run| {
+                            let status = run.status.as_str();
+                            let elapsed = run.elapsed_ms();
+                            let tokens = run.total_tokens();
+                            serde_json::json!({
+                                "subagent_id": run.id,
+                                "title": run.title,
+                                "status": status,
+                                "elapsed_ms": elapsed,
+                                "tokens": tokens,
+                            })
+                        })
+                        .collect();
+                    return Ok(serde_json::json!({ "runs": runs }));
+                }
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(wait);
+                loop {
+                    let Some(run) = registry.run(&id) else {
+                        return Err(ToolError::InvalidInput(format!(
+                            "no subagent run '{id}'; omit subagent_id to list runs"
+                        )));
+                    };
+                    let timed_out = std::time::Instant::now() >= deadline;
+                    if !run.status.is_running() || wait == 0 || timed_out {
+                        let status = run.status.as_str();
+                        let elapsed = run.elapsed_ms();
+                        let mut payload = serde_json::json!({
+                            "subagent_id": run.id,
+                            "title": run.title,
+                            "status": status,
+                            "elapsed_ms": elapsed,
+                            "prompt_tokens": run.prompt_tokens,
+                            "completion_tokens": run.completion_tokens,
+                        });
+                        if let Some(result) = run.result {
+                            let clipped: String = result.chars().take(16_000).collect();
+                            payload["result"] = serde_json::Value::String(clipped);
+                        }
+                        if let Some(error) = run.error {
+                            payload["error"] = serde_json::Value::String(error);
+                        }
+                        if run.status.is_running() {
+                            payload["note"] = serde_json::Value::String(
+                                "still running; call again or pass wait_seconds".to_string(),
+                            );
+                        }
+                        return Ok(payload);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }
+        },
+    );
+    if let Err(error) = agent.try_add_async_tool(Arc::new(tool)) {
+        warn!("subagent_result tool was not registered: {error}");
     }
 }
 

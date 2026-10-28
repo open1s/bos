@@ -475,6 +475,108 @@ fn the_todo_header_expands_the_list(cx: &mut TestAppContext) {
     );
 }
 
+/// The running step's glyph is the shared ongoing mark at its measured box: the
+/// animated ring lays out exactly like the still one, so the row it sits in does
+/// not move when the cycle starts.
+#[gpui::test]
+fn the_running_step_draws_the_shared_spinner(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_plan(
+            "todo-spinner",
+            vec![
+                plan_item("Read the code", PlanStatus::Completed),
+                plan_item("Draw the panel", PlanStatus::InProgress),
+            ],
+        );
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let head = cx
+        .debug_bounds("todo-panel-header")
+        .expect("the header renders");
+    cx.simulate_click(head.center(), Modifiers::default());
+    assert!(cx.update(|_, cx| shell.read(cx).todo_open));
+
+    // Two frames: the animation wrapper takes its own global element id, so the
+    // second frame is the one that would expose a re-layout that drifts.
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let first = cx
+        .debug_bounds("state-dot-spinner")
+        .expect("the running step's ring renders");
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let second = cx
+        .debug_bounds("state-dot-spinner")
+        .expect("the ring renders on the next frame too");
+    assert_eq!(
+        (first.size.width, first.size.height),
+        (px(14.0), px(14.0)),
+        "the ring is the shared 14px mark"
+    );
+    assert_eq!(
+        (first.origin.x, first.origin.y),
+        (second.origin.x, second.origin.y),
+        "the animated frame lays out where the still one does"
+    );
+}
+
+/// The ongoing cycle, measured from the reference's two keyframe tracks: the arc
+/// breathes 12 -> 24 -> 12 viewBox units while its offset walks 0 -> -6 -> 0, and
+/// the sheet's reduced-motion rule is that same pair's midpoint.
+#[test]
+fn the_state_dot_breathes_on_the_measured_cycle() {
+    use crate::ui::todo_panel::{spin_rest, spin_sweep, SPIN_CIRCUMFERENCE};
+    let units = |sweep: f32| sweep * SPIN_CIRCUMFERENCE;
+    let (start, sweep) = spin_sweep(0.0);
+    assert!(start.abs() < 1e-4, "the cycle opens at the path's origin");
+    assert!(
+        (units(sweep) - 12.0).abs() < 1e-3,
+        "an 12-unit dash opens it"
+    );
+
+    // Halfway, the quadratic ease-in-out has covered half its segment.
+    let (start, sweep) = spin_sweep(0.5);
+    assert!(
+        (units(sweep) - 24.0).abs() < 1e-3,
+        "the dash doubles at the peak"
+    );
+    assert!(
+        (units(start) - 6.0).abs() < 1e-3,
+        "and the offset has walked it 6 units forward"
+    );
+
+    // The second half is the mirror, so the seam at 1.0 is the opening shape.
+    let quarter = spin_sweep(0.25);
+    let three_quarter = spin_sweep(0.75);
+    assert!(
+        (units(quarter.1) - 18.0).abs() < 1e-3 && (units(three_quarter.1) - 18.0).abs() < 1e-3,
+        "both segments pass through the 18-unit midpoint"
+    );
+    let wrapped = spin_sweep(1.0);
+    assert!(
+        (units(wrapped.1) - 12.0).abs() < 1e-3,
+        "the cycle wraps to its start"
+    );
+
+    // The reduced-motion dash is exactly that midpoint, which is why the still
+    // ring reads as the same mark.
+    let (rest_start, rest_sweep) = spin_rest();
+    assert!((units(rest_sweep) - 18.0).abs() < 1e-3);
+    assert!((units(rest_start) - 3.0).abs() < 1e-3);
+    assert!(
+        (units(rest_sweep) - units(quarter.1)).abs() < 1e-4
+            && (units(rest_start) - units(quarter.0)).abs() < 1e-4,
+        "the still shape is the cycle at its quarter turn"
+    );
+    let (peak_start, _) = spin_sweep(0.5);
+    assert!(
+        units(peak_start) > units(rest_start),
+        "the arc keeps walking forward through the grow"
+    );
+}
+
 /// A session with no plan draws no panel, which is what the reference does.
 #[gpui::test]
 fn the_todo_panel_is_hidden_without_a_plan(cx: &mut TestAppContext) {

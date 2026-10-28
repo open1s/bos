@@ -208,8 +208,15 @@ pub(crate) struct SubagentRegistry {
     next: AtomicU64,
 }
 
+/// How many child runs may occupy the machine at once.
+pub(crate) const SUBAGENT_SLOTS: usize = 3;
+
 impl SubagentRegistry {
     /// Start one run and return its id.
+    ///
+    /// Test-only now that the tool reserves a slot atomically through
+    /// [`Self::try_begin`]; the tests still want the unconditional form.
+    #[cfg(test)]
     pub(crate) fn begin(
         &self,
         session: &str,
@@ -243,6 +250,59 @@ impl SubagentRegistry {
             runs.push(run);
         }
         id
+    }
+
+    /// Start one run only when a concurrency slot is free.
+    ///
+    /// The check and the insert share one lock: a batch of parallel subagent
+    /// calls cannot all observe the same free slot and overrun the cap.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_begin(
+        &self,
+        session: &str,
+        parent: &str,
+        depth: usize,
+        estimated_tokens: u64,
+        title: &str,
+        prompt: &str,
+        limit: usize,
+    ) -> Option<String> {
+        let _ = self.next.fetch_add(1, Ordering::Relaxed);
+        let id = format!("sub-{}", Uuid::new_v4());
+        let run = SubagentRun {
+            id: id.clone(),
+            session: session.to_string(),
+            parent: parent.to_string(),
+            depth,
+            title: title.to_string(),
+            prompt: prompt.to_string(),
+            status: SubagentStatus::Running,
+            started_at: now_ms(),
+            finished_at: None,
+            estimated_tokens,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            result: None,
+            error: None,
+            revision: 0,
+            transcript: Vec::new(),
+        };
+        let mut runs = self.runs.lock().ok()?;
+        if runs.iter().filter(|run| run.status.is_running()).count() >= limit {
+            return None;
+        }
+        runs.push(run);
+        Some(id)
+    }
+
+    /// One run's current snapshot, when it exists.
+    pub(crate) fn run(&self, id: &str) -> Option<SubagentRun> {
+        self.runs
+            .lock()
+            .ok()?
+            .iter()
+            .find(|run| run.id == id)
+            .cloned()
     }
 
     /// Mark one run done with its final answer and token usage.
@@ -472,6 +532,29 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A background start reserves its slot under one lock, so parallel
+    /// subagent calls cannot all pass the same `running_count` check.
+    #[test]
+    fn try_begin_reserves_a_slot_and_run_reads_it() {
+        let registry = SubagentRegistry::default();
+        let first = registry
+            .try_begin("s", "s", 1, 0, "A", "a", 1)
+            .expect("the first slot");
+        assert!(
+            registry.try_begin("s", "s", 1, 0, "B", "b", 1).is_none(),
+            "the only slot is taken"
+        );
+        assert_eq!(
+            registry.run(&first).expect("the reserved run").status,
+            SubagentStatus::Running
+        );
+        registry.finish(&first, "ok".to_string(), (1, 2), Vec::new());
+        assert!(
+            registry.try_begin("s", "s", 1, 0, "C", "c", 1).is_some(),
+            "a finished run frees its slot"
+        );
+    }
 
     #[test]
     fn a_run_moves_from_running_to_done() {

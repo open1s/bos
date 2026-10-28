@@ -49,9 +49,9 @@ pub(crate) fn progress(items: &[PlanItem], lang: Lang) -> String {
 ///
 /// Measured: a 10px slot painting a 6px core - the static green-500 when the
 /// step is done, state-idle-primary while it waits - and a 14px ring with a 2px
-/// viewBox stroke in label-tertiary while the step runs. The reference's ring
-/// rotates on two 1.5s keyframes; a GPUI canvas path carries no animation seam,
-/// so bsh draws its reduced-motion shape: a 25% track with a static arc.
+/// viewBox stroke in label-tertiary while the step runs. The running ring is
+/// [`spinner`], the shared ongoing mark, so the composer's busy chip, the job
+/// rows and the trajectory all turn and breathe on the same measured cycle.
 fn glyph(status: PlanStatus) -> Div {
     let slot = div()
         .w(px(theme::TODO_GLYPH))
@@ -87,51 +87,125 @@ fn glyph(status: PlanStatus) -> Div {
     }
 }
 
-/// The running step's ring: a full track at 25% behind a static arc.
+/// The reference's ongoing cycle, measured from StateDot.module.css.
 ///
-/// The arc is the reference's own reduced-motion dash pair - 18 of 150 units,
-/// offset by -3 - on a 9.5-radius circle in a 24-unit viewBox scaled to 14px.
-/// It is the shared ongoing `StateDot`, so the composer's model trigger borrows
-/// it for its own busy mark.
-pub(crate) fn spinner() -> impl IntoElement {
+/// `dsh-state-dot-spin` is `1.5s linear infinite` on a `rotate(360deg)`
+/// transform, and `dsh-state-dot-dash` is `1.5s ease-in-out infinite` on the
+/// arc's dash pair. Both carry that one period so pinning their start times
+/// aligns them, which is why a single phase drives both here.
+pub(crate) const SPIN_PERIOD: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// The dash pattern's own length space: one circumference of the reference's
+/// 24-unit viewBox ring (r = 9.5), the units `stroke-dasharray` is written in.
+/// bsh draws that ring at 14px, so a dash length converts to turns by this.
+pub(crate) const SPIN_CIRCUMFERENCE: f32 = 59.690_26;
+
+/// The running arc's start and sweep in turns of the ring, for a phase in
+/// `0..1` of [`SPIN_PERIOD`].
+///
+/// Measured keyframes: the dash runs `12 150` at offset 0, `24 150` at -6 and
+/// back to `12 150` at 0, so the arc both grows and walks forward. A negative
+/// `stroke-dashoffset` starts the dash that many units into the path. The
+/// sheet's `ease-in-out` is the kit's quadratic S-curve, which departs from
+/// CSS's `cubic-bezier(.42, 0, .58, 1)` by under 0.5% of the sweep.
+pub(crate) fn spin_sweep(phase: f32) -> (f32, f32) {
+    let phase = if phase.is_finite() {
+        phase.rem_euclid(1.0)
+    } else {
+        0.0
+    };
+    let rising = phase < 0.5;
+    let eased = ease_in_out(if rising {
+        phase * 2.0
+    } else {
+        (phase - 0.5) * 2.0
+    });
+    let (dash, offset) = if rising {
+        (12.0 + 12.0 * eased, -6.0 * eased)
+    } else {
+        (24.0 - 12.0 * eased, -6.0 + 6.0 * eased)
+    };
+    (-offset / SPIN_CIRCUMFERENCE, dash / SPIN_CIRCUMFERENCE)
+}
+
+/// The `prefers-reduced-motion` shape: `stroke-dasharray: 18 150` at
+/// `stroke-dashoffset: -3`, which the sheet substitutes for both animations
+/// and which bsh paints as the still ring.
+pub(crate) fn spin_rest() -> (f32, f32) {
+    (3.0 / SPIN_CIRCUMFERENCE, 18.0 / SPIN_CIRCUMFERENCE)
+}
+
+/// The running step's ring at one phase of the cycle: a full track at 25%
+/// behind the moving arc, on a 9.5-radius circle in a 24-unit viewBox.
+fn spinner_at(phase: f32) -> Div {
     let size = theme::TODO_SPINNER;
     let stroke = px(theme::TODO_SPINNER_STROKE);
     let radius = theme::TODO_SPINNER_RADIUS;
     let track = rgb(theme::faint()).alpha(0.25);
     let arc = rgb(theme::faint());
-    canvas(
-        |_bounds, _window, _cx| (),
-        move |bounds, _state, window, _cx| {
-            let center = bounds.center();
-            let point_at = |turns: f32| {
-                let angle = turns * std::f32::consts::TAU;
-                point(
-                    center.x + px(radius * angle.cos()),
-                    center.y + px(radius * angle.sin()),
-                )
-            };
-            let mut ring = PathBuilder::stroke(stroke);
-            ring.move_to(point_at(0.0));
-            for step in 1..=32 {
-                ring.line_to(point_at(step as f32 / 32.0));
-            }
-            ring.close();
-            if let Ok(path) = ring.build() {
-                window.paint_path(path, track);
-            }
-            let (from, to) = (0.087, 0.609);
-            let mut sweep = PathBuilder::stroke(stroke);
-            sweep.move_to(point_at(from));
-            for step in 1..=24 {
-                sweep.line_to(point_at(from + (to - from) * step as f32 / 24.0));
-            }
-            if let Ok(path) = sweep.build() {
-                window.paint_path(path, arc);
-            }
-        },
+    div()
+        .debug_selector(|| "state-dot-spinner".to_string())
+        .w(px(size))
+        .h(px(size))
+        .flex_none()
+        .child(
+            canvas(
+                |_bounds, _window, _cx| (),
+                move |bounds, _state, window, cx| {
+                    let center = bounds.center();
+                    let point_at = |turns: f32| {
+                        let angle = turns * std::f32::consts::TAU;
+                        point(
+                            center.x + px(radius * angle.cos()),
+                            center.y + px(radius * angle.sin()),
+                        )
+                    };
+                    let mut ring = PathBuilder::stroke(stroke);
+                    ring.move_to(point_at(0.0));
+                    for step in 1..=32 {
+                        ring.line_to(point_at(step as f32 / 32.0));
+                    }
+                    ring.close();
+                    if let Ok(path) = ring.build() {
+                        window.paint_path(path, track);
+                    }
+                    // The ring turns once per cycle under the arc's own
+                    // breathing; reduced motion freezes both, as the sheet's
+                    // media query does.
+                    let (start, sweep) = if cx.reduce_motion() {
+                        spin_rest()
+                    } else {
+                        let (start, sweep) = spin_sweep(phase);
+                        (start + phase, sweep)
+                    };
+                    let steps = ((sweep * 32.0).ceil() as usize).max(2);
+                    let mut dash = PathBuilder::stroke(stroke);
+                    dash.move_to(point_at(start));
+                    for step in 1..=steps {
+                        dash.line_to(point_at(start + sweep * step as f32 / steps as f32));
+                    }
+                    if let Ok(path) = dash.build() {
+                        window.paint_path(path, arc);
+                    }
+                },
+            )
+            .w(px(size))
+            .h(px(size)),
+        )
+}
+
+/// The shared ongoing mark: the reference's turn-and-breathe ring.
+///
+/// `AnimationExt::with_animation` is the frame seam the canvas path lacked, and
+/// it is where the reference's media query lands too: with reduce motion on it
+/// renders the cycle's start once and schedules no frames, while the paint
+/// closure sees `reduce_motion()` and draws the sheet's own still dash.
+pub(crate) fn spinner() -> impl IntoElement {
+    spinner_at(0.0).with_animation(
+        "state-dot-spinner",
+        Animation::new(SPIN_PERIOD).repeat(),
+        |_still: Div, phase| spinner_at(phase),
     )
-    .w(px(size))
-    .h(px(size))
 }
 
 impl Shell {

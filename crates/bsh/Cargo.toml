@@ -42,6 +42,9 @@ config = { path = "../config" }
 # Codex MCP server). `log` is already in the workspace graph through `logging`;
 # it is the shell's way to report that refusal instead of silently dropping it.
 log = "0.4.29"
+# The MCP gateway implements the async-tool trait, so the macro is needed by
+# the library build, not only by tests.
+async-trait = { workspace = true }
 # Remote plugin-market index fetches run on the shell's tokio runtime; reqwest
 # is the workspace's HTTP client and already in the build through `agent`.
 reqwest = { workspace = true }
@@ -103,8 +106,6 @@ rand = { workspace = true }
 # shell is booted headlessly and its controls are clicked by debug selector.
 gpui = { package = "gpui-pre", version = "=0.3.10", features = ["test-support"] }
 # The runner's automatic-compaction test drives a local `LlmClient` mock; the
-# react trait is async-trait-transformed, so implementations need the macro.
-async-trait = { workspace = true }
 
 # A bare `bsh` binary has no bundle, so macOS would draw a generic Dock tile;
 # assets::install_dock_icon hands AppKit the .icns compiled into the binary

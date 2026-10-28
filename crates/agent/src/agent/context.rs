@@ -1827,6 +1827,21 @@ mod budget_tests {
         }
     }
 
+    /// The trait the engine sees prices the history and can condense it
+    /// without a model call, which is what makes a mid-turn budget check cheap.
+    #[test]
+    fn the_session_prices_itself_and_mechanically_compacts() {
+        use react::llm::ReactSession as _;
+        let mut session = chat(20, 400);
+        let before = session.estimate_tokens().expect("the app prices itself");
+        assert!(session.compact_mechanical(4, 1_000));
+        let after = session.estimate_tokens().expect("the app prices itself");
+        assert!(
+            after < before,
+            "the mechanical path shrank: {before} -> {after}"
+        );
+    }
+
     /// The allocation-free part estimate must equal the joined-text one.
     ///
     /// [`estimate_session`](ContextBudget::estimate_session) runs on every turn,
