@@ -3217,6 +3217,35 @@ Evidence: `ui::shell_tests::an_image_alone_can_be_sent` (stored URL, painted
 Native screenshot: 1280x820 sandboxed home, the stored red image paints as the
 rounded frame with no `[image: ...]` text anywhere in the transcript.
 
+Round 127 answered the measured cause of slow, unfocused turns, and the cause was
+not the model. A stored demo turn (`hello` workspace, request `create AGENTS.md`)
+took 5 LLM round trips and ~4 minutes; the request bodies were 60 KB each, and
+36,379 of the 41,762-byte system prompt was the skill catalogue - every installed
+skill's full description, on every step, for a task that used none of them. A
+direct probe of the configured endpoint showed ~23 s per call REGARDLESS of prompt
+size (180 vs 9,175 prompt tokens), so the only lever that moves wall clock is the
+number of calls, and the only lever that moves focus is what rides in the prompt.
+
+Two changes, both in the request path:
+- `react::llm::render_skill_catalog` ranks skills against THIS request: up to 8
+  matching skills keep a 240-char description, every other skill is a name, and the
+  whole block is capped at 4,096 bytes (measured on the installed set: 36,379 ->
+  ~4,000). The Chat and Responses vendors both call it; `load_skill` still opens any
+  of them by name. A machine that carries 178 skills no longer pays for them.
+- The runtime snapshot now names the workspace layout: top level plus one level
+  into up to three directories (`src/ (main.rs, lib.rs)`), bounded at 900 bytes and
+  40 entries, with the remainder named. Step one can read the file it needs instead
+  of spending a whole round trip on `list_dir`; the shared rule in the prompt also
+  asks for every independent read in one message.
+
+Evidence: `llm::types::tests::an_unrelated_catalogue_costs_names_not_descriptions`,
+`a_matching_skill_keeps_its_description`, `the_catalogue_is_bounded_even_with_hundreds_of_skills`,
+`wire_format_test::the_skill_catalogue_on_the_wire_is_ranked_and_bounded`,
+`context::tests::the_snapshot_names_the_workspace_layout`, `the_layout_is_bounded`.
+Not fixed here, stated: the endpoint's ~23 s fixed cost per call is the provider's,
+and the skill ROOTS (`~/.agents/skills` 119, `~/.claude/skills` 22, `~/.dsh/skills` 1)
+are the reader's own configuration; the pane can switch a source off.
+
 The lightbox is the reference's interaction, measured by behaviour rather than
 CSS (the primitives bundle is not in the extracted corpus): a modal over the
 shell, the cached original fitted to the viewport without a second decode, and
@@ -3225,3 +3254,24 @@ handled before the composer's own key bindings and EVERY other key is swallowed
 while it is open, so the modal cannot leave the composer editing behind it.
 Because GPUI has no zoom-in cursor asset, the frame uses `cursor_pointer`; that
 is the only cosmetic difference from the reference frame.
+
+A session delete could be undone by the next LAUNCH, and the cause was a duplicate
+document, not the delete: `Store::remove` removed `<root>/<id>.json` for the one
+workspace the build resolved, while an older copy of the same id sat under another
+registered root. `read` scans every root, `dedupe_by_id` kept one row, and the
+surviving stray resurrected the chat on restart. Measured in the demo home:
+`8d7f157e...` existed under both `hello/.bsh/sessions` and `bos/.bsh/sessions` with
+different `workspace` ids.
+
+`Store::remove` now sweeps every directory a session can live in (each registered
+root, then the quarantine), removing the document AND its `history/<id>` log, and
+logs a warning when a document cannot be removed instead of swallowing the error.
+`Store::save` heals the same way (`drop_strays`): the root the document was just
+written to is the authority, so the same id anywhere else is stale and is dropped.
+An id is unique, which is what makes "another root's copy" a safe thing to delete.
+
+Evidence: `store::raw_tests::deleting_a_session_sweeps_a_stray_copy_under_another_root`
+(two roots, one id, delete, reopen -> empty) and
+`store::raw_tests::a_save_drops_a_stray_copy_under_another_root`; the parked/restore
+and purge flows still pass (`a_deleted_chat_is_parked_and_can_be_restored`,
+`a_parked_chat_can_be_deleted_for_good`).

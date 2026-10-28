@@ -3990,6 +3990,22 @@ mod tests {
         names
     }
 
+    /// The system prompt rides on EVERY step of EVERY turn, so its size is a
+    /// per-request cost, not a wording preference. A change that doubles it is a
+    /// performance bug: the measured prompt with the tool rules is about 5 KB,
+    /// and the skill catalogue is deliberately NOT part of it (the vendor ranks
+    /// that against the request instead).
+    #[test]
+    fn the_system_prompt_stays_within_its_budget() {
+        let built = build(&bare());
+        let prompt = &built.agent.config().system_prompt;
+        assert!(
+            prompt.len() < 12_000,
+            "the system prompt rides on every step: {} bytes",
+            prompt.len()
+        );
+    }
+
     /// An EMPTY persona is "the framework's default", not "no persona": a
     /// workspace that never typed a prompt (and a preset that publishes none)
     /// still sends the agentic default, while a typed prompt and a preset

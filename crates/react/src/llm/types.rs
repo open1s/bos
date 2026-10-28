@@ -947,6 +947,131 @@ impl ReactSession for LlmSession {
     }
 }
 
+/// How many skills keep their full description in one request.
+///
+/// A machine accumulates skills, and a measured BSH install carried 123 of
+/// them. Injecting every description cost 36 KB of a 41 KB system prompt on
+/// every step of every turn - for tasks that used none of them. Selection needs
+/// the few skills that could apply and the NAMES of the rest, because
+/// load_skill reads the instructions on demand.
+pub const SKILL_CATALOG_DESCRIBED: usize = 8;
+
+/// Hard byte budget for the whole rendered catalogue.
+pub const SKILL_CATALOG_BUDGET: usize = 4_096;
+
+/// The longest description a described skill keeps.
+const SKILL_DESCRIPTION_CHARS: usize = 240;
+
+/// Words too common to say what a request is about.
+const SKILL_STOPWORDS: &[&str] = &[
+    "the", "and", "for", "with", "that", "this", "from", "into", "your", "when", "use", "using",
+    "are", "was", "were", "will", "would", "should", "can", "could", "have", "has", "had", "not",
+    "but", "you", "our", "its", "their", "them", "they", "than", "then", "there", "here", "also",
+    "any", "all", "some", "such", "each", "every", "work", "works", "working", "task", "tasks",
+    "thing", "things", "need", "needs", "want", "wants", "make", "makes", "making", "get", "gets",
+    "one", "two", "new", "add", "adds", "adding", "create", "creates", "creating", "file", "files",
+];
+
+/// Render the catalogue of available skills for one request.
+///
+/// The catalogue is RANKED against the request, not listed in full: a skill
+/// whose name or category shares a word with the request keeps its description
+/// (up to SKILL_CATALOG_DESCRIBED of them), every other skill is named only, and
+/// the whole block is bounded by SKILL_CATALOG_BUDGET. The model still discovers
+/// everything by name and can open any of them with load_skill; what it no
+/// longer pays for is a 36 KB catalogue of skills unrelated to the turn.
+pub fn render_skill_catalog(skills: &[Skill], query: &str) -> String {
+    if skills.is_empty() {
+        return String::new();
+    }
+    let wanted = catalog_words(query);
+    let mut ranked: Vec<(usize, usize)> = skills
+        .iter()
+        .enumerate()
+        .map(|(index, skill)| {
+            let head = format!("{} {}", skill.name, skill.category);
+            (catalog_score(&wanted, &head, &skill.description), index)
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+
+    let described: Vec<usize> = ranked
+        .iter()
+        .filter(|(score, _)| *score > 0)
+        .take(SKILL_CATALOG_DESCRIBED)
+        .map(|(_, index)| *index)
+        .collect();
+
+    let mut text = format!(
+        "Available skills ({}; call load_skill with a name to read its instructions):\n",
+        skills.len()
+    );
+    for index in &described {
+        let skill = &skills[*index];
+        text.push_str(&format!(
+            "- {}: {}\n",
+            skill.name,
+            clip(&skill.description, SKILL_DESCRIPTION_CHARS)
+        ));
+    }
+    let rest: Vec<&str> = skills
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !described.contains(index))
+        .map(|(_, skill)| skill.name.as_str())
+        .collect();
+    if !rest.is_empty() {
+        text.push_str("- other skills (name only): ");
+        text.push_str(&rest.join(", "));
+    }
+    if text.len() > SKILL_CATALOG_BUDGET {
+        text = clip(&text, SKILL_CATALOG_BUDGET);
+    }
+    text
+}
+
+/// The words a request is about, lowercased and without the filler.
+fn catalog_words(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| word.chars().count() >= 3)
+        .map(|word| word.to_lowercase())
+        .filter(|word| !SKILL_STOPWORDS.contains(&word.as_str()))
+        .collect()
+}
+
+/// How strongly one skill answers the request; 0 means "not this one".
+fn catalog_score(wanted: &[String], head: &str, description: &str) -> usize {
+    if wanted.is_empty() {
+        return 0;
+    }
+    let head = catalog_words(head);
+    let body = catalog_words(description);
+    wanted
+        .iter()
+        .map(|word| {
+            if head.iter().any(|candidate| candidate == word) {
+                3
+            } else if body.iter().any(|candidate| candidate == word) {
+                1
+            } else {
+                0
+            }
+        })
+        .sum()
+}
+
+/// Truncate on a character boundary, marking that it was cut.
+fn clip(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_string();
+    }
+    let mut cut = limit.saturating_sub(4).min(text.len());
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{} ...", &text[..cut])
+}
+
 #[cfg(test)]
 mod tests {
     use super::{parse_content_parts, ApiMode, Content, ContentPart, LlmError};
@@ -993,5 +1118,78 @@ mod tests {
         }
         // An unknown name falls back to chat rather than failing.
         assert_eq!(ApiMode::from_name("nonsense"), ApiMode::Chat);
+    }
+
+    fn skill(name: &str, description: &str) -> super::Skill {
+        super::Skill {
+            category: "general".to_string(),
+            description: description.to_string(),
+            name: name.to_string(),
+        }
+    }
+
+    /// A catalogue of skills that have nothing to do with the turn is NAMES,
+    /// not descriptions. The measured BSH install carried 123 skills and their
+    /// descriptions were 87% of the system prompt.
+    #[test]
+    fn an_unrelated_catalogue_costs_names_not_descriptions() {
+        let skills: Vec<super::Skill> = (0..200)
+            .map(|index| {
+                skill(
+                    &format!("threejs-procedural-thing-{index}"),
+                    "Author physically based procedural Three.js materials with                      derivative normals, atlas filtering and specular antialiasing.",
+                )
+            })
+            .collect();
+        let catalog = super::render_skill_catalog(&skills, "create AGENTS.md");
+        assert!(
+            catalog.len() <= super::SKILL_CATALOG_BUDGET,
+            "bounded: {} bytes",
+            catalog.len()
+        );
+        assert!(
+            !catalog.contains("derivative normals"),
+            "no unrelated description rides along: {catalog}"
+        );
+        assert!(
+            catalog.contains("threejs-procedural-thing-0"),
+            "every skill is still discoverable by name"
+        );
+    }
+
+    /// A skill that answers the request keeps its description, because that is
+    /// the one thing the model needs to decide to open it.
+    #[test]
+    fn a_matching_skill_keeps_its_description() {
+        let skills = vec![
+            skill("threejs-bloom", "Implement production bloom in Three.js."),
+            skill(
+                "rust-testing",
+                "Write and run Rust tests, then fix the failures they report.",
+            ),
+        ];
+        let catalog = super::render_skill_catalog(&skills, "the rust tests are failing, fix them");
+        assert!(
+            catalog.contains("Write and run Rust tests"),
+            "the matching skill is described: {catalog}"
+        );
+        assert!(
+            !catalog.contains("Implement production bloom"),
+            "the unrelated one is a name only: {catalog}"
+        );
+    }
+
+    /// The budget wins over any skill count.
+    #[test]
+    fn the_catalogue_is_bounded_even_with_hundreds_of_skills() {
+        let skills: Vec<super::Skill> = (0..500)
+            .map(|index| skill(&format!("rust-tests-{index}"), &"x".repeat(400)))
+            .collect();
+        let catalog = super::render_skill_catalog(&skills, "rust tests");
+        assert!(
+            catalog.len() <= super::SKILL_CATALOG_BUDGET,
+            "the catalogue stays inside its budget: {} bytes",
+            catalog.len()
+        );
     }
 }

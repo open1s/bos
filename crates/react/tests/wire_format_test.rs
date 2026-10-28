@@ -424,6 +424,57 @@ async fn chat_hosted_tools_serialized_as_function_tools() {
     server.shutdown().await;
 }
 
+/// A machine can carry well over a hundred skills, and their full descriptions
+/// used to be injected on every request (36 KB of a 41 KB prompt in a measured
+/// BSH turn). The wire now carries a catalogue ranked against THIS request and
+/// bounded, so the skills still reach the model without the noise.
+#[tokio::test]
+async fn the_skill_catalogue_on_the_wire_is_ranked_and_bounded() {
+    let server =
+        MockLlmServer::start(|_req: &CapturedRequest| MockReply::Json(chat_completion("hi"))).await;
+    let vendor = OpenAiVendor::new(server.url(), "gpt-4".into(), "sk-mock".into());
+
+    let mut session = LlmSession::new();
+    session.push(LlmMessage::user("create AGENTS.md"));
+    let mut context = LlmContext {
+        skills: (0..200)
+            .map(|index| react::llm::Skill {
+                category: "general".to_string(),
+                description: "Author physically based procedural Three.js materials with \
+                              derivative normals, atlas filtering and specular antialiasing."
+                    .to_string(),
+                name: format!("threejs-procedural-thing-{index}"),
+            })
+            .collect(),
+        ..LlmContext::default()
+    };
+    let req = LlmRequest::new("gpt-4");
+
+    vendor
+        .complete(None, req, &mut session, &mut context)
+        .await
+        .expect("chat complete");
+
+    let reqs = server.requests();
+    let system = reqs[0].body["messages"][0]["content"]
+        .as_str()
+        .expect("the system message is text");
+    assert!(
+        system.contains("other skills (name only)"),
+        "the catalogue is names, not descriptions"
+    );
+    assert!(
+        !system.contains("derivative normals"),
+        "an unrelated description does not ride along"
+    );
+    assert!(
+        system.len() < 6_000,
+        "the system message stays bounded, was {} bytes",
+        system.len()
+    );
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn chat_stream_preserves_a_split_multibyte_character() {
     let payload = format!("data: {}\n\ndata: [DONE]\n\n", chat_chunk("你好"));

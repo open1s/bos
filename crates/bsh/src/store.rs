@@ -537,12 +537,64 @@ impl Store {
             return false;
         };
         self.histories.borrow_mut().clear();
-        let path = self
-            .dir_for(&self.sessions[index])
-            .join(format!("{id}.json"));
-        let _ = fs::remove_file(path);
+        // Every root is swept, not only the one this build resolved. A session
+        // id is unique, so the same document under a second root is a stray
+        // left by an earlier move between workspaces - and deleting only the
+        // resolved copy left that stray on disk, which the NEXT LAUNCH read
+        // back. That is why a removed chat came back after a restart.
+        for dir in self.session_dirs() {
+            let document = dir.join(format!("{id}.json"));
+            if document.is_file() {
+                if let Err(error) = fs::remove_file(&document) {
+                    log::warn!(
+                        "session {id} document could not be removed ({}): {error}",
+                        document.display()
+                    );
+                }
+            }
+            let history = History::dir_for(&dir, id);
+            if history.is_dir() {
+                let _ = fs::remove_dir_all(&history);
+            }
+        }
         self.sessions.remove(index);
         true
+    }
+
+    /// Every directory a session document can live in: each registered
+    /// workspace root, then the harness directory. A path appears once.
+    fn session_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = self.roots.values().cloned().collect();
+        dirs.push(self.quarantine.clone());
+        dirs.sort();
+        dirs.dedup();
+        dirs
+    }
+
+    /// Drop the same session's document from every root except `keep`.
+    ///
+    /// A save writes a session to the root of the workspace it belongs to, so a
+    /// copy anywhere else is stale by definition. Removing it here heals the
+    /// strays that already exist instead of waiting for the delete that would
+    /// otherwise resurrect the chat on the next launch.
+    fn drop_strays(&self, id: &str, keep: &Path) {
+        for dir in self.session_dirs() {
+            if dir == keep {
+                continue;
+            }
+            let document = dir.join(format!("{id}.json"));
+            if document.is_file() {
+                log::warn!(
+                    "dropping a stray copy of session {id} under {}",
+                    dir.display()
+                );
+                let _ = fs::remove_file(&document);
+            }
+            let history = History::dir_for(&dir, id);
+            if history.is_dir() {
+                let _ = fs::remove_dir_all(&history);
+            }
+        }
     }
 
     /// Insert a session at the front.
@@ -587,6 +639,9 @@ impl Store {
         let text = self.redact(&serde_json::to_string_pretty(&document)?);
         fs::write(path, text)?;
         self.save_history(&normalized, dir)?;
+        // The document just written is the authority; the same id anywhere else
+        // is a leftover that would resurrect this chat if it were deleted.
+        self.drop_strays(&normalized.id, dir);
         Ok(())
     }
 
@@ -1699,6 +1754,86 @@ mod raw_tests {
         let dir = crate::store::sessions_dir(&root);
         let log = crate::history::History::open(crate::history::History::dir_for(&dir, "trim"));
         assert_eq!(log.len(), WINDOW * 12, "while the log keeps every row");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Two roots, one id: the store reads one row, and the delete must remove
+    /// the document under BOTH roots. Removing only the copy the build resolved
+    /// left the stray behind, and the next launch read it back - a deleted chat
+    /// reappeared after a restart.
+    #[test]
+    fn deleting_a_session_sweeps_a_stray_copy_under_another_root() {
+        let base = std::env::temp_dir().join(format!("bsh-stray-delete-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("the scratch root");
+        let first = base.join("one");
+        let second = base.join("two");
+        let registry = vec![
+            ("w1".to_string(), first.to_string_lossy().to_string()),
+            ("w2".to_string(), second.to_string_lossy().to_string()),
+        ];
+        let store = super::Store::open_over(&registry, base.join("quarantine"));
+        let mut session = crate::model::Session::new("w1", "same-id");
+        session.id = "same-id".to_string();
+        store.save(&session).expect("saves");
+
+        // A leftover under the other root, as an earlier move between
+        // workspaces used to leave behind.
+        std::fs::create_dir_all(super::sessions_dir(&second)).expect("the other root");
+        std::fs::copy(
+            super::sessions_dir(&first).join("same-id.json"),
+            super::sessions_dir(&second).join("same-id.json"),
+        )
+        .expect("the stray copy");
+
+        let mut store = super::Store::open_over(&registry, base.join("quarantine"));
+        assert_eq!(store.sessions.len(), 1, "one row, deduplicated on read");
+        assert!(store.remove("same-id"), "the delete happens");
+        drop(store);
+
+        let reopened = super::Store::open_over(&registry, base.join("quarantine"));
+        assert!(
+            reopened.sessions.is_empty(),
+            "the deleted session does not come back: {:?}",
+            reopened.sessions.iter().map(|s| &s.id).collect::<Vec<_>>()
+        );
+        assert!(
+            !super::sessions_dir(&second).join("same-id.json").exists(),
+            "the stray document is gone too"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A save heals a stray that already exists, so the next launch cannot
+    /// resurrect a session whose deletion happened before this fix.
+    #[test]
+    fn a_save_drops_a_stray_copy_under_another_root() {
+        let base = std::env::temp_dir().join(format!("bsh-stray-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("the scratch root");
+        let first = base.join("one");
+        let second = base.join("two");
+        let registry = vec![
+            ("w1".to_string(), first.to_string_lossy().to_string()),
+            ("w2".to_string(), second.to_string_lossy().to_string()),
+        ];
+        let store = super::Store::open_over(&registry, base.join("quarantine"));
+        let mut session = crate::model::Session::new("w1", "same-id");
+        session.id = "same-id".to_string();
+        store.save(&session).expect("saves");
+        std::fs::create_dir_all(super::sessions_dir(&second)).expect("the other root");
+        std::fs::copy(
+            super::sessions_dir(&first).join("same-id.json"),
+            super::sessions_dir(&second).join("same-id.json"),
+        )
+        .expect("the stray copy");
+
+        store.save(&session).expect("saves again");
+        assert!(
+            !super::sessions_dir(&second).join("same-id.json").exists(),
+            "the owning root keeps the document and every other root loses it"
+        );
+        assert!(super::sessions_dir(&first).join("same-id.json").exists());
         let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -150,8 +150,94 @@ pub(crate) fn is_injected_user_text(text: &str) -> bool {
         || text.starts_with(react::engine::EMPTY_ANSWER_NOTE)
 }
 
-/// Render the snapshot: heading, working directory, sandbox, permission,
-/// preset, then the child context when this is a child turn.
+/// The most top-level entries the layout names.
+const LAYOUT_ENTRIES: usize = 40;
+
+/// How many directories the layout opens one level.
+const LAYOUT_EXPANDED_DIRS: usize = 3;
+
+/// The most children a directory may have and still be opened.
+const LAYOUT_DIR_ENTRIES: usize = 12;
+
+/// The layout's byte budget, so a wide directory cannot bloat the snapshot.
+const LAYOUT_BYTES: usize = 900;
+
+/// One line naming the workspace's shape.
+///
+/// The reader asks for a small thing and the model starts by listing the tree:
+/// one round trip, then the real work. The listing is cheap here - two read_dir
+/// levels, not a walk - and it lets step one read the file it needs. Opening a
+/// source directory matters as much as naming it: "src/" alone still forces a
+/// list_dir before src/main.rs can be read. Nothing hidden, no .git, bounded so
+/// a huge directory cannot become the prompt.
+fn render_layout(root: &Path) -> Option<String> {
+    let entries = child_names(root);
+    if entries.is_empty() {
+        return None;
+    }
+    let total = entries.len();
+    let mut shown: Vec<String> = Vec::new();
+    let mut bytes = 0;
+    let mut expanded = 0;
+    for (name, is_dir) in entries {
+        if shown.len() >= LAYOUT_ENTRIES || bytes + name.len() > LAYOUT_BYTES {
+            break;
+        }
+        let mut text = if is_dir { format!("{name}/") } else { name };
+        if is_dir && expanded < LAYOUT_EXPANDED_DIRS {
+            let children = child_names(&root.join(text.trim_end_matches('/')));
+            if !children.is_empty() && children.len() <= LAYOUT_DIR_ENTRIES {
+                expanded += 1;
+                let names: Vec<String> = children
+                    .into_iter()
+                    .filter(|(child, _)| !child.starts_with('.'))
+                    .map(|(child, dir)| if dir { format!("{child}/") } else { child })
+                    .collect();
+                if !names.is_empty() {
+                    text = format!("{text} ({})", names.join(", "));
+                }
+            }
+        }
+        bytes += text.len() + 2;
+        shown.push(text);
+    }
+    let more = if total > shown.len() {
+        format!(" (+{} more)", total - shown.len())
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "Workspace layout: {}{}. Read the files you need from this without listing the workspace first, and batch every independent read into one message.",
+        shown.join(", "),
+        more
+    ))
+}
+
+/// The visible names of one directory, sorted, as (name, is directory).
+///
+/// The repository directory is dropped: it is not a workspace fact, and every
+/// model already knows what it holds.
+fn child_names(dir: &Path) -> Vec<(String, bool)> {
+    let mut names: Vec<(String, bool)> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.file_name() != ".git")
+                .map(|entry| {
+                    (
+                        entry.file_name().to_string_lossy().to_string(),
+                        entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// Render the snapshot: heading, working directory and layout, sandbox,
+/// permission, preset, then the child context when this is a child turn.
 fn render_snapshot(facts: &RuntimeFacts, child: bool) -> String {
     let mut sections: Vec<String> = Vec::new();
     let cwd = facts.cwd.trim();
@@ -160,6 +246,14 @@ fn render_snapshot(facts: &RuntimeFacts, child: bool) -> String {
     } else {
         format!("Current working directory: {cwd:?}.")
     });
+    // The shape of the workspace, so the first step can read the file it needs
+    // instead of spending a whole round trip on list_dir. A turn is one LLM
+    // call per step and a step costs seconds, so a free listing is not free.
+    if !cwd.is_empty() {
+        if let Some(layout) = render_layout(Path::new(cwd)) {
+            sections.push(layout);
+        }
+    }
     sections.push(match (facts.confined, facts.sandbox_reason) {
         (true, _) => "Sandbox: confined to the workspace.".to_string(),
         (false, Some(reason)) => format!("Sandbox: none ({reason})."),
@@ -263,6 +357,46 @@ mod tests {
             "{snapshot}"
         );
         assert!(snapshot.contains("Agent preset: standard."), "{snapshot}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The first user message names the workspace top level, so step one can
+    /// read the file it needs instead of spending a round trip on list_dir.
+    #[test]
+    fn the_snapshot_names_the_workspace_layout() {
+        let root = scratch("layout");
+        std::fs::create_dir_all(root.join("src")).expect("src");
+        std::fs::write(root.join("Cargo.toml"), "[package]").expect("manifest");
+        std::fs::write(root.join("src").join("main.rs"), "fn main() {}").expect("file");
+        let snapshot = render_snapshot(&facts(&rooted(&root)), false);
+        assert!(
+            snapshot.contains("Workspace layout: Cargo.toml, src/ (main.rs)."),
+            "{snapshot}"
+        );
+        assert!(
+            !snapshot.contains(".git,"),
+            "the repository directory is not a workspace fact: {snapshot}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A wide directory is capped, and the cap is named rather than silent.
+    #[test]
+    fn the_layout_is_bounded() {
+        let root = scratch("layout-wide");
+        for index in 0..100 {
+            std::fs::write(root.join(format!("file-{index:03}.txt")), "x").expect("file");
+        }
+        let snapshot = render_snapshot(&facts(&rooted(&root)), false);
+        assert!(
+            snapshot.contains("(+"),
+            "the remainder is named: {snapshot}"
+        );
+        assert!(
+            snapshot.len() < 2_000,
+            "the layout cannot bloat the snapshot: {} bytes",
+            snapshot.len()
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

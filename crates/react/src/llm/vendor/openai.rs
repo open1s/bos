@@ -248,17 +248,13 @@ impl OpenAiVendor {
         }
 
         if let Some(skills) = context.skills() {
-            if !skills.is_empty() {
-                let skill_names = skills
-                    .iter()
-                    .map(|s| format!("- {}: {}", s.name, s.description))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                extra_system_prompt.push_str(&format!(
-                    "Available Skills (call load_skill to read instructions when needed):\n{}\n",
-                    skill_names
-                ));
-            }
+            // The catalogue is ranked against THIS request and bounded; see
+            // render_skill_catalog. Listing every skill's description cost a
+            // measured 36 KB of a 41 KB prompt on every step.
+            extra_system_prompt.push_str(&crate::llm::render_skill_catalog(
+                skills,
+                req.input.as_text().unwrap_or_default(),
+            ));
         }
 
         if let Some(rules) = context.rules() {

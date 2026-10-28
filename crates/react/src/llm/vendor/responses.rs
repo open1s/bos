@@ -469,6 +469,7 @@ fn serialize_tools(tools: Option<&[LlmTool]>) -> Option<Vec<Value>> {
 
 fn build_instructions(
     persona: Option<String>,
+    query: &str,
     session: &impl ReactSession,
     context: &impl ReactContext,
 ) -> Option<String> {
@@ -488,17 +489,8 @@ fn build_instructions(
     }
 
     if let Some(skills) = context.skills() {
-        if !skills.is_empty() {
-            let skill_names = skills
-                .iter()
-                .map(|s| format!("- {}: {}", s.name, s.description))
-                .collect::<Vec<_>>()
-                .join("\n");
-            instructions.push_str(&format!(
-                "Available Skills (call load_skill to read instructions when needed):\n{}\n",
-                skill_names
-            ));
-        }
+        // Ranked against this request and bounded; see render_skill_catalog.
+        instructions.push_str(&crate::llm::render_skill_catalog(skills, query));
     }
 
     if let Some(rules) = context.rules() {
@@ -540,7 +532,12 @@ pub fn build_request(
 ) -> ResponsesRequest {
     ResponsesRequest {
         model: req.model.clone(),
-        instructions: build_instructions(persona, session, context),
+        instructions: build_instructions(
+            persona,
+            req.input.as_text().unwrap_or_default(),
+            session,
+            context,
+        ),
         input: build_input(session.history(), &req.input),
         tools: serialize_tools(context.tools()),
         temperature: req.temperature,
