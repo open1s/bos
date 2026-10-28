@@ -20,10 +20,18 @@ The child receives:
 
 A child at depth 0 or 1 receives the subagent tool again, giving the bounded DSH
 lineage tree: session root, children, and grandchildren. Depth 2 is the leaf.
-At most three children run at once across the tree. A child has no wall-clock
-limit of its own: it ends on the same rule as any turn - when its model stops
-asking for tools - and the reader can stop the run. The result returned to the parent is bounded to 16,000 characters; the
-full result and the child transcript are kept in the run registry.
+At most three children run at once across the tree; the slot is reserved under
+one lock, so a parallel batch cannot overrun it. A child has no wall-clock limit
+of its own: it ends on the same rule as any turn - when its model stops asking
+for tools - and the reader can stop the run.
+
+The subagent tool does NOT wait for the child. It returns immediately with a
+`subagent_id` and `status: "running"`, and the child is detached on the runner's
+Tokio runtime, so the parent turn keeps working while it runs. Collect the
+answer with the `subagent_result` tool: pass the id (and optionally
+`wait_seconds`, up to 60) or omit it to list this session's runs. A collected
+result is bounded to 16,000 characters; the full result and the child
+transcript stay in the run registry and the subagent menu.
 
 The child's tools still carry the parent session and policy principal, so the
 same workspace policy, permission ceiling, path scopes and builtin Rego modules

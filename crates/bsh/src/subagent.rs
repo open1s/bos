@@ -295,6 +295,16 @@ impl SubagentRegistry {
         Some(id)
     }
 
+    /// One run's lifecycle state, cheap enough to poll while it runs.
+    pub(crate) fn status(&self, id: &str) -> Option<SubagentStatus> {
+        self.runs
+            .lock()
+            .ok()?
+            .iter()
+            .find(|run| run.id == id)
+            .map(|run| run.status)
+    }
+
     /// One run's current snapshot, when it exists.
     pub(crate) fn run(&self, id: &str) -> Option<SubagentRun> {
         self.runs

@@ -415,6 +415,7 @@ impl Shell {
                     .map(|session| session.title.clone())
             })
             .unwrap_or_default();
+        let child_run = self.state.subagent_view_run();
         let streaming = self.state.any_streaming();
         let lang = self.state.lang;
         let parent_title = self.state.subagent_parent_title().unwrap_or_default();
@@ -506,7 +507,7 @@ impl Shell {
             .when(!self.state.hero_phase(), |row| {
                 row.child(self.agent_preset_chip(lang, cx))
             })
-            .when(streaming, |row| {
+            .when(streaming && child_run.is_none(), |row| {
                 row.child(
                     div()
                         .px(px(8.0))
@@ -518,6 +519,23 @@ impl Shell {
                             theme::CHIP_SIZE,
                             theme::page(),
                         )),
+                )
+            })
+            // A child turn streams outside `any_streaming`, so its own run
+            // status is the one the preview header must name.
+            .when_some(child_run, |row, run| {
+                let (key, color) = match run.status {
+                    SubagentStatus::Running => ("subagents.statusRunning", theme::accent()),
+                    SubagentStatus::Done => ("subagents.statusDone", theme::success()),
+                    SubagentStatus::Failed => ("subagents.statusFailed", theme::error()),
+                };
+                row.child(
+                    div()
+                        .px(px(8.0))
+                        .py(px(2.0))
+                        .rounded(px(6.0))
+                        .bg(rgb(color))
+                        .child(txt(lang.tr(key), theme::CHIP_SIZE, theme::page())),
                 )
             })
             .children(self.subagent_chip(cx))
@@ -762,6 +780,25 @@ impl Shell {
                     let tokens = run.total_tokens();
                     let estimated_tokens = run.estimated_tokens;
                     let elapsed = run.elapsed_ms();
+                    let status_label = match status {
+                        SubagentStatus::Running => lang.tr("subagents.statusRunning"),
+                        SubagentStatus::Done => lang.tr("subagents.statusDone"),
+                        SubagentStatus::Failed => lang.tr("subagents.statusFailed"),
+                    };
+                    let result_label = lang.tr("subagents.result");
+                    let result_hint = run
+                        .result
+                        .as_deref()
+                        .map(|text| {
+                            let clipped: String = text.chars().take(200).collect();
+                            format!("\n{result_label}: {clipped}")
+                        })
+                        .unwrap_or_default();
+                    let error_hint = run
+                        .error
+                        .as_deref()
+                        .map(|text| format!("\nerror: {text}"))
+                        .unwrap_or_default();
                     let is_current = current_id.as_deref() == Some(id.as_str());
                     let row_debug = SUBAGENT_ROW_DEBUG[index.min(SUBAGENT_ROW_DEBUG.len() - 1)];
                     let summary_debug =
@@ -772,7 +809,7 @@ impl Shell {
                         let open_shell = open_shell.clone();
                         let open_id = open_id.clone();
                         let row_title = title.clone();
-                        let summary = prompt_snippet(&prompt);
+                        let summary = format!("{status_label} · {}", prompt_snippet(&prompt));
                         let time = job_duration(elapsed, lang);
                         let token_text = if tokens == 0 {
                             format!("~{} tok", crate::state::human_tokens(estimated_tokens))
@@ -809,7 +846,9 @@ impl Shell {
                             .cursor_pointer()
                             .hover(|style| style.bg(rgb(theme::hover())))
                             .tooltip({
-                                let tip = format!("{prompt}\nparent: {parent_id}");
+                                let tip = format!(
+                                    "{prompt}\nstatus: {status_label}\nparent: {parent_id}{result_hint}{error_hint}"
+                                );
                                 move |window, cx| Tooltip::new(tip.clone()).build(window, cx)
                             })
                             .on_click(move |_, _window, cx| {

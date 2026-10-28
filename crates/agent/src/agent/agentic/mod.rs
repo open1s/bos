@@ -391,6 +391,11 @@ impl Agent {
         self
     }
 
+    /// The send-side history ceiling this agent applies mid-turn; 0 is off.
+    pub fn context_budget(&self) -> usize {
+        self.context_budget
+    }
+
     /// Set the bus for tool event publishing.
     pub fn with_bus(mut self, bus: Bus) -> Self {
         self.bus = Some(bus);

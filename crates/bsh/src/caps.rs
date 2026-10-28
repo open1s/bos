@@ -1491,6 +1491,8 @@ pub(crate) struct SubagentContext {
     /// Captured from the parent build's one `Effective`, so a child reports the
     /// same sandbox, permission and preset the tools it inherits enforce.
     runtime: crate::context::RuntimeFacts,
+    /// The parent's mid-turn history ceiling, inherited by the child.
+    context_budget: usize,
 }
 
 impl SubagentContext {
@@ -1532,6 +1534,7 @@ impl SubagentContext {
             preset: preset.into(),
             root: root.into(),
             runtime,
+            context_budget: agent.context_budget(),
         }
     }
 
@@ -1571,7 +1574,7 @@ impl SubagentContext {
             "You are a focused subagent. Complete the task and return a concise result.\n\n{}",
             config.system_prompt
         );
-        let mut child = Agent::from_config(config);
+        let mut child = Agent::from_config(config).with_context_budget(self.context_budget);
         for tool in &self.sync_tools {
             child.add_tool(tool.clone());
         }
@@ -1758,11 +1761,13 @@ pub(crate) fn attach_subagent_tool(agent: &mut Agent, context: SubagentContext) 
                     crate::context::TurnContext::from_facts(&context.runtime, true);
                 let registry = context.registry.clone();
                 let task_id = id.clone();
+                let task_title = title.clone();
                 // The child is detached on the runner's runtime: the tool used
                 // to await the whole child turn, which serialized the parent
                 // behind work it had just delegated. The registry is the live
                 // handle the header and subagent_result read.
                 tokio::spawn(async move {
+                    log::info!("subagent {task_id} started: {task_title}");
                     let result = stream_child(
                         &child,
                         prompt,
@@ -1777,8 +1782,10 @@ pub(crate) fn attach_subagent_tool(agent: &mut Agent, context: SubagentContext) 
                     match result {
                         Ok((text, usage)) => {
                             registry.finish(&task_id, text, usage, transcript);
+                            log::info!("subagent {task_id} done");
                         }
                         Err(message) => {
+                            log::warn!("subagent {task_id} failed: {message}");
                             registry.fail(&task_id, message, Some(usage), transcript);
                         }
                     }
@@ -1857,13 +1864,18 @@ fn attach_subagent_result_tool(
                 let deadline =
                     std::time::Instant::now() + std::time::Duration::from_secs(wait);
                 loop {
-                    let Some(run) = registry.run(&id) else {
+                    let Some(status) = registry.status(&id) else {
                         return Err(ToolError::InvalidInput(format!(
                             "no subagent run '{id}'; omit subagent_id to list runs"
                         )));
                     };
                     let timed_out = std::time::Instant::now() >= deadline;
-                    if !run.status.is_running() || wait == 0 || timed_out {
+                    if !status.is_running() || wait == 0 || timed_out {
+                        let Some(run) = registry.run(&id) else {
+                            return Err(ToolError::InvalidInput(format!(
+                                "subagent run '{id}' disappeared"
+                            )));
+                        };
                         let status = run.status.as_str();
                         let elapsed = run.elapsed_ms();
                         let mut payload = serde_json::json!({
@@ -7764,6 +7776,44 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
                 .contains("## Delegating with subagents"),
             "guidance is absent when an allowlist removes the tool"
         );
+    }
+
+    /// The collector reads a detached run's answer and lists the session's runs.
+    #[test]
+    fn a_background_subagent_result_is_collectable() {
+        use std::sync::Arc;
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let registry = Arc::new(crate::subagent::SubagentRegistry::default());
+            let mut agent = agent::Agent::from_config(agent::AgentConfig::default());
+            super::attach_subagent_result_tool(&mut agent, registry.clone(), "parent".to_string());
+            let id = registry
+                .try_begin(
+                    "parent",
+                    "parent",
+                    1,
+                    0,
+                    "Inspect",
+                    "look",
+                    crate::subagent::SUBAGENT_SLOTS,
+                )
+                .expect("a free slot");
+            registry.finish(&id, "the answer".to_string(), (3, 4), Vec::new());
+            let tool = agent
+                .registry()
+                .expect("registry")
+                .get_async("subagent_result")
+                .expect("the collector");
+            let out = tool
+                .run(&serde_json::json!({ "subagent_id": id }))
+                .await
+                .expect("the result");
+            assert_eq!(out["status"], "done");
+            assert_eq!(out["result"], "the answer");
+            assert_eq!(out["prompt_tokens"], 3);
+            let listed = tool.run(&serde_json::json!({})).await.expect("the list");
+            assert_eq!(listed["runs"][0]["subagent_id"], id);
+        });
     }
 
     /// A preset's Rego module applies only when the reader trusted it. A

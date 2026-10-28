@@ -3326,3 +3326,47 @@ Evidence: `caps::tests::a_zero_step_ceiling_means_no_ceiling`,
 `a_child_carries_no_step_ceiling`, `plugins_carry_the_filtered_tools` (asserts
 the built agent carries 0), `ui::shell_tests::the_agent_loop_pane_draws_its_switches`,
 `settings::workspace::tests::an_old_step_ceiling_is_read_but_never_used`.
+
+Round 186 made the running step's ring turn. The mark the reference draws for an
+ongoing item is the shared `StateDot`, and its sheet carries TWO infinite tracks
+over one 1.5s period - the ring rotating a full turn while the arc's dash length
+breathes - so what bsh painted was the sheet's reduced-motion shape, not its look.
+
+MEASURED from
+`docs/ui-mirror/reference/dsh-css-files/dsh-client-ui-primitives__lib__StateDot.module.css`:
+`.spinnerMotion{transform-origin:center;animation:dsh-state-dot-spin 1.5s linear
+infinite}` is `to{transform:rotate(360deg)}`, and `.spinnerArc{stroke-dasharray:12
+150;animation:dsh-state-dot-dash 1.5s ease-in-out infinite}` runs `12 150` at
+offset 0 -> `24 150` at -6 -> `12 150` at 0, while the media query replaces both
+with a still `18 150` at `-3`. The dash lengths are viewBox units of the ring's
+own circumference (r 9.5 -> 59.69), which is why `spin_sweep` converts them to
+turns instead of keeping the old 0.087/0.609 pair - that pair spans 52% of the
+ring where the sheet's static dash spans 30%.
+
+`AnimationExt::with_animation` is the frame seam a canvas path lacks:
+`spinner_at(phase)` rebuilds the ring each frame, the animator ignores the element
+it is handed, and `Animation::new(SPIN_PERIOD).repeat()` drives the phase. Two
+traps. `canvas`'s paint is a `FnOnce` here, so the phase has to arrive through the
+element - a closure that captured it once would freeze on the first frame. And the
+paint closure still sees `cx.reduce_motion()`, so the still shape is the sheet's
+18-unit dash rather than the running cycle's 12-unit phase 0.
+
+The rate is capped at 30fps (`with_max_fps`): the reference's CSS is composited
+and costs it no layout, while a GPUI animation frame rebuilds the view. The ring
+still turns 8 degrees a frame, and it only spins while a busy mark is on screen -
+no idle window pays for it.
+
+Evidence: `the_state_dot_breathes_on_the_measured_cycle` pins both segments'
+12/24/12 pair, the walk 0 -> 6 units, the wrap at 1.0 and the reduced-motion dash as
+the cycle's quarter turn; `the_running_step_draws_the_shared_spinner` opens the
+to-do list and asserts the animated ring lays out in the same 14px box on two
+consecutive frames; the three older to-do chrome/list/empty tests still pin the
+37/93 heights. Captured on the running app (scratch store, `todo_open` flipped for
+one build and reverted): two frames 350ms apart differ only inside the 14px ring,
+with the arc at the ring's right in one and its lower left in the other.
+
+Honest gap: `PathBuilder::stroke` has no cap hook, so the sheet's
+`stroke-linecap: round` ends are butt caps here, and CSS's `ease-in-out` is
+approximated by the kit's quadratic S-curve, which departs from
+`cubic-bezier(.42, 0, .58, 1)` by up to 0.012 of a segment (under 0.5% of the
+sweep).

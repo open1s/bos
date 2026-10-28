@@ -194,6 +194,14 @@ fn spinner_at(phase: f32) -> Div {
         )
 }
 
+/// How often the ring redraws.
+///
+/// The reference's cycle is a composited CSS animation, which costs it no
+/// layout; a GPUI animation frame rebuilds the view, so the mark samples at
+/// half the display rate. The ring still turns 8 degrees a frame, which reads
+/// as motion, and a window with no mark in it pays nothing at all.
+pub(crate) const SPIN_FPS: f32 = 30.0;
+
 /// The shared ongoing mark: the reference's turn-and-breathe ring.
 ///
 /// `AnimationExt::with_animation` is the frame seam the canvas path lacked, and
@@ -203,7 +211,7 @@ fn spinner_at(phase: f32) -> Div {
 pub(crate) fn spinner() -> impl IntoElement {
     spinner_at(0.0).with_animation(
         "state-dot-spinner",
-        Animation::new(SPIN_PERIOD).repeat(),
+        Animation::new(SPIN_PERIOD).repeat().with_max_fps(SPIN_FPS),
         |_still: Div, phase| spinner_at(phase),
     )
 }
