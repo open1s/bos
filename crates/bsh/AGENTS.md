@@ -3275,3 +3275,31 @@ Evidence: `store::raw_tests::deleting_a_session_sweeps_a_stray_copy_under_anothe
 `store::raw_tests::a_save_drops_a_stray_copy_under_another_root`; the parked/restore
 and purge flows still pass (`a_deleted_chat_is_parked_and_can_be_restored`,
 `a_parked_chat_can_be_deleted_for_good`).
+
+Halting or quitting mid-turn lost the turn, and the demo home showed it: the
+`create AGENTS.md` session's JSON was untouched at 19:04 while a request was
+logged at 19:26, so the running turn had never been written. Four separate holes:
+- the debug log was TRUNCATED per launch (flexi_logger default), so "the log"
+  after a restart was only the last run; the previous run sat beside it as
+  `bsh_2026-10-28H19-00-27.log`. The logger now uses `.append()` with the same
+  10 MB rotation, so `bsh.log` is continuous and rotation still bounds the set.
+- nothing saved at window close: `QuitMode::LastWindowClosed` exits the process
+  with the turn's rows still in memory. `AppState::shutdown` now stops every
+  running stream and saves every session, wired to
+  `Window::on_window_should_close`.
+- `Store::save_history` treated "the same ROW COUNT" as "the same rows". A save
+  that lands after the assistant placeholder was appended (a goal round, an
+  automatic-compaction install, a stop after either) returned early and the
+  turn's text/reasoning/tool results were never written. The tail is now compared
+  by content (`same_transcript`) and rewritten when it changed.
+- and a save from a window that does not reach the log's end (a list-only row a
+  turn wrote into) used to take the truncation arm and rewrite the log down to
+  that window. It is now refused with a warning instead.
+
+`AppState::stop` also logs what the halted turn kept (text/reasoning chars, tool
+calls), so a stopped request is not a dangling body in the log.
+
+Evidence: `state::tests::a_stopped_turn_keeps_its_rows_on_disk`,
+`a_shutdown_mid_turn_saves_the_transcript`,
+`store::raw_tests::a_save_after_a_placeholder_rewrites_the_tail`,
+`a_save_of_an_unhydrated_session_keeps_the_log`.

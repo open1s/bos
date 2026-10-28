@@ -172,6 +172,10 @@ pub fn auto_init_tracing_in(log_dir: impl AsRef<Path>, basename: &str) {
     };
     let logger = logger
         .log_to_file(file_spec)
+        // Append, not truncate: a plain start renames the previous run's file
+        // and begins a new one, so a reader who looks for "the log" after a
+        // restart finds only the last launch. Rotation still bounds the set.
+        .append()
         .rotate(
             Criterion::Size(10_000_000), // 10 MB
             Naming::TimestampsCustomFormat {

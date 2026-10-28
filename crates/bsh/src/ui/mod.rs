@@ -281,6 +281,17 @@ pub(crate) fn run(startup: Startup) {
                 |window, cx| {
                     let browser = startup.browser.clone();
                     let shell = cx.new(|cx| shell::Shell::new(window, startup.settings, cx));
+                    // Closing the window while a turn runs used to take that
+                    // turn with it: the process exits and nothing had saved the
+                    // stream. Settle every running turn and persist every
+                    // session before the close is allowed.
+                    window.on_window_should_close(cx, {
+                        let shell = shell.clone();
+                        move |_window, cx| {
+                            shell.update(cx, |shell, _| shell.state.shutdown());
+                            true
+                        }
+                    });
                     if let Some(url) = browser {
                         // The deep link lands on the pane it names, with the
                         // same navigation a press of Go performs.

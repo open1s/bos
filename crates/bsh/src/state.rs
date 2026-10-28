@@ -1811,6 +1811,18 @@ impl AppState {
 
     pub(crate) fn stop(&mut self, id: &str) {
         self.runner.stop(id);
+        // A halted turn is still a turn the reader saw: say so in the log, with
+        // what it had produced, so a halted request is not a dangling body.
+        if let Some(session) = self.store.session(id) {
+            if let Some(message) = session.messages.last() {
+                log::info!(
+                    "session {id}: turn halted by the reader after {} text chars, {} reasoning chars, {} tool calls",
+                    message.text.chars().count(),
+                    message.reasoning.chars().count(),
+                    message.tools.len()
+                );
+            }
+        }
         self.streams.remove(id);
         // The task is aborted before it can report a withdrawal, so the rows
         // it never answered for are put back here: an aborted turn never
@@ -1831,6 +1843,26 @@ impl AppState {
         if let Some(session) = self.store.session(id) {
             let _ = self.store.save(session);
         }
+    }
+
+    /// Settle every running turn and persist every session.
+    ///
+    /// Runs when the window is about to close. Quitting mid-turn used to lose
+    /// the whole turn: nothing saved the stream that was in flight, and the
+    /// process exited with the turn's rows still only in memory. Each running
+    /// session is stopped (which settles its row and saves it), then every
+    /// session is saved once more so an edit outside a turn lands too.
+    pub(crate) fn shutdown(&mut self) {
+        let running: Vec<String> = self.streams.keys().cloned().collect();
+        for id in running {
+            self.stop(&id);
+        }
+        let ids: Vec<String> = self.store.sessions.iter().map(|s| s.id.clone()).collect();
+        let saved = ids.len();
+        for id in ids {
+            self.save_session(&id);
+        }
+        log::info!("harness shutting down: {saved} sessions saved");
     }
 
     /// Snapshot the history, append the user turn and the assistant placeholder.
@@ -5663,6 +5695,78 @@ mod tests {
         assert!(state.clear_goal(&id));
         assert!(state.goal(&id).is_none());
         assert!(!state.clear_goal(&id));
+    }
+
+    /// Halting a running turn must not lose what the turn already produced:
+    /// the user's line, the reasoning and the visible text are what the reader
+    /// is about to see scroll away, and a restart has to bring them back.
+    #[test]
+    fn a_stopped_turn_keeps_its_rows_on_disk() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("bsh-stop-persist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let id;
+        {
+            let mut state = super::AppState::with_store(crate::store::Store::open_at(dir.clone()));
+            id = state.active_id.clone().expect("a session");
+            state.begin_turn_in(&id, "hello").expect("a turn opens");
+            state.apply_event(&id, crate::runner::AgentEvent::Reasoning("weigh it".into()));
+            state.apply_event(&id, crate::runner::AgentEvent::Text("the answer".into()));
+            state.stop(&id);
+            let session = state.store.session(&id).expect("the session");
+            assert!(
+                session
+                    .messages
+                    .iter()
+                    .any(|m| m.text.contains("the answer")),
+                "the stopped turn still holds its text in memory: {session:?}"
+            );
+        }
+
+        let log = crate::history::History::open(crate::history::History::dir_for(&dir, &id));
+        let rows = log.page(0).expect("a page of the log");
+        let texts: Vec<&str> = rows.iter().map(|row| row.text.as_str()).collect();
+        assert!(
+            texts.iter().any(|text| text.contains("hello")),
+            "the user's line survives the stop: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text.contains("the answer")),
+            "the streamed answer survives the stop: {texts:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Closing the window mid-turn must save the turn, not take it with the
+    /// process: a shutdown settles every running stream and writes every
+    /// session. Quitting used to exit with the turn's rows only in memory.
+    #[test]
+    fn a_shutdown_mid_turn_saves_the_transcript() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("bsh-shutdown-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let id;
+        {
+            let mut state = super::AppState::with_store(crate::store::Store::open_at(dir.clone()));
+            id = state.active_id.clone().expect("a session");
+            state.begin_turn_in(&id, "hello").expect("a turn opens");
+            state.apply_event(&id, crate::runner::AgentEvent::Text("half a reply".into()));
+            state.shutdown();
+        }
+        let log = crate::history::History::open(crate::history::History::dir_for(&dir, &id));
+        let texts: Vec<String> = log
+            .page(0)
+            .expect("a page")
+            .into_iter()
+            .map(|row| row.text)
+            .collect();
+        assert!(
+            texts.iter().any(|text| text.contains("half a reply")),
+            "the running turn is on disk after a shutdown: {texts:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A session reload keeps the goal and its rounds, and disarms it.

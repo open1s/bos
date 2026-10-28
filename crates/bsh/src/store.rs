@@ -666,7 +666,22 @@ impl Store {
         }
         let count = history.len();
         if count == end {
-            return Ok(());
+            // The row COUNT is not the row CONTENT. Streaming mutates the last
+            // row in place - text, reasoning, tool results, error - so a save
+            // that lands after a placeholder was already appended (a goal
+            // round, an automatic-compaction install, a stop after either) used
+            // to return here as "nothing new" and the turn's output was never
+            // written. A halted turn showed it plainly: the log stopped at an
+            // empty assistant row.
+            let unchanged = match (history.window(count.saturating_sub(1), 1), rows.last()) {
+                (Ok(saved), Some(last)) => saved
+                    .first()
+                    .is_some_and(|saved| Self::same_transcript(saved, last)),
+                _ => true,
+            };
+            if unchanged {
+                return Ok(());
+            }
         }
         // The common case: the log ends inside the in-memory window, so only
         // the rows after that point are new. Appending them keeps a save
@@ -679,6 +694,18 @@ impl Store {
             history.append(&rows[skip..])?;
             return Ok(());
         }
+        // A window that claims to start at row 0 but does not reach the log's
+        // end is not a truncation of THIS log - it is a list-only row that a
+        // turn wrote into without hydrating the window. Writing it would drop
+        // every row the window does not know about, which is how a whole
+        // conversation could disappear.
+        if start == 0 && count > end {
+            log::warn!(
+                "session {}: refusing to rewrite its log from {count} to {end} rows; the window was never hydrated",
+                session.id
+            );
+            return Ok(());
+        }
         // A truncation or a compaction changed the tail. The pages ABOVE the
         // window are untouched, so they are read back before the rewrite:
         // rebuilding from the window alone would drop them.
@@ -686,6 +713,23 @@ impl Store {
         all.extend(rows);
         history.rewrite(&all)?;
         Ok(())
+    }
+
+    /// Whether two rows would write the same transcript content.
+    ///
+    /// Timing, parts and usage are display metadata that settles after a turn;
+    /// the content is what a lost save would drop, so that is what decides
+    /// whether the log has to be rewritten.
+    fn same_transcript(a: &crate::model::ChatMessage, b: &crate::model::ChatMessage) -> bool {
+        a.role == b.role
+            && a.text == b.text
+            && a.reasoning == b.reasoning
+            && a.error == b.error
+            && a.steering == b.steering
+            && a.tools.len() == b.tools.len()
+            && a.tools.iter().zip(&b.tools).all(|(left, right)| {
+                left.name == right.name && left.args == right.args && left.output == right.output
+            })
     }
 
     /// One message with every string run through the secret scrubber.
@@ -1132,6 +1176,93 @@ mod tests {
 #[cfg(test)]
 mod raw_tests {
     use super::*;
+
+    /// A save of a session that was NOT hydrated must never truncate its log.
+    ///
+    /// Startup reads metadata only, so the in-memory window is empty while the
+    /// log already holds the conversation. Writing a turn onto that row makes
+    /// the index arithmetic look like a truncation (the log is longer than the
+    /// window), and the "rewrite" arm then replaced every row with the two new
+    /// ones.
+    #[test]
+    fn a_save_of_an_unhydrated_session_keeps_the_log() {
+        let base = std::env::temp_dir().join(format!("bsh-unhydrated-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("the scratch root");
+        let mut session = crate::model::Session::new("w1", "long chat");
+        session.id = "unhydrated".to_string();
+        session.workspace = "w1".to_string();
+        for index in 0..40 {
+            session
+                .messages
+                .push(crate::model::ChatMessage::user(format!("row {index}")));
+        }
+        {
+            let store = Store::open_at(base.clone());
+            store.save(&session).expect("the first save");
+        }
+        let mut store = Store::open_at(base.clone());
+        {
+            // The turn opens on a row whose window was never hydrated: the
+            // document is loaded, the transcript is not.
+            let row = store.session_mut("unhydrated").expect("the row");
+            row.messages
+                .push(crate::model::ChatMessage::user("new question"));
+            row.messages.push(crate::model::ChatMessage::assistant());
+        }
+        let fresh = store.session("unhydrated").expect("the row").clone();
+        store.save(&fresh).expect("the turn's save");
+
+        let log =
+            crate::history::History::open(crate::history::History::dir_for(&base, "unhydrated"));
+        assert!(
+            log.len() >= 40,
+            "the old rows are still in the log, was {}",
+            log.len()
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A save after the assistant placeholder is already in the log must
+    /// rewrite the tail, not skip it: the row COUNT is the same but the content
+    /// is not, and skipping is how a turn's streamed text and reasoning were
+    /// silently dropped - a halted turn showed it plainly.
+    #[test]
+    fn a_save_after_a_placeholder_rewrites_the_tail() {
+        let base = std::env::temp_dir().join(format!("bsh-placeholder-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("the scratch root");
+        let mut session = crate::model::Session::new("w1", "halted");
+        session.id = "halted".to_string();
+        session.workspace = "w1".to_string();
+        session
+            .messages
+            .push(crate::model::ChatMessage::user("ask"));
+        session
+            .messages
+            .push(crate::model::ChatMessage::assistant());
+
+        let store = Store::open_at(base.clone());
+        store.save(&session).expect("the placeholder is written");
+        {
+            let before =
+                crate::history::History::open(crate::history::History::dir_for(&base, "halted"));
+            assert_eq!(before.len(), 2, "the placeholder is in the log");
+            assert_eq!(before.page(0).expect("a page")[1].text, "");
+        }
+
+        session.messages.last_mut().expect("the reply").text = "the answer".to_string();
+        session.messages.last_mut().expect("the reply").reasoning = "weigh it".to_string();
+        store.save(&session).expect("the turn's save");
+
+        let after =
+            crate::history::History::open(crate::history::History::dir_for(&base, "halted"));
+        let rows = after.page(0).expect("a page");
+        assert_eq!(rows.len(), 2, "the same rows, now with content");
+        assert_eq!(rows[1].text, "the answer", "the streamed text is written");
+        assert_eq!(rows[1].reasoning, "weigh it", "and the reasoning with it");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     /// A session whose workspace nobody registers is re-homed, not hidden.
     ///

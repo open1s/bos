@@ -11751,6 +11751,72 @@ fn the_primary_control_stops_only_while_the_draft_is_empty() {
     );
 }
 
+/// Clicking the primary control while a turn runs stops it - and what it
+/// halted is still the reader's: the rows stay in the session and the rail
+/// still counts the prompt. A halt is not a deletion.
+#[gpui::test]
+fn clicking_the_stop_control_keeps_the_halted_turn(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("stop-keeps", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let id = cx.update(|_, cx| {
+        shell.update(cx, |shell, cx| {
+            let id = shell.state.active_id.clone().expect("a session");
+            shell
+                .state
+                .begin_turn_in(&id, "halting this")
+                .expect("a turn opens");
+            shell
+                .state
+                .apply_event(&id, crate::runner::AgentEvent::Reasoning("weigh it".into()));
+            shell
+                .state
+                .apply_event(&id, crate::runner::AgentEvent::Text("half a reply".into()));
+            cx.notify();
+            id
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let control = cx
+        .debug_bounds("composer-send")
+        .expect("the primary control renders");
+    cx.simulate_click(control.center(), Modifiers::default());
+
+    let (streaming, messages, turns, text) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        let session = shell.state.store.session(&id).expect("the session");
+        let text = session
+            .messages
+            .last()
+            .map(|message| message.text.clone())
+            .unwrap_or_default();
+        (
+            shell.state.is_streaming(&id),
+            session.messages.len(),
+            shell.turn_indices().len(),
+            text,
+        )
+    });
+    assert!(!streaming, "the click stopped the turn");
+    assert_eq!(messages, 4, "the halted turn's rows are still there");
+    assert_eq!(turns, 2, "and the rail still counts its prompt");
+    assert!(
+        text.contains("half a reply") || text == "…",
+        "the words it had streamed survive the halt: {text:?}"
+    );
+    // And the pane draws it back: the rail's mark for the halted turn is on
+    // screen, so the reader still sees the conversation it belongs to.
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("turn-tick-1").is_some(),
+        "the rail still draws the halted turn's mark"
+    );
+}
+
 /// The reference's select-slot trigger: 28 tall at radius-sm over
 /// `padding:0 4px 0 8px`, shared by the permission and model chips, and each
 /// opens a menu, so each carries the `.chevron` in label-caption (the 14px box).
