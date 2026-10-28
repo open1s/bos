@@ -2535,19 +2535,18 @@ impl Shell {
         let handle = self.state.runner.spawn_task(async move {
             let turn_context = crate::context::TurnContext::from_facts(&facts, true);
             let guard = agent.lock().await;
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(600),
-                crate::caps::stream_child(
-                    &guard,
-                    prompt,
-                    stream_registry,
-                    &stream_id,
-                    &turn_context,
-                ),
+            // A follow-up is a child turn too, so it ends on the child's own
+            // rule: its model stops asking for tools. The 600-second wall clock
+            // here was the same cap the spawn path carried, and it aborted real
+            // work while reporting "subagent timed out" as a finished run.
+            let result = crate::caps::stream_child(
+                &guard,
+                prompt,
+                stream_registry,
+                &stream_id,
+                &turn_context,
             )
-            .await
-            .map_err(|_| "subagent timed out".to_string())
-            .and_then(|result| result);
+            .await;
             let usage = guard.last_token_usage().unwrap_or((0, 0));
             let transcript = crate::caps::child_transcript(&guard);
             (result, usage, transcript)

@@ -20,10 +20,11 @@ pub(crate) const GLOB: &str =
 /// The reference's grep guidance, with BSH's tool name.
 ///
 /// The reference's "Use read on a matched file" becomes `read_file`, and the
-/// two facts this tool adds are stated: case folding is opt-in and the walk is
-/// ignore-aware unless `include_ignored` is set.
+/// facts this tool adds are stated: case folding is opt-in, the walk is
+/// ignore-aware unless `include_ignored` is set, and `path` may name a single
+/// file so a known file is grepped directly.
 pub(crate) const GREP: &str =
-    "Use the grep tool — not shell grep or rg — to search file contents. It returns each matching line with its file and line number. Matching is case-sensitive unless case_insensitive is set; ignored and hidden files are skipped unless include_ignored is set. Use read_file on a matched file when you need surrounding context.";
+    "Use the grep tool — not shell grep or rg — to search file contents. It returns each matching line with its file and line number. path may be a directory, searched recursively, or one file; a file you name is searched even if it is hidden or ignored. Matching is case-sensitive unless case_insensitive is set; ignored and hidden files are skipped unless include_ignored is set. include takes one glob filter for which files to search, invert reports the lines that do not match, context adds that many lines around each match, files_without_match returns the paths that had none, and text searches binary files as text. Use read_file on a matched file when you need surrounding context.";
 
 /// The reference's `read` guidance, with BSH's tool name.
 ///

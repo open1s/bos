@@ -141,6 +141,10 @@ pub(crate) fn is_injected_user_text(text: &str) -> bool {
     text.starts_with(RUNTIME_CONTEXT_PREAMBLE)
         || (text.starts_with("<system-reminder>")
             && text.contains("The following workspace instructions"))
+        // The engine's closing request when a turn reaches its step guard. It is
+        // a harness instruction, not something the child or its caller said, so
+        // the read-only view must not draw it as a user row.
+        || text.starts_with(react::engine::STEP_GUARD_NOTE)
 }
 
 /// Render the snapshot: heading, working directory, sandbox, permission,
@@ -185,6 +189,17 @@ mod tests {
 
     const READ_ONLY: &str = "read-only";
     const FULL_ACCESS: &str = "danger-full-access";
+
+    /// The engine's closing request is a harness instruction, so the child's
+    /// read-only transcript must not draw it as something the caller said.
+    #[test]
+    fn the_step_guard_note_is_not_a_user_row() {
+        assert!(is_injected_user_text(react::engine::STEP_GUARD_NOTE));
+        assert!(
+            !is_injected_user_text("Please fix the failing test."),
+            "a real request still draws as a user row"
+        );
+    }
 
     fn scratch(label: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(

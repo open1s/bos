@@ -66,18 +66,29 @@ unicode-width = { workspace = true }
 # standard library's str::matches cost about 1us a match on a 4MiB file, and an
 # edit with tens of thousands of matches spent more time searching than writing.
 memchr = "2"
-# The glob tool's walk and matcher are ripgrep's own ignore crate - the engine
+# The glob tool's walk and matcher are ripgrep's own ignore crate
+# (https://github.com/BurntSushi/ripgrep, crate ignore 0.4.32) - the engine
 # behind rg --files - which carries both the .gitignore/.ignore walk and the
 # overrides matcher that gives "rg -g" its basename/separator semantics. The
 # ripgrep crate on crates.io is a binary-only package (autolib = false, target
 # rg), so ignore is its reusable half. It is already locked in the workspace
 # graph, so naming it adds no package.
 ignore = "0.4"
-# The grep tool's pattern engine and line searcher are ripgrep's own crates,
-# named through the `grep` facade the rg binary is built from. Its regex
-# matcher, line-oriented searcher and binary detection are the ones rg uses;
-# the facade pulls its sibling crates, all small and pure Rust.
+# The grep tool's pattern engine, line searcher and binary detection are
+# ripgrep's own crates (https://github.com/BurntSushi/ripgrep), named through
+# the `grep` facade the rg binary is built from: grep 0.4.1 pulls
+# grep-searcher 0.1.17, grep-regex 0.1.14, grep-printer 0.3.1 and their
+# matcher. The tool runs the search through grep-printer's JSON printer - the
+# wire format `rg --json` writes - so the line numbers, the context kind and
+# the base64 branch for a line that is not UTF-8 are that printer's, and the
+# buffer in front of it only enforces the row budget.
 grep = "0.4"
+# The JSON printer encodes a non-UTF-8 line as base64 `bytes`, so decoding one
+# needs base64. 0.23.1 is already in THIS crate's build graph (arrow, parquet
+# and reqwest all use it), so naming it adds no package and no second copy of
+# the decoder; the lock's other entry, 0.22.1, is hyper-util's and is not ours
+# to borrow.
+base64 = "0.23.1"
 
 # The Vault's cryptography. The admin key is derived with Argon2id, the file is
 # sealed with XChaCha20-Poly1305, and every key and plaintext buffer is held in

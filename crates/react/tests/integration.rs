@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use react::engine::ReActEngineBuilder;
-use react::llm::vendor::{ChatCompletionResponse, ChatMessage, Choice};
+use react::llm::vendor::{ChatCompletionResponse, ChatMessage, Choice, FunctionCall, ToolCall};
 use react::llm::{
     LlmClient, LlmContext, LlmError, LlmRequest, LlmResponse, LlmResponseResult, LlmSession,
     TokenStream,
@@ -366,8 +366,11 @@ impl LlmClient<LlmSession, LlmContext> for LoopingStreamLlm {
     }
 }
 
+/// The guard is a bound on WORK, not on the turn: a client that never stops
+/// asking for a tool still ends with the model's own words. Before this, the
+/// loop yielded `Done` at the bound and the turn simply stopped mid-task.
 #[tokio::test]
-async fn react_stream_honours_max_steps() {
+async fn react_stream_closes_a_guarded_turn_with_an_answer() {
     use futures::StreamExt;
     use react::llm::StreamToken;
 
@@ -386,20 +389,133 @@ async fn react_stream_honours_max_steps() {
     let mut request = LlmRequest::new("test");
     request.input = react::llm::Content::text("loop forever?");
 
-    let stream = engine.react_stream(None, request, &mut session, &mut context);
-    futures::pin_mut!(stream);
-
     let mut done = false;
-    while let Some(item) = stream.next().await {
-        if let StreamToken::Done = item.expect("stream item") {
-            done = true;
+    {
+        let stream = engine.react_stream(None, request, &mut session, &mut context);
+        futures::pin_mut!(stream);
+        while let Some(item) = stream.next().await {
+            if let StreamToken::Done = item.expect("stream item") {
+                done = true;
+            }
         }
     }
 
-    assert!(done, "the bounded stream still terminates with Done");
+    assert!(done, "the guarded stream still terminates with Done");
     assert_eq!(
         calls.load(Ordering::SeqCst),
+        3,
+        "two working steps plus one closing turn"
+    );
+    assert_eq!(
+        engine.tool_call_count(),
         2,
-        "max_steps bounds the number of LLM calls in streaming mode"
+        "the closing turn's tool call is not run, so the guard costs an answer, not another step"
+    );
+}
+
+/// A non-streaming client that always asks for the same tool, so the only thing
+/// that can finish the turn is the engine's guard.
+struct LoopingToolLlm {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl LlmClient<LlmSession, LlmContext> for LoopingToolLlm {
+    async fn complete(
+        &self,
+        _persona: Option<String>,
+        _request: LlmRequest,
+        _session: &mut LlmSession,
+        _context: &mut LlmContext,
+    ) -> LlmResponseResult {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(LlmResponse::OpenAI(ChatCompletionResponse {
+            id: "looping".to_string(),
+            object: "chat.completion".to_string(),
+            created: 1234567890,
+            model: "looping-model".to_string(),
+            choices: vec![Choice {
+                index: 0,
+                message: ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Some("looking again".to_string()),
+                    tool_calls: Some(vec![ToolCall {
+                        id: "call_loop".to_string(),
+                        r#type: "function".to_string(),
+                        function: FunctionCall {
+                            name: Some("calculator".to_string()),
+                            arguments: Some(r#"{"expression":"1+1"}"#.to_string()),
+                        },
+                    }]),
+                    function_call: None,
+                    reasoning_content: None,
+                    extra: Value::Object(serde_json::Map::new()),
+                },
+                finish_reason: Some("tool_calls".to_string()),
+                stop_reason: None,
+                logprobs: None,
+            }],
+            usage: None,
+            system_fingerprint: None,
+            nvext: None,
+        }))
+    }
+
+    async fn stream_complete(
+        &self,
+        _persona: Option<String>,
+        _request: LlmRequest,
+        _session: &mut LlmSession,
+        _context: &mut LlmContext,
+    ) -> Result<TokenStream, LlmError> {
+        Err(LlmError::Other(
+            "this client only answers `complete`".to_string(),
+        ))
+    }
+
+    fn supports_tools(&self) -> bool {
+        true
+    }
+    fn provider_name(&self) -> &'static str {
+        "looping"
+    }
+}
+
+/// The same contract on the non-streaming path: the guarded turn returns the
+/// closing response's text instead of an empty thought.
+#[tokio::test]
+async fn a_guarded_turn_ends_with_an_answer_not_a_truncation() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut engine = ReActEngineBuilder::<TestApp>::new()
+        .llm(Box::new(LoopingToolLlm {
+            calls: Arc::clone(&calls),
+        }))
+        .with_tool(ToolVariant::Sync(Box::new(TestCalculator)))
+        .max_steps(2)
+        .build()
+        .unwrap();
+
+    let mut session = LlmSession::default();
+    let mut context = LlmContext::default();
+    let mut request = LlmRequest::new("test");
+    request.input = react::llm::Content::text("loop forever?");
+    let answer = engine
+        .react(None, request, &mut session, &mut context)
+        .await
+        .expect("the guarded turn completes");
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "two working steps plus one closing turn"
+    );
+    assert_eq!(
+        engine.tool_call_count(),
+        2,
+        "the closing turn's tool call is not run"
+    );
+    assert_eq!(
+        answer, "looking again",
+        "the closing response is the turn's answer, not an empty thought"
     );
 }

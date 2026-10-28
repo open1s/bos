@@ -39,7 +39,7 @@ pub use tool_run::{ToolCallEvent, ToolRunManager};
 /// forever. It must never end a turn mid-thought: the turn that reaches it gets
 /// one closing request carrying this note, so the reader always receives what
 /// the run established and what is left, instead of a `Done` with no answer.
-const STEP_GUARD_NOTE: &str = "You have reached this turn's step budget, so no further tool calls will run. Reply in plain text now: what you established, what is still incomplete, and the next concrete step. Do not call any tools.";
+pub const STEP_GUARD_NOTE: &str = "You have reached this turn's step budget, so no further tool calls will run. Reply in plain text now: what you established, what is still incomplete, and the next concrete step. Do not call any tools.";
 
 /// The ReAct loop: LLM calls, tool execution, skills, telemetry, and resilience.
 pub struct ReActEngine<A: ReActApp> {
@@ -198,8 +198,7 @@ impl<A: ReActApp> ReActEngine<A> {
                         // On the closing turn the model is asked for prose: a
                         // call it still emits is not run, so the guard costs an
                         // answer rather than one more truncated step.
-                        if let Some(tool_calls) = message.tool_calls.as_ref().filter(|_| !closing)
-                        {
+                        if let Some(tool_calls) = message.tool_calls.as_ref().filter(|_| !closing) {
                             // Phase A: every call of this response is parsed and
                             // passes its before-hook first. The hooks take the
                             // session, so they stay in the model own order.
@@ -433,6 +432,11 @@ skill_dir: {}
                                 arguments,
                                 ..
                             } => {
+                                // Closing turn: the call is not run (see the
+                                // OpenAI arm); its text becomes the answer.
+                                if closing {
+                                    continue;
+                                }
                                 found_tool_call = true;
                                 let call_id = call_id.clone();
                                 let name = name.clone();
@@ -640,6 +644,9 @@ skill_dir: {}
             let mut loaded_skills: std::collections::HashMap<String, (String, String)> = std::collections::HashMap::new();
             let mut request = request;
             let mut steps = 0usize;
+            // See `react_loop`: the bound guards against a runaway loop, and a
+            // guarded turn closes with an answer instead of a bare `Done`.
+            let mut closing = false;
 
             context.add_tool(load_skill_tool());
 
@@ -650,12 +657,17 @@ skill_dir: {}
                 }
 
                 // The streaming loop drives the same ReAct steps as
-                // `react_loop`, so it must honour the same `max_steps` bound.
-                // Without it a model that keeps requesting tools would grow
-                // the session without limit.
+                // `react_loop`, so it honours the same guard. The bound stops a
+                // runaway loop; it does not end a turn, which is why reaching it
+                // pushes one closing request instead of yielding `Done` with no
+                // answer.
                 if steps >= self.max_steps {
-                    yield Ok(StreamToken::Done);
-                    break;
+                    if closing {
+                        yield Ok(StreamToken::Done);
+                        break;
+                    }
+                    closing = true;
+                    session.push(LlmMessage::user_text(STEP_GUARD_NOTE));
                 }
                 steps += 1;
 
@@ -721,6 +733,12 @@ skill_dir: {}
                             break;// End of LLM response stream
                         }
                         Ok(StreamToken::ToolCall { name, mut args, id }) => {
+                            // The closing turn asks for prose, not work: a call
+                            // here is not run, so the turn ends with an answer
+                            // instead of one more step.
+                            if closing {
+                                continue;
+                            }
                             saw_tool_call = true;
                             yield Ok(StreamToken::ToolCall { name: name.clone(), args: args.clone(), id: id.clone() });
 

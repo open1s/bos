@@ -1493,7 +1493,10 @@ impl SubagentContext {
     fn child(&self, child_id: &str) -> Agent {
         let mut config = self.config.clone();
         config.name = "subagent".to_string();
-        config.max_steps = config.max_steps.min(12);
+        // The child runs on the parent's own budget. It used to be capped at 12
+        // while the parent ran to its own ceiling, so a delegated task stopped
+        // mid-investigation and handed back a partial result that read like an
+        // answer. Only the child's model may end its turn.
         // A leaf child has no subagent tool, so it must not inherit the parent's
         // standing instruction to delegate. A child that gets the tool has it
         // appended by attach_subagent_tool below.
@@ -1687,19 +1690,19 @@ pub(crate) fn attach_subagent_tool(agent: &mut Agent, context: SubagentContext) 
                 let child = context.child(&id);
                 let turn_context =
                     crate::context::TurnContext::from_facts(&context.runtime, true);
-                let result = tokio::time::timeout(
-                    std::time::Duration::from_secs(600),
-                    stream_child(
-                        &child,
-                        prompt,
-                        context.registry.clone(),
-                        &id,
-                        &turn_context,
-                    ),
+                // No wall clock around the child: a delegated task ends when
+                // its own model stops asking for tools, the same rule a parent
+                // turn follows. The 600-second cap this replaces aborted real
+                // work mid-investigation and returned "subagent timed out" as
+                // if the task had finished.
+                let result = stream_child(
+                    &child,
+                    prompt,
+                    context.registry.clone(),
+                    &id,
+                    &turn_context,
                 )
-                .await
-                .map_err(|_| "subagent timed out".to_string())
-                .and_then(|result| result);
+                .await;
                 let usage = child.last_token_usage().unwrap_or((0, 0));
                 let transcript = child_transcript(&child);
                 context.registry.set_agent(
@@ -2817,7 +2820,7 @@ fn grep_tool(
 ) -> FunctionTool {
     FunctionTool::new(
         "grep",
-        "Search file contents with a ripgrep regular expression. Returns each matching line with its file and 1-based line number. Ignored and hidden files, and dependency or build trees, are skipped unless include_ignored is set. Matching is case-sensitive unless case_insensitive is set.",
+        "Search file contents with a ripgrep regular expression. Returns each matching line with its file and 1-based line number. path may be a directory, searched recursively, or a single file. Ignored and hidden files, and dependency or build trees, are skipped unless include_ignored is set; a path that names one file is searched whatever its name, ignore status or include glob. Matching is case-sensitive unless case_insensitive is set. include takes one glob filter for which files the walk searches (negation is not supported); invert reports the lines that do NOT match; context adds that many lines on each side of a match; files_without_match returns the paths of files with no match instead of lines; text searches binary files as text. A binary file reports the lines matched before its first NUL byte, plus a binary row naming that offset.",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -2825,7 +2828,12 @@ fn grep_tool(
                 "path": { "type": "string" },
                 "case_insensitive": { "type": "boolean" },
                 "include_ignored": { "type": "boolean" },
-                "limit": { "type": "integer", "minimum": 1, "maximum": 500 }
+                "limit": { "type": "integer", "minimum": 1, "maximum": 500 },
+                "invert": { "type": "boolean" },
+                "context": { "type": "integer", "minimum": 0, "maximum": 20 },
+                "files_without_match": { "type": "boolean" },
+                "include": { "type": "string" },
+                "text": { "type": "boolean" }
             },
             "required": ["pattern"]
         }),
@@ -2851,6 +2859,36 @@ fn grep_tool(
                     crate::grep::MAX_RESULTS
                 )));
             }
+            let flag = |key: &str| {
+                args.get(key)
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            };
+            let invert = flag("invert");
+            let files_without_match = flag("files_without_match");
+            let text = flag("text");
+            let context = match args.get("context").filter(|value| !value.is_null()) {
+                Some(value) => {
+                    let Some(number) = value.as_u64() else {
+                        return Err(ToolError::InvalidInput(
+                            "context must be a non-negative integer".to_string(),
+                        ));
+                    };
+                    if number > crate::grep::MAX_CONTEXT as u64 {
+                        return Err(ToolError::InvalidInput(format!(
+                            "context must be at most {}",
+                            crate::grep::MAX_CONTEXT
+                        )));
+                    }
+                    number as usize
+                }
+                None => 0,
+            };
+            let include = args
+                .get("include")
+                .and_then(serde_json::Value::as_str)
+                .filter(|pattern| !pattern.trim().is_empty())
+                .map(str::to_string);
             let search_root =
                 resolve_path(root.as_deref(), &raw).map_err(ToolError::InvalidInput)?;
             check_path(
@@ -2865,41 +2903,61 @@ fn grep_tool(
                 .as_deref()
                 .filter(|workspace| search_root.starts_with(workspace))
                 .unwrap_or(&search_root);
-            let found = crate::grep::search(
-                &search_root,
-                base,
-                &crate::grep::Query {
-                    pattern: &pattern,
-                    include_ignored,
-                    case_insensitive,
-                    limit,
-                },
-            )
-            .map_err(ToolError::InvalidInput)?;
+            let query = crate::grep::Query {
+                pattern: &pattern,
+                include_ignored,
+                case_insensitive,
+                limit,
+                invert,
+                context,
+                files_without_match,
+                include: include.as_deref(),
+                text,
+            };
+            let found =
+                crate::grep::search(&search_root, base, &query).map_err(ToolError::InvalidInput)?;
             let matches: Vec<serde_json::Value> = found
                 .hits
                 .iter()
                 .map(|hit| {
-                    serde_json::json!({
+                    let mut row = serde_json::json!({
                         "path": hit.path.to_string_lossy(),
                         "line": hit.line,
                         "text": hit.text,
-                    })
+                    });
+                    if hit.kind == crate::grep::Kind::Context {
+                        row["kind"] = serde_json::json!("context");
+                    }
+                    row
                 })
                 .collect();
-            let empty = matches.is_empty();
+            let empty = matches.is_empty() && found.binary.is_empty();
             let mut result = serde_json::json!({
                 "path": search_root.display().to_string(),
                 "pattern": pattern,
                 "matches": matches,
                 "truncated": found.truncated,
             });
-            if empty {
-                result["hint"] = serde_json::json!(crate::grep::hint(
-                    &pattern,
-                    &search_root,
-                    include_ignored
-                ));
+            if !found.binary.is_empty() {
+                result["binary"] = serde_json::json!(found
+                    .binary
+                    .iter()
+                    .map(|binary| serde_json::json!({
+                        "path": binary.path.to_string_lossy(),
+                        "offset": binary.offset,
+                        "message": binary.message(),
+                    }))
+                    .collect::<Vec<_>>());
+            }
+            if files_without_match {
+                result["files_without_match"] = serde_json::json!(found
+                    .unmatched
+                    .iter()
+                    .map(|path| path.to_string_lossy())
+                    .collect::<Vec<_>>());
+            }
+            if empty && found.unmatched.is_empty() {
+                result["hint"] = serde_json::json!(crate::grep::hint(&query, &search_root));
             }
             Ok(result)
         },
@@ -5340,6 +5398,34 @@ verdict := {{"allow": false, "rule": "{rule}", "reason": "refused by the workspa
         assert!(subagent, "an unrelated tool stayed");
     }
 
+    /// A child runs on the parent's budget. It used to be capped at 12 steps
+    /// while the parent ran to its own ceiling, so a delegated task stopped
+    /// mid-investigation and handed back a partial result as the answer.
+    #[test]
+    fn a_child_inherits_the_parents_step_budget() {
+        let root = scratch("subagent-budget");
+        let mut settings = rooted(&root);
+        settings.workspace.agent.max_steps = 77;
+        let built = build(&settings);
+        let context = crate::caps::SubagentContext::new(
+            &built.agent,
+            "parent",
+            "parent",
+            0,
+            std::sync::Arc::new(crate::subagent::SubagentRegistry::default()),
+            built.policy.clone(),
+            "",
+            root.to_string_lossy().to_string(),
+            crate::context::RuntimeFacts::from_effective(&built.effective),
+        );
+        let child = context.child("child-1");
+        assert_eq!(
+            child.config().max_steps,
+            77,
+            "the child sees the parent's budget, not a lower cap"
+        );
+    }
+
     /// Denying `run_in_background` keeps the shell tool but withdraws the
     /// flag: the schema no longer advertises it, so the capability is not
     /// merely refused after the fact.
@@ -6625,6 +6711,170 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             .execute("grep", &serde_json::json!({ "pattern": "(" }))
             .expect_err("an unbalanced group is refused");
         assert!(invalid.to_string().contains("invalid regex"), "{invalid}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The grep tool accepts a file where it accepts a directory: the path may
+    /// name one file, and its hits stay workspace-relative.
+    #[test]
+    fn a_grep_searches_a_file_path() {
+        let root = scratch("grep-file-path");
+        std::fs::create_dir_all(root.join("src")).expect("src");
+        let file = root.join("src").join("main.rs");
+        std::fs::write(&file, "fn main() {\n    let bubble = 1;\n}\n").expect("main");
+        std::fs::write(root.join("src").join("other.rs"), "let bubble = 2;\n").expect("other");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        let found = registry
+            .execute(
+                "grep",
+                &serde_json::json!({
+                    "pattern": "bubble",
+                    "path": file.to_string_lossy(),
+                }),
+            )
+            .expect("a file path is searched");
+        assert_eq!(found["path"], file.to_string_lossy().as_ref());
+        assert_eq!(found["matches"][0]["path"], "src/main.rs");
+        assert_eq!(found["matches"][0]["line"], 2);
+        assert_eq!(found["matches"][0]["text"], "    let bubble = 1;");
+        assert_eq!(
+            found["matches"].as_array().map(Vec::len),
+            Some(1),
+            "only the named file is read: {found}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The five ripgrep switches reach the search and its answer: invert,
+    /// context, include, files_without_match and text, plus the binary row a
+    /// file with a match before its NUL byte carries.
+    #[test]
+    fn a_grep_takes_ripgreps_switches() {
+        let root = scratch("grep-switches");
+        std::fs::write(root.join("one.rs"), "a\nneedle\nb\nc\n").expect("rs");
+        std::fs::write(root.join("notes.md"), "needle\n").expect("md");
+        std::fs::write(root.join("plain.txt"), "nothing\n").expect("plain");
+        std::fs::write(root.join("blob.bin"), b"needle\n\x00rest\n".as_slice()).expect("blob");
+        std::fs::write(root.join("late.bin"), {
+            let mut bytes = b"needle\n".to_vec();
+            bytes.resize(70 * 1024, b'a');
+            bytes.push(0);
+            bytes
+        })
+        .expect("late");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        let inverted = registry
+            .execute(
+                "grep",
+                &serde_json::json!({ "pattern": "needle", "invert": true }),
+            )
+            .expect("grep runs");
+        assert!(
+            inverted["matches"]
+                .as_array()
+                .expect("matches")
+                .iter()
+                .all(|row| row["text"] != "needle"),
+            "invert reports the lines that do not match: {inverted}"
+        );
+        assert!(
+            inverted["matches"]
+                .as_array()
+                .expect("matches")
+                .iter()
+                .any(|row| row["path"] == "one.rs" && row["text"] == "a"),
+            "{inverted}"
+        );
+
+        let with_context = registry
+            .execute(
+                "grep",
+                &serde_json::json!({ "pattern": "needle", "context": 1, "path": "one.rs" }),
+            )
+            .expect("grep runs");
+        assert_eq!(
+            with_context["matches"][0]["kind"], "context",
+            "{with_context}"
+        );
+        assert_eq!(with_context["matches"][0]["line"], 1);
+        assert_eq!(with_context["matches"][1]["line"], 2);
+        assert!(
+            with_context["matches"][1].get("kind").is_none(),
+            "a match row keeps its old shape: {with_context}"
+        );
+
+        let included = registry
+            .execute(
+                "grep",
+                &serde_json::json!({ "pattern": "needle", "include": "*.rs" }),
+            )
+            .expect("grep runs");
+        assert_eq!(
+            included["matches"].as_array().map(Vec::len),
+            Some(1),
+            "{included}"
+        );
+        assert_eq!(included["matches"][0]["path"], "one.rs");
+
+        let without = registry
+            .execute(
+                "grep",
+                &serde_json::json!({ "pattern": "needle", "files_without_match": true }),
+            )
+            .expect("grep runs");
+        assert_eq!(without["matches"].as_array().map(Vec::len), Some(0));
+        assert_eq!(without["files_without_match"][0], "plain.txt");
+
+        let text = registry
+            .execute(
+                "grep",
+                &serde_json::json!({ "pattern": "needle", "text": true, "path": "blob.bin" }),
+            )
+            .expect("grep runs");
+        assert_eq!(text["matches"][0]["path"], "blob.bin");
+        assert!(text.get("binary").is_none(), "{text}");
+
+        // The same file reached through the WALK answers the same way: its
+        // pre-NUL row and its binary row are both reported, which is what rg
+        // prints for a directory search too.
+        let walked = registry
+            .execute("grep", &serde_json::json!({ "pattern": "needle" }))
+            .expect("grep runs");
+        assert!(
+            walked["matches"]
+                .as_array()
+                .expect("matches")
+                .iter()
+                .any(|row| row["path"] == "late.bin"),
+            "{walked}"
+        );
+        assert_eq!(walked["binary"][0]["path"], "late.bin");
+
+        let binary = registry
+            .execute(
+                "grep",
+                &serde_json::json!({ "pattern": "needle", "path": "late.bin" }),
+            )
+            .expect("a named binary file is searched");
+        assert_eq!(binary["matches"][0]["path"], "late.bin");
+        assert_eq!(binary["binary"][0]["path"], "late.bin");
+        assert_eq!(binary["binary"][0]["offset"], 70 * 1024);
+        assert_eq!(
+            binary["binary"][0]["message"],
+            "binary file matches (found \"\\0\" byte around offset 71680)"
+        );
+
+        let too_much = registry
+            .execute(
+                "grep",
+                &serde_json::json!({ "pattern": "needle", "context": 21 }),
+            )
+            .expect_err("context is bounded");
+        assert!(too_much.to_string().contains("context"), "{too_much}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

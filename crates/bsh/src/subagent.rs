@@ -18,7 +18,7 @@ pub(crate) enum SubagentStatus {
     Running,
     /// The child returned a final answer.
     Done,
-    /// The child failed or timed out.
+    /// The child's turn ended in an error.
     Failed,
 }
 

@@ -2670,3 +2670,166 @@ each box carried `.flex_none()`; and two older tests pressed the pin/ellipsis
 without hovering - those controls are only in the flow under the pointer now, so
 they hover first, as the workspace-row test already did.
 
+Round 179 let `grep` take a file where it takes a directory. The tool refused a
+file root with "is not a directory", so an agent that had just listed a path got
+an error for naming one of the files it found; `search` now branches once - a
+file to read, a directory to walk - and both go through the same per-file
+`search_file`, so bounds, binary detection and the sink cannot drift.
+
+Two rules the branch had to state rather than share. A file named in `path` is
+read whatever its name or ignore status says, because naming it is the point;
+and a named file that cannot be searched - binary, past the 4 MiB ceiling, not
+regular - is REFUSED with its reason instead of returning no hits, since there
+is no other file in the call that could answer, while the walk keeps silently
+skipping those files (the others still answer). The empty hint drops its
+"ignored and hidden files were skipped" sentence for a named file, which would
+be false there.
+
+Traps: `relative_to(base, path)` returns an EMPTY path when the two are equal,
+so a file that is its own search base reports its parent-stripped NAME
+(`hit_base`); and `std::fs::metadata` follows a symlink where the walker's
+`entry.metadata` does not, which is fine only because a symlink never reaches
+the helper from the walk. Tests: file root by name and by workspace-relative
+path, ignore/hidden exemption, binary and oversized refusal, a missing path
+that says `does not exist`, a socket that says `not a file or directory`, and
+the registry-level `a_grep_searches_a_file_path`.
+
+Round 180 put grep on ripgrep's SDK seam rather than beside it. The engine was
+already ripgrep's (`grep` facade: grep-regex + grep-searcher, and `ignore` for
+the walk), but the tool only used the `sinks::Lossy` closure and pre-probed the
+file itself for a NUL in its first 8 KiB. `grep.rs` now implements
+`grep::searcher::Sink` (`HitSink`) - `matched` writes a `Hit`, `finish` records
+`SinkFinish::binary_byte_offset()` - so the line buffer, the line numbers and
+the binary detection are the searcher's; `looks_binary`, `BINARY_PROBE_BYTES`
+and the `std::io::Read` import are gone, and a named file that cannot be opened
+now reports "could not be read" instead of "looks binary".
+
+The reason the sink had to grow a `finish` is the one behaviour the pre-probe
+had and `BinaryDetection::quit(0)` does not: with the generic reader the line
+buffer scans each 64 KiB fill and quits at the NUL, and the searcher's
+per-matched-line check only fires on the slice/mmap path (macOS never takes it -
+`mmap::open` returns None there). So a file that matches BEFORE a NUL past the
+first buffer has already written a hit when the quit arrives, and rg's answer is
+"binary file matches", not those lines. `search_file` records
+`found.hits.len()` before the search and truncates back to it when `finish`
+reports a binary offset; a binary file also clears `limited`, so a rolled-back
+file never sets `truncated`.
+
+Traps: a `&mut S` is a `Sink`, so `search_path(matcher, path, &mut sink)` keeps
+the sink readable afterwards; but `HitSink` holds `&mut found.hits`, so read its
+flags into locals BEFORE touching `found` (the borrow lives as long as the sink
+is used, and `found.hits.truncate(..)` is a second mutable borrow); `finish` IS
+called when `matched` returns false, which is what makes the limit and the
+binary rollback compose; and a test for the rollback has to put the NUL past
+64 KiB, because inside the first buffer the buffer scan kills the file before
+any line matches and the test would pass without a rollback. Proven both ways:
+`a_match_before_a_nul_is_rolled_back_as_binary` fails with
+`["clean.txt:1:needle", "late.bin:1:needle"]` when the truncate is removed.
+
+Honest gaps of the SDK refactor, so the next round does not assume more than
+shipped:
+
+- No `grep::printer`. The tool answers typed hits, so `JSON`/`Summary` would be
+  an encode-then-decode round trip. Consequence: rg's "binary file matches" line
+  has no output row here - a walk drops the file's hits silently and a named
+  file is refused by name.
+- The dependency is the crates.io facade (`grep 0.4.1`, `ignore 0.4.32`), not a
+  `git` dependency on the repository: the code is that repo's, but a git source
+  would need network at build time and break the offline build. The `ripgrep`
+  crate itself is still unusable (binary-only, no lib target).
+- Binary detection became the searcher's, so it is EARLY-QUIT semantics, not a
+  whole-file verdict: once the hit limit stops a search, a NUL later in the file
+  is never met and the earlier hits stand. The old 8 KiB pre-probe would have
+  dropped them. That is rg's own behaviour and it is stated rather than hidden.
+- The refactor changed no output shape and no bound: `{path, line, text}`, the
+  4 MiB / 300-char / 50-500 limits, the sort and the empty hint are as round 176
+  and 179 left them; caps, prompt and reference docs needed no edit.
+- Still absent as tool options, measured against rg rather than assumed: invert
+  (`-v`), files-without-match (`-L`), context lines (`-A/-B/-C`), an `include`
+  glob, and a text-mode override (`--text`). The reference's own grep tool
+  carries `include` ("One glob filter for which files to search ... negation is
+  not supported"), so that one is also a parity gap, not only an omission.
+
+Round 181 put the results through ripgrep's printer and answered a binary file
+the way rg answers one. Round 180's rollback is REVERSED: a file that matches
+before its first NUL keeps those rows and gains a binary row, because that is
+what `rg` prints (`path:1:needle` then `binary file matches (found "\0" byte
+around offset N)`), and the rows a searcher already read are not a lie.
+
+The pipeline is `grep::printer::JSON`, not a hand-written sink: `JSON::new(&mut
+buffer)` plus `sink_with_path(matcher, &relative)` per file, then the buffer is
+decoded line by line with serde into `Hit { path, line, text, kind }`. So the
+line numbers, the `context` kind of a `-C` row, and the base64 `bytes` branch
+the printer takes for a line that is not UTF-8 are ripgrep's, and the tool's own
+`bounded_line` only trims the terminator and the width. `Emit` wraps the printer
+for the one thing a printer has no opinion about - the call's ROW BUDGET: it
+forwards `begin`/`matched`/`context`/`binary_data`/`finish` and answers `Ok(false)`
+once the budget is spent, which is how the searcher is told to stop reading this
+file. `binary_byte_offset()` on the sink is the binary verdict. The new
+dependency is `base64 0.23.1`, the copy this crate's own arrow/parquet/reqwest
+graph already builds, so naming it adds no package.
+
+The five switches are rg's, with rg's own semantics measured rather than assumed:
+`invert` (`-v`), `context` (`-C`, one integer, clamped to `MAX_CONTEXT` = 20 and
+refused above it in caps), `files_without_match` (`--files-without-match`, NOT
+`-L`, which is `--follow`), `include` (one glob for which files the WALK
+searches), and `text` (`-a`, `BinaryDetection::none`). Measured: `-g` never
+narrows an explicitly named file, so the tool's include is a walk filter and a
+named `path` is read whatever it says; `--files-without-match` never lists a
+binary file, and a file list spends its budget on files, not rows, so one
+`matched` per file is all it needs; `-a` reports the lines before AND after a NUL
+because it turns detection off rather than converting.
+
+The binary rule is now uniform across a walk and a named file, and stated because
+one half is a deviation: a file whose match precedes the NUL yields its rows plus
+one binary row (`path`, `offset`, `message`) whether it was walked or named; a
+named binary file with NO pre-NUL match is REFUSED by name ("is binary (a NUL
+byte at offset N), so its text is not searched"), where rg would print `binary
+file matches` - but rg reaches that sentence from a match, and there is none to
+print; a walked file with no pre-NUL match is silently skipped, as rg skips it.
+
+Evidence: `the_rows_match_the_installed_ripgrep` is `#[ignore]`d (it shells out
+to `rg`, 15.2.0 here) and compares this tool's `(path, line, text, kind)` rows
+against `rg --json` for the default, `-v`, `-C1`, `-g '*.rs'` and `-a` cases,
+including the base64 branch; binary parity goes through `rg -n --with-filename`
+instead, and text-mode parity on the same file through `rg -a --json`. It was
+discrimination-checked: reporting a context row as a match fails it with "rows
+differ from rg for context". Run it with `cargo test -p bsh --lib grep --
+--ignored`.
+
+Traps and honest gaps:
+
+- `rg --json` and rg's standard printer DISAGREE about a binary file: the JSON
+  printer converts (reporting matches past the NUL and putting the offset in
+  `end.data.binary_offset`), the standard printer quits. The tool takes the
+  standard printer's answer, so binary parity has to be measured on standard
+  output, not on `--json`.
+- The binary offset is the exact NUL offset, not a buffer boundary. Round 180's
+  `71680` was that fixture's exact NUL position (`resize(70 * 1024)` then `push`),
+  and the probe here reads `70007` from rg for a NUL at 70007 - so do not
+  "round" it to a page size to match a memory of the old number.
+- Not mirrored: the multi-file `WARNING: stopped searching binary file after
+  match` wording. A row already names its own path, so the walk's binary row
+  reuses the single-file sentence rather than emitting a second line shape.
+- The budget is a ROW budget, where rg's `-m` counts matching LINES: with
+  `context` set, a context row spends budget too, and a `files_without_match`
+  call spends it on paths. Stated rather than changed, because an agent's real
+  question is "how many rows will I read".
+- Not offered, so nobody assumes otherwise: multi-line matches, separate
+  before/after counts (`-A`/`-B`), repeated or excluded globs (`-g` lists and
+  `!` patterns are refused by name), `--files-with-matches`, `--type`, and
+  `--no-ignore-vcs`.
+- The parity test parses rg's JSON with its own `serde_json::Value` reads rather
+  than widening this module's `Data`: a `path` field added there is never read by
+  the tool, and `cargo clippy --all-targets` would report it as dead code in the
+  non-test build.
+
+`Query` gained `invert`, `context`, `files_without_match`, `include`, `text` and
+`Default`; `Found` gained `binary` and `unmatched`; `Skip::Binary` is gone
+(refusal now comes from `FileResult::Binary { offset, matched: false }`); `hint`
+takes `&Query` and the root and names include, invert and files_without_match.
+The result JSON keeps its old shape, adds `kind: "context"` on a context row,
+`binary: [{path, offset, message}]` and `files_without_match: [path]`, and only
+carries a hint when nothing at all was found. `base64` is the round's one new
+dependency; caps, the GREP prompt line and both rows of `docs/bsh-prompts.md` now
+name the switches.

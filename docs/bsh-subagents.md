@@ -13,12 +13,15 @@ The child receives:
 - a copy of the parent's tool registry at build time;
 - a focused-subagent system instruction prepended to the parent persona;
 - a fresh Agent session and context;
-- max_steps capped at 12.
+- the parent's own step budget, uncapped (`max_steps` is a runaway guard, not
+  the exit rule: a turn - parent or child - ends when its model stops asking
+  for tools).
 
 A child at depth 0 or 1 receives the subagent tool again, giving the bounded DSH
 lineage tree: session root, children, and grandchildren. Depth 2 is the leaf.
-At most three children run at once across the tree; each has a 600-second
-timeout. The result returned to the parent is bounded to 16,000 characters; the
+At most three children run at once across the tree. A child has no wall-clock
+limit of its own: it ends on the same rule as any turn - when its model stops
+asking for tools - and the reader can stop the run. The result returned to the parent is bounded to 16,000 characters; the
 full result and the child transcript are kept in the run registry.
 
 The child's tools still carry the parent session and policy principal, so the
