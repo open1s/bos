@@ -3595,6 +3595,93 @@ fn chord_modifiers(modifiers: &gpui::Modifiers) -> u32 {
     bits
 }
 
+/// How much further a mouse notch travels than a trackpad's own delta.
+///
+/// The same rule and the same number as the transcript's wheel (`MOUSE_GAIN`):
+/// a wheel sends whole LINES, one coarse detent, while a trackpad sends precise
+/// pixels that already carry momentum. Gaining the coarse one makes a notch a
+/// comfortable step; gaining the precise one would fight the hardware.
+const BROWSER_WHEEL_GAIN: f32 = 2.0;
+
+/// One wheel event's page point and deltas, in CDP's own sign.
+///
+/// GPUI hands a delta the way its own scroller consumes it: positive moves the
+/// CONTENT down, which is the reader scrolling UP. CDP's `mouseWheel` is the
+/// opposite - a positive `deltaY` scrolls the page DOWN - so forwarding the
+/// window's number unchanged scrolls every page backwards. Both axes are
+/// negated here, which is why this is a function a test can pin rather than a
+/// sign in the middle of a handler.
+///
+/// The point is CLAMPED into the frame: a wheel delivered at the pane's edge is
+/// still a wheel over the page, and CDP would otherwise aim it at nothing.
+fn page_wheel(
+    bounds: Bounds<Pixels>,
+    viewport: (u32, u32),
+    position: Point<Pixels>,
+    delta: &ScrollDelta,
+    line_height: Pixels,
+) -> Option<(f32, f32, f32, f32)> {
+    let (x, y) = page_point(bounds, viewport, position, true)?;
+    let gain = if delta.precise() {
+        1.0
+    } else {
+        BROWSER_WHEEL_GAIN
+    };
+    let pixels = delta.pixel_delta(line_height);
+    Some((x, y, -pixels.x.as_f32() * gain, -pixels.y.as_f32() * gain))
+}
+
+/// The engine's name for a named (non-text) key.
+///
+/// Modifiers are deliberately NOT folded into the name: the pane has the
+/// physical mask and [`crate::browser::engine::Engine::press_with`] carries it,
+/// so Shift+Arrow extends a selection and Cmd/Ctrl+Arrow jumps a line the way
+/// they do in a browser. `None` means the key's meaning is its text.
+fn named_key(key: &str) -> Option<&'static str> {
+    Some(match key {
+        "enter" => "enter",
+        "tab" => "tab",
+        "escape" => "escape",
+        "up" => "arrowup",
+        "down" => "arrowdown",
+        "left" => "arrowleft",
+        "right" => "arrowright",
+        "backspace" => "backspace",
+        "delete" => "delete",
+        "home" => "home",
+        "end" => "end",
+        "pageup" => "pageup",
+        "pagedown" => "pagedown",
+        _ => return None,
+    })
+}
+
+/// The text a keystroke carries, when it is text the page should receive.
+///
+/// Three rules, and each is a defect without it:
+///
+/// - Control and Cmd chords are accelerators, not text. The ones the pane owns
+///   have already been delivered as chords; the rest belong to the application.
+/// - Alt is usually an accelerator too (`Option`+`f` is a menu key on many
+///   layouts), so an Option chord whose character is the key itself is not
+///   text.
+/// - Alt that PRODUCES a different character is composition - macOS `Option`+`a`
+///   is `a` with the character `å` - and dropping it means no Option-composed
+///   character can be typed into a page at all.
+fn typed_text(keystroke: &Keystroke) -> Option<&str> {
+    if keystroke.modifiers.control || keystroke.modifiers.platform {
+        return None;
+    }
+    let text = keystroke.key_char.as_deref()?;
+    if text.is_empty() || text.chars().all(char::is_control) {
+        return None;
+    }
+    if keystroke.modifiers.alt && keystroke.key == text {
+        return None;
+    }
+    Some(text)
+}
+
 /// Handle the editing chords the pane owns: Cmd/Ctrl+C, +V, +X, +A, +Z and
 /// +F.
 ///
@@ -4077,8 +4164,8 @@ impl Shell {
                             cx.notify();
                         }),
                     )
-                    .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
-                        this.browser_scroll(event);
+                    .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
+                        this.browser_scroll(event, window.line_height());
                         cx.notify();
                     }))
                     .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
@@ -4292,27 +4379,28 @@ impl Shell {
     }
 
     /// Forward a wheel event.
-    fn browser_scroll(&mut self, event: &ScrollWheelEvent) {
+    ///
+    /// The page scrolls itself: the pane only maps the point and the deltas, so
+    /// a page's own wheel handler, its smooth scrolling and its nested scrollers
+    /// all behave as they do in a browser. [`page_wheel`] owns the sign
+    /// conversion and the clamp.
+    fn browser_scroll(&mut self, event: &ScrollWheelEvent, line_height: Pixels) {
         let Some(bounds) = self.browser_bounds.get() else {
             return;
-        };
-        let width = bounds.size.width.as_f32().max(1.0);
-        let height = bounds.size.height.as_f32().max(1.0);
-        let x = (event.position.x.as_f32() - bounds.origin.x.as_f32()).max(0.0);
-        let y = (event.position.y.as_f32() - bounds.origin.y.as_f32()).max(0.0);
-        let delta = match event.delta {
-            ScrollDelta::Pixels(delta) => delta.y.as_f32(),
-            ScrollDelta::Lines(lines) => lines.y * 40.0,
         };
         let Some(engine) = self.state.browser.engine() else {
             return;
         };
-        let viewport = engine.viewport();
-        let (x, y) = (
-            x * viewport.0 as f32 / width,
-            y * viewport.1 as f32 / height,
-        );
-        let _ = engine.scroll(x, y, delta, true);
+        let Some((x, y, delta_x, delta_y)) = page_wheel(
+            bounds,
+            engine.viewport(),
+            event.position,
+            &event.delta,
+            line_height,
+        ) else {
+            return;
+        };
+        let _ = engine.scroll(x, y, delta_x, delta_y, true);
     }
 
     /// Forward a key: printable text as text, the named keys as keys.
@@ -4324,39 +4412,17 @@ impl Shell {
         if browser_shortcut(keystroke, &engine, cx) {
             return;
         }
-        let named = match keystroke.key.as_str() {
-            "enter" => Some("enter"),
-            "tab" => Some(if keystroke.modifiers.shift {
-                "shift+tab"
-            } else {
-                "tab"
-            }),
-            "escape" => Some("escape"),
-            "up" => Some("arrowup"),
-            "down" => Some("arrowdown"),
-            "left" => Some("arrowleft"),
-            "right" => Some("arrowright"),
-            "backspace" => Some("backspace"),
-            "delete" => Some("delete"),
-            "home" => Some("home"),
-            "end" => Some("end"),
-            "pageup" => Some("pageup"),
-            "pagedown" => Some("pagedown"),
-            _ => None,
-        };
-        if let Some(named) = named {
-            let _ = engine.press(named, true);
+        if let Some(named) = named_key(&keystroke.key) {
+            // The modifiers ride along: Shift+Tab walks backwards, Shift+Arrow
+            // extends a selection and Cmd/Ctrl+Arrow jumps a word, which all
+            // arrive as the bare key otherwise.
+            let _ = engine.press_with(named, chord_modifiers(&keystroke.modifiers), true);
             return;
         }
-        // A shortcut this pane does not own (Cmd-S, Cmd-T, ...) belongs to the
-        // application; a control or alt chord is not text in any browser.
-        if keystroke.modifiers.control || keystroke.modifiers.platform || keystroke.modifiers.alt {
-            return;
-        }
-        let Some(text) = &keystroke.key_char else {
+        let Some(text) = typed_text(keystroke) else {
             return;
         };
-        if text.chars().count() == 1 && !text.chars().all(char::is_control) {
+        if text.chars().count() == 1 {
             // One printable character: a real browser's keydown plus char, so
             // a page listening for keydown sees the key AND the field receives
             // exactly that character once.
@@ -6002,11 +6068,14 @@ fn terminal_confinement(
 
 #[cfg(test)]
 mod tests {
-    use gpui_kit::{point, px, size, Bounds, FontStyle, FontWeight, Keystroke, Modifiers};
+    use gpui_kit::{
+        point, px, size, Bounds, FontStyle, FontWeight, Keystroke, Modifiers, Pixels, ScrollDelta,
+    };
 
     use super::{
-        anchor_line, grid_fonts, page_point, terminal_key_bytes, BrowserClick, BROWSER_CLICK_MS,
-        BROWSER_CLICK_SLOP,
+        anchor_line, chord_modifiers, grid_fonts, named_key, page_point, page_wheel,
+        terminal_key_bytes, typed_text, BrowserClick, BROWSER_CLICK_MS, BROWSER_CLICK_SLOP,
+        BROWSER_WHEEL_GAIN,
     };
 
     fn key(key: &str, key_char: Option<&str>) -> Keystroke {
@@ -6188,5 +6257,162 @@ mod tests {
             .expect("an outside point clamps into the frame");
         assert!((x - 995.0).abs() < 0.001, "the last page column: {x}");
         assert!((y - 495.0).abs() < 0.001, "the last page row: {y}");
+    }
+
+    fn frame() -> Bounds<Pixels> {
+        Bounds {
+            origin: point(px(100.0), px(50.0)),
+            size: size(px(200.0), px(100.0)),
+        }
+    }
+
+    /// The window and the page disagree about the wheel's sign: GPUI's delta
+    /// moves the CONTENT (positive = the reader scrolls up) while CDP's moves
+    /// the VIEWPORT (positive `deltaY` = the page scrolls down). Forwarding the
+    /// window's number unchanged scrolls every page backwards.
+    #[test]
+    fn a_wheel_scrolls_the_page_the_way_the_hand_moved() {
+        let up = page_wheel(
+            frame(),
+            (1000, 500),
+            point(px(200.0), px(100.0)),
+            &ScrollDelta::Pixels(point(px(0.0), px(50.0))),
+            px(20.0),
+        )
+        .expect("a point inside the frame");
+        assert!(
+            up.3 < 0.0,
+            "a positive window delta scrolls the page up: {up:?}"
+        );
+
+        let down = page_wheel(
+            frame(),
+            (1000, 500),
+            point(px(200.0), px(100.0)),
+            &ScrollDelta::Pixels(point(px(0.0), px(-50.0))),
+            px(20.0),
+        )
+        .expect("a point inside the frame");
+        assert!(
+            down.3 > 0.0,
+            "a negative window delta scrolls the page down: {down:?}"
+        );
+        assert_eq!(down.3, -up.3, "the two directions are exact opposites");
+    }
+
+    /// A mouse wheel sends whole LINES, one coarse detent per notch, so it is
+    /// gained to a comfortable step. A trackpad sends precise pixels that
+    /// already carry momentum, so it passes through untouched.
+    #[test]
+    fn a_wheel_notch_is_gained_and_a_trackpad_delta_is_not() {
+        let notch = page_wheel(
+            frame(),
+            (1000, 500),
+            point(px(200.0), px(100.0)),
+            &ScrollDelta::Lines(point(0.0, 3.0)),
+            px(20.0),
+        )
+        .expect("a point inside the frame");
+        assert_eq!(notch.3, -3.0 * 20.0 * BROWSER_WHEEL_GAIN);
+        assert!(
+            notch.3.abs() > 3.0 * 20.0,
+            "a notch travels further than its raw pixels: {}",
+            notch.3
+        );
+
+        let precise = page_wheel(
+            frame(),
+            (1000, 500),
+            point(px(200.0), px(100.0)),
+            &ScrollDelta::Pixels(point(px(0.0), px(60.0))),
+            px(20.0),
+        )
+        .expect("a point inside the frame");
+        assert_eq!(precise.3, -60.0, "a precise delta comes through as itself");
+    }
+
+    /// A sideways wheel reaches the page on its own axis; it was hardcoded to
+    /// zero before, so a horizontal scroller could not be scrolled at all.
+    #[test]
+    fn a_horizontal_wheel_reaches_the_page() {
+        let (_, _, dx, dy) = page_wheel(
+            frame(),
+            (1000, 500),
+            point(px(200.0), px(100.0)),
+            &ScrollDelta::Pixels(point(px(30.0), px(0.0))),
+            px(20.0),
+        )
+        .expect("a point inside the frame");
+        assert_eq!(dx, -30.0, "the horizontal delta is negated too");
+        assert_eq!(dy, 0.0, "and the axes stay independent");
+    }
+
+    /// A wheel delivered at the pane's edge is still a wheel over the page:
+    /// CDP would otherwise aim it at nothing and the scroll would be lost.
+    #[test]
+    fn a_wheel_outside_the_frame_lands_on_the_edge() {
+        let (x, y, _, _) = page_wheel(
+            frame(),
+            (1000, 500),
+            point(px(0.0), px(0.0)),
+            &ScrollDelta::Lines(point(0.0, 1.0)),
+            px(20.0),
+        )
+        .expect("an outside point clamps into the frame");
+        assert_eq!((x, y), (0.0, 0.0));
+    }
+
+    /// A named key keeps its modifiers out of its name: the pane has the
+    /// physical mask and the engine carries it, so Shift+Arrow extends a
+    /// selection instead of arriving as a plain Arrow.
+    #[test]
+    fn a_named_key_keeps_its_modifiers_out_of_its_name() {
+        assert_eq!(named_key("up"), Some("arrowup"));
+        assert_eq!(named_key("pagedown"), Some("pagedown"));
+        assert_eq!(named_key("a"), None, "a letter is its own text");
+
+        let mut shifted = key("up", None);
+        shifted.modifiers.shift = true;
+        assert_eq!(
+            named_key(&shifted.key),
+            Some("arrowup"),
+            "the name carries no chord"
+        );
+        assert_eq!(
+            chord_modifiers(&shifted.modifiers),
+            crate::browser::engine::cdp::SHIFT,
+            "the mask carries it instead"
+        );
+    }
+
+    /// Option composition is text; an Option accelerator is not.
+    #[test]
+    fn option_composition_is_typed_but_an_option_accelerator_is_not() {
+        assert_eq!(typed_text(&key("a", Some("a"))), Some("a"));
+
+        let mut shifted = key("a", Some("A"));
+        shifted.modifiers.shift = true;
+        assert_eq!(typed_text(&shifted), Some("A"));
+
+        // macOS Option+a produces "å": the character differs from the key, so
+        // this is composition and the page must receive it.
+        let mut composed = key("a", Some("å"));
+        composed.modifiers.alt = true;
+        assert_eq!(typed_text(&composed), Some("å"));
+
+        // Option+f has no composed character here, so it is a menu key.
+        let mut accelerator = key("f", Some("f"));
+        accelerator.modifiers.alt = true;
+        assert_eq!(typed_text(&accelerator), None);
+
+        let mut command = key("s", Some("s"));
+        command.modifiers.platform = true;
+        assert_eq!(typed_text(&command), None);
+
+        let mut control = key("c", Some("c"));
+        control.modifiers.control = true;
+        assert_eq!(typed_text(&control), None);
+
+        assert_eq!(typed_text(&key("tab", Some("\t"))), None);
     }
 }

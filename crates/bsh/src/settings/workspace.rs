@@ -152,7 +152,7 @@ impl Default for AgentSection {
             memory_enabled: true,
             max_tokens: None,
             context_budget: 32768,
-            max_steps: 10,
+            max_steps: 256,
             shell_timeout_secs: 300,
             tool_output_cap: 16384,
             skills_dir: None,
@@ -257,6 +257,19 @@ extensions = ["plan"]
         assert!(
             settings.agent.mcp_servers.is_empty(),
             "a workspace adds to the global list, it does not replace it"
+        );
+    }
+
+    /// The shipped ceiling has to be a working budget, not a demo number.
+    ///
+    /// Ten steps ran out in the middle of every investigation and the loop
+    /// reported `Done` when it did, so a truncated turn looked finished.
+    #[test]
+    fn the_shipped_step_ceiling_is_a_working_budget() {
+        assert_eq!(
+            AgentSection::default().max_steps,
+            256,
+            "a turn gets up to 256 ReAct steps unless the workspace lowers it"
         );
     }
 

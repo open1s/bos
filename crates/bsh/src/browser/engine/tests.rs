@@ -329,7 +329,6 @@ fn native_video_plays_and_keeps_frames_moving() {
     engine.set_streaming(true);
     wait_for_frame(&frames, 0, Duration::from_secs(1))
         .expect("a playing video paints a captured frame");
-    let sequence = frames.seq();
     // The same load tolerance as the self-animating test below: a starved
     // window on a shared machine is not a cadence regression, so the bar must
     // be met in ONE window of three. A regression publishes slowly everywhere.
@@ -1155,6 +1154,75 @@ fn a_release_at_the_clamped_edge_clears_the_page_drag() {
         "no move may be forwarded after the release: {after}"
     );
     eprintln!("PROOF captured release: {after}");
+}
+
+/// The wheel's sign and both axes, against a real page.
+///
+/// A CDP `mouseWheel` moves the VIEWPORT, so a positive `deltaY` scrolls the
+/// page down - the opposite of the window's own delta, which moves the
+/// CONTENT. The pane negates before forwarding, and this is the proof that the
+/// negation ends in the direction a hand expects. Both axes are checked
+/// because `deltaX` used to be hardcoded to zero, which made a horizontally
+/// scrolling page unreachable.
+#[test]
+fn the_wheel_scrolls_the_page_in_the_direction_cdp_names() {
+    fn wait_axis(engine: &Engine, axis: &str, wanted: impl Fn(f64) -> bool) -> f64 {
+        let mut last = 0.0;
+        for _ in 0..100 {
+            last = engine
+                .evaluate(&format!("window.{axis}"))
+                .ok()
+                .and_then(|value| value.as_f64())
+                .unwrap_or(0.0);
+            if wanted(last) {
+                return last;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        last
+    }
+
+    let html = "<!doctype html><html><body style=\"margin:0\">\
+        <div style=\"width:4000px;height:4000px;background:linear-gradient(#fff,#000)\"></div>\
+        </body></html>";
+    let origin = Origin::start(String::from(html));
+    let Some(engine) = engine() else {
+        return;
+    };
+    engine
+        .navigate_settling(&format!("http://127.0.0.1:{}/", origin.port), Settle::Idle)
+        .expect("the tall page loads");
+
+    // A positive deltaY scrolls the page DOWN.
+    engine
+        .scroll(400.0, 300.0, 0.0, 600.0, true)
+        .expect("the wheel dispatches");
+    let down = wait_axis(&engine, "scrollY", |y| y > 0.0);
+    assert!(
+        down > 0.0,
+        "a positive deltaY should scroll the page down: {down}"
+    );
+
+    // A negative deltaY scrolls it back UP.
+    engine
+        .scroll(400.0, 300.0, 0.0, -600.0, true)
+        .expect("the wheel dispatches");
+    let up = wait_axis(&engine, "scrollY", |y| y < down);
+    assert!(
+        up < down,
+        "a negative deltaY should scroll the page up: {down} -> {up}"
+    );
+
+    // deltaX has its own axis; it used to be sent as a hardcoded zero.
+    engine
+        .scroll(400.0, 300.0, 600.0, 0.0, true)
+        .expect("the wheel dispatches");
+    let right = wait_axis(&engine, "scrollX", |x| x > 0.0);
+    assert!(
+        right > 0.0,
+        "a positive deltaX should scroll the page right: {right}"
+    );
+    eprintln!("PROOF wheel: down={down} up={up} right={right}");
 }
 
 /// Wait until the frame slot holds a frame NEWER than `above`, bounded.

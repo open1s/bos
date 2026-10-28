@@ -39,6 +39,29 @@ playing, it keeps the fast capture cadence so motion remains visible in the
 pane. Chromium supplies native DOM rendering, text selection, keyboard and
 pointer input, and media decoding.
 
+## Input
+
+The pane maps the window's coordinates into page coordinates and forwards each
+event as CDP input; the page handles selection, focus and its own scrollers.
+
+Two sign and scale conventions are worth stating, because getting either wrong
+is a silent behaviour bug rather than an error:
+
+- A window wheel delta moves the CONTENT (positive scrolls the reader up) while
+  a CDP `mouseWheel` moves the VIEWPORT (positive `deltaY` scrolls the page
+  down), so both axes are negated before forwarding. Both axes are forwarded:
+  a horizontal wheel reaches a horizontally scrolling page.
+- A mouse notch arrives in whole lines and is gained (the transcript's own
+  `MOUSE_GAIN`) so one detent is a comfortable step; a trackpad's precise pixel
+  delta passes through untouched because its hardware already carries momentum.
+
+Keys carry their physical modifier mask instead of folding Shift into the key
+name, so Shift+Arrow extends a selection and Cmd/Ctrl+Arrow jumps a line.
+Composed characters are typed: macOS `Option`+`a` produces `å` and is forwarded
+as that character, while an Option chord whose character equals its key is an
+accelerator and is not typed. Control and Cmd chords belong to the page or the
+application, never to the text path.
+
 ## Tests
 
 Browser integration tests use the installed Chrome/Chromium binary and a

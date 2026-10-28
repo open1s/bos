@@ -4786,7 +4786,7 @@ mod tests {
         );
         narrow.global.default_preset = "shell-only".to_string();
         let built = build(&narrow);
-        assert_eq!(built.agent.config().max_steps, 10);
+        assert_eq!(built.agent.config().max_steps, 256);
         let mut carrying: Vec<String> = built
             .plugins
             .iter()

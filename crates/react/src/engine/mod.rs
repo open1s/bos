@@ -33,6 +33,14 @@ pub use error::{BuilderError, ReactError};
 pub use skill_cache::{CachedSkill, SkillCache};
 pub use tool_run::{ToolCallEvent, ToolRunManager};
 
+/// What the model is told when a turn reaches its step guard.
+///
+/// The guard exists so a runaway tool loop cannot spend the machine's time
+/// forever. It must never end a turn mid-thought: the turn that reaches it gets
+/// one closing request carrying this note, so the reader always receives what
+/// the run established and what is left, instead of a `Done` with no answer.
+const STEP_GUARD_NOTE: &str = "You have reached this turn's step budget, so no further tool calls will run. Reply in plain text now: what you established, what is still incomplete, and the next concrete step. Do not call any tools.";
+
 /// The ReAct loop: LLM calls, tool execution, skills, telemetry, and resilience.
 pub struct ReActEngine<A: ReActApp> {
     llm: Box<dyn LlmClient<A::Session, A::Context> + Send + Sync>,
@@ -131,7 +139,21 @@ impl<A: ReActApp> ReActEngine<A> {
         //build request
         session.push(LlmMessage::user(request.input.clone()));
 
-        for _ in 0..self.max_steps {
+        // A turn ends when the MODEL stops asking for tools. The step bound is
+        // a guard, not the exit rule: when it trips, the model gets one closing
+        // turn, so a guarded turn still ends with an answer.
+        let mut steps = 0usize;
+        let mut closing = false;
+        loop {
+            if steps >= self.max_steps {
+                if closing {
+                    break;
+                }
+                closing = true;
+                session.push(LlmMessage::user_text(STEP_GUARD_NOTE));
+            }
+            steps += 1;
+
             if self.stop_flag.load(Ordering::SeqCst) {
                 return Err(ReactError::HookAbort(
                     "Execution stopped by user".to_string(),
@@ -173,7 +195,11 @@ impl<A: ReActApp> ReActEngine<A> {
                     for choice in rsp.choices {
                         let message = &choice.message;
 
-                        if let Some(tool_calls) = &message.tool_calls {
+                        // On the closing turn the model is asked for prose: a
+                        // call it still emits is not run, so the guard costs an
+                        // answer rather than one more truncated step.
+                        if let Some(tool_calls) = message.tool_calls.as_ref().filter(|_| !closing)
+                        {
                             // Phase A: every call of this response is parsed and
                             // passes its before-hook first. The hooks take the
                             // session, so they stay in the model own order.

@@ -650,21 +650,38 @@ impl Engine {
         key: &str,
         fire: bool,
     ) -> Result<Option<(String, String)>, EngineError> {
-        let (name, code, vk) = match key {
-            "tab" => ("Tab", "Tab", 9),
-            "shift+tab" => ("Tab", "Tab", 9),
-            "arrowdown" => ("ArrowDown", "ArrowDown", 40),
-            "arrowup" => ("ArrowUp", "ArrowUp", 38),
-            "arrowleft" => ("ArrowLeft", "ArrowLeft", 37),
-            "arrowright" => ("ArrowRight", "ArrowRight", 39),
-            "escape" => ("Escape", "Escape", 27),
-            "enter" => ("Enter", "Enter", 13),
-            "backspace" => ("Backspace", "Backspace", 8),
-            "delete" => ("Delete", "Delete", 46),
-            "home" => ("Home", "Home", 36),
-            "end" => ("End", "End", 35),
-            "pageup" => ("PageUp", "PageUp", 33),
-            "pagedown" => ("PageDown", "PageDown", 34),
+        self.press_with(key, 0, fire)
+    }
+
+    /// Press one key with the physical modifiers it arrived with.
+    ///
+    /// A bare key name cannot carry a chord, and the difference is not
+    /// cosmetic: Shift+Arrow EXTENDS a selection, Cmd/Ctrl+Arrow jumps by a
+    /// word or a line, and Alt+Backspace deletes one. Forwarding those as the
+    /// plain key (which is what a caller without this seam had to do) sends the
+    /// wrong edit to the page. `shift+tab` keeps its spelling because the tool
+    /// path names a chord rather than carrying a mask.
+    pub(crate) fn press_with(
+        &self,
+        key: &str,
+        modifiers: u32,
+        fire: bool,
+    ) -> Result<Option<(String, String)>, EngineError> {
+        let (name, code, vk, implied) = match key {
+            "tab" => ("Tab", "Tab", 9, 0),
+            "shift+tab" => ("Tab", "Tab", 9, SHIFT),
+            "arrowdown" => ("ArrowDown", "ArrowDown", 40, 0),
+            "arrowup" => ("ArrowUp", "ArrowUp", 38, 0),
+            "arrowleft" => ("ArrowLeft", "ArrowLeft", 37, 0),
+            "arrowright" => ("ArrowRight", "ArrowRight", 39, 0),
+            "escape" => ("Escape", "Escape", 27, 0),
+            "enter" => ("Enter", "Enter", 13, 0),
+            "backspace" => ("Backspace", "Backspace", 8, 0),
+            "delete" => ("Delete", "Delete", 46, 0),
+            "home" => ("Home", "Home", 36, 0),
+            "end" => ("End", "End", 35, 0),
+            "pageup" => ("PageUp", "PageUp", 33, 0),
+            "pagedown" => ("PageDown", "PageDown", 34, 0),
             other => {
                 return Err(EngineError::Rpc {
                     method: String::from("browser_press"),
@@ -678,7 +695,8 @@ impl Engine {
                 })
             }
         };
-        let modifiers = i64::from(key == "shift+tab") * 8;
+        let modifiers = i64::from(modifiers | implied);
+        let shifted = modifiers & i64::from(SHIFT) != 0;
         self.send(
             fire,
             "Input.dispatchKeyEvent",
@@ -736,7 +754,7 @@ impl Engine {
         if key == "escape" {
             return Ok(None);
         }
-        let focused = self.evaluate(&focus_script(key == "shift+tab" || key == "arrowup"))?;
+        let focused = self.evaluate(&focus_script(shifted || key == "arrowup"))?;
         let reference = focused.get("ref").and_then(Value::as_str);
         let label = focused
             .get("label")
@@ -1035,10 +1053,17 @@ impl Engine {
     }
 
     /// Forward a scroll wheel event.
+    ///
+    /// Both deltas are in CSS pixels and in CDP's own sign: positive scrolls
+    /// the page RIGHT and DOWN. The window gives the opposite sign for the
+    /// same motion (its delta moves the content, not the viewport), so the
+    /// caller negates; doing it here would hide a convention the two sides
+    /// disagree about.
     pub(crate) fn scroll(
         &self,
         x: f32,
         y: f32,
+        delta_x: f32,
         delta_y: f32,
         fire: bool,
     ) -> Result<(), EngineError> {
@@ -1052,7 +1077,7 @@ impl Engine {
                 "type": "mouseWheel",
                 "x": f64::from(x),
                 "y": f64::from(y),
-                "deltaX": 0.0,
+                "deltaX": f64::from(delta_x),
                 "deltaY": f64::from(delta_y),
             }),
         )
