@@ -83,7 +83,7 @@ Agent configuration structure with builder pattern.
 | `temperature` | `f32` | `0.7` | Temperature (0.0 to 2.0) |
 | `max_tokens` | `Option<u32>` | `None` | Max tokens for completion |
 | `timeout_secs` | `u64` | `60` | Request timeout in seconds |
-| `max_steps` | `usize` | `10` | Maximum ReAct steps |
+| `max_steps` | `usize` | `10` | Optional ReAct step guard; `0` means no ceiling, so a turn ends when the model stops calling tools |
 | `circuit_breaker` | `Option<CircuitBreakerConfig>` | `None` | Circuit breaker config |
 | `rate_limit` | `Option<RateLimiterConfig>` | `None` | Rate limiter config |
 
@@ -99,7 +99,7 @@ Agent configuration structure with builder pattern.
 | `temperature(temp)` | Set temperature | `Self` |
 | `max_tokens(tokens)` | Set max tokens | `Self` |
 | `timeout_secs(secs)` | Set timeout | `Self` |
-| `max_steps(steps)` | Set max steps | `Self` |
+| `max_steps(steps)` | Set a runaway guard (`0` disables it) | `Self` |
 | `circuit_breaker(config)` | Set circuit breaker | `Self` |
 | `rate_limit(config)` | Set rate limiter | `Self` |
 

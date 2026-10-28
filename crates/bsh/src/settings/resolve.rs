@@ -471,8 +471,6 @@ pub(crate) struct Resolution {
     pub(crate) temperature: Option<f32>,
     /// Completion cap; none leaves it to the engine.
     pub(crate) max_tokens: Option<u32>,
-    /// ReAct steps one turn may take before the loop stops.
-    pub(crate) max_steps: usize,
     /// Run one turn's tool calls concurrently.
     pub(crate) parallel_tool_calls: bool,
     /// The session's permission and the preset ceiling folded into the mode in
@@ -702,7 +700,6 @@ pub(crate) fn resolve_with_catalogue(
         reasoning_effort: workspace.agent.reasoning_effort.clone().or(declared_effort),
         temperature: workspace.agent.temperature,
         max_tokens: workspace.agent.max_tokens,
-        max_steps: workspace.agent.max_steps,
         parallel_tool_calls: workspace.agent.parallel_tool_calls,
         permission,
         sandbox,

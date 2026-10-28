@@ -118,7 +118,6 @@ pub(crate) struct SettingsInputs {
     budget: Entity<InputState>,
     shell_timeout: Entity<InputState>,
     output_cap: Entity<InputState>,
-    pub(crate) max_steps: Entity<InputState>,
     max_tokens: Entity<InputState>,
     /// The local web-search endpoint (the Search API base).
     pub(crate) web_search_base: Entity<InputState>,
@@ -136,7 +135,6 @@ impl SettingsInputs {
             budget: cx.new(|cx| InputState::new(window, cx)),
             shell_timeout: cx.new(|cx| InputState::new(window, cx)),
             output_cap: cx.new(|cx| InputState::new(window, cx)),
-            max_steps: cx.new(|cx| InputState::new(window, cx)),
             max_tokens: cx.new(|cx| InputState::new(window, cx)),
             web_search_base: cx.new(|cx| InputState::new(window, cx)),
             web_search_results: cx.new(|cx| InputState::new(window, cx)),
@@ -170,7 +168,6 @@ impl SettingsInputs {
             window,
             cx,
         );
-        set(&self.max_steps, effective.max_steps.to_string(), window, cx);
         set(
             &self.max_tokens,
             effective
@@ -208,10 +205,6 @@ impl SettingsInputs {
         let cap = self.output_cap.read(cx).value().trim().to_string();
         if let Ok(parsed) = cap.parse::<usize>() {
             settings.workspace.agent.tool_output_cap = parsed.max(256);
-        }
-        let steps = self.max_steps.read(cx).value().trim().to_string();
-        if let Ok(parsed) = steps.parse::<usize>() {
-            settings.workspace.agent.max_steps = parsed.max(1);
         }
         let tokens = self.max_tokens.read(cx).value().trim().to_string();
         if tokens.is_empty() {
@@ -734,8 +727,6 @@ enum Field {
     ShellTimeout,
     /// The per-stream output cap.
     OutputCap,
-    /// The ReAct step ceiling.
-    MaxSteps,
     /// The context budget.
     Budget,
     /// The cap on completion tokens per turn.
@@ -753,7 +744,6 @@ impl Field {
         match self {
             Field::ShellTimeout => default.workspace.agent.shell_timeout_secs.to_string(),
             Field::OutputCap => default.workspace.agent.tool_output_cap.to_string(),
-            Field::MaxSteps => default.workspace.agent.max_steps.to_string(),
             Field::Budget => default.workspace.agent.context_budget.to_string(),
             Field::MaxTokens => default
                 .workspace
@@ -6321,19 +6311,16 @@ impl Shell {
         ("settings.webToolsTitle", "settings.webSearchHint", rows)
     }
 
-    /// Agent loop: the step ceiling one turn may reach.
+    /// Agent loop: what a turn is bounded by.
+    ///
+    /// There is no step ceiling any more. A turn ends when the model stops
+    /// asking for tools, and the reader can stop it from the composer, so a
+    /// number that cut a healthy turn off had no place here.
     fn section_agent_loop(
         &self,
         cx: &mut Context<Shell>,
     ) -> (&'static str, &'static str, Vec<AnyElement>) {
-        let inputs = &self.settings_inputs;
         let rows = vec![
-            self.input_row(
-                "settings.maxRecursionDepth",
-                &inputs.max_steps,
-                Field::MaxSteps,
-                cx,
-            ),
             {
                 let on = self.state.draft().workspace.agent.memory_enabled;
                 // The reference's General pane has no memory row, so this one

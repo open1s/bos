@@ -3303,3 +3303,26 @@ Evidence: `state::tests::a_stopped_turn_keeps_its_rows_on_disk`,
 `a_shutdown_mid_turn_saves_the_transcript`,
 `store::raw_tests::a_save_after_a_placeholder_rewrites_the_tail`,
 `a_save_of_an_unhydrated_session_keeps_the_log`.
+
+The step ceiling is GONE. The Agent loop pane used to draw "Maximum recursion
+depth" (256 by default, 1000 in the demo file), and a turn that reached it got
+one forced closing note - a number deciding when a healthy turn ends. The
+engine's exit rule is the model itself: a turn ends when a response carries no
+tool call, and the reader can always stop it from the composer.
+
+Three layers changed together:
+- `react::engine` carries `max_steps: Option<usize>`, `None` by default; the
+  builder's `max_steps(n)` still exists for an embedder that wants a runaway
+  guard, and `0` from `AgentConfig` means "no ceiling".
+- `bsh` builds the agent with `max_steps: 0`; the Effective and workspace
+  `max_steps` are gone. The WORKSPACE FIELD is kept as `#[serde(default,
+  skip_serializing)]` so an older settings file (the demo's `max_steps = 1000`)
+  still parses - read for migration, never used and never written again.
+- the pane draws only the two switches (Memory, Parallel tool calls) and its
+  hint now says the model decides; `settings.maxRecursionDepth` is deleted in
+  both locales.
+
+Evidence: `caps::tests::a_zero_step_ceiling_means_no_ceiling`,
+`a_child_carries_no_step_ceiling`, `plugins_carry_the_filtered_tools` (asserts
+the built agent carries 0), `ui::shell_tests::the_agent_loop_pane_draws_its_switches`,
+`settings::workspace::tests::an_old_step_ceiling_is_read_but_never_used`.

@@ -53,7 +53,11 @@ pub const EMPTY_ANSWER_NOTE: &str = "Your last reply contained no text and no to
 pub struct ReActEngine<A: ReActApp> {
     llm: Box<dyn LlmClient<A::Session, A::Context> + Send + Sync>,
     tools: Arc<ToolRegistry>,
-    max_steps: usize,
+    /// The step guard, when the caller asks for one. `None` is the harness
+    /// contract: a turn ends when the MODEL stops asking for tools, and a
+    /// healthy run must not be cut off by a number. The bound exists for
+    /// embedders that need a runaway guard, not as the exit rule.
+    max_steps: Option<usize>,
     parallel_tool_calls: bool,
     telemetry: Telemetry,
     llm_timeout_secs: u64,
@@ -72,7 +76,7 @@ pub struct ReActEngine<A: ReActApp> {
 pub struct ReActEngineBuilder<A: ReActApp> {
     llm: Option<Box<dyn LlmClient<A::Session, A::Context>>>,
     tools: ToolRegistry,
-    max_steps: usize,
+    max_steps: Option<usize>,
     parallel_tool_calls: bool,
     telemetry: Telemetry,
     resilience: Option<ReActResilience>,
@@ -156,7 +160,7 @@ impl<A: ReActApp> ReActEngine<A> {
         // EMPTY_ANSWER_NOTE); a second blank reply ends the turn.
         let mut nudged = false;
         'turn: loop {
-            if steps >= self.max_steps {
+            if self.max_steps.is_some_and(|bound| steps >= bound) {
                 if closing {
                     break;
                 }
@@ -692,7 +696,7 @@ skill_dir: {}
                 // runaway loop; it does not end a turn, which is why reaching it
                 // pushes one closing request instead of yielding `Done` with no
                 // answer.
-                if steps >= self.max_steps {
+                if self.max_steps.is_some_and(|bound| steps >= bound) {
                     if closing {
                         yield Ok(StreamToken::Done);
                         break;

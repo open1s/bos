@@ -2848,33 +2848,23 @@ fn plugin_switch_writes_the_disabled_plugin(cx: &mut TestAppContext) {
     );
 }
 
-/// The agent loop pane loads the ceiling the agent will be built with, so the
-/// field is bound to the setting rather than a label that looks like one.
+/// The agent loop pane keeps the switches that do something. The step ceiling
+/// is gone from the model, the resolution and the pane: a control for a limit
+/// that is not enforced would be a lying control, and the absence of the field
+/// is what the compiler holds.
 #[gpui::test]
-fn agent_loop_pane_loads_the_step_ceiling(cx: &mut TestAppContext) {
+fn the_agent_loop_pane_draws_its_switches(cx: &mut TestAppContext) {
     init_test_app(cx);
-    let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let mut state = state_with_turns("agent-loop", 2);
-        state.settings.workspace.agent.max_steps = 23;
+    let (_harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("agent-loop", 2);
         let shell =
             cx.new(|cx| Shell::build_for_test(window, section_index("agent-loop"), state, cx));
         Harness { shell }
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
-
-    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    let text = cx.update(|_, cx| {
-        shell
-            .read(cx)
-            .settings_inputs
-            .max_steps
-            .read(cx)
-            .value()
-            .to_string()
-    });
-    assert_eq!(
-        text, "23",
-        "the pane must show the ceiling the agent will be built with"
+    assert!(
+        cx.debug_bounds("parallel-tool-calls").is_some(),
+        "parallel tool calls is still a real switch in the pane"
     );
 }
 

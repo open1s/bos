@@ -121,7 +121,14 @@ pub(crate) struct AgentSection {
     pub(crate) max_tokens: Option<u32>,
     /// Send-side token ceiling; 0 disables compaction.
     pub(crate) context_budget: usize,
-    /// ReAct steps one turn may take before the loop stops.
+    /// The old ReAct step ceiling.
+    ///
+    /// Read so a settings file written before the bound was removed still
+    /// parses, and never written again: the loop ends when the model stops
+    /// asking for tools, so the number cannot cut a healthy turn off. The field
+    /// is deliberately not surfaced anywhere - a control for a limit that is not
+    /// enforced would be a lying control.
+    #[serde(default, skip_serializing)]
     pub(crate) max_steps: usize,
     /// Seconds one shell command may run before it is killed.
     pub(crate) shell_timeout_secs: u64,
@@ -152,7 +159,7 @@ impl Default for AgentSection {
             memory_enabled: true,
             max_tokens: None,
             context_budget: 32768,
-            max_steps: 256,
+            max_steps: 0,
             shell_timeout_secs: 300,
             tool_output_cap: 16384,
             skills_dir: None,
@@ -260,16 +267,20 @@ extensions = ["plan"]
         );
     }
 
-    /// The shipped ceiling has to be a working budget, not a demo number.
-    ///
-    /// Ten steps ran out in the middle of every investigation and the loop
-    /// reported `Done` when it did, so a truncated turn looked finished.
+    /// A step ceiling from an older file parses and is then ignored: the bound
+    /// was removed, so reading it back is migration, not behaviour.
     #[test]
-    fn the_shipped_step_ceiling_is_a_working_budget() {
+    fn an_old_step_ceiling_is_read_but_never_used() {
+        let text = "[agent]\nmax_steps = 1000\n";
+        let settings = WorkspaceSettings::from_toml(text).expect("an older file still parses");
+        assert_eq!(
+            settings.agent.max_steps, 1000,
+            "the field is read so the file loads"
+        );
         assert_eq!(
             AgentSection::default().max_steps,
-            256,
-            "a turn gets up to 256 ReAct steps unless the workspace lowers it"
+            0,
+            "and a fresh workspace carries no ceiling at all"
         );
     }
 

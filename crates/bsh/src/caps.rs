@@ -589,8 +589,10 @@ fn build_agent_for_session_inner(
         // the provider whole and came back as an error the UI called a useless
         // summary.
         compaction_input_tokens: compaction_input_tokens(&eff),
-        // A zero-step loop would return nothing, so the floor is one.
-        max_steps: eff.max_steps.max(1),
+        // No ceiling: the loop ends when the model stops asking for tools, so a
+        // long but healthy turn is never cut off by a number. A zero budget is
+        // the engine's "unbounded" contract.
+        max_steps: 0,
         parallel_tool_calls: eff
             .preset_parallel_tool_calls
             .unwrap_or(eff.parallel_tool_calls),
@@ -4863,7 +4865,11 @@ mod tests {
         );
         narrow.global.default_preset = "shell-only".to_string();
         let built = build(&narrow);
-        assert_eq!(built.agent.config().max_steps, 256);
+        assert_eq!(
+            built.agent.config().max_steps,
+            0,
+            "the loop has no step ceiling: the model decides when the turn ends"
+        );
         let mut carrying: Vec<String> = built
             .plugins
             .iter()
@@ -4890,7 +4896,6 @@ mod tests {
     fn plugins_carry_the_filtered_tools() {
         let mut settings = bare();
         settings.workspace.disabled.tools = vec!["read_file".to_string()];
-        settings.workspace.agent.max_steps = 17;
         let built = build(&settings);
         let names = |plugin: &str| {
             let mut tools = built
@@ -4923,8 +4928,8 @@ mod tests {
         assert_eq!(names("plan"), vec!["update_plan".to_string()]);
         assert_eq!(
             built.agent.config().max_steps,
-            17,
-            "the loop depth must reach the agent"
+            0,
+            "a turn is bounded by the model, not by a number"
         );
     }
 
@@ -5417,14 +5422,12 @@ verdict := {{"allow": false, "rule": "{rule}", "reason": "refused by the workspa
         assert!(subagent, "an unrelated tool stayed");
     }
 
-    /// A child runs on the parent's budget. It used to be capped at 12 steps
-    /// while the parent ran to its own ceiling, so a delegated task stopped
-    /// mid-investigation and handed back a partial result as the answer.
+    /// A child runs unbounded, exactly like its parent: the step ceiling is
+    /// gone, so a delegated task cannot be cut off mid-investigation.
     #[test]
-    fn a_child_inherits_the_parents_step_budget() {
+    fn a_child_carries_no_step_ceiling() {
         let root = scratch("subagent-budget");
-        let mut settings = rooted(&root);
-        settings.workspace.agent.max_steps = 77;
+        let settings = rooted(&root);
         let built = build(&settings);
         let context = crate::caps::SubagentContext::new(
             &built.agent,
@@ -5440,7 +5443,7 @@ verdict := {{"allow": false, "rule": "{rule}", "reason": "refused by the workspa
         let child = context.child("child-1");
         assert_eq!(
             child.config().max_steps,
-            77,
+            0,
             "the child sees the parent's budget, not a lower cap"
         );
     }
@@ -5593,12 +5596,12 @@ verdict := {{"allow": false, "rule": "{rule}", "reason": "refused by the workspa
         );
     }
 
-    /// A zero step ceiling cannot run a loop, so it is floored at one.
+    /// A zero step ceiling is the engine's "no ceiling": the loop ends when the
+    /// model stops asking for tools, so a long healthy turn is never cut off.
     #[test]
-    fn a_zero_step_ceiling_is_floored() {
-        let mut settings = bare();
-        settings.workspace.agent.max_steps = 0;
-        assert_eq!(build(&settings).agent.config().max_steps, 1);
+    fn a_zero_step_ceiling_means_no_ceiling() {
+        let settings = bare();
+        assert_eq!(build(&settings).agent.config().max_steps, 0);
     }
 
     /// A vault in a scratch directory, unlocked, holding one entry.

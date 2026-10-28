@@ -146,10 +146,16 @@ impl Agent {
             .llm(react_llm)
             .resilience(self.resilience.clone())
             .llm_timeout(self.config.timeout_secs)
-            .max_steps(self.config.max_steps)
             .parallel_tool_calls(self.config.parallel_tool_calls)
             .model(self.config.model.clone())
             .app(app);
+        // A zero budget is "no budget": the loop ends when the model stops
+        // asking for tools. The shell runs this way so a long, healthy turn is
+        // never cut off by a number; an embedder that wants a runaway guard
+        // sets one.
+        if self.config.max_steps > 0 {
+            builder = builder.max_steps(self.config.max_steps);
+        }
 
         if let Some(ref bus) = self.bus {
             builder = builder

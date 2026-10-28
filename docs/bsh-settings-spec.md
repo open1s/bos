@@ -218,7 +218,6 @@ parallel_tool_calls = false
 memory_enabled = true
 max_tokens = 4096              # absent leaves it to the engine
 context_budget = 32768
-max_steps = 256
 shell_timeout_secs = 300
 tool_output_cap = 16384
 skills_dir = "…"               # absent inherits the global one

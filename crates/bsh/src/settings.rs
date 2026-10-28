@@ -156,8 +156,6 @@ impl TranscriptPolicy {
 /// The concrete values a build uses once workspace overrides are applied.
 #[derive(Debug, Clone)]
 pub(crate) struct Effective {
-    /// ReAct steps one turn may take before the loop stops.
-    pub(crate) max_steps: usize,
     /// Run one turn tool calls concurrently when the model asks for several.
     pub(crate) parallel_tool_calls: bool,
     /// API protocol, or empty to follow the model.
@@ -806,7 +804,6 @@ impl Settings {
             provider: provider_id,
             model_ref: resolution.model.reference().cloned(),
             model_name,
-            max_steps: resolution.max_steps,
             parallel_tool_calls: resolution.parallel_tool_calls,
             api_mode: connection
                 .and_then(|c| c.api_mode.clone())

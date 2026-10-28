@@ -6,7 +6,9 @@ impl<A: ReActApp> ReActEngineBuilder<A> {
         Self {
             llm: None,
             tools: ToolRegistry::new(),
-            max_steps: 10,
+            // No bound by default: a turn ends when the model stops asking
+            // for tools, which is the contract the shipped shell relies on.
+            max_steps: None,
             parallel_tool_calls: false,
             telemetry: Telemetry::new(),
             resilience: None,
@@ -39,9 +41,13 @@ impl<A: ReActApp> ReActEngineBuilder<A> {
         self
     }
 
-    /// Set the maximum number of ReAct steps.
+    /// Set a runaway guard on the number of ReAct steps.
+    ///
+    /// Optional on purpose: the loop's exit rule is the model itself - a turn
+    /// ends when a response carries no tool call - so a well-behaved run is
+    /// never cut off. A caller that needs a ceiling asks for one here.
     pub fn max_steps(mut self, steps: usize) -> Self {
-        self.max_steps = steps;
+        self.max_steps = (steps > 0).then_some(steps);
         self
     }
 

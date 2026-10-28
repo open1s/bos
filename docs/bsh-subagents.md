@@ -13,9 +13,10 @@ The child receives:
 - a copy of the parent's tool registry at build time;
 - a focused-subagent system instruction prepended to the parent persona;
 - a fresh Agent session and context;
-- the parent's own step budget, uncapped (`max_steps` is a runaway guard, not
-  the exit rule: a turn - parent or child - ends when its model stops asking
-  for tools).
+- no step budget at all: a turn - parent or child - ends when its model stops
+  asking for tools, and the reader can stop it from the composer. The engine's
+  `max_steps` exists only as an optional runaway guard for embedders that ask
+  for one; BSH never sets it.
 
 A child at depth 0 or 1 receives the subagent tool again, giving the bounded DSH
 lineage tree: session root, children, and grandchildren. Depth 2 is the leaf.
