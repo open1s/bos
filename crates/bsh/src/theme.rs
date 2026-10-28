@@ -236,6 +236,9 @@ pub(crate) const RADIUS_LG: f32 = 16.0;
 /// The `--dsw-radius-sm` token from the same sheet: the meter trigger's corner.
 pub(crate) const RADIUS_SM: f32 = 8.0;
 
+/// The `--dsw-radius-xl` token (`20px`), the composer attachment tile's corner.
+pub(crate) const RADIUS_XL: f32 = 20.0;
+
 /// The turn rail's geometry, from `TurnNavigator`: a 10px mark pitch
 /// (`TURN_SPACING_PX`), a 6px inset at each end (`RAIL_INSET_PX`), a 28px frame
 /// parked 12px off the transcript's right edge and capped at 420.

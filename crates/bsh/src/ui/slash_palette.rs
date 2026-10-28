@@ -1603,7 +1603,14 @@ impl Shell {
         if attachments.is_empty() {
             return;
         }
+        let slot = self
+            .state
+            .store
+            .session(id)
+            .map(|session| session.loaded_from + session.messages.len())
+            .unwrap_or(0);
         if self.state.append_goal_attachments(id, attachments) {
+            self.transcript_images.borrow_mut().invalidate_from(slot);
             self.state.attachments.clear();
         }
     }

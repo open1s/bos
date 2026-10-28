@@ -77,6 +77,23 @@ fn parse_capacity(text: &str) -> Option<usize> {
     digits.trim().parse::<usize>().ok()?.checked_mul(scale)
 }
 
+/// The host the shortcut row's key labels are drawn for.
+///
+/// gpui 0.3.10 removed `Display` from `KeybindingKeystroke`: a keystroke is now
+/// formatted by `unparse`, which takes the operating system explicitly, so the
+/// shell answers that question from the process it is running in.
+fn host_operating_system() -> gpui_kit::OperatingSystem {
+    match std::env::consts::OS {
+        "macos" => gpui_kit::OperatingSystem::Mac,
+        "windows" => gpui_kit::OperatingSystem::Windows,
+        "linux" => gpui_kit::OperatingSystem::Linux,
+        "freebsd" => gpui_kit::OperatingSystem::FreeBsd,
+        "ios" => gpui_kit::OperatingSystem::Ios,
+        "android" => gpui_kit::OperatingSystem::Android,
+        _ => gpui_kit::OperatingSystem::Unknown,
+    }
+}
+
 pub(crate) fn section_index(id: &str) -> Option<usize> {
     SECTIONS.iter().position(|key| {
         // A pane the rail does not carry is reached by its short id, so the
@@ -1288,7 +1305,7 @@ impl Shell {
             // over a pane section that does not scroll) reached the transcript
             // behind and moved the page instead of the dialog.
             .occlude()
-            .on_scroll_wheel(cx.listener(|_this, _event, _window, cx| {
+            .on_scroll(cx.listener(|_this, _event, _window, cx| {
                 cx.stop_propagation();
             }))
             .bg(rgba(0x0F111580))
@@ -2223,7 +2240,7 @@ impl Shell {
                     let chord: Vec<String> = binding
                         .keystrokes()
                         .iter()
-                        .map(|stroke| stroke.to_string())
+                        .map(|stroke| stroke.inner().unparse(host_operating_system()))
                         .collect();
                     format!("{}  {}", chord.join(" "), binding.action().name())
                 })

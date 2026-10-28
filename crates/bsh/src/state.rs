@@ -1120,6 +1120,25 @@ impl AppState {
             self.subagent = None;
             self.tab = Tab::Chat;
             self.settings.global.general.active_session = id.to_string();
+            // The window follows the chat: the workspace this session belongs to
+            // becomes the active one, so `+`, the composer's workspace chip and
+            // the restore filter name the same project the transcript is running
+            // in. A turn resolves the session's own workspace regardless - this
+            // is what keeps the VIEW from pointing at another one.
+            if let Some(workspace) = self.store.session(id).map(|s| s.workspace.clone()) {
+                if !workspace.is_empty()
+                    && self.settings.global.general.active_workspace != workspace
+                    && self
+                        .settings
+                        .global
+                        .workspaces
+                        .iter()
+                        .any(|w| w.id == workspace)
+                {
+                    self.settings.global.general.active_workspace = workspace;
+                    self.refresh_egress_allowlist();
+                }
+            }
             let _ = self.settings.save_global();
         }
     }
@@ -2086,24 +2105,39 @@ impl AppState {
         (!summary.is_empty()).then_some(summary)
     }
 
-    /// Snapshot the active session's history and append the user turn.
-    pub(crate) fn begin_turn(&mut self, prompt: &str) -> Option<(String, Vec<ChatMessage>, usize)> {
+    /// Snapshot the active session's history and append a user turn carrying
+    /// the given images (data URLs, stored on the row the transcript draws).
+    pub(crate) fn begin_turn_with_images(
+        &mut self,
+        prompt: &str,
+        images: &[String],
+    ) -> Option<(String, Vec<ChatMessage>, usize)> {
         let id = self.active_id.clone()?;
-        let (transcript, budget) = self.begin_turn_in(&id, prompt)?;
+        let (transcript, budget) = self.begin_turn_in_with_images(&id, prompt, images)?;
         Some((id, transcript, budget))
     }
 
     /// Begin a turn in one session, whatever put the message there.
+    pub(crate) fn begin_turn_in(
+        &mut self,
+        session_id: &str,
+        prompt: &str,
+    ) -> Option<(Vec<ChatMessage>, usize)> {
+        self.begin_turn_in_with_images(session_id, prompt, &[])
+    }
+
+    /// Begin a turn in one session, with the prompt row's images.
     ///
     /// The scheduler runs a task in the session it was created in and the queue
     /// drains into the session whose turn just ended, so neither is necessarily
     /// the one on screen. The events fold into that session either way, so a
     /// reader who opens it sees the turn. `None` when the session is gone, which
     /// is what tells the caller to switch the task off.
-    pub(crate) fn begin_turn_in(
+    pub(crate) fn begin_turn_in_with_images(
         &mut self,
         session_id: &str,
         prompt: &str,
+        images: &[String],
     ) -> Option<(Vec<ChatMessage>, usize)> {
         // The ceiling belongs to the session the turn is FOR, not to whichever
         // chat happens to be on screen: the queue and the scheduler open turns
@@ -2126,7 +2160,11 @@ impl AppState {
             if session.messages.is_empty() {
                 session.title = Session::title_from(prompt, self.lang);
             }
-            session.messages.push(ChatMessage::user(prompt.to_string()));
+            // The images ride the row the transcript draws, so reopening the
+            // session shows the same pictures and the next request replays them.
+            let mut row = ChatMessage::user(prompt.to_string());
+            row.images = images.to_vec();
+            session.messages.push(row);
             session.messages.push(ChatMessage::assistant());
             for message in session.messages.iter_mut().rev().take(2) {
                 message.timing_mut().start = Some(opened);
@@ -2985,7 +3023,7 @@ impl AppState {
             return;
         };
         let at = now_ms();
-        let display = display_text(&steering.queued.text, &steering.queued.attachments);
+        let images = attachment_images(&steering.queued.attachments);
         {
             let Some(session) = self.store.session_mut(id) else {
                 return;
@@ -2995,7 +3033,8 @@ impl AppState {
                     settle_ms(last, at);
                 }
             }
-            let mut user = ChatMessage::steer(display);
+            let mut user = ChatMessage::steer(steering.queued.text.clone());
+            user.images = images;
             user.timing_mut().start = Some(at);
             session.messages.push(user);
             let mut placeholder = ChatMessage::assistant();
@@ -4980,35 +5019,93 @@ pub(crate) fn matches(query: &str, title: &str) -> bool {
 /// both providers want and the file is read once, at attach time.
 #[derive(Clone)]
 pub(crate) struct Attachment {
-    /// The file name, shown on the composer chip and in the transcript.
+    /// The file name, shown on the composer tile and in the transcript.
     pub(crate) name: String,
     /// The MIME type declared to the provider.
     pub(crate) mime: String,
     /// The base64 payload.
     pub(crate) base64: String,
+    /// The rail's square preview, when the bytes decoded as an image.
+    pub(crate) preview: Option<Arc<[u8]>>,
 }
 
+/// The reference's own intake ceilings (the dsh-attachment-local defaults):
+/// maxImagesPerMessage 20 and maxImageBytes 20 MiB.
+pub(crate) const MAX_ATTACHMENTS: usize = 20;
+
+/// The encoded-byte ceiling for one image; see MAX_ATTACHMENTS.
+pub(crate) const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+
+/// The reference draws a 64px tile, so a 2x preview keeps it sharp on a
+/// retina display without carrying the original into every frame.
+const PREVIEW_EDGE: u32 = 128;
+
 impl Attachment {
+    /// One attachment from bytes the platform already handed over: a pasted
+    /// clipboard image, or a file the reader dropped or picked.
+    pub(crate) fn from_bytes(name: String, mime: &str, bytes: &[u8]) -> Self {
+        Self {
+            name,
+            mime: mime.to_string(),
+            base64: base64_encode(bytes),
+            preview: preview(bytes),
+        }
+    }
+
     /// Read an image file into an attachment.
     ///
     /// Returns None for anything that is not one of the image types bsh sends,
     /// so the caller can fall back to mentioning the path as text.
     pub(crate) fn from_path(path: &std::path::Path) -> Option<Self> {
-        let extension = path.extension()?.to_str()?.to_ascii_lowercase();
-        let mime = match extension.as_str() {
-            "png" => "image/png",
-            "jpg" | "jpeg" => "image/jpeg",
-            "webp" => "image/webp",
-            "gif" => "image/gif",
-            _ => return None,
-        };
+        let mime = image_mime(path)?;
         let bytes = std::fs::read(path).ok()?;
-        Some(Self {
-            name: path.file_name()?.to_string_lossy().to_string(),
-            mime: mime.to_string(),
-            base64: base64_encode(&bytes),
-        })
+        Some(Self::from_bytes(
+            path.file_name()?.to_string_lossy().to_string(),
+            mime,
+            &bytes,
+        ))
     }
+
+    /// The data URL a STORED user row keeps for this image.
+    ///
+    /// The session row carries the same "data:<mime>;base64,<payload>" form the
+    /// provider receives, so a reopened transcript draws the picture and a later
+    /// turn replays the block without reading any file again.
+    pub(crate) fn data_url(&self) -> String {
+        format!("data:{};base64,{}", self.mime, self.base64)
+    }
+}
+
+/// The MIME type an image path is sent as, by extension.
+///
+/// None for anything else, which is what tells the picker and the drop target
+/// to mention the path instead of attaching it.
+pub(crate) fn image_mime(path: &std::path::Path) -> Option<&'static str> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    match extension.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "webp" => Some("image/webp"),
+        "gif" => Some("image/gif"),
+        _ => None,
+    }
+}
+
+/// A 128px square PNG preview of one image payload.
+///
+/// Centre-cropped (resize_to_fill), matching the reference thumbnail's
+/// object-fit: cover. A payload the decoder rejects has no preview; the rail
+/// then draws the file name in the tile instead of a picture.
+fn preview(bytes: &[u8]) -> Option<Arc<[u8]>> {
+    let decoded = image::load_from_memory(bytes).ok()?;
+    let square = decoded.resize_to_fill(
+        PREVIEW_EDGE,
+        PREVIEW_EDGE,
+        image::imageops::FilterType::Triangle,
+    );
+    let mut png = std::io::Cursor::new(Vec::new());
+    square.write_to(&mut png, image::ImageFormat::Png).ok()?;
+    Some(png.into_inner().into())
 }
 
 /// Encode bytes as standard base64 with padding.
@@ -5191,9 +5288,15 @@ pub(crate) fn turn_input(text: &str, attachments: &[Attachment]) -> react::llm::
     if attachments.is_empty() {
         return react::llm::Content::Text(text.to_string());
     }
-    let mut parts = vec![react::llm::ContentPart::Text {
-        text: text.to_string(),
-    }];
+    // The reference's draft is sendable with an image and no words, so an
+    // empty text part is not written: some providers reject an empty block,
+    // and there is nothing in it to send.
+    let mut parts = Vec::with_capacity(attachments.len() + 1);
+    if !text.is_empty() {
+        parts.push(react::llm::ContentPart::Text {
+            text: text.to_string(),
+        });
+    }
     for attachment in attachments {
         if let react::llm::Content::Parts(mut image) =
             react::llm::Content::binary(attachment.mime.clone(), attachment.base64.clone())
@@ -5204,19 +5307,14 @@ pub(crate) fn turn_input(text: &str, attachments: &[Attachment]) -> react::llm::
     react::llm::Content::Parts(parts)
 }
 
-/// The text a turn shows in the transcript.
+/// The data URLs a stored user row keeps for its attachments.
 ///
-/// gpui-kit has no image view here, so an attachment is named rather than drawn;
-/// this is bsh own presentation and is recorded as such.
-pub(crate) fn display_text(text: &str, attachments: &[Attachment]) -> String {
-    if attachments.is_empty() {
-        return text.to_string();
-    }
-    let names: Vec<String> = attachments
-        .iter()
-        .map(|a| format!("[image: {}]", a.name))
-        .collect();
-    format!("{}{}{}", text, "\n", names.join(" "))
+/// A data URL is the exact form the provider receives, so persisting it preserves
+/// the MIME type and the original base64 bytes. The transcript draws the same
+/// stored value, and [`message_content`] turns it back into the multimodal block
+/// on every later request.
+pub(crate) fn attachment_images(attachments: &[Attachment]) -> Vec<String> {
+    attachments.iter().map(Attachment::data_url).collect()
 }
 
 /// The fixed text the /goal command puts before the attachments it admits.
@@ -5256,7 +5354,7 @@ pub(crate) fn message_content(message: &ChatMessage) -> Option<react::llm::Conte
 }
 
 /// Split a data URL into its MIME type and base64 payload.
-fn parse_data_url(url: &str) -> Option<(&str, &str)> {
+pub(crate) fn parse_data_url(url: &str) -> Option<(&str, &str)> {
     let rest = url.strip_prefix("data:")?;
     let (mime, payload) = rest.split_once(";base64,")?;
     (!mime.is_empty() && !payload.is_empty()).then_some((mime, payload))
@@ -5277,11 +5375,9 @@ fn session_roots(settings: &Settings) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     fn image_fixture() -> super::Attachment {
-        super::Attachment {
-            name: "shot.png".to_string(),
-            mime: "image/png".to_string(),
-            base64: "Zg==".to_string(),
-        }
+        // The RFC 4648 vector for "f": the base64 every attachment assertion
+        // below pins.
+        super::Attachment::from_bytes("shot.png".to_string(), "image/png", b"f")
     }
 
     /// The /plan and /goal line grammar is the reference's command registry
@@ -6154,6 +6250,87 @@ mod tests {
         );
     }
 
+    /// An ordinary image turn keeps the reader's words and the ORIGINAL data
+    /// URL, and the stored row replays as the same binary block on a later turn.
+    #[test]
+    fn an_ordinary_image_turn_persists_and_replays_the_same_block() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("bsh-image-replay-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut state = super::AppState::with_store(crate::store::Store::open_at(dir));
+        let attachment = image_fixture();
+        let images = super::attachment_images(std::slice::from_ref(&attachment));
+        assert_eq!(images, vec!["data:image/png;base64,Zg=="]);
+        state
+            .begin_turn_with_images("look", &images)
+            .expect("a turn");
+        let session = state.active_session().expect("the session");
+        let last = session
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == crate::model::Role::User)
+            .expect("the stored user row");
+        assert_eq!(last.text, "look");
+        assert_eq!(last.images, images);
+        let content = super::message_content(last).expect("multimodal replay");
+        let react::llm::Content::Parts(parts) = content else {
+            panic!("an image row must replay as parts");
+        };
+        assert!(matches!(
+            &parts[0],
+            react::llm::ContentPart::Text { text } if text == "look"
+        ));
+        assert!(matches!(
+            &parts[1],
+            react::llm::ContentPart::Binary { binary }
+                if binary.content_type == "image/png"
+                    && binary.url() == "data:image/png;base64,Zg=="
+        ));
+    }
+
+    /// A steer carries the same image bytes into its durable transcript row, so
+    /// the next step's request still sees the picture instead of a filename.
+    #[test]
+    fn a_steered_image_row_replays_as_a_binary_block() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("bsh-steer-image-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut state = super::AppState::with_store(crate::store::Store::open_at(dir));
+        let id = state.active_id.clone().expect("a session");
+        state
+            .begin_turn_with_images("start", &[])
+            .expect("the running turn");
+        state.mark_steering(
+            &id,
+            super::Queued {
+                seq: 7,
+                text: "look here".to_string(),
+                attachments: vec![image_fixture()],
+            },
+        );
+        state.apply_event(&id, crate::runner::AgentEvent::Steered { ticket: 7 });
+        let row = state
+            .active_session()
+            .and_then(|session| session.messages.iter().find(|message| message.steering))
+            .expect("the landed steer row");
+        assert_eq!(row.text, "look here");
+        assert_eq!(row.images, vec!["data:image/png;base64,Zg=="]);
+        let content = super::message_content(row).expect("multimodal steer replay");
+        assert!(matches!(
+            content,
+            react::llm::Content::Parts(parts)
+                if matches!(&parts[0], react::llm::ContentPart::Text { text } if text == "look here")
+                    && matches!(
+                        &parts[1],
+                        react::llm::ContentPart::Binary { binary }
+                            if binary.url() == "data:image/png;base64,Zg=="
+                    )
+        ));
+    }
+
     /// The occupancy share rounds like the reference's own `Math.round` and
     /// caps at 100.
     #[test]
@@ -6178,6 +6355,38 @@ mod tests {
         assert_eq!(super::base64_encode(b"foobar"), "Zm9vYmFy");
     }
 
+    /// A real PNG gives the rail a square preview at the reference tile's 2x
+    /// edge; a payload the decoder refuses keeps None, and the tile names the
+    /// file instead of drawing a broken picture.
+    #[test]
+    fn an_attachment_preview_is_a_square_png() {
+        const RED: &[u8] = &[
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
+            8, 2, 0, 0, 0, 144, 119, 83, 222, 0, 0, 0, 12, 73, 68, 65, 84, 120, 156, 99, 248, 207,
+            192, 0, 0, 3, 1, 1, 0, 201, 254, 146, 239, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96,
+            130,
+        ];
+        let attachment = super::Attachment::from_bytes("red.png".to_string(), "image/png", RED);
+        let preview = attachment
+            .preview
+            .as_deref()
+            .expect("a decoded image has a preview");
+        assert_eq!(&preview[1..4], b"PNG", "the preview is a real PNG");
+        let width = u32::from_be_bytes([preview[16], preview[17], preview[18], preview[19]]);
+        let height = u32::from_be_bytes([preview[20], preview[21], preview[22], preview[23]]);
+        assert_eq!(
+            (width, height),
+            (128, 128),
+            "a square at the tile's 2x edge"
+        );
+        assert!(
+            super::Attachment::from_bytes("notes.png".to_string(), "image/png", b"f")
+                .preview
+                .is_none(),
+            "bytes that are not an image fall back to a named tile"
+        );
+    }
+
     #[test]
     fn only_image_extensions_become_attachments() {
         let dir = std::env::temp_dir();
@@ -6193,7 +6402,6 @@ mod tests {
             super::turn_input("hello", &[]),
             react::llm::Content::Text("hello".to_string())
         );
-        assert_eq!(super::display_text("hello", &[]), "hello");
     }
 
     #[test]
@@ -6214,12 +6422,20 @@ mod tests {
         }
     }
 
+    /// An image-only turn carries no empty text block, and its stored row keeps
+    /// the exact data URL rather than a filename mark.
     #[test]
-    fn the_transcript_names_an_attachment() {
+    fn an_image_alone_is_a_sendable_turn() {
         let attachment = image_fixture();
+        let content = super::turn_input("", std::slice::from_ref(&attachment));
+        let react::llm::Content::Parts(parts) = content else {
+            panic!("an image-only turn must be multimodal");
+        };
+        assert_eq!(parts.len(), 1, "no empty text part");
+        assert!(matches!(&parts[0], react::llm::ContentPart::Binary { .. }));
         assert_eq!(
-            super::display_text("look", std::slice::from_ref(&attachment)),
-            "look\n[image: shot.png]"
+            super::attachment_images(std::slice::from_ref(&attachment)),
+            vec!["data:image/png;base64,Zg=="]
         );
     }
     use super::{cache_hit_percent, exact_tokens, human_tokens, matches, stamp};
@@ -6264,7 +6480,7 @@ mod tests {
             "with no turn yet the session's chosen model is the honest answer"
         );
 
-        let (id, _, _) = state.begin_turn("hello").expect("a turn");
+        let (id, _, _) = state.begin_turn_with_images("hello", &[]).expect("a turn");
         state.apply_event(
             &id,
             super::AgentEvent::Usage {

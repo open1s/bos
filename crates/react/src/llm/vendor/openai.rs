@@ -845,6 +845,21 @@ mod tests {
         );
     }
 
+    /// MiniMax uses the OpenAI-compatible `image_url` object, so the ORIGINAL
+    /// base64 payload must reach the wire unchanged. This pins the exact shape
+    /// the normal image turn and the replay path both feed to the vendor.
+    #[test]
+    fn image_content_serializes_as_an_openai_image_url() {
+        let content = Content::binary("image/png", "AAEC");
+        assert_eq!(
+            super::serialize_content(&content),
+            serde_json::json!([{
+                "type": "image_url",
+                "image_url": { "url": "data:image/png;base64,AAEC" }
+            }])
+        );
+    }
+
     #[tokio::test]
     async fn test_openai_vendor() {
         let mut section = Section::default();

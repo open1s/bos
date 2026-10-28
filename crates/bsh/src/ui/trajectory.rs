@@ -2142,7 +2142,7 @@ impl Shell {
                             // The same eased wheel the chat uses, so the log
                             // scrolls with the trackpad the way the reference
                             // does instead of stepping a notch at a time.
-                            .on_scroll_wheel(cx.listener(super::transcript::traj_wheel))
+                            .on_scroll(cx.listener(super::transcript::traj_wheel))
                             .py(px(6.0))
                             .flex()
                             .flex_col()

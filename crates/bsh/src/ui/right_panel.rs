@@ -30,6 +30,7 @@ use gpui_kit::*;
 use super::diff_pane::{self, DiffSource};
 use super::shell::{Shell, SideDrag};
 use super::{hairline_left, handle_bar, icon, txt, DivExt, IconName};
+use crate::browser::engine::cdp::PointerButton;
 use crate::files::{self, Kind};
 use crate::model::Role;
 use crate::terminal::KeyOutcome;
@@ -1723,7 +1724,7 @@ impl Shell {
             )
             // The wheel browses the retained scrollback; the pane stays at the
             // bottom until the reader scrolls away from it.
-            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
+            .on_scroll(cx.listener(|this, event: &ScrollEvent, _window, cx| {
                 this.terminal_wheel(event, cx);
             }));
         if let Some((text, is_error)) = self.terminal_status_text() {
@@ -1913,7 +1914,7 @@ impl Shell {
 
     /// The wheel over the pane: one cell per line of scroll, browsing the
     /// retained scrollback and returning towards the bottom on the way back.
-    pub(crate) fn terminal_wheel(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+    pub(crate) fn terminal_wheel(&mut self, event: &ScrollEvent, cx: &mut Context<Self>) {
         let cell_h = self
             .terminal_frame
             .get()
@@ -3468,34 +3469,23 @@ impl Shell {
     }
 }
 
-/// The last press inside the page, for counting a double or triple click.
+/// The last press inside the page, so its release can carry the same count.
 ///
-/// gpui's [`gpui::ClickEvent::click_count`] exists, but the pane receives raw
-/// down/move/up and has to time the count itself: the count must ride the CDP
-/// `mousePressed`/`mouseReleased` (that is what becomes the page's
-/// `event.detail`), and a move beyond the slop has to reset it as well as the
-/// interval.
+/// The count itself is the PLATFORM's (`MouseDownEvent::click_count`, which is
+/// AppKit's own `clickCount`): it is measured in window coordinates against
+/// the real double-click interval and point, so a viewport resize between the
+/// two presses cannot break it. The pane used to time the count itself in PAGE
+/// coordinates, and MEASURED, a resize that moved the page point from
+/// (500, 350) to (240, 502) between two presses reset the count to one - an
+/// ordinary double click never became a `dblclick`. The stored button keeps a
+/// right press from continuing a left press's count.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BrowserClick {
-    /// When the press happened.
-    at: std::time::Instant,
-    /// Where it happened, in PAGE coordinates.
-    page: (f32, f32),
+    /// The button this count belongs to.
+    button: MouseButton,
     /// 1 for a single click, 2 for a double, 3 for a triple.
     count: u32,
 }
-
-/// The platform's double-click interval.
-///
-/// macOS' default `NSEvent.doubleClickInterval` is 500 ms, which is also the
-/// Windows default; gpui exposes no query for the user's preference, so the
-/// pane uses the platform default rather than a shorter window that would turn
-/// an ordinary double click into two singles.
-pub(crate) const BROWSER_CLICK_MS: u64 = 500;
-
-/// How far a press may drift from the previous one and still be the same
-/// multi-click, in PAGE pixels.
-pub(crate) const BROWSER_CLICK_SLOP: f32 = 4.0;
 
 /// The least time between two viewport overrides the pane applies.
 ///
@@ -3506,41 +3496,43 @@ pub(crate) const BROWSER_CLICK_SLOP: f32 = 4.0;
 pub(crate) const BROWSER_RESIZE_EVERY: std::time::Duration = std::time::Duration::from_millis(150);
 
 impl BrowserClick {
-    /// Count a press at `page` happening `now`, relative to the previous one.
+    /// The count a press of `button` carries, given the platform's count.
     ///
-    /// A press within the interval and the slop advances the count (2, then 3,
-    /// and 3 for any further rapid press); anything else starts over at 1.
-    pub(crate) fn next(
+    /// A press of a different button starts a new sequence at one, because a
+    /// right press must not turn the page's next left click into a double. The
+    /// platform's count is bounded at three: the page's own events only name
+    /// 1, 2 and 3.
+    pub(crate) fn press(
         previous: Option<&BrowserClick>,
-        now: std::time::Instant,
-        page: (f32, f32),
+        button: MouseButton,
+        click_count: usize,
     ) -> Self {
-        let continues = previous.is_some_and(|previous| {
-            now.saturating_duration_since(previous.at)
-                <= std::time::Duration::from_millis(BROWSER_CLICK_MS)
-                && (page.0 - previous.page.0).abs() <= BROWSER_CLICK_SLOP
-                && (page.1 - previous.page.1).abs() <= BROWSER_CLICK_SLOP
-        });
-        let count = match previous {
-            Some(previous) if continues => (previous.count + 1).min(3),
-            _ => 1,
+        let continues = previous.is_some_and(|previous| previous.button == button);
+        let count = if continues {
+            click_count.clamp(1, 3) as u32
+        } else {
+            1
         };
-        Self {
-            at: now,
-            page,
-            count,
-        }
+        Self { button, count }
     }
 
     /// The count this press carried.
     pub(crate) fn count(&self) -> u32 {
         self.count
     }
+}
 
-    /// Whether `page` is still within the slop of this press.
-    pub(crate) fn near(&self, page: (f32, f32)) -> bool {
-        (page.0 - self.page.0).abs() <= BROWSER_CLICK_SLOP
-            && (page.1 - self.page.1).abs() <= BROWSER_CLICK_SLOP
+/// The CDP button for a GPUI button, or `None` for a navigation button.
+///
+/// The pane registers the three pointer buttons; a navigation button (back or
+/// forward) has no page event, and forwarding it as a left click would put a
+/// press on the page the reader never made.
+fn pointer_button(button: MouseButton) -> Option<PointerButton> {
+    match button {
+        MouseButton::Left => Some(PointerButton::Left),
+        MouseButton::Right => Some(PointerButton::Right),
+        MouseButton::Middle => Some(PointerButton::Middle),
+        MouseButton::Navigate(_) => None,
     }
 }
 
@@ -3696,7 +3688,7 @@ fn browser_shortcut(
     cx: &mut Context<Shell>,
 ) -> bool {
     let modifiers = keystroke.modifiers;
-    if !modifiers.secondary() || modifiers.alt {
+    if !modifiers.secondary(cx) || modifiers.alt {
         return false;
     }
     let bits = chord_modifiers(&modifiers);
@@ -3864,6 +3856,13 @@ impl Shell {
         // Begin here, not on the worker: the press has to have an answer before
         // the request exists, or the pane looks inert for a frame or two.
         let seq = handle.mutate(|browser| browser.begin(&url));
+        // The capture on screen pictures the page this navigation replaces, so
+        // it leaves with it. Otherwise a pre-warm's `about:blank` whiteness, or
+        // the previous page, stands in for the one being loaded. The tile is
+        // released by the next render, the same way a replaced frame is.
+        if let Some(previous) = self.browser_render.take() {
+            self.browser_render_stale.push(previous);
+        }
         self.browser_refresh_pane();
         cx.notify();
         // The GPUI background executor, not the runner's tokio runtime: this is
@@ -3942,6 +3941,10 @@ impl Shell {
         self.browser_refresh_pane();
         if let Err(message) = outcome {
             self.state.notice(message);
+        } else if let Some(previous) = self.browser_render.take() {
+            // The restored document is a different page, so the capture on
+            // screen is not it; the pump repaints from the cached document.
+            self.browser_render_stale.push(previous);
         }
         cx.notify();
     }
@@ -4003,8 +4006,7 @@ impl Shell {
         self.browser_bounds.set(None);
         // A gesture belongs to the page that was on screen; closing it must
         // not leave the pane thinking a press is still down.
-        self.browser_pressed = false;
-        self.browser_drag_start = None;
+        self.browser_pressed = None;
         self.browser_click = None;
     }
 
@@ -4030,9 +4032,27 @@ impl Shell {
         let live = browser.engine_ready();
         let visible = self.right.open && matches!(self.right.tab, Some(RightTab::Browser));
         let mut dirty = false;
+        // The pane's cached view first: the pump's answer below depends on
+        // whether there is a page to capture, and the revision is the only
+        // thing that says the view moved.
+        let revision = browser.revision();
+        if self.browser_pane.is_none() || revision != self.browser_rev {
+            let view = browser.read(|browser| browser.pane_view());
+            self.browser_pane = Some(view);
+            self.browser_rev = revision;
+            dirty = true;
+        }
         if live {
             if let Some(engine) = browser.engine() {
-                engine.set_streaming(visible);
+                // A pane with no document captures nothing. The pre-warm's
+                // `about:blank` would otherwise be probed and PNG-decoded eight
+                // times a second and published as a full-viewport texture this
+                // pane does not draw, which is work nobody asked for.
+                let has_page = self
+                    .browser_pane
+                    .as_ref()
+                    .is_some_and(|view| frame_is_the_page(view.status));
+                engine.set_streaming(visible && has_page);
                 if visible {
                     // The viewport follows the geometry the frame is actually
                     // drawn in, so the page reflows instead of being upscaled.
@@ -4077,13 +4097,6 @@ impl Shell {
             self.browser_render_stale.push(previous);
             dirty = true;
         }
-        let revision = browser.revision();
-        if self.browser_pane.is_none() || revision != self.browser_rev {
-            let view = browser.read(|browser| browser.pane_view());
-            self.browser_pane = Some(view);
-            self.browser_rev = revision;
-            dirty = true;
-        }
         if let Some((seq, frame)) = browser.frames().take_newer(self.browser_frame_seq) {
             self.browser_frame_seq = seq;
             let size = (frame.width, frame.height);
@@ -4106,8 +4119,31 @@ impl Shell {
     /// The live page inside the pane: the frame, its pointer, its wheel and its
     /// keys, or the named reason the text view is what is on screen.
     fn browser_live_body(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(render) = self.browser_render.clone() else {
-            return self.browser_engine_notice();
+        let view = self.browser_pane.clone().unwrap_or_default();
+        // A capture is only the reader's page when the browser holds a
+        // document for it. The engine's pre-warm paints `about:blank`, so a
+        // frame with no document behind it is NOT a page: drawing it leaves a
+        // plain white rectangle with no globe, no prompt and no way to start -
+        // the blank pane this rule exists to prevent. `browser_go` releases
+        // the frame it replaces for the same reason, so a stale capture cannot
+        // stand in for the page being loaded either.
+        let Some(render) = self
+            .browser_render
+            .clone()
+            .filter(|_| frame_is_the_page(view.status))
+        else {
+            // Never a blank rectangle: the text view states what the pane is
+            // doing (nothing yet, loading this URL, or why a load failed) and
+            // the engine's own sentence sits above it when it could not start.
+            return div()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .flex()
+                .flex_col()
+                .child(self.browser_engine_notice())
+                .child(self.browser_body(view, cx))
+                .into_any_element();
         };
         let bounds = self.browser_bounds.clone();
         let tracked = bounds.clone();
@@ -4125,7 +4161,14 @@ impl Shell {
         // draws one texture pixel per screen pixel, which is the difference
         // between a sharp page and a blurry one.
         let scale = self.browser_scale.clone();
-        let column = div().flex_1().min_h_0().w_full().flex().flex_col();
+        let mut column = div().flex_1().min_h_0().w_full().flex().flex_col();
+        // A failed navigation keeps the page the reader was already reading
+        // and says why above it, which is the rule the text view follows.
+        // Without this the live pane swallowed every failure: the frame stayed
+        // and the sentence the pane owed the reader was never drawn.
+        if let Some(failure) = view.failure.clone() {
+            column = column.child(self.browser_failure(failure));
+        }
         column
             .child(
                 div()
@@ -4144,31 +4187,101 @@ impl Shell {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            eprintln!(
+                                "BSHPROBE down {:?} count={} pos={:?} bounds={:?} vp={:?} engine={} focused={}",
+                                event.button,
+                                event.click_count,
+                                event.position,
+                                this.browser_bounds.get(),
+                                this.state.browser.engine().map(|e| e.viewport()),
+                                this.state.browser.engine().is_some(),
+                                this.browser_focus.is_focused(window),
+                            );
                             // A press enters the page: keys go there from now on.
                             window.focus(&this.browser_focus, cx);
-                            this.browser_pointer_down(event.position);
+                            this.browser_pointer_down(
+                                event.position,
+                                event.button,
+                                event.click_count,
+                            );
+                            cx.notify();
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            // A right press enters the page too: the focus
+                            // follows the gesture whichever button made it.
+                            window.focus(&this.browser_focus, cx);
+                            this.browser_pointer_down(
+                                event.position,
+                                event.button,
+                                event.click_count,
+                            );
+                            cx.notify();
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Middle,
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            window.focus(&this.browser_focus, cx);
+                            this.browser_pointer_down(
+                                event.position,
+                                event.button,
+                                event.click_count,
+                            );
                             cx.notify();
                         }),
                     )
                     .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                        if this.browser_pressed.is_some() {
+                            eprintln!(
+                                "BSHPROBE frame move pressed_button={:?} pressed={:?} pos={:?}",
+                                event.pressed_button, this.browser_pressed, event.position
+                            );
+                        }
                         // Hover updates :hover; a held button turns the same
                         // event into a drag. Both reach the page now, so a
                         // reader can hover a link and select text.
-                        this.browser_pointer_move(event.position, event.pressed_button.is_some());
+                        this.browser_pointer_move(event.position, event.pressed_button);
                         cx.notify();
                     }))
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(|this, event: &MouseUpEvent, _, cx| {
-                            this.browser_pointer_up(event.position);
+                            eprintln!(
+                                "BSHPROBE frame up {:?} pos={:?} pressed={:?}",
+                                event.button, event.position, this.browser_pressed
+                            );
+                            this.browser_pointer_up(event.position, event.button);
                             cx.notify();
                         }),
                     )
-                    .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
+                    .on_mouse_up(
+                        MouseButton::Right,
+                        cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                            this.browser_pointer_up(event.position, event.button);
+                            cx.notify();
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Middle,
+                        cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                            this.browser_pointer_up(event.position, event.button);
+                            cx.notify();
+                        }),
+                    )
+                    .on_scroll(cx.listener(|this, event: &ScrollEvent, window, cx| {
                         this.browser_scroll(event, window.line_height());
                         cx.notify();
                     }))
-                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                        eprintln!(
+                            "BSHPROBE key {:?} focused={} engine={}",
+                            event.keystroke,
+                            this.browser_focus.is_focused(window),
+                            this.state.browser.engine().is_some(),
+                        );
                         this.browser_key(event, cx);
                         cx.notify();
                     }))
@@ -4243,29 +4356,44 @@ impl Shell {
         page_point(bounds, engine.viewport(), position, true)
     }
 
-    /// A press inside the page: focus the pane, then HOLD the button down.
+    /// A press inside the page: focus the pane, then HOLD that button down.
     ///
-    /// The press also counts the click: a second press within the platform
-    /// interval at nearly the same point becomes `clickCount: 2`, a third 3,
-    /// so the page's `dblclick` and the word/line selection have a count to
-    /// work from.
-    fn browser_pointer_down(&mut self, position: Point<Pixels>) {
-        let Some((x, y)) = self.browser_page_point(position) else {
+    /// The count is the platform's and the release reuses it, so the page's
+    /// `click`/`dblclick` (and their `detail`) see one number. The button is
+    /// forwarded as it arrived: a right press is the page's `contextmenu`, a
+    /// middle press its `auxclick`.
+    fn browser_pointer_down(
+        &mut self,
+        position: Point<Pixels>,
+        button: MouseButton,
+        click_count: usize,
+    ) {
+        let Some(pointer) = pointer_button(button) else {
+            eprintln!("BSHPROBE down unsupported button {button:?}");
             return;
         };
-        let click = BrowserClick::next(
-            self.browser_click.as_ref(),
-            std::time::Instant::now(),
-            (x, y),
-        );
+        // One gesture at a time. A second button pressed while one is held is
+        // not an event the page can express, and treating it as a new press
+        // would break the drag or selection the reader is still making.
+        if self.browser_pressed.is_some() {
+            eprintln!(
+                "BSHPROBE down ignored: already pressed {:?}",
+                self.browser_pressed
+            );
+            return;
+        }
+        let Some((x, y)) = self.browser_page_point(position) else {
+            eprintln!("BSHPROBE down ignored: page point none");
+            return;
+        };
+        let click = BrowserClick::press(self.browser_click.as_ref(), button, click_count);
         let count = click.count();
         self.browser_click = Some(click);
         if let Some(engine) = self.state.browser.engine() {
             // Only a press the page actually received is a held gesture; a pane
             // with no engine has nothing to release later.
-            self.browser_pressed = true;
-            self.browser_drag_start = Some((x, y));
-            let _ = engine.pointer_down(x, y, count, true);
+            self.browser_pressed = Some(button);
+            let _ = engine.pointer_down(x, y, count, pointer, true);
         }
     }
 
@@ -4275,10 +4403,16 @@ impl Shell {
     /// is fire-and-forget (no reply is waited on), but each one is still a
     /// queued CDP command, and a page only needs enough of them to update
     /// :hover; a drag is never throttled, because every point is part of the
-    /// selection. A move beyond the click slop also ends the multi-click
-    /// window, so a press after it starts again at one.
-    fn browser_pointer_move(&mut self, position: Point<Pixels>, pressed: bool) {
-        let dragging = pressed && self.browser_pressed;
+    /// selection.
+    ///
+    /// The held button rides the move, which is the whole selection mechanism:
+    /// the page runs its own default (the dragged range, the word under a
+    /// double click, a textarea's own selection) as soon as it sees a move with
+    /// that button down. The pane used to synthesize the selection from carets
+    /// instead, which failed wherever an endpoint was not text - a margin, a
+    /// gap between blocks, a field - and could not select a field's text at all.
+    fn browser_pointer_move(&mut self, position: Point<Pixels>, pressed: Option<MouseButton>) {
+        let dragging = pressed.is_some() && pressed == self.browser_pressed;
         let now = std::time::Instant::now();
         if !dragging {
             if let Some(last) = self.browser_last_move {
@@ -4291,18 +4425,8 @@ impl Shell {
         let Some((x, y)) = self.browser_page_point(position) else {
             return;
         };
-        if let Some(click) = self.browser_click {
-            if !click.near((x, y)) {
-                self.browser_click = None;
-            }
-        }
         if let Some(engine) = self.state.browser.engine() {
-            let _ = engine.pointer_move(x, y, dragging);
-            if dragging {
-                if let Some(start) = self.browser_drag_start {
-                    let _ = engine.select_text_between(start, (x, y), true);
-                }
-            }
+            let _ = engine.pointer_move(x, y, self.browser_pressed.and_then(pointer_button));
         }
     }
 
@@ -4313,39 +4437,41 @@ impl Shell {
     /// clamped edge point while the press is held. A move that is still inside
     /// the frame is left to the frame, so a drag point is never sent twice.
     pub(crate) fn browser_drag_outside(&mut self, position: Point<Pixels>) {
-        if !self.browser_pressed || self.browser_page_point(position).is_some() {
+        if self.browser_pressed.is_none() || self.browser_page_point(position).is_some() {
             return;
         }
         let Some((x, y)) = self.browser_page_point_clamped(position) else {
             return;
         };
         if let Some(engine) = self.state.browser.engine() {
-            let _ = engine.pointer_move(x, y, true);
-            if let Some(start) = self.browser_drag_start {
-                let _ = engine.select_text_between(start, (x, y), true);
-            }
+            let _ = engine.pointer_move(x, y, self.browser_pressed.and_then(pointer_button));
         }
     }
 
-    /// The release that completes a press.
-    fn browser_pointer_up(&mut self, position: Point<Pixels>) {
-        if !self.browser_pressed {
+    /// The release that completes a press of `button`.
+    ///
+    /// A release of any OTHER button is not this gesture's end: releasing the
+    /// right button while the left is held leaves the left press down.
+    fn browser_pointer_up(&mut self, position: Point<Pixels>, button: MouseButton) {
+        if self.browser_pressed != Some(button) {
+            eprintln!(
+                "BSHPROBE up ignored: pressed={:?} button={:?}",
+                self.browser_pressed, button
+            );
             return;
         }
-        self.browser_pressed = false;
+        let Some(pointer) = pointer_button(button) else {
+            return;
+        };
+        self.browser_pressed = None;
+        // The stored count is the one the press carried, so both halves of the
+        // gesture name the same click to the page.
         let count = self.browser_click.map_or(1, |click| click.count());
         let Some((x, y)) = self.browser_page_point_clamped(position) else {
             return;
         };
         if let Some(engine) = self.state.browser.engine() {
-            let _ = engine.pointer_up(x, y, count, true);
-            if let Some(start) = self.browser_drag_start.take() {
-                if (x - start.0).abs() > 3.0 || (y - start.1).abs() > 3.0 {
-                    let _ = engine.select_text_between(start, (x, y), true);
-                }
-            }
-        } else {
-            self.browser_drag_start = None;
+            let _ = engine.pointer_up(x, y, count, pointer, true);
         }
     }
 
@@ -4353,28 +4479,25 @@ impl Shell {
     ///
     /// This is the captured-pointer half of the gesture: the page gets a last
     /// drag move and a real `mouseReleased` at the frame's clamped edge, so its
-    /// drag state clears instead of staying pressed forever. Called from the
-    /// window's own mouse-up listeners; a release inside the frame was already
-    /// handled by `browser_pointer_up`, which clears the pressed flag first.
-    pub(crate) fn browser_release_outside(&mut self, position: Point<Pixels>) {
-        if !self.browser_pressed {
+    /// selection and its drag state settle instead of staying pressed forever.
+    /// Called from the window's own mouse-up listeners; a release inside the
+    /// frame was already handled by `browser_pointer_up`, which clears the
+    /// pressed flag first.
+    pub(crate) fn browser_release_outside(&mut self, position: Point<Pixels>, button: MouseButton) {
+        if self.browser_pressed != Some(button) {
             return;
         }
-        self.browser_pressed = false;
+        let Some(pointer) = pointer_button(button) else {
+            return;
+        };
+        self.browser_pressed = None;
         let count = self.browser_click.map_or(1, |click| click.count());
         let Some((x, y)) = self.browser_page_point_clamped(position) else {
             return;
         };
         if let Some(engine) = self.state.browser.engine() {
-            let _ = engine.pointer_move(x, y, true);
-            let _ = engine.pointer_up(x, y, count, true);
-            if let Some(start) = self.browser_drag_start.take() {
-                if (x - start.0).abs() > 3.0 || (y - start.1).abs() > 3.0 {
-                    let _ = engine.select_text_between(start, (x, y), true);
-                }
-            }
-        } else {
-            self.browser_drag_start = None;
+            let _ = engine.pointer_move(x, y, Some(pointer));
+            let _ = engine.pointer_up(x, y, count, pointer, true);
         }
     }
 
@@ -4384,7 +4507,7 @@ impl Shell {
     /// a page's own wheel handler, its smooth scrolling and its nested scrollers
     /// all behave as they do in a browser. [`page_wheel`] owns the sign
     /// conversion and the clamp.
-    fn browser_scroll(&mut self, event: &ScrollWheelEvent, line_height: Pixels) {
+    fn browser_scroll(&mut self, event: &ScrollEvent, line_height: Pixels) {
         let Some(bounds) = self.browser_bounds.get() else {
             return;
         };
@@ -6021,6 +6144,19 @@ impl Shell {
     }
 }
 
+/// Whether a captured frame is the page the pane should draw.
+///
+/// A frame is the reader's page only when the browser holds a document for
+/// it. The engine's pre-warm paints `about:blank` before any navigation, and
+/// an `Empty` pane must not draw that capture: the empty state (globe plus
+/// prompt) is the pane's answer to "nothing loaded yet", and a white capture
+/// drawn over it is the same rectangle as a broken pane. Every other status
+/// has a document behind the frame, including a failed one, where the frame is
+/// the page the reader already had and the failure line sits above it.
+pub(crate) fn frame_is_the_page(status: crate::browser::Status) -> bool {
+    !matches!(status, crate::browser::Status::Empty)
+}
+
 /// Build the image the pane draws from one captured frame.
 ///
 /// The buffer was decoded AND channel-swapped on the engine's pump thread, so
@@ -6069,13 +6205,13 @@ fn terminal_confinement(
 #[cfg(test)]
 mod tests {
     use gpui_kit::{
-        point, px, size, Bounds, FontStyle, FontWeight, Keystroke, Modifiers, Pixels, ScrollDelta,
+        point, px, size, Bounds, FontStyle, FontWeight, Keystroke, Modifiers, MouseButton, Pixels,
+        ScrollDelta,
     };
 
     use super::{
         anchor_line, chord_modifiers, grid_fonts, named_key, page_point, page_wheel,
-        terminal_key_bytes, typed_text, BrowserClick, BROWSER_CLICK_MS, BROWSER_CLICK_SLOP,
-        BROWSER_WHEEL_GAIN,
+        terminal_key_bytes, typed_text, BrowserClick, BROWSER_WHEEL_GAIN,
     };
 
     fn key(key: &str, key_char: Option<&str>) -> Keystroke {
@@ -6124,6 +6260,25 @@ mod tests {
         assert_eq!(anchor_line("one\ntwo\n", &(3..3), &(0..10)), None);
     }
 
+    /// The pre-warm paints `about:blank` before any navigation, so a capture
+    /// exists while no document does. Drawing that capture is the blank pane:
+    /// the same white rectangle whether the pane is waiting for a URL or
+    /// broken, with no globe and no prompt. The frame is the reader's page only
+    /// once a navigation has produced a document for it.
+    #[test]
+    fn an_empty_pane_never_draws_a_capture() {
+        use crate::browser::Status;
+        assert!(
+            !super::frame_is_the_page(Status::Empty),
+            "the pre-warm's about:blank capture is not a page"
+        );
+        // A failed navigation is the exception that proves it: the frame there
+        // is the page the reader already had, and the failure line sits above.
+        for status in [Status::Loading, Status::Ready, Status::Failed] {
+            assert!(super::frame_is_the_page(status), "{status:?}");
+        }
+    }
+
     #[test]
     fn arrows_send_their_csi_sequences() {
         assert_eq!(
@@ -6169,65 +6324,38 @@ mod tests {
         assert_eq!(terminal_key_bytes(&chord), None);
     }
 
-    /// The click count is timing plus slop, because the CDP press has to carry
-    /// it: a second press in the interval and near the first is a double, a
-    /// third a triple, and anything else starts over.
+    /// The platform's count is used as-is, bounded at three, and a different
+    /// button starts a new sequence: the page's `detail` must never borrow a
+    /// left click's count for a right press.
     #[test]
-    fn a_press_counts_double_and_triple_clicks_by_time_and_slop() {
-        let start = std::time::Instant::now();
-        let first = BrowserClick::next(None, start, (10.0, 10.0));
+    fn a_press_uses_the_platform_count_and_restarts_for_another_button() {
+        let first = BrowserClick::press(None, MouseButton::Left, 1);
         assert_eq!(first.count(), 1);
-        let second = BrowserClick::next(
-            Some(&first),
-            start + std::time::Duration::from_millis(120),
-            (12.0, 11.0),
-        );
-        assert_eq!(second.count(), 2);
-        let third = BrowserClick::next(
-            Some(&second),
-            start + std::time::Duration::from_millis(240),
-            (9.0, 12.0),
-        );
-        assert_eq!(third.count(), 3);
         assert_eq!(
-            BrowserClick::next(
-                Some(&third),
-                start + std::time::Duration::from_millis(300),
-                (10.0, 10.0)
-            )
-            .count(),
+            BrowserClick::press(Some(&first), MouseButton::Left, 2).count(),
+            2,
+            "a second left press is a double click"
+        );
+        assert_eq!(
+            BrowserClick::press(Some(&first), MouseButton::Left, 3).count(),
             3,
-            "a fourth rapid press stays on triple-click selection"
+            "a third left press is a triple click"
         );
         assert_eq!(
-            BrowserClick::next(
-                Some(&third),
-                start + std::time::Duration::from_millis(240 + BROWSER_CLICK_MS + 1),
-                (10.0, 10.0)
-            )
-            .count(),
-            1,
-            "the interval resets the count"
+            BrowserClick::press(Some(&first), MouseButton::Left, 7).count(),
+            3,
+            "the page's own events only name one, two and three"
         );
         assert_eq!(
-            BrowserClick::next(
-                Some(&second),
-                start + std::time::Duration::from_millis(200),
-                (12.0 + BROWSER_CLICK_SLOP + 1.0, 11.0)
-            )
-            .count(),
+            BrowserClick::press(Some(&first), MouseButton::Left, 0).count(),
             1,
-            "a press beyond the slop is a new click"
+            "a platform count of zero is still one press"
         );
-    }
-
-    /// A move beyond the slop ends the multi-click window, which is what makes
-    /// two separate clicks never read as one double click.
-    #[test]
-    fn a_move_beyond_the_slop_ends_the_click_window() {
-        let click = BrowserClick::next(None, std::time::Instant::now(), (10.0, 10.0));
-        assert!(click.near((13.0, 13.0)));
-        assert!(!click.near((10.0 + BROWSER_CLICK_SLOP + 0.5, 10.0)));
+        assert_eq!(
+            BrowserClick::press(Some(&first), MouseButton::Right, 2).count(),
+            1,
+            "a right press does not continue the left press's sequence"
+        );
     }
 
     /// The captured release maps an outside point to the page's edge; an

@@ -711,6 +711,9 @@ impl Session {
         crate::settings::resolve::SessionChoice {
             model: named,
             preset: self.agent_preset.clone().filter(|id| !id.trim().is_empty()),
+            // The owning workspace, so a turn opened from another workspace
+            // still runs in the project this chat was created in.
+            workspace: Some(self.workspace.clone()).filter(|id| !id.trim().is_empty()),
         }
     }
 

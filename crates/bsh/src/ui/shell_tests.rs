@@ -7,9 +7,18 @@
 //! test attribute macro, which shadows the builtin one its own expansion emits.
 
 use gpui_kit::{
-    img, px, relative, AppContext as _, Context, Entity, ImageSource, IntoElement, Modifiers,
-    Render, Styled, TestAppContext, VisualTestContext, Window,
+    img, px, relative, AppContext as _, ClipboardEntry, ClipboardItem, ClipboardString, Context,
+    Entity, ExternalPaths, FileDropEvent, ImageFormat, ImageSource, IntoElement, Modifiers, Render,
+    Styled, TestAppContext, VisualTestContext, Window,
 };
+
+/// A 1x1 red PNG: the smallest payload the clipboard and the image decoder
+/// both accept, so a paste test needs no fixture on disk.
+const ATTACHMENT_PNG: &[u8] = &[
+    137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0,
+    0, 0, 144, 119, 83, 222, 0, 0, 0, 12, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 0, 0, 3, 1,
+    1, 0, 201, 254, 146, 239, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+];
 
 use agent::Tool as _;
 
@@ -239,11 +248,12 @@ fn wheel_settings_pane(cx: &mut VisualTestContext, dy: f32) {
     let pane = cx.debug_bounds("settings-pane").expect("the options box");
     cx.update(|window, cx| {
         window.dispatch_event(
-            gpui_kit::PlatformInput::ScrollWheel(gpui_kit::ScrollWheelEvent {
+            gpui_kit::PlatformInput::Scroll(gpui_kit::ScrollEvent {
                 position: pane.center(),
                 delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.0), px(dy))),
                 modifiers: Modifiers::default(),
                 touch_phase: gpui_kit::TouchPhase::Moved,
+                source: gpui_kit::ScrollSource::Pointer,
             }),
             cx,
         );
@@ -281,6 +291,34 @@ fn state_with_turns(label: &str, turns: usize) -> AppState {
             session.messages.push(ChatMessage::assistant());
         }
     }
+    state
+}
+
+/// The same store, with a model chosen for the session.
+///
+/// An attachment is refused when the session resolves no model at all, so a
+/// paste or a drop test needs the choice a real reader would have made. The
+/// leaf declares no input types, which the tree reads as permissive - the
+/// reference's own reading of an undeclared model.
+fn state_with_image_model(label: &str) -> AppState {
+    let mut state = state_with_turns(label, 1);
+    let mut provider = crate::settings::global::Provider {
+        base_url: String::from("http://127.0.0.1:1/v1"),
+        ..Default::default()
+    };
+    provider.models.insert(
+        "shot".to_string(),
+        crate::settings::global::ModelEntry {
+            model: String::from("shot-id"),
+            ..Default::default()
+        },
+    );
+    state
+        .settings
+        .global
+        .providers
+        .insert("p".to_string(), provider);
+    state.select_model("shot");
     state
 }
 
@@ -2557,11 +2595,12 @@ fn the_compaction_rows_scroll_with_the_transcript(cx: &mut TestAppContext) {
     // movement, without depending on the animation's exact settle frame.
     cx.update(|window, cx| {
         window.dispatch_event(
-            gpui_kit::PlatformInput::ScrollWheel(gpui_kit::ScrollWheelEvent {
+            gpui_kit::PlatformInput::Scroll(gpui_kit::ScrollEvent {
                 position: body.center(),
                 delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.0), px(60.0))),
                 modifiers: Modifiers::default(),
                 touch_phase: gpui_kit::TouchPhase::Moved,
+                source: gpui_kit::ScrollSource::Pointer,
             }),
             cx,
         );
@@ -9439,11 +9478,12 @@ fn the_plugin_tabs_stay_pinned_while_the_market_scrolls(cx: &mut TestAppContext)
     let card = cx.debug_bounds("market-card-0").expect("the first card");
     cx.update(|window, cx| {
         window.dispatch_event(
-            gpui_kit::PlatformInput::ScrollWheel(gpui_kit::ScrollWheelEvent {
+            gpui_kit::PlatformInput::Scroll(gpui_kit::ScrollEvent {
                 position: pane.center(),
                 delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.0), px(-240.0))),
                 modifiers: Modifiers::default(),
                 touch_phase: gpui_kit::TouchPhase::Moved,
+                source: gpui_kit::ScrollSource::Pointer,
             }),
             cx,
         );
@@ -10360,10 +10400,10 @@ fn the_input_type_chips_write_the_draft(cx: &mut TestAppContext) {
     );
 }
 
-/// Round 87 left the attachment chip unclicked; this closes it. Two chips are
-/// seeded so the click has to drop the one that was clicked, not the last one.
+/// The rail's remove control is the one press that drops an attachment; two
+/// are seeded so the click has to remove the one it sits on, not the last one.
 #[gpui::test]
-fn clicking_an_attachment_chip_removes_it(cx: &mut TestAppContext) {
+fn the_remove_control_drops_an_attachment(cx: &mut TestAppContext) {
     init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_turns("attach-chip", 1);
@@ -10372,24 +10412,28 @@ fn clicking_an_attachment_chip_removes_it(cx: &mut TestAppContext) {
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    let chip = |name: &str| crate::state::Attachment {
-        name: name.to_string(),
-        mime: "image/png".to_string(),
-        base64: "Zg==".to_string(),
-    };
+    let tile =
+        |name: &str| crate::state::Attachment::from_bytes(name.to_string(), "image/png", b"f");
     cx.update(|_, cx| {
         shell.update(cx, |this, cx| {
-            this.state.attachments.push(chip("shot.png"));
-            this.state.attachments.push(chip("second.png"));
+            this.state.attachments.push(tile("shot.png"));
+            this.state.attachments.push(tile("second.png"));
             cx.notify();
         })
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
 
-    let bounds = cx
+    // The reference reveals the control on hover, so it is pressed at its own
+    // 18px box inside the first tile.
+    let tile = cx
         .debug_bounds("attachment-0")
-        .expect("the first attachment chip");
-    cx.simulate_click(bounds.center(), Modifiers::default());
+        .expect("the first attachment tile");
+    let remove = cx
+        .debug_bounds("attachment-remove-0")
+        .expect("the first tile's remove control");
+    assert_eq!(remove.size, gpui_kit::size(px(18.0), px(18.0)));
+    assert_eq!(tile.size, gpui_kit::size(px(64.0), px(64.0)));
+    cx.simulate_click(remove.center(), Modifiers::default());
 
     let names = cx.update(|_, cx| {
         shell
@@ -10406,6 +10450,379 @@ fn clicking_an_attachment_chip_removes_it(cx: &mut TestAppContext) {
         "only the clicked chip goes"
     );
 }
+
+/// The composer takes an image from the CLIPBOARD: Cmd-V on a pasted
+/// screenshot attaches it instead of inserting text, and the rail draws the
+/// reference's 64px tile for it.
+#[gpui::test]
+fn pasting_an_image_attaches_it(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_image_model("attach-paste");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    focus_composer(&shell, cx);
+    cx.update(|_, cx| {
+        cx.write_to_clipboard(ClipboardItem::new_image(&gpui_kit::Image::from_bytes(
+            ImageFormat::Png,
+            ATTACHMENT_PNG.to_vec(),
+        )));
+    });
+    cx.simulate_keystrokes("cmd-v");
+    draw_until(cx, "the pasted image is attached", DRAW_UNTIL_MAX, |cx| {
+        !cx.update(|_, cx| shell.read(cx).state.attachments.is_empty())
+    });
+    let (name, mime, preview) = cx.update(|_, cx| {
+        let attachment = &shell.read(cx).state.attachments[0];
+        (
+            attachment.name.clone(),
+            attachment.mime.clone(),
+            attachment.preview.is_some(),
+        )
+    });
+    assert_eq!(name, "image.png", "a paste carries no file name of its own");
+    assert_eq!(mime, "image/png");
+    assert!(preview, "the rail has a picture to draw");
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).composer_value.clone()),
+        "",
+        "the image must not land in the draft as text"
+    );
+    let tile = cx.debug_bounds("attachment-0").expect("the tile");
+    assert_eq!(
+        tile.size,
+        gpui_kit::size(px(64.0), px(64.0)),
+        "the reference tile is 64px square"
+    );
+}
+
+/// A text paste still reaches the field: the image handler consumes only what
+/// it can attach, so copying a word still types a word.
+#[gpui::test]
+fn pasting_text_still_reaches_the_draft(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("paste-text", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    focus_composer(&shell, cx);
+    cx.update(|_, cx| {
+        cx.write_to_clipboard(ClipboardItem::new_string("pasted words".to_string()));
+    });
+    cx.simulate_keystrokes("cmd-v");
+    draw_until(
+        cx,
+        "the clipboard text is in the draft",
+        DRAW_UNTIL_MAX,
+        |cx| cx.update(|_, cx| shell.read(cx).composer_value == "pasted words"),
+    );
+    assert!(
+        cx.update(|_, cx| shell.read(cx).state.attachments.is_empty()),
+        "text is not an attachment"
+    );
+}
+
+/// A clipboard that carries an image AND text keeps both: the reference takes
+/// the files and then pastes the text, so consuming the paste would eat the
+/// caption that came with the picture.
+#[gpui::test]
+fn pasting_an_image_with_text_keeps_both(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_image_model("paste-caption");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    focus_composer(&shell, cx);
+    cx.update(|_, cx| {
+        cx.write_to_clipboard(ClipboardItem {
+            entries: vec![
+                ClipboardEntry::String(ClipboardString::new("a caption".to_string())),
+                ClipboardEntry::Image(gpui_kit::Image::from_bytes(
+                    ImageFormat::Png,
+                    ATTACHMENT_PNG.to_vec(),
+                )),
+            ],
+        });
+    });
+    cx.simulate_keystrokes("cmd-v");
+    draw_until(
+        cx,
+        "the image is attached and its caption lands in the draft",
+        DRAW_UNTIL_MAX,
+        |cx| {
+            let (attached, draft) = cx.update(|_, cx| {
+                let shell = shell.read(cx);
+                (shell.state.attachments.len(), shell.composer_value.clone())
+            });
+            attached == 1 && draft == "a caption"
+        },
+    );
+}
+
+/// An image with no words is a send: the reference's "empty" counts the draft
+/// AND the attachments, so Enter must reach the turn rather than silently doing
+/// nothing.
+#[gpui::test]
+fn an_image_alone_can_be_sent(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    // The runner wakes GPUI from its Tokio worker. Parking mode is the kit's
+    // seam for a test that performs real I/O and then stops the turn.
+    cx.dispatcher.allow_parking();
+    // A bound-but-silent endpoint keeps the send gate green while never
+    // answering the turn, so the test can stop it deterministically.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let port = listener
+        .local_addr()
+        .expect("the bound loopback address")
+        .port();
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_image_model("image-only-send");
+        if let Some(provider) = state.settings.global.providers.get_mut("p") {
+            provider.base_url = format!("http://127.0.0.1:{port}/v1");
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    // The measured rule itself: whitespace with no attachment is not a send.
+    assert!(!crate::ui::composer::can_send("   ", 0));
+    assert!(crate::ui::composer::can_send("hi", 0));
+    assert!(
+        crate::ui::composer::can_send("", 1),
+        "an image alone is a send"
+    );
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.state
+                .attachments
+                .push(crate::state::Attachment::from_bytes(
+                    "shot.png".to_string(),
+                    "image/png",
+                    ATTACHMENT_PNG,
+                ));
+            cx.notify();
+        })
+    });
+    focus_composer(&shell, cx);
+    cx.simulate_keystrokes("enter");
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    // The turn OPENED: the user row keeps the image bytes and no filename
+    // marker. The empty-draft guard would have returned before begin_turn.
+    let (last, user_index, id) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        let session = shell.state.active_session().expect("the session");
+        let user_index = session
+            .messages
+            .iter()
+            .rposition(|row| row.role == Role::User)
+            .expect("the submitted user row");
+        let last = session
+            .messages
+            .get(user_index)
+            .map(|row| (row.text.clone(), row.images.clone()));
+        (last, user_index, session.id.clone())
+    });
+    assert_eq!(
+        last,
+        Some((
+            String::new(),
+            vec![format!(
+                "data:image/png;base64,{}",
+                crate::state::base64_encode(ATTACHMENT_PNG)
+            )],
+        )),
+        "an image-only draft opens the turn and keeps the original bytes"
+    );
+    // The transcript must DRAW that stored payload, above where the text bubble
+    // would be, and an image-only row must not draw a bubble or a file-name
+    // marker at all.
+    let image_selector: &'static str =
+        Box::leak(format!("user-image-{user_index}-0").into_boxed_str());
+    draw_until(cx, "the submitted image is painted", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds(image_selector).is_some()
+    });
+    let image = cx.debug_bounds(image_selector).expect("the image frame");
+    assert_eq!(
+        image.size,
+        gpui_kit::size(px(44.0), px(44.0)),
+        "the 1x1 fixture is clamped to the reference frame floor, not upscaled past it"
+    );
+    let bubble_selector: &'static str =
+        Box::leak(format!("user-bubble-{user_index}").into_boxed_str());
+    assert!(
+        cx.debug_bounds(bubble_selector).is_none(),
+        "an image-only turn has no text bubble"
+    );
+    // The frame opens the stored original, and both its close control and
+    // Escape dismiss the lightbox.
+    cx.simulate_click(image.center(), Modifiers::default());
+    draw_until(cx, "the image lightbox opens", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("image-lightbox").is_some()
+    });
+    let close = cx
+        .debug_bounds("image-lightbox-close")
+        .expect("the lightbox close control");
+    cx.simulate_click(close.center(), Modifiers::default());
+    draw_until(
+        cx,
+        "the close control dismisses the lightbox",
+        DRAW_UNTIL_MAX,
+        |cx| cx.debug_bounds("image-lightbox").is_none(),
+    );
+    cx.simulate_click(image.center(), Modifiers::default());
+    draw_until(cx, "the image lightbox reopens", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("image-lightbox").is_some()
+    });
+    // The overlay owns the keyboard: a printable key must not reach the
+    // composer behind it.
+    cx.simulate_keystrokes("x");
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).composer_value.clone()),
+        "",
+        "a character typed under the lightbox must not edit the composer"
+    );
+    cx.simulate_keystrokes("escape");
+    draw_until(cx, "Escape dismisses the lightbox", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("image-lightbox").is_none()
+    });
+    // Stop the silent loopback request before the test ends so no runtime task
+    // outlives the assertion.
+    cx.update(|_, cx| shell.update(cx, |shell, _| shell.state.stop(&id)));
+}
+
+/// A queued image is not a filename-only placeholder: when it drains into its
+/// own turn, the durable user row keeps the original data URL and the exact
+/// caption, so a later replay still sends the picture.
+#[gpui::test]
+fn a_queued_image_drains_with_its_original_bytes(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    cx.dispatcher.allow_parking();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let port = listener
+        .local_addr()
+        .expect("the bound loopback address")
+        .port();
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_image_model("image-queue");
+        if let Some(provider) = state.settings.global.providers.get_mut("p") {
+            provider.base_url = format!("http://127.0.0.1:{port}/v1");
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let id = cx.update(|_, cx| {
+        shell.update(cx, |shell, _| {
+            let id = shell.state.active_id.clone().expect("an active session");
+            shell.state.enqueue(
+                &id,
+                "look".to_string(),
+                vec![crate::state::Attachment::from_bytes(
+                    "shot.png".to_string(),
+                    "image/png",
+                    ATTACHMENT_PNG,
+                )],
+            );
+            id
+        })
+    });
+    cx.update(|_, cx| {
+        shell.update(cx, |shell, cx| shell.drain_inbox(&id, cx));
+    });
+    let (text, images) = cx.update(|_, cx| {
+        let session = shell
+            .read(cx)
+            .state
+            .store
+            .session(&id)
+            .expect("the session");
+        let row = session
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == Role::User)
+            .expect("the drained user row");
+        (row.text.clone(), row.images.clone())
+    });
+    assert_eq!(text, "look");
+    assert_eq!(
+        images,
+        vec![format!(
+            "data:image/png;base64,{}",
+            crate::state::base64_encode(ATTACHMENT_PNG)
+        )]
+    );
+    cx.update(|_, cx| shell.update(cx, |shell, _| shell.state.stop(&id)));
+}
+
+/// Dropping files on the window takes them the way the picker does: an image
+/// attaches, and a non-image is mentioned as a path in the draft.
+#[gpui::test]
+fn dropping_files_attaches_images_and_mentions_the_rest(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_image_model("attach-drop");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let dir = std::env::temp_dir();
+    let image = dir.join(format!("bsh-drop-{}.png", std::process::id()));
+    let note = dir.join(format!("bsh-drop-{}.txt", std::process::id()));
+    std::fs::write(&image, ATTACHMENT_PNG).expect("write the dropped image");
+    std::fs::write(&note, b"x").expect("write the dropped note");
+
+    let card = cx.debug_bounds("composer-card").expect("the composer card");
+    let paths = ExternalPaths(vec![image.clone(), note.clone()].into());
+    cx.simulate_event(FileDropEvent::Entered {
+        position: card.center(),
+        paths,
+    });
+    cx.simulate_event(FileDropEvent::Submit {
+        position: card.center(),
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let names = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .attachments
+            .iter()
+            .map(|attachment| attachment.name.clone())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        names,
+        vec![image
+            .file_name()
+            .expect("a name")
+            .to_string_lossy()
+            .to_string()],
+        "the dropped image is attached"
+    );
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).composer_value.clone()),
+        format!(" @{}", note.display()),
+        "the dropped note becomes a reference, not an attachment"
+    );
+    std::fs::remove_file(&image).ok();
+    std::fs::remove_file(&note).ok();
+}
+
 /// The seam the tick uses: a task opens a turn in its OWN session, and one whose
 /// session is gone cannot open one at all.
 #[gpui::test]
@@ -17660,11 +18077,12 @@ fn the_chat_scrolls_smoothly_with_the_wheel(cx: &mut TestAppContext) {
     // One notch towards the top, which is positive in GPUI's offsets.
     cx.update(|window, cx| {
         window.dispatch_event(
-            gpui_kit::PlatformInput::ScrollWheel(gpui_kit::ScrollWheelEvent {
+            gpui_kit::PlatformInput::Scroll(gpui_kit::ScrollEvent {
                 position: body.center(),
                 delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.0), px(160.0))),
                 modifiers: Modifiers::default(),
                 touch_phase: gpui_kit::TouchPhase::Moved,
+                source: gpui_kit::ScrollSource::Pointer,
             }),
             cx,
         );
@@ -17741,11 +18159,12 @@ fn the_trajectory_scrolls_with_the_wheel(cx: &mut TestAppContext) {
     let body = cx.debug_bounds("trajectory").expect("the trajectory");
     cx.update(|window, cx| {
         window.dispatch_event(
-            gpui_kit::PlatformInput::ScrollWheel(gpui_kit::ScrollWheelEvent {
+            gpui_kit::PlatformInput::Scroll(gpui_kit::ScrollEvent {
                 position: body.center(),
                 delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.0), px(-100.0))),
                 modifiers: Modifiers::default(),
                 touch_phase: gpui_kit::TouchPhase::Moved,
+                source: gpui_kit::ScrollSource::Pointer,
             }),
             cx,
         );
@@ -17804,11 +18223,12 @@ fn the_workspace_tree_scrolls_with_the_wheel_and_the_keys(cx: &mut TestAppContex
     // does not have; the window dispatches the same event the platform would.
     cx.update(|window, cx| {
         window.dispatch_event(
-            gpui_kit::PlatformInput::ScrollWheel(gpui_kit::ScrollWheelEvent {
+            gpui_kit::PlatformInput::Scroll(gpui_kit::ScrollEvent {
                 position: tree.center(),
                 delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.0), px(-160.0))),
                 modifiers: Modifiers::default(),
                 touch_phase: gpui_kit::TouchPhase::Moved,
+                source: gpui_kit::ScrollSource::Pointer,
             }),
             cx,
         );
@@ -19584,11 +20004,12 @@ fn the_terminal_wheel_browses_the_scrollback(cx: &mut TestAppContext) {
         .debug_bounds("terminal-pane")
         .expect("the pane has bounds");
     cx.simulate_mouse_move(pane.center(), None, Modifiers::default());
-    cx.simulate_event(gpui_kit::ScrollWheelEvent {
+    cx.simulate_event(gpui_kit::ScrollEvent {
         position: pane.center(),
         delta: gpui_kit::ScrollDelta::Lines(gpui_kit::point(0.0, 5.0)),
         modifiers: Modifiers::default(),
         touch_phase: gpui_kit::TouchPhase::Moved,
+        source: gpui_kit::ScrollSource::Pointer,
     });
     let after = cx.update(|_, cx| shell.read(cx).terminal_snapshot.first_row);
     assert_eq!(
@@ -19598,11 +20019,12 @@ fn the_terminal_wheel_browses_the_scrollback(cx: &mut TestAppContext) {
     );
 
     // And back down returns to the bottom, where the cursor lives again.
-    cx.simulate_event(gpui_kit::ScrollWheelEvent {
+    cx.simulate_event(gpui_kit::ScrollEvent {
         position: pane.center(),
         delta: gpui_kit::ScrollDelta::Lines(gpui_kit::point(0.0, -5.0)),
         modifiers: Modifiers::default(),
         touch_phase: gpui_kit::TouchPhase::Moved,
+        source: gpui_kit::ScrollSource::Pointer,
     });
     let bottom = cx.update(|_, cx| shell.read(cx).terminal_snapshot.first_row);
     assert_eq!(bottom, before, "the wheel down came back to the bottom");
@@ -21005,11 +21427,12 @@ fn the_slash_palette_list_scrolls_with_the_wheel(cx: &mut TestAppContext) {
         card.size.height
     );
     cx.simulate_mouse_move(card.center(), None, Modifiers::default());
-    cx.simulate_event(gpui_kit::ScrollWheelEvent {
+    cx.simulate_event(gpui_kit::ScrollEvent {
         position: card.center(),
         delta: gpui_kit::ScrollDelta::Lines(gpui_kit::point(0.0, -6.0)),
         modifiers: Modifiers::default(),
         touch_phase: gpui_kit::TouchPhase::Moved,
+        source: gpui_kit::ScrollSource::Pointer,
     });
     draw_until(cx, "the list scrolled", DRAW_UNTIL_MAX, |cx| {
         cx.update(|_, cx| shell.read(cx).slash.scroll.offset().y < before)
@@ -21743,11 +22166,11 @@ fn goal_attachments_ride_only_an_objective(cx: &mut TestAppContext) {
     let attach = |cx: &mut VisualTestContext| {
         cx.update(|_, cx| {
             shell.update(cx, |this, _cx| {
-                this.state.attachments.push(Attachment {
-                    name: "shot.png".to_string(),
-                    mime: "image/png".to_string(),
-                    base64: "Zg==".to_string(),
-                });
+                this.state.attachments.push(Attachment::from_bytes(
+                    "shot.png".to_string(),
+                    "image/png",
+                    b"f",
+                ));
             })
         })
     };
@@ -27819,4 +28242,415 @@ fn probe_tool_timeline(cx: &mut TestAppContext) {
         cx.update(|window, cx| window.draw(cx).clear(cx));
     }
     dump(cx, "after Done");
+}
+
+/// The pane's live pointer path: a press reaches the page with its own button
+/// and its own click count.
+///
+/// Two defects met here. The pane registered LEFT down/up only, so a right
+/// click never reached the page at all, and it timed double clicks itself in
+/// PAGE coordinates, so a viewport resize between two presses reset the count
+/// and the page's `dblclick` never fired. This drives the real frame with the
+/// events a window delivers: a right press must become the page's
+/// `contextmenu`, and a press carrying `click_count: 2` its `dblclick`.
+#[gpui::test]
+fn a_double_click_and_a_right_click_reach_the_live_page(cx: &mut TestAppContext) {
+    use std::io::{Read as _, Write as _};
+    if crate::browser::engine::cdp::client::discover_binary().is_err() {
+        eprintln!("SKIP: no Chromium/Chrome installed for the live pane pointer test");
+        return;
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let addr = listener.local_addr().expect("the port");
+    let body = String::from(
+        "<!doctype html><html><body style=\"margin:0\">\
+         <div id=\"pad\" style=\"width:100vw;height:100vh;background:#eee\">pad</div>\
+         <script>window.__log=[];\
+         ['mousedown','mouseup','click','dblclick','contextmenu','auxclick'].forEach(function(k){\
+           document.addEventListener(k, function(e){\
+             window.__log.push(k+':'+e.detail+':'+e.button); }); });\
+         </script></body></html>",
+    );
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buffer = [0u8; 4096];
+            let _ = stream.read(&mut buffer);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    init_test_app(cx);
+    // The engine's pump thread publishes frames and wakes the pane's clock
+    // from that thread: the production path, and exactly the cross-thread work
+    // the deterministic scheduler refuses. Parking mode is the kit's seam for
+    // a test that performs real I/O.
+    cx.dispatcher.allow_parking();
+    let (harness, cx) = cx.add_window_view(|window, cx| {
+        let mut state = AppState::with_store(scratch_store("browser-live-pointer"));
+        state.browser = std::sync::Arc::new(crate::browser::BrowserHandle::live());
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, cx)));
+    let url = format!("http://{addr}/");
+    cx.update(|_, cx| shell.update(cx, |this, cx| this.browser_go(url.clone(), cx)));
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        cx.run_until_parked();
+        cx.update(|_, cx| shell.update(cx, |this, cx| this.sync_browser(cx)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        if cx.update(|_, cx| shell.read(cx).browser_render.is_some()) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        cx.update(|_, cx| shell.read(cx).browser_render.is_some()),
+        "the pump published a frame"
+    );
+    // Settle the viewport the way a live pane does: the page point is derived
+    // from it, so a click before the first override would aim at the wrong
+    // place for reasons unrelated to this test.
+    for _ in 0..80 {
+        cx.update(|_, cx| shell.update(cx, |this, cx| this.sync_browser(cx)));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let settled = cx.update(|_, cx| {
+            let shell = shell.read(cx);
+            let bounds = shell.browser_bounds.get();
+            let engine = shell.state.browser.engine().expect("the engine is ready");
+            bounds.is_some_and(|bounds| {
+                engine.viewport()
+                    == (
+                        bounds.size.width.as_f32().round() as u32,
+                        bounds.size.height.as_f32().round() as u32,
+                    )
+            })
+        });
+        if settled {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+    let frame = cx
+        .debug_bounds("browser-render-frame")
+        .expect("the live frame is drawn");
+    let center = frame.center();
+    let modifiers = Modifiers::default();
+
+    // Read the page's own event log through the engine.
+    let log = |cx: &mut VisualTestContext| -> String {
+        cx.update(|_, cx| {
+            shell
+                .read(cx)
+                .state
+                .browser
+                .engine()
+                .expect("the engine is ready")
+                .evaluate("JSON.stringify(window.__log)")
+                .expect("the page log reads")
+        })
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+    };
+
+    // One left press and release: the page sees an ordinary click.
+    cx.simulate_event(gpui_kit::MouseDownEvent {
+        position: center,
+        modifiers,
+        button: gpui_kit::MouseButton::Left,
+        click_count: 1,
+        first_mouse: false,
+    });
+    cx.simulate_event(gpui_kit::MouseUpEvent {
+        position: center,
+        modifiers,
+        button: gpui_kit::MouseButton::Left,
+        click_count: 1,
+    });
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let single = log(cx);
+    assert!(
+        single.contains("click:1:0"),
+        "a left press and release must reach the page as a click: {single}"
+    );
+    assert!(
+        !single.contains("dblclick"),
+        "one press is not a double click: {single}"
+    );
+
+    // The platform's second press carries click_count 2; the pane must pass it
+    // on to the release even though the viewport may have moved underneath.
+    cx.update(|_, cx| {
+        let engine = shell
+            .read(cx)
+            .state
+            .browser
+            .engine()
+            .expect("the engine is ready");
+        engine
+            .evaluate("window.__log = []")
+            .expect("the page log resets");
+    });
+    cx.simulate_event(gpui_kit::MouseDownEvent {
+        position: center,
+        modifiers,
+        button: gpui_kit::MouseButton::Left,
+        click_count: 2,
+        first_mouse: false,
+    });
+    cx.simulate_event(gpui_kit::MouseUpEvent {
+        position: center,
+        modifiers,
+        button: gpui_kit::MouseButton::Left,
+        click_count: 2,
+    });
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let double = log(cx);
+    assert!(
+        double.contains("dblclick:2:0"),
+        "a press carrying count two must reach the page as a double click: {double}"
+    );
+
+    // A right press is the page's secondary click, never a left click.
+    cx.update(|_, cx| {
+        let engine = shell
+            .read(cx)
+            .state
+            .browser
+            .engine()
+            .expect("the engine is ready");
+        engine
+            .evaluate("window.__log = []")
+            .expect("the page log resets");
+    });
+    cx.simulate_event(gpui_kit::MouseDownEvent {
+        position: center,
+        modifiers,
+        button: gpui_kit::MouseButton::Right,
+        click_count: 1,
+        first_mouse: false,
+    });
+    cx.simulate_event(gpui_kit::MouseUpEvent {
+        position: center,
+        modifiers,
+        button: gpui_kit::MouseButton::Right,
+        click_count: 1,
+    });
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let right = log(cx);
+    assert!(
+        right.contains("mousedown:1:2") && right.contains("contextmenu:0:2"),
+        "a right press must reach the page as its secondary click and contextmenu: {right}"
+    );
+    assert!(
+        !right.contains("click:1:0"),
+        "a right press must not reach the page as a left click: {right}"
+    );
+}
+
+/// A drag over the live pane's page selects the page's own text.
+///
+/// The pane forwards the press, every drag move and the release, and the page
+/// runs its default selection from them. MEASURED at the engine: that only
+/// happens while each move NAMES the held button - with `button: "none"` and
+/// `buttons: 1` Chromium reads the move as a hover and selects nothing, mid-drag
+/// or after the release - which is why this reads the page's selection rather
+/// than trusting that the events were sent.
+#[gpui::test]
+fn a_drag_over_the_live_page_selects_the_text(cx: &mut TestAppContext) {
+    use std::io::{Read as _, Write as _};
+    if crate::browser::engine::cdp::client::discover_binary().is_err() {
+        eprintln!("SKIP: no Chromium/Chrome installed for the live pane selection test");
+        return;
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let addr = listener.local_addr().expect("the port");
+    let body = String::from(
+        "<!doctype html><html><body style=\"margin:0\">\
+         <p id=\"copy\" style=\"font-size:16px;margin:20px 24px\">alpha beta gamma delta</p>\
+         <script>window.__drag=0;\
+         document.addEventListener('mousemove', function(e){ if (e.buttons === 1) { window.__drag++; } });\
+         </script></body></html>",
+    );
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buffer = [0u8; 4096];
+            let _ = stream.read(&mut buffer);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    init_test_app(cx);
+    // The engine's pump thread publishes frames and wakes the pane's clock from
+    // that thread, which is exactly the cross-thread work the deterministic
+    // scheduler refuses.
+    cx.dispatcher.allow_parking();
+    let (harness, cx) = cx.add_window_view(|window, cx| {
+        let mut state = AppState::with_store(scratch_store("browser-live-drag"));
+        state.browser = std::sync::Arc::new(crate::browser::BrowserHandle::live());
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, cx)));
+    let url = format!("http://{addr}/");
+    cx.update(|_, cx| shell.update(cx, |this, cx| this.browser_go(url.clone(), cx)));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        cx.run_until_parked();
+        cx.update(|_, cx| shell.update(cx, |this, cx| this.sync_browser(cx)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        if cx.update(|_, cx| shell.read(cx).browser_render.is_some()) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        cx.update(|_, cx| shell.read(cx).browser_render.is_some()),
+        "the pump published a frame"
+    );
+    // Settle the viewport: the page point is derived from it, so a drag before
+    // the first override would aim at the wrong place for reasons unrelated to
+    // this test.
+    for _ in 0..80 {
+        cx.update(|_, cx| shell.update(cx, |this, cx| this.sync_browser(cx)));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let settled = cx.update(|_, cx| {
+            let shell = shell.read(cx);
+            let bounds = shell.browser_bounds.get();
+            let engine = shell.state.browser.engine().expect("the engine is ready");
+            bounds.is_some_and(|bounds| {
+                engine.viewport()
+                    == (
+                        bounds.size.width.as_f32().round() as u32,
+                        bounds.size.height.as_f32().round() as u32,
+                    )
+            })
+        });
+        if settled {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+    let bounds = cx
+        .update(|_, cx| shell.read(cx).browser_bounds.get())
+        .expect("the live frame is laid out");
+    let viewport = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .browser
+            .engine()
+            .expect("the engine is ready")
+            .viewport()
+    });
+    // The rendered text's own boxes, from the first line's left edge to the
+    // last line's right edge, so the drag covers the sentence whatever the
+    // column does to its wrapping.
+    let boxes = cx
+        .update(|_, cx| {
+            shell
+                .read(cx)
+                .state
+                .browser
+                .engine()
+                .expect("the engine is ready")
+                .evaluate(
+                    "JSON.stringify((() => { const node = document.getElementById('copy').firstChild; \
+                     const range = document.createRange(); range.selectNodeContents(node); \
+                     const rects = range.getClientRects(); const first = rects[0]; \
+                     const last = rects[rects.length - 1]; \
+                     return [first.left + 1, first.top + first.height / 2, \
+                             last.right - 1, last.top + last.height / 2]; })())",
+                )
+                .expect("the text boxes read")
+        })
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let boxes: Vec<f32> = serde_json::from_str(&boxes).expect("four box coordinates");
+    // The page's own point -> the window's point, which is the inverse of the
+    // pane's own mapping.
+    let to_window = |x: f32, y: f32| -> gpui_kit::Point<gpui_kit::Pixels> {
+        gpui_kit::point(
+            bounds.origin.x + gpui_kit::px(x * bounds.size.width.as_f32() / viewport.0 as f32),
+            bounds.origin.y + gpui_kit::px(y * bounds.size.height.as_f32() / viewport.1 as f32),
+        )
+    };
+    let start = to_window(boxes[0], boxes[1]);
+    let end = to_window(boxes[2], boxes[3]);
+    let modifiers = Modifiers::default();
+    cx.simulate_event(gpui_kit::MouseDownEvent {
+        position: start,
+        modifiers,
+        button: gpui_kit::MouseButton::Left,
+        click_count: 1,
+        first_mouse: false,
+    });
+    let steps = 6;
+    for step in 1..=steps {
+        let t = step as f32 / steps as f32;
+        let position = gpui_kit::point(
+            start.x + (end.x - start.x) * t,
+            start.y + (end.y - start.y) * t,
+        );
+        cx.simulate_event(gpui_kit::MouseMoveEvent {
+            position,
+            pressed_button: Some(gpui_kit::MouseButton::Left),
+            modifiers,
+        });
+        cx.run_until_parked();
+    }
+    cx.simulate_event(gpui_kit::MouseUpEvent {
+        position: end,
+        modifiers,
+        button: gpui_kit::MouseButton::Left,
+        click_count: 1,
+    });
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let state = cx
+        .update(|_, cx| {
+            shell
+                .read(cx)
+                .state
+                .browser
+                .engine()
+                .expect("the engine is ready")
+                .evaluate(
+                    "JSON.stringify({selected: String(window.getSelection()), drags: window.__drag})",
+                )
+                .expect("the page selection reads")
+        })
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let state: serde_json::Value = serde_json::from_str(&state).expect("the selection JSON parses");
+    assert!(
+        state["drags"].as_u64().unwrap_or(0) >= 1,
+        "the page must see a move with the left button held: {state}"
+    );
+    let selected = state["selected"].as_str().unwrap_or_default();
+    assert!(
+        selected.contains("alpha") && selected.contains("gamma"),
+        "a drag over the page must select the text it crossed: {selected:?}"
+    );
 }

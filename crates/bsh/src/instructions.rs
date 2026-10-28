@@ -18,9 +18,11 @@
 //!   `AGENTS.local.md`, `CLAUDE.local.md`;
 //! - byte-identical (trimmed) duplicates inside one directory collapse to the
 //!   earlier candidate;
-//! - the rendered baseline is capped at 65,536 bytes, a single source at
-//!   1,048,576 bytes, and the framing strings are `AGENT_INSTRUCTIONS_INTRO`
-//!   and `Instructions from: <path>\n\n<content>`.
+//! - the framing strings are `AGENT_INSTRUCTIONS_INTRO` and
+//!   `Instructions from: <path>\n\n<content>`, and a single source is capped
+//!   at 1,048,576 bytes. The rendered baseline is capped at 16,384 bytes rather
+//!   than the reference's 65,536 (see [`MAX_RENDERED_BYTES`]): BSH sends the
+//!   text on every turn, so size is a per-request cost here, not a cached one.
 //!
 //! Two deliberate differences, both stated rather than silent:
 //!
@@ -48,9 +50,20 @@ pub(crate) const INSTRUCTIONS_INTRO: &str = "The following workspace instruction
 const COMPACT_INTRO: &str =
     "Workspace instructions were omitted or truncated to fit the configured byte budget.";
 
-/// The reference's rendered budget for one baseline (`maxBytes: 65536` in its
-/// standard preset).
-pub(crate) const MAX_RENDERED_BYTES: usize = 65_536;
+/// The rendered budget for one baseline.
+///
+/// The reference uses `maxBytes: 65536` for its standard preset, but it renders
+/// that text into the system prompt it caches; BSH prepends it to the turn as a
+/// user message that is rebuilt from the stored transcript on every turn, and
+/// the same request is re-sent on every tool step of that turn. At 65,536 bytes
+/// a large instruction file costs roughly 16k prompt tokens per request for
+/// text the model mostly does not need to act.
+///
+/// 16,384 bytes is the measured compromise: it keeps a normal `AGENTS.md` whole
+/// (the common case), and a larger one is truncated by the most specific file
+/// first with the named marker below, so the model knows the rest exists and
+/// can `read_file` it when a rule matters.
+pub(crate) const MAX_RENDERED_BYTES: usize = 16_384;
 
 /// The reference's per-source cap (`maxSourceBytes: 1048576`).
 pub(crate) const MAX_SOURCE_BYTES: u64 = 1_048_576;
@@ -579,8 +592,9 @@ mod tests {
             text.len()
         );
         assert!(
-            text.contains("Workspace instruction budget 65536 bytes")
-                && text.contains("truncated AGENTS.md"),
+            text.contains(&format!(
+                "Workspace instruction budget {MAX_RENDERED_BYTES} bytes"
+            )) && text.contains("truncated AGENTS.md"),
             "the truncation is named: {text}"
         );
         let _ = std::fs::remove_dir_all(&root);

@@ -2833,3 +2833,395 @@ The result JSON keeps its old shape, adds `kind: "context"` on a context row,
 carries a hint when nothing at all was found. `base64` is the round's one new
 dependency; caps, the GREP prompt line and both rows of `docs/bsh-prompts.md` now
 name the switches.
+
+Round 182 fixed the blank body the browser pane drew when it opened. The report
+was a white rectangle with no globe, no prompt, no loading line and no failure
+line - indistinguishable from a crash, and it reported nothing the reader could
+act on.
+
+The cause was not the engine. `browser_live_body` chose between "draw the
+capture" and "draw `browser_engine_notice()`", and that notice renders an EMPTY
+div when `engine_error()` is None. So the healthy states - engine ready, no
+capture yet - produced exactly nothing, while the empty and broken states each
+had their own body the reader never saw.
+
+Two rules came out of it, and both are now structural rather than copied prose:
+
+- A pane with no drawable frame falls back to `browser_engine_notice()` PLUS
+  `browser_body(view, cx)`. The text view is the pane's account of what it is
+  doing (empty prompt, "loading <url>", or the failure and its next step), so
+  there is no state left that can paint a bare rectangle.
+- A capture is the reader's PAGE only when the browser holds a document for it:
+  `frame_is_the_page(status)` is `status != Empty`, because the engine
+  pre-warms `about:blank` and that white capture is indistinguishable from a
+  broken pane. `browser_go` now drops the frame it replaces into
+  `browser_render_stale` (released by the next render's `drop_image`), and
+  `browser_history` does the same on success, so neither the pre-warm nor the
+  previous page can stand in for the page being loaded.
+
+The same gate then removed work nobody asked for: `sync_browser` asks the pump
+for frames only while there is a page AND the pane is visible
+(`set_streaming(visible && has_page)`), so an empty window stops probing and
+PNG-decoding `about:blank` eight times a second and stops publishing a
+full-viewport texture this pane does not draw. That forced one ordering change -
+the cached pane view is refreshed BEFORE the engine block, because the gate's
+`has_page` is read from it and a stale view would keep an emptied pane
+streaming for a tick.
+
+Draw the failure ABOVE the frame, not instead of it. A live pane swallowed every
+failure: the frame stayed and the sentence the pane owed the reader was never
+drawn. It now sits in the column above the live body, which is the rule the text
+view already followed (keep the page you were reading, say why the load failed).
+
+That exposed a copy bug worth naming. `Page.navigate` answers with Chromium's own
+`net::ERR_*` when the PAGE cannot load - a name that does not resolve, a port
+that is closed - and the engine is perfectly healthy there. Reporting it through
+`Failure::from_engine` appended "the text view is still usable / reopen the tab to
+start a new engine" to a reader whose only problem was a typo. `page_load_failure`
+now classifies the navigation refusals into the transport vocabulary the pane
+already has (`dns`, `tls`, `connect`, `redirect`, `scheme`) and carries the
+engine's raw sentence as the detail; anything else (a dead socket, a CDP method
+the engine does not implement) keeps the engine's message AND its install/restart
+advice, because there the engine is what has to be fixed.
+
+Evidence: two probes pin the pure halves -
+`ui::right_panel::tests::an_empty_pane_never_draws_a_capture` (pre-warm is not a
+page; loading/ready/failed are) and
+`browser::tests::a_navigation_chromium_refused_is_a_load_failure` (eight
+`net::ERR_*` texts to their kind, the sentence travelling unchanged, no fallback
+advice; and a `Runtime.evaluate` refusal staying an engine failure). In the GUI,
+with the window still live: a fresh launch shows the globe plus "Enter a URL to
+open a page ..."; `example.com` draws the captured page; `nosuchhost.invalid`
+shows "The name did not resolve / net::ERR_NAME_NOT_RESOLVED" above Chrome's own
+error page; a local `http://127.0.0.1:8799/{a,b}.html` fixture renders A then B,
+and Back shows A's text view.
+
+Traps and honest gaps:
+
+- Back/Forward restore the PANE's cached document, not the engine's history:
+  the model's history holds only what it loaded, while the engine also holds
+  `about:blank` and its own error pages. So the frame is dropped on a successful
+  move and the restored document shows as a text view until the next navigation.
+  Truth over a stale picture, and the visible cost is stated here rather than
+  papered over.
+- The pane-level gate has live evidence only. Test builds disable the engine, so
+  there is no shell test that drives `set_streaming(visible && has_page)`; the
+  engine tests prove `set_streaming(true)` publishes frames, including after a
+  `false`. The pure `frame_is_the_page` is what is pinned headlessly.
+- The LAST change (the `has_page` pump gate plus that reordering) is verified by
+  build, clippy, docs and 1188 tests only. The GUI session went dark right after
+  it: `ocu` answers `Apple event error -10005: cgWindowNotFound` for every app
+  and `screencapture` shows wallpaper with no menu bar, so the empty-pane frame
+  capture could not be re-taken. Re-verify live before trusting it further.
+- `browser_frame_size` is still write-only: it is recorded from each frame and
+  nothing reads it. Either a size-dependent decision appears, or it should go;
+  it is not evidence that the viewport is checked.
+- `set_streaming(false)` only clears an atomic (the pump thread stays alive and
+  sleeps `FRAME_IDLE`), which is why gating it per tick is free and cannot strand
+  the pump. Do not "optimise" it into a start/stop of the thread.
+
+Round 183 fixed the browser pane's pointer HANDLING. The report was that the
+right pane's page accepted no right click and no double click. Two independent
+defects met, and the second one hid behind a plausible-looking mechanism:
+
+- Only LEFT down/up were registered, and `mouse_params` stamped
+  `button: "left"` on every event. A right press therefore never became the
+  page's `contextmenu` (it was not delivered at all), and the middle button was
+  equally absent.
+- The pane timed double clicks itself in PAGE coordinates
+  (`BrowserClick::next` over the mapped point) with a 500 ms / 4 px window.
+  MEASURED with a live frame: the initial engine viewport is `(1000, 700)` until
+  `Emulation.setDeviceMetricsOverride` lands, so two presses half a second apart
+  mapped the same window point to (500, 350) and then (240, 502). The slop
+  failed, the second press carried count 1, and `dblclick` never fired - and the
+  press could also aim at the wrong spot while the frame on screen was captured
+  at the old size.
+
+The fixes are structural, not local tweaks:
+
+- `PointerButton` (cdp) names the button and carries its mask. `pointer_down`,
+  `pointer_up` and `pointer_move` take it, and `buttons` is the held set: the
+  pressed button's mask on a press, 0 on a release, and the held mask on a drag.
+  The pane registers down/up for Left, Right and Middle on both the frame and
+  the window's captured-release listeners, so a release outside the frame still
+  ends the right gesture it started.
+- The count is now the PLATFORM's: `MouseDownEvent::click_count` is AppKit's own
+  `clickCount`, measured in window coordinates against the real double-click
+  time and point. It is clamped to 1..=3 for the page's `detail` and stored with
+  its button, so a right press cannot continue a left press's sequence. The
+  pane deleted `BROWSER_CLICK_MS`, `BROWSER_CLICK_SLOP` and the page-space
+  `near` reset; a move beyond the slop is the platform's job.
+- `browser_pressed` is now `Option<MouseButton>` and a release only ends the
+  gesture of the button that is actually held; `browser_drag_start` is `Some`
+  only for a left press, so a right drag does not touch the text selection.
+
+Evidence: `browser::engine::tests::a_right_press_raises_contextmenu_and_a_middle_press_its_own_button`
+drives a real Chromium page and sees `mousedown`/`contextmenu` with button 2,
+then `mousedown`/`auxclick` with button 1. The unit test
+`ui::right_panel::tests::a_press_uses_the_platform_count_and_restarts_for_another_button`
+pins the count clamp and the button reset, and
+`ui::shell_tests::a_double_click_and_a_right_click_reach_the_live_page` drives
+the LIVE pane (no text view) through single, double and right clicks and reads
+the page's own log: `click:1:0`, then `dblclick:2:0`, then
+`mousedown:1:2`/`contextmenu:0:2` with no left click. That test calls
+`cx.dispatcher.allow_parking()` because the pump thread's frame wake is real
+cross-thread work, the same seam the turn tests use.
+
+Traps:
+
+- `MouseUpEvent::click_count` exists but the pane does not read it: the stored
+  press count is what both halves of the gesture must name, and using the up's
+  value would let a mismatched pair reach the page.
+- `contextmenu`'s `detail` is 0, not the click count; a test that expects `:1:2`
+  is asserting Chromium's event table, not the pane. The button is the field
+  that matters there.
+- A second press while one is held is ignored. The page cannot express two held
+  buttons through CDP's `buttons` field meaningfully, and accepting it would
+  release the drag in progress.
+- The page point still maps through `engine.viewport()`, the last viewport the
+  engine was ASKED for, so a frame captured before a resize can be on screen for
+  a tick while the mapping already uses the new size. That transient aim is
+  unchanged; what this round removed is its effect on the click COUNT, which is
+  now measured in window coordinates by the platform.
+
+Round 184 fixed text selection in the browser pane, and the cause was one field
+missing from a mouse move. The report was that rendered page text could not be
+selected at all.
+
+MEASURED at the engine, with a real Chromium page: `Input.dispatchMouseEvent`
+with `type: mouseMoved`, `buttons: 1` and `button: "none"` selects nothing -
+before or after the release - while the same drag with `button: "left"` selects
+the crossed range, spans block boundaries, and selects inside a `<textarea>`
+(`selectionStart`/`selectionEnd` moved). `buttons` alone is not enough; the
+renderer needs the move to NAME the held button to treat it as a drag rather than
+a hover.
+
+That is why the pane had a workaround, and why the workaround was what the reader
+saw fail: `select_text_between` synthesized a range from
+`document.caretPositionFromPoint` at the drag's two endpoints, and it returns
+false - selecting nothing - whenever either endpoint's caret is not a TEXT node
+(a margin, the gap between blocks, whitespace beside a block) and refuses editable
+nodes outright, so no field's text could be selected at all. The script also cost
+a `Runtime.evaluate` per captured-frame move, on the UI thread's queue.
+
+The fix is in `pointer_move`, not in the pane: a held button rides the move
+(`button` = the held button's name, `buttons` = its mask), and the page's own
+default selection does the rest. `select_text_between`, `text_selection_script`,
+`SELECT_AT_JS`/`select_at_script`, the pane's four call sites and
+`Shell::browser_drag_start` are gone - one mechanism, no caret heuristic.
+
+The same measurement retired the multi-click script: a press and release carrying
+`clickCount: 2` select exactly the word, `3` the line/block, natively. The
+triple-click assertion now trims the value, because Chromium's block selection
+keeps the boundary's `\n\n` in `getSelection().toString()`.
+
+Evidence, each re-injected and watched to fail:
+`browser::engine::tests::dragging_over_page_text_selects_it_in_the_page` (a drag
+across two paragraphs, then a later drag that must REPLACE it - empty string when
+`button: "none"` is restored) and
+`ui::shell_tests::a_drag_over_the_live_page_selects_the_text` (the live pane, a
+press, six moves and a release; the page reports `drags >= 1` and a selection
+containing the crossed words - empty when the field is reverted).
+`a_double_click_selects_the_word_and_a_triple_click_the_line` now proves the
+native path too, since nothing scripts the selection any more.
+
+Trap worth keeping: a `.5px`-style "harmless" redundancy hides the real gap. The
+scripted selection made double click look correct for rounds while the drag path
+was broken, because the two shared a mechanism only by accident - the script ran
+on both. Assert the PAGE's own `getSelection()`/`selectionStart`, never that the
+pane sent events.
+
+Round 185 gave the composer image input: a pasted screenshot, a dropped file and
+the picker now feed one intake path, and the attached images draw the reference's
+64px rail. A picked image already reached the model (Attachment -> `turn_input`);
+what was missing was every way of getting one in, and any picture saying so.
+
+MEASURED from the reference's own sheets (now in
+`docs/ui-mirror/reference/dsh-css-inline/`): `ComposerAttachments.module.css` and
+`AttachmentRail.module.css` - `.rail{margin-bottom:-6px;padding:2px 10px 0}`,
+`.item{height:64px}`, `.thumbnail{width:64px;height:64px;border:.5px solid
+border-l2-darkmode-thin;border-radius:radius-xl;background:
+interactive-bg-hover}` with an `object-fit:cover` image, and `.remove{18x18 at
+top:4px;right:4px;background:button-contrast-fill;color:
+label-primary-inverted;opacity:0}` revealed by `.item:hover .remove`. The radius
+is 20px (`--dsw-radius-xl:20px`, read from `dsh-client-ui-theme/lib/client.js`).
+The ceilings are the shipped `dsh-attachment-local` defaults
+(`maxImagesPerMessage` 20, `maxImageBytes` 20 MiB), and the refusals reuse the
+reference's own sentences ("Image exceeds the configured byte limit.",
+"Unsupported or malformed image data.", "Image limit: up to {count} images,
+{size} each", from the conversation bundle's `attachment.dropDesc`).
+
+The seam: the kit's `Input`/`Textarea` already ships `.on_paste(handler)`, and
+its own doc names this case ("images and copied files belong in app-owned state
+beside the input (e.g. Attachments)"). bsh wires it on the composer; text returns
+`false` and falls through to the kit's insertion. Drops arrive as
+`PlatformInput::FileDrop`: Entered parks an `ExternalPaths` on
+`cx.active_drag`, Submit becomes a MouseUp, and every element whose hitbox is
+hovered gets the drop on the bubble - so the listener sits on the shell frame,
+this window's document. The picker, the paste and the drop share
+`intake_paths`/`push_attachment`, so they cannot disagree about the ceilings or
+about what counts (an image path attaches; anything else becomes an @mention,
+bsh's existing file-reference vocabulary).
+
+The rail draws a 128px PNG `Attachment::preview` built ONCE at attach, so a frame
+hashes ~20 KB and GPUI's asset cache (keyed by the `Image` id, i.e. a content
+hash) reuses the decoded tile; the original payload never reaches a frame. That
+is also why the tile is `img(Arc<Image>)` and not a `RenderImage`:
+`RenderImage::new` mints a fresh id per call and would leak one atlas tile per
+frame - the trap the browser pane's frame cache documents.
+
+Traps:
+- `on_paste` is `Fn(&ClipboardItem, &mut Window, &mut App) -> bool` with no
+  `Context`, so `cx.listener` cannot express it: the handler holds
+  `cx.entity().downgrade()` and calls `paste_clipboard` through
+  `WeakEntity::update`.
+- `accepts_image_for` answers FALSE when the session resolves no model, so an
+  intake test on a blank scratch state looks exactly like a paste that never
+  fired. `state_with_image_model` seeds a provider and selects a leaf; without it
+  both new intake tests failed with an empty list.
+- `ExternalPaths` has no `FromIterator`; the field wants a `SmallVec`, so
+  `ExternalPaths(vec.into())` is the construction a test can write.
+- A clipboard carrying images AND text must not be fully consumed: the reference
+  pastes the text too, so `paste_clipboard` returns `false` when a non-empty
+  string entry exists and lets the kit type it.
+- A refused image still consumes the paste: otherwise the kit's fallback types
+  the file paths (its `text()` falls back to them) after the notice already said
+  no.
+- The SEND guard was the hidden half of "take images": the reference defines
+  `empty = draft.trim() === "" && attachments.length === 0` (its InputBar), so an
+  image with no words is a send. bsh's `Shell::send` returned early on an empty
+  draft, which made an image-only message a silent no-op; `composer::can_send` is
+  the pure rule now, `turn_input` writes no empty text block, and `display_text`
+  has no leading blank line for an image-only row. A credential-refusal probe is
+  NOT a usable observable for this (an anonymous provider opens the turn), so the
+  test asserts the stored user row instead.
+
+Honest gaps, each with what has no seam:
+- The reference's full-viewport drop invitation (`DropOverlay`: blurred mask,
+  115x84 illustration, 20px title over 16px/14px copy) is NOT drawn. bsh accepts
+  a drop anywhere in the window but paints no cue over it.
+- The rail's hidden scrollbar and its 24px edge arrows are not drawn; the rail
+  scrolls horizontally with the platform's own overflow.
+- A tile press opens the reference's original-image lightbox. bsh has no image
+  viewer, so the tile is inert, the only action is the hover-revealed remove, and
+  `cursor:zoom-in` is deliberately not set - the cursor must not promise a
+  preview that does not exist.
+- Only png/jpeg decode: `image` is built with those two features, so a webp/gif
+  attachment gets a named tile instead of a picture.
+- Non-image drops are @mentions, not the reference's 240x64 file cards: bsh's
+  attachment model is an image.
+- Stored history still carries only the display text (`[image: name]`) while the
+  live request carries the blocks, and `caps::agent_messages` replays text only,
+  so a later turn cannot re-read the image. Reported, not faked.
+- The 128px preview is decoded synchronously at attach (one decode per image, on
+  the input path), so a 12MP photo blocks that frame for the decode; the
+  reference normalizes off-thread.
+- The reference's tile carries `title: image.openOriginal` and its remove an
+  `aria-label: image.remove {name}`; GPUI exposes no accessibility tree, so bsh
+  carries neither, and the tile has no original to open.
+
+Four axes:
+1. Backend in Rust: the same `Attachment`/`turn_input` path a picked image used;
+   the new intake only decides what becomes an attachment, and the model's image
+   switch plus both ceilings are enforced in `push_attachment` before the
+   payload is held.
+2. Interaction: Cmd-V attaches a clipboard image; dropping attaches image files
+   and mentions the rest; the hover-revealed remove drops one attachment; the
+   picker takes the same ceilings. Text paste is unchanged (proved by a test).
+3. Tips/help: no new tooltip (the reference's `+` keeps `input.commands`);
+   refusals carry the reference's sentences.
+4. Errors: no model / text-only, oversize, over-count and undecodable formats
+   each show a notice and consume the paste, so nothing lands in the draft.
+
+Evidence: `ui::shell_tests::pasting_an_image_attaches_it` (clipboard image,
+64px tile), `pasting_text_still_reaches_the_draft`,
+`dropping_files_attaches_images_and_mentions_the_rest` (a real
+`FileDropEvent` pair), `the_remove_control_drops_an_attachment` (the 18px
+control pressed inside the tile), `an_image_alone_can_be_sent` (Enter opens the
+turn with the mark and no words), and
+`state::tests::an_attachment_preview_is_a_square_png` /
+`an_image_alone_is_a_sendable_turn`. Screenshot, sandboxed home at 1280x820: the
+tile draws 64px with the 10px inset and 2px top pad in the composer card, and no
+remove control until hover.
+
+Round 126 made a turn cheaper and more tool-first, in the places the cost
+actually lives. Measured first from a stored session (the .bsh history
+parquet): the model streamed a long reasoning trace, and its preamble text was
+DROPPED, because the engine recorded an assistant row only when the step had no
+tool call - so the next step rebuilt a thought it had already had, and the
+transcript showed words the session never kept.
+
+Four seams:
+- `crates/react/src/engine/mod.rs`: the preamble is recorded BEFORE the call it
+  introduces (streaming and non-streaming loops), and a step that arrives with
+  neither text nor a call gets one directed retry (`EMPTY_ANSWER_NOTE`) instead
+  of closing the turn on silence. A reasoning model that spends a whole step
+  thinking and emits nothing used to end the turn blank.
+- `crates/agent/src/agent/agentic/engine.rs`: a skill is no longer a tool of its
+  own. N skills used to mean N no-op entries in the request tool array, on top of
+  the same catalog the vendor already appends to the system prompt; the single
+  `load_skill` loader is the whole surface now.
+- `crates/bsh/src/instructions.rs`: the rendered `AGENTS.md` baseline is capped at
+  16,384 bytes rather than the reference's 65,536, because BSH re-injects it every
+  turn and re-sends every step. A larger file is truncated most-specific-first
+  with the named budget marker, and the rest stays readable with `read_file`.
+- `crates/agent/src/agent/prompts.rs`: the standing guidance now opens with the
+  harness bar - act now (call the tool in the same message you decide), think
+  briefly (decide, then call) - before the plan/verify/report rules. The pinned
+  rule test follows it.
+
+Evidence: `react::tests::a_blank_stream_step_is_retried_instead_of_ending_on_silence`,
+`react::tests::the_preamble_before_a_tool_call_stays_in_the_session`,
+`agent::prompts::tests::the_default_prompt_pins_every_workflow_rule`,
+`instructions::tests::the_rendered_batch_is_bounded_and_names_the_truncation`.
+
+Round 127 made a submitted image durable and visible. The bug was not the live
+request: `turn_input` already sent the exact binary block. `Shell::submit` and
+`drain_inbox` then stored `display_text(...)` (the `[image: name]` mark) through
+`begin_turn`/`begin_turn_in`, so the row's `images` stayed empty; a later turn
+or reload replayed text only. Rows now keep the reader's clean words plus the
+EXACT `data:<mime>;base64,<payload>` URL for normal, queued and steered turns.
+
+- Backend in Rust: `state::attachment_images` is the one data-URL builder;
+  `begin_turn_with_images` / `begin_turn_in_with_images` persist it, and
+  `message_content` reconstructs the same `ContentPart::Binary` on replay. The
+  MiniMax/OpenAI `image_url` shape is pinned in the vendor test.
+- Interaction: the transcript draws the stored picture ABOVE the optional text
+  bubble, right-aligned, with the reference `singleFit` (240px long edge, ratio
+  clamped to 0.25..4, no upscaling, 44px frame floor) or 64px cover tiles for
+  multiple images. Image-only rows draw NO bubble. The composer still previews
+  its attachments, and the queue summary says `Image`, never a file name. A
+  frame press opens a full-window lightbox of the cached original; its close
+  control, the backdrop, and Escape dismiss it. GPUI has no zoom-in cursor, so
+  the frame uses the close analogue (`cursor_pointer`), not a fake one.
+- Tips/help: the frame carries the reference's "Open image" label as its
+  accessible name and 500ms tooltip; the lightbox names "Image preview" and its
+  close control "Close preview" in both locales.
+- Errors: a malformed legacy data URL draws a quiet image icon in the same
+  frame, with a localized "Image unavailable" tooltip; it does not print a
+  filename or retry per frame. Send-time refusals (text-only model, oversize,
+  undecodable format) are unchanged.
+
+Performance: a slot-keyed cache (`loaded_from + local index`) decodes a stored
+image once, capped at 64 entries and invalidated from the appended/rewound slot
+on normal turns, queue drains, steers, goal attachments and rewind; a repaint
+only clones an `Arc`.
+
+Evidence: `ui::shell_tests::an_image_alone_can_be_sent` (stored URL, painted
+44px frame, no bubble, lightbox opens; close control and Escape dismiss),
+`a_queued_image_drains_with_its_original_bytes`,
+`state::tests::an_ordinary_image_turn_persists_and_replays_the_same_block`,
+`a_steered_image_row_replays_as_a_binary_block`,
+`ui::transcript::tests::the_lone_image_box_matches_the_reference`, and
+`react::llm::vendor::openai::tests::image_content_serializes_as_an_openai_image_url`.
+Native screenshot: 1280x820 sandboxed home, the stored red image paints as the
+rounded frame with no `[image: ...]` text anywhere in the transcript.
+
+The lightbox is the reference's interaction, measured by behaviour rather than
+CSS (the primitives bundle is not in the extracted corpus): a modal over the
+shell, the cached original fitted to the viewport without a second decode, and
+the frame carrying a real button role, accessible name and tooltip. Escape is
+handled before the composer's own key bindings and EVERY other key is swallowed
+while it is open, so the modal cannot leave the composer editing behind it.
+Because GPUI has no zoom-in cursor asset, the frame uses `cursor_pointer`; that
+is the only cosmetic difference from the reference frame.

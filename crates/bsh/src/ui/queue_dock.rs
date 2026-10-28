@@ -233,17 +233,25 @@ impl Shell {
                 .border_color(rgb(theme::border())),
             );
         } else {
+            // The queue is a summary surface, not a message row: it never
+            // prints an image's file name. Words lead; an attachment adds the
+            // reference's own "Image" label, plus a count when several ride
+            // the same queued message.
+            let image_label = self.state.lang.tr("settings.inputImage");
+            let summary = match (item.text.is_empty(), item.attachments.len()) {
+                (true, 0) => String::new(),
+                (true, 1) => image_label,
+                (true, count) => format!("{image_label} ×{count}"),
+                (false, 0) => preview(&item.text),
+                (false, _) => format!("{} · {image_label}", preview(&item.text)),
+            };
             row = row.child(
                 div().flex_1().min_w_0().child(
-                    txt(
-                        preview(&crate::state::display_text(&item.text, &item.attachments)),
-                        theme::QUEUE_COUNT,
-                        theme::muted(),
-                    )
-                    .line_height(px(theme::QUEUE_COUNT_LINE))
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .whitespace_nowrap(),
+                    txt(summary, theme::QUEUE_COUNT, theme::muted())
+                        .line_height(px(theme::QUEUE_COUNT_LINE))
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap(),
                 ),
             );
         }

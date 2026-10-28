@@ -41,6 +41,14 @@ pub use tool_run::{ToolCallEvent, ToolRunManager};
 /// the run established and what is left, instead of a `Done` with no answer.
 pub const STEP_GUARD_NOTE: &str = "You have reached this turn's step budget, so no further tool calls will run. Reply in plain text now: what you established, what is still incomplete, and the next concrete step. Do not call any tools.";
 
+/// What the model is told when a step came back empty.
+///
+/// A reasoning model can spend a whole step thinking and emit neither text nor
+/// a tool call; without this the turn would close on a blank answer and the
+/// reader would receive nothing. The retry is bounded to one per turn, and it
+/// asks for the two things a harness can act on: a tool call, or an answer.
+pub const EMPTY_ANSWER_NOTE: &str = "Your last reply contained no text and no tool call. Do not think further: call a tool now, or answer the reader in plain text.";
+
 /// The ReAct loop: LLM calls, tool execution, skills, telemetry, and resilience.
 pub struct ReActEngine<A: ReActApp> {
     llm: Box<dyn LlmClient<A::Session, A::Context> + Send + Sync>,
@@ -144,7 +152,10 @@ impl<A: ReActApp> ReActEngine<A> {
         // turn, so a guarded turn still ends with an answer.
         let mut steps = 0usize;
         let mut closing = false;
-        loop {
+        // One directed retry when a step comes back empty (see
+        // EMPTY_ANSWER_NOTE); a second blank reply ends the turn.
+        let mut nudged = false;
+        'turn: loop {
             if steps >= self.max_steps {
                 if closing {
                     break;
@@ -194,6 +205,20 @@ impl<A: ReActApp> ReActEngine<A> {
 
                     for choice in rsp.choices {
                         let message = &choice.message;
+
+                        // The model's own words belong in the transcript even
+                        // when the same message also carries tool calls: a
+                        // dropped preamble is context the next step has to
+                        // rebuild, and it is what the reader was told. Recorded
+                        // BEFORE the calls so the session keeps the model's own
+                        // order.
+                        let mut recorded = false;
+                        if let Some(content) = &message.content {
+                            if !content.trim().is_empty() {
+                                session.push(LlmMessage::assistant(content.clone()));
+                                recorded = true;
+                            }
+                        }
 
                         // On the closing turn the model is asked for prose: a
                         // call it still emits is not run, so the guard costs an
@@ -373,7 +398,8 @@ skill_dir: {}
                             }
                         }
 
-                        let mut recorded = false;
+                        // A response with no tool call is the answer: the text
+                        // recorded above IS the final thought.
                         if !found_tool_call {
                             if let Some(content) = &message.content {
                                 if !content.is_empty() {
@@ -384,13 +410,16 @@ skill_dir: {}
                                             .to_string();
                                     }
                                     self.react_app.on_thought(&thought, session, context).await;
-                                    // Record the text now, so a pre-tool-call
-                                    // message is not lost; the final branches
-                                    // below only push when this did not.
-                                    session.push(LlmMessage::assistant(content.clone()));
-                                    recorded = true;
                                 }
                             }
+                        }
+
+                        // A blank step ends the turn with nothing: give the model
+                        // one directed retry instead of closing on silence.
+                        if !found_tool_call && thought.trim().is_empty() && !nudged {
+                            nudged = true;
+                            session.push(LlmMessage::user_text(EMPTY_ANSWER_NOTE));
+                            continue 'turn;
                         }
 
                         let finish = choice.finish_reason.as_deref();
@@ -647,6 +676,8 @@ skill_dir: {}
             // See `react_loop`: the bound guards against a runaway loop, and a
             // guarded turn closes with an answer instead of a bare `Done`.
             let mut closing = false;
+            // One directed retry when a step streams nothing at all.
+            let mut nudged = false;
 
             context.add_tool(load_skill_tool());
 
@@ -697,6 +728,8 @@ skill_dir: {}
                 futures::pin_mut!(llm_stream);
                 let mut full_response = String::new();
                 let mut saw_tool_call = false;
+                // Whether the words collected so far already reached the session.
+                let mut recorded = false;
 
                 while let Some(item) = llm_stream.next().await {
                     match item {
@@ -740,6 +773,14 @@ skill_dir: {}
                                 continue;
                             }
                             saw_tool_call = true;
+                            // Keep the words that introduced the call: the
+                            // transcript is the model's own context, so a dropped
+                            // preamble is context it has to rebuild on the next
+                            // step. Pushed before the call, in the model's order.
+                            if !recorded && !full_response.trim().is_empty() {
+                                session.push(LlmMessage::assistant(full_response.clone()));
+                                recorded = true;
+                            }
                             yield Ok(StreamToken::ToolCall { name: name.clone(), args: args.clone(), id: id.clone() });
 
                             let call_id = id.unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple()));
@@ -848,20 +889,28 @@ skill_dir: {}
 
                 if !full_response.is_empty() {
                     self.react_app.on_thought(&full_response, session, context).await;
-                    if !saw_tool_call {
+                    if !recorded {
                         session.push(LlmMessage::assistant(full_response.clone()));
                     }
                 }
 
                 if !saw_tool_call {
+                    // A step that produced neither words nor a call would end
+                    // the turn on silence. Ask once for the two things a harness
+                    // can act on - a tool call or an answer - then close.
+                    if full_response.trim().is_empty() && !nudged {
+                        nudged = true;
+                        session.push(LlmMessage::user_text(EMPTY_ANSWER_NOTE));
+                        continue;
+                    }
                     // A turn ends only when nothing waits for its next step.
                     // This is the reference's next-step inbox rule (the agent
-                    // loop checks `inbox.nextStep.length` before closing a
-                    // turn): a steer that arrived while this response streamed
-                    // keeps the turn open, and the next iteration's
-                    // `before_llm_call` appends it as a user turn. Without
-                    // this, a steer could only be taken when a tool call
-                    // happened to force another step.
+                    // loop checks the inbox length before closing a turn): a
+                    // steer that arrived while this response streamed keeps the
+                    // turn open, and the next iteration's before_llm_call
+                    // appends it as a user turn. Without this, a steer could
+                    // only be taken when a tool call happened to force another
+                    // step.
                     if self.react_app.has_pending_step_input() {
                         continue;
                     }

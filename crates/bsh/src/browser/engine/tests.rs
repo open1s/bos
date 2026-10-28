@@ -27,6 +27,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::cdp::client::discover_binary;
+use super::cdp::PointerButton;
 use super::{Engine, FrameSlot, Navigation, Settle};
 
 /// A loopback origin that records every path it served, one body for all of them.
@@ -356,10 +357,23 @@ fn native_video_plays_and_keeps_frames_moving() {
     );
 }
 
+/// A drag over page text IS a text selection, made by the page itself.
+///
+/// MEASURED, and the reason this test exists: Chromium only runs its default
+/// selection while the held button rides each move. With `button: "none"` and
+/// `buttons: 1` - which is what the pane sent - the move reads as a hover, so
+/// nothing is selected mid-drag and nothing is selected after the release.
+/// The pane then had to synthesize a range from carets, which selected nothing
+/// wherever an endpoint was not a text node (a margin, a gap between blocks)
+/// and could not select a field's text at all.
 #[test]
-fn dragging_over_page_text_creates_a_copyable_selection() {
+fn dragging_over_page_text_selects_it_in_the_page() {
     let origin = Origin::start(String::from(
-        "<!doctype html><html><body><p id=\"copy\">selectable page text</p></body></html>",
+        "<!doctype html><html><body style=\"margin:0\">\
+         <p id=\"one\" style=\"font-size:24px;margin:20px 40px\">alpha beta gamma</p>\
+         <p id=\"two\" style=\"font-size:24px;margin:20px 40px\">delta epsilon</p>\
+         <textarea id=\"ta\" style=\"margin:20px 40px;width:360px;height:80px;font-size:18px\">textarea words here</textarea>\
+         </body></html>",
     ));
     let Some(engine) = engine() else {
         return;
@@ -367,62 +381,116 @@ fn dragging_over_page_text_creates_a_copyable_selection() {
     engine
         .navigate_settling(&format!("http://127.0.0.1:{}/", origin.port), Settle::Idle)
         .expect("the text page loads");
-    let bounds = engine
-        .evaluate(
-            "JSON.stringify((() => { const range = document.createRange(); range.selectNodeContents(document.querySelector('#copy').firstChild); const box = range.getBoundingClientRect(); return [box.left, box.top, box.width, box.height]; })())",
-        )
-        .expect("the text bounds are available");
-    let bounds: Vec<f32> =
-        serde_json::from_str(bounds.as_str().expect("bounds are JSON")).expect("four bounds");
-    let start = (bounds[0] + 1.0, bounds[1] + bounds[3] / 2.0);
-    let end = (bounds[0] + bounds[2] - 1.0, bounds[1] + bounds[3] / 2.0);
-    engine
-        .pointer_down(start.0, start.1, 1, false)
-        .expect("the drag starts");
-    engine
-        .pointer_move(end.0, end.1, true)
-        .expect("the held-button move dispatches");
-    engine
-        .pointer_up(end.0, end.1, 1, false)
-        .expect("the drag ends");
-    engine
-        .select_text_between(start, end, false)
-        .expect("the rendered text range is selected");
-
-    let selected = engine
-        .evaluate("window.getSelection().toString()")
-        .expect("the page selection is readable");
-    assert!(
-        selected
-            .as_str()
-            .is_some_and(|text| text.contains("selectable page text")),
-        "the selected range should contain the dragged text: {selected}"
-    );
-
-    // A later drag replaces an existing selection. This exercises the same
-    // caret-based route the pane uses after each captured-frame drag.
-    let word_bounds = engine
-        .evaluate(
-            "JSON.stringify((() => { const node = document.querySelector('#copy').firstChild; const range = document.createRange(); range.setStart(node, 11); range.setEnd(node, 15); const box = range.getBoundingClientRect(); return [box.left, box.top, box.width, box.height]; })())",
-        )
-        .expect("the second range bounds are available");
-    let word_bounds: Vec<f32> =
-        serde_json::from_str(word_bounds.as_str().expect("second range bounds are JSON"))
-            .expect("four second range bounds");
-    let word_start = (word_bounds[0] + 1.0, word_bounds[1] + word_bounds[3] / 2.0);
-    let word_end = (
-        word_bounds[0] + word_bounds[2] - 1.0,
-        word_bounds[1] + word_bounds[3] / 2.0,
-    );
-    engine
-        .select_text_between(word_start, word_end, false)
-        .expect("the later drag replaces the previous selection");
-    assert_eq!(
+    std::thread::sleep(Duration::from_millis(120));
+    // A point inside a known range of a paragraph's text, so the fixture does
+    // not depend on font metrics: the range's own box is the rendered text.
+    // `last` picks the range's RIGHT edge one pixel in, so a drag aimed at a
+    // range's end lands after its last character instead of in its middle.
+    let point = |engine: &Engine, id: &str, from: usize, to: usize, last: bool| -> (f32, f32) {
+        let side = if last {
+            "box.right - 1"
+        } else {
+            "box.left + 1"
+        };
+        let script = format!(
+            "JSON.stringify((() => {{ const node = document.querySelector('#{id}').firstChild; \
+             const range = document.createRange(); range.setStart(node, {from}); range.setEnd(node, {to}); \
+             const box = range.getBoundingClientRect(); \
+             return [{side}, box.top + box.height / 2]; }})())"
+        );
+        let value = engine
+            .evaluate(&script)
+            .expect("the text point is available");
+        let values: Vec<f32> =
+            serde_json::from_str(value.as_str().expect("the point is JSON")).expect("two");
+        (values[0], values[1])
+    };
+    let drag = |engine: &Engine, from: (f32, f32), to: (f32, f32)| {
         engine
-            .evaluate("window.getSelection().toString()")
-            .expect("the replacement selection is readable")
-            .as_str(),
-        Some("page")
+            .pointer_down(from.0, from.1, 1, PointerButton::Left, false)
+            .expect("the drag starts");
+        for step in 1..=6 {
+            let t = step as f32 / 6.0;
+            engine
+                .pointer_move(
+                    from.0 + (to.0 - from.0) * t,
+                    from.1 + (to.1 - from.1) * t,
+                    Some(PointerButton::Left),
+                )
+                .expect("a held-button move dispatches");
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        engine
+            .pointer_up(to.0, to.1, 1, PointerButton::Left, false)
+            .expect("the drag ends");
+        std::thread::sleep(Duration::from_millis(120));
+        engine
+            .evaluate("String(window.getSelection())")
+            .expect("the page selection is readable")
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    // A drag from inside the first paragraph into the second selects across the
+    // block boundary, which is the case a caret-derived range kept losing.
+    let across = drag(
+        &engine,
+        point(&engine, "one", 6, 10, false),
+        point(&engine, "two", 0, 5, true),
+    );
+    assert!(
+        across.contains("gamma") && across.contains("delta"),
+        "a drag across two paragraphs must select both halves: {across:?}"
+    );
+
+    // A later drag REPLACES the selection rather than extending it, and stays
+    // inside the first paragraph.
+    let within = drag(
+        &engine,
+        point(&engine, "one", 0, 5, false),
+        point(&engine, "one", 11, 16, true),
+    );
+    assert!(
+        within.contains("alpha") && within.contains("gamma"),
+        "a drag within one paragraph must select its own range: {within:?}"
+    );
+    assert!(
+        !within.contains("delta"),
+        "a later drag must replace the previous selection, not extend it: {within:?}"
+    );
+
+    // A field's own text is selectable too. This is the case the caret-based
+    // workaround refused outright, so a field could not be selected at all.
+    let field = engine
+        .evaluate(
+            "JSON.stringify((() => { const box = document.getElementById('ta').getBoundingClientRect(); \
+             return [box.left + 8, box.top + 12, box.left + 140]; })())",
+        )
+        .expect("the field box reads");
+    let field: Vec<f32> =
+        serde_json::from_str(field.as_str().expect("the field JSON")).expect("three");
+    engine
+        .pointer_down(field[0], field[1], 1, PointerButton::Left, false)
+        .expect("the field drag starts");
+    engine
+        .pointer_move(field[2], field[1], Some(PointerButton::Left))
+        .expect("the field drag moves");
+    engine
+        .pointer_up(field[2], field[1], 1, PointerButton::Left, false)
+        .expect("the field drag ends");
+    std::thread::sleep(Duration::from_millis(120));
+    let range = engine
+        .evaluate(
+            "JSON.stringify([document.getElementById('ta').selectionStart, \
+             document.getElementById('ta').selectionEnd])",
+        )
+        .expect("the field selection reads");
+    let range: Vec<i64> =
+        serde_json::from_str(range.as_str().expect("the range JSON")).expect("two");
+    assert!(
+        range[0] < range[1],
+        "a drag inside a textarea must select its text: {range:?}"
     );
 }
 
@@ -751,10 +819,10 @@ fn an_inline_link_reports_the_path_its_click_took() {
     let point: Vec<f32> = serde_json::from_str(point.as_str().expect("point is JSON"))
         .expect("two pointer coordinates");
     engine
-        .pointer_down(point[0], point[1], 1, false)
+        .pointer_down(point[0], point[1], 1, PointerButton::Left, false)
         .expect("the page receives the link press");
     engine
-        .pointer_up(point[0], point[1], 1, false)
+        .pointer_up(point[0], point[1], 1, PointerButton::Left, false)
         .expect("the page receives the link release");
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     while std::time::Instant::now() < deadline && !engine.url().expect("a URL").ends_with("/next") {
@@ -1016,8 +1084,12 @@ fn a_double_click_selects_the_word_and_a_triple_click_the_line() {
 
     // A single click selects nothing in document text, which is what makes the
     // double-click assertion discriminate.
-    engine.pointer_down(x, y, 1, false).expect("press");
-    engine.pointer_up(x, y, 1, false).expect("release");
+    engine
+        .pointer_down(x, y, 1, PointerButton::Left, false)
+        .expect("press");
+    engine
+        .pointer_up(x, y, 1, PointerButton::Left, false)
+        .expect("release");
     std::thread::sleep(Duration::from_millis(80));
     let single = engine
         .evaluate("String(window.getSelection())")
@@ -1028,8 +1100,12 @@ fn a_double_click_selects_the_word_and_a_triple_click_the_line() {
         "a single click must not select a word"
     );
 
-    engine.pointer_down(x, y, 2, false).expect("press");
-    engine.pointer_up(x, y, 2, false).expect("release");
+    engine
+        .pointer_down(x, y, 2, PointerButton::Left, false)
+        .expect("press");
+    engine
+        .pointer_up(x, y, 2, PointerButton::Left, false)
+        .expect("release");
     std::thread::sleep(Duration::from_millis(80));
     let word = engine
         .evaluate("String(window.getSelection())")
@@ -1040,14 +1116,21 @@ fn a_double_click_selects_the_word_and_a_triple_click_the_line() {
         "a double click must select exactly the word under the pointer"
     );
 
-    engine.pointer_down(x, y, 3, false).expect("press");
-    engine.pointer_up(x, y, 3, false).expect("release");
+    engine
+        .pointer_down(x, y, 3, PointerButton::Left, false)
+        .expect("press");
+    engine
+        .pointer_up(x, y, 3, PointerButton::Left, false)
+        .expect("release");
     std::thread::sleep(Duration::from_millis(80));
     let line = engine
         .evaluate("String(window.getSelection())")
         .expect("selection reads");
+    // Chromium's own triple click takes the whole block and keeps the block
+    // boundary's newlines in the string, so the comparison trims them. The
+    // selection is the page's, not a script's: no caller supplies a range.
     assert_eq!(
-        line.as_str().unwrap_or_default(),
+        line.as_str().unwrap_or_default().trim(),
         "alpha beta gamma",
         "a triple click must select the line (the block, for this fixture)"
     );
@@ -1111,8 +1194,12 @@ fn a_release_at_the_clamped_edge_clears_the_page_drag() {
     assert_eq!(navigation, Navigation::Loaded);
     std::thread::sleep(Duration::from_millis(120));
 
-    engine.pointer_down(100.0, 100.0, 1, false).expect("press");
-    engine.pointer_move(140.0, 120.0, true).expect("drag");
+    engine
+        .pointer_down(100.0, 100.0, 1, PointerButton::Left, false)
+        .expect("press");
+    engine
+        .pointer_move(140.0, 120.0, Some(PointerButton::Left))
+        .expect("drag");
     std::thread::sleep(Duration::from_millis(80));
     let dragging = engine
         .evaluate(
@@ -1127,7 +1214,9 @@ fn a_release_at_the_clamped_edge_clears_the_page_drag() {
 
     // The clamp the pane applies to a release outside its frame: the page's
     // far edge. The engine must deliver it as a real release.
-    engine.pointer_up(799.0, 599.0, 1, false).expect("release");
+    engine
+        .pointer_up(799.0, 599.0, 1, PointerButton::Left, false)
+        .expect("release");
     std::thread::sleep(Duration::from_millis(80));
     let after = engine
         .evaluate(
@@ -1513,5 +1602,89 @@ fn the_frame_mailbox_takes_only_a_published_newer_frame() {
     assert!(
         frames.take_newer(seq).is_none(),
         "the frame was consumed once"
+    );
+}
+
+/// A right press is a secondary click the page can see, and a middle press is
+/// the wheel button.
+///
+/// The pane used to send `button: "left"` on every event, so a page's own
+/// `contextmenu` and `auxclick` handlers never ran: the reader's right click
+/// was a left click the page never asked for.
+#[test]
+fn a_right_press_raises_contextmenu_and_a_middle_press_its_own_button() {
+    let html = "<!doctype html><html><body>\
+        <div id=\"pad\" style=\"width:400px;height:200px;background:#eee\">pad</div>\
+        <script>\
+        window.__log = [];\
+        ['mousedown','mouseup','contextmenu','auxclick','click'].forEach(function(k){\
+          document.addEventListener(k, function(e){\
+            window.__log.push([k, e.button, e.detail]); });\
+        });\
+        </script></body></html>";
+    let origin = Origin::start(String::from(html));
+    let Some(engine) = engine() else {
+        return;
+    };
+    engine
+        .navigate_settling(&format!("http://127.0.0.1:{}/", origin.port), Settle::Idle)
+        .expect("the page should load");
+    std::thread::sleep(Duration::from_millis(120));
+
+    engine
+        .pointer_down(40.0, 40.0, 1, PointerButton::Right, false)
+        .expect("the right press");
+    engine
+        .pointer_up(40.0, 40.0, 1, PointerButton::Right, false)
+        .expect("the right release");
+    std::thread::sleep(Duration::from_millis(150));
+    let log = engine
+        .evaluate("JSON.stringify(window.__log)")
+        .expect("the log reads");
+    let log: serde_json::Value =
+        serde_json::from_str(log.as_str().expect("a JSON string")).expect("the log JSON");
+    let entries = log.as_array().cloned().unwrap_or_default();
+    let saw = |kind: &str, button: u64| {
+        entries
+            .iter()
+            .any(|entry| entry[0].as_str() == Some(kind) && entry[1].as_u64() == Some(button))
+    };
+    assert!(
+        saw("mousedown", 2),
+        "a right press must reach the page with button 2: {log}"
+    );
+    assert!(
+        saw("contextmenu", 2),
+        "a right press must raise the page's contextmenu: {log}"
+    );
+
+    engine
+        .evaluate("window.__log = []")
+        .expect("the log resets");
+    engine
+        .pointer_down(40.0, 40.0, 1, PointerButton::Middle, false)
+        .expect("the middle press");
+    engine
+        .pointer_up(40.0, 40.0, 1, PointerButton::Middle, false)
+        .expect("the middle release");
+    std::thread::sleep(Duration::from_millis(150));
+    let log = engine
+        .evaluate("JSON.stringify(window.__log)")
+        .expect("the log reads");
+    let log: serde_json::Value =
+        serde_json::from_str(log.as_str().expect("a JSON string")).expect("the log JSON");
+    let entries = log.as_array().cloned().unwrap_or_default();
+    let saw = |kind: &str, button: u64| {
+        entries
+            .iter()
+            .any(|entry| entry[0].as_str() == Some(kind) && entry[1].as_u64() == Some(button))
+    };
+    assert!(
+        saw("mousedown", 1),
+        "a middle press must reach the page with button 1: {log}"
+    );
+    assert!(
+        saw("auxclick", 1),
+        "a middle release must be the page's auxclick: {log}"
     );
 }

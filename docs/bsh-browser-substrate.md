@@ -55,6 +55,30 @@ is a silent behaviour bug rather than an error:
   `MOUSE_GAIN`) so one detent is a comfortable step; a trackpad's precise pixel
   delta passes through untouched because its hardware already carries momentum.
 
+A press forwards the button it was made with. CDP names the button in `button`
+and reports the held set in `buttons` (left 1, right 2, middle 4), so a right
+press reaches the page as a secondary click and its `contextmenu`, and a middle
+press as `auxclick`. One button is held at a time.
+
+A drag move carries BOTH: `button` names the button being dragged with and
+`buttons` is the held set. That pair is the whole selection mechanism, and it is
+not optional - MEASURED, a move with `button: "none"` and `buttons: 1` reads as a
+hover, so Chromium selects nothing while dragging and nothing after the release,
+while the same drag with `button: "left"` selects the crossed text, works across
+block boundaries, and selects inside a textarea. The page's own default
+selection is therefore what the pane relies on: the pane does not synthesize a
+range from carets.
+
+The click count rides the press AND its release, because that is what becomes
+the page's `event.detail` and its `dblclick`. The count is the platform's
+(`MouseDownEvent::click_count`), measured in window coordinates against the
+real double-click interval, so a viewport resize between two presses cannot
+reset it; the pane does not time it itself. Chromium turns that count into its
+own default selection - `1` places the caret, `2` selects the word, `3` the
+line/block - so no script supplies the word or the line either. A triple click's
+native string keeps the block boundary's newlines, which is why a test compares
+it trimmed.
+
 Keys carry their physical modifier mask instead of folding Shift into the key
 name, so Shift+Arrow extends a selection and Cmd/Ctrl+Arrow jumps a line.
 Composed characters are typed: macOS `Option`+`a` produces `å` and is forwarded

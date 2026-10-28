@@ -171,7 +171,9 @@ distributed, and these are all of its shipped forms:
 - `:141` — `Instructions from: ${file.displayPath}\n\n${file.content}`
 
 The discovery is budgeted (`maxBytes` `65536` in the standard preset) and the
-model sees a `<system-reminder>` frame.
+model sees a `<system-reminder>` frame. BSH sends 16,384 of those bytes, not
+65,536 (see §5): the text is rebuilt into EVERY turn of EVERY step here, so its
+size is a per-request cost rather than a cached one.
 
 Measured discovery, now reproduced by
 [`crates/bsh/src/instructions.rs`](../crates/bsh/src/instructions.rs):
@@ -239,7 +241,7 @@ Injection order for one turn:
 |---|---|---|---|
 | harness identity | `crates/agent/src/agent/prompts.rs:19` | system, first | `You are an AI agent powered by BOS Harness.` |
 | default persona | `crates/agent/src/agent/prompts.rs:28` | system, persona slot | `You are a coding agent working directly in the user's workspace, powered by the selected model.` |
-| workflow guidance | `crates/agent/src/agent/prompts.rs:39` | system, always | five rules: plan with `update_plan`, small verifiable increments, verify before claiming done, ask only for what inspection cannot answer, report honestly and briefly |
+| workflow guidance | `crates/agent/src/agent/prompts.rs:39` | system, always | seven rules opening with the harness bar: **act now** (call the tool in the same message), **think briefly** (decide, then call), then plan once with `update_plan`, small verifiable increments, verify before claiming done, ask only for what inspection cannot answer, report honestly and briefly |
 | default prompt | `crates/agent/src/agent/prompts.rs:53` | fallback persona | identity + default persona + workflow, blank-line joined |
 | complete persona | `agent::prompts::compose_system_prompt_with` via `crates/bsh/src/caps.rs` | system, sole section | the persona text alone: no identity, no workflow, no tool guidance |
 | runtime context snapshot | `crates/bsh/src/context.rs` | first user message, every turn | `Current runtime context. This snapshot supersedes earlier runtime-context snapshots.` + cwd / sandbox / permission / preset (+ delegation context in a child) |
@@ -329,9 +331,11 @@ BSH could follow and now does; **n/a** = DSH capability BSH lacks, so no prompt.
    every attachment and appends a rule only when the tool is in the registry, so
    a read-only build no longer carries the shell rule. The subagent rule is last,
    which preserves the child-prompt truncation contract.
-4. **The default prompt is the reference's shape.** It now opens with the harness
-   identity and the coding-agent persona, then the five workflow rules, instead
-   of a flat five-bullet list. It names only tools BSH registers.
+4. **The default prompt is the reference's shape, with BSH's harness bar.** It
+   opens with the harness identity and the coding-agent persona, then the seven
+   workflow rules: the reference's plan/increment/verify/ask/report set, preceded
+   by the two BSH adds that make the agent act instead of narrate (`Act now`,
+   `Think briefly`). It names only tools BSH registers.
 5. **The plan tool description carries the todo guidance.** `update_plan` now
    says what DSH's `todo_write` says, in BSH's item vocabulary.
 6. **The plan directive gained DSH's inspection rule** without naming
@@ -378,6 +382,7 @@ BSH could follow and now does; **n/a** = DSH capability BSH lacks, so no prompt.
 | the reference drops an unreadable instruction file | BSH names it in the injected text | deliberate honesty deviation; the file stays visible in the prompt instead of vanishing |
 | `${model}` interpolation | a const prompt is not re-rendered per request; the model id is on the wire and in the Models pane | persona names "the selected model" |
 | injected context in the durable transcript | the snapshot and instructions are per-turn request messages, rebuilt from the current build; BSH's stored transcript and context meter do not carry/pay for them | stated limit: re-rendering each turn is the contract (a switch must not be baked into history), and the meter still prices the stored conversation |
+| workspace instruction budget: 16,384 bytes, not the reference's 65,536 | the reference renders the baseline into the system prompt it caches; BSH re-injects it as a user message on every turn and re-sends the request on every tool step, so 65,536 bytes of a large `AGENTS.md` costs roughly 16k prompt tokens PER REQUEST | performance wins over parity here (the crate's own rule): 16,384 keeps a normal `AGENTS.md` whole, a larger one is truncated most-specific-first with the named budget marker, and the model can `read_file` the rest when a rule matters |
 | shipped preset roster | BSH ships `standard`/`ptc`/`creator`/`read-only`; DSH ships `standard`/`ptc`/`minimal`/`cordis` | BSH ids and personas kept; `complete = true` is available to any preset, so a future `minimal` needs no engine change |
 
 ---
@@ -388,7 +393,7 @@ BSH could follow and now does; **n/a** = DSH capability BSH lacks, so no prompt.
 |---|---|---|
 | `agent::prompts::tests::default_prompt_is_the_composition` | agent | the default literal is exactly identity + persona + workflow; deleting a line from either side fails |
 | `agent::prompts::tests::a_persona_replaces_only_the_persona_slot` | agent | a persona cannot drop the identity or the workflow |
-| `agent::prompts::tests::the_default_prompt_pins_every_workflow_rule` | agent | all five rules survive an edit |
+| `agent::prompts::tests::the_default_prompt_pins_every_workflow_rule` | agent | all seven rules survive an edit, including the tool-first pair (`Act now`, `Think briefly`) |
 | `agent::prompts::tests::no_stale_reference_to_a_removed_tool` | agent | no removed DSH tool name appears |
 | `agent::agentic::tests::the_system_prompt_is_the_persona_the_request_carries` | agent | the built request's persona equals the configured prompt and starts with the identity (a mock vendor records the argument) |
 | `agent::agentic::tests::the_compaction_request_carries_the_pinned_instruction` | agent | an overflow summarizer request actually ends with `COMPACTION_INSTRUCTION` |
@@ -412,7 +417,7 @@ BSH could follow and now does; **n/a** = DSH capability BSH lacks, so no prompt.
 | `instructions::tests::an_unchanged_file_is_not_re_read_and_an_edit_is_picked_up` | bsh | an unchanged `(path, mtime)` is a cache hit (read counter stays); a rewrite is read on the next turn |
 | `instructions::tests::an_unreadable_file_is_reported_in_the_text` | bsh | invalid UTF-8 is named with its reason, not dropped |
 | `instructions::tests::a_workspace_without_instructions_renders_nothing` | bsh | no file means `None`, not an empty message |
-| `instructions::tests::the_rendered_batch_is_bounded_and_names_the_truncation` | bsh | the 65,536-byte budget holds and the marker names the truncation |
+| `instructions::tests::the_rendered_batch_is_bounded_and_names_the_truncation` | bsh | the 16,384-byte budget holds and the marker names the truncation |
 | `instructions::tests::a_trim_identical_sibling_collapses_within_its_directory` | bsh | trimmed-identical siblings collapse behind the earlier candidate |
 | `instructions::tests::the_display_path_is_project_relative` | bsh | the model reads project-relative paths, never the scratch root |
 | `context::tests::the_snapshot_carries_the_live_facts` | bsh | the snapshot opens with the reference heading and states cwd, sandbox, permission and preset |
@@ -428,7 +433,7 @@ BSH could follow and now does; **n/a** = DSH capability BSH lacks, so no prompt.
 
 Missing-prompt regression, measured (each edit restored afterwards):
 
-- deleting `3. Verify before you claim done. …` from `WORKFLOW_GUIDANCE`
+- deleting `5. Verify before you claim done. …` from `WORKFLOW_GUIDANCE`
   makes `default_prompt_is_the_composition` fail with
   `assertion left == right failed` (the literal no longer matches the pieces);
 - deleting the same line from the `DEFAULT_SYSTEM_PROMPT` literal makes

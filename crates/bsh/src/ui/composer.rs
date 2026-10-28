@@ -8,6 +8,8 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::Disableable as _;
 use gpui_kit::*;
 
+use std::sync::Arc;
+
 use super::shell::Shell;
 use super::todo_panel::spinner;
 use super::{hairline_all, icon, txt, DivExt, IconName};
@@ -37,6 +39,19 @@ const MODEL_CHIP_CAP: f32 = 360.0;
 /// The modules size their own icon box at 14px (`triggerIcon svg`); the chevron
 /// comes from the same icon primitives, so it takes the same box.
 const CHIP_CHEVRON: f32 = 14.0;
+
+/// The reference's draft-attachment tiles, measured from
+/// `AttachmentRail.module.css` and `ComposerAttachments.module.css`: a 64px
+/// square at radius-xl inside a rail whose items are 10px apart, inset 10px a
+/// side with a 2px top pad and pulled 6px into the editor's gap.
+const ATTACHMENT_TILE: f32 = 64.0;
+const ATTACHMENT_GAP: f32 = 10.0;
+const ATTACHMENT_PAD: f32 = 10.0;
+const ATTACHMENT_TOP: f32 = 2.0;
+const ATTACHMENT_PULL: f32 = -6.0;
+/// `.remove{width:18px;height:18px}` at `top:4px;right:4px`.
+const ATTACHMENT_REMOVE: f32 = 18.0;
+const ATTACHMENT_REMOVE_INSET: f32 = 4.0;
 
 /// What the model chip needs to name the model and fill its menu: the label it
 /// shows, the effort suffix the trigger appends, the active id, the catalog rows
@@ -74,6 +89,14 @@ pub(crate) fn permission_modes() -> [(&'static str, &'static str); 3] {
 /// bsh is the queue path the dock already shows.
 pub(crate) fn primary_stops(streaming: bool, can_send: bool) -> bool {
     streaming && !can_send
+}
+
+/// The measured rule for the primary control's enabled look.
+///
+/// The reference's `empty = draft.trim() === "" && attachments.length === 0`,
+/// so an image with no words is still sendable and the arrow stays live.
+pub(crate) fn can_send(draft: &str, attachments: usize) -> bool {
+    !draft.trim().is_empty() || attachments > 0
 }
 
 /// The composer's placeholder, fitted to the field's own content width.
@@ -393,7 +416,7 @@ impl Shell {
     pub(crate) fn render_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let lang = self.state.lang;
         let streaming = self.state.any_streaming();
-        let can_send = !self.composer_value.trim().is_empty();
+        let sendable = can_send(&self.composer_value, self.state.attachments.len());
         // One resolution per frame: `effective()` clones a whole resolved
         // workspace, and the chip asks three separate facts of it. The
         // resolution is the ACTIVE SESSION's choice, which is what the menu
@@ -484,7 +507,23 @@ impl Shell {
                                     })
                                     .on_token_click(cx.listener(|this, event, window, cx| {
                                         this.open_reference_chip(event, window, cx);
-                                    })),
+                                    }))
+                                    // Measured: the reference's editor takes files
+                                    // and images from the clipboard before the
+                                    // field sees text. The kit hands the payload
+                                    // here for exactly that; a paste the shell does
+                                    // not take falls through to the kit's own text
+                                    // insertion.
+                                    .on_paste({
+                                        let shell = cx.entity().downgrade();
+                                        move |item, window, cx| {
+                                            shell
+                                                .update(cx, |this, cx| {
+                                                    this.paste_clipboard(item, window, cx)
+                                                })
+                                                .unwrap_or(false)
+                                        }
+                                    }),
                             ),
                     )
                     .child(
@@ -554,7 +593,7 @@ impl Shell {
                                         lang,
                                         cx,
                                     ))
-                                    .child(self.send_button(streaming, can_send, lang, cx)),
+                                    .child(self.send_button(streaming, sendable, lang, cx)),
                             ),
                     )
                     // Measured `.card{position:absolute;bottom:calc(100% + 4px);
@@ -964,34 +1003,81 @@ impl Shell {
             ))
     }
 
-    /// The chips naming the images attached to the next turn.
+    /// The reference's draft-attachment rail: one 64px tile per image, under
+    /// the card's own 2px top pad and a 10px side inset, pulled 6px into the
+    /// editor's gap.
+    ///
+    /// Measured (`ComposerAttachments.module.css` / `AttachmentRail.module.css`):
+    /// `.rail{margin-bottom:-6px;padding:2px 10px 0}`, `.item{height:64px}`,
+    /// `.thumbnail{width:64px;height:64px;border:.5px solid
+    /// border-l2-darkmode-thin;border-radius:radius-xl;background:
+    /// interactive-bg-hover}` with an `object-fit:cover` picture inside, and
+    /// `.remove{width:18px;height:18px;border-radius:50%;background:
+    /// button-contrast-fill;color:label-primary-inverted;top:4px;right:4px;
+    /// opacity:0}` revealed by `.item:hover .remove`.
     fn attachment_row(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         if self.state.attachments.is_empty() {
             return None;
         }
-        let chips = self
+        let tiles = self
             .state
             .attachments
             .iter()
             .enumerate()
             .map(|(index, attachment)| {
-                let label = format!("{}  {}", attachment.name, '\u{2715}');
-                div()
-                    .debug_selector(move || format!("attachment-{index}"))
-                    .id(SharedString::from(format!("attachment-{index}")))
-                    .px(px(8.0))
-                    .py(px(3.0))
-                    .rounded(px(6.0))
-                    .bg(rgb(theme::hover()))
+                let group = SharedString::from(format!("attachment-tile-{index}"));
+                let remove = div()
+                    .debug_selector(move || format!("attachment-remove-{index}"))
+                    .id(SharedString::from(format!("attachment-remove-{index}")))
+                    .absolute()
+                    .top(px(ATTACHMENT_REMOVE_INSET))
+                    .right(px(ATTACHMENT_REMOVE_INSET))
+                    .w(px(ATTACHMENT_REMOVE))
+                    .h(px(ATTACHMENT_REMOVE))
+                    .rounded_full()
+                    .bg(rgb(theme::text()))
+                    .opacity(0.0)
+                    .group_hover(group.clone(), |style| style.opacity(1.0))
                     .cursor_pointer()
-                    .child(txt(label, theme::CHIP_SIZE, theme::muted()))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(icon(IconName::X, 12.0, theme::page()))
                     .on_click(cx.listener(move |this, _event, _window, cx| {
                         this.remove_attachment(index);
                         cx.notify();
-                    }))
+                    }));
+                let tile = div()
+                    .debug_selector(move || format!("attachment-{index}"))
+                    .id(SharedString::from(format!("attachment-{index}")))
+                    .group(group)
+                    .relative()
+                    .flex_none()
+                    .w(px(ATTACHMENT_TILE))
+                    .h(px(ATTACHMENT_TILE))
+                    .rounded(px(theme::RADIUS_XL))
+                    .overflow_hidden()
+                    .bg(rgb(theme::hover()))
+                    .child(tile_image(attachment))
+                    .child(remove);
+                hairline_all(tile).border_color(rgb(theme::border_soft()))
             })
             .collect::<Vec<_>>();
-        Some(div().flex().flex_row().gap(px(6.0)).children(chips))
+        Some(
+            div()
+                .debug_selector(|| "attachments".to_string())
+                .id("attachments")
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(ATTACHMENT_GAP))
+                .pl(px(ATTACHMENT_PAD))
+                .pr(px(ATTACHMENT_PAD))
+                .pt(px(ATTACHMENT_TOP))
+                .mb(px(ATTACHMENT_PULL))
+                .overflow_x_scroll()
+                .children(tiles),
+        )
     }
     /// The reference's `.primary`: a 34x34 round control on the info fill with
     /// a white 16px glyph, lifted the measured 2px and dimmed to 40% when there
@@ -1050,4 +1136,35 @@ impl Shell {
                 }
             }))
     }
+}
+
+/// One attachment's 64px picture, or its file name when the payload did not
+/// decode as an image.
+///
+/// The preview is already square and at 2x, so the element only asks GPUI for
+/// a cover fit; GPUI caches the decoded draw by the image's content id, so a
+/// re-created `Image` each frame reuses the atlas tile instead of adding one.
+fn tile_image(attachment: &crate::state::Attachment) -> AnyElement {
+    let Some(preview) = attachment.preview.clone() else {
+        return div()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .px(px(6.0))
+            .child(txt(
+                attachment.name.clone(),
+                theme::CHIP_SIZE,
+                theme::muted(),
+            ))
+            .into_any_element();
+    };
+    img(Arc::new(gpui_kit::Image::from_bytes(
+        gpui_kit::ImageFormat::Png,
+        preview.to_vec(),
+    )))
+    .w_full()
+    .h_full()
+    .object_fit(ObjectFit::Cover)
+    .into_any_element()
 }

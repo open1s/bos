@@ -113,6 +113,21 @@ pub(crate) fn selection_drag(dx: f32, dy: f32) -> bool {
     (dx * dx + dy * dy).sqrt() >= SELECTION_DRAG_PX
 }
 
+/// The MIME type and file extension one clipboard image format is sent as.
+///
+/// The set is the same four the picker accepts, because it is what the
+/// providers decode; a clipboard format outside it is refused with a notice
+/// rather than sent as bytes no provider reads.
+fn clipboard_image_mime(format: gpui_kit::ImageFormat) -> Option<(&'static str, &'static str)> {
+    match format {
+        gpui_kit::ImageFormat::Png => Some(("image/png", "png")),
+        gpui_kit::ImageFormat::Jpeg => Some(("image/jpeg", "jpg")),
+        gpui_kit::ImageFormat::Webp => Some(("image/webp", "webp")),
+        gpui_kit::ImageFormat::Gif => Some(("image/gif", "gif")),
+        _ => None,
+    }
+}
+
 /// The row text one classified compaction failure earns.
 ///
 /// One generic sentence used to hide every cause: a provider 400, an empty
@@ -315,17 +330,16 @@ pub(crate) struct Shell {
     /// The page frame's keyboard focus. A press takes it, so the page receives
     /// keys only while the reader is actually in the page.
     pub(crate) browser_focus: FocusHandle,
-    /// Whether a press that started INSIDE the page frame is still down.
+    /// Which button of a press that started INSIDE the page frame is still down.
     ///
     /// The window, not the frame, owns the rest of that gesture: a drag that
     /// leaves the pane keeps sending moves, and the release is delivered even
     /// when the pointer is outside the frame (see `browser_drag_outside` /
     /// `browser_release_outside`). Without the flag the page kept its drag
-    /// state after a release over the sidebar or outside the window.
-    pub(crate) browser_pressed: bool,
-    /// The page point where a text-selection drag began.
-    pub(crate) browser_drag_start: Option<(f32, f32)>,
-    /// The last press, for counting a double or triple click.
+    /// state after a release over the sidebar or outside the window. The button
+    /// is part of the flag so a right release cannot end a left drag.
+    pub(crate) browser_pressed: Option<MouseButton>,
+    /// The last press, so its release can carry the platform's click count.
     pub(crate) browser_click: Option<super::right_panel::BrowserClick>,
     /// The last printable character the page received as a KEY.
     ///
@@ -496,6 +510,12 @@ pub(crate) struct Shell {
     /// The measured height of every transcript row, so offscreen rows cost a
     /// spacer instead of a full message element on every frame.
     pub(crate) transcript_layout: std::cell::RefCell<super::transcript::TranscriptLayout>,
+    /// Decoded images for the transcript, keyed by durable row slot. A row's
+    /// original data URL is decoded once and the resulting GPUI image reused;
+    /// a repaint never base64-decodes, hashes or re-uploads the same picture.
+    pub(crate) transcript_images: std::cell::RefCell<super::transcript::TranscriptImageCache>,
+    /// The stored image the reader opened, drawn above the whole shell.
+    pub(crate) image_lightbox: Option<super::transcript::CachedTranscriptImage>,
     /// Parsed markdown bodies, one state entity per text, reused across frames.
     ///
     /// A `TextView` built from TEXT hands the state that text every frame, and
@@ -1462,6 +1482,19 @@ impl Shell {
             let Some(shell) = palette.upgrade() else {
                 return;
             };
+            // The lightbox is modal over the whole shell: Escape dismisses it
+            // wherever focus sits, and every other key is swallowed so editing
+            // cannot continue behind the overlay.
+            if shell.read(cx).image_lightbox.is_some() {
+                if event.keystroke.key.as_str() == "escape" {
+                    shell.update(cx, |this, cx| {
+                        this.image_lightbox = None;
+                        cx.notify();
+                    });
+                }
+                cx.stop_propagation();
+                return;
+            }
             if !shell.read(cx).composer_focused(window, cx) {
                 return;
             }
@@ -1511,8 +1544,7 @@ impl Shell {
             browser_last_move: None,
             browser_resize_want: None,
             browser_resize_at: None,
-            browser_pressed: false,
-            browser_drag_start: None,
+            browser_pressed: None,
             browser_click: None,
             browser_typed: None,
             preset_details: None,
@@ -1615,6 +1647,10 @@ impl Shell {
             transcript_layout: std::cell::RefCell::new(
                 super::transcript::TranscriptLayout::default(),
             ),
+            transcript_images: std::cell::RefCell::new(
+                super::transcript::TranscriptImageCache::default(),
+            ),
+            image_lightbox: None,
             body_states: std::cell::RefCell::new(std::collections::BTreeMap::new()),
             frame_trace: super::frame_trace::FrameTrace::from_env(),
             frame_no: 0,
@@ -1936,13 +1972,6 @@ impl Shell {
 
     /// Ask for files and mention them in the composer.
     pub(crate) fn attach_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let choice = self
-            .state
-            .active_id
-            .as_deref()
-            .map(|id| self.state.session_choice(id))
-            .unwrap_or_default();
-        let accepts = self.state.settings.accepts_image_for(&choice);
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: true,
@@ -1953,35 +1982,186 @@ impl Shell {
             let Ok(Ok(Some(paths))) = paths.await else {
                 return;
             };
-            let mut picked: Vec<crate::state::Attachment> = Vec::new();
-            let mut mention = String::new();
-            let mut refused = false;
-            for path in &paths {
-                match crate::state::Attachment::from_path(path) {
-                    Some(_) if !accepts => refused = true,
-                    Some(attachment) => picked.push(attachment),
-                    None => mention.push_str(&format!(" @{}", path.display())),
-                }
-            }
             this.update_in(cx, |this, window, cx| {
-                if refused {
-                    this.state.notice(
-                        crate::i18n::tr(this.state.lang, "composer.imageRefused").to_string(),
-                    );
-                }
-                this.state.attachments.extend(picked);
-                if !mention.is_empty() {
-                    let current = this.composer.read(cx).value().to_string();
-                    let next = format!("{current}{mention}");
-                    // Appending a picked path is an INSERT: the caret belongs
-                    // after it, not back at the draft's start.
-                    this.set_composer_text(&next, window, cx);
-                }
-                cx.notify();
+                this.intake_paths(&paths, window, cx);
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Whether the active session's model takes images.
+    ///
+    /// The picker, a paste and a drop ask this one question of the same choice
+    /// the next turn resolves, so no intake path can attach an image the send
+    /// would then refuse.
+    fn accepts_images(&self) -> bool {
+        let choice = self
+            .state
+            .active_id
+            .as_deref()
+            .map(|id| self.state.session_choice(id))
+            .unwrap_or_default();
+        self.state.settings.accepts_image_for(&choice)
+    }
+
+    /// Add one image from the clipboard, or say why it cannot be added.
+    fn attach_image(
+        &mut self,
+        name: String,
+        mime: &str,
+        bytes: &[u8],
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let attachment = crate::state::Attachment::from_bytes(name, mime, bytes);
+        self.push_attachment(attachment, bytes.len(), cx)
+    }
+
+    /// Queue one attachment for the next turn, or say why it cannot be queued.
+    ///
+    /// The ceilings are the reference's shipped defaults: the model must accept
+    /// images, a message carries at most `maxImagesPerMessage`, and one image
+    /// at most `maxImageBytes`. `bytes` is the encoded size, checked before
+    /// the payload is held rather than at the provider.
+    fn push_attachment(
+        &mut self,
+        attachment: crate::state::Attachment,
+        bytes: usize,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if bytes > crate::state::MAX_ATTACHMENT_BYTES {
+            let why = crate::i18n::tr(self.state.lang, "composer.imageTooLarge");
+            self.state.notice(why);
+            cx.notify();
+            return false;
+        }
+        if !self.accepts_images() {
+            let why = crate::i18n::tr(self.state.lang, "composer.imageRefused");
+            self.state.notice(why);
+            cx.notify();
+            return false;
+        }
+        if self.state.attachments.len() >= crate::state::MAX_ATTACHMENTS {
+            let why = crate::i18n::tr_args(
+                self.state.lang,
+                "composer.imageLimit",
+                &[
+                    ("count", crate::state::MAX_ATTACHMENTS.to_string()),
+                    ("size", "20 MB".to_string()),
+                ],
+            );
+            self.state.notice(why);
+            cx.notify();
+            return false;
+        }
+        self.state.attachments.push(attachment);
+        true
+    }
+
+    /// Take one list of picked or dropped paths: an image attaches, anything
+    /// else becomes an @mention in the draft.
+    ///
+    /// The file picker and the window drop target share this, so the two
+    /// intake paths cannot disagree about what an attachment is.
+    fn intake_paths(
+        &mut self,
+        paths: &[std::path::PathBuf],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut mention = String::new();
+        for path in paths {
+            if crate::state::image_mime(path).is_none() {
+                mention.push_str(&format!(" @{}", path.display()));
+                continue;
+            }
+            let size = std::fs::metadata(path)
+                .map(|meta| meta.len() as usize)
+                .unwrap_or(0);
+            let Some(attachment) = crate::state::Attachment::from_path(path) else {
+                continue;
+            };
+            self.push_attachment(attachment, size, cx);
+        }
+        self.mention(&mention, window, cx);
+        cx.notify();
+    }
+
+    /// Append the paths an intake could not attach as @ mentions.
+    fn mention(&mut self, mention: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if mention.is_empty() {
+            return;
+        }
+        let current = self.composer.read(cx).value().to_string();
+        // Appending a picked path is an INSERT: the caret belongs after it,
+        // not back at the draft's start.
+        self.set_composer_text(&format!("{current}{mention}"), window, cx);
+    }
+
+    /// Take a paste: an image attaches, a copied file attaches or is mentioned,
+    /// and text falls through to the field.
+    ///
+    /// Returns whether the paste was consumed; false lets the kit insert the
+    /// clipboard's text exactly as it did before.
+    pub(crate) fn paste_clipboard(
+        &mut self,
+        item: &gpui_kit::ClipboardItem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut took = false;
+        let mut mention = String::new();
+        for entry in item.entries() {
+            match entry {
+                gpui_kit::ClipboardEntry::Image(image) => {
+                    took = true;
+                    let Some((mime, extension)) = clipboard_image_mime(image.format) else {
+                        let why = crate::i18n::tr(self.state.lang, "composer.imageUnsupported");
+                        self.state.notice(why);
+                        continue;
+                    };
+                    self.attach_image(format!("image.{extension}"), mime, &image.bytes, cx);
+                }
+                gpui_kit::ClipboardEntry::ExternalPaths(paths) => {
+                    took = true;
+                    for path in paths.paths() {
+                        match crate::state::image_mime(path) {
+                            Some(_) => {
+                                let size = std::fs::metadata(path)
+                                    .map(|meta| meta.len() as usize)
+                                    .unwrap_or(0);
+                                let Some(attachment) = crate::state::Attachment::from_path(path)
+                                else {
+                                    continue;
+                                };
+                                self.push_attachment(attachment, size, cx);
+                            }
+                            None => mention.push_str(&format!(" @{}", path.display())),
+                        }
+                    }
+                }
+                gpui_kit::ClipboardEntry::String(_) => {}
+            }
+        }
+        self.mention(&mention, window, cx);
+        cx.notify();
+        // A clipboard that also carries text keeps the kit's own insertion:
+        // the reference pastes the text AND takes the files, and consuming the
+        // paste here would silently eat a copied caption.
+        let has_text = item.entries().iter().any(|entry| {
+            matches!(entry, gpui_kit::ClipboardEntry::String(text) if !text.text.is_empty())
+        });
+        took && !has_text
+    }
+
+    /// Attach what the operating system dropped on the window.
+    pub(crate) fn drop_files(
+        &mut self,
+        paths: &gpui_kit::ExternalPaths,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.intake_paths(paths.paths(), window, cx);
     }
 
     /// Ask for a folder and add it as a workspace.
@@ -2263,16 +2443,22 @@ impl Shell {
     /// Send the composer's text, or queue it while the session is running.
     pub(crate) fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.composer.read(cx).value().trim().to_string();
-        if text.is_empty() {
-            return;
-        }
+        // A subagent turn is text: an attachment belongs to the chat's own
+        // composer, so an image-only draft has nothing to say there.
         if let Some(id) = self
             .state
             .subagent
             .as_ref()
             .map(|subagent| subagent.id.clone())
         {
-            self.send_to_subagent(id, text, window, cx);
+            if !text.is_empty() {
+                self.send_to_subagent(id, text, window, cx);
+            }
+            return;
+        }
+        // Measured: the reference's `empty = draft.trim() === "" &&
+        // attachments.length === 0`, so an image with no words is a send.
+        if text.is_empty() && self.state.attachments.is_empty() {
             return;
         }
         let attachments = std::mem::take(&mut self.state.attachments);
@@ -2317,7 +2503,11 @@ impl Shell {
         let plan = self.state.active_plan_mode();
         let request = crate::state::turn_text(&text, plan);
         let input = crate::state::turn_input(&request, &attachments);
-        let display = crate::state::display_text(&text, &attachments);
+        // The transcript row keeps the reader's own words and the ORIGINAL image
+        // bytes. The filename marker was only a stand-in for a renderer this
+        // shell did not have; the durable data URLs now drive both the picture
+        // and the next request's binary blocks.
+        let images = crate::state::attachment_images(&attachments);
         // The session on screen is the one this send opens a turn in, so its
         // own model choice is what the gate and the build resolve.
         let choice = self
@@ -2343,9 +2533,18 @@ impl Shell {
             self.state.notice(why);
             return Submit::Refused(attachments);
         }
-        let Some((id, transcript, budget)) = self.state.begin_turn(&display) else {
+        let image_slot = self
+            .state
+            .active_session()
+            .map(|session| session.loaded_from + session.messages.len())
+            .unwrap_or(0);
+        let Some((id, transcript, budget)) = self.state.begin_turn_with_images(&text, &images)
+        else {
             return Submit::Refused(attachments);
         };
+        self.transcript_images
+            .borrow_mut()
+            .invalidate_from(image_slot);
         self.spawn_turn(id, input, transcript, budget, cx);
         Submit::Accepted
     }
@@ -2972,10 +3171,24 @@ impl Shell {
         let plan = self.state.plan_mode(id);
         let request = crate::state::turn_text(&queued.text, plan);
         let input = crate::state::turn_input(&request, &queued.attachments);
-        let display = crate::state::display_text(&queued.text, &queued.attachments);
-        let Some((transcript, budget)) = self.state.begin_turn_in(id, &display) else {
+        let images = crate::state::attachment_images(&queued.attachments);
+        let image_slot = self
+            .state
+            .store
+            .session(id)
+            .map(|session| session.loaded_from + session.messages.len())
+            .unwrap_or(0);
+        let Some((transcript, budget)) =
+            self.state
+                .begin_turn_in_with_images(id, &queued.text, &images)
+        else {
             return;
         };
+        if self.state.active_id.as_deref() == Some(id) {
+            self.transcript_images
+                .borrow_mut()
+                .invalidate_from(image_slot);
+        }
         self.spawn_turn(id.to_string(), input, transcript, budget, cx);
     }
 
@@ -3210,7 +3423,18 @@ impl Shell {
                         }
                         let failed = matches!(&event, AgentEvent::Error(_));
                         let done = matches!(&event, AgentEvent::Done);
+                        let steered = matches!(&event, AgentEvent::Steered { .. });
+                        let steered_slot = steered.then(|| {
+                            shell
+                                .state
+                                .store
+                                .session(&session_id)
+                                .map(|session| session.loaded_from + session.messages.len())
+                        });
                         shell.state.apply_event(&session_id, event);
+                        if let Some(Some(slot)) = steered_slot {
+                            shell.transcript_images.borrow_mut().invalidate_from(slot);
+                        }
                         if failed || done {
                             terminal = Some(failed);
                         } else {
@@ -4403,6 +4627,86 @@ impl Shell {
     }
 }
 
+impl Shell {
+    /// The stored image the reader opened, over the whole shell.
+    ///
+    /// The source is the cached image itself, so this overlay adds no decode or
+    /// upload. A backdrop press or the close control dismisses it; the image
+    /// stops its own press so a click on the picture does not close it.
+    fn render_image_lightbox(
+        &self,
+        viewport_w: f32,
+        viewport_h: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let image = self.image_lightbox.as_ref()?;
+        let available_w = (viewport_w - 96.0).max(64.0);
+        let available_h = (viewport_h - 96.0).max(64.0);
+        let scale = (available_w / image.width as f32).min(available_h / image.height as f32);
+        let width = (image.width as f32 * scale).max(1.0);
+        let height = (image.height as f32 * scale).max(1.0);
+        let close_label = self.state.lang.tr("chat.closeImage");
+        let aria = close_label.clone();
+        Some(
+            div()
+                .id("image-lightbox")
+                .debug_selector(|| "image-lightbox".to_string())
+                .absolute()
+                .inset_0()
+                .occlude()
+                .role(gpui_kit::Role::Dialog)
+                .aria_label(self.state.lang.tr("chat.imagePreview"))
+                .bg(rgba(0x0F1115E6))
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.image_lightbox = None;
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .id("image-lightbox-image")
+                        .on_click(cx.listener(|_this, _event, _window, cx| {
+                            cx.stop_propagation();
+                        }))
+                        .child(
+                            img(image.source.clone())
+                                .w(px(width))
+                                .h(px(height))
+                                .object_fit(ObjectFit::Contain),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("image-lightbox-close")
+                        .debug_selector(|| "image-lightbox-close".to_string())
+                        .absolute()
+                        .top(px(20.0))
+                        .right(px(20.0))
+                        .w(px(32.0))
+                        .h(px(32.0))
+                        .rounded_full()
+                        .bg(rgba(0xFFFFFF1A))
+                        .hover(|style| style.bg(rgba(0xFFFFFF2E)))
+                        .role(gpui_kit::Role::Button)
+                        .aria_label(aria)
+                        .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.image_lightbox = None;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }))
+                        .child(super::icon(super::IconName::X, 16.0, 0xFFFFFF)),
+                )
+                .into_any_element(),
+        )
+    }
+}
+
 impl Drop for Shell {
     fn drop(&mut self) {
         // Close the channels FIRST, then cancel the tasks. Closing is
@@ -4593,6 +4897,7 @@ impl Render for Shell {
             self.following_tail = true;
             self.think_open.clear();
             self.process_open.clear();
+            self.image_lightbox = None;
             self.compaction_open.clear();
             // The audit's folds name turn and call positions in the transcript
             // that just changed, so a switch closes them and starts the list at
@@ -4731,6 +5036,9 @@ impl Render for Shell {
             } else {
                 None
             };
+        let viewport = window.viewport_size();
+        let image_lightbox =
+            self.render_image_lightbox(viewport.width.as_f32(), viewport.height.as_f32(), cx);
         div()
             .id("shell-frame")
             .flex()
@@ -4738,6 +5046,15 @@ impl Render for Shell {
             .size_full()
             .overflow_hidden()
             .relative()
+            // A file dropped anywhere in the window is taken the way the
+            // picker takes it: an image attaches, anything else is mentioned.
+            // The reference installs this on the document; the frame is the
+            // element that spans this window.
+            .on_drop::<gpui_kit::ExternalPaths>(cx.listener(
+                |this, paths: &gpui_kit::ExternalPaths, window, cx| {
+                    this.drop_files(paths, window, cx);
+                },
+            ))
             // The reference's DragHandle captures its pointer, so its own
             // onPointerUp ends the drag; gpui hands the release back to the
             // pressed strip but the MOVES to whatever is under the pointer,
@@ -4759,9 +5076,12 @@ impl Render for Shell {
                 // press is down, the up went somewhere this window never heard
                 // about, so end the gesture now rather than leaving the page
                 // stuck in a drag.
-                if event.pressed_button.is_none() && this.browser_pressed {
-                    this.browser_release_outside(event.position);
-                    cx.notify();
+                if event.pressed_button.is_none() {
+                    if let Some(button) = this.browser_pressed {
+                        eprintln!("BSHPROBE root move releases stuck {:?}", button);
+                        this.browser_release_outside(event.position, button);
+                        cx.notify();
+                    }
                 }
                 // A drag that started in the browser page keeps reaching the
                 // page after it leaves the pane: the frame's own handler stops
@@ -4775,8 +5095,30 @@ impl Render for Shell {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseUpEvent, _window, cx| {
-                    if this.browser_pressed {
-                        this.browser_release_outside(event.position);
+                    eprintln!(
+                        "BSHPROBE root up {:?} pos={:?} pressed={:?}",
+                        event.button, event.position, this.browser_pressed
+                    );
+                    if this.browser_pressed == Some(event.button) {
+                        this.browser_release_outside(event.position, event.button);
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
+                    if this.browser_pressed == Some(event.button) {
+                        this.browser_release_outside(event.position, event.button);
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
+                    if this.browser_pressed == Some(event.button) {
+                        this.browser_release_outside(event.position, event.button);
                         cx.notify();
                     }
                 }),
@@ -4788,8 +5130,26 @@ impl Render for Shell {
             .on_mouse_up_out(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseUpEvent, _window, cx| {
-                    if this.browser_pressed {
-                        this.browser_release_outside(event.position);
+                    if this.browser_pressed == Some(event.button) {
+                        this.browser_release_outside(event.position, event.button);
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
+                    if this.browser_pressed == Some(event.button) {
+                        this.browser_release_outside(event.position, event.button);
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Middle,
+                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
+                    if this.browser_pressed == Some(event.button) {
+                        this.browser_release_outside(event.position, event.button);
                         cx.notify();
                     }
                 }),
@@ -4869,6 +5229,7 @@ impl Render for Shell {
             .when_some(confirm_trust, |root, confirm| root.child(confirm))
             .when_some(confirm_vault_delete, |root, confirm| root.child(confirm))
             .when_some(trash, |root, panel| root.child(panel))
+            .when_some(image_lightbox, |root, lightbox| root.child(lightbox))
             // The frame clock: a zero-size canvas painted last, so the value it
             // records covers this frame's render, layout, prepaint and paint.
             // Appended only while the trace is open; with it off this is one

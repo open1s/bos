@@ -504,9 +504,13 @@ mod tests {
                     _ => None,
                 })
                 .collect();
-            Ok(Box::pin(futures::stream::iter(vec![Ok(
-                react::llm::StreamToken::Done,
-            )])))
+            // A real turn says something; an empty stream would trip the
+            // engine's blank-answer retry and add a harness note this test is
+            // not about.
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(react::llm::StreamToken::Text("ok".to_string())),
+                Ok(react::llm::StreamToken::Done),
+            ])))
         }
 
         fn provider_name(&self) -> &'static str {

@@ -769,11 +769,16 @@ impl Settings {
     /// means. There is no workspace-level default: a session that names
     /// nothing has no model rather than inheriting someone else's.
     pub(crate) fn effective_for(&self, session: &resolve::SessionChoice) -> Effective {
-        let entry = self
-            .global
-            .workspaces
-            .iter()
-            .find(|w| w.id == self.global.general.active_workspace);
+        // A chat's workspace is the session's own. The active workspace is the
+        // window's preference (where a new chat is created), so it is only the
+        // fallback for a session that names none - a blank session, or one
+        // written before sessions carried a workspace id.
+        let workspace_id = session
+            .workspace
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or(&self.global.general.active_workspace);
+        let entry = self.global.workspaces.iter().find(|w| w.id == workspace_id);
         // The catalogue comes from the cache, keyed by the settings that name
         // it: a frame resolves several times, and only the first may touch disk.
         let (skill_sources, skills) = self.skill_cache.resolve(&self.global, &self.workspace);
@@ -1050,6 +1055,40 @@ mod tests {
         assert_eq!(settings.global.general.transcript_view, "standard");
     }
 
+    /// A turn runs in the workspace its CHAT belongs to, not in whichever
+    /// workspace the window last pointed at.
+    ///
+    /// That root is the shell's cwd, the tree the file tools may touch, and the
+    /// directory the runtime snapshot tells the model it is standing in. Taking
+    /// it from the active workspace is what let a chat opened from another
+    /// workspace run `pwd` in the wrong project.
+    #[test]
+    fn a_session_resolves_its_own_workspace_root() {
+        let mut settings = Settings::default();
+        let hello = settings.note_workspace("hello", "/tmp/bsh-hello");
+        let bos = settings.note_workspace("bos", "/tmp/bsh-bos");
+        settings.global.general.active_workspace = bos.clone();
+
+        let chat = super::resolve::SessionChoice {
+            workspace: Some(hello),
+            ..Default::default()
+        };
+        assert_eq!(
+            settings.effective_for(&chat).root,
+            "/tmp/bsh-hello",
+            "the chat's own workspace decides the root"
+        );
+
+        // A session that names none - a blank chat, or one written before
+        // sessions carried a workspace id - still follows the window.
+        let unnamed = super::resolve::SessionChoice::default();
+        assert_eq!(
+            settings.effective_for(&unnamed).root,
+            "/tmp/bsh-bos",
+            "no workspace on the session falls back to the active one"
+        );
+    }
+
     /// A fresh install ships no endpoint, so the first run asks for one rather
     /// than pretending a provider is configured.
     #[test]
@@ -1082,6 +1121,7 @@ mod tests {
                 model: model.to_string(),
             }),
             preset: None,
+            ..Default::default()
         };
         assert_eq!(
             settings.refusal_for(&crate::settings::resolve::SessionChoice::default()),
@@ -1141,6 +1181,7 @@ mod tests {
                 model: "fast".to_string(),
             }),
             preset: None,
+            ..Default::default()
         };
         assert_eq!(
             settings.refusal_for(&choice),
@@ -1381,6 +1422,7 @@ mod tests {
                 model: "fast".to_string(),
             }),
             preset: None,
+            ..Default::default()
         };
         let effective = settings.effective_for(&choice);
         assert_eq!(effective.provider, "p");
@@ -1420,6 +1462,7 @@ mod tests {
                 model: "m".to_string(),
             }),
             preset: None,
+            ..Default::default()
         };
         assert!(
             settings.accepts_image_for(&choice),

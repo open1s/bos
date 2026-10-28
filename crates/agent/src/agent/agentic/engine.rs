@@ -185,35 +185,13 @@ impl Agent {
                 .map(|s| s.metadata.name.clone())
                 .collect();
 
-            for skill in &self.skills {
-                let skill_name = skill.metadata.name.clone();
-                let skill_desc = format!("Get instructions for the {} skill", skill_name);
-                let skill_instructions = skill.instructions.clone();
-                let skill_name_for_closure = skill_name.clone();
-                let skill_tool = Arc::new(FunctionTool::skill(
-                    &skill_name,
-                    &skill_desc,
-                    serde_json::json!({
-                        "type": "object",
-                        "properties": {},
-                        "required": []
-                    }),
-                    move |_args: &serde_json::Value| {
-                        Ok(serde_json::json!({
-                            "skill": skill_name_for_closure,
-                            "instructions": skill_instructions
-                        }))
-                    },
-                ));
-                builder =
-                    builder.with_tool(ToolVariant::Sync(Box::new(ExtensibleToolAdapter::new(
-                        skill_tool,
-                        self.plugins.clone(),
-                        self.hooks.clone(),
-                        self.config.name.clone(),
-                    ))));
-            }
-
+            // One tool for every skill is not an option: it puts a no-op entry
+            // in the request's tool array for each skill installed, which the
+            // model then has to read and choose between on every step. The
+            // catalog is already in the system prompt (the vendor appends the
+            // names and descriptions), so a single named loader is the whole
+            // surface: the model reads the list, calls load_skill for the one
+            // it needs, and the instructions arrive as the tool result.
             let load_skill_tool = Arc::new(FunctionTool::new(
                 "load_skill",
                 "Load a skill by name to get its instructions",

@@ -154,8 +154,21 @@ impl Failure {
     /// The failure for an engine that could not do what was asked.
     ///
     /// The engine's own sentence travels unchanged, with its install hint, so
-    /// the pane and the tool error say the same thing.
+    /// the pane and the tool error say the same thing - EXCEPT when the PAGE
+    /// refused to load. `Page.navigate` answers with Chromium's own `net::ERR_*`
+    /// text for a name that does not resolve or a port that is closed, and the
+    /// engine is healthy there: the failure takes the navigation vocabulary
+    /// this pane already has for a direct fetch, and the engine's "restart the
+    /// engine" advice is not appended to a failure that did not happen.
     pub(crate) fn from_engine(error: &engine::EngineError, url: &str) -> Self {
+        if let Some((kind, message)) = page_load_failure(error) {
+            return Self {
+                kind,
+                message,
+                rule: None,
+                url: url.to_string(),
+            };
+        }
         Self {
             kind: "engine",
             message: format!("{} {}", error.message(), error.hint()),
@@ -163,6 +176,43 @@ impl Failure {
             url: url.to_string(),
         }
     }
+}
+
+/// A navigation Chromium refused, in the pane's transport vocabulary.
+///
+/// Returns the cause and the engine's raw sentence. None keeps the failure the
+/// engine's own (a dead connection, a missing CDP method), where its message
+/// and hint are the right advice.
+fn page_load_failure(error: &engine::EngineError) -> Option<(&'static str, String)> {
+    let engine::EngineError::Rpc { method, error: rpc } = error else {
+        return None;
+    };
+    if method != "Page.navigate" {
+        return None;
+    }
+    let text = rpc.message.as_str();
+    let kind = if text.contains("NAME_NOT_RESOLVED") || text.contains("NAME_RESOLUTION_FAILED") {
+        "dns"
+    } else if text.contains("CERT_") || text.contains("SSL_") {
+        "tls"
+    } else if text.contains("TOO_MANY_REDIRECTS") {
+        "redirect"
+    } else if text.contains("UNKNOWN_URL_SCHEME")
+        || text.contains("DISALLOWED_URL_SCHEME")
+        || text.contains("INVALID_URL")
+        || text.contains("UNSAFE_PORT")
+    {
+        "scheme"
+    } else if text.contains("CONNECTION_")
+        || text.contains("ADDRESS_UNREACHABLE")
+        || text.contains("EMPTY_RESPONSE")
+        || text.contains("INTERNET_DISCONNECTED")
+    {
+        "connect"
+    } else {
+        return None;
+    };
+    Some((kind, text.to_string()))
 }
 
 /// What an element is, for the kind of interaction a ref accepts.
@@ -3577,6 +3627,62 @@ mod tests {
             doc.elements[0].label.contains("More information"),
             "the label: {:?}",
             doc.elements[0].label
+        );
+    }
+
+    /// A page Chromium could not load takes the pane's transport vocabulary.
+    ///
+    /// `Page.navigate` answers with `net::ERR_*` when the PAGE cannot load and
+    /// the engine is healthy. Reporting that as an engine failure put "the
+    /// text view is still usable / reopen the tab to start a new engine" in
+    /// front of a reader whose only problem was a typo in a host name.
+    #[test]
+    fn a_navigation_chromium_refused_is_a_load_failure() {
+        use crate::browser::engine::cdp::wire::RpcError;
+        use crate::browser::engine::EngineError;
+
+        let navigation = |text: &str| EngineError::Rpc {
+            method: String::from("Page.navigate"),
+            error: RpcError {
+                code: 0,
+                message: text.to_string(),
+                data: None,
+            },
+        };
+        let cases = [
+            ("net::ERR_NAME_NOT_RESOLVED", "dns"),
+            ("net::ERR_CERT_AUTHORITY_INVALID", "tls"),
+            ("net::ERR_SSL_PROTOCOL_ERROR", "tls"),
+            ("net::ERR_CONNECTION_REFUSED", "connect"),
+            ("net::ERR_EMPTY_RESPONSE", "connect"),
+            ("net::ERR_TOO_MANY_REDIRECTS", "redirect"),
+            ("net::ERR_UNKNOWN_URL_SCHEME", "scheme"),
+            ("net::ERR_UNSAFE_PORT", "scheme"),
+        ];
+        for (text, kind) in cases {
+            let failure = Failure::from_engine(&navigation(text), "https://example.com/");
+            assert_eq!(failure.kind, kind, "{text}");
+            assert_eq!(failure.message, text, "the engine's own sentence travels");
+            assert!(
+                !failure.message.contains("text view"),
+                "no fallback advice for a load failure: {}",
+                failure.message
+            );
+        }
+        // A refusal that is NOT about the page keeps the engine's message and
+        // its advice, because the engine is what the reader then has to fix.
+        let engine = EngineError::Rpc {
+            method: String::from("Runtime.evaluate"),
+            error: RpcError {
+                code: -32601,
+                message: String::from("'Runtime.evaluate' wasn't found"),
+                data: None,
+            },
+        };
+        let failure = Failure::from_engine(&engine, "https://example.com/");
+        assert_eq!(failure.kind, "engine");
+        assert!(
+            failure.message.contains("did not implement") || failure.message.contains("refused")
         );
     }
 }

@@ -15,7 +15,10 @@ use gpui_kit::component::tooltip::Tooltip;
 fn open_link(url: &SharedString, _event: &ClickEvent, _window: &mut Window, cx: &mut App) {
     cx.open_url(url);
 }
+use base64::Engine as _;
 use gpui_kit::*;
+use std::collections::{HashMap, VecDeque};
+use std::io::Cursor;
 use std::sync::Arc;
 
 use super::shell::{BodySlot, ChangesHover, Shell};
@@ -33,6 +36,117 @@ const BODY: u8 = 0;
 /// by the tests that read a painted body back.
 pub(crate) const THINK: u8 = 1;
 const COMPACTION: u8 = 2;
+
+/// The reference's lone-image box: a 240px long edge, no upscaling, and a
+/// displayed aspect ratio clamped to `[0.25, 4]` (`singleFit`).
+const IMAGE_LONG_EDGE: f32 = 240.0;
+/// A gallery tile when a message carries more than one image.
+const IMAGE_TILE: f32 = 64.0;
+/// The frame's own minimum, so a tiny image still has a clickable box.
+const IMAGE_MIN_EDGE: f32 = 44.0;
+/// At most this many decoded images stay resident. The transcript only builds
+/// visible rows, so the working set is normally far smaller; the cap bounds a
+/// reader who scrolls a long image-heavy session.
+const IMAGE_CACHE_LIMIT: usize = 64;
+
+/// One decoded transcript image plus the natural dimensions its box uses.
+#[derive(Clone)]
+pub(crate) struct CachedTranscriptImage {
+    pub(crate) source: Arc<gpui_kit::Image>,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
+/// Decoded images for the ACTIVE transcript, keyed by durable row slot.
+///
+/// A row's global slot is `loaded_from + local index`, which paging never
+/// changes; a session switch clears the map. A failed decode is cached as
+/// `None`, so a malformed legacy row does not retry on every repaint.
+#[derive(Default)]
+pub(crate) struct TranscriptImageCache {
+    session: Option<String>,
+    entries: HashMap<(usize, usize), Option<CachedTranscriptImage>>,
+    order: VecDeque<(usize, usize)>,
+}
+
+impl TranscriptImageCache {
+    fn get(
+        &mut self,
+        session: &str,
+        slot: usize,
+        image: usize,
+        url: &str,
+    ) -> Option<CachedTranscriptImage> {
+        if self.session.as_deref() != Some(session) {
+            self.session = Some(session.to_string());
+            self.entries.clear();
+            self.order.clear();
+        }
+        let key = (slot, image);
+        if let Some(hit) = self.entries.get(&key) {
+            return hit.clone();
+        }
+        let decoded = decode_stored_image(url);
+        if self.entries.len() >= IMAGE_CACHE_LIMIT {
+            if let Some(evicted) = self.order.pop_front() {
+                self.entries.remove(&evicted);
+            }
+        }
+        self.order.push_back(key);
+        self.entries.insert(key, decoded.clone());
+        decoded
+    }
+
+    /// Drop cached rows from `slot` onward. A rewind can put a different image
+    /// into a slot a cached row used to own, so every append/mutation that can
+    /// reuse a slot invalidates from that point rather than from the beginning
+    /// (images above it are still the same bytes).
+    pub(crate) fn invalidate_from(&mut self, slot: usize) {
+        self.entries.retain(|(message, _), _| *message < slot);
+        self.order.retain(|(message, _)| *message < slot);
+    }
+}
+
+/// Decode one durable data URL into a GPUI image and its natural dimensions.
+///
+/// The base64 payload is the ORIGINAL file, so its MIME/formats are preserved.
+/// This runs once per visible row (the cache owns the result), never per frame.
+fn decode_stored_image(url: &str) -> Option<CachedTranscriptImage> {
+    let (mime, payload) = crate::state::parse_data_url(url)?;
+    let format = gpui_kit::ImageFormat::from_mime_type(mime)?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .ok()?;
+    let (width, height) = image::ImageReader::new(Cursor::new(bytes.as_slice()))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()?;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some(CachedTranscriptImage {
+        source: Arc::new(gpui_kit::Image::from_bytes(format, bytes)),
+        width,
+        height,
+    })
+}
+
+/// The reference's lone-image `singleFit` box in logical pixels.
+fn single_fit(width: u32, height: u32) -> (f32, f32) {
+    let natural = width as f32 / height as f32;
+    let ratio = natural.clamp(0.25, 4.0);
+    let (box_w, box_h) = if ratio >= 1.0 {
+        (IMAGE_LONG_EDGE, IMAGE_LONG_EDGE / ratio)
+    } else {
+        (IMAGE_LONG_EDGE * ratio, IMAGE_LONG_EDGE)
+    };
+    let scale = 1.0_f32.min(width as f32 / box_w).min(height as f32 / box_h);
+    (
+        (box_w * scale).round().max(1.0),
+        (box_h * scale).round().max(1.0),
+    )
+}
 
 /// How much of a STREAMING reasoning body the pane paints.
 ///
@@ -753,7 +867,7 @@ const MOUSE_GAIN: f32 = 2.0;
 ///
 /// Both kinds are resolved against the window's line height - the same conversion
 /// the scroller itself would have done - and only the coarse one is gained.
-fn wheel_delta(event: &ScrollWheelEvent, window: &mut Window) -> f32 {
+fn wheel_delta(event: &ScrollEvent, window: &mut Window) -> f32 {
     wheel_pixels(&event.delta, window.line_height())
 }
 
@@ -767,12 +881,7 @@ pub(crate) fn wheel_pixels(delta: &ScrollDelta, line_height: Pixels) -> f32 {
 }
 
 /// The chat transcript's wheel handler, named so the element chain stays small.
-fn chat_wheel(
-    this: &mut Shell,
-    event: &ScrollWheelEvent,
-    window: &mut Window,
-    cx: &mut Context<Shell>,
-) {
+fn chat_wheel(this: &mut Shell, event: &ScrollEvent, window: &mut Window, cx: &mut Context<Shell>) {
     let dy = wheel_delta(event, window);
     this.wheel_chat(dy, cx);
     cx.stop_propagation();
@@ -781,7 +890,7 @@ fn chat_wheel(
 /// The trajectory tab's wheel handler.
 pub(crate) fn traj_wheel(
     this: &mut Shell,
-    event: &ScrollWheelEvent,
+    event: &ScrollEvent,
     window: &mut Window,
     cx: &mut Context<Shell>,
 ) {
@@ -1157,6 +1266,29 @@ struct RowTurn {
     writing: bool,
 }
 
+/// The durable identity of one transcript row.
+///
+/// The session and its loading floor are here beside the local index because
+/// image caching keys on the GLOBAL row slot: paging shifts local indices but
+/// never the global one.
+#[derive(Clone, Copy)]
+struct MessageSlot<'a> {
+    session: &'a str,
+    loaded_from: usize,
+    index: usize,
+}
+
+/// One stored image inside a message gallery.
+#[derive(Clone, Copy)]
+struct StoredImage<'a> {
+    session: &'a str,
+    slot: usize,
+    index: usize,
+    selector: &'a str,
+    url: &'a str,
+    compact: bool,
+}
+
 impl Shell {
     /// The reference's own markdown scale, measured from its theme tokens.
     ///
@@ -1412,8 +1544,19 @@ impl Shell {
                 writing: live && index == last,
             };
             rows.push(
-                self.message_row(index, message, row, last_user, &chrome, cx)
-                    .into_any_element(),
+                self.message_row(
+                    MessageSlot {
+                        session: &session.id,
+                        loaded_from: session.loaded_from,
+                        index,
+                    },
+                    message,
+                    row,
+                    last_user,
+                    &chrome,
+                    cx,
+                )
+                .into_any_element(),
             );
         }
         // Markers committed at (or beyond) the current end, and legacy records,
@@ -1440,7 +1583,10 @@ impl Shell {
         // sees their interjection land. The durable row replaces it when the
         // `Steered` delivery arrives.
         for queued in self.state.pending_steers(&session.id) {
-            rows.push(self.pending_steer_row(queued).into_any_element());
+            rows.push(
+                self.pending_steer_row(&session.id, queued, cx)
+                    .into_any_element(),
+            );
         }
         // The reference puts a turn-jump rail down the transcript's right edge.
         // The scroll handle records each child's painted bounds, so a tick can jump
@@ -1619,8 +1765,8 @@ impl Shell {
                     // delta becomes a target the frame loop eases towards, and
                     // taking it also stops the tail-follow from pinning the
                     // transcript back to the newest message.
-                    .on_scroll_wheel(cx.listener(chat_wheel))
-                    .on_scroll_wheel(cx.listener(|_this, _event, _window, cx| cx.notify()))
+                    .on_scroll(cx.listener(chat_wheel))
+                    .on_scroll(cx.listener(|_this, _event, _window, cx| cx.notify()))
                     // Copy on selection: the press records where it started, and
                     // a release that travelled far enough takes the window's
                     // selection to the clipboard. A click is not a selection, so
@@ -1904,7 +2050,7 @@ impl Shell {
             .min_h_0()
             .overflow_y_scroll()
             .track_scroll(&self.traj_scroll)
-            .on_scroll_wheel(cx.listener(traj_wheel))
+            .on_scroll(cx.listener(traj_wheel))
             .px(px(theme::INSET))
             .py(px(24.0))
             .flex()
@@ -1938,6 +2084,123 @@ impl Shell {
         self.tool_row(usize::MAX - index, 0, &tool, true, chrome, cx)
     }
 
+    /// The stored pictures of one user row, above its optional text bubble.
+    ///
+    /// The image value is the durable data URL, not a file name. A lone image
+    /// gets the reference `singleFit` box; two or more become 64px cover tiles.
+    fn image_gallery(
+        &self,
+        session: &str,
+        slot: usize,
+        selector: &str,
+        images: &[String],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let compact = images.len() > 1;
+        let gallery_selector = format!("{selector}-gallery");
+        let mut gallery = div()
+            .debug_selector(move || gallery_selector.clone())
+            .flex()
+            .flex_wrap()
+            .justify_end()
+            .gap(px(8.0))
+            .max_w(relative(1.0));
+        for (index, url) in images.iter().enumerate() {
+            gallery = gallery.child(self.image_frame(
+                StoredImage {
+                    session,
+                    slot,
+                    index,
+                    selector,
+                    url,
+                    compact,
+                },
+                cx,
+            ));
+        }
+        gallery.into_any_element()
+    }
+
+    /// One image frame from a stored data URL, or a quiet broken-image box.
+    fn image_frame(&self, stored: StoredImage<'_>, cx: &mut Context<Self>) -> AnyElement {
+        let cached = self.transcript_images.borrow_mut().get(
+            stored.session,
+            stored.slot,
+            stored.index,
+            stored.url,
+        );
+        let frame_selector = format!("{}-{}", stored.selector, stored.index);
+        let (width, height) = match &cached {
+            Some(_) if stored.compact => (IMAGE_TILE, IMAGE_TILE),
+            Some(image) => single_fit(image.width, image.height),
+            None => (IMAGE_MIN_EDGE, IMAGE_MIN_EDGE),
+        };
+        let width = if stored.compact {
+            IMAGE_TILE
+        } else {
+            width.max(IMAGE_MIN_EDGE)
+        };
+        let height = if stored.compact {
+            IMAGE_TILE
+        } else {
+            height.max(IMAGE_MIN_EDGE)
+        };
+        let frame = super::hairline_all(div())
+            .debug_selector(move || frame_selector.clone())
+            .flex_none()
+            .w(px(width))
+            .h(px(height))
+            .rounded(px(20.0))
+            .border_color(rgb(theme::border_soft()))
+            .bg(rgb(theme::hover()))
+            .overflow_hidden();
+        match cached {
+            Some(image) => {
+                let opened = image.clone();
+                let open_label = self.state.lang.tr("chat.openImage");
+                let aria = open_label.clone();
+                let tip = open_label.clone();
+                frame
+                    .id(SharedString::from(format!(
+                        "image-frame-{}-{}",
+                        stored.slot, stored.index
+                    )))
+                    .role(gpui_kit::Role::Button)
+                    .aria_label(aria)
+                    .cursor_pointer()
+                    .tooltip_show_delay(std::time::Duration::from_millis(500))
+                    .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.image_lightbox = Some(opened.clone());
+                        cx.notify();
+                    }))
+                    .child(
+                        img(image.source)
+                            .w(px(width))
+                            .h(px(height))
+                            .object_fit(ObjectFit::Cover),
+                    )
+                    .into_any_element()
+            }
+            None => {
+                let unavailable = self.state.lang.tr("chat.imageUnavailable");
+                let tip = unavailable.clone();
+                frame
+                    .id(SharedString::from(format!(
+                        "image-error-{}-{}",
+                        stored.slot, stored.index
+                    )))
+                    .tooltip_show_delay(std::time::Duration::from_millis(500))
+                    .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(icon(IconName::Image, 16.0, theme::faint()))
+                    .into_any_element()
+            }
+        }
+    }
+
     /// One steered message the running turn has not taken yet.
     ///
     /// The reference renders an inbox steering item with the same bubble it
@@ -1945,36 +2208,60 @@ impl Shell {
     /// the reader sees the interjection immediately; the bubble becomes the
     /// durable row when the step claims it. No action row: there is nothing to
     /// copy or retry until it is part of the conversation.
-    fn pending_steer_row(&self, queued: &crate::state::Queued) -> Div {
+    fn pending_steer_row(
+        &self,
+        session: &str,
+        queued: &crate::state::Queued,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let seq = queued.seq;
         let content = self.state.draft().global.general.content_font_size;
-        div()
-            .debug_selector(move || format!("steer-pending-{seq}"))
-            .w_full()
+        let images = crate::state::attachment_images(&queued.attachments);
+        let mut stack = div()
+            .max_w(px((self.chat_w() - 2.0 * theme::INSET) * 0.82))
             .flex()
-            .flex_row()
-            .justify_end()
-            .child(
+            .flex_col()
+            .items_end()
+            .gap(px(8.0));
+        if !images.is_empty() {
+            stack = stack.child(self.image_gallery(
+                session,
+                usize::MAX - seq as usize,
+                &format!("steer-image-{seq}"),
+                &images,
+                cx,
+            ));
+        }
+        if !queued.text.is_empty() {
+            stack = stack.child(
                 div()
-                    .max_w(px((self.chat_w() - 2.0 * theme::INSET) * 0.82))
+                    .max_w(relative(1.0))
                     .px(px(16.0))
                     .py(px(10.0))
                     .rounded(px(20.0))
                     .bg(rgb(theme::user_bubble()))
                     .child(
                         txt(
-                            crate::state::display_text(&queued.text, &queued.attachments),
+                            queued.text.clone(),
                             theme::body_size_at(content),
                             theme::text(),
                         )
                         .line_height(px(theme::bubble_line_at(content))),
                     ),
-            )
+            );
+        }
+        div()
+            .debug_selector(move || format!("steer-pending-{seq}"))
+            .w_full()
+            .flex()
+            .flex_row()
+            .justify_end()
+            .child(stack)
     }
 
     fn message_row(
         &self,
-        index: usize,
+        slot: MessageSlot<'_>,
         message: &ChatMessage,
         turn: RowTurn,
         // The newest prompt in the transcript. A prompt that has a later one
@@ -1986,6 +2273,9 @@ impl Shell {
     ) -> impl IntoElement {
         #[cfg(test)]
         ROWS_BUILT.with(|built| built.set(built.get() + 1));
+        let index = slot.index;
+        let session = slot.session;
+        let loaded_from = slot.loaded_from;
         if message.role == Role::User {
             let size = theme::body_size_at(chrome.content_size);
             let line = theme::bubble_line_at(chrome.content_size);
@@ -2001,6 +2291,55 @@ impl Shell {
                     .opacity(0.0)
                     .group_hover(group.clone(), |style| style.opacity(1.0));
             }
+            // Measured (MessageItem): the user stack is capped at 82% of the
+            // row, its images sit ABOVE the optional bubble with 8px between
+            // them, and the action row follows the stack after 6px. An
+            // image-only message has no bubble at all.
+            let steering = message.steering;
+            let mut stack = div()
+                .max_w(px((self.chat_w() - 2.0 * theme::INSET) * 0.82))
+                .flex()
+                .flex_col()
+                .items_end()
+                .gap(px(8.0));
+            if !message.images.is_empty() {
+                stack = stack.child(self.image_gallery(
+                    session,
+                    loaded_from + index,
+                    &format!("user-image-{index}"),
+                    &message.images,
+                    cx,
+                ));
+            }
+            if !message.text.is_empty() {
+                stack = stack.child(
+                    // Measured (MessageItem): radius-xl 20 over `10px 16px`,
+                    // the bubble fill, `line-height: 22px + delta`, capped at
+                    // 100% of the user stack above.
+                    div()
+                        // The reference draws an admitted steer with the SAME
+                        // user bubble it draws a prompt with (its
+                        // `data-chat-flow-kind=steering` shares the user
+                        // styles), so the only difference is the identity a
+                        // test can look up and the turn grouping the flag
+                        // drives.
+                        .debug_selector(move || {
+                            if steering {
+                                format!("steer-bubble-{index}")
+                            } else {
+                                format!("user-bubble-{index}")
+                            }
+                        })
+                        .max_w(relative(1.0))
+                        .px(px(16.0))
+                        .py(px(10.0))
+                        .rounded(px(20.0))
+                        .bg(rgb(theme::user_bubble()))
+                        .child(
+                            txt(message.text.clone(), size, theme::text()).line_height(px(line)),
+                        ),
+                );
+            }
             return div()
                 .w_full()
                 .flex()
@@ -2013,37 +2352,7 @@ impl Shell {
                         .flex_col()
                         .items_end()
                         .gap(px(6.0))
-                        .child(
-                            // Measured (MessageItem): radius-xl 20 over `10px 16px`,
-                            // the bubble fill, `line-height: 22px + delta`, capped at
-                            // 82% of the row - and at `content * .702`, which only
-                            // binds wider.
-                            div()
-                                // The reference draws an admitted steer with the
-                                // SAME user bubble it draws a prompt with (its
-                                // `data-chat-flow-kind=steering` shares the user
-                                // styles), so the only difference is the identity
-                                // a test can look up and the turn grouping the
-                                // flag drives.
-                                .debug_selector(move || {
-                                    if message.steering {
-                                        format!("steer-bubble-{index}")
-                                    } else {
-                                        format!("user-bubble-{index}")
-                                    }
-                                })
-                                // 82% of the transcript's content box. The reference
-                                // also caps at `content * .702`, which only binds wider.
-                                .max_w(px((self.chat_w() - 2.0 * theme::INSET) * 0.82))
-                                .px(px(16.0))
-                                .py(px(10.0))
-                                .rounded(px(20.0))
-                                .bg(rgb(theme::user_bubble()))
-                                .child(
-                                    txt(message.text.clone(), size, theme::text())
-                                        .line_height(px(line)),
-                                ),
-                        )
+                        .child(stack)
                         .child(actions),
                 )
                 .into_any_element();
@@ -3707,7 +4016,14 @@ impl Shell {
             move |window, cx| Tooltip::new(label.clone()).build(window, cx)
         })
         .on_click(cx.listener(move |this, _event, _window, cx| {
+            let slot = this
+                .state
+                .store
+                .session(&cut_id)
+                .map(|session| session.loaded_from + index)
+                .unwrap_or(0);
             this.state.truncate_from(&cut_id, index);
+            this.transcript_images.borrow_mut().invalidate_from(slot);
             cx.notify();
         }));
 
@@ -4205,7 +4521,8 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::{
-        output_body, process_summary, think_stream_tail, think_summary_live, timeline_is_consistent,
+        output_body, process_summary, single_fit, think_stream_tail, think_summary_live,
+        timeline_is_consistent,
     };
     use crate::i18n::Lang;
     use crate::model::{ChatMessage, ToolEvent, TurnPart};
@@ -4463,5 +4780,18 @@ mod tests {
     fn one_kind_is_its_label_and_the_unknown_falls_back_to_tools() {
         assert_eq!(process_summary(&[step("bash")], Lang::Zh), "执行了命令");
         assert_eq!(process_summary(&[], Lang::En), "Called tools");
+    }
+
+    /// The reference `singleFit`: long edge 240, aspect clamped to [0.25, 4],
+    /// and no image upscaled past its natural size.
+    #[test]
+    fn the_lone_image_box_matches_the_reference() {
+        assert_eq!(single_fit(1000, 1000), (240.0, 240.0));
+        assert_eq!(single_fit(480, 240), (240.0, 120.0));
+        assert_eq!(single_fit(240, 480), (120.0, 240.0));
+        assert_eq!(single_fit(250, 1000), (60.0, 240.0));
+        assert_eq!(single_fit(40, 1000), (40.0, 160.0));
+        assert_eq!(single_fit(100, 10), (40.0, 10.0));
+        assert_eq!(single_fit(10, 10), (10.0, 10.0));
     }
 }

@@ -215,9 +215,16 @@
 "settings.inputText": "Text"
 "settings.inputImage": "Image"
 "composer.imageRefused": "This model accepts text only."
+"composer.imageTooLarge": "Image exceeds the configured byte limit."
+"composer.imageUnsupported": "Unsupported or malformed image data."
+"composer.imageLimit": "Image limit: up to {count} images, {size} each"
 "settings.apiAnthropic": "Anthropic Messages"
 "msg.copy": "Copy"
 "chat.copied": "Copied"
+"chat.openImage": "Open image"
+"chat.imagePreview": "Image preview"
+"chat.closeImage": "Close preview"
+"chat.imageUnavailable": "Image unavailable"
 # The rail preview card's fallback first line, measured from the reference's
 # `chat.turnNavigation.turn` ("Turn {turn}" / "第 {turn} 轮").
 "chat.railTurn": "Turn {turn}"

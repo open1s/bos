@@ -145,6 +145,9 @@ pub(crate) fn is_injected_user_text(text: &str) -> bool {
         // a harness instruction, not something the child or its caller said, so
         // the read-only view must not draw it as a user row.
         || text.starts_with(react::engine::STEP_GUARD_NOTE)
+        // The engine's one retry when a step came back empty: also harness
+        // wording, never a row the caller wrote.
+        || text.starts_with(react::engine::EMPTY_ANSWER_NOTE)
 }
 
 /// Render the snapshot: heading, working directory, sandbox, permission,
@@ -195,6 +198,7 @@ mod tests {
     #[test]
     fn the_step_guard_note_is_not_a_user_row() {
         assert!(is_injected_user_text(react::engine::STEP_GUARD_NOTE));
+        assert!(is_injected_user_text(react::engine::EMPTY_ANSWER_NOTE));
         assert!(
             !is_injected_user_text("Please fix the failing test."),
             "a real request still draws as a user row"

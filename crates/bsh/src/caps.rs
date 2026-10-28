@@ -3690,6 +3690,7 @@ mod tests {
                 model: "work-model".to_string(),
             }),
             preset: None,
+            ..Default::default()
         }
     }
 
@@ -4712,6 +4713,7 @@ mod tests {
                 model: "session-model".to_string(),
             }),
             preset: None,
+            ..Default::default()
         };
         assert_eq!(
             build_for(&settings, &choice).agent.config().model,
@@ -4798,6 +4800,7 @@ mod tests {
                 model: "m".to_string(),
             }),
             preset: None,
+            ..Default::default()
         };
         settings.global.set_family_protocol("p", "responses");
         assert_eq!(
@@ -7048,6 +7051,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         let session_choice = crate::settings::resolve::SessionChoice {
             model: None,
             preset: Some("scoped".to_string()),
+            ..Default::default()
         };
         let built = build_agent(&settings, &Vault::disabled(), &session_choice, &mcp);
         assert!(
@@ -7313,6 +7317,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         let choice = crate::settings::resolve::SessionChoice {
             model: None,
             preset: Some("strict".to_string()),
+            ..Default::default()
         };
         assert_eq!(
             egress.refusal_for(&choice),

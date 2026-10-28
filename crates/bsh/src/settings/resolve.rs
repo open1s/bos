@@ -112,6 +112,16 @@ pub(crate) struct SessionChoice {
     pub(crate) model: Option<ModelRef>,
     /// The preset id the session recorded, if any.
     pub(crate) preset: Option<String>,
+    /// The workspace this session belongs to, by id.
+    ///
+    /// A chat's WORKSPACE is not a window preference: the root it names is the
+    /// curl the shell starts in, the tree the file tools may touch, and the
+    /// paragraph the runtime snapshot tells the model. Resolving that from the
+    /// globally active workspace let a chat opened from another workspace run
+    /// its commands in whichever project the window happened to point at, so the
+    /// session's own id wins here and the active workspace is only the fallback
+    /// for a session that names none.
+    pub(crate) workspace: Option<String>,
 }
 
 /// The session's permission, capped by the selected preset's ceiling.
@@ -1156,6 +1166,7 @@ mcp_servers = [
                 model: model.to_string(),
             }),
             preset: None,
+            ..Default::default()
         }
     }
 
@@ -1229,6 +1240,7 @@ mcp_servers = [
             &SessionChoice {
                 model: Some(chosen.clone()),
                 preset: None,
+                ..Default::default()
             },
         );
         assert_eq!(
@@ -1717,6 +1729,7 @@ mcp_servers = [
             &SessionChoice {
                 model: None,
                 preset: Some("tight".to_string()),
+                ..Default::default()
             },
         );
         assert_eq!(r.preset_id.as_deref(), Some("tight"));
@@ -1732,6 +1745,7 @@ mcp_servers = [
             &SessionChoice {
                 model: None,
                 preset: Some("minimal".to_string()),
+                ..Default::default()
             },
         );
         assert!(
@@ -1749,6 +1763,7 @@ mcp_servers = [
             &SessionChoice {
                 model: None,
                 preset: Some("gone".to_string()),
+                ..Default::default()
             },
         );
         assert_eq!(r.preset_missing.as_deref(), Some("gone"));

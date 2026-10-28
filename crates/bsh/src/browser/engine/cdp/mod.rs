@@ -84,6 +84,42 @@ pub(crate) const META: u32 = 4;
 /// The shift bit, which turns Cmd/Ctrl-Z into redo.
 pub(crate) const SHIFT: u32 = 8;
 
+/// The pointer button an input event belongs to.
+///
+/// CDP names the button on every event AND reports the held set as a bit mask
+/// (left 1, right 2, middle 4). The pane forwards the distinction it received:
+/// a press that carried `button: "left"` for every event can never raise a
+/// page's `contextmenu`, which is why a right click used to do nothing at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PointerButton {
+    /// The primary button: selection, links, ordinary clicks.
+    Left,
+    /// The wheel button: `auxclick` and the platform's middle-click actions.
+    Middle,
+    /// The secondary button: the page's `contextmenu`.
+    Right,
+}
+
+impl PointerButton {
+    /// The protocol's name for the button, as `button` carries it.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Middle => "middle",
+            Self::Right => "right",
+        }
+    }
+
+    /// The protocol's bit for the button, as `buttons` carries it.
+    fn mask(self) -> u32 {
+        match self {
+            Self::Left => 1,
+            Self::Middle => 4,
+            Self::Right => 2,
+        }
+    }
+}
+
 /// Whether a CDP failure is a transport reset rather than the page's own error.
 fn is_transport_error(error: &EngineError) -> bool {
     match error {
@@ -549,9 +585,22 @@ impl Engine {
             }
             return Ok(Activation::Clicked { via: "script" });
         }
-        self.mouse(false, "mouseMoved", x, y, None, 0)?;
-        self.mouse(false, "mousePressed", x, y, Some(1), 1)?;
-        self.mouse(false, "mouseReleased", x, y, Some(1), 0)?;
+        self.mouse(false, mouse_params("mouseMoved", x, y, None, "none", 0))?;
+        self.mouse(
+            false,
+            mouse_params(
+                "mousePressed",
+                x,
+                y,
+                Some(1),
+                PointerButton::Left.name(),
+                PointerButton::Left.mask(),
+            ),
+        )?;
+        self.mouse(
+            false,
+            mouse_params("mouseReleased", x, y, Some(1), "left", 0),
+        )?;
         if matches!(kind.as_str(), "input" | "textarea" | "select") {
             // A field takes focus and stops there, which is the behaviour the
             // text view already promised: browser_type is the next call.
@@ -894,20 +943,8 @@ impl Engine {
     }
 
     /// Dispatch one mouse event.
-    fn mouse(
-        &self,
-        fire: bool,
-        kind: &str,
-        x: f64,
-        y: f64,
-        clicks: Option<u32>,
-        buttons: u32,
-    ) -> Result<(), EngineError> {
-        self.send(
-            fire,
-            "Input.dispatchMouseEvent",
-            mouse_params(kind, x, y, clicks, buttons),
-        )
+    fn mouse(&self, fire: bool, params: Value) -> Result<(), EngineError> {
+        self.send(fire, "Input.dispatchMouseEvent", params)
     }
 
     /// A press at a point: move there, then press and HOLD.
@@ -915,17 +952,29 @@ impl Engine {
     /// The release is a separate call. Sending press+release on the down event
     /// is what a click needs, but it makes every drag a burst of clicks and
     /// leaves no way to select text, so the pane forwards the three events it
-    /// actually receives.
+    /// actually receives. `button` rides the event, so a right press is a
+    /// secondary click the page can turn into `contextmenu`.
     pub(crate) fn pointer_down(
         &self,
         x: f32,
         y: f32,
         clicks: u32,
+        button: PointerButton,
         fire: bool,
     ) -> Result<(), EngineError> {
         let (x, y) = (f64::from(x), f64::from(y));
-        self.mouse(fire, "mouseMoved", x, y, None, 0)?;
-        self.mouse(fire, "mousePressed", x, y, Some(clicks.max(1)), 1)
+        self.mouse(fire, mouse_params("mouseMoved", x, y, None, "none", 0))?;
+        self.mouse(
+            fire,
+            mouse_params(
+                "mousePressed",
+                x,
+                y,
+                Some(clicks.max(1)),
+                button.name(),
+                button.mask(),
+            ),
+        )
     }
 
     /// A pointer move: hover when no button is held, a drag while one is.
@@ -933,7 +982,19 @@ impl Engine {
     /// Fire-and-forget: a move has no answer worth waiting for, and blocking
     /// the UI thread on every ~16 ms of hover would be the input path's whole
     /// cost. Queue order still preserves move-then-press.
-    pub(crate) fn pointer_move(&self, x: f32, y: f32, pressed: bool) -> Result<(), EngineError> {
+    ///
+    /// A drag move names the button it is dragging WITH, not `"none"`: MEASURED,
+    /// Chromium only runs its default selection (the word under a double click,
+    /// a dragged range, a textarea's own selection) when a move arrives while a
+    /// button is down AND the event names that button. `buttons` alone is not
+    /// enough - the same drag with `button: "none"` and `buttons: 1` selected
+    /// nothing here, in the page, mid-drag and after the release.
+    pub(crate) fn pointer_move(
+        &self,
+        x: f32,
+        y: f32,
+        pressed: Option<PointerButton>,
+    ) -> Result<(), EngineError> {
         self.client.notify(
             "Input.dispatchMouseEvent",
             mouse_params(
@@ -941,56 +1002,41 @@ impl Engine {
                 f64::from(x),
                 f64::from(y),
                 None,
-                u32::from(pressed),
+                pressed.map_or("none", PointerButton::name),
+                pressed.map_or(0, PointerButton::mask),
             ),
-        )
-    }
-
-    /// Keep a text drag selected on engines whose mouse pipeline reports the
-    /// drag but does not update the page's Selection object itself.
-    pub(crate) fn select_text_between(
-        &self,
-        start: (f32, f32),
-        end: (f32, f32),
-        fire: bool,
-    ) -> Result<(), EngineError> {
-        self.send(
-            fire,
-            "Runtime.evaluate",
-            json!({
-                "expression": text_selection_script(start, end),
-                "returnByValue": true,
-            }),
         )
     }
 
     /// The release that completes a press.
     ///
     /// `clicks` is the same count the press carried, so the page's `click` and
-    /// `dblclick` events see one number. With a count of two or more the pane
-    /// also selects the word (or, at three, the line) under the pointer: the
-    /// engine fires the click events but implements none of the browser's
-    /// DEFAULT selection, which is measured, not assumed.
+    /// `dblclick` events see one number. Chromium turns that count into its own
+    /// DEFAULT selection - a double click selects the word, a triple click the
+    /// line - so nothing here synthesizes one: MEASURED, a press and release
+    /// carrying `clickCount: 2` select exactly the word under the pointer, and
+    /// `3` selects the line, with no script of ours involved.
     pub(crate) fn pointer_up(
         &self,
         x: f32,
         y: f32,
         clicks: u32,
+        button: PointerButton,
         fire: bool,
     ) -> Result<(), EngineError> {
-        let (px, py) = (f64::from(x), f64::from(y));
-        self.mouse(fire, "mouseReleased", px, py, Some(clicks.max(1)), 0)?;
-        if clicks >= 2 {
-            // The selection is made by the page, through a script whose value
-            // the pane never reads: firing it keeps a double click off the
-            // UI thread's wait.
-            self.send(
-                fire,
-                "Runtime.evaluate",
-                json!({ "expression": select_at_script(px, py, clicks), "returnByValue": true, "awaitPromise": true }),
-            )?;
-        }
-        Ok(())
+        // A release reports no held buttons: `buttons` is the set STILL down,
+        // and the one being released has just left it.
+        self.mouse(
+            fire,
+            mouse_params(
+                "mouseReleased",
+                f64::from(x),
+                f64::from(y),
+                Some(clicks.max(1)),
+                button.name(),
+                0,
+            ),
+        )
     }
 
     /// Type one printable character the way a browser does.
@@ -1411,62 +1457,29 @@ fn capture(client: &Client, format: &str, quality: Option<u32>) -> Result<Vec<u8
 }
 
 /// The parameters of one pointer event.
-fn mouse_params(kind: &str, x: f64, y: f64, clicks: Option<u32>, buttons: u32) -> Value {
+///
+/// `button` is the event's button name (`none` for a move); `buttons` is the
+/// mask of the buttons still held, which is what a page reads to tell a hover
+/// from a drag.
+fn mouse_params(
+    kind: &str,
+    x: f64,
+    y: f64,
+    clicks: Option<u32>,
+    button: &str,
+    buttons: u32,
+) -> Value {
     let mut params = json!({
         "type": kind,
         "x": x,
         "y": y,
-        "button": if kind == "mouseMoved" { "none" } else { "left" },
+        "button": button,
         "buttons": buttons,
     });
     if let Some(count) = clicks {
         params["clickCount"] = json!(count);
     }
     params
-}
-
-/// Set the page selection from the text carets under a drag's endpoints.
-///
-/// Caret APIs use Chromium's rendered text geometry to provide a consistent
-/// selection and copy path across native pointer and captured-frame input.
-fn text_selection_script(start: (f32, f32), end: (f32, f32)) -> String {
-    const SCRIPT: &str = r#"(function(ax, ay, bx, by) {
-  function caret(x, y) {
-    if (typeof document.caretPositionFromPoint === 'function') {
-      var position = document.caretPositionFromPoint(x, y);
-      return position && [position.offsetNode, position.offset];
-    }
-    if (typeof document.caretRangeFromPoint === 'function') {
-      var range = document.caretRangeFromPoint(x, y);
-      return range && [range.startContainer, range.startOffset];
-    }
-    return null;
-  }
-  function editable(node) {
-    var element = node && (node.nodeType === 1 ? node : node.parentElement);
-    while (element) {
-      var tag = element.tagName;
-      if (element.isContentEditable || tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
-        return true;
-      }
-      element = element.parentElement;
-    }
-    return false;
-  }
-  var start = caret(ax, ay);
-  var end = caret(bx, by);
-  if (!start || !end || start[0].nodeType !== 3 || end[0].nodeType !== 3 ||
-      editable(start[0]) || editable(end[0])) return false;
-  var selection = document.getSelection();
-  if (!selection || typeof selection.setBaseAndExtent !== 'function') return false;
-  selection.setBaseAndExtent(start[0], start[1], end[0], end[1]);
-  return String(selection);
-})(%AX%, %AY%, %BX%, %BY%)"#;
-    SCRIPT
-        .replace("%AX%", &start.0.to_string())
-        .replace("%AY%", &start.1.to_string())
-        .replace("%BX%", &end.0.to_string())
-        .replace("%BY%", &end.1.to_string())
 }
 
 /// The text a named key produces, when it produces one.
@@ -1571,94 +1584,6 @@ fn digit_code(digit: char) -> &'static str {
         '8' => "Digit8",
         _ => "Digit9",
     }
-}
-
-/// The double-click word selection, or the triple-click line/block selection,
-/// applied at a page point.
-///
-/// MEASURED: `mousePressed` with `clickCount: 2` fires
-/// `dblclick` (`event.detail` 2) but the DOM's own selection stays empty, and
-/// a drag never selects text either. That is the engine's gap, so the pane
-/// supplies the DEFAULT selection here - using the engine's own hit testing, a
-/// field's own `selectionStart` (which a press does set) or
-/// `caretRangeFromPoint` for document text. A page's own handlers still run;
-/// this only fills in the missing default.
-const SELECT_AT_JS: &str = r#"
-(function(x, y, clicks) {
-  function wordChar(ch) {
-    if (!ch) return false;
-    var code = ch.charCodeAt(0);
-    return (code >= 48 && code <= 57) || (code >= 65 && code <= 90) ||
-      (code >= 97 && code <= 122) || ch === '_' || code > 127;
-  }
-  var element = document.elementFromPoint ? document.elementFromPoint(x, y) : null;
-  var field = element && element.closest ? element.closest('input, textarea') : null;
-  if (field && typeof field.setSelectionRange === 'function') {
-    var value = String(field.value == null ? '' : field.value);
-    var start = field.selectionStart;
-    // MEASURED: a click focuses an input/textarea but the CDP input path leaves
-    // selectionStart null, so the click's caret is not observable and there is
-    // no offset to expand. Guessing (the end of the value) would select the
-    // wrong word, so this returns none and the doc states the residual.
-    if (typeof start !== 'number') return 'none';
-    if (clicks >= 3) {
-      var lineStart = 0;
-      var lineEnd = value.length;
-      if (field.tagName !== 'INPUT') {
-        lineStart = value.lastIndexOf(String.fromCharCode(10), Math.max(0, start - 1)) + 1;
-        var next = value.indexOf(String.fromCharCode(10), start);
-        lineEnd = next < 0 ? value.length : next;
-      }
-      field.setSelectionRange(lineStart, lineEnd);
-      return 'field-line';
-    }
-    var from = start;
-    var to = start;
-    while (from > 0 && wordChar(value[from - 1])) from--;
-    while (to < value.length && wordChar(value[to])) to++;
-    if (from === to) return 'none';
-    field.setSelectionRange(from, to);
-    return 'field-word';
-  }
-  if (!document.caretRangeFromPoint) return 'none';
-  var range = document.caretRangeFromPoint(x, y);
-  if (!range) return 'none';
-  if (clicks >= 3) {
-    var node = range.startContainer;
-    var block = node && node.nodeType === 3 ? node.parentNode : node;
-    if (!block || !block.nodeType) return 'none';
-    var whole = document.createRange();
-    whole.selectNodeContents(block);
-    var selection = window.getSelection();
-    selection.removeAllRanges();
-    selection.addRange(whole);
-    return 'block';
-  }
-  var textNode = range.startContainer;
-  if (!textNode || textNode.nodeType !== 3) return 'none';
-  var data = String(textNode.data);
-  var at = range.startOffset;
-  var wordFrom = at;
-  var wordTo = at;
-  while (wordFrom > 0 && wordChar(data[wordFrom - 1])) wordFrom--;
-  while (wordTo < data.length && wordChar(data[wordTo])) wordTo++;
-  if (wordFrom === wordTo) return 'none';
-  var word = document.createRange();
-  word.setStart(textNode, wordFrom);
-  word.setEnd(textNode, wordTo);
-  var target = window.getSelection();
-  target.removeAllRanges();
-  target.addRange(word);
-  return 'word';
-})(%X%, %Y%, %CLICKS%)
-"#;
-
-/// The expression that selects at a point, with the point filled in.
-fn select_at_script(x: f64, y: f64, clicks: u32) -> String {
-    SELECT_AT_JS
-        .replace("%X%", &x.to_string())
-        .replace("%Y%", &y.to_string())
-        .replace("%CLICKS%", &clicks.to_string())
 }
 
 /// Read (and let a page override) the text a copy would put on the clipboard.
@@ -2050,11 +1975,32 @@ mod tests {
 
     #[test]
     fn mouse_move_carries_the_held_button_for_drag_selection() {
-        let drag = mouse_params("mouseMoved", 14.0, 22.0, None, 1);
-        let hover = mouse_params("mouseMoved", 14.0, 22.0, None, 0);
+        let drag = mouse_params("mouseMoved", 14.0, 22.0, None, "none", 1);
+        let hover = mouse_params("mouseMoved", 14.0, 22.0, None, "none", 0);
         assert_eq!(drag["button"], "none");
         assert_eq!(drag["buttons"], 1);
         assert_eq!(hover["buttons"], 0);
+    }
+
+    #[test]
+    fn a_right_press_names_the_right_button_and_its_mask() {
+        let press = mouse_params("mousePressed", 10.0, 20.0, Some(1), "right", 2);
+        assert_eq!(press["button"], "right");
+        assert_eq!(press["buttons"], 2);
+        // A release reports no held buttons, so the page sees the press end.
+        let release = mouse_params("mouseReleased", 10.0, 20.0, Some(1), "right", 0);
+        assert_eq!(release["button"], "right");
+        assert_eq!(release["buttons"], 0);
+    }
+
+    #[test]
+    fn the_three_buttons_have_distinct_names_and_masks() {
+        assert_eq!(PointerButton::Left.name(), "left");
+        assert_eq!(PointerButton::Left.mask(), 1);
+        assert_eq!(PointerButton::Right.name(), "right");
+        assert_eq!(PointerButton::Right.mask(), 2);
+        assert_eq!(PointerButton::Middle.name(), "middle");
+        assert_eq!(PointerButton::Middle.mask(), 4);
     }
 
     #[test]
