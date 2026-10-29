@@ -15,6 +15,21 @@ Google Chrome and Chromium application paths.
 If none is found, the Browser pane reports the searched locations and asks for
 Chrome or Chromium to be installed.
 
+## The sandbox fallback
+
+The first launch keeps Chromium's own process sandbox, which is the guard a
+process rendering untrusted web content should have. Some hosts cannot give it
+what it needs - a container, a CI runner, a sandboxed harness - and there
+Chromium's sandbox fails to initialize and its GPU and network services exit
+(MEASURED: `sandbox initialization failed: Operation not permitted`, `GPU
+process exited unexpectedly: exit_code=6`, then the CDP websocket is reset).
+Without a fallback the pane could only report a closed socket.
+
+So a launch that fails this way is retried once with `--no-sandbox
+--disable-gpu-sandbox --disable-dev-shm-usage`. The retry is not the default:
+a normal desktop keeps the sandbox, and the fallback is remembered for the
+rest of the process so the next pane opens directly in the mode that works.
+
 ## Process and network
 
 Each pane starts Chrome with its own temporary profile, an ephemeral CDP port,

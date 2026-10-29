@@ -355,11 +355,55 @@ impl Client {
             );
         }
         let binary = discover_binary()?;
+        // The sandboxed launch first: it is the one that should guard a
+        // process rendering untrusted content. A process that already learned
+        // its environment cannot host that sandbox goes straight to the mode
+        // that works, so the reader waits once rather than on every pane.
+        let preferred = if SANDBOX_BROKEN.load(Ordering::Relaxed) {
+            SandboxMode::Relaxed
+        } else {
+            SandboxMode::Default
+        };
+        match Self::launch_once(&binary, viewport, state_dir, preferred) {
+            Ok(engine) => Ok(engine),
+            Err(first) => {
+                // Chromium's own sandbox needs privileges a container, a CI
+                // runner or a sandboxed harness does not give it. MEASURED
+                // there: "sandbox initialization failed: Operation not
+                // permitted", the GPU process exits with code 6, and the CDP
+                // websocket is reset - so the pane would show nothing but a
+                // closed-socket sentence. Retrying without the flags keeps the
+                // pane WORKING where the outer sandbox is the boundary that
+                // already applies, instead of dying with a correct refusal.
+                eprintln!(
+                    "bsh: the browser engine did not start with its own sandbox ({}); retrying without it",
+                    first.message()
+                );
+                SANDBOX_BROKEN.store(true, Ordering::Relaxed);
+                Self::launch_once(&binary, viewport, state_dir, SandboxMode::Relaxed).inspect_err(
+                    |second| {
+                        eprintln!(
+                            "bsh: the browser engine did not start without its sandbox either ({})",
+                            second.message()
+                        );
+                    },
+                )
+            }
+        }
+    }
+
+    /// One launch attempt under one [`SandboxMode`].
+    fn launch_once(
+        binary: &Path,
+        viewport: (u32, u32),
+        state_dir: &std::path::Path,
+        sandbox: SandboxMode,
+    ) -> Result<Self, EngineError> {
         let marker = reap::new_marker(LAUNCH_SEQ.fetch_add(1, Ordering::Relaxed));
         let storage_dir = std::env::temp_dir().join(&marker);
         let ready_file = storage_dir.join("DevToolsActivePort");
         let log = Arc::new(Mutex::new(String::new()));
-        let mut child = spawn_engine(&binary, &storage_dir)?;
+        let mut child = spawn_engine(binary, &storage_dir, sandbox)?;
         // Record the child BEFORE the handshake: a crash during startup is
         // exactly the case a later pass has to be able to reap.
         let pidfile = match reap::write_pidfile(state_dir, child.id(), &marker) {
@@ -1130,7 +1174,52 @@ fn scrub_sandbox_env(command: &mut Command) {
     }
 }
 
-fn spawn_engine(binary: &Path, storage_dir: &Path) -> Result<Child, EngineError> {
+/// Whether this process has proved Chromium's own sandbox cannot initialize.
+///
+/// Set by the first launch that had to fall back, so the NEXT pane in the same
+/// process does not pay the doomed attempt again: the sandboxed launch costs a
+/// failed spawn, a handshake and its cleanup (MEASURED ~1.5 s) before the retry
+/// even starts.
+static SANDBOX_BROKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// How much of Chromium's own process sandbox to keep.
+///
+/// [`SandboxMode::Default`] is the normal launch and the one that should
+/// guard a process rendering untrusted web content. [`SandboxMode::Relaxed`]
+/// exists for the environments that cannot give Chromium what its sandbox
+/// needs - a container, a CI runner, a sandboxed harness - where the
+/// alternative is a pane that cannot start at all. It is only ever a RETRY,
+/// never the first attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SandboxMode {
+    /// Chromium keeps its own sandbox.
+    Default,
+    /// Chromium's sandbox flags are relaxed.
+    Relaxed,
+}
+
+impl SandboxMode {
+    /// The extra Chromium flags this mode adds.
+    fn args(self) -> &'static [&'static str] {
+        match self {
+            SandboxMode::Default => &[],
+            // `--disable-dev-shm-usage` rides along because the container case
+            // that breaks the sandbox usually has a tiny `/dev/shm` too, and
+            // Chromium crashes on a full one.
+            SandboxMode::Relaxed => &[
+                "--no-sandbox",
+                "--disable-gpu-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        }
+    }
+}
+
+fn spawn_engine(
+    binary: &Path,
+    storage_dir: &Path,
+    sandbox: SandboxMode,
+) -> Result<Child, EngineError> {
     std::fs::create_dir_all(storage_dir).map_err(|error| {
         EngineError::Spawn(format!(
             "the engine's profile directory {} could not be created: {error}",
@@ -1149,7 +1238,11 @@ fn spawn_engine(binary: &Path, storage_dir: &Path) -> Result<Child, EngineError>
         .arg("--disable-extensions")
         .arg("--disable-background-networking")
         .arg("--no-proxy-server")
-        .arg("--autoplay-policy=no-user-gesture-required")
+        .arg("--autoplay-policy=no-user-gesture-required");
+    for flag in sandbox.args() {
+        command.arg(flag);
+    }
+    command
         .arg("about:blank")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1319,6 +1412,21 @@ mod tests {
                 .any(|(name, value)| name == "KEEP_ME" && value.as_deref() == Some("1")),
             "unrelated variables must survive: {envs:?}"
         );
+    }
+
+    #[test]
+    fn the_default_launch_is_sandboxed_and_only_the_retry_relaxes() {
+        // The first attempt must keep Chromium's own sandbox: it renders
+        // untrusted web content. A regression that relaxes the DEFAULT would
+        // silently drop that guard on every desktop.
+        assert!(SandboxMode::Default.args().is_empty());
+        // The retry relaxes precisely what a constrained host needs, and
+        // includes the /dev/shm flag because the environments that break the
+        // sandbox usually have a tiny one.
+        let relaxed = SandboxMode::Relaxed.args();
+        assert!(relaxed.contains(&"--no-sandbox"));
+        assert!(relaxed.contains(&"--disable-gpu-sandbox"));
+        assert!(relaxed.contains(&"--disable-dev-shm-usage"));
     }
 
     #[test]
