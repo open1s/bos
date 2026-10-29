@@ -31,6 +31,14 @@ parquet = { version = "60.0.0", features = ["arrow"] }
 # of "the editor supports this type", the compiled grammar is the other half.
 gpui-kit = { version = "=0.8.1", features = ["tree-sitter-languages"] }
 
+# The WebView backend: a native Wry view (WKWebView on macOS) hosted in the
+# GPUI window, replacing the CDP capture pipeline in the browser pane. Built on
+# the same gpui-pre backend as the rest of this crate, so no gpui-fast feature
+# is enabled (that would swap the whole GUI backend). `wry` is lb-wry, the fork
+# this integration is written against.
+gpui-webview = { version = "=0.8.1" }
+wry = { package = "lb-wry", version = "0.53.3" }
+
 # The BOS framework, used directly (no intermediate shell crate). This crate
 # consumes the ONE `SandboxSpec` seam for the shell tool and the terminal pane,
 # and never depends on heel itself, so the workspace has one dependency entry.
@@ -154,3 +162,9 @@ features = ["png", "jpeg"]
 # an array literal, which the trait does not accept for a one-frame image.
 [dependencies.smallvec]
 version = "1"
+
+[profile.release]
+panic = "abort"
+
+[lints]
+workspace = true

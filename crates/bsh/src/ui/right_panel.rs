@@ -1267,7 +1267,7 @@ impl Shell {
                 .child(self.browser_icon(
                     "browser-back",
                     IconName::ArrowLeft,
-                    view.can_back,
+                    view.can_back || self.browser_webview.is_some(),
                     "right.browser.back",
                     cx,
                     |this, cx| this.browser_history(-1, cx),
@@ -1275,7 +1275,7 @@ impl Shell {
                 .child(self.browser_icon(
                     "browser-forward",
                     IconName::ArrowRight,
-                    view.can_forward,
+                    view.can_forward || self.browser_webview.is_some(),
                     "right.browser.forward",
                     cx,
                     |this, cx| this.browser_history(1, cx),
@@ -1283,7 +1283,7 @@ impl Shell {
                 .child(self.browser_icon(
                     "browser-reload",
                     IconName::RotateCw,
-                    view.snapshot.is_some(),
+                    view.snapshot.is_some() || self.browser_webview.is_some(),
                     "right.browser.reload",
                     cx,
                     |this, cx| this.browser_reload(cx),
@@ -1297,7 +1297,9 @@ impl Shell {
                 )
                 .child(self.browser_go_control(cx)),
         );
-        let live = self.state.browser.engine_ready();
+        // The native view IS the live pane; the CDP engine path stays for the
+        // text/agent backend.
+        let live = self.state.browser.engine_ready() || self.browser_webview.is_some();
         if live {
             pane.child(self.browser_live_body(cx))
         } else {
@@ -3859,6 +3861,17 @@ impl Shell {
         }
         self.browser_refresh_pane();
         cx.notify();
+        // The native view is the page: load it there and stop. The HTTP fetch
+        // below feeds the TEXT model the agent tools read; the reader's pane
+        // does not need it, and its failures would draw a banner over a page
+        // that actually loaded.
+        if let Some(webview) = self.browser_webview.clone() {
+            if url.starts_with("http://") || url.starts_with("https://") {
+                webview.update(cx, |view, _| view.load_url(&url));
+                cx.notify();
+                return;
+            }
+        }
         // The GPUI background executor, not the runner's tokio runtime: this is
         // work the window started, and it is the executor the test scheduler
         // can drive deterministically.
@@ -3890,6 +3903,163 @@ impl Shell {
         .detach();
     }
 
+    /// Build the native browser view, once the Browser tab has a live window.
+    ///
+    /// The view needs a real window and a native child view, so it is built
+    /// from a deferred task rather than during paint. Headless tests keep the
+    /// text/capture path: a native view cannot be exercised there, and the
+    /// suite would be claiming coverage it does not have.
+    pub(crate) fn browser_ensure_webview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if cfg!(test) || self.browser_webview.is_some() || self.browser_webview_pending {
+            return;
+        }
+        if !self.right.open || !matches!(self.right.tab, Some(RightTab::Browser)) {
+            return;
+        }
+        // Nothing to show yet: a native view on `about:blank` would cover the
+        // pane's empty state (the globe and prompt) with a white rectangle.
+        // The view is built by the first navigation, which sets the address.
+        if self.state.browser.read(|browser| browser.address().is_empty()) {
+            return;
+        }
+        self.browser_webview_pending = true;
+        let shell = cx.entity();
+        window.defer(cx, move |window, cx| {
+            shell.update(cx, |this, cx| this.build_browser_webview(window, cx));
+        });
+    }
+
+    /// Attach the native view and point it at what the pane is showing.
+    fn build_browser_webview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.browser_webview_pending = false;
+        if self.browser_webview.is_some() {
+            return;
+        }
+        // Every navigation reports its URL here, including a link click, a
+        // redirect and a history move, so the address bar follows the page
+        // without asking the view for a URL it cannot always give.
+        let nav = self.browser_script.clone();
+        let popups = self.browser_script.clone();
+        // A real browser UA: Wry's default is a sparse `AppleWebKit/605.1.15`
+        // with no Safari token, and sites that sniff it serve a stub (MEASURED:
+        // baidu.com answered with a document that had no body at all).
+        let user_agent = if cfg!(target_os = "macos") {
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
+        } else if cfg!(target_os = "windows") {
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        } else {
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        };
+        let builder = wry::WebViewBuilder::new()
+            .with_user_agent(user_agent)
+            .with_navigation_handler(move |url: String| {
+                nav.note_navigation(url);
+                true
+            })
+            // A link with `target="_blank"` (or `window.open`) asks for a NEW
+            // window. The pane has one page, so the request is denied and the
+            // URL is loaded here instead - otherwise the click did nothing.
+            .with_new_window_req_handler(move |url: String, _features| {
+                popups.note_new_window(url);
+                wry::NewWindowResponse::Deny
+            });
+        match gpui_webview::WebView::build(builder, window, cx) {
+            Ok(view) => {
+                let entity = cx.new(|_| view);
+                // A pane opened after a navigation shows the page already
+                // asked for, not a blank view.
+                let address = self
+                    .state
+                    .browser
+                    .read(|browser| browser.address().to_string());
+                if !address.is_empty() {
+                    entity.update(cx, |view, _| view.load_url(&address));
+                }
+                // From here the agent tools drive THIS page instead of
+                // starting a second browser.
+                self.state.browser.set_script(self.browser_script.clone());
+
+                self.browser_webview = Some(entity);
+            }
+            Err(error) => {
+                eprintln!("bsh: the browser view could not be created: {error}");
+                self.state
+                    .notice(format!("the browser view could not be created: {error}"));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Keep the native view sized, visible, and following the page's own URL.
+    fn sync_browser_webview(&mut self, cx: &mut Context<Self>) {
+        let Some(webview) = self.browser_webview.clone() else {
+            return;
+        };
+        // The agent tools' queued work runs HERE, because the view is
+        // UI-thread-only: a tool posted the command and is waiting on its reply.
+        for job in self.browser_script.drain() {
+            use crate::browser::script::ScriptCommand;
+            match job.command {
+                ScriptCommand::Eval(js) => {
+                    let reply = job.reply;
+                    let _ = webview
+                        .read(cx)
+                        .evaluate_script_with_callback(&js, move |out| {
+                            let _ = reply.send(Ok(out));
+                        });
+                }
+                ScriptCommand::Load(url) => {
+                    webview.update(cx, |view, _| view.load_url(&url));
+                    let _ = job.reply.send(Ok(String::new()));
+                }
+
+            }
+        }
+        let visible = self.right.open
+            && matches!(self.right.tab, Some(RightTab::Browser))
+            // A native child view is drawn ABOVE the GPUI tree on this
+            // backend, so an open dialog would be hidden behind the page.
+            && matches!(self.state.overlay, crate::state::Overlay::None);
+        if let Some(bounds) = self.browser_bounds.get() {
+            let rect = wry::Rect {
+                position: wry::dpi::Position::Logical(wry::dpi::LogicalPosition::new(
+                    f64::from(bounds.origin.x.as_f32()),
+                    f64::from(bounds.origin.y.as_f32()),
+                )),
+                size: wry::dpi::Size::Logical(wry::dpi::LogicalSize::new(
+                    f64::from(bounds.size.width.as_f32().max(0.0)),
+                    f64::from(bounds.size.height.as_f32().max(0.0)),
+                )),
+            };
+            let _ = webview.read(cx).set_bounds(rect);
+        }
+        let _ = webview.read(cx).set_visible(visible);
+        // A link that asked for a new window: the pane has one page, so load
+        // it here. This is what makes a search RESULT open at all.
+        if let Some(url) = self.browser_script.take_new_window() {
+            if url.starts_with("http://") || url.starts_with("https://") {
+                webview.update(cx, |view, _| view.load_url(&url));
+                self.state.browser.mutate(|browser| browser.follow(&url));
+                self.browser_refresh_pane();
+                cx.notify();
+            }
+        }
+        // Follow a link click or a redirect from the navigation handler. This
+        // never calls `WebView::url()`: that unwraps a nil NSURL before the
+        // first commit, which aborts the process.
+        let navigated = self.browser_script.take_navigation();
+        if let Some(url) = navigated {
+            if !url.is_empty() && url != "about:blank" {
+                let changed = self.state.browser.read(|browser| browser.address() != url);
+                if changed {
+                    self.state.browser.mutate(|browser| browser.follow(&url));
+                    self.browser_refresh_pane();
+                    cx.notify();
+                }
+            }
+        }
+    }
+
     /// Start the rendered engine when the Browser tab is first shown.
     ///
     /// MEASURED: launching Chromium (process + CDP handshake) takes ~1.3 s in
@@ -3899,6 +4069,16 @@ impl Shell {
     /// starts on the first painted frame), so a pane that is shown and never
     /// used costs an idle process and nothing else; closing the pane stops it.
     pub(crate) fn browser_prewarm(&mut self, cx: &mut Context<Self>) {
+        // The pane's backend is the native view, built from a frame with a live
+        // window (`browser_ensure_webview`). Nothing is launched here: the CDP
+        // engine remains for the agent tools, which drive a page
+        // programmatically and need the protocol.
+        //
+        // The headless suite still runs on the capture path, so there it still
+        // wants the engine warm.
+        if !cfg!(test) {
+            return;
+        }
         if self.state.browser.engine_ready() || self.state.browser.engine_error().is_some() {
             return;
         }
@@ -3910,8 +4090,6 @@ impl Shell {
             let outcome = task.await;
             let _ = this.update(cx, |this, cx| {
                 this.browser_refresh_pane();
-                // A pre-warm that failed is not the reader's action: the named
-                // engine notice draws it, and a later Go retries the launch.
                 let _ = outcome;
                 cx.notify();
             });
@@ -3925,6 +4103,15 @@ impl Shell {
     /// question and make no request; reload is a new navigation and goes
     /// through the same gate a fresh open does.
     pub(crate) fn browser_history(&mut self, step: isize, cx: &mut Context<Self>) {
+        if let Some(webview) = self.browser_webview.clone() {
+            if step < 0 {
+                let _ = webview.update(cx, |view, _| view.back());
+            } else {
+                let _ = webview.update(cx, |view, _| view.forward());
+            }
+            cx.notify();
+            return;
+        }
         let outcome = self.state.browser.mutate(|browser| {
             if step < 0 {
                 browser.back()
@@ -3945,6 +4132,11 @@ impl Shell {
 
     /// Reload the page on screen.
     pub(crate) fn browser_reload(&mut self, cx: &mut Context<Self>) {
+        if let Some(webview) = self.browser_webview.clone() {
+            let _ = webview.read(cx).reload();
+            cx.notify();
+            return;
+        }
         let url = self
             .state
             .browser
@@ -4022,6 +4214,16 @@ impl Shell {
     /// @@RenderImage@@ from bytes that already exist. A hidden tab stops the
     /// pump entirely, so a page nobody is looking at costs nothing.
     pub(crate) fn sync_browser(&mut self, cx: &mut Context<Self>) {
+        // The native view first: it is the page the reader sees, and its size,
+        // visibility and URL are what the rest of this clock is about.
+        self.sync_browser_webview(cx);
+        // With no view, a queued tool command must hear that rather than wait
+        // out its timeout.
+        if self.browser_webview.is_none() {
+            for job in self.browser_script.drain() {
+                crate::browser::script::reject(job, "no browser view is open in the pane");
+            }
+        }
         let browser = self.state.browser.clone();
         let live = browser.engine_ready();
         let visible = self.right.open && matches!(self.right.tab, Some(RightTab::Browser));
@@ -4122,6 +4324,18 @@ impl Shell {
     /// The live page inside the pane: the frame, its pointer, its wheel and its
     /// keys, or the named reason the text view is what is on screen.
     fn browser_live_body(&self, cx: &mut Context<Self>) -> AnyElement {
+        // The native view owns the page: WKWebView/WebView2/WebKitGTK
+        // composites it, and mouse, keyboard, IME, scrolling, selection and
+        // video are the platform's own. Nothing is captured and nothing is
+        // forwarded, so the pane behaves as the engine does by definition.
+        if let Some(webview) = self.browser_webview.clone() {
+            return div()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .child(webview)
+                .into_any_element();
+        }
         let view = self.browser_pane.clone().unwrap_or_default();
         // A capture is only the reader's page when the browser holds a
         // document for it. The engine's pre-warm paints `about:blank`, so a

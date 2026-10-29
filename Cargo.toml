@@ -175,3 +175,6 @@ opt-level = 3
 
 [profile.dev.package.zune-jpeg]
 opt-level = 3
+
+[workspace.lints.rust]
+linker_messages = "allow"

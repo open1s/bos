@@ -348,6 +348,24 @@ pub(crate) struct Shell {
     /// listeners, which have no page event to read the chord from, and
     /// Shift+drag outside the pane must still EXTEND rather than replace.
     pub(crate) browser_modifiers: gpui_kit::Modifiers,
+    /// The native browser view: WKWebView on macOS, WebView2 on Windows,
+    /// WebKitGTK on Linux (X11 only).
+    ///
+    /// It replaces the CDP capture pipeline for the PANE: the platform
+    /// composites the page, so scrolling, text selection, IME and video are the
+    /// platform's own rather than something forwarded frame by frame. Built
+    /// lazily, the first time the Browser tab is shown, because a native view
+    /// needs a live window.
+    pub(crate) browser_webview: Option<gpui_kit::Entity<gpui_webview::WebView>>,
+    /// A build is already deferred for a later frame, so render asks once.
+    pub(crate) browser_webview_pending: bool,
+    /// The native view's script channel: the agent tools queue commands here
+    /// and this pane's clock runs them on the UI thread.
+    ///
+    /// It also carries the view's own navigation reports, which are the ONLY
+    /// safe source of the page URL: `WebView::url()` unwraps a nil `NSURL` and
+    /// ABORTS the process before a navigation commits (MEASURED).
+    pub(crate) browser_script: std::sync::Arc<crate::browser::script::ScriptBridge>,
     /// The last text the page received as a KEY.
     ///
     /// The page's input handler sees the same text again after the key listener
@@ -1558,6 +1576,9 @@ impl Shell {
             browser_click: None,
             browser_typed: None,
             browser_modifiers: gpui_kit::Modifiers::default(),
+        browser_webview: None,
+        browser_webview_pending: false,
+        browser_script: std::sync::Arc::new(crate::browser::script::ScriptBridge::default()),
             preset_details: None,
             preset_advanced: None,
             preset_editor: None,
@@ -4791,6 +4812,9 @@ impl Render for Shell {
         // stay resident in the sprite atlas for the life of the window. The
         // render pass owns the release because it is the only place with the
         // `Window`.
+        // The Browser tab's native view is built from a frame with a live
+        // window; until then the pane draws its own placeholder.
+        self.browser_ensure_webview(window, cx);
         for stale in self.browser_render_stale.drain(..) {
             let _ = window.drop_image(stale);
         }

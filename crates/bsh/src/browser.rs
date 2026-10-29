@@ -54,6 +54,8 @@ use agent::{Agent, ToolError};
 /// document. A build with no binary installed falls back to the text view and
 /// the pane says why.
 pub(crate) mod engine;
+/// The native view's script channel, used when the pane runs on one.
+pub(crate) mod script;
 
 /// Characters of page text a snapshot returns.
 pub(crate) const TEXT_CAP: usize = 4_000;
@@ -575,6 +577,19 @@ impl Browser {
         seq
     }
 
+    /// Follow a navigation the NATIVE view made: a link click, a redirect, a
+    /// history move.
+    ///
+    /// The address, the status and the failure follow the page on screen. The
+    /// document is NOT re-read: the native view renders it, and the text model
+    /// is only what the agent tools read.
+    pub(crate) fn follow(&mut self, url: &str) {
+        self.address = url.to_string();
+        self.status = Status::Ready;
+        self.failure = None;
+        self.open = true;
+    }
+
     /// Settle a navigation that produced a page.
     ///
     /// Returns false when a newer navigation replaced this one while it was in
@@ -931,6 +946,12 @@ pub(crate) struct BrowserHandle {
     /// None is production (the harness data directory). The engine's own tests
     /// point it at a scratch path so crash bookkeeping never touches `~/.bos`.
     engine_state_dir: Option<std::path::PathBuf>,
+    /// The native view's script channel, once the pane built one.
+    ///
+    /// Some means the PANE is a native view: the tools then drive the page
+    /// through it instead of starting Chromium, so one page serves the reader
+    /// and the agent at the same time.
+    script: Mutex<Option<Arc<dyn script::ScriptRunner>>>,
 }
 
 impl std::fmt::Debug for BrowserHandle {
@@ -960,6 +981,7 @@ impl BrowserHandle {
             engine_disabled: cfg!(test),
             launch_flight: Mutex::new(()),
             engine_state_dir: None,
+            script: Mutex::new(None),
         }
     }
 
@@ -1004,6 +1026,18 @@ impl BrowserHandle {
     }
 
     /// The live engine, when one is running.
+    /// The native view's script channel, when the pane runs on one.
+    pub(crate) fn script(&self) -> Option<Arc<dyn script::ScriptRunner>> {
+        self.script.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    /// Attach the native view's channel. Called when the pane builds the view.
+    pub(crate) fn set_script(&self, bridge: Arc<dyn script::ScriptRunner>) {
+        if let Ok(mut slot) = self.script.lock() {
+            *slot = Some(bridge);
+        }
+    }
+
     pub(crate) fn engine(&self) -> Option<Arc<engine::Engine>> {
         let slot = self.engine.lock().ok()?;
         match &*slot {
@@ -1195,6 +1229,11 @@ pub(crate) fn load(
                 url: String::new(),
             })
         };
+    }
+    // The pane's own view is the page: navigate IT, so the reader and the
+    // agent look at the same page and no second browser is started.
+    if let Some(bridge) = handle.script() {
+        return web_navigate(handle, bridge.as_ref(), url, seq);
     }
     match handle.ensure_engine() {
         Ok(engine) => load_live(handle, &engine, url, seq, settle),
@@ -1581,6 +1620,9 @@ fn engine_error(error: &engine::EngineError) -> ToolError {
 
 /// Re-read the live page into the entry under the cursor.
 fn refresh_live(handle: &BrowserHandle) -> Result<(), ToolError> {
+    if let Some(bridge) = handle.script() {
+        return web_read_page(handle, bridge.as_ref(), false);
+    }
     let Some(engine) = handle.engine() else {
         return Ok(());
     };
@@ -1600,6 +1642,9 @@ fn refresh_live(handle: &BrowserHandle) -> Result<(), ToolError> {
 
 /// Re-read the live page, letting a changed URL open a history entry.
 fn settle_live(handle: &BrowserHandle) -> Result<(), ToolError> {
+    if let Some(bridge) = handle.script() {
+        return web_read_page(handle, bridge.as_ref(), true);
+    }
     let Some(engine) = handle.engine() else {
         return Ok(());
     };
@@ -1617,11 +1662,351 @@ fn settle_live(handle: &BrowserHandle) -> Result<(), ToolError> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// The native view path
+//
+// These run the SAME scripts the engine does, through the pane's view, so a
+// tool sees one page whichever backend serves it: the snapshot, its refs and
+// the payloads are shared, and only the transport differs.
+// ---------------------------------------------------------------------------
+
+/// Evaluate JavaScript against the native view and read its JSON answer.
+fn web_eval(
+    bridge: &dyn script::ScriptRunner,
+    js: String,
+) -> Result<serde_json::Value, ToolError> {
+    let out = bridge
+        .run(script::ScriptCommand::Eval(js))
+        .map_err(ToolError::Failed)?;
+    script::decode_answer(&out).map_err(ToolError::Failed)
+}
+
+/// Read the live page from the native view into the model.
+fn web_read_page(
+    handle: &BrowserHandle,
+    bridge: &dyn script::ScriptRunner,
+    adopt: bool,
+) -> Result<(), ToolError> {
+    let start = handle.read(|browser| browser.next_id);
+    let value = web_eval(bridge, engine::cdp::snapshot_script(start))?;
+    let page = engine::cdp::page_from_json(&value);
+    let focused = page.focused;
+    handle.mutate(|browser| {
+        let mut next = browser.next_id;
+        let doc = document_from_page(page, &mut next);
+        browser.next_id = next;
+        if adopt {
+            browser.adopt(doc, focused);
+        } else {
+            browser.replace_current(doc, focused);
+        }
+    });
+    Ok(())
+}
+
+/// Wait until the view has finished a navigation away from `previous`.
+fn web_wait_loaded(
+    bridge: &dyn script::ScriptRunner,
+    previous: Option<&str>,
+    target: &str,
+) -> Result<(), Failure> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        if let Ok(value) = web_eval(
+            bridge,
+            String::from("JSON.stringify({ready: document.readyState, href: location.href})"),
+        ) {
+            let ready = value.get("ready").and_then(|v| v.as_str()).unwrap_or("");
+            let href = value.get("href").and_then(|v| v.as_str()).unwrap_or("");
+            let moved = previous != Some(href);
+            if ready == "complete" && (moved || href == target) {
+                return Ok(());
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Err(Failure {
+        kind: "timeout",
+        message: String::from("The page did not finish loading within 20 s."),
+        rule: None,
+        url: target.to_string(),
+    })
+}
+
+/// Navigate the native view and settle the model on the page it landed on.
+fn web_navigate(
+    handle: &BrowserHandle,
+    bridge: &dyn script::ScriptRunner,
+    url: &str,
+    _seq: u64,
+) -> Result<(), Failure> {
+    let previous = web_eval(
+        bridge,
+        String::from("JSON.stringify({href: location.href})"),
+    )
+    .ok()
+    .and_then(|value| value.get("href").and_then(|v| v.as_str()).map(String::from));
+    bridge
+        .run(script::ScriptCommand::Load(url.to_string()))
+        .map_err(|message| Failure {
+            kind: "engine",
+            message,
+            rule: None,
+            url: url.to_string(),
+        })?;
+    web_wait_loaded(bridge, previous.as_deref(), url)?;
+    let landed = web_eval(
+        bridge,
+        String::from("JSON.stringify({href: location.href})"),
+    )
+    .ok()
+    .and_then(|value| value.get("href").and_then(|v| v.as_str()).map(String::from))
+    .unwrap_or_else(|| url.to_string());
+    handle.mutate(|browser| {
+        browser.follow(&landed);
+    });
+    web_read_page(handle, bridge, true).map_err(|error| Failure {
+        kind: "engine",
+        message: match error {
+            ToolError::Failed(message) => message,
+            other => format!("{other:?}"),
+        },
+        rule: None,
+        url: url.to_string(),
+    })?;
+    Ok(())
+}
+
+/// The JavaScript that names one ref and its kind/label, shared by the
+/// click and type routes.
+fn web_ref_js(reference: &str) -> String {
+    let reference = serde_json::to_string(reference).unwrap_or_else(|_| String::from("\"\""));
+    format!("document.querySelector('[data-bsh-ref=' + {reference} + ']')")
+}
+
+/// `browser_click` against the native view.
+fn web_click(
+    handle: &BrowserHandle,
+    bridge: &dyn script::ScriptRunner,
+    reference: &str,
+) -> Result<serde_json::Value, ToolError> {
+    handle
+        .read(|browser| browser.resolve(reference))
+        .map_err(ToolError::Failed)?;
+    let find = web_ref_js(reference);
+    let kind = engine::cdp::KIND_JS;
+    let js = format!(
+        "(function(){{ const el = {find}; if (!el) return JSON.stringify({{ error: 'not-on-page' }});",
+    );
+    let js = format!(
+        "{js} {} if (['input','textarea','select'].indexOf(el.tagName.toLowerCase()) >= 0 || el.isContentEditable) {{ el.focus(); return JSON.stringify({{ action: 'focus', kind: kind, label: label }}); }} el.scrollIntoView({{ block: 'center' }}); el.click(); return JSON.stringify({{ action: 'click', kind: kind, label: label }}); }})()",
+        kind
+    );
+    let value = web_eval(bridge, js)?;
+    if value.get("error").is_some() {
+        return Err(ToolError::Failed(format!(
+            "{reference} is not on this page. Call browser_snapshot.",
+        )));
+    }
+    let action = value.get("action").and_then(|v| v.as_str()).unwrap_or("click");
+    let kind = value.get("kind").and_then(|v| v.as_str()).unwrap_or("button");
+    let label = value.get("label").and_then(|v| v.as_str()).unwrap_or("");
+    if action == "focus" {
+        if let Some(id) = parse_ref(reference) {
+            handle.mutate(|browser| browser.focused = Some(id));
+        }
+        return Ok(serde_json::json!({
+            "focused": reference,
+            "kind": kind,
+            "label": label,
+            "via": "script",
+            "next": "Call browser_type with this ref and the text to enter, then browser_press Enter if it is inside a form."
+        }));
+    }
+    web_read_page(handle, bridge, true)?;
+    let mut payload = snapshot_payload(handle, "navigated")?;
+    payload["via"] = serde_json::json!("script");
+    Ok(payload)
+}
+
+/// `browser_type` against the native view.
+fn web_type(
+    handle: &BrowserHandle,
+    bridge: &dyn script::ScriptRunner,
+    reference: &str,
+    text: &str,
+) -> Result<serde_json::Value, ToolError> {
+    handle
+        .read(|browser| browser.resolve(reference))
+        .map_err(ToolError::Failed)?;
+    let find = web_ref_js(reference);
+    let text_js = serde_json::to_string(text).unwrap_or_else(|_| String::from("\"\""));
+    let js = format!(
+        r#"(function(){{ const el = {find}; if (!el) return JSON.stringify({{ error: 'not-on-page' }});
+  const name = el.tagName.toLowerCase();
+  if (name === 'select') {{
+    const wanted = {text_js};
+    let hit = Array.from(el.options).find(o => (o.textContent || '').trim() === wanted);
+    if (!hit) hit = Array.from(el.options).find(o => (o.textContent || '').trim().toLowerCase().startsWith(wanted.toLowerCase()));
+    if (!hit) return JSON.stringify({{ error: 'not-an-option', offered: Array.from(el.options).map(o => (o.textContent || '').trim()).filter(Boolean) }});
+    el.value = hit.value;
+    el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+    return JSON.stringify({{ kind: 'select', value: el.value, secret: false }});
+  }}
+  el.focus();
+  el.value = {text_js};
+  el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+  el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+  const secret = name === 'input' && (el.type || '') === 'password';
+  return JSON.stringify({{ kind: name, value: secret ? '' : el.value, secret: secret }});
+}})()"#
+    );
+    let value = web_eval(bridge, js)?;
+    if let Some(error) = value.get("error").and_then(|v| v.as_str()) {
+        if error == "not-an-option" {
+            let shown: Vec<String> = value
+                .get("offered")
+                .and_then(|v| v.as_array())
+                .map(|options| {
+                    options
+                        .iter()
+                        .filter_map(|option| option.as_str().map(String::from))
+                        .take(8)
+                        .collect()
+                })
+                .unwrap_or_default();
+            return Err(ToolError::Failed(format!(
+                "'{text}' is not an option of {reference}. Its options are {shown:?}; call browser_type with one of them.",
+            )));
+        }
+        return Err(ToolError::Failed(format!(
+            "{reference} is not on this page. Call browser_snapshot.",
+        )));
+    }
+    // Read first, THEN record the focus: the read replaces the document with
+    // the page's own `focused`, which would otherwise clear the field this
+    // call just focused, and `browser_press Enter` is the documented next step.
+    web_read_page(handle, bridge, false)?;
+    if let Some(id) = parse_ref(reference) {
+        handle.mutate(|browser| browser.focused = Some(id));
+    }
+    let kind = value.get("kind").and_then(|v| v.as_str()).unwrap_or("input");
+    let secret = value.get("secret").and_then(|v| v.as_bool()).unwrap_or(false);
+    let stored = value.get("value").and_then(|v| v.as_str()).unwrap_or("");
+    let mut payload = serde_json::json!({
+        "ref": reference,
+        "kind": kind,
+        "value": if secret { String::from("(hidden)") } else { stored.to_string() },
+    });
+    if secret {
+        payload["hidden"] = serde_json::json!(true);
+        payload["note"] = serde_json::json!(
+            "The field is a password: its value is stored but never returned, so you cannot read a secret back out of the page."
+        );
+    }
+    Ok(payload)
+}
+
+/// `browser_press` against the native view.
+fn web_press(
+    handle: &BrowserHandle,
+    bridge: &dyn script::ScriptRunner,
+    key: &str,
+) -> Result<serde_json::Value, ToolError> {
+    if key == "enter" && handle.read(|browser| browser.focused).is_none() {
+        return Err(ToolError::Failed(String::from(
+            "No element is focused, so Enter has nothing to activate. Call browser_click on an element (or browser_press Tab to focus the first one), then press Enter.",
+        )));
+    }
+    let before = handle.read(|browser| browser.address.clone());
+    let (key_name, code, vk) = match key {
+        "enter" => ("Enter", "Enter", 13),
+        "tab" => ("Tab", "Tab", 9),
+        "shift+tab" => ("Tab", "Tab", 9),
+        "escape" => ("Escape", "Escape", 27),
+        "backspace" => ("Backspace", "Backspace", 8),
+        "delete" => ("Delete", "Delete", 46),
+        "arrowup" => ("ArrowUp", "ArrowUp", 38),
+        "arrowdown" => ("ArrowDown", "ArrowDown", 40),
+        "arrowleft" => ("ArrowLeft", "ArrowLeft", 37),
+        "arrowright" => ("ArrowRight", "ArrowRight", 39),
+        "home" => ("Home", "Home", 36),
+        "end" => ("End", "End", 35),
+        "pageup" => ("PageUp", "PageUp", 33),
+        "pagedown" => ("PageDown", "PageDown", 34),
+        other => {
+            return Err(ToolError::Failed(format!(
+                "{other} is not a key this view supports. Use Enter, Tab, Shift+Tab, the arrow keys, Backspace, Delete, Home, End, PageUp, PageDown or Escape.",
+            )))
+        }
+    };
+    let js = format!(
+        r#"(function(){{
+  const el = document.activeElement || document.body;
+  const key = '{key_name}';
+  const code = '{code}';
+  const vk = {vk};
+  const opts = {{ key: key, code: code, keyCode: vk, which: vk, bubbles: true, cancelable: true }};
+  el.dispatchEvent(new KeyboardEvent('keydown', opts));
+  if (key === 'Enter') {{
+    el.dispatchEvent(new KeyboardEvent('keypress', opts));
+    if (el.form && el.form.requestSubmit) el.form.requestSubmit();
+  }}
+  el.dispatchEvent(new KeyboardEvent('keyup', opts));
+  const ref = el.getAttribute ? el.getAttribute('data-bsh-ref') : null;
+  return JSON.stringify({{ focused: ref, href: location.href }});
+}})()"#
+    );
+    let value = web_eval(bridge, js)?;
+    let focused = value.get("focused").and_then(|v| v.as_str());
+    if key == "escape" {
+        handle.mutate(|browser| browser.focused = None);
+        return Ok(serde_json::json!({
+            "focused": serde_json::Value::Null,
+            "next": "Nothing is focused. Call browser_click on a field to focus it."
+        }));
+    }
+    let mut href = value.get("href").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    // A submit starts a navigation ASYNCHRONOUSLY, so the URL can still be the
+    // old one immediately after the key event. Give it a moment: MEASURED,
+    // Baidu answered `rsv_enter=1` a fraction of a second later, and reading
+    // too early reported the focus instead of the page it had already left.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while href == before && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if let Ok(now) = web_eval(
+            bridge,
+            String::from("JSON.stringify({href: location.href})"),
+        ) {
+            href = now
+                .get("href")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+        }
+    }
+    if href != before {
+        web_wait_loaded(bridge, Some(before.as_str()), &href)
+            .map_err(|failure| ToolError::Failed(failure.tool_message()))?;
+        web_read_page(handle, bridge, true)?;
+        return snapshot_payload(handle, "navigated");
+    }
+    web_read_page(handle, bridge, false)?;
+    Ok(match focused {
+        Some(reference) => focused_payload(reference),
+        None => snapshot_payload(handle, "pressed")?,
+    })
+}
+
 /// `browser_click` against the live page.
 pub(crate) fn click_live(
     handle: &BrowserHandle,
     reference: &str,
 ) -> Result<serde_json::Value, ToolError> {
+    if let Some(bridge) = handle.script() {
+        return web_click(handle, bridge.as_ref(), reference);
+    }
     let engine = handle
         .engine()
         .ok_or_else(|| ToolError::Failed(String::from("No rendered engine is running.")))?;
@@ -1669,6 +2054,9 @@ pub(crate) fn type_live(
     reference: &str,
     text: &str,
 ) -> Result<serde_json::Value, ToolError> {
+    if let Some(bridge) = handle.script() {
+        return web_type(handle, bridge.as_ref(), reference, text);
+    }
     let engine = handle
         .engine()
         .ok_or_else(|| ToolError::Failed(String::from("No rendered engine is running.")))?;
@@ -1716,6 +2104,9 @@ pub(crate) fn press_live(
     handle: &BrowserHandle,
     key: &str,
 ) -> Result<serde_json::Value, ToolError> {
+    if let Some(bridge) = handle.script() {
+        return web_press(handle, bridge.as_ref(), key);
+    }
     let engine = handle
         .engine()
         .ok_or_else(|| ToolError::Failed(String::from("No rendered engine is running.")))?;
@@ -3683,6 +4074,95 @@ mod tests {
         assert_eq!(failure.kind, "engine");
         assert!(
             failure.message.contains("did not implement") || failure.message.contains("refused")
+        );
+    }
+
+    /// The TOOL path, driven through an injected runner.
+    ///
+    /// The pane's native view cannot exist in the headless harness, so the
+    /// runner seam is what makes this coverage real: `EngineRunner` answers the
+    /// SAME `Eval`/`Load` commands the view answers, so `load`, `snapshot_live`,
+    /// `type_live` and `click_live` below run their real code - the JavaScript
+    /// snapshot, the ref stamps, the payloads - against a live page.
+    #[test]
+    fn the_tools_drive_a_page_through_an_injected_runner() {
+        use std::io::{Read as _, Write as _};
+        if crate::browser::engine::cdp::client::discover_binary().is_err() {
+            eprintln!("SKIP: no Chromium/Chrome installed for the tool runner test");
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let addr = listener.local_addr().expect("the port");
+        let body = String::from(
+            "<!doctype html><html><body>\
+             <input id=\"q\">\
+             <button id=\"go\">Go</button>\
+             <script>window.__clicks = 0;\
+             document.getElementById('go').addEventListener('click', function () { window.__clicks++; });\
+             </script></body></html>",
+        );
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buffer = [0u8; 4096];
+                let _ = stream.read(&mut buffer);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let frames = Arc::new(engine::FrameSlot::default());
+        let state_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("bsh-browser-tool-{}", std::process::id()));
+        let live = Arc::new(
+            engine::Engine::launch_in(frames, (800, 600), &state_dir).expect("the engine starts"),
+        );
+        // The runner the pane would supply, answered here by the engine.
+        let handle = BrowserHandle::live();
+        handle.set_script(Arc::new(script::EngineRunner(live.clone())));
+
+        let url = format!("http://{addr}/");
+        let seq = handle.mutate(|browser| browser.begin(&url));
+        load(&handle, &url, seq, engine::Settle::Idle)
+            .expect("the page loads through the runner");
+
+        let snapshot = snapshot_live(&handle).expect("a snapshot");
+        let elements = snapshot["snapshot"]["elements"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            elements.len() >= 2,
+            "the field and the button are in the snapshot: {snapshot}"
+        );
+        let reference = |kind: &str| -> Option<String> {
+            elements.iter().find_map(|element| {
+                (element["kind"].as_str() == Some(kind))
+                    .then(|| element["ref"].as_str().map(String::from))
+                    .flatten()
+            })
+        };
+        let field = reference("input").expect("an input ref");
+        let button = reference("submit")
+            .or_else(|| reference("button"))
+            .expect("a button ref");
+
+        // The real tool calls, in the order an agent makes them.
+        let typed = type_live(&handle, &field, "hello").expect("type");
+        assert_eq!(typed["value"], "hello", "the field holds the text: {typed}");
+        let clicks_before = live.evaluate("window.__clicks").expect("the counter");
+        assert_eq!(clicks_before.as_u64(), Some(0), "nothing clicked yet");
+        click_live(&handle, &button).expect("click");
+        let clicks = live.evaluate("window.__clicks").expect("the counter");
+        assert_eq!(
+            clicks.as_u64(),
+            Some(1),
+            "the page's own click handler ran through the tool path"
         );
     }
 }

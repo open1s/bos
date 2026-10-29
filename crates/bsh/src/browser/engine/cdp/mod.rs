@@ -2028,7 +2028,7 @@ const SELECT_ALL_JS: &str = r#"
 
 /// The JS that decides what an element is. Shared by both scripts so a click
 /// and a snapshot cannot disagree about a ref's kind.
-const KIND_JS: &str = r#"
+pub(crate) const KIND_JS: &str = r#"
   const name = el.tagName.toLowerCase();
   let kind = 'button';
   if (name === 'a' || name === 'area') kind = 'link';
@@ -2042,7 +2042,7 @@ const KIND_JS: &str = r#"
 "#;
 
 /// The snapshot expression: read the live DOM and stamp refs.
-fn snapshot_script(start: u64) -> String {
+pub(crate) fn snapshot_script(start: u64) -> String {
     format!(
         r#"(() => {{
   const START = {start};
@@ -2057,7 +2057,13 @@ fn snapshot_script(start: u64) -> String {
     if (style.display === 'none' || style.visibility === 'hidden') continue;
     let mark = el.getAttribute('data-bsh-ref');
     let id = mark ? parseInt(mark.slice(1), 10) : NaN;
-    if (!Number.isFinite(id) || id < START) {{ id = next++; el.setAttribute('data-bsh-ref', 'e' + id); }}
+    // An element that already carries a ref KEEPS it: a re-read of the same
+    // document must not move the refs a tool is holding (MEASURED: typing into
+    // a field re-read the page and the following click was refused as stale).
+    // Only an unmarked element - a new document, or a node the page re-created -
+    // takes a fresh id above `START`, which is what mints a new range after a
+    // navigation.
+    if (!Number.isFinite(id)) {{ id = next++; el.setAttribute('data-bsh-ref', 'e' + id); }}
     {KIND_JS}
     const item = {{ ref: 'e' + id, kind: kind, label: label }};
     if (kind === 'link') item.href = el.href || null;
@@ -2197,7 +2203,7 @@ fn focus_script(_backwards: bool) -> String {
 }
 
 /// Turn the snapshot JSON into a `Page`.
-fn page_from_json(value: &Value) -> Page {
+pub(crate) fn page_from_json(value: &Value) -> Page {
     let mut elements = Vec::new();
     for item in value
         .get("elements")
@@ -2369,13 +2375,17 @@ mod tests {
     }
 
     #[test]
-    fn the_snapshot_script_stamps_a_monotonic_floor() {
+    fn the_snapshot_script_keeps_an_existing_ref_and_mints_new_ones_above_the_floor() {
         let script = snapshot_script(41);
         assert!(script.contains("const START = 41;"), "{script}");
         assert!(script.contains("data-bsh-ref"), "{script}");
-        assert!(script.contains("id < START"), "{script}");
+        // An element that already carries a ref KEEPS it. A re-read must not
+        // move the refs a tool is holding: MEASURED, typing into a field
+        // re-read the page, and the documented click that follows was refused
+        // as stale because every ref had been re-stamped.
+        assert!(!script.contains("id < START"), "{script}");
+        assert!(script.contains("if (!Number.isFinite(id))"), "{script}");
     }
-
     #[test]
     fn a_ref_is_embedded_as_a_string_literal_not_raw() {
         let script = point_script("e3'\"");

@@ -1,9 +1,131 @@
-# Browser substrate: Chromium over CDP
+# Browser substrate: a native view for the pane, Chromium over CDP for the tools
 
-The BSH Browser pane uses the installed Google Chrome or Chromium executable.
-It starts a private headless browser process and controls it through the
-standard Chrome DevTools Protocol (CDP). No browser engine is linked into the
-Rust build.
+Two consumers, two backends, because they need different things.
+
+- **The pane** renders a native web view: `gpui-webview` hosts Wry in the GPUI
+  window - WKWebView on macOS, WebView2 on Windows, WebKitGTK on Linux
+  (X11/XWayland only). The platform composites the page, so scrolling, text
+  selection, keyboard, IME, links and video are the platform's own. Nothing is
+  captured, forwarded or re-encoded.
+- **The agent tools** (`browser_navigate`, `_snapshot`, `_click`, `_type`,
+  `_press`) drive the installed Chrome/Chromium over CDP, because a page an
+  agent reads and clicks needs a programmable protocol, not a picture.
+
+## The pane's native view
+
+The view is built lazily, from a deferred task on a frame with a live window
+(`browser_ensure_webview`), and only once the pane has an address: a native
+view on `about:blank` would cover the pane's empty state with a white
+rectangle. `sync_browser_webview` keeps it sized to the pane and visible only
+while the Browser tab is the one showing.
+
+A native child view is drawn ABOVE the GPUI tree on this backend, so it covers
+popovers, dialogs, menus and tooltips in its bounds, and it cannot be clipped.
+The pane hides the view while an overlay (the settings dialog) is open, which
+is what keeps that dialog visible. A pane that never navigates never builds the
+view at all, so the cost is paid by the pane that is used.
+
+The view is given a REAL browser user agent, per platform. Wry's default is a
+sparse `AppleWebKit/605.1.15` with no `Safari` token, and sites that sniff it
+serve a stub: MEASURED, baidu.com answered with `readyState: complete` and NO
+`document.body` at all (so its `#kw` search field did not exist), while the same
+view with a Safari-style UA loaded the real page (`百度一下，你就知道`, body
+445 KB) and the full search flow worked: typed `Python` into `#kw`, clicked
+`#su`, and the results page arrived as `Python_百度搜索` with `#content_left`.
+
+A link that asks for a NEW window (`target="_blank"`, `window.open`) is a
+separate case: the pane has one page, so Wry's new-window handler DENIES the
+window and records the URL, and the pane loads it in its own view. Without
+that, every search result looked dead - MEASURED on Baidu, whose results are
+all `target="_blank"`: clicking one did nothing at all, while the same click
+with the handler in place landed on the destination
+(`https://python.bd.cylsoft.cn/?...`).
+
+The address bar follows the page through Wry's navigation handler, which
+reports every navigation - a link click, a redirect, a history move. This is
+deliberately NOT `WebView::url()`: that unwraps a nil `NSURL` and ABORTS the
+process when the view has no committed URL yet (MEASURED: polling it from the
+pane clock killed the app while a page was still loading).
+
+The headless test suite keeps the text/capture path (`cfg!(test)`), because a
+native view cannot be exercised in the test harness; the view itself is verified
+by running the app.
+
+**Do not enable `gpui-fast`.** `gpui-webview`'s default features turn on
+`gpui-kit/gpui-fast`, which SWAPS the whole GUI backend: it compiled and ran,
+but `gpui_kit::TestAppContext` disappears, so the entire test suite stops
+compiling. The dependency is pinned to `default-features = false` for that
+reason. On Linux the application must also start on X11 (see the crate's
+guide); `WebView::build` refuses a Wayland window.
+
+## The agent tools drive the pane's own view
+
+The tools talk to the SAME page the reader sees. The view is `!Send` and lives
+on the UI thread, so `browser/script.rs` is the bridge: a tool queues an
+`Eval` or `Load` command and blocks on its reply, and the pane's own clock
+drains the queue into `evaluate_script_with_callback` / `load_url`. Nothing is
+re-implemented per backend: the tools run the SAME snapshot script the engine
+uses, so refs, element kinds and payloads are identical.
+
+A tool's sequence is therefore: navigate (the view loads, the tool waits for
+`readyState === "complete"` on a page that moved), snapshot (the script reads
+the live DOM and stamps refs), then type/click/press. Two behaviours are worth
+stating because they cost a measurement each:
+
+- `browser_type` records the focused ref AFTER it re-reads the page, because
+  the read replaces the document with the page's own `focused` and would
+  otherwise clear the field the call had just focused - which made the
+  documented `browser_press Enter` refuse with "no element is focused".
+- `browser_press Enter` waits up to 3 s for the URL to move: a form submits
+  asynchronously, and sampling immediately reported the focus payload while
+  the page had already left (MEASURED on Baidu, `rsv_enter=1` arrived a
+  fraction of a second later).
+
+VERIFIED on Baidu through these functions (a temporary probe, since the
+headless suite cannot host a native view): `browser_snapshot` returned 60
+element refs around the real page (title `百度一下，你就知道`, 615 characters of
+text), `browser_type` stored `Python` into the search field, `browser_click`
+activated a submit ref (`via: "script"`) and the page navigated to a `/s?wd=`
+result URL, and `browser_press Enter` navigated with the same shape.
+
+Chromium over CDP remains the fallback for a handle with NO view - the
+headless test suite, or a pane that was never opened - so the tool surface is
+unchanged when there is no native view to drive.
+
+### The runner seam, and the coverage it buys
+
+`ScriptRunner` is the seam (`browser/script.rs`): the pane supplies the queue
+that the native view drains, and the TEST harness supplies `EngineRunner`,
+which answers the same `Eval`/`Load` commands through Chromium over CDP. That
+is what makes the tool path testable without a native window:
+`the_tools_drive_a_page_through_an_injected_runner` runs `load`,
+`snapshot_live`, `type_live` and `click_live` against a local page - the real
+JavaScript, refs and payloads - and asserts that the page's own click handler
+ran.
+
+That test earned its keep immediately: it caught a REF-STABILITY bug. The
+snapshot script used to re-stamp every element whose ref was below the floor,
+so the re-read that `browser_type` performs moved every ref, and the documented
+`browser_type` then `browser_click` sequence was refused as stale (MEASURED on
+Baidu as well). The script now KEEPS an element's existing ref and mints ids
+above the floor only for unmarked elements, which is what mints a fresh range
+after a NAVIGATION and leaves it alone on a re-read.
+
+### What the page sees, and what it does not
+
+Wry exposes no input dispatch, so on the native view a tool's input is
+DOM-synthetic: `browser_click` uses `element.click()` and reports
+`via: "script"`, `browser_type` sets the value and fires `input`/`change`,
+and `browser_press` dispatches `keydown`/`keypress`/`keyup` and calls
+`form.requestSubmit()` for Enter. Those events are NOT `isTrusted`: a page
+that checks `event.isTrusted` can tell them apart, and a page that only reacts
+to real OS input will not see them. The CDP path still has real input dispatch,
+so a handle with no view keeps that behaviour.
+
+A snapshot lists elements in DOM order with their kind and label; choosing
+which ref to act on is the caller's job. On a page with promotional or
+trending links (Baidu's home page is one) several refs look plausible, and the
+tool acts on the one it is given.
 
 ## Discovery
 
