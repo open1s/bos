@@ -1595,6 +1595,9 @@ fn decode_messages(batch: &RecordBatch) -> Result<Vec<ChatMessage>> {
                 .is_valid(index)
                 .then(|| serde_json::from_str::<MessageMeta>(meta.value(index)).ok())
                 .flatten(),
+            // The invoked-skill blocks are display-only and never ride the
+            // request; the log does not carry them.
+            skills: Vec::new(),
             steering: steering.as_ref().is_some_and(|column| column.value(index)),
             // A file written before the timeline had no column: its rows draw
             // in the older reasoning-then-text-then-steps order.
@@ -1672,6 +1675,7 @@ mod tests {
             },
             error: (index.is_multiple_of(7)).then(|| format!("boom {index}")),
             meta: (index.is_multiple_of(5)).then(MessageMeta::default),
+            skills: Vec::new(),
             // An even index is a user row; make one of them a steering row so
             // the round trip proves the flag survives the log.
             steering: index == 2,

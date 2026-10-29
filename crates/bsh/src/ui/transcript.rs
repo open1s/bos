@@ -2340,6 +2340,12 @@ impl Shell {
                         ),
                 );
             }
+            // A skill the prompt invoked shows the block the request carried,
+            // not only the invocation's name: the reader asked for the skill,
+            // and this is the text the model was given.
+            for (slot, skill) in message.skills.iter().enumerate() {
+                stack = stack.child(self.skill_block(index, slot, skill, chrome));
+            }
             return div()
                 .w_full()
                 .flex()
@@ -3556,6 +3562,50 @@ impl Shell {
                 theme::body_size_at(self.state.draft().global.general.content_font_size),
                 theme::muted(),
             ))
+    }
+
+    /// The instructions one skill invocation carried, as the model received
+    /// them.
+    ///
+    /// A prompt that invokes a skill shows the rendered block here, so the
+    /// pane answers "what was actually sent" instead of repeating the name
+    /// the reader typed.
+    fn skill_block(
+        &self,
+        row: usize,
+        slot: usize,
+        skill: &crate::model::SkillInvocation,
+        chrome: &RowChrome<'_>,
+    ) -> impl IntoElement {
+        let content = chrome.content_size;
+        div()
+            .debug_selector(move || format!("skill-block-{row}-{slot}"))
+            .w_full()
+            .p(px(10.0))
+            .rounded(px(12.0))
+            .border_1()
+            .border_color(rgb(theme::border_soft()))
+            .bg(rgb(theme::page()))
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(txt(
+                format!(
+                    "{} · {}",
+                    crate::i18n::tr(self.state.lang, "skill.invoked"),
+                    skill.name
+                ),
+                11.0,
+                theme::faint(),
+            ))
+            .child(
+                txt(
+                    skill.content.clone(),
+                    theme::small_size_at(content),
+                    theme::muted(),
+                )
+                .line_height(px(theme::body_line_at(content))),
+            )
     }
 
     /// One reasoning disclosure: one Thinking segment of a turn.

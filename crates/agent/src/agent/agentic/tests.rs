@@ -1096,6 +1096,184 @@ async fn stopping_at_done_keeps_the_session_history() {
     );
 }
 
+/// The model's catalogue and its loader answer from ONE rule: a skill whose
+/// manifest reserves it for the reader (disable-model-invocation: true) stays
+/// registered - the reader's slash-name gesture loads it - but the request the
+/// model receives never names it.
+#[test]
+fn a_user_only_skill_is_not_in_the_models_catalogue() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock before epoch")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("bos-skill-policy-{nanos}"));
+    let write = |name: &str, restriction: &str| {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).expect("the skill directory");
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: a test skill\n{restriction}---\n\nbody\n"),
+        )
+        .expect("the manifest");
+    };
+    write("open", "");
+    write("reserved", "disable-model-invocation: true\n");
+
+    let mut agent = Agent::new(AgentConfig::default(), Arc::new(make_llm_provider()));
+    agent
+        .register_skills_from_dir(root.clone())
+        .expect("the skills register");
+
+    // The reader's path keeps both: the gesture resolves against the agent, and
+    // a skill reserved from the model is exactly the one a reader must name.
+    assert!(
+        agent.skill("reserved").is_some(),
+        "registered for the reader"
+    );
+    assert!(agent.skill("open").is_some());
+
+    // The model's catalogue carries only the open one.
+    let context = agent.prepare_context();
+    let names: Vec<&str> = context.skills.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["open"],
+        "only the model-invocable skill is advertised: {names:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A vendor that asks for load_skill once, then reports what the engine put in
+/// the tool result.
+struct SkillLoadingLlm {
+    name: String,
+    seen: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl LlmClient<AgentSession, AgentReactContext> for SkillLoadingLlm {
+    async fn complete(
+        &self,
+        _persona: Option<String>,
+        _req: LlmRequest,
+        session: &mut AgentSession,
+        _context: &mut AgentReactContext,
+    ) -> Result<LlmResponse, LlmError> {
+        let call = self
+            .calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if call == 0 {
+            return Ok(make_tool_call_response(
+                "load_skill",
+                &format!("{{\"name\":\"{}\"}}", self.name),
+            ));
+        }
+        let result = session
+            .messages()
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                react::llm::LlmMessage::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            });
+        *self.seen.lock().unwrap() = result;
+        Ok(make_text_response("final".to_string()))
+    }
+
+    async fn stream_complete(
+        &self,
+        _persona: Option<String>,
+        _req: LlmRequest,
+        _session: &mut AgentSession,
+        _context: &mut AgentReactContext,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamToken, LlmError>> + Send>>, LlmError> {
+        Ok(Box::pin(futures::stream::iter(vec![Ok(StreamToken::Done)])))
+    }
+
+    fn supports_tools(&self) -> bool {
+        true
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "skill-loading-mock"
+    }
+}
+
+/// The model's load_skill answers from the SAME policy the catalogue uses: a
+/// skill reserved for the reader is refused with the reference's wording, and
+/// its instructions never reach the model; an ordinary skill still loads.
+#[tokio::test]
+async fn the_loader_refuses_a_skill_reserved_from_the_model() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock before epoch")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("bos-skill-loader-{nanos}"));
+    let write = |name: &str, restriction: &str, body: &str| {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).expect("the skill directory");
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: a test skill\n{restriction}---\n\n{body}\n"),
+        )
+        .expect("the manifest");
+    };
+    write("open", "", "OPEN BODY");
+    write(
+        "reserved",
+        "disable-model-invocation: true\n",
+        "RESERVED BODY",
+    );
+
+    let load = |name: &str| {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut provider = LlmProvider::new();
+        provider.register_vendor(
+            "skill-loading-mock".to_string(),
+            Box::new(SkillLoadingLlm {
+                name: name.to_string(),
+                seen: seen.clone(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+        );
+        (provider, seen)
+    };
+
+    let (provider, refused) = load("reserved");
+    let mut agent = Agent::new(AgentConfig::default(), Arc::new(provider));
+    agent
+        .register_skills_from_dir(root.clone())
+        .expect("the skills register");
+    let _ = agent.react("load the reserved one".to_string()).await;
+    let refused = refused
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the loader answered");
+    assert!(
+        refused.contains("not available for model invocation"),
+        "the refusal is the reference's: {refused}"
+    );
+    assert!(
+        !refused.contains("RESERVED BODY"),
+        "the reserved body must not travel: {refused}"
+    );
+
+    let (provider, loaded) = load("open");
+    let mut agent = Agent::new(AgentConfig::default(), Arc::new(provider));
+    agent
+        .register_skills_from_dir(root.clone())
+        .expect("the skills register");
+    let _ = agent.react("load the open one".to_string()).await;
+    let loaded = loaded.lock().unwrap().clone().expect("the loader answered");
+    assert!(
+        loaded.contains("OPEN BODY"),
+        "an ordinary skill still loads: {loaded}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 // ============================================================================
 // Working-plan (update_plan) Tests
 

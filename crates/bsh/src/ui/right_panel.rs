@@ -833,18 +833,7 @@ impl Shell {
             // The reference hangs the same `.5px` rule on this seam that it
             // hangs on the sidebar's, so the panel reads as a column of the
             // same family.
-            .child({
-                let started = std::time::Instant::now();
-                let body = self.right_panel_body(cx);
-                let took = started.elapsed();
-                if took.as_millis() >= 2 {
-                    eprintln!(
-                        "BSHPROBE right_panel_body {:?} tab={:?}",
-                        took, self.right.tab
-                    );
-                }
-                body
-            });
+            .child(self.right_panel_body(cx));
         Some(
             div()
                 .debug_selector(|| String::from("right-panel-frame"))
@@ -1203,12 +1192,7 @@ impl Shell {
         match self.right.tab {
             None => body.child(self.right_start(cx)),
             Some(RightTab::Files) => {
-                let t = std::time::Instant::now();
                 let pane = body.child(self.files_pane(cx));
-                let took = t.elapsed();
-                if took.as_millis() >= 2 {
-                    eprintln!("BSHPROBE files_pane {:?}", took);
-                }
                 let _ = __all;
                 pane
             }
@@ -4052,7 +4036,16 @@ impl Shell {
                     .browser_pane
                     .as_ref()
                     .is_some_and(|view| frame_is_the_page(view.status));
-                engine.set_streaming(visible && has_page);
+                // Capture only a SETTLED page. MEASURED: a capture queued while
+                // a page is still loading waits for the renderer for 0.6-1.2 s
+                // and returns a half-painted frame, while the same capture on a
+                // settled page costs 30-120 ms. The last frame stays on screen
+                // for the length of the load, which is what a reader expects.
+                let settled = self
+                    .browser_pane
+                    .as_ref()
+                    .is_some_and(|view| matches!(view.status, crate::browser::Status::Ready));
+                engine.set_streaming(visible && has_page && settled);
                 if visible {
                     // The viewport follows the geometry the frame is actually
                     // drawn in, so the page reflows instead of being upscaled.
@@ -4060,9 +4053,9 @@ impl Shell {
                     // render path: the want is recorded here and applied off
                     // the UI thread, at most one override per tick window, so
                     // a pane drag reflows at a bounded rate and a settled pane
-                    // still catches the final size. The compositor stream
-                    // publishes the reflow on its next painted frame, so no
-                    // dirty flag is needed here.
+                    // still catches the final size. The pump's probe publishes
+                    // the reflow on its next capture, so no dirty flag is
+                    // needed here.
                     if let Some(bounds) = self.browser_bounds.get() {
                         let width = bounds.size.width.as_f32().round().max(0.0) as u32;
                         let height = bounds.size.height.as_f32().round().max(0.0) as u32;
@@ -4187,16 +4180,6 @@ impl Shell {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                            eprintln!(
-                                "BSHPROBE down {:?} count={} pos={:?} bounds={:?} vp={:?} engine={} focused={}",
-                                event.button,
-                                event.click_count,
-                                event.position,
-                                this.browser_bounds.get(),
-                                this.state.browser.engine().map(|e| e.viewport()),
-                                this.state.browser.engine().is_some(),
-                                this.browser_focus.is_focused(window),
-                            );
                             // A press enters the page: keys go there from now on.
                             window.focus(&this.browser_focus, cx);
                             this.browser_pointer_down(
@@ -4234,12 +4217,6 @@ impl Shell {
                         }),
                     )
                     .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
-                        if this.browser_pressed.is_some() {
-                            eprintln!(
-                                "BSHPROBE frame move pressed_button={:?} pressed={:?} pos={:?}",
-                                event.pressed_button, this.browser_pressed, event.position
-                            );
-                        }
                         // Hover updates :hover; a held button turns the same
                         // event into a drag. Both reach the page now, so a
                         // reader can hover a link and select text.
@@ -4249,10 +4226,6 @@ impl Shell {
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(|this, event: &MouseUpEvent, _, cx| {
-                            eprintln!(
-                                "BSHPROBE frame up {:?} pos={:?} pressed={:?}",
-                                event.button, event.position, this.browser_pressed
-                            );
                             this.browser_pointer_up(event.position, event.button);
                             cx.notify();
                         }),
@@ -4275,13 +4248,7 @@ impl Shell {
                         this.browser_scroll(event, window.line_height());
                         cx.notify();
                     }))
-                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                        eprintln!(
-                            "BSHPROBE key {:?} focused={} engine={}",
-                            event.keystroke,
-                            this.browser_focus.is_focused(window),
-                            this.state.browser.engine().is_some(),
-                        );
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                         this.browser_key(event, cx);
                         cx.notify();
                     }))
@@ -4369,21 +4336,15 @@ impl Shell {
         click_count: usize,
     ) {
         let Some(pointer) = pointer_button(button) else {
-            eprintln!("BSHPROBE down unsupported button {button:?}");
             return;
         };
         // One gesture at a time. A second button pressed while one is held is
         // not an event the page can express, and treating it as a new press
         // would break the drag or selection the reader is still making.
         if self.browser_pressed.is_some() {
-            eprintln!(
-                "BSHPROBE down ignored: already pressed {:?}",
-                self.browser_pressed
-            );
             return;
         }
         let Some((x, y)) = self.browser_page_point(position) else {
-            eprintln!("BSHPROBE down ignored: page point none");
             return;
         };
         let click = BrowserClick::press(self.browser_click.as_ref(), button, click_count);
@@ -4454,10 +4415,6 @@ impl Shell {
     /// right button while the left is held leaves the left press down.
     fn browser_pointer_up(&mut self, position: Point<Pixels>, button: MouseButton) {
         if self.browser_pressed != Some(button) {
-            eprintln!(
-                "BSHPROBE up ignored: pressed={:?} button={:?}",
-                self.browser_pressed, button
-            );
             return;
         }
         let Some(pointer) = pointer_button(button) else {

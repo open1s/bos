@@ -220,6 +220,7 @@ impl Runner {
             // cannot be summarized into the history it supersedes.
             let context = crate::context::TurnContext::from_facts(&facts, false);
             context.inject(&agent);
+
             // The terminal event is held back until the mailbox has been handed
             // back: a steer the turn never reached another step for must be
             // restored BEFORE the shell starts the next turn from the queue.

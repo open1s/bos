@@ -15,7 +15,7 @@ use agent::SteerMailbox;
 use crate::i18n::Lang;
 use crate::model::{
     ChatMessage, CompactCommand, CompactOutcome, CompactionReport, MessageMeta, MessageUsage,
-    PlanItem, PlanStore, Role, Session, ToolEvent,
+    PlanItem, PlanStore, Role, Session, SkillInvocation, ToolEvent,
 };
 use crate::runner::{AgentEvent, Runner};
 use crate::settings::Settings;
@@ -483,6 +483,13 @@ pub(crate) struct AppState {
     /// control can only steer a LIVE turn: an idle session's queued row is an
     /// ordinary send, not a message into a mailbox nobody drains.
     steer_mailboxes: HashMap<String, Arc<SteerMailbox>>,
+    /// The agent each live turn was built with, by session id.
+    ///
+    /// A message steered into a running turn must load a `/name` gesture the
+    /// same way a fresh turn does, and the turn's own build holds the parsed
+    /// skills that resolution needs. Attached with the steer mailbox and
+    /// dropped with it, so only a live turn's agent is reachable here.
+    turn_agents: HashMap<String, Arc<agent::Agent>>,
     /// Messages taken off a queue to steer, by ticket.
     ///
     /// A message is removed from the queue the moment the reader asks for it
@@ -778,6 +785,7 @@ impl AppState {
             inbox: HashMap::new(),
             inbox_seq: 0,
             steer_mailboxes: HashMap::new(),
+            turn_agents: HashMap::new(),
             steering: HashMap::new(),
             search_open: false,
             search_query: String::new(),
@@ -1828,6 +1836,7 @@ impl AppState {
         // it never answered for are put back here: an aborted turn never
         // delivered them, and the next turn is seeded from the store.
         self.steer_mailboxes.remove(id);
+        self.turn_agents.remove(id);
         self.restore_orphan_steers(id);
         let stopped = now_ms();
         if let Some(session) = self.store.session_mut(id) {
@@ -2998,6 +3007,23 @@ impl AppState {
         self.steer_mailboxes.insert(id.to_string(), mailbox);
     }
 
+    /// Attach the agent a newly spawned turn runs.
+    ///
+    /// The steer path resolves a `/name` gesture against the SAME build the
+    /// turn sent with, so a skill the reader invoked in the steer loads
+    /// exactly as it would in a fresh turn.
+    pub(crate) fn attach_turn_agent(&mut self, id: &str, agent: Arc<agent::Agent>) {
+        self.turn_agents.insert(id.to_string(), agent);
+    }
+
+    /// The agent a session's running turn was built with.
+    ///
+    /// None for an idle session: there is no live build to ask, and the next
+    /// turn's own build answers instead.
+    pub(crate) fn turn_agent(&self, id: &str) -> Option<Arc<agent::Agent>> {
+        self.turn_agents.get(id).cloned()
+    }
+
     /// The steer mailbox of a session whose turn is running.
     ///
     /// None for an idle session: a queued row there is an ordinary send, not a
@@ -3228,6 +3254,7 @@ impl AppState {
             // The turn is over: nothing may steer it any more, and a steering
             // row it never answered for goes back to the queue.
             self.steer_mailboxes.remove(id);
+            self.turn_agents.remove(id);
             self.restore_orphan_steers(id);
             self.turn_started = None;
             self.refresh_policy_audit();
@@ -3256,6 +3283,31 @@ impl AppState {
             .trim_front(id, crate::store::WINDOW * crate::theme::WINDOWS_KEPT)
     }
 
+    /// Record the skill blocks a prompt's turn carried, for the transcript.
+    ///
+    /// The rows the turn appended are the reader's prompt and its assistant
+    /// placeholder, so the prompt is the row before the last. A GOAL round
+    /// appends only the placeholder, and its last two rows are both
+    /// assistant, so a round never labels a previous prompt.
+    pub(crate) fn record_prompt_skills(&mut self, id: &str, skills: &[SkillInvocation]) {
+        if skills.is_empty() {
+            return;
+        }
+        {
+            let Some(session) = self.store.session_mut(id) else {
+                return;
+            };
+            let Some(index) = session.messages.len().checked_sub(2) else {
+                return;
+            };
+            if session.messages[index].role != Role::User {
+                return;
+            }
+            session.messages[index].skills = skills.to_vec();
+        }
+        self.save_session(id);
+    }
+
     /// Persist one session.
     pub(crate) fn save_session(&self, id: &str) {
         if let Some(session) = self.store.session(id) {
@@ -3280,6 +3332,7 @@ impl AppState {
         self.runner.stop(id);
         self.streams.remove(id);
         self.steer_mailboxes.remove(id);
+        self.turn_agents.remove(id);
         self.restore_orphan_steers(id);
         if let Some(session) = self.store.session_mut(id) {
             session.archived_at = Some(now());

@@ -2469,6 +2469,30 @@ impl Shell {
         }
     }
 
+    /// Tell the reader when a leading `/name` token names no enabled skill.
+    ///
+    /// The palette only offers enabled skills, so a hand-typed gesture is the
+    /// one path that can name a skill the turn cannot load - a switched-off
+    /// source, or a name that is not installed at all. The request still goes
+    /// out (the token is ordinary text then), but the reader is told why
+    /// nothing loaded instead of watching the model discuss a name it cannot
+    /// read.
+    pub(crate) fn warn_unresolved_skill(&mut self, text: &str, session: &str) {
+        let Some(name) = crate::skill_invocation::leading_skill_name(text) else {
+            return;
+        };
+        let known = self
+            .state
+            .effective_in(session)
+            .enabled_skills()
+            .any(|skill| skill.name == name);
+        if known {
+            return;
+        }
+        let notice = crate::i18n::tr(self.state.lang, "skill.notEnabled").replace("{name}", &name);
+        self.state.notice(notice);
+    }
+
     /// Put one message into the session: queue it behind a running turn, or
     /// open a turn when the session is idle.
     ///
@@ -2483,6 +2507,13 @@ impl Shell {
         attachments: Vec<crate::state::Attachment>,
         cx: &mut Context<Self>,
     ) -> Submit {
+        // A leading /name that resolves to no enabled skill is worth saying
+        // out loud: the palette only offers enabled ones, so a hand-typed
+        // gesture naming a switched-off or missing skill would otherwise
+        // travel as prose and look like the skill simply did nothing.
+        if let Some(id) = self.state.active_id.clone() {
+            self.warn_unresolved_skill(&text, &id);
+        }
         // Measured: the reference queues a submission while its session is
         // already running instead of opening a second turn over the same
         // transcript, which is what its queue dock lists.
@@ -2586,9 +2617,18 @@ impl Shell {
         let Some(queued) = self.state.take_queued(id, seq) else {
             return;
         };
+        self.warn_unresolved_skill(&queued.text, id);
         let plan = self.state.plan_mode(id);
         let request = crate::state::turn_text(&queued.text, plan);
         let input = crate::state::turn_input(&request, &queued.attachments);
+        // A message into a running turn is still the reader's own request, so a
+        // `/name` gesture in it loads that skill the way a fresh turn would.
+        // The turn's build answers: it is the only one whose skills the engine
+        // running the next step actually holds.
+        let input = match self.state.turn_agent(id) {
+            Some(agent) => crate::skill_invocation::expand(&agent, input).0,
+            None => input,
+        };
         let accepted = mailbox.push(agent::SteerMessage {
             content: input,
             ticket: seq,
@@ -3108,6 +3148,13 @@ impl Shell {
         // this baked build, so the queue compares against this record.
         self.state.record_turn_generation(&id);
         let agent = built.agent;
+        // The reader's `/name` gesture loads that skill into THIS turn - the
+        // reference's pre-step listener - and the block is recorded on the
+        // prompt row so the transcript shows what the model actually
+        // received. A skill the settings switched off was never registered,
+        // so nothing loads for it.
+        let (input, invoked) = crate::skill_invocation::expand(&agent, input);
+        self.state.record_prompt_skills(&id, &invoked);
         // The agent shares this store with its `update_plan` tool, so the
         // to-do panel reads the running plan through it.
         self.state.attach_plan(&id, agent.plan());
@@ -3115,6 +3162,9 @@ impl Shell {
         // mailbox. It is attached here, at the one turn-opening path, and
         // dropped when the turn ends - so only a live turn can be steered.
         self.state.attach_steers(&id, agent.steers().clone());
+        // A steer resolves its own `/name` gestures against THIS build, so the
+        // turn's agent is kept beside the mailbox and dropped with it.
+        self.state.attach_turn_agent(&id, agent.clone());
         let cap = self.state.effective_in(&id).tool_output_cap;
         // The automatic trigger prices the request the turn is about to send:
         // the history window plus the rows `begin_turn_in` just appended (the
@@ -5078,7 +5128,6 @@ impl Render for Shell {
                 // stuck in a drag.
                 if event.pressed_button.is_none() {
                     if let Some(button) = this.browser_pressed {
-                        eprintln!("BSHPROBE root move releases stuck {:?}", button);
                         this.browser_release_outside(event.position, button);
                         cx.notify();
                     }
@@ -5095,10 +5144,6 @@ impl Render for Shell {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseUpEvent, _window, cx| {
-                    eprintln!(
-                        "BSHPROBE root up {:?} pos={:?} pressed={:?}",
-                        event.button, event.position, this.browser_pressed
-                    );
                     if this.browser_pressed == Some(event.button) {
                         this.browser_release_outside(event.position, event.button);
                         cx.notify();

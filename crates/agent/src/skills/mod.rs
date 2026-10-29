@@ -271,6 +271,33 @@ impl SkillLoader {
     }
 }
 
+/// What one `load_skill` name resolved to.
+#[derive(Debug, Clone, Copy)]
+pub enum ModelSkillLookup<'a> {
+    /// The skill may be advertised to and loaded by the model.
+    Found(&'a SkillContent),
+    /// The skill exists, but its manifest reserves it for the reader
+    /// (`disable-model-invocation: true`).
+    UserOnly(&'a SkillContent),
+    /// No registered skill answers to that name.
+    Unknown,
+}
+
+/// Resolve one skill name the MODEL asked to load.
+///
+/// The policy is the manifest's own `disable-model-invocation` flag, read into
+/// [`SkillMetadata::user_only`] by the loader. A user-only skill stays
+/// registered - the reader's `/name` gesture loads it - but it must not be
+/// advertised to the model nor opened by its `load_skill` tool. Keeping the
+/// decision here means the catalogue and the tool answer from one rule.
+pub fn lookup_for_model<'a>(skills: &'a [SkillContent], name: &str) -> ModelSkillLookup<'a> {
+    match skills.iter().find(|skill| skill.metadata.name == name) {
+        Some(skill) if skill.metadata.user_only => ModelSkillLookup::UserOnly(skill),
+        Some(skill) => ModelSkillLookup::Found(skill),
+        None => ModelSkillLookup::Unknown,
+    }
+}
+
 /// Errors raised while loading skills.
 #[derive(thiserror::Error, Debug)]
 pub enum SkillError {
@@ -289,4 +316,47 @@ pub enum SkillError {
     /// A skill frontmatter block was not valid YAML.
     #[error("YAML parse error: {0}")]
     YamlError(#[from] serde_yaml::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{lookup_for_model, ModelSkillLookup, SkillContent, SkillMetadata};
+    use std::path::PathBuf;
+
+    fn skill(name: &str, user_only: bool) -> SkillContent {
+        let mut metadata = SkillMetadata::new(
+            name.to_string(),
+            "a test skill".to_string(),
+            PathBuf::from("/skills").join(name).join("SKILL.md"),
+        );
+        metadata.user_only = user_only;
+        SkillContent {
+            metadata,
+            instructions: format!("Body of {name}."),
+            skill_dir: PathBuf::from("/skills").join(name),
+        }
+    }
+
+    /// The manifest decides who may open a skill: the model gets the ones it
+    /// was offered, and a user-only skill is NAMED as such rather than
+    /// reported missing.
+    #[test]
+    fn a_user_only_skill_is_not_the_models_to_open() {
+        let skills = vec![skill("open", false), skill("reserved", true)];
+        match lookup_for_model(&skills, "open") {
+            ModelSkillLookup::Found(skill) => assert_eq!(skill.metadata.name, "open"),
+            other => panic!("an ordinary skill answers the model: {other:?}"),
+        }
+        assert!(
+            matches!(
+                lookup_for_model(&skills, "reserved"),
+                ModelSkillLookup::UserOnly(skill) if skill.metadata.name == "reserved"
+            ),
+            "a reserved skill is refused as user-only, not invented as missing"
+        );
+        assert!(
+            matches!(lookup_for_model(&skills, "nope"), ModelSkillLookup::Unknown),
+            "an unregistered name is unknown"
+        );
+    }
 }

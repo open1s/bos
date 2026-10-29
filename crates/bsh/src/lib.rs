@@ -33,6 +33,7 @@ pub(crate) mod prompts;
 pub(crate) mod reference;
 pub(crate) mod runner;
 pub(crate) mod settings;
+pub(crate) mod skill_invocation;
 pub(crate) mod state;
 pub(crate) mod store;
 pub(crate) mod subagent;

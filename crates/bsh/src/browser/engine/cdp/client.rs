@@ -93,12 +93,35 @@ pub(crate) struct Shared {
     fetch_ready: AtomicBool,
     /// Why the connection ended, when it did.
     closed: Mutex<Option<String>>,
-    /// Latest compositor frame delivered by `Page.startScreencast`.
-    screencast_frame: Mutex<Option<String>>,
-    /// Pairs with `screencast_wake` so a frame cannot be missed while waiting.
-    screencast_gate: Mutex<()>,
-    /// Woken when a screencast frame arrives.
-    screencast_wake: Condvar,
+    /// Count of DELIBERATE input - a key, a press or release, a wheel, a
+    /// navigation, a resize - which is what wakes the frame pump immediately.
+    ///
+    /// Pointer MOTION is deliberately not counted. A hover repaints `:hover`,
+    /// and the pump still sees that (a changed capture resets its quiet count),
+    /// but a mouse crossing a pane arrives at ~60 Hz, and letting each move pull
+    /// a fresh capture pinned the browser process at its capture ceiling and made
+    /// every click and hover arrive late. The pane's pointer path forwards the
+    /// move to the page; it does not spend a screenshot on it.
+    intent: AtomicU64,
+    /// Count of COALESCED hover wakes: a pointer that keeps moving gets at most
+    /// one capture per [`HOVER_WAKE`], so `:hover` still lands quickly without
+    /// spending a screenshot per motion event.
+    hover: AtomicU64,
+    /// When the last hover wake was sent, so motion is coalesced.
+    hover_wake_at: Mutex<Option<Instant>>,
+    /// Held while `intent` is bumped, so a wake cannot be lost between the
+    /// pump's counter read and its wait.
+    wake_gate: Mutex<()>,
+    /// Woken by an intent bump, so a keystroke after an idle second is captured
+    /// now instead of at the next idle probe.
+    wake: Condvar,
+    /// The page target this engine attached to, so discovery can tell a popup
+    /// from the pane's own page.
+    own_target: Mutex<Option<String>>,
+    /// A page target the PAGE opened - `window.open`, a `target="_blank"` link -
+    /// as (targetId, url). The pane has one view, so the pump adopts it: the
+    /// extra target is closed and its URL navigates this one.
+    popup: Mutex<Option<(String, String)>>,
 }
 
 impl Shared {
@@ -145,10 +168,69 @@ impl Shared {
     }
 
     /// Note that the request seam just saw something.
+    ///
+    /// This is the NAVIGATION idle clock only; it is not input, so it does not
+    /// wake the frame pump. A page that finishes a subresource is picked up by
+    /// the pump's next probe.
     pub(crate) fn touch(&self) {
         if let Ok(mut slot) = self.last_activity.lock() {
             slot.replace(Instant::now());
         }
+    }
+
+    /// Record deliberate input and wake the frame pump.
+    ///
+    /// The counter and the wake travel together under [`Shared::wake_gate`], so
+    /// an input that lands while the pump is deciding what to do cannot be
+    /// missed: either the pump reads the new count or the wait sees the notify.
+    fn note_intent(&self) {
+        let _gate = self
+            .wake_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.intent.fetch_add(1, Ordering::Relaxed);
+        self.wake.notify_one();
+    }
+
+    /// Wake the frame pump for a hover, at most once per [`HOVER_WAKE`].
+    ///
+    /// ``:hover`` is the one thing a pointer move buys, and it must not cost a
+    /// capture per event: MEASURED, a pointer crossing the pane sends a move
+    /// every ~16 ms, and one screenshot each pinned the browser process at its
+    /// capture ceiling. Coalescing keeps the highlight responsive (one probe per
+    /// window) and leaves the page's own repaint to carry the rest.
+    fn note_hover(&self) {
+        if let Ok(mut at) = self.hover_wake_at.lock() {
+            if at.is_some_and(|last| last.elapsed() < HOVER_WAKE) {
+                return;
+            }
+            *at = Some(Instant::now());
+        }
+        let _gate = self
+            .wake_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.hover.fetch_add(1, Ordering::Relaxed);
+        self.wake.notify_one();
+    }
+
+    /// The hover stamp the frame pump reads.
+    pub(crate) fn hover(&self) -> u64 {
+        self.hover.load(Ordering::Relaxed)
+    }
+
+    /// The intent stamp the frame pump reads. See [`Shared::intent`].
+    pub(crate) fn intent(&self) -> u64 {
+        self.intent.load(Ordering::Relaxed)
+    }
+
+    /// Wait for the next intent bump, or for `timeout`.
+    pub(crate) fn wait_intent(&self, timeout: Duration) {
+        let Ok(gate) = self.wake_gate.lock() else {
+            thread::sleep(timeout);
+            return;
+        };
+        let _ = self.wake.wait_timeout(gate, timeout);
     }
 
     /// Wait until no request has been seen for `idle`, capped at `cap`.
@@ -183,6 +265,20 @@ impl Shared {
     pub(crate) fn closed(&self) -> Option<String> {
         self.closed.lock().ok().and_then(|slot| slot.clone())
     }
+}
+
+/// How often a moving pointer may wake the pump.
+///
+/// Faster than the idle probe, slower than the input cadence: `:hover` reads as
+/// "caught up" within a capture, and a sweep costs bounded probes instead of one
+/// per motion event.
+const HOVER_WAKE: Duration = Duration::from_millis(200);
+
+/// Whether a command is pointer MOTION, which is coalesced rather than
+/// deliberate.
+fn is_hover(method: &str, params: &Value) -> bool {
+    method == "Input.dispatchMouseEvent"
+        && params.get("type").and_then(Value::as_str) == Some("mouseMoved")
 }
 
 /// One queued request for the socket thread.
@@ -385,10 +481,17 @@ impl Client {
                     "Target.attachToTarget answered without a session for page {target}"
                 ))
             })?;
+        if let Ok(mut slot) = self.shared.own_target.lock() {
+            *slot = Some(target.clone());
+        }
         self.target = target;
         if let Ok(mut slot) = self.session.lock() {
             *slot = session.clone();
         }
+        // Watch for page targets this pane did not create. A search result is
+        // usually a `target="_blank"` link, and without this the page it opens
+        // renders in a window nobody can see, so the click looks dead.
+        let _ = self.call_browser("Target.setDiscoverTargets", json!({ "discover": true }));
         self.call("Page.enable", json!({}))?;
         self.call("Runtime.enable", json!({}))?;
         // Observe page requests for the navigation idle clock. Every paused
@@ -431,6 +534,30 @@ impl Client {
         &self.shared
     }
 
+    /// The intent stamp the frame pump reads. See [`Shared::intent`].
+    pub(crate) fn intent(&self) -> u64 {
+        self.shared.intent()
+    }
+
+    /// The hover stamp the frame pump reads. See [`Shared::hover`].
+    pub(crate) fn hover(&self) -> u64 {
+        self.shared.hover()
+    }
+
+    /// Wait for the next deliberate input, or for `timeout`.
+    pub(crate) fn wait_intent(&self, timeout: Duration) {
+        self.shared.wait_intent(timeout);
+    }
+
+    /// The (targetId, url) of a page the page itself opened, once.
+    pub(crate) fn take_popup(&self) -> Option<(String, String)> {
+        self.shared
+            .popup
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+    }
+
     /// The tail of the child's own output, for a failure sentence.
     pub(crate) fn log(&self) -> String {
         let text = self.log.lock().map(|slot| slot.clone()).unwrap_or_default();
@@ -444,51 +571,57 @@ impl Client {
         self.dispatch(method, params, session)
     }
 
-    /// Ask the page compositor to stream frames as it paints them.
-    pub(crate) fn start_screencast(&self) -> Result<(), EngineError> {
-        self.call("Page.startScreencast", json!({ "format": "png" }))
-            .map(|_| ())
-    }
-
-    /// Stop compositor frame delivery.
-    pub(crate) fn stop_screencast(&self) -> Result<(), EngineError> {
-        self.call("Page.stopScreencast", json!({})).map(|_| ())
-    }
-
-    /// Wait for the latest compositor frame, coalescing frames while the
-    /// consumer is busy.
-    pub(crate) fn wait_screencast_frame(&self, timeout: Duration) -> Option<String> {
-        let deadline = Instant::now() + timeout;
-        let mut gate = self
-            .shared
-            .screencast_gate
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        loop {
-            if let Ok(mut frame) = self.shared.screencast_frame.lock() {
-                if let Some(frame) = frame.take() {
-                    return Some(frame);
-                }
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return None;
-            }
-            let (next, result) = self
-                .shared
-                .screencast_wake
-                .wait_timeout(gate, remaining)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            gate = next;
-            if result.timed_out() {
-                return None;
-            }
-        }
-    }
-
     /// Call a browser-level method (Target.*, Browser.*), with no session.
     pub(crate) fn call_browser(&self, method: &str, params: Value) -> Result<Value, EngineError> {
         self.dispatch(method, params, None)
+    }
+
+    /// Queue one request and return the channel its answer will arrive on.
+    ///
+    /// The PUMP uses this instead of [`Client::dispatch`], because a capture
+    /// round trip is a queue wait inside the engine and not work: MEASURED at
+    /// the pane's real size, one capture at a time costs ~50 ms and does not
+    /// shrink with the format, the scale or the region, while two in flight
+    /// cost ~25 ms each and eight cost ~10 ms each. The pump therefore keeps
+    /// more than one capture outstanding and is never idle across the wait.
+    ///
+    /// The caller owns the receiver, so a request it no longer wants can be
+    /// dropped without disturbing the ones it kept.
+    ///
+    /// Unlike [`Client::dispatch`], this never notes intent or hover: the
+    /// pump's captures are the EFFECT of input, not input themselves, and
+    /// counting them would wake the pump for its own probe. Any future caller
+    /// that sends deliberate input through here must call
+    /// [`Shared::note_intent`] itself.
+    pub(crate) fn dispatch_async(
+        &self,
+        method: &str,
+        params: Value,
+        session: Option<String>,
+    ) -> Result<Receiver<Result<Value, EngineError>>, EngineError> {
+        if !self.alive.load(Ordering::Relaxed) {
+            return Err(EngineError::Closed(
+                self.shared
+                    .closed()
+                    .unwrap_or_else(|| String::from("the engine's socket stopped")),
+            ));
+        }
+        let (tx, rx) = mpsc::channel();
+        self.jobs
+            .send(Job {
+                method: method.to_string(),
+                params,
+                session,
+                reply: tx,
+            })
+            .map_err(|_| {
+                EngineError::Closed(
+                    self.shared
+                        .closed()
+                        .unwrap_or_else(|| String::from("the engine's socket stopped")),
+                )
+            })?;
+        Ok(rx)
     }
 
     /// Queue one request and wait, bounded, for its answer.
@@ -498,6 +631,16 @@ impl Client {
         params: Value,
         session: Option<String>,
     ) -> Result<Value, EngineError> {
+        // Deliberate input may repaint the page: a navigate, a key, a press, a
+        // resize. The pump's own probe is excepted; pointer MOTION is coalesced
+        // instead - see [`Shared::intent`] and [`Shared::hover`].
+        if method != "Page.captureScreenshot" {
+            if is_hover(method, &params) {
+                self.shared.note_hover();
+            } else {
+                self.shared.note_intent();
+            }
+        }
         if !self.alive.load(Ordering::Relaxed) {
             return Err(EngineError::Closed(
                 self.shared
@@ -557,21 +700,28 @@ impl Client {
                     .unwrap_or_else(|| String::from("the engine's socket stopped")),
             ));
         }
+        // A fire-and-forget event is input exactly like a call: a keystroke, a
+        // wheel or a press repaints, so the pump wakes for it without this path
+        // paying for a reply. Hover motion is coalesced.
+        if is_hover(method, &params) {
+            self.shared.note_hover();
+        } else {
+            self.shared.note_intent();
+        }
         let (reply, _unread) = mpsc::channel();
-        self.jobs
-            .send(Job {
-                method: method.to_string(),
-                params,
-                session: Some(self.session()),
-                reply,
-            })
-            .map_err(|_| {
-                EngineError::Closed(
-                    self.shared
-                        .closed()
-                        .unwrap_or_else(|| String::from("the engine's socket stopped")),
-                )
-            })
+        let queued = self.jobs.send(Job {
+            method: method.to_string(),
+            params,
+            session: Some(self.session()),
+            reply,
+        });
+        queued.map_err(|_| {
+            EngineError::Closed(
+                self.shared
+                    .closed()
+                    .unwrap_or_else(|| String::from("the engine's socket stopped")),
+            )
+        })
     }
 
     /// Resize the page viewport, which is also the capture size.
@@ -746,33 +896,44 @@ fn handle_event(
     shared: &Shared,
 ) {
     match method {
-        "Page.screencastFrame" => {
-            if let Some(data) = params.get("data").and_then(Value::as_str) {
-                let gate = shared
-                    .screencast_gate
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if let Ok(mut frame) = shared.screencast_frame.lock() {
-                    frame.replace(data.to_string());
-                }
-                if let Some(session_id) = params.get("sessionId").and_then(Value::as_i64) {
-                    let mut ack = json!({
-                        "id": 0,
-                        "method": "Page.screencastFrameAck",
-                        "params": { "sessionId": session_id },
-                    });
-                    if let Some(target) = event_session {
-                        ack["sessionId"] = Value::String(target.to_string());
-                    }
-                    let _ = socket.send(&ack.to_string());
-                }
-                shared.screencast_wake.notify_one();
-                drop(gate);
-            }
-        }
         "Page.domContentEventFired" => {
             shared.dom_contents.fetch_add(1, Ordering::Relaxed);
             shared.touch();
+        }
+        "Target.targetCreated" | "Target.targetInfoChanged" => {
+            let Some(info) = params.get("targetInfo") else {
+                return;
+            };
+            if info.get("type").and_then(Value::as_str) != Some("page") {
+                return;
+            }
+            let Some(target) = info.get("targetId").and_then(Value::as_str) else {
+                return;
+            };
+            // Discovery reports the pane's OWN page too; it is not a popup.
+            let own = shared.own_target.lock().ok().and_then(|slot| slot.clone());
+            if own.as_deref() == Some(target) {
+                return;
+            }
+            // A window is created on `about:blank` and navigated after, so the
+            // URL only names the page on the LATER report.
+            let url = info.get("url").and_then(Value::as_str).unwrap_or_default();
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                return;
+            }
+            if let Ok(mut slot) = shared.popup.lock() {
+                slot.replace((target.to_string(), url.to_string()));
+            }
+        }
+        "Target.targetDestroyed" => {
+            let Some(target) = params.get("targetId").and_then(Value::as_str) else {
+                return;
+            };
+            if let Ok(mut slot) = shared.popup.lock() {
+                if slot.as_ref().is_some_and(|(id, _)| id == target) {
+                    slot.take();
+                }
+            }
         }
         "Page.loadEventFired" => {
             shared.loads.fetch_add(1, Ordering::Relaxed);
@@ -1103,6 +1264,31 @@ pub(crate) fn default_state_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hover_is_coalesced_and_every_other_command_is_deliberate_input() {
+        let move_event = json!({ "type": "mouseMoved", "button": "none", "buttons": 0 });
+        assert!(
+            is_hover("Input.dispatchMouseEvent", &move_event),
+            "a hover must be coalesced: it arrives at ~60 Hz"
+        );
+        for kind in ["mousePressed", "mouseReleased", "mouseWheel"] {
+            let event = json!({ "type": kind });
+            assert!(
+                !is_hover("Input.dispatchMouseEvent", &event),
+                "{kind} is the reader's intent"
+            );
+        }
+        assert!(!is_hover(
+            "Input.dispatchKeyEvent",
+            &json!({ "type": "char" })
+        ));
+        assert!(!is_hover("Input.insertText", &json!({ "text": "a" })));
+        assert!(!is_hover(
+            "Page.navigate",
+            &json!({ "url": "https://example.com" })
+        ));
+    }
 
     #[test]
     fn the_engine_launch_removes_the_sandbox_environment() {

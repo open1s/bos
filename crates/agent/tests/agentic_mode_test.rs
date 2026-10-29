@@ -86,3 +86,48 @@ async fn a_denied_skill_is_not_registered() {
     assert!(!kept.iter().any(|n| n == "calculator"), "kept: {kept:?}");
     assert_eq!(kept.len(), names.len() - 1, "kept: {kept:?} vs {names:?}");
 }
+
+/// The eager lookup a host uses for a skill the READER invoked by name answers
+/// with the same parsed content the loader registered - instructions and the
+/// directory its references resolve against - so loading it costs no disk read
+/// on the request path.
+#[tokio::test]
+async fn a_registered_skill_answers_an_eager_lookup() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/skills")
+        .to_path_buf();
+    let mut llm = LlmProvider::new();
+    llm.register_vendor(
+        "openai".to_string(),
+        Box::new(
+            OpenAiVendorBuilder::new()
+                .model("gpt-4o-mini".to_string())
+                .api_key("sk-test".to_string())
+                .build()
+                .expect("vendor"),
+        ),
+    );
+    let mut agent = Agent::new(AgentConfig::default(), Arc::new(llm));
+    agent
+        .register_skills_from_dir(dir.clone())
+        .expect("fixture loads");
+
+    let skill = agent
+        .skill("calculator")
+        .expect("the fixture skill answers");
+    assert_eq!(skill.metadata.name, "calculator");
+    assert!(
+        skill.instructions.contains("ONLY job is addition"),
+        "the body is the manifest body, frontmatter stripped: {}",
+        skill.instructions
+    );
+    assert_eq!(
+        skill.skill_dir,
+        dir.join("calculator"),
+        "the directory is the one its relative references resolve against"
+    );
+    assert!(
+        agent.skill("not-a-skill").is_none(),
+        "an unregistered name answers nothing rather than inventing a skill"
+    );
+}

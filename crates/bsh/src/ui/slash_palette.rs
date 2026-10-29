@@ -139,6 +139,12 @@ pub(crate) enum SlashAction {
     /// Run a command this build backs.
     Command(SlashCommand),
     /// Put the skill's name in the prompt, after its slash.
+    ///
+    /// The load itself belongs to the SEND: the runner's turn task resolves
+    /// the gesture against the skills that build registered and appends the
+    /// skill's instructions, so a click never reads a file and a name the
+    /// settings switched off loads nothing. See
+    /// [`crate::skill_invocation`].
     Insert(String),
     /// Switch to one permission preset.
     Permission(&'static str),
@@ -986,6 +992,10 @@ impl Shell {
             },
             // The reference inserts the picked skill's name as the prompt's
             // slash invocation; it never runs a tool on the reader's behalf.
+            // The send is what loads it: the runner's turn task resolves the
+            // gesture against the skills that build registered and appends
+            // the instructions (crate::skill_invocation), which is exactly
+            // the reference's pre-step skill listener.
             SlashAction::Insert(name) => {
                 self.slash.close();
                 self.set_composer_text(&format!("/{name} "), window, cx);

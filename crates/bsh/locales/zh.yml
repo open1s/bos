@@ -704,6 +704,8 @@
 "queue.remove": "删除排队消息"
 "queue.sendNow": "立即发送"
 "queue.steerFailed": "插话发送失败，请重试。"
+"skill.notEnabled": "没有启用的技能\"{name}\"，请求已按原文发送。"
+"skill.invoked": "技能"
 "queue.settingsChanged": "本回合开始后预设或权限已更改；该消息会等待下一回合。"
 
 # 通用设置各行的文案。与参考实现同名的行沿用上文已有的

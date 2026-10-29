@@ -918,6 +918,41 @@ impl Agent {
             .collect()
     }
 
+    /// The registered skill with this name, if one is registered.
+    ///
+    /// The agent has already parsed every manifest it registered, so a host
+    /// that must answer a skill the READER invoked by name - the slash-name
+    /// gesture a palette inserts - can read the instructions and their skill
+    /// directory from here instead of re-reading the file on the request
+    /// path. A skill switched off in the host's settings was never registered,
+    /// so it is absent here too, which is what keeps this eager path and the
+    /// load_skill tool answering from one set.
+    pub fn skill(&self, name: &str) -> Option<&crate::skills::SkillContent> {
+        self.skills.iter().find(|skill| skill.metadata.name == name)
+    }
+
+    /// Every registered skill, in registration order.
+    ///
+    /// A host that builds a second agent from this one - the shell's child
+    /// turn is exactly that - hands the parsed set across instead of walking
+    /// the sources again, so the two agents answer from one parse of one
+    /// catalogue.
+    pub fn skills(&self) -> &[crate::skills::SkillContent] {
+        &self.skills
+    }
+
+    /// Register one skill that is already loaded.
+    ///
+    /// This is the inheritance path: a child agent receives its parent's
+    /// parsed skills rather than a directory to re-scan, so registering N
+    /// skills costs N pushes and no file I/O. The policy travels with the
+    /// content: a user-only skill stays user-only for the child.
+    pub fn register_skill_content(&mut self, skill: crate::skills::SkillContent) {
+        self.skills.push(skill);
+        self.engine_cache.lock().unwrap().take();
+        self.context_cache.lock().unwrap().take();
+    }
+
     /// Register skills from directory.
     pub fn register_skills_from_dir(
         &mut self,

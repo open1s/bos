@@ -1024,6 +1024,12 @@ pub fn render_skill_catalog(skills: &[Skill], query: &str) -> String {
     // A listed skill is a candidate, not an instruction: the only installed
     // skill must not be loaded just because it is the only one.
     text.push_str("Load a skill only when its description matches the request; being listed is not a reason to load it.\n");
+    // The reader can invoke one by name in the composer (the `/name`
+    // gesture), in which case its instructions arrive as a block of their
+    // own. Saying so is the reference catalogue's own sentence, retargeted
+    // to this tool's name, and it stops a second read of a skill that is
+    // already in the conversation.
+    text.push_str("A user may also invoke one directly; its <skill_content> block then appears in the conversation. Follow it, and do not call load_skill again for that skill.\n");
     for index in &described {
         let skill = &skills[*index];
         text.push_str(&format!(
@@ -1208,6 +1214,22 @@ mod tests {
             catalog.len() <= super::SKILL_CATALOG_BUDGET,
             "the catalogue stays inside its budget: {} bytes",
             catalog.len()
+        );
+    }
+
+    /// A skill the READER invoked by name arrives as a block in the
+    /// conversation, so the catalogue must say the model does not load it
+    /// again - the reference catalogue's own sentence.
+    #[test]
+    fn the_catalogue_says_a_direct_invocation_needs_no_second_load() {
+        let catalog = super::render_skill_catalog(&[skill("alpha", "does alpha")], "alpha");
+        assert!(
+            catalog.contains("<skill_content>"),
+            "the block the gesture produces is named: {catalog}"
+        );
+        assert!(
+            catalog.contains("do not call load_skill again"),
+            "a direct invocation is not loaded twice: {catalog}"
         );
     }
 }

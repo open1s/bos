@@ -709,6 +709,8 @@
 "queue.remove": "Remove queued message"
 "queue.sendNow": "Send now"
 "queue.steerFailed": "Steering failed. Try again."
+"skill.notEnabled": "No enabled skill is named \"{name}\" - the request is sent as text."
+"skill.invoked": "Skill"
 "queue.settingsChanged": "The preset or permission changed after this turn started; the message waits for the next turn."
 
 # General-pane rows. `settings.language`, `settings.appearance`,

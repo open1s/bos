@@ -75,7 +75,7 @@ fn offers_web_search(enabled: bool, api_mode: &str) -> bool {
 impl Agent {
     /// Prepare context with tools and skills populated from the agent's state.
     /// Shared by react() and stream() to avoid code duplication.
-    fn prepare_context(&self) -> AgentReactContext {
+    pub(super) fn prepare_context(&self) -> AgentReactContext {
         let mut context = AgentReactContext::new(self.config.name.clone());
 
         if let Some(ref registry) = self.registry {
@@ -112,17 +112,21 @@ impl Agent {
             context.tools.push(react::llm::LlmTool::web_search(None));
         }
 
-        if !self.skills.is_empty() {
-            context.skills = self
-                .skills
-                .iter()
-                .map(|s| react::llm::Skill {
-                    category: s.metadata.category.as_str().to_string(),
-                    name: s.metadata.name.clone(),
-                    description: s.metadata.description.clone(),
-                })
-                .collect();
-        }
+        // The catalogue is the MODEL-INVOCABLE half of the registered set. A
+        // skill whose manifest says `disable-model-invocation: true` is the
+        // reader's to invoke (the composer's `/name` gesture loads it), and
+        // advertising it here would invite a tool call the same policy refuses.
+        // The registered list keeps it, so the gesture still resolves it.
+        context.skills = self
+            .skills
+            .iter()
+            .filter(|s| !s.metadata.user_only)
+            .map(|s| react::llm::Skill {
+                category: s.metadata.category.as_str().to_string(),
+                name: s.metadata.name.clone(),
+                description: s.metadata.description.clone(),
+            })
+            .collect();
 
         context
     }
@@ -184,10 +188,17 @@ impl Agent {
             }
         }
 
-        let has_skills = !self.skills.is_empty();
-        if has_skills {
-            let skill_names: Vec<String> = self
-                .skills
+        // The loader advertises the MODEL-INVOCABLE skills only: a skill whose
+        // manifest reserves it for the reader is still registered (the `/name`
+        // gesture loads it), but the tool must not open it. With none left, no
+        // loader is registered at all rather than one that can only refuse.
+        let model_skills: Vec<&crate::skills::SkillContent> = self
+            .skills
+            .iter()
+            .filter(|s| !s.metadata.user_only)
+            .collect();
+        if !model_skills.is_empty() {
+            let skill_names: Vec<String> = model_skills
                 .iter()
                 .map(|s| s.metadata.name.clone())
                 .collect();
@@ -219,18 +230,23 @@ impl Agent {
                             .get("name")
                             .and_then(|v| v.as_str())
                             .unwrap_or("unknown");
-                        let found = skills.iter().find(|s| s.metadata.name == name);
-                        if let Some(skill) = found {
-                            Ok(serde_json::json!({
-                                "name": skill.metadata.name,
-                                "description": skill.metadata.description,
-                                "instructions": skill.instructions,
-                                "skill_dir": skill.skill_dir.to_string_lossy()
-                            }))
-                        } else {
-                            Ok(serde_json::json!({
+                        match crate::skills::lookup_for_model(&skills, name) {
+                            crate::skills::ModelSkillLookup::Found(skill) => {
+                                Ok(serde_json::json!({
+                                    "name": skill.metadata.name,
+                                    "description": skill.metadata.description,
+                                    "instructions": skill.instructions,
+                                    "skill_dir": skill.skill_dir.to_string_lossy()
+                                }))
+                            }
+                            // The reference's refusal, verbatim in shape: the name
+                            // exists, the model may not open it.
+                            crate::skills::ModelSkillLookup::UserOnly(_) => Ok(serde_json::json!({
+                                "error": format!("Skill '{name}' is not available for model invocation")
+                            })),
+                            crate::skills::ModelSkillLookup::Unknown => Ok(serde_json::json!({
                                 "error": format!("Skill '{}' not found. Available: {}", name, skill_names.join(", "))
-                            }))
+                            })),
                         }
                     }
                 },

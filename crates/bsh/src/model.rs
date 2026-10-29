@@ -332,6 +332,15 @@ pub(crate) struct MessageMeta {
     pub(crate) cancelled: bool,
 }
 
+/// One skill a prompt invoked, with the instructions the model received.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SkillInvocation {
+    /// The skill's own name, from its manifest.
+    pub(crate) name: String,
+    /// The rendered `<skill_content>` block, exactly what the request carried.
+    pub(crate) content: String,
+}
+
 /// One segment of a turn, in the order the stream produced it.
 ///
 /// A turn interleaves reasoning, visible text and tool calls - the model thinks,
@@ -378,6 +387,14 @@ pub(crate) struct ChatMessage {
     /// Reader notes: marker, feedback, usage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) meta: Option<MessageMeta>,
+    /// Skills this prompt invoked, with the rendered block the request carried.
+    ///
+    /// Display only: the model received each block once, and a later turn
+    /// replays the reader's own words (the skill is loaded again when it is
+    /// invoked again). The transcript draws the block here so what the model
+    /// saw is what the bubble shows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) skills: Vec<SkillInvocation>,
     /// Whether this is a mid-turn STEER rather than the turn's own prompt.
     ///
     /// A steered message is a real user turn in the model history - it sits
@@ -409,6 +426,7 @@ impl ChatMessage {
             images: Vec::new(),
             error: None,
             meta: None,
+            skills: Vec::new(),
             steering: false,
         }
     }
@@ -432,6 +450,7 @@ impl ChatMessage {
             images: Vec::new(),
             error: None,
             meta: None,
+            skills: Vec::new(),
             steering: false,
         }
     }

@@ -1493,6 +1493,13 @@ pub(crate) struct SubagentContext {
     runtime: crate::context::RuntimeFacts,
     /// The parent's mid-turn history ceiling, inherited by the child.
     context_budget: usize,
+    /// The parent's parsed skills, inherited by the child.
+    ///
+    /// A child is a build of the same turn, so it reads the same catalogue the
+    /// parent does - including a skill the manifest reserves for the reader,
+    /// which a delegated prompt may name. Carrying the parsed content means a
+    /// child costs pushes, not a second walk of the sources.
+    skills: Vec<agent::skills::SkillContent>,
 }
 
 impl SubagentContext {
@@ -1535,6 +1542,7 @@ impl SubagentContext {
             root: root.into(),
             runtime,
             context_budget: agent.context_budget(),
+            skills: agent.skills().to_vec(),
         }
     }
 
@@ -1575,6 +1583,12 @@ impl SubagentContext {
             config.system_prompt
         );
         let mut child = Agent::from_config(config).with_context_budget(self.context_budget);
+        // The same skills the parent turn carries: a delegated prompt can name
+        // one (the `/name` gesture), and the child's own catalogue and
+        // `load_skill` tool then answer from it.
+        for skill in &self.skills {
+            child.register_skill_content(skill.clone());
+        }
         for tool in &self.sync_tools {
             child.add_tool(tool.clone());
         }
@@ -1613,7 +1627,8 @@ pub(crate) fn child_transcript(child: &Agent) -> Vec<crate::subagent::SubagentMe
         let row = match message {
             react::llm::LlmMessage::System { .. } => None,
             react::llm::LlmMessage::User { content } => {
-                let text = content.as_text().unwrap_or("").to_string();
+                let text = crate::skill_invocation::visible_text(content.as_text().unwrap_or(""))
+                    .to_string();
                 // The per-turn runtime snapshot and workspace instructions are
                 // harness injections, not something the child or its caller
                 // said; the read-only view shows the child's work.
@@ -1658,6 +1673,11 @@ pub(crate) async fn stream_child(
     // The child turn carries the same two per-turn messages a parent turn
     // does, rendered with the delegation context added.
     context.inject(child);
+    // A child prompt can carry the same `/name` gesture a parent request can,
+    // and the child was built with the same skills, so it resolves through the
+    // same reader and appends the same block.
+    let (prompt, _invoked) =
+        crate::skill_invocation::expand(child, react::llm::Content::Text(prompt));
     let mut stream = child.stream(prompt);
     let mut text = String::new();
     while let Some(item) = stream.next().await {
@@ -5616,6 +5636,41 @@ verdict := {{"allow": false, "rule": "{rule}", "reason": "refused by the workspa
             child.config().max_steps,
             0,
             "the child sees the parent's budget, not a lower cap"
+        );
+    }
+
+    /// A child inherits the parent's parsed skills: a delegated prompt can name
+    /// one (the slash-name gesture), and the child's own catalogue and loader
+    /// answer from the same set.
+    #[test]
+    fn a_child_inherits_the_parents_skills() {
+        let root = scratch("subagent-skills");
+        write_skill(&root, "alpha", "one");
+        let settings = with_one_source(&root);
+        let built = build(&settings);
+        assert!(
+            built.agent.skill("alpha").is_some(),
+            "the premise: the parent turn carries the skill"
+        );
+        let context = crate::caps::SubagentContext::new(
+            &built.agent,
+            "parent",
+            "parent",
+            0,
+            std::sync::Arc::new(crate::subagent::SubagentRegistry::default()),
+            built.policy.clone(),
+            "",
+            root.to_string_lossy().to_string(),
+            crate::context::RuntimeFacts::from_effective(&built.effective),
+        );
+        let child = context.child("child-1");
+        let skill = child
+            .skill("alpha")
+            .expect("the child carries the parent's skill");
+        assert!(
+            skill.instructions.contains("Body of alpha."),
+            "with the parsed body, not a re-read: {}",
+            skill.instructions
         );
     }
 

@@ -1165,6 +1165,186 @@ fn the_queue_row_sends_one_message_now(cx: &mut TestAppContext) {
     assert_eq!(turns, 1, "and the session still reports one turn");
 }
 
+/// A skill named in a STEERED message loads exactly as it would in a fresh
+/// turn: the running build answers the gesture, because a message into the
+/// turn's next step is still the reader's own request.
+#[gpui::test]
+fn a_steered_slash_name_loads_the_skill_into_the_running_turn(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_queue(
+            "queue-steer-skill",
+            &["/alpha shape the plan", "second wait"],
+        );
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let (id, mailbox) = begin_steerable_turn(&shell, cx);
+
+    // The build the turn runs with: an agent holding one skill. No model is
+    // configured because this test never streams - it reads the skill the way
+    // the runner would.
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/bsh-steer-skill-tests")
+        .join(format!("skill-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    skills_write_manifest(&root, "alpha", "a test skill", false);
+    let mut agent = agent::Agent::new(
+        agent::AgentConfig::default(),
+        std::sync::Arc::new(agent::agent::agentic::LlmProvider::new()),
+    );
+    agent
+        .register_skills_from_dir(root.clone())
+        .expect("the skill registers");
+    cx.update(|_, cx| {
+        shell.update(cx, |shell, _| {
+            shell
+                .state
+                .attach_turn_agent(&id, std::sync::Arc::new(agent));
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let arrow = cx
+        .debug_bounds("queue-steer-1")
+        .expect("the send-now control renders on a queued row");
+    cx.simulate_click(arrow.center(), Modifiers::default());
+
+    let taken = mailbox.take();
+    assert_eq!(taken.len(), 1, "the turn takes the steered message");
+    let text = match &taken[0].content {
+        react::llm::Content::Text(text) => text.clone(),
+        other => panic!("a text steer stays text: {other:?}"),
+    };
+    assert!(
+        text.starts_with("<skill_content name=\"alpha\">"),
+        "the instructions open the combined message: {text}"
+    );
+    assert!(!text.starts_with("/alpha"), "no literal command: {text}");
+    assert!(
+        text.ends_with("shape the plan"),
+        "the question follows the divider in the same message: {text}"
+    );
+    assert!(
+        text.contains("<skill_content name=\"alpha\">"),
+        "the running build loads the skill for it: {text}"
+    );
+    assert!(text.contains("Body."), "with the manifest body: {text}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The agent of a finished turn is dropped with its mailbox, so nothing can
+/// steer into a build that is no longer running.
+#[gpui::test]
+fn the_turn_agent_is_dropped_when_the_turn_ends(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_queue("queue-agent-drop", &["first wait"]);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let (id, _mailbox) = begin_steerable_turn(&shell, cx);
+    let agent = std::sync::Arc::new(agent::Agent::new(
+        agent::AgentConfig::default(),
+        std::sync::Arc::new(agent::agent::agentic::LlmProvider::new()),
+    ));
+    cx.update(|_, cx| {
+        shell.update(cx, |shell, _| {
+            shell.state.attach_turn_agent(&id, agent);
+        })
+    });
+    assert!(
+        cx.update(|_, cx| shell.read(cx).state.turn_agent(&id).is_some()),
+        "the premise: a live turn has its build"
+    );
+    cx.update(|_, cx| shell.update(cx, |shell, _| shell.state.stop(&id)));
+    assert!(
+        cx.update(|_, cx| shell.read(cx).state.turn_agent(&id).is_none()),
+        "a stopped turn leaves no agent to steer"
+    );
+}
+
+/// A leading slash-name the settings cannot resolve is reported, and one that
+/// resolves is not. The palette only offers enabled skills, so a hand-typed
+/// gesture naming a switched-off or missing skill is the one path that would
+/// otherwise travel as prose and look like the skill simply did nothing.
+#[gpui::test]
+fn a_leading_skill_name_with_no_enabled_skill_is_reported(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/bsh-slash-notice-tests")
+        .join(format!("skills-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    skills_write_manifest(&root, "alpha", "a test skill", false);
+    let (harness, cx) = slash_shell(cx, "slash-skill-notice", root.clone(), 1);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    // A live turn keeps each submission in the queue, so this test never opens
+    // a stream against the seeded endpoint.
+    let (id, _mailbox) = begin_steerable_turn(&shell, cx);
+
+    let send = |shell: &Entity<Shell>, cx: &mut VisualTestContext, text: &str| {
+        cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell
+                    .composer
+                    .update(cx, |input, cx| input.set_value(text, window, cx));
+                shell.send(window, cx);
+            });
+        });
+    };
+
+    send(&shell, cx, "/nosuch do it");
+    let (notice, queued) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (shell.state.notice.clone(), shell.state.inbox(&id).len())
+    });
+    let notice = notice.expect("an unresolved name is reported");
+    assert!(
+        notice.contains("nosuch"),
+        "the notice names the skill that could not load: {notice}"
+    );
+    assert_eq!(queued, 1, "the request still goes out, as text");
+
+    // A name the settings resolve is not reported: the turn will load it.
+    cx.update(|_, cx| shell.update(cx, |shell, _| shell.state.notice = None));
+    send(&shell, cx, "/alpha do it");
+    let notice = cx.update(|_, cx| shell.read(cx).state.notice.clone());
+    assert_eq!(
+        notice, None,
+        "an enabled skill loads, so there is nothing to report"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A prompt that invoked a skill draws the block the model received, not only
+/// the invocation's name: the pane answers "what was actually sent".
+#[gpui::test]
+fn an_invoked_skill_is_drawn_as_the_block_the_model_received(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (_harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_queue("skill-block-render", &[]);
+        let id = state.active_id.clone().expect("a session");
+        if let Some(session) = state.store.session_mut(&id) {
+            session.messages[0].skills = vec![crate::model::SkillInvocation {
+                name: "alpha".to_string(),
+                content: "<skill_content name=\"alpha\">\nBODY\n</skill_content>".to_string(),
+            }];
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("skill-block-0-0").is_some(),
+        "the invocation's block is drawn under the prompt"
+    );
+}
+
 /// A steer the turn ends before taking goes back to its old place in the dock,
 /// and its pending bubble goes away - the reader never loses a message.
 #[gpui::test]
@@ -28810,5 +28990,176 @@ fn a_drag_over_the_live_page_selects_the_text(cx: &mut TestAppContext) {
     assert!(
         selected.contains("alpha") && selected.contains("gamma"),
         "a drag over the page must select the text it crossed: {selected:?}"
+    );
+}
+
+/// Typing into a live page's field keeps every character.
+///
+/// The report was a search box that held exactly ONE character while the key
+/// log showed every keystroke arriving at the pane. This drives the pane the
+/// way a window does - the pane's focus handle, then the platform's own
+/// keystroke route, which types the character into the page AND hands it to the
+/// IME handler (the echo the pane has to recognise) - and then reads the page's
+/// OWN field. A dropped, doubled or replacing insertion fails here, and the
+/// frame sequence printed beside it says whether the pane repainted the result.
+#[gpui::test]
+fn typing_into_a_live_page_field_keeps_every_character(cx: &mut TestAppContext) {
+    use std::io::{Read as _, Write as _};
+    if crate::browser::engine::cdp::client::discover_binary().is_err() {
+        eprintln!("SKIP: no Chromium/Chrome installed for the live pane typing test");
+        return;
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let addr = listener.local_addr().expect("the port");
+    let body = String::from(
+        "<!doctype html><html><body style=\"margin:0\">\
+         <input id=\"q\" style=\"position:absolute;left:10px;top:10px;width:300px;height:40px\" \
+                autocomplete=\"off\">\
+         <script>window.__log=[];\
+         document.addEventListener('keydown', function(e){ window.__log.push('down:'+e.key); });\
+         document.addEventListener('input', function(e){ window.__log.push('input:'+e.target.value); });\
+         </script></body></html>",
+    );
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buffer = [0u8; 4096];
+            let _ = stream.read(&mut buffer);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    init_test_app(cx);
+    // The engine's pump publishes frames from its own thread, which is real
+    // cross-thread work the deterministic scheduler refuses.
+    cx.dispatcher.allow_parking();
+    let (harness, cx) = cx.add_window_view(|window, cx| {
+        let mut state = AppState::with_store(scratch_store("browser-live-typing"));
+        state.browser = std::sync::Arc::new(crate::browser::BrowserHandle::live());
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, cx)));
+    let url = format!("http://{addr}/");
+    cx.update(|_, cx| shell.update(cx, |this, cx| this.browser_go(url.clone(), cx)));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        cx.run_until_parked();
+        cx.update(|_, cx| shell.update(cx, |this, cx| this.sync_browser(cx)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        if cx.update(|_, cx| shell.read(cx).browser_render.is_some()) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        cx.update(|_, cx| shell.read(cx).browser_render.is_some()),
+        "the pump published a frame"
+    );
+
+    // Settle the viewport first: a resize is a CDP round trip that reflows the
+    // page, and a capture queued behind one pays for it (MEASURED: 0.6-1 s),
+    // which would make this proof about the resize rather than about typing.
+    for _ in 0..80 {
+        cx.update(|_, cx| shell.update(cx, |this, cx| this.sync_browser(cx)));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let settled = cx.update(|_, cx| {
+            let shell = shell.read(cx);
+            let bounds = shell.browser_bounds.get();
+            let engine = shell.state.browser.engine().expect("the engine is ready");
+            bounds.is_some_and(|bounds| {
+                engine.viewport()
+                    == (
+                        bounds.size.width.as_f32().round() as u32,
+                        bounds.size.height.as_f32().round() as u32,
+                    )
+            })
+        });
+        if settled {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+
+    // Enter the page: the pane's focus handle (what a press sets) and the
+    // page's own field (what the press's DOM focus does).
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            window.focus(&this.browser_focus, cx);
+        });
+    });
+    cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .browser
+            .engine()
+            .expect("the engine is ready")
+            .evaluate("document.getElementById('q').focus()")
+            .expect("the field takes focus");
+    });
+
+    let frames_before = cx.update(|_, cx| shell.read(cx).browser_frame_seq);
+    cx.simulate_keystrokes("a s d f");
+    // A capture is bounded by the host, not by a sleep: poll the pane's own
+    // frame clock until a frame lands (or the budget runs out), so a slow
+    // capture fails with the measurement rather than with a guessed wait.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut frames_after = frames_before;
+    while std::time::Instant::now() < deadline {
+        cx.run_until_parked();
+        cx.update(|_, cx| shell.update(cx, |this, cx| this.sync_browser(cx)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        frames_after = cx.update(|_, cx| shell.read(cx).browser_frame_seq);
+        if frames_after > frames_before {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let state = cx
+        .update(|_, cx| {
+            shell
+                .read(cx)
+                .state
+                .browser
+                .engine()
+                .expect("the engine is ready")
+                .evaluate(
+                    "JSON.stringify({value: document.getElementById('q').value, \
+                     active: document.activeElement.id, log: window.__log})",
+                )
+                .expect("the field reads")
+        })
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    eprintln!("MEASURE live typing: {state} frames {frames_before} -> {frames_after}");
+    let state: serde_json::Value = serde_json::from_str(&state).expect("the field JSON parses");
+    assert_eq!(
+        state["active"].as_str().unwrap_or_default(),
+        "q",
+        "the page's own field holds focus"
+    );
+    assert_eq!(
+        state["value"].as_str().unwrap_or_default(),
+        "asdf",
+        "every typed character must stay in the page's field: {state}"
+    );
+    // The field holding the text is only half the report: the reader sees the
+    // PAGE, so a changed page has to reach the frame slot and repaint. MEASURED
+    // before the pump was repaired: typing four characters published NO frame
+    // (the pane froze on the first capture) while this field already read
+    // "asdf" - which is exactly the one-visible-character report.
+    assert!(
+        frames_after > frames_before,
+        "typing must publish a frame, not just reach the page: frames {frames_before} -> {frames_after}"
     );
 }

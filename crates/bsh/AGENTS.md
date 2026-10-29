@@ -3370,3 +3370,169 @@ Honest gap: `PathBuilder::stroke` has no cap hook, so the sheet's
 approximated by the kit's quadratic S-curve, which departs from
 `cubic-bezier(.42, 0, .58, 1)` by up to 0.012 of a segment (under 0.5% of the
 sweep).
+
+Round 186 fixed the browser pane that typed one character and then froze. The
+report was a Baidu search box holding ONE character while the log showed every
+keystroke arriving, and the two halves had to be measured apart:
+
+- INPUT was correct. MEASURED at the engine with the pane's own fired sequence
+  (a fired click, then one `type_key(fire = true)` per character): the field
+  read `asdfasdf` with one `input` event per character
+  (`browser::engine::tests::pane_fired_typing_lands_every_character_in_a_field`).
+  A live-pane probe that also drove the macOS text route read
+  `a` -> `as` -> `asd` -> `asdf` after each keystroke, with every echoed
+  `replace_text_in_range` recognised and dropped.
+- DISPLAY was the defect. The same live-pane probe recorded
+  `browser_frame_seq` before and after typing: **frames 1 -> 1**. Four
+  keystrokes reached the page and published no frame, so the pane stayed on the
+  one capture it had - the visible one character.
+
+The cause was one change smuggled into `skozyqsy` ("floor older-page reads at
+the paging floor; clear the shared red"): it replaced the capture pump with a
+`Page.startScreencast` pump and deleted `Shared::activity`, which was the
+wake that made an input, a navigation or a resize land a capture. MEASURED on
+this engine, a screencast acknowledges its start and then misses paints: a
+keystroke published ZERO frames, and a page animating at 25 fps was published at
+~10 fps (4 frames per 400 ms). The pump also dead-ended: `started_at` is cleared
+by the FIRST frame, so the 500 ms "fall back to captures" branch could never
+fire again once a frame had arrived.
+
+The fix restores the design the substrate doc and its proofs describe - a
+capture pump (`Page.captureScreenshot`, compared as TEXT, so a still page costs
+one round trip and no decode) with the activity stamp back in `Shared`:
+`dispatch` bumps it for every command except the pump's own probe, `notify`
+bumps it for fire-and-forget input, and `touch` bumps it for the request seam.
+Four unchanged probes drop the cadence to `FRAME_IDLE` (120 ms); anything else
+keeps it at the `FRAME_FAST` (33 ms) budget. The screencast API is GONE rather
+than kept as a second source: a frame source that misses input is not a faster
+source, and one mechanism is the honest count.
+
+Also removed with this round: every `BSHPROBE` probe (they were eprintln!s on
+the UI thread per pointer event and per keystroke, and the last one added a
+BLOCKING `Runtime.evaluate` per key inside `browser_key`, i.e. an engine round
+trip on the input path).
+
+Traps worth keeping:
+
+- A capture probe queued while a page is MID-NAVIGATION can wait for the
+  renderer for the whole 20 s call timeout (MEASURED), while captures on a
+  settled page are fast. The pane never does that: `browser_go` navigates
+  synchronously on the UI thread and the frame clock starts the pump after it
+  returns. A proof that starts the pump before a navigation measures the
+  pathological interleaving, not the pane.
+- Capture cost is the HOST's, not this crate's: 8.3 ms for a still PNG page in
+  `docs/bsh-browser-substrate.md`, 55 ms for the same page and ~300 ms for a
+  playing video inside a software-rendered sandbox (no display link, Chrome
+  forced `--no-sandbox`, because the harness's own sandbox refuses Chrome's).
+  The two wall-clock cadence bars therefore fail THERE and pass where the probe
+  costs 8 ms: `a_self_animating_page_is_published_at_the_fast_cadence` measured
+  best 7 frames/400 ms and `native_video_plays_and_keeps_frames_moving` 2
+  frames/600 ms. Report the measurement; do not relax a bar into a tautology.
+  The proof that matters for this bug is
+  `ui::shell_tests::typing_into_a_live_page_field_keeps_every_character`, which
+  asserts BOTH the page's value ("asdf") and that a frame was published.
+- `Page.startScreencast` is worth remembering as a trap, not a tool: it answers
+  OK, it has no error, and the frames it does not send look exactly like a page
+  that did not change.
+- The pane's frame values are BGRA (`store_captured` swaps the channels), so a
+  pixel proof of a red page reads `bgra[2] > 200 && bgra[0] < 40`; checking the
+  RGBA order reads green as red.
+- A live-pane proof needs a Chromium that can start under this sandbox: point
+  `BSH_CHROMIUM_BIN` at a wrapper that adds `--no-sandbox`, e.g.
+  `printf '#!/bin/sh\nexec "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --no-sandbox "$@"\n' > target/chrome-no-sandbox && chmod +x target/chrome-no-sandbox`.
+  Without it every engine test panics with "Connection reset without closing
+  handshake" because Chrome's renderer processes cannot initialize their own
+  sandbox, and the failure looks like this crate's socket.
+
+### Follow-up (same round): the two reports a working pane exposed
+
+Once frames flowed, the owner reported the pane as MUCH laggier than the frozen
+build, and that a mouse click still could not browse. Both were measured, and
+one was a real bug:
+
+- A click that opens a WINDOW was invisible. MEASURED: a `target="_blank"`
+  link - which is how most search results link, Baidu included - creates a
+  SECOND page target; `Target.getTargets` listed it at `/next` while the
+  engine's session still read the old URL. The engine attaches to one target
+  and nothing ever looked at another, so the click appeared dead.
+  `Target.setDiscoverTargets(true)` is on from launch now, and the socket
+  thread records a page target that is not its own (in `Shared::popup`, after
+  filtering the pane's own target and `about:blank`). `adopt_popup` - called on
+  the PUMP, not the UI clock, because adopting costs two CDP calls - closes that
+  target and navigates the attached one to its URL, so one pane stays one page
+  (and back/forward keep working). Then a page's own `window.open` cannot
+  stack renderers either. Proof:
+  `browser::engine::tests::a_click_that_opens_a_new_window_is_shown_in_the_pane`
+  (click, the pane's path becomes `/next`, `/next` was requested, and the
+  target count returns to 1).
+- The lag was the CAPTURE, not the decode. MEASURED at the pane's real size
+  (480x744 at 2x = 960x1488, a dense page): `Page.captureScreenshot` cost
+  118-135 ms in this sandbox while the PNG decoded in 1.1 ms (36 kB, the
+  `image` crate is NOT the slow half - the earlier "decode is the slow part"
+  note is true for a big photographic PNG, not for a page of text). A pump that
+  probes as fast as the machine allows therefore drives the BROWSER process at
+  its ceiling, which is what a window doing anything else feels. So the cadence
+  is now split by what the frames buy:
+  - `FRAME_FAST` 33 ms while the reader is INTERACTING (activity within
+    `FRAME_INPUT_WINDOW` = 600 ms): a keystroke or a click must be on screen.
+  - `FRAME_MOTION` 66 ms while the page moves on its own (a carousel, a video):
+    half the probe cost, motion still visible.
+  - `FRAME_IDLE` 120 ms after `FRAME_QUIET_TICKS` unchanged probes.
+  A page's own animation no longer runs at the input cadence; the owner's pane
+  spends its fast cadence only where responsiveness is felt. Honest residual:
+  the input cadence is still 30 fps, so typing on a slow host is the expensive
+  moment, and the pane's cost is Chrome's raster+PNG of a retina-sized page -
+  the knobs left are a 1x capture (softer) or folding the pane (which already
+  stops the pump). Debug builds make it worse: the shell's own drawing is
+  unoptimised, so measure on `--release` before blaming the pump.
+- A wall-clock cadence bar cannot be met in a sandbox whose capture takes
+  118 ms: `a_self_animating_page_is_published_at_the_fast_cadence` measures
+  6 frames/400 ms against a bar of 10 (it passes where a capture costs the
+  8 ms the substrate doc records) and the video proof measures 2/600 ms. Those
+  two are HOST bars, not code bars; the pump is at its capture ceiling here.
+  The proofs this round added are the ones that discriminate: the typing test
+  asserts BOTH the page's value and that a frame was published, and the popup
+  test asserts the click lands where the reader is looking.
+
+### Follow-up 2 (same round): the pointer must not buy a capture
+
+The owner's next report was that the MOUSE felt very unsmooth - laggy, sometimes
+not working. The cause was the round's own wake: every `Input.dispatchMouseEvent`
+counted as activity, a pointer crossing the pane sends a move every ~16 ms, and
+each move reset the pump's quiet count, so the pump ran at the INPUT cadence for
+as long as the pointer moved. At a pane-sized capture (30-120 ms) that is the
+browser process pinned at its ceiling, which is exactly how a laggy click feels.
+
+Three rules now, each measured:
+
+- `is_hover` separates pointer MOTION from deliberate input. Keys, presses,
+  releases, wheels, navigations and resizes wake the pump immediately
+  (`Shared::intent` + a Condvar, so a keystroke after an idle second is captured
+  now, not at the next idle probe). A hover goes to a COALESCED wake
+  (`Shared::hover`, at most one per `HOVER_WAKE` = 200 ms), so `:hover` still
+  lands without spending a screenshot per motion event.
+- `frame_budget(quiet, since_intent, capture)` gives the page's OWN cadences a
+  half-duty floor: the pause is at least as long as the capture it follows. On a
+  host where one capture costs 120 ms, no cadence below that can be met anyway,
+  and asking for it pins the machine. The input cadence keeps its 33 ms with no
+  floor, because there the reader is waiting.
+- The pump runs only on a SETTLED page (`Status::Ready`). MEASURED: a capture
+  queued while a page is still loading waits for the renderer for 0.6-1.2 s and
+  returns a half-painted frame, while the same capture on a settled page costs
+  30-120 ms. The pane keeps the last frame for the length of the load, which is
+  what a reader expects, and the frame clock's work moves off the load path.
+
+Traps:
+
+- The capture cost is not a constant and not the decode: 30-120 ms settled,
+  0.6-1.2 s mid-load, 1.1 ms to DECODE a 36 kB page PNG. A probe that times a
+  capture while a navigation's subresource is in flight measures the renderer,
+  not the pump.
+- A live-pane test must settle the VIEWPORT before it types: a capture queued
+  behind `Emulation.setDeviceMetricsOverride` pays for the reflow (measured
+  0.9 s), and the failure then looks like "typing publishes no frame". The typing
+  proof settles the viewport and POLLS for the frame instead of sleeping 500 ms.
+- `a_self_animating_page_is_published_at_the_fast_cadence` measures 6
+  frames/400 ms here against a bar of 10: one capture costs ~120 ms on this
+  sandbox, so the pump is at its ceiling, not at its budget. The bar holds where
+  a capture costs the 8 ms the substrate doc records.

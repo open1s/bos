@@ -33,11 +33,42 @@ intercept or rewrite page traffic.
 
 ## Rendering and media
 
-The capture pump compares successive PNG captures, publishes changed frames,
-and reduces capture frequency after a page becomes still. While video is
-playing, it keeps the fast capture cadence so motion remains visible in the
-pane. Chromium supplies native DOM rendering, text selection, keyboard and
-pointer input, and media decoding.
+The capture pump probes `Page.captureScreenshot` in JPEG, compares successive
+captures as text, and publishes only changed frames, dropping to the idle
+cadence once a page becomes still. While video is playing, it keeps the motion
+cadence so movement remains visible in the pane. Chromium supplies native DOM
+rendering, text selection, keyboard and pointer input, and media decoding.
+
+Three measured facts shaped the pump (480x744@2x, Chrome 156, macOS):
+
+- One capture costs ~50 ms and is CONSTANT: it does not shrink with the
+  format, the scale, or the region captured (`clip` included), and
+  `--disable-gpu` does not move it. The cost is the compositor readback round
+  trip, not the pixels.
+- What follows the round trip is NOT constant: JPEG decodes in ~8 ms where
+  PNG needs ~17 ms, and the gap widens with the viewport (40 ms vs 26 ms at
+  960x1488@2x). That is why the probe is JPEG - the frame is compared as text
+  and shown as a screen capture, so nothing needs losslessness.
+- The ~50 ms is a per-request queue wait, not work: with two captures in
+  flight the effective cost halves (~25 ms each) and eight in flight cost
+  ~10 ms each. The pump therefore keeps `PIPELINE_DEPTH` (2) captures
+  outstanding - the cheap part of that curve; more depth buys little and is
+  another frame of staleness between a change and the pane showing it.
+
+The decode runs on its own thread (`bsh-browser-decode`), so the pump starts
+its next capture as soon as the bytes are handed over: the cycle is
+`max(capture, decode)` instead of `capture + decode`. A hand-off that finds
+the decoder busy is DROPPED, and the pump only advances its "what the pane is
+showing" marker when the hand-off was accepted - otherwise a dropped frame
+would be remembered as displayed and the pane could settle on an image it
+never received.
+
+`Page.startScreencast` is deliberately NOT the frame source. MEASURED on this
+engine, it acknowledges its start and then misses paints: a typed key published
+NO frame (a search box showed one character while every keystroke reached the
+page), and a page animating at 25 fps was published at ~10 fps. A capture probe
+answers every change, and the activity stamp (`Shared::activity`) is what makes
+an input, a navigation or a resize publish without waiting for the idle cadence.
 
 ## Input
 

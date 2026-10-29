@@ -52,22 +52,80 @@ const PAINT_READY_TIMEOUT: Duration = Duration::from_millis(250);
 /// How long after the load event a snapshot waits, so a script that runs on
 /// `DOMContentLoaded` lands before the text is read.
 const SETTLE: Duration = Duration::from_millis(120);
+/// The capture format the pump probes with.
+///
+/// JPEG, not PNG. MEASURED on this engine at the pane's real 480x744@2x, a
+/// still page's capture round trip is format-independent (~50 ms either way,
+/// because the cost is the compositor readback and not the encoder), but the
+/// DECODE that follows it is not: PNG decodes in 16.8 ms and JPEG in 8.2 ms.
+/// At a large viewport the gap widens, because PNG decode scales with pixels
+/// (40.3 ms at 960x1488@2x against 25.9 ms for JPEG).
+///
+/// Losslessness is not needed here: the frame's only other use is being
+/// compared as text against the previous probe to decide whether the page
+/// changed, and a JPEG's bytes are just as comparable. What the pane shows is
+/// a screen capture either way.
+const FRAME_FORMAT: &str = "jpeg";
+/// The quality for [`FRAME_FORMAT`].
+///
+/// High enough that text and UI edges stay clean at the pane's size, low
+/// enough to keep the payload small. MEASURED: q80 and q90 capture in the same
+/// time, so this picks the better-looking of two equally cheap options.
+const FRAME_QUALITY: u32 = 80;
+/// How many captures the pump keeps outstanding.
+///
+/// MORE THAN ONE, because the engine's capture is a queue wait and not work.
+/// MEASURED at the pane's real size, issuing captures without waiting for
+/// each reply costs: 1 in flight ~50.1 ms per capture, 2 ~25.4 ms, 4 ~17.3 ms,
+/// 8 ~10.4 ms. Two already halves the wait, and the curve flattens after
+/// that, so this takes the cheap part of the win and leaves the engine its
+/// headroom. The cost of a deeper pipe is latency: every extra capture in
+/// flight is one more frame of delay between a change and the pane showing
+/// it, which is exactly what a reader notices.
+const PIPELINE_DEPTH: usize = 2;
+
 /// The frame budget while the page is changing: about thirty frames a second,
 /// and a BUDGET rather than a sleep.
 ///
-/// MEASURED on this engine: a PNG capture of a STILL page costs ~8 ms and of a
-/// CHANGING one ~19 ms (min 6, max 161), and a still page's captures are
-/// byte-identical, which is what makes the comparison worth doing. The decode
-/// of the frame is the other half of a cycle and is the slow part in a debug
-/// build, so the pump sleeps only what is LEFT of this budget after the work
-/// it just did: a fixed sleep on top would make the cadence the work plus the
-/// sleep, and a page would be displayed slower than the machine can decode it.
+/// MEASURED on this engine: one `Page.captureScreenshot` costs ~50 ms at the
+/// pane's real size and is REMARKABLY CONSTANT - a 240x372@2x capture costs the
+/// same as a 480x744@2x one, a `clip` to a quarter of the page costs the same
+/// as the whole page, and `--disable-gpu` does not move it. The cost is the
+/// compositor readback round trip, not the pixels, so it does not shrink with
+/// the format, the scale or the region.
+///
+/// What DOES stack on top of it is the decode, which is why it runs on its own
+/// thread (see `spawn_decoder`): the pump starts its next capture as soon as
+/// the bytes are handed over, so the ~50 ms round trip overlaps the ~12 ms
+/// decode instead of following it. A still page's captures are byte-identical,
+/// which is what makes the text comparison worth doing at all.
+///
+/// The pump sleeps only what is LEFT of this budget after the work it just did:
+/// a fixed sleep on top would make the cadence the work plus the sleep, and a
+/// page would be displayed slower than the machine can decode it.
 const FRAME_FAST: Duration = Duration::from_millis(33);
-/// Time to wait for the first pushed frame before falling back to capture RPCs.
-const FRAME_START_TIMEOUT: Duration = Duration::from_millis(500);
-/// Bounded wait for a compositor frame, also limiting how long the pump takes
-/// to notice that the preview pane was hidden.
+/// The frame budget while the page moves on its OWN (a carousel, a video).
+///
+/// Half the input cadence, because the cost is not: MEASURED at the pane's real
+/// size (480x744 at 2x), one capture cycle of a changing page saturates a core
+/// on this hardware, and a page's own motion driving that at the input rate is
+/// what the owner reported as a laggy window. Half the probes keeps motion
+/// visible and gives the machine its headroom back.
+const FRAME_MOTION: Duration = Duration::from_millis(66);
+/// How recently the activity stamp must have moved for the input cadence.
+///
+/// Long enough to cover a burst of typing or a scroll gesture, short enough
+/// that a page left alone returns to its own cadence.
+const FRAME_INPUT_WINDOW: Duration = Duration::from_millis(600);
+/// Bounded wait once the page has stopped changing, and the interval at which
+/// a hidden pane notices that it is wanted again.
 const FRAME_IDLE: Duration = Duration::from_millis(120);
+/// Unchanged captures in a row before the pump drops to the idle cadence.
+///
+/// Four is MEASURED, not chosen: a freshly navigated page keeps re-rendering
+/// for a few probes (layout, fonts, a script), so a lower count falls back to
+/// the idle rate mid-load and the pane appears to arrive in two lumps.
+const FRAME_QUIET_TICKS: u32 = 4;
 /// How long a navigation waits before its one retry.
 const RETRY_PAUSE: Duration = Duration::from_millis(150);
 
@@ -871,25 +929,6 @@ impl Engine {
         capture(&self.client, "png", None)
     }
 
-    /// Stream compositor frames as they are painted, rather than polling
-    /// `Page.captureScreenshot` after each page update.
-    #[cfg(test)]
-    pub(crate) fn start_screencast(&self) -> Result<(), EngineError> {
-        self.client.start_screencast()
-    }
-
-    /// Stop compositor frame delivery.
-    #[cfg(test)]
-    pub(crate) fn stop_screencast(&self) -> Result<(), EngineError> {
-        self.client.stop_screencast()
-    }
-
-    /// Wait for the latest compositor frame, coalescing intermediate frames.
-    #[cfg(test)]
-    pub(crate) fn wait_screencast_frame(&self, timeout: Duration) -> Option<String> {
-        self.client.wait_screencast_frame(timeout)
-    }
-
     /// Resize the page viewport and set the capture's device scale factor.
     ///
     /// The scale is the window's, so the frame's pixel size is the viewport's
@@ -1283,70 +1322,144 @@ impl Engine {
         *slot = self.spawn_pump();
     }
 
-    /// Spawn the compositor capture thread. Chromium pushes frames as it paints,
-    /// avoiding the screenshot RPC round trip on every frame. Screenshot polling
-    /// remains a fallback for Chromium builds that cannot start a screencast.
+    /// Spawn the capture thread: adopt a popup, probe the page, publish what
+    /// changed.
+    ///
+    /// The probe is `Page.captureScreenshot` compared as TEXT against the last
+    /// one, so an unchanged page costs one round trip and no decode, and a
+    /// changed one hands its text to the decoder thread rather than decoding
+    /// it here (see [`spawn_decoder`]). Three cadences, because the work each
+    /// one buys is different:
+    ///
+    /// - [`FRAME_FAST`] while the reader is INTERACTING (activity within
+    ///   [`FRAME_INPUT_WINDOW`]): a keystroke or a click has to be on screen
+    ///   before the hand moves on.
+    /// - [`FRAME_MOTION`] while the page moves on its OWN (a carousel, a
+    ///   video): motion stays visible, at half the capture cost. MEASURED at the
+    ///   pane's real size (480x744 at 2x), a capture cycle of a changing page
+    ///   saturates a core on this hardware, and the owner reported the window
+    ///   as laggy when every page's own motion drove it at the input rate.
+    /// - [`FRAME_IDLE`] after [`FRAME_QUIET_TICKS`] unchanged probes: a still
+    ///   page costs one capture every 120 ms, and the activity stamp is what
+    ///   makes the next input publish promptly instead of waiting for it.
+    ///
+    /// Why polling and not `Page.startScreencast`: MEASURED on this engine, a
+    /// screencast acknowledges its start and then pushes frames for some paints
+    /// but not all - a key typed into a field published NO frame (the pane froze
+    /// with one character visible while every keystroke reached the page), and a
+    /// page animating at 25 fps was published at ~10 fps. A capture probe
+    /// answers every change, which is what a browser pane has to do.
+    ///
+    /// The popup check rides this thread rather than the pane's clock: adopting
+    /// one costs two CDP calls, and the frame clock runs on the UI thread.
     fn spawn_pump(&self) -> Option<JoinHandle<()>> {
+        // The decode runs on its own thread, so the capture round trip that
+        // follows it does not wait behind it. See `spawn_decoder`.
+        let decoder = spawn_decoder(self.frames.clone())?;
         let stop = self.stop.clone();
         let streaming = self.streaming.clone();
-        let frames = self.frames.clone();
         let client = self.client.clone();
         std::thread::Builder::new()
             .name(String::from("bsh-browser-pump"))
             .spawn(move || {
                 let mut last: Option<String> = None;
-                let mut active = false;
-                let mut screencast = false;
-                let mut fallback = false;
-                let mut started_at = None;
+                let mut seen_intent = client.intent();
+                let mut seen_hover = client.hover();
+                let mut quiet = FRAME_QUIET_TICKS;
+                // Captures waiting for a reply, oldest first. More than one so
+                // the engine always has the next probe queued while it works on
+                // the current one - see `PIPELINE_DEPTH`.
+                let mut inflight: std::collections::VecDeque<
+                    std::sync::mpsc::Receiver<Result<Value, EngineError>>,
+                > = std::collections::VecDeque::new();
+                // When deliberate input last arrived, so the input cadence can
+                // expire back to the motion one.
+                let mut interacted = std::time::Instant::now() - FRAME_INPUT_WINDOW;
+                // The frame count the last published change was measured from,
+                // so a probe cycle can report what it cost.
+                let mut cycle_started = std::time::Instant::now();
                 while !stop.load(Ordering::Relaxed) {
-                    let wants_frames = streaming.load(Ordering::Relaxed);
-                    if wants_frames != active {
-                        active = wants_frames;
-                        if active {
-                            screencast = client.start_screencast().is_ok();
-                            fallback = !screencast;
-                            started_at = Some(std::time::Instant::now());
-                            last = None;
-                        } else if screencast {
-                            let _ = client.stop_screencast();
-                            screencast = false;
-                        }
-                    }
-                    if !active {
+                    if !streaming.load(Ordering::Relaxed) {
+                        // Nothing is watching: drop anything outstanding and
+                        // stop spending captures on this pane.
+                        inflight.clear();
                         std::thread::sleep(FRAME_IDLE);
                         continue;
                     }
-                    if screencast {
-                        if let Some(text) = client.wait_screencast_frame(FRAME_IDLE) {
-                            started_at = None;
-                            if last.as_ref() != Some(&text) {
-                                if let Some(bytes) = wire::decode_base64(&text) {
-                                    store_captured(&frames, &bytes);
-                                }
-                                last = Some(text);
-                            }
-                        } else if started_at.is_some_and(|at| at.elapsed() >= FRAME_START_TIMEOUT) {
-                            let _ = client.stop_screencast();
-                            screencast = false;
-                            fallback = true;
+                    // A click can open a window; the pane has one view, so the
+                    // page it opened is shown HERE.
+                    adopt_popup(&client);
+                    // A keystroke, a press, a wheel, a resize or a navigation is
+                    // deliberate input: probe at once and stay fast while the
+                    // reader is working.
+                    if client.intent() != seen_intent {
+                        seen_intent = client.intent();
+                        quiet = 0;
+                        interacted = std::time::Instant::now();
+                    }
+                    // A hover is worth one probe - `:hover` must land - but it
+                    // is not the reader working, so it does not buy the input
+                    // cadence.
+                    if client.hover() != seen_hover {
+                        seen_hover = client.hover();
+                        quiet = 0;
+                    }
+                    // Keep the pipe full. Topping up BEFORE the pause is the
+                    // whole point: the engine works on the oldest capture while
+                    // this thread waits out the cadence, so the pause and the
+                    // engine-side queue wait overlap instead of queueing up.
+                    while inflight.len() < PIPELINE_DEPTH {
+                        match client.dispatch_async(
+                            "Page.captureScreenshot",
+                            json!({ "format": FRAME_FORMAT, "quality": FRAME_QUALITY }),
+                            Some(client.session()),
+                        ) {
+                            Ok(reply) => inflight.push_back(reply),
+                            // The socket is down; the retry is the next loop.
+                            Err(_) => break,
                         }
                     }
-                    if fallback {
-                        if let Ok(text) = capture_b64(&client, "png", None) {
-                            if last.as_ref() != Some(&text) {
-                                if let Some(bytes) = wire::decode_base64(&text) {
-                                    store_captured(&frames, &bytes);
+                    // Wait out the cadence with the pipe already full. This is
+                    // a real sleep, bounded by a wake on deliberate input, and
+                    // it is what keeps a still page cheap and an input prompt.
+                    let budget = probe_budget(quiet, interacted.elapsed());
+                    let remaining = budget.saturating_sub(cycle_started.elapsed());
+                    client.wait_intent(remaining);
+                    cycle_started = std::time::Instant::now();
+                    // Now drain the OLDEST reply. It has had the whole pause to
+                    // be produced, so this normally returns immediately; the
+                    // timeout is only a guard against a lost reply wedging the
+                    // pump. A failed or unanswered probe keeps the previous
+                    // frame on screen and the next probe retries.
+                    let Some(reply) = inflight.pop_front() else {
+                        continue;
+                    };
+                    if let Ok(Ok(answer)) = reply.recv_timeout(LOAD_TIMEOUT) {
+                        if let Some(text) = answer.get("data").and_then(Value::as_str) {
+                            if last.as_deref() == Some(text) {
+                                quiet = quiet.saturating_add(1);
+                            } else {
+                                quiet = 0;
+                                // Hand the text to the decoder and start the
+                                // next capture immediately: the decode must not
+                                // be paid in front of the round trip.
+                                //
+                                // `last` advances ONLY when the hand-off was
+                                // accepted. A full slot means the decoder is
+                                // behind and this frame is dropped in favour of
+                                // the next one - so it must not be remembered as
+                                // displayed, or the following probe would see
+                                // identical text, count it as unchanged, and let
+                                // the pane settle on an image it never received.
+                                if decoder.try_send(text.to_string()).is_ok() {
+                                    last = Some(text.to_string());
                                 }
-                                last = Some(text);
                             }
                         }
-                        std::thread::sleep(FRAME_FAST);
                     }
                 }
-                if screencast {
-                    let _ = client.stop_screencast();
-                }
+                // Dropping the sender ends the decoder once it drains.
+                drop(decoder);
             })
             .ok()
     }
@@ -1392,11 +1505,107 @@ impl Drop for Engine {
     }
 }
 
-/// Decode a captured PNG into the frame slot, paying the channel swap here.
+/// How long the pump waits before its next probe.
+///
+/// Three classes, and each is a different budget against the same fixed cost
+/// (MEASURED: one `Page.captureScreenshot` of the pane's real 960x1488 page
+/// costs 40-135 ms and does not shrink with the format or the scale):
+///
+/// - [`FRAME_IDLE`] once [`FRAME_QUIET_TICKS`] probes in a row are unchanged.
+/// - [`FRAME_FAST`] while the reader is working: a keystroke or a click is
+///   visible before the hand moves on.
+/// - [`FRAME_MOTION`] while only the page moves (a carousel, a video).
+///
+/// The page's own cadences never spend more than half the pump's time in a
+/// capture: the pause is at least as long as the capture it follows.
+/// MEASURED, a pane-sized capture can cost 120 ms, and a cadence under that
+/// pins the browser process at its capture ceiling - which is what made the
+/// window feel slow while a page animated under a moving pointer.
+///
+/// A pure function because the rule is the contract; the pump only measures.
+fn frame_budget(quiet: u32, since_intent: Duration, capture: Duration) -> Duration {
+    if quiet >= FRAME_QUIET_TICKS {
+        FRAME_IDLE.max(capture)
+    } else if since_intent <= FRAME_INPUT_WINDOW {
+        FRAME_FAST
+    } else {
+        FRAME_MOTION.max(capture)
+    }
+}
+
+/// The interval between two PROBES, given the same inputs as [`frame_budget`].
+///
+/// [`frame_budget`] answers "how long may one probe cycle take", which is the
+/// right question when a cycle is one blocking capture. With captures
+/// pipelined the pump issues the next probe before waiting for the oldest
+/// reply, so what the pane receives is a PROBE RATE and the thing to bound is
+/// the spacing between probes, not the duration of a cycle.
+///
+/// Because the engine already overlaps the captures, the spacing needs no
+/// division by the depth: the measured rate IS the pipelined rate. Dividing
+/// here as well would make the pump issue twice as often as the engine can
+/// answer and grow the in-flight set without bound.
+fn probe_budget(quiet: u32, since_intent: Duration) -> Duration {
+    frame_budget(quiet, since_intent, Duration::ZERO)
+}
+
+/// Show a page the page itself opened in THIS pane.
+///
+/// MEASURED: a `target="_blank"` click - which is how most search results link -
+/// leaves a second page target rendering in the browser's own invisible window
+/// while the pane keeps the old document, so the click looks dead. The pane has
+/// ONE view and one session (every key, click and capture goes through it), so
+/// the extra target is closed and its URL navigates the attached one. Closing
+/// first also releases that renderer, so repeated clicks cannot pile pages up.
+///
+/// The navigation is fired, not awaited: this runs on the frame pump, and
+/// waiting for a load here would stall the frame clock for the navigation.
+fn adopt_popup(client: &Client) {
+    let Some((target, url)) = client.take_popup() else {
+        return;
+    };
+    let _ = client.call_browser("Target.closeTarget", json!({ "targetId": target }));
+    let _ = client.notify("Page.navigate", json!({ "url": url }));
+}
+
+/// Spawn the decode thread and return its handle.
+///
+/// The pump captures and this thread decodes, because the two costs are
+/// different sizes and worth overlapping. MEASURED at the pane's real
+/// 480x744@2x: a `Page.captureScreenshot` round trip costs ~50 ms and is
+/// format- and size-independent (it is the compositor readback), while the
+/// JPEG decode plus the RGBA-to-BGRA swap that follows it costs ~12 ms.
+/// Paying the decode on the pump thread put it INSIDE the cycle and made the
+/// pane's rate `capture + decode`; handing the bytes across instead makes it
+/// `max(capture, decode)`, i.e. the ~50 ms the engine actually takes.
+///
+/// The channel is bounded to one and the pump uses `try_send`, so a decoder
+/// that falls behind cannot build a backlog: the pump drops the frame it
+/// could not hand over and keeps capturing, and the newest frame is the one
+/// that reaches the pane. That is the same coalescing rule the frame slot
+/// itself follows.
+fn spawn_decoder(frames: Arc<FrameSlot>) -> Option<async_channel::Sender<String>> {
+    let (sender, queue) = async_channel::bounded::<String>(1);
+    std::thread::Builder::new()
+        .name(String::from("bsh-browser-decode"))
+        .spawn(move || {
+            while let Ok(text) = queue.recv_blocking() {
+                if let Some(bytes) = wire::decode_base64(&text) {
+                    store_captured(&frames, &bytes);
+                }
+            }
+        })
+        .ok()
+        .map(|_| sender)
+}
+
+/// Decode one captured frame into the frame slot, paying the channel swap here.
 ///
 /// The one decode path for both the pump and a navigation's paint beat: GPUI's
 /// `RenderImage` wants BGRA and a capture is RGBA. MEASURED: handing RGBA over
 /// unchanged draws a blue heading orange.
+///
+/// Runs on the decoder thread, never on the pump or the UI thread.
 fn store_captured(frames: &FrameSlot, bytes: &[u8]) {
     let Ok(image) = image::load_from_memory(bytes) else {
         return;
@@ -1417,7 +1626,19 @@ fn store_captured(frames: &FrameSlot, bytes: &[u8]) {
 /// stopped moving return bytes identical to the last ones; decoding those
 /// would spend a measured 0.72 ms and a 17 KB allocation to prove the page is
 /// still. Comparing the text instead costs 0.0007 ms - a thousandth - and only
-/// a capture that actually changed is decoded.
+/// a capture that actually changed is handed to the decoder.
+///
+/// MEASURED: the round trip this makes is ~50 ms and does not depend on the
+/// format, the scale or the region captured - a 240x372@2x capture and a
+/// 960x1488@2x one differ only in the DECODE that follows. That is why
+/// [`FRAME_FORMAT`] trades PNG for JPEG: it makes the decode half of the
+/// pipeline cheaper without touching the half that cannot move.
+///
+/// Test-only: the pump issues its captures through
+/// [`Client::dispatch_async`] so several can be in flight at once, which a
+/// blocking helper cannot express. A proof or a saved capture still wants one
+/// request and its bytes, and that is what this is for.
+#[cfg(test)]
 fn capture_b64(client: &Client, format: &str, quality: Option<u32>) -> Result<String, EngineError> {
     let mut params = json!({ "format": format });
     if let Some(quality) = quality {
@@ -1955,6 +2176,102 @@ fn page_from_json(value: &Value) -> Page {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_dropped_hand_off_must_not_be_remembered_as_displayed() {
+        // The decoder channel is bounded to one, so a pump that outruns the
+        // decoder drops a frame. The rule that matters: `last` (what the pane
+        // is believed to be showing) may only advance when the hand-off was
+        // ACCEPTED. If a dropped frame advanced it, the next probe would see
+        // identical text, count it as unchanged, and the pane would settle on
+        // an image it never received.
+        let (sender, queue) = async_channel::bounded::<String>(1);
+        assert!(sender.try_send(String::from("frame-1")).is_ok());
+        assert!(
+            sender.try_send(String::from("frame-2")).is_err(),
+            "a full slot must refuse: that refusal is what stops `last` advancing"
+        );
+        // Draining one frees exactly one slot, which is the coalescing the
+        // pump relies on to catch up with a moving page.
+        assert_eq!(queue.recv_blocking().as_deref(), Ok("frame-1"));
+        assert!(sender.try_send(String::from("frame-3")).is_ok());
+    }
+
+    #[test]
+    fn the_pipeline_depth_is_small_and_probed_between_not_around() {
+        // Depth 1 is the old serial behaviour and pays the engine's full
+        // per-capture queue wait. More than two buys little (MEASURED: 2 ->
+        // ~25 ms per capture, 4 -> ~17 ms, 8 -> ~10 ms) and costs latency,
+        // because every extra capture in flight is another frame of delay
+        // between a change and the pane showing it.
+        const {
+            assert!(
+                PIPELINE_DEPTH >= 2,
+                "a serial pump pays the full queue wait"
+            );
+            assert!(
+                PIPELINE_DEPTH <= 4,
+                "a deeper pipe is latency the reader feels for little gain"
+            );
+        }
+        // The probe interval must not also be divided by the depth: the engine
+        // already overlaps the captures, so dividing here would have the pump
+        // issue faster than the engine answers and grow the in-flight set.
+        assert_eq!(
+            probe_budget(0, Duration::from_millis(10)),
+            FRAME_FAST,
+            "the probe interval is the frame budget, not the budget over depth"
+        );
+        assert_eq!(probe_budget(FRAME_QUIET_TICKS, Duration::ZERO), FRAME_IDLE);
+    }
+
+    #[test]
+    fn the_pump_probes_losselessly_enough_but_decodes_in_jpeg() {
+        // The format is a performance decision, not a cosmetic one, so it is
+        // pinned: JPEG's decode is measured at roughly half PNG's at the
+        // pane's size, and the frame is only ever compared as text before
+        // being shown, so nothing depends on the encoding being lossless.
+        assert_eq!(FRAME_FORMAT, "jpeg");
+        assert!((1..=100).contains(&FRAME_QUALITY));
+        // PNG is the one alternative that would still decode, and it is slower.
+        assert_ne!(FRAME_FORMAT, "png");
+    }
+
+    #[test]
+    fn the_frame_budget_follows_input_then_motion_then_stillness() {
+        let cheap = Duration::from_millis(1);
+        // A still page: the idle probe.
+        assert_eq!(
+            frame_budget(FRAME_QUIET_TICKS, Duration::ZERO, cheap),
+            FRAME_IDLE
+        );
+        // The page is changing right after input: the input cadence.
+        assert_eq!(
+            frame_budget(0, Duration::from_millis(10), cheap),
+            FRAME_FAST
+        );
+        // The page is changing on its own: the motion cadence, half the cost.
+        assert_eq!(
+            frame_budget(0, FRAME_INPUT_WINDOW + Duration::from_millis(1), cheap),
+            FRAME_MOTION
+        );
+        // Stillness wins over a recent intent: nothing changed, so probe slowly.
+        assert_eq!(
+            frame_budget(FRAME_QUIET_TICKS, Duration::from_millis(10), cheap),
+            FRAME_IDLE
+        );
+        assert!(FRAME_FAST < FRAME_MOTION && FRAME_MOTION < FRAME_IDLE);
+        // A slow capture floors the page's own cadences: never more than half
+        // the pump's time in a capture.
+        let slow = Duration::from_millis(300);
+        assert_eq!(frame_budget(FRAME_QUIET_TICKS, Duration::ZERO, slow), slow);
+        assert_eq!(
+            frame_budget(0, FRAME_INPUT_WINDOW + Duration::from_millis(1), slow),
+            slow
+        );
+        // Input is the reader waiting: it keeps its cadence even on a slow host.
+        assert_eq!(frame_budget(0, Duration::from_millis(10), slow), FRAME_FAST);
+    }
 
     #[test]
     fn the_snapshot_script_stamps_a_monotonic_floor() {
