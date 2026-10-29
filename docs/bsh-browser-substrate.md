@@ -90,6 +90,31 @@ an input, a navigation or a resize publish without waiting for the idle cadence.
 The pane maps the window's coordinates into page coordinates and forwards each
 event as CDP input; the page handles selection, focus and its own scrollers.
 
+Input is fire-and-forget (`fire: true`) everywhere, so no CDP round trip runs on
+the UI thread: a keystroke, a wheel tick or a drag move is queued and the next
+frame continues immediately. The exceptions are the clipboard chords, whose
+answer is the text being copied, and the tool-driven activation path.
+
+The held CHORD rides every mouse and wheel event (`modifiers`, in CDP's bits),
+which is what a page reads as `shiftKey`/`ctrlKey`/`metaKey`: Shift+click
+extends a selection instead of replacing it, Alt+click and Cmd/Ctrl+click reach
+the page's own handler, Shift+drag keeps extending, and Ctrl/Cmd+wheel is the
+zoom a map or an editor implements itself. A drag that leaves the frame keeps
+its chord too, because the pane stores it with the rest of the gesture state.
+
+A keystroke is forwarded the way a browser dispatches it: `rawKeyDown`, then a
+`char` event, then `keyUp` for a printable key (so both the page's `keydown`
+handler and its field see one character), and `Input.insertText` for text with
+no US-keyboard identity - a composed CJK character, an emoji. Tab and
+Shift+Tab are forwarded as real `Tab` keys, so the DOCUMENT's focus order
+walks rather than the shell's.
+
+An IME commit is text the platform also hands the pane's input handler, so the
+two routes are deduplicated: the last text the key path inserted is remembered
+and its echo is dropped. MEASURED, without that a two-character commit landed
+TWICE (`你好` in a field read `你好你好`); a single-character echo was already
+handled, which is why the defect only showed on composition input.
+
 Two sign and scale conventions are worth stating, because getting either wrong
 is a silent behaviour bug rather than an error:
 

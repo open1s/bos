@@ -643,7 +643,9 @@ impl Engine {
             }
             return Ok(Activation::Clicked { via: "script" });
         }
-        self.mouse(false, mouse_params("mouseMoved", x, y, None, "none", 0))?;
+        // A tool-driven activation carries no chord: it is not a reader's
+        // gesture and nothing asked for a modified click.
+        self.mouse(false, mouse_params("mouseMoved", x, y, None, "none", 0, 0))?;
         self.mouse(
             false,
             mouse_params(
@@ -653,11 +655,12 @@ impl Engine {
                 Some(1),
                 PointerButton::Left.name(),
                 PointerButton::Left.mask(),
+                0,
             ),
         )?;
         self.mouse(
             false,
-            mouse_params("mouseReleased", x, y, Some(1), "left", 0),
+            mouse_params("mouseReleased", x, y, Some(1), "left", 0, 0),
         )?;
         if matches!(kind.as_str(), "input" | "textarea" | "select") {
             // A field takes focus and stops there, which is the behaviour the
@@ -993,6 +996,12 @@ impl Engine {
     /// leaves no way to select text, so the pane forwards the three events it
     /// actually receives. `button` rides the event, so a right press is a
     /// secondary click the page can turn into `contextmenu`.
+    /// A press with no chord, the shorthand the tests drive.
+    ///
+    /// Test-only because the pane always has the reader's chord in hand and
+    /// must forward it: an unmodified press is a fact about the GESTURE, not a
+    /// convenience the production path should be able to fall back to.
+    #[cfg(test)]
     pub(crate) fn pointer_down(
         &self,
         x: f32,
@@ -1001,8 +1010,30 @@ impl Engine {
         button: PointerButton,
         fire: bool,
     ) -> Result<(), EngineError> {
+        self.pointer_down_with(x, y, clicks, button, 0, fire)
+    }
+
+    /// A press with the chord the reader was holding.
+    ///
+    /// `modifiers` is what a page reads as `shiftKey`/`ctrlKey`/`metaKey` on
+    /// the event: Shift+click extends a selection instead of replacing it, and
+    /// a modified click reaches the page's own handler. Without it the page
+    /// sees every press as unmodified, which is not what a reader who held
+    /// Shift did.
+    pub(crate) fn pointer_down_with(
+        &self,
+        x: f32,
+        y: f32,
+        clicks: u32,
+        button: PointerButton,
+        modifiers: u32,
+        fire: bool,
+    ) -> Result<(), EngineError> {
         let (x, y) = (f64::from(x), f64::from(y));
-        self.mouse(fire, mouse_params("mouseMoved", x, y, None, "none", 0))?;
+        self.mouse(
+            fire,
+            mouse_params("mouseMoved", x, y, None, "none", 0, modifiers),
+        )?;
         self.mouse(
             fire,
             mouse_params(
@@ -1012,6 +1043,7 @@ impl Engine {
                 Some(clicks.max(1)),
                 button.name(),
                 button.mask(),
+                modifiers,
             ),
         )
     }
@@ -1028,11 +1060,27 @@ impl Engine {
     /// button is down AND the event names that button. `buttons` alone is not
     /// enough - the same drag with `button: "none"` and `buttons: 1` selected
     /// nothing here, in the page, mid-drag and after the release.
+    /// A move with no chord, the shorthand the tests drive.
+    #[cfg(test)]
     pub(crate) fn pointer_move(
         &self,
         x: f32,
         y: f32,
         pressed: Option<PointerButton>,
+    ) -> Result<(), EngineError> {
+        self.pointer_move_with(x, y, pressed, 0)
+    }
+
+    /// A move with the chord the reader was holding.
+    ///
+    /// A move carries the chord too, because that is how a page distinguishes a
+    /// plain drag (replace the selection) from Shift+drag (extend it).
+    pub(crate) fn pointer_move_with(
+        &self,
+        x: f32,
+        y: f32,
+        pressed: Option<PointerButton>,
+        modifiers: u32,
     ) -> Result<(), EngineError> {
         self.client.notify(
             "Input.dispatchMouseEvent",
@@ -1043,6 +1091,7 @@ impl Engine {
                 None,
                 pressed.map_or("none", PointerButton::name),
                 pressed.map_or(0, PointerButton::mask),
+                modifiers,
             ),
         )
     }
@@ -1055,12 +1104,31 @@ impl Engine {
     /// line - so nothing here synthesizes one: MEASURED, a press and release
     /// carrying `clickCount: 2` select exactly the word under the pointer, and
     /// `3` selects the line, with no script of ours involved.
+    /// A release with no chord, the shorthand the tests drive.
+    #[cfg(test)]
     pub(crate) fn pointer_up(
         &self,
         x: f32,
         y: f32,
         clicks: u32,
         button: PointerButton,
+        fire: bool,
+    ) -> Result<(), EngineError> {
+        self.pointer_up_with(x, y, clicks, button, 0, fire)
+    }
+
+    /// The release with the chord the reader was holding.
+    ///
+    /// The `click` event carries the chord too, which is where a page reads
+    /// `shiftKey` for Shift+click and where a link's default is skipped when
+    /// a modifier asks for a new window.
+    pub(crate) fn pointer_up_with(
+        &self,
+        x: f32,
+        y: f32,
+        clicks: u32,
+        button: PointerButton,
+        modifiers: u32,
         fire: bool,
     ) -> Result<(), EngineError> {
         // A release reports no held buttons: `buttons` is the set STILL down,
@@ -1074,6 +1142,7 @@ impl Engine {
                 Some(clicks.max(1)),
                 button.name(),
                 0,
+                modifiers,
             ),
         )
     }
@@ -1144,12 +1213,32 @@ impl Engine {
     /// same motion (its delta moves the content, not the viewport), so the
     /// caller negates; doing it here would hide a convention the two sides
     /// disagree about.
+    /// A wheel with no chord, the shorthand the tests drive.
+    #[cfg(test)]
     pub(crate) fn scroll(
         &self,
         x: f32,
         y: f32,
         delta_x: f32,
         delta_y: f32,
+        fire: bool,
+    ) -> Result<(), EngineError> {
+        self.scroll_with(x, y, delta_x, delta_y, 0, fire)
+    }
+
+    /// Forward a wheel event with the chord the reader was holding.
+    ///
+    /// A page reads the chord on a wheel too: Ctrl/Cmd+wheel is the zoom that
+    /// a map, an image viewer or an editor implements itself, and a
+    /// Shift+wheel is often a horizontal scroll. Without the mask the page
+    /// sees every wheel as a plain one.
+    pub(crate) fn scroll_with(
+        &self,
+        x: f32,
+        y: f32,
+        delta_x: f32,
+        delta_y: f32,
+        modifiers: u32,
         fire: bool,
     ) -> Result<(), EngineError> {
         // Wheel events arrive at trackpad momentum rates; a blocking round
@@ -1164,6 +1253,7 @@ impl Engine {
                 "y": f64::from(y),
                 "deltaX": f64::from(delta_x),
                 "deltaY": f64::from(delta_y),
+                "modifiers": i64::from(modifiers),
             }),
         )
     }
@@ -1689,6 +1779,7 @@ fn mouse_params(
     clicks: Option<u32>,
     button: &str,
     buttons: u32,
+    modifiers: u32,
 ) -> Value {
     let mut params = json!({
         "type": kind,
@@ -1696,6 +1787,10 @@ fn mouse_params(
         "y": y,
         "button": button,
         "buttons": buttons,
+        // The held chord, in CDP's own bits: a page reads `shiftKey` here,
+        // which is what makes Shift+click extend a selection and a modified
+        // click reach the page's own handler.
+        "modifiers": i64::from(modifiers),
     });
     if let Some(count) = clicks {
         params["clickCount"] = json!(count);
@@ -2292,8 +2387,8 @@ mod tests {
 
     #[test]
     fn mouse_move_carries_the_held_button_for_drag_selection() {
-        let drag = mouse_params("mouseMoved", 14.0, 22.0, None, "none", 1);
-        let hover = mouse_params("mouseMoved", 14.0, 22.0, None, "none", 0);
+        let drag = mouse_params("mouseMoved", 14.0, 22.0, None, "none", 1, 0);
+        let hover = mouse_params("mouseMoved", 14.0, 22.0, None, "none", 0, 0);
         assert_eq!(drag["button"], "none");
         assert_eq!(drag["buttons"], 1);
         assert_eq!(hover["buttons"], 0);
@@ -2301,13 +2396,23 @@ mod tests {
 
     #[test]
     fn a_right_press_names_the_right_button_and_its_mask() {
-        let press = mouse_params("mousePressed", 10.0, 20.0, Some(1), "right", 2);
+        let press = mouse_params("mousePressed", 10.0, 20.0, Some(1), "right", 2, 0);
         assert_eq!(press["button"], "right");
         assert_eq!(press["buttons"], 2);
         // A release reports no held buttons, so the page sees the press end.
-        let release = mouse_params("mouseReleased", 10.0, 20.0, Some(1), "right", 0);
+        let release = mouse_params("mouseReleased", 10.0, 20.0, Some(1), "right", 0, 0);
         assert_eq!(release["button"], "right");
         assert_eq!(release["buttons"], 0);
+    }
+
+    #[test]
+    fn the_mouse_params_carry_the_held_chord() {
+        // A page reads `shiftKey` from this field, which is what makes
+        // Shift+click extend a selection instead of replacing it.
+        let shifted = mouse_params("mousePressed", 1.0, 2.0, Some(1), "left", 1, SHIFT);
+        assert_eq!(shifted["modifiers"], i64::from(SHIFT));
+        let plain = mouse_params("mousePressed", 1.0, 2.0, Some(1), "left", 1, 0);
+        assert_eq!(plain["modifiers"], 0);
     }
 
     #[test]

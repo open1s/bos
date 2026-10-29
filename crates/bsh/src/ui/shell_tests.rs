@@ -29163,3 +29163,475 @@ fn typing_into_a_live_page_field_keeps_every_character(cx: &mut TestAppContext) 
         "typing must publish a frame, not just reach the page: frames {frames_before} -> {frames_after}"
     );
 }
+
+/// The Tab key walks the PAGE's own focus order, both ways.
+///
+/// A normal browser hands Tab to the document, so a reader can reach a form's
+/// fields without the mouse. The pane has to do the same: the keystroke must
+/// survive GPUI's own focus traversal and arrive as a real `Tab` at the page,
+/// with Shift walking backwards. The page records the keydown, because a Tab
+/// that only changed focus without being delivered would still be a lie about
+/// what a page's own handler can see.
+#[gpui::test]
+fn tab_walks_the_page_focus_order_both_ways(cx: &mut TestAppContext) {
+    use std::io::{Read as _, Write as _};
+    if crate::browser::engine::cdp::client::discover_binary().is_err() {
+        eprintln!("SKIP: no Chromium/Chrome installed for the live pane tab test");
+        return;
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let addr = listener.local_addr().expect("the port");
+    let body = String::from(
+        r#"<!doctype html><html><body style="margin:0">
+         <input id="a" style="position:absolute;left:10px;top:10px;width:200px">
+         <input id="b" style="position:absolute;left:10px;top:60px;width:200px">
+         <script>window.__tabs=[];
+         document.addEventListener('keydown', function(e){
+           if (e.key === 'Tab') { window.__tabs.push((e.shiftKey ? 'shift-' : '') + 'tab'); }
+         });
+         </script></body></html>"#,
+    );
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buffer = [0u8; 4096];
+            let _ = stream.read(&mut buffer);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    init_test_app(cx);
+    cx.dispatcher.allow_parking();
+    let (harness, cx) = cx.add_window_view(|window, cx| {
+        let mut state = AppState::with_store(scratch_store("browser-live-tab"));
+        state.browser = std::sync::Arc::new(crate::browser::BrowserHandle::live());
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, cx)));
+    let url = format!("http://{addr}/");
+    cx.update(|_, cx| shell.update(cx, |this, cx| this.browser_go(url.clone(), cx)));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        cx.run_until_parked();
+        cx.update(|_, cx| shell.update(cx, |this, cx| this.sync_browser(cx)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        if cx.update(|_, cx| shell.read(cx).browser_render.is_some()) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        cx.update(|_, cx| shell.read(cx).browser_render.is_some()),
+        "the pump published a frame"
+    );
+    // Settle the viewport before counting keys: a resize is a round trip that
+    // would reflow the page under the assertion.
+    for _ in 0..80 {
+        cx.update(|_, cx| shell.update(cx, |this, cx| this.sync_browser(cx)));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let settled = cx.update(|_, cx| {
+            let shell = shell.read(cx);
+            let bounds = shell.browser_bounds.get();
+            let engine = shell.state.browser.engine().expect("the engine is ready");
+            bounds.is_some_and(|bounds| {
+                engine.viewport()
+                    == (
+                        bounds.size.width.as_f32().round() as u32,
+                        bounds.size.height.as_f32().round() as u32,
+                    )
+            })
+        });
+        if settled {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+    // Enter the page, then start at the first field - what a reader does by
+    // clicking it.
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            window.focus(&this.browser_focus, cx);
+        });
+    });
+    cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .browser
+            .engine()
+            .expect("the engine is ready")
+            .evaluate("document.getElementById('a').focus()")
+            .expect("the first field takes focus");
+    });
+
+    fn read_page(cx: &mut VisualTestContext, shell: &Entity<Shell>) -> serde_json::Value {
+        let text = cx
+            .update(|_, cx| {
+                shell
+                    .read(cx)
+                    .state
+                    .browser
+                    .engine()
+                    .expect("the engine is ready")
+                    .evaluate(
+                        "JSON.stringify({active: document.activeElement.id, tabs: window.__tabs})",
+                    )
+                    .expect("the page reads")
+            })
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        serde_json::from_str(&text).expect("the page JSON parses")
+    }
+
+    assert_eq!(
+        read_page(cx, &shell)["active"],
+        "a",
+        "the test starts in the first field"
+    );
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    let after = read_page(cx, &shell);
+    assert_eq!(
+        after["active"].as_str().unwrap_or_default(),
+        "b",
+        "Tab must move the page's own focus to the next field: {after}"
+    );
+    assert_eq!(
+        after["tabs"].as_array().map(Vec::len).unwrap_or(0),
+        1,
+        "the page must RECEIVE the Tab, not only act on it: {after}"
+    );
+
+    cx.simulate_keystrokes("shift-tab");
+    cx.run_until_parked();
+    let back = read_page(cx, &shell);
+    assert_eq!(
+        back["active"].as_str().unwrap_or_default(),
+        "a",
+        "Shift+Tab must walk backwards: {back}"
+    );
+    assert_eq!(
+        back["tabs"].as_array().map(Vec::len).unwrap_or(0),
+        2,
+        "the page must see the shifted Tab as a Tab too: {back}"
+    );
+}
+/// An IME commit inserts its whole string, once, without faking a key.
+///
+/// Chinese, Japanese and Korean input does not arrive as a key this keyboard
+/// has: the input method commits a string. A normal browser inserts that
+/// string and fires `input` (no `keydown` for a key that was never pressed).
+/// The pane's route for a multi-character commit is `Input.insertText`, and
+/// this proves the whole path - pane listener, engine, page - with two
+/// characters, because the one-character route is a different branch (a real
+/// keydown plus char).
+#[gpui::test]
+fn an_ime_commit_inserts_its_string_once_without_a_keydown(cx: &mut TestAppContext) {
+    use std::io::{Read as _, Write as _};
+    if crate::browser::engine::cdp::client::discover_binary().is_err() {
+        eprintln!("SKIP: no Chromium/Chrome installed for the live pane IME test");
+        return;
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let addr = listener.local_addr().expect("the port");
+    let body = String::from(
+        r#"<!doctype html><html><body style="margin:0">
+         <input id="q" style="position:absolute;left:10px;top:10px;width:300px;height:40px">
+         <script>window.__keys=[]; window.__inputs=0;
+         document.addEventListener('keydown', function(e){ window.__keys.push(e.key); });
+         document.addEventListener('input', function(){ window.__inputs++; });
+         </script></body></html>"#,
+    );
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buffer = [0u8; 4096];
+            let _ = stream.read(&mut buffer);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    init_test_app(cx);
+    cx.dispatcher.allow_parking();
+    let (harness, cx) = cx.add_window_view(|window, cx| {
+        let mut state = AppState::with_store(scratch_store("browser-live-ime"));
+        state.browser = std::sync::Arc::new(crate::browser::BrowserHandle::live());
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, cx)));
+    let url = format!("http://{addr}/");
+    cx.update(|_, cx| shell.update(cx, |this, cx| this.browser_go(url.clone(), cx)));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        cx.run_until_parked();
+        cx.update(|_, cx| shell.update(cx, |this, cx| this.sync_browser(cx)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        if cx.update(|_, cx| shell.read(cx).browser_render.is_some()) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        cx.update(|_, cx| shell.read(cx).browser_render.is_some()),
+        "the pump published a frame"
+    );
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            window.focus(&this.browser_focus, cx);
+        });
+    });
+    cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .browser
+            .engine()
+            .expect("the engine is ready")
+            .evaluate("document.getElementById('q').focus()")
+            .expect("the field takes focus");
+    });
+
+    // What the platform hands gpui when an input method commits: one keystroke
+    // whose character is the whole composed string, not a key on the keyboard.
+    let committed = String::from("你好");
+    cx.update(|window, cx| {
+        window.dispatch_keystroke(
+            gpui_kit::Keystroke {
+                modifiers: Modifiers::default(),
+                key: committed.clone(),
+                key_char: Some(committed.clone()),
+            },
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    let text = cx
+        .update(|_, cx| {
+            shell
+                .read(cx)
+                .state
+                .browser
+                .engine()
+                .expect("the engine is ready")
+                .evaluate(
+                    "JSON.stringify({value: document.getElementById('q').value, \
+                     keys: window.__keys, inputs: window.__inputs})",
+                )
+                .expect("the field reads")
+        })
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    eprintln!("MEASURE live ime: {text}");
+    let state: serde_json::Value = serde_json::from_str(&text).expect("the field JSON parses");
+    assert_eq!(
+        state["value"].as_str().unwrap_or_default(),
+        "你好",
+        "the composed string must land in the field exactly once: {state}"
+    );
+    assert_eq!(
+        state["inputs"].as_u64().unwrap_or(0),
+        1,
+        "one commit is one input event: {state}"
+    );
+    assert_eq!(
+        state["keys"].as_array().map(Vec::len).unwrap_or(99),
+        0,
+        "a composition commit must not pretend to be a keydown: {state}"
+    );
+}
+/// A held chord reaches the page with the click, which is what Shift+click is.
+///
+/// In a normal browser Shift+click EXTENDS a selection instead of replacing it,
+/// and a page reads that from `e.shiftKey` on the mouse events. The pane used
+/// to forward every press as unmodified, so a reader who held Shift got a plain
+/// click and lost the selection they were extending. Both directions are
+/// asserted here: a shifted gesture must say so, and a plain one must not.
+#[gpui::test]
+fn a_shift_click_reaches_the_page_as_shift_key(cx: &mut TestAppContext) {
+    use std::io::{Read as _, Write as _};
+    if crate::browser::engine::cdp::client::discover_binary().is_err() {
+        eprintln!("SKIP: no Chromium/Chrome installed for the live pane chord test");
+        return;
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let addr = listener.local_addr().expect("the port");
+    let body = String::from(
+        r#"<!doctype html><html><body style="margin:0">
+         <div id="pad" style="width:100vw;height:100vh;background:#eee">pad</div>
+         <script>window.__log=[];
+         ['mousedown','mouseup','click'].forEach(function(k){
+           document.addEventListener(k, function(e){
+             window.__log.push(k+':'+e.shiftKey); }); });
+         </script></body></html>"#,
+    );
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buffer = [0u8; 4096];
+            let _ = stream.read(&mut buffer);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    init_test_app(cx);
+    cx.dispatcher.allow_parking();
+    let (harness, cx) = cx.add_window_view(|window, cx| {
+        let mut state = AppState::with_store(scratch_store("browser-live-chord"));
+        state.browser = std::sync::Arc::new(crate::browser::BrowserHandle::live());
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, cx)));
+    let url = format!("http://{addr}/");
+    cx.update(|_, cx| shell.update(cx, |this, cx| this.browser_go(url.clone(), cx)));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        cx.run_until_parked();
+        cx.update(|_, cx| shell.update(cx, |this, cx| this.sync_browser(cx)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        if cx.update(|_, cx| shell.read(cx).browser_render.is_some()) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        cx.update(|_, cx| shell.read(cx).browser_render.is_some()),
+        "the pump published a frame"
+    );
+    for _ in 0..80 {
+        cx.update(|_, cx| shell.update(cx, |this, cx| this.sync_browser(cx)));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let settled = cx.update(|_, cx| {
+            let shell = shell.read(cx);
+            let bounds = shell.browser_bounds.get();
+            let engine = shell.state.browser.engine().expect("the engine is ready");
+            bounds.is_some_and(|bounds| {
+                engine.viewport()
+                    == (
+                        bounds.size.width.as_f32().round() as u32,
+                        bounds.size.height.as_f32().round() as u32,
+                    )
+            })
+        });
+        if settled {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+    let frame = cx
+        .debug_bounds("browser-render-frame")
+        .expect("the live frame is drawn");
+    let center = frame.center();
+
+    let log = |cx: &mut VisualTestContext| -> String {
+        cx.update(|_, cx| {
+            shell
+                .read(cx)
+                .state
+                .browser
+                .engine()
+                .expect("the engine is ready")
+                .evaluate("JSON.stringify(window.__log)")
+                .expect("the page log reads")
+        })
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+    };
+
+    // A gesture that held Shift: the page must see the chord on all three
+    // events, because a click handler reads it from the release.
+    let shift = Modifiers {
+        shift: true,
+        ..Default::default()
+    };
+    cx.simulate_event(gpui_kit::MouseDownEvent {
+        position: center,
+        modifiers: shift,
+        button: gpui_kit::MouseButton::Left,
+        click_count: 1,
+        first_mouse: false,
+    });
+    cx.simulate_event(gpui_kit::MouseUpEvent {
+        position: center,
+        modifiers: shift,
+        button: gpui_kit::MouseButton::Left,
+        click_count: 1,
+    });
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let shifted = log(cx);
+    assert!(
+        shifted.contains("mousedown:true"),
+        "a shifted press must reach the page with shiftKey: {shifted}"
+    );
+    assert!(
+        shifted.contains("mouseup:true"),
+        "a shifted release must reach the page with shiftKey: {shifted}"
+    );
+    assert!(
+        shifted.contains("click:true"),
+        "the click a page reads must carry shiftKey: {shifted}"
+    );
+
+    // The same gesture with no chord must NOT carry it: without this half, the
+    // shifted assertion above would pass even if the pane always set the bit.
+    cx.update(|_, cx| {
+        let engine = shell
+            .read(cx)
+            .state
+            .browser
+            .engine()
+            .expect("the engine is ready");
+        engine
+            .evaluate("window.__log = []")
+            .expect("the page log resets");
+    });
+    let plain = Modifiers::default();
+    cx.simulate_event(gpui_kit::MouseDownEvent {
+        position: center,
+        modifiers: plain,
+        button: gpui_kit::MouseButton::Left,
+        click_count: 1,
+        first_mouse: false,
+    });
+    cx.simulate_event(gpui_kit::MouseUpEvent {
+        position: center,
+        modifiers: plain,
+        button: gpui_kit::MouseButton::Left,
+        click_count: 1,
+    });
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let unmodified = log(cx);
+    assert!(
+        unmodified.contains("click:false"),
+        "an unmodified click must not claim shiftKey: {unmodified}"
+    );
+}

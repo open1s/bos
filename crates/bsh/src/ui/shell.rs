@@ -341,12 +341,22 @@ pub(crate) struct Shell {
     pub(crate) browser_pressed: Option<MouseButton>,
     /// The last press, so its release can carry the platform's click count.
     pub(crate) browser_click: Option<super::right_panel::BrowserClick>,
-    /// The last printable character the page received as a KEY.
+    /// The chord the held gesture was made with.
     ///
-    /// The page's input handler sees the same character again after the key
-    /// listener typed it (MEASURED: without recognising the echo every typed
-    /// character doubled). A commit that differs from it supersedes the key.
-    pub(crate) browser_typed: Option<(std::time::Instant, char)>,
+    /// Part of the gesture state like the button and the click count: a drag
+    /// or release that leaves the frame is delivered by the window's own
+    /// listeners, which have no page event to read the chord from, and
+    /// Shift+drag outside the pane must still EXTEND rather than replace.
+    pub(crate) browser_modifiers: gpui_kit::Modifiers,
+    /// The last text the page received as a KEY.
+    ///
+    /// The page's input handler sees the same text again after the key listener
+    /// inserted it (MEASURED: without recognising the echo every typed
+    /// character doubled). It is the whole STRING, not one character, because a
+    /// composition commits several at once - and an IME commit that also
+    /// arrived as a key doubled the same way (MEASURED: `你好` landed twice).
+    /// A commit that differs from a one-character key supersedes it.
+    pub(crate) browser_typed: Option<(std::time::Instant, String)>,
     /// The preset card whose config details are expanded, if any.
     pub(crate) preset_details: Option<String>,
     /// The preset card whose Advanced block is expanded, if any. Mode details
@@ -1547,6 +1557,7 @@ impl Shell {
             browser_pressed: None,
             browser_click: None,
             browser_typed: None,
+            browser_modifiers: gpui_kit::Modifiers::default(),
             preset_details: None,
             preset_advanced: None,
             preset_editor: None,

@@ -303,12 +303,22 @@ impl gpui::EntityInputHandler for Shell {
                     .take()
                     .filter(|(at, _)| at.elapsed() <= std::time::Duration::from_millis(300));
                 if let Some((_, typed)) = recent {
-                    let mut chars = text.chars();
-                    if chars.next() == Some(typed) && chars.next().is_none() {
+                    // The echo of what the key listener already inserted, in
+                    // full: one character for a printable key, the whole
+                    // string for a composition that arrives as a key too.
+                    if typed == text {
                         cx.notify();
                         return;
                     }
-                    let _ = engine.press("backspace", true);
+                    // A longer commit SUPERSEDES a just-typed key, which is
+                    // the shape of a synthetic Unicode keystroke and of an
+                    // IME conversion: the character the key inserted is not
+                    // part of what the commit means. Only a one-character key
+                    // is removed, because that is the only case where the
+                    // stray character is known to be one character long.
+                    if typed.chars().count() == 1 {
+                        let _ = engine.press("backspace", true);
+                    }
                 }
                 let _ = engine.insert_text(text, true);
             }
@@ -4186,6 +4196,7 @@ impl Shell {
                                 event.position,
                                 event.button,
                                 event.click_count,
+                                event.modifiers,
                             );
                             cx.notify();
                         }),
@@ -4200,6 +4211,7 @@ impl Shell {
                                 event.position,
                                 event.button,
                                 event.click_count,
+                                event.modifiers,
                             );
                             cx.notify();
                         }),
@@ -4212,6 +4224,7 @@ impl Shell {
                                 event.position,
                                 event.button,
                                 event.click_count,
+                                event.modifiers,
                             );
                             cx.notify();
                         }),
@@ -4220,27 +4233,31 @@ impl Shell {
                         // Hover updates :hover; a held button turns the same
                         // event into a drag. Both reach the page now, so a
                         // reader can hover a link and select text.
-                        this.browser_pointer_move(event.position, event.pressed_button);
+                        this.browser_pointer_move(
+                            event.position,
+                            event.pressed_button,
+                            event.modifiers,
+                        );
                         cx.notify();
                     }))
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(|this, event: &MouseUpEvent, _, cx| {
-                            this.browser_pointer_up(event.position, event.button);
+                            this.browser_pointer_up(event.position, event.button, event.modifiers);
                             cx.notify();
                         }),
                     )
                     .on_mouse_up(
                         MouseButton::Right,
                         cx.listener(|this, event: &MouseUpEvent, _, cx| {
-                            this.browser_pointer_up(event.position, event.button);
+                            this.browser_pointer_up(event.position, event.button, event.modifiers);
                             cx.notify();
                         }),
                     )
                     .on_mouse_up(
                         MouseButton::Middle,
                         cx.listener(|this, event: &MouseUpEvent, _, cx| {
-                            this.browser_pointer_up(event.position, event.button);
+                            this.browser_pointer_up(event.position, event.button, event.modifiers);
                             cx.notify();
                         }),
                     )
@@ -4334,6 +4351,7 @@ impl Shell {
         position: Point<Pixels>,
         button: MouseButton,
         click_count: usize,
+        modifiers: Modifiers,
     ) {
         let Some(pointer) = pointer_button(button) else {
             return;
@@ -4350,11 +4368,15 @@ impl Shell {
         let click = BrowserClick::press(self.browser_click.as_ref(), button, click_count);
         let count = click.count();
         self.browser_click = Some(click);
+        self.browser_modifiers = modifiers;
         if let Some(engine) = self.state.browser.engine() {
             // Only a press the page actually received is a held gesture; a pane
             // with no engine has nothing to release later.
             self.browser_pressed = Some(button);
-            let _ = engine.pointer_down(x, y, count, pointer, true);
+            // The held chord rides the press: a page reads `shiftKey` here, so
+            // Shift+click extends a selection instead of replacing it.
+            let _ =
+                engine.pointer_down_with(x, y, count, pointer, chord_modifiers(&modifiers), true);
         }
     }
 
@@ -4372,7 +4394,12 @@ impl Shell {
     /// that button down. The pane used to synthesize the selection from carets
     /// instead, which failed wherever an endpoint was not text - a margin, a
     /// gap between blocks, a field - and could not select a field's text at all.
-    fn browser_pointer_move(&mut self, position: Point<Pixels>, pressed: Option<MouseButton>) {
+    fn browser_pointer_move(
+        &mut self,
+        position: Point<Pixels>,
+        pressed: Option<MouseButton>,
+        modifiers: Modifiers,
+    ) {
         let dragging = pressed.is_some() && pressed == self.browser_pressed;
         let now = std::time::Instant::now();
         if !dragging {
@@ -4387,7 +4414,14 @@ impl Shell {
             return;
         };
         if let Some(engine) = self.state.browser.engine() {
-            let _ = engine.pointer_move(x, y, self.browser_pressed.and_then(pointer_button));
+            // Shift+drag EXTENDS the selection; without the chord the page
+            // replaces it, which is not what the reader held Shift for.
+            let _ = engine.pointer_move_with(
+                x,
+                y,
+                self.browser_pressed.and_then(pointer_button),
+                chord_modifiers(&modifiers),
+            );
         }
     }
 
@@ -4405,7 +4439,12 @@ impl Shell {
             return;
         };
         if let Some(engine) = self.state.browser.engine() {
-            let _ = engine.pointer_move(x, y, self.browser_pressed.and_then(pointer_button));
+            let _ = engine.pointer_move_with(
+                x,
+                y,
+                self.browser_pressed.and_then(pointer_button),
+                chord_modifiers(&self.browser_modifiers),
+            );
         }
     }
 
@@ -4413,7 +4452,12 @@ impl Shell {
     ///
     /// A release of any OTHER button is not this gesture's end: releasing the
     /// right button while the left is held leaves the left press down.
-    fn browser_pointer_up(&mut self, position: Point<Pixels>, button: MouseButton) {
+    fn browser_pointer_up(
+        &mut self,
+        position: Point<Pixels>,
+        button: MouseButton,
+        modifiers: Modifiers,
+    ) {
         if self.browser_pressed != Some(button) {
             return;
         }
@@ -4428,7 +4472,7 @@ impl Shell {
             return;
         };
         if let Some(engine) = self.state.browser.engine() {
-            let _ = engine.pointer_up(x, y, count, pointer, true);
+            let _ = engine.pointer_up_with(x, y, count, pointer, chord_modifiers(&modifiers), true);
         }
     }
 
@@ -4453,8 +4497,9 @@ impl Shell {
             return;
         };
         if let Some(engine) = self.state.browser.engine() {
-            let _ = engine.pointer_move(x, y, Some(pointer));
-            let _ = engine.pointer_up(x, y, count, pointer, true);
+            let modifiers = chord_modifiers(&self.browser_modifiers);
+            let _ = engine.pointer_move_with(x, y, Some(pointer), modifiers);
+            let _ = engine.pointer_up_with(x, y, count, pointer, modifiers, true);
         }
     }
 
@@ -4480,7 +4525,16 @@ impl Shell {
         ) else {
             return;
         };
-        let _ = engine.scroll(x, y, delta_x, delta_y, true);
+        // The chord rides the wheel: Ctrl/Cmd+wheel is the zoom a map or an
+        // editor implements itself, Shift+wheel a horizontal scroll.
+        let _ = engine.scroll_with(
+            x,
+            y,
+            delta_x,
+            delta_y,
+            chord_modifiers(&event.modifiers),
+            true,
+        );
     }
 
     /// Forward a key: printable text as text, the named keys as keys.
@@ -4507,14 +4561,17 @@ impl Shell {
             // a page listening for keydown sees the key AND the field receives
             // exactly that character once.
             let _ = engine.type_key(text, chord_modifiers(&keystroke.modifiers), true);
-            if let Some(ch) = text.chars().next() {
-                self.browser_typed = Some((std::time::Instant::now(), ch));
-            }
+            self.browser_typed = Some((std::time::Instant::now(), text.to_string()));
         } else {
             // A composition (CJK/IME) or an input source's multi-character
             // commit: insert it as text, the route that does not pretend to be
             // a key this keyboard does not have.
+            //
+            // Recorded like a typed key, because the platform can deliver the
+            // same commit to the input handler as well: MEASURED, `你好` landed
+            // in the field twice before this.
             let _ = engine.insert_text(text, true);
+            self.browser_typed = Some((std::time::Instant::now(), text.to_string()));
         }
     }
 
