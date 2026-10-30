@@ -3562,6 +3562,10 @@ What changed in the contract, deliberately:
   unconfined. The start and input gates still decide everything they did.
 - **The start gate still runs before any surface exists**, and Enter on a dead
   pane asks it again and replaces the surface.
+- **The pane follows the Font size setting.** The size rides the same temporary
+  Ghostty configuration file as the colors (the vendored crate gained
+  `TerminalOptions::font_size`), so a step in the setting resizes the terminal
+  with the rest of the app; the clock reapplies it only when it changed.
 
 Traps, all measured:
 
@@ -3572,9 +3576,14 @@ Traps, all measured:
   prepaint and registers the handler in the paint closure.
 - **The native surface is a layer of the window view, above everything GPUI
   paints.** The status strip is a flex sibling ABOVE the terminal area (an
-  absolute overlay would be hidden under it), and switching tabs or closing the
-  panel must call `set_visible(false)` or the terminal keeps drawing over the
-  new pane.
+  absolute overlay would be hidden under it). Its presence is DERIVED once per
+  frame - `Shell::terminal_surface_wanted`: panel open, Terminal tab, no
+  settings overlay, no image lightbox - rather than trusted to each path that
+  switches tabs, because the paths are many (the header toggle, every diff
+  opener, trajectory and slash-palette file links) and one missed call leaves
+  the terminal painting over the new pane. That derivation also covers the
+  settings dialog, which is drawn in-window and would otherwise sit UNDER the
+  surface. A unit test pins the four inputs.
 - **A launch from the agent's own shell cannot open a PTY.** Under the file
   sandbox the app starts, the surface draws, and Ghostty paints its own
   "system cannot allocate any more pty devices" message (`error.OpenptyFailed`
@@ -3590,6 +3599,9 @@ Traps, all measured:
 - Ghostty runs the command as `login -flp <user> bash -c "exec -l <command>"`,
   so the shell is a **login shell** and `env BSH_SANDBOX=... shell` is how an
   env value reaches it. `quiet_login=true` suppresses the banner.
+- A window that is not key draws a hollow cursor: the surface gets
+  `set_focused` from the pane's focus handle AND `observe_window_activation`,
+  so the two cannot drift.
 - Zig's package fetch failed once with `HttpConnectionClosing` when Ghostty
   fetched six packages at once; a retry succeeded, so do not chase the network.
 - Test-count reality check: the suite is 1202 tests, not the 254 the round-124

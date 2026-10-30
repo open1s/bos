@@ -1204,6 +1204,15 @@ fn is_light(color: u32) -> bool {
     0.2126 * ch(16) + 0.7152 * ch(8) + 0.0722 * ch(0) > 0.5
 }
 
+/// The terminal's text size for a content size setting.
+///
+/// One point under the body, which is the relationship the pane had when its
+/// size was a constant (14 -> 13) and keeps a scaled app from pinning the
+/// terminal at the default.
+pub(crate) fn terminal_font_size(content_font_size: u32) -> f32 {
+    (body_size_at(content_font_size) - 1.0).max(6.0)
+}
+
 /// The sixteen ANSI colours the terminal pane hands libghostty.
 ///
 /// The kit theme carries no terminal palette, so the hues come from the tokens
@@ -1243,6 +1252,17 @@ pub(crate) fn terminal_palette() -> [u32; 16] {
 
 #[cfg(test)]
 mod tests {
+    use super::terminal_font_size;
+
+    /// The terminal sits one point under the body, at every step of the Font
+    /// size setting, so scaling the app scales the terminal with it.
+    #[test]
+    fn the_terminal_font_size_tracks_the_content_setting() {
+        assert_eq!(terminal_font_size(14), 13.0);
+        assert_eq!(terminal_font_size(20), 19.0);
+        assert_eq!(terminal_font_size(10), 9.0);
+    }
+
     use super::THEME_SET;
     use gpui_kit::component::theme::ThemeSet;
 

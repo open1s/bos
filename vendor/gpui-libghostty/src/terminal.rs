@@ -77,6 +77,12 @@ pub struct TerminalOptions {
     pub quiet_login: bool,
     /// Approval policy for protected clipboard operations; absent means deny.
     pub clipboard_approval: Option<ClipboardApprovalCallback>,
+    /// The text size, in points, the surface is configured with.
+    ///
+    /// Written into the same temporary configuration file as the colors, so an
+    /// embedder that sizes its own text can keep the terminal in step without
+    /// a settings screen of its own. Absent leaves Ghostty's default.
+    pub font_size: Option<f32>,
 }
 
 impl TerminalOptions {
@@ -88,6 +94,7 @@ impl TerminalOptions {
             configuration: TerminalConfiguration::Default,
             quiet_login: false,
             clipboard_approval: None,
+            font_size: None,
         }
     }
 }
@@ -105,12 +112,22 @@ fn theme_config_contents(theme: &TerminalTheme) -> String {
     )
 }
 
-fn write_theme_config(theme: &TerminalTheme) -> Result<tempfile::NamedTempFile, String> {
+fn write_config(
+    theme: Option<&TerminalTheme>,
+    font_size: Option<f32>,
+) -> Result<Option<tempfile::NamedTempFile>, String> {
+    if theme.is_none() && font_size.is_none() {
+        return Ok(None);
+    }
+    let mut contents = theme.map(theme_config_contents).unwrap_or_default();
+    if let Some(size) = font_size {
+        contents.push_str(&format!("font-size = {size}\n"));
+    }
     let mut file = tempfile::NamedTempFile::new()
         .map_err(|error| format!("create temporary Ghostty theme: {error}"))?;
-    file.write_all(theme_config_contents(theme).as_bytes())
+    file.write_all(contents.as_bytes())
         .map_err(|error| format!("write temporary Ghostty theme: {error}"))?;
-    Ok(file)
+    Ok(Some(file))
 }
 
 /// Holds the temporary theme file a surface was configured from so a later
@@ -118,6 +135,8 @@ fn write_theme_config(theme: &TerminalTheme) -> Result<tempfile::NamedTempFile, 
 pub struct TerminalThemeState {
     load_user_config: bool,
     file: Option<tempfile::NamedTempFile>,
+    /// The text size the configuration carries, so an update rebuilds it.
+    font_size: Option<f32>,
 }
 
 impl TerminalThemeState {
@@ -129,7 +148,9 @@ impl TerminalThemeState {
         &mut self,
         surface: &mut NativeSurface,
         theme: &TerminalTheme,
+        font_size: Option<f32>,
     ) -> Result<(), String> {
+        self.font_size = font_size;
         let load_user_config = self.load_user_config;
         self.apply_with(theme, |path| {
             surface.update_theme(load_user_config, Some(path))
@@ -146,7 +167,7 @@ impl TerminalThemeState {
         theme: &TerminalTheme,
         update: impl FnOnce(&CStr) -> bool,
     ) -> Result<(), String> {
-        let file = write_theme_config(theme)?;
+        let file = write_config(Some(theme), self.font_size)?.expect("a theme is always written");
         let path = CString::new(file.path().to_string_lossy().as_bytes())
             .map_err(|_| "temporary Ghostty theme path contains a NUL byte".to_owned())?;
         if !update(path.as_c_str()) {
@@ -174,6 +195,7 @@ pub unsafe fn spawn_surface(
         configuration,
         quiet_login,
         clipboard_approval,
+        font_size,
     } = options;
     let working_directory =
         CString::new(working_directory.to_string_lossy().as_bytes()).map_err(|_| {
@@ -185,11 +207,11 @@ pub unsafe fn spawn_surface(
     let command =
         CString::new(command).map_err(|_| "terminal command contains a NUL byte".to_owned())?;
     let (load_user_config, theme_config) = match configuration {
-        TerminalConfiguration::Default => (false, None),
-        TerminalConfiguration::UserDefault => (true, None),
-        TerminalConfiguration::Custom(theme) => (false, Some(write_theme_config(&theme)?)),
+        TerminalConfiguration::Default => (false, write_config(None, font_size)?),
+        TerminalConfiguration::UserDefault => (true, write_config(None, font_size)?),
+        TerminalConfiguration::Custom(theme) => (false, write_config(Some(&theme), font_size)?),
         TerminalConfiguration::UserDefaultWithOverride(theme) => {
-            (true, Some(write_theme_config(&theme)?))
+            (true, write_config(Some(&theme), font_size)?)
         }
     };
     let theme_config_path = theme_config
@@ -217,6 +239,7 @@ pub unsafe fn spawn_surface(
         TerminalThemeState {
             load_user_config,
             file: theme_config,
+            font_size,
         },
     ))
 }
@@ -610,6 +633,7 @@ mod tests {
         let mut state = TerminalThemeState {
             load_user_config: false,
             file: None,
+            font_size: None,
         };
 
         let first = std::cell::RefCell::new(None);
@@ -652,6 +676,7 @@ mod tests {
         let mut state = TerminalThemeState {
             load_user_config: true,
             file: None,
+            font_size: None,
         };
 
         let error = state
@@ -775,6 +800,37 @@ mod tests {
         assert!(config.ends_with("palette-generate = true\n"));
     }
 
+    /// The text size rides the same temporary configuration file as the
+    /// colors, so an embedder that scales its own text keeps the terminal in
+    /// step with one config reload.
+    #[test]
+    fn the_config_file_carries_the_requested_font_size() {
+        let theme = TerminalTheme::new(
+            TerminalColor::new(0, 0, 0),
+            TerminalColor::new(255, 255, 255),
+            [TerminalColor::new(0, 0, 0); 16],
+        );
+        let file = write_config(Some(&theme), Some(15.5))
+            .expect("the configuration is writable")
+            .expect("a theme is always written");
+        let contents = std::fs::read_to_string(file.path()).expect("the config is readable");
+        assert!(contents.contains("font-size = 15.5\n"), "{contents}");
+        assert!(contents.contains("background = #000000\n"), "{contents}");
+
+        // A surface with no theme and no size asks for no file at all.
+        assert!(
+            write_config(None, None)
+                .expect("nothing to write")
+                .is_none()
+        );
+        // A size alone still produces one, so Ghostty's default colors stay.
+        let file = write_config(None, Some(18.0))
+            .expect("the configuration is writable")
+            .expect("a size is worth a file");
+        let contents = std::fs::read_to_string(file.path()).expect("the config is readable");
+        assert_eq!(contents, "font-size = 18\n");
+    }
+
     #[test]
     fn temporary_theme_config_is_removed_when_released() {
         let theme = TerminalTheme::new(
@@ -782,7 +838,9 @@ mod tests {
             TerminalColor::new(255, 255, 255),
             [TerminalColor::new(0, 0, 0); 16],
         );
-        let file = write_theme_config(&theme).expect("theme config should be writable");
+        let file = write_config(Some(&theme), None)
+            .expect("theme config should be writable")
+            .expect("a theme is written");
         let path = file.path().to_owned();
         assert!(path.exists());
 

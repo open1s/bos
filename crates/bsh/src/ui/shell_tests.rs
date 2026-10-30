@@ -20092,6 +20092,73 @@ fn a_refused_input_surfaces_in_the_terminal_status(cx: &mut TestAppContext) {
     );
 }
 
+/// The terminal's native surface follows ONE derivation: the panel is open on
+/// its tab and nothing full-window is over it. A tab switch, a closed panel and
+/// the settings dialog all have to take it down - the surface is above GPUI's
+/// own drawing, so an overlay under it would be hidden.
+#[gpui::test]
+fn the_terminal_surface_steps_aside_for_another_tab_or_an_overlay(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("terminal-presence");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(crate::ui::right_panel::RightTab::Terminal, window, cx);
+        });
+    });
+    assert!(
+        cx.update(|_, cx| shell.read(cx).terminal_surface_wanted()),
+        "the panel is open on the Terminal tab"
+    );
+
+    // The settings dialog is drawn in-window and would sit under the surface.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.state.overlay = crate::state::Overlay::Settings;
+            cx.notify();
+        });
+    });
+    assert!(
+        !cx.update(|_, cx| shell.read(cx).terminal_surface_wanted()),
+        "an overlay takes the surface down"
+    );
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.state.overlay = crate::state::Overlay::None;
+            cx.notify();
+        });
+    });
+
+    // Another tab in the body, and a closed panel, both hide it.
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.show_right_tab(crate::ui::right_panel::RightTab::Files, cx);
+            let _ = window;
+        });
+    });
+    assert!(
+        !cx.update(|_, cx| shell.read(cx).terminal_surface_wanted()),
+        "the Files tab owns the body"
+    );
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.show_right_tab(crate::ui::right_panel::RightTab::Terminal, cx);
+            this.right.open = false;
+            cx.notify();
+        });
+    });
+    assert!(
+        !cx.update(|_, cx| shell.read(cx).terminal_surface_wanted()),
+        "a closed panel has no body"
+    );
+}
+
 /// A scratch session directory no other test shares.
 fn paging_scratch(label: &str) -> std::path::PathBuf {
     let dir = scratch_home(label);
@@ -25330,7 +25397,11 @@ fn the_folded_shell_reserves_the_traffic_lights_for_the_maximised_panel(cx: &mut
 
     // Fold the panel: the corner returns to the main column, so neither the
     // strip nor an inert gap may survive it.
-    cx.update(|window, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Files, window, cx)));
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(RightTab::Files, window, cx)
+        })
+    });
     draw_until(cx, "the Files pane is back", DRAW_UNTIL_MAX, |cx| {
         cx.debug_bounds("right-tab").is_some()
     });
@@ -25381,7 +25452,11 @@ fn the_open_shell_keeps_the_panel_tab_strip_where_it_was(cx: &mut TestAppContext
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    cx.update(|window, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Files, window, cx)));
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(RightTab::Files, window, cx)
+        })
+    });
     draw_until(cx, "the Files tab renders", DRAW_UNTIL_MAX, |cx| {
         cx.debug_bounds("right-tab").is_some()
     });
@@ -25591,7 +25666,11 @@ fn the_browser_pane_renders_loading_and_the_loaded_page(cx: &mut TestAppContext)
             cx.notify();
         })
     });
-    cx.update(|window, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, window, cx)));
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(RightTab::Browser, window, cx)
+        })
+    });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(
         cx.debug_bounds("browser-state-empty").is_some(),
@@ -25656,7 +25735,11 @@ fn a_policy_refused_navigation_is_still_attempted(cx: &mut TestAppContext) {
             cx.notify();
         })
     });
-    cx.update(|window, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, window, cx)));
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(RightTab::Browser, window, cx)
+        })
+    });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let url = site.url();
     cx.update(|_, cx| shell.update(cx, |this, cx| this.browser_go(url, cx)));
@@ -25702,7 +25785,11 @@ fn switching_tabs_keeps_the_browser_in_its_own_pane(cx: &mut TestAppContext) {
             cx.notify();
         })
     });
-    cx.update(|window, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, window, cx)));
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(RightTab::Browser, window, cx)
+        })
+    });
     let url = site.url();
     cx.update(|_, cx| shell.update(cx, |this, cx| this.browser_go(url, cx)));
     assert_eq!(
@@ -25714,7 +25801,11 @@ fn switching_tabs_keeps_the_browser_in_its_own_pane(cx: &mut TestAppContext) {
     assert!(cx.debug_bounds("browser-pane").is_some());
 
     // The Files pane takes the body: the browser's controls must go with it.
-    cx.update(|window, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Files, window, cx)));
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(RightTab::Files, window, cx)
+        })
+    });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(
         cx.debug_bounds("browser-pane").is_none(),
@@ -25731,7 +25822,11 @@ fn switching_tabs_keeps_the_browser_in_its_own_pane(cx: &mut TestAppContext) {
 
     // Coming back finds the same page: the browser is shell state, not a
     // per-tab scratch buffer.
-    cx.update(|window, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, window, cx)));
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(RightTab::Browser, window, cx)
+        })
+    });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(cx.debug_bounds("browser-pane").is_some());
     let view = cx
@@ -25920,7 +26015,11 @@ fn typing_a_url_and_pressing_enter_opens_the_page(cx: &mut TestAppContext) {
             cx.notify();
         })
     });
-    cx.update(|window, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, window, cx)));
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(RightTab::Browser, window, cx)
+        })
+    });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(
         cx.debug_bounds("browser-address").is_some(),
@@ -27324,7 +27423,10 @@ fn a_permission_change_keeps_an_open_terminal_on_its_spawn_spec(cx: &mut TestApp
             .expect("the terminal")
             .sandbox_label()
             .map(str::to_string);
-        let status = shell.read(cx).terminal_status_text(false).map(|(text, _)| text);
+        let status = shell
+            .read(cx)
+            .terminal_status_text(false)
+            .map(|(text, _)| text);
         (terminal, status)
     });
     assert!(
@@ -28311,7 +28413,11 @@ fn a_double_click_and_a_right_click_reach_the_live_page(cx: &mut TestAppContext)
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    cx.update(|window, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, window, cx)));
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(RightTab::Browser, window, cx)
+        })
+    });
     let url = format!("http://{addr}/");
     cx.update(|_, cx| shell.update(cx, |this, cx| this.browser_go(url.clone(), cx)));
 
@@ -28522,7 +28628,11 @@ fn a_drag_over_the_live_page_selects_the_text(cx: &mut TestAppContext) {
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    cx.update(|window, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, window, cx)));
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(RightTab::Browser, window, cx)
+        })
+    });
     let url = format!("http://{addr}/");
     cx.update(|_, cx| shell.update(cx, |this, cx| this.browser_go(url.clone(), cx)));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -28720,7 +28830,11 @@ fn typing_into_a_live_page_field_keeps_every_character(cx: &mut TestAppContext) 
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    cx.update(|window, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, window, cx)));
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(RightTab::Browser, window, cx)
+        })
+    });
     let url = format!("http://{addr}/");
     cx.update(|_, cx| shell.update(cx, |this, cx| this.browser_go(url.clone(), cx)));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -28889,7 +29003,11 @@ fn tab_walks_the_page_focus_order_both_ways(cx: &mut TestAppContext) {
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    cx.update(|window, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, window, cx)));
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(RightTab::Browser, window, cx)
+        })
+    });
     let url = format!("http://{addr}/");
     cx.update(|_, cx| shell.update(cx, |this, cx| this.browser_go(url.clone(), cx)));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -29050,7 +29168,11 @@ fn an_ime_commit_inserts_its_string_once_without_a_keydown(cx: &mut TestAppConte
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    cx.update(|window, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, window, cx)));
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(RightTab::Browser, window, cx)
+        })
+    });
     let url = format!("http://{addr}/");
     cx.update(|_, cx| shell.update(cx, |this, cx| this.browser_go(url.clone(), cx)));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -29182,7 +29304,11 @@ fn a_shift_click_reaches_the_page_as_shift_key(cx: &mut TestAppContext) {
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    cx.update(|window, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, window, cx)));
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(RightTab::Browser, window, cx)
+        })
+    });
     let url = format!("http://{addr}/");
     cx.update(|_, cx| shell.update(cx, |this, cx| this.browser_go(url.clone(), cx)));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -29325,7 +29451,11 @@ fn enter_in_the_address_bar_starts_a_navigation(cx: &mut TestAppContext) {
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    cx.update(|window, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, window, cx)));
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(RightTab::Browser, window, cx)
+        })
+    });
     // The reader's route: CLICK into the field (which is what focuses it in
     // the app), then press Enter. `set_value` stands in for typing, which other
     // tests already cover.
@@ -29349,8 +29479,9 @@ fn enter_in_the_address_bar_starts_a_navigation(cx: &mut TestAppContext) {
     cx.update(|window, cx| {
         shell.update(cx, |this, cx| {
             window.focus(&this.browser_url.read(cx).focus_handle(cx), cx);
-            this.browser_url
-                .update(cx, |state, cx| state.set_value("http://127.0.0.1:9/", window, cx));
+            this.browser_url.update(cx, |state, cx| {
+                state.set_value("http://127.0.0.1:9/", window, cx)
+            });
         });
     });
     cx.simulate_keystrokes("enter");

@@ -35,6 +35,8 @@ pub(crate) struct TerminalView {
     theme: TerminalThemeState,
     /// The theme last applied, so a same-palette tick costs one compare.
     applied: TerminalTheme,
+    /// The text size last applied, compared the same way.
+    applied_font: f32,
     /// The pane's last measured bounds, in window coordinates: pointer events
     /// arrive in those coordinates and Ghostty wants them pane-relative.
     frame: Bounds<Pixels>,
@@ -52,11 +54,13 @@ impl TerminalView {
     /// in its status line.
     pub(crate) fn spawn<T: 'static>(
         mut options: TerminalOptions,
+        font_size: f32,
         window: &mut Window,
         cx: &mut Context<T>,
     ) -> Result<Entity<Self>, String> {
         let theme = terminal_theme();
         options.configuration = TerminalConfiguration::Custom(theme);
+        options.font_size = Some(font_size);
         // Ghostty's own confirmations still apply; bsh answers the ones it
         // asks. Writing the clipboard (a copy) and an unsafe paste are the
         // reader's own gestures, so they are approved; a protected READ is a
@@ -75,6 +79,7 @@ impl TerminalView {
             surface,
             theme: theme_state,
             applied: theme,
+            applied_font: font_size,
             frame: Bounds::default(),
             pump: None,
             visible: true,
@@ -249,13 +254,14 @@ impl TerminalView {
     ///
     /// Returns whether anything was applied, so the clock only notifies a
     /// redraw for a real change.
-    pub(crate) fn sync_theme(&mut self, theme: TerminalTheme) -> bool {
-        if theme == self.applied {
+    pub(crate) fn sync_theme(&mut self, theme: TerminalTheme, font_size: f32) -> bool {
+        if theme == self.applied && font_size == self.applied_font {
             return false;
         }
-        match self.theme.apply(&mut self.surface, &theme) {
+        match self.theme.apply(&mut self.surface, &theme, Some(font_size)) {
             Ok(()) => {
                 self.applied = theme;
+                self.applied_font = font_size;
                 true
             }
             // A failed theme write leaves the previous colours; the next tick

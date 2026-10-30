@@ -1777,7 +1777,9 @@ impl Shell {
             return;
         }
         let options = TerminalOptions::new(terminal.command(), terminal.cwd.clone());
-        match TerminalView::spawn(options, window, cx) {
+        let font_size =
+            crate::theme::terminal_font_size(self.state.draft().global.general.content_font_size);
+        match TerminalView::spawn(options, font_size, window, cx) {
             Ok(view) => {
                 let focus_in = cx.on_focus(&self.terminal_focus, window, |this, _window, cx| {
                     this.terminal_focus_changed(true, cx);
@@ -1785,8 +1787,15 @@ impl Shell {
                 let focus_out = cx.on_blur(&self.terminal_focus, window, |this, _window, cx| {
                     this.terminal_focus_changed(false, cx);
                 });
+                // A window that is not key draws a hollow cursor: the surface
+                // is told once per activation change rather than per frame.
+                let activation = cx.observe_window_activation(window, |this, window, cx| {
+                    let focused =
+                        this.terminal_focus.is_focused(window) && window.is_window_active();
+                    this.terminal_focus_changed(focused, cx);
+                });
                 self.right.terminal_view = Some(view);
-                self.right.terminal_view_subs = vec![focus_in, focus_out];
+                self.right.terminal_view_subs = vec![focus_in, focus_out, activation];
                 if let Some(terminal) = self.right.terminal.as_mut() {
                     terminal.failure = None;
                 }
@@ -4755,7 +4764,9 @@ impl Shell {
         // The palette follows the window's theme; applying it is a compare and,
         // only on a real change, one configuration reload.
         let theme = super::terminal_view::terminal_theme();
-        if view.update(cx, |view, _| view.sync_theme(theme)) {
+        let font_size =
+            crate::theme::terminal_font_size(self.state.draft().global.general.content_font_size);
+        if view.update(cx, |view, _| view.sync_theme(theme, font_size)) {
             cx.notify();
         }
         // A shell that exited is noticed through Ghostty's own answer; the
