@@ -68,10 +68,22 @@ uuid = { workspace = true }
 shellexpand = { workspace = true }
 rust-i18n = "4.2.4"
 dirs = "7.0.0"
-portable-pty = { workspace = true }
+# The terminal pane's backend. gpui-libghostty vendors Ghostty and builds its
+# static archive with Zig at build time; the pane then draws Ghostty's own Metal
+# surface instead of bsh parsing the PTY with vte into a grid. The vendored
+# Ghostty pins Zig 0.16 exactly: put a 0.16 zig on PATH or point ZIG at one
+# (ZIG=/path/to/zig-0.16 cargo build), or the build stops with "Your Zig
+# version ... does not meet the required build version". It carries no GPUI
+# dependency of its own, so it cannot pin a different gpui: bsh owns the key
+# path and drives the surface directly (see `ui/terminal_view.rs`), because the
+# terminal policy gates a submitted line before the shell sees it.
+#
+# A local copy, not the registry package: its build script looks for clang in
+# Xcode's XcodeDefault.xctoolchain, which a Command-Line-Tools-only machine does
+# not have. vendor/gpui-libghostty/VENDOR.md records the one-line fallback; drop
+# the copy and go back to "=0.3.1" from crates.io once upstream accepts it.
+gpui-libghostty = { path = "../../vendor/gpui-libghostty" }
 regorus = { workspace = true }
-vte = { workspace = true }
-unicode-width = { workspace = true }
 # The edit tool's substring search. memchr is already in the workspace graph
 # through the framework's regex stack, so naming it adds no package; the
 # standard library's str::matches cost about 1us a match on a 4MiB file, and an
@@ -118,9 +130,10 @@ gpui = { package = "gpui-pre", version = "=0.3.10", features = ["test-support"] 
 # A bare `bsh` binary has no bundle, so macOS would draw a generic Dock tile;
 # assets::install_dock_icon hands AppKit the .icns compiled into the binary
 # instead. Versions match what gpui-pre-macos already pulls in, so they unify.
-# The host's own calendar offset, for the message clock. Already in the build
-# through portable-pty, so this adds no crate; a date library would be a
-# dependency bought for one localtime_r call.
+# The host's own calendar offset, for the message clock. libc is already in
+# this crate's build graph (gpui-libghostty's native side and the framework
+# both link it), so this adds no crate; a date library would be a dependency
+# bought for one localtime_r call.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

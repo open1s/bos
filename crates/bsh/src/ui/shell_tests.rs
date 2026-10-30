@@ -14644,9 +14644,9 @@ fn a_workspace_switch_drops_the_file_panes_view(cx: &mut TestAppContext) {
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
 
     // Open the pane and a document in it, so there is something to drop.
-    cx.update(|_, cx| {
+    cx.update(|window, cx| {
         shell.update(cx, |this, cx| {
-            this.open_right_tab(crate::ui::right_panel::RightTab::Files, cx);
+            this.open_right_tab(crate::ui::right_panel::RightTab::Files, window, cx);
         })
     });
     let listed = cx.update(|_, cx| shell.read(cx).files.roots.len());
@@ -17523,101 +17523,6 @@ fn a_line_selection_raises_the_comment_plus(cx: &mut TestAppContext) {
         "pressing it opens the card"
     );
 }
-/// After `exit` the pane must say so, and Enter must bring a shell back.
-#[gpui::test]
-fn the_pane_says_the_shell_exited(cx: &mut TestAppContext) {
-    init_test_app(cx);
-    let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let mut state = state_with_workspace_tree("terminal-exit");
-        tests_pin_reference_defaults(&mut state);
-        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
-        Harness { shell }
-    });
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    cx.update(|window, cx| {
-        shell.update(cx, |this, cx| {
-            this.right.open = true;
-            this.open_right_tab(crate::ui::right_panel::RightTab::Terminal, cx);
-            let _ = &window;
-        });
-    });
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-
-    let running = cx.update(|_, cx| {
-        shell
-            .read(cx)
-            .right
-            .terminal
-            .as_ref()
-            .map(|t| t.is_running())
-    });
-    assert_eq!(running, Some(true), "the shell starts");
-
-    // Type exit the way the pane does, then let the reader see the EOF.
-    cx.update(|_, cx| {
-        shell.update(cx, |this, cx| {
-            if let Some(terminal) = this.right.terminal.as_mut() {
-                for byte in b"exit" {
-                    terminal.send_key(&[*byte]);
-                }
-                terminal.send_key(b"\r");
-            }
-            cx.notify();
-        });
-    });
-    // The pane's terminal clock is what notices a shell that exited: a
-    // sandboxed shell's reader does not see EOF (the pane keeps a slave
-    // description open), so the child is the authority and the clock polls it.
-    // A test that asserts liveness has to drive the same clock.
-    let mut stopped = false;
-    for _ in 0..120 {
-        stopped = cx.update(|_, cx| {
-            shell.update(cx, |this, _| {
-                let Some(terminal) = this.right.terminal.as_mut() else {
-                    return false;
-                };
-                terminal.poll();
-                !terminal.is_running()
-            })
-        });
-        if stopped {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    assert!(stopped, "the shell exited");
-
-    let status = cx.update(|_, cx| shell.read(cx).terminal_status_text());
-    let (text, _) = status.expect("the pane reports it");
-    let hint =
-        cx.update(|_, cx| crate::i18n::tr(shell.read(cx).state.lang, "right.terminal.restartHint"));
-    assert!(
-        text.contains(&hint),
-        "the status tells the reader how to come back: {text}"
-    );
-
-    // Enter on the dead pane starts a new shell.
-    cx.update(|_, cx| {
-        shell.update(cx, |this, cx| {
-            if let Some(terminal) = this.right.terminal.as_mut() {
-                terminal.send_key(b"\r");
-            }
-            cx.notify();
-        });
-    });
-    let again = cx.update(|_, cx| {
-        shell
-            .read(cx)
-            .right
-            .terminal
-            .as_ref()
-            .map(|t| t.is_running())
-    });
-    assert_eq!(again, Some(true), "Enter brings a shell back");
-    let status = cx.update(|_, cx| shell.read(cx).terminal_status_text());
-    assert!(status.is_none(), "and the pane is quiet again: {status:?}");
-}
 /// The review card is the write surface: pressing Comments in the strip raises
 /// it, and its Comment button pins the note at the cursor's line and closes it.
 #[gpui::test]
@@ -18820,9 +18725,9 @@ fn a_folder_can_be_added_as_a_workspace(cx: &mut TestAppContext) {
 
     // The file pane only re-lists while it is the pane on screen, which is the
     // behaviour that keeps a closed panel from walking the filesystem.
-    cx.update(|_, cx| {
+    cx.update(|window, cx| {
         shell.update(cx, |this, cx| {
-            this.open_right_tab(crate::ui::right_panel::RightTab::Files, cx);
+            this.open_right_tab(crate::ui::right_panel::RightTab::Files, window, cx);
         });
     });
     cx.update(|_, cx| {
@@ -19676,9 +19581,9 @@ fn double_clicking_the_blank_tree_adds_a_file(cx: &mut TestAppContext) {
     );
 
     // Go straight to the Files tab the way the card does.
-    cx.update(|_, cx| {
+    cx.update(|window, cx| {
         shell.update(cx, |this, cx| {
-            this.open_right_tab(crate::ui::right_panel::RightTab::Files, cx);
+            this.open_right_tab(crate::ui::right_panel::RightTab::Files, window, cx);
         });
     });
     // With nothing open the tree owns the surface, and its blank area is there
@@ -19798,9 +19703,9 @@ fn opening_a_second_file_adds_a_tab_and_keeps_the_first(cx: &mut TestAppContext)
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
 
-    cx.update(|_, cx| {
+    cx.update(|window, cx| {
         shell.update(cx, |this, cx| {
-            this.open_right_tab(crate::ui::right_panel::RightTab::Files, cx);
+            this.open_right_tab(crate::ui::right_panel::RightTab::Files, window, cx);
         });
     });
     for name in ["README.md", "Cargo.toml"] {
@@ -19885,9 +19790,9 @@ fn an_edit_marks_the_file_dirty_and_save_clears_it(cx: &mut TestAppContext) {
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
 
-    cx.update(|_, cx| {
+    cx.update(|window, cx| {
         shell.update(cx, |this, cx| {
-            this.open_right_tab(crate::ui::right_panel::RightTab::Files, cx);
+            this.open_right_tab(crate::ui::right_panel::RightTab::Files, window, cx);
         });
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -19968,7 +19873,7 @@ fn a_note_pins_to_the_file_and_survives_a_reload(cx: &mut TestAppContext) {
 
     cx.update(|window, cx| {
         shell.update(cx, |this, cx| {
-            this.open_right_tab(crate::ui::right_panel::RightTab::Files, cx);
+            this.open_right_tab(crate::ui::right_panel::RightTab::Files, window, cx);
             this.open_file(std::path::Path::new("README.md"), window, cx);
         });
     });
@@ -20035,11 +19940,13 @@ fn a_note_pins_to_the_file_and_survives_a_reload(cx: &mut TestAppContext) {
     assert!(sidecar.contains("remember to mention the bus"));
 }
 
-/// Opening the Terminal tab starts a real interactive shell and paints its
-/// cell grid. Typing is proven through the screen model, so the assertion does
-/// not depend on a shell round-trip in CI.
+/// Opening the Terminal tab mounts the pane; a window that cannot host a
+/// native surface is reported instead of drawing a blank terminal.
+///
+/// The harness has no platform window, so Ghostty cannot attach. The pane must
+/// say so in its status line, keep no surface, and still paint its frame.
 #[gpui::test]
-fn the_terminal_pane_starts_a_shell_and_paints_its_grid(cx: &mut TestAppContext) {
+fn the_terminal_tab_reports_a_surface_it_cannot_create(cx: &mut TestAppContext) {
     init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_workspace_tree("right-terminal");
@@ -20049,114 +19956,45 @@ fn the_terminal_pane_starts_a_shell_and_paints_its_grid(cx: &mut TestAppContext)
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
 
-    cx.update(|_, cx| {
+    cx.update(|window, cx| {
         shell.update(cx, |this, cx| {
-            this.open_right_tab(crate::ui::right_panel::RightTab::Terminal, cx);
+            this.open_right_tab(crate::ui::right_panel::RightTab::Terminal, window, cx);
         });
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
 
     assert!(
         cx.debug_bounds("terminal-pane").is_some(),
-        "the terminal surface renders"
+        "the tab mounts the pane"
     );
-    assert!(
-        cx.debug_bounds("terminal-status").is_none(),
-        "and a running shell draws no status line"
-    );
-    let (running, refused, spawned) = cx.update(|_, cx| {
+    let (failure, view, status) = cx.update(|_, cx| {
         let shell = shell.read(cx);
-        let terminal = shell.right.terminal.as_ref().expect("the pane spawned one");
         (
-            terminal.is_running(),
-            terminal.refused,
-            shell.right.terminal.is_some(),
+            shell
+                .right
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.failure.clone()),
+            shell.right.terminal_view.is_some(),
+            shell.terminal_status_text(false),
         )
     });
-    assert!(spawned, "opening the tab spawns the terminal");
-    assert!(running, "the default gate starts an interactive shell");
-    assert!(!refused, "and nothing refused it");
-
-    // Bytes into the screen model: the parser paints them, with their colour.
-    cx.update(|_, cx| {
-        shell.update(cx, |this, cx| {
-            let terminal = this.right.terminal.as_ref().expect("the terminal");
-            terminal.feed(b"\x1b[2J\x1b[H\x1b[?25h\x1b[32mok\x1b[0m");
-            this.sync_terminal(cx);
-        });
-    });
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-
-    let snapshot = cx.update(|_, cx| shell.read(cx).terminal_snapshot.clone());
-    let found = snapshot.rows.iter().enumerate().find_map(|(row, cells)| {
-        cells
-            .iter()
-            .position(|cell| cell.ch == 'o' && cell.fg == crate::terminal::Color::Indexed(2))
-            .map(|col| (row, col))
-    });
-    let (row, col) = found.expect("the fed bytes are on the grid, in green");
-    assert_eq!(
-        snapshot.cell(row, col + 1).map(|cell| cell.ch),
-        Some('k'),
-        "the whole word reaches the grid"
-    );
-
-    // The grid is painted, not only laid out: the cursor cell's inverted
-    // block is a solid quad in the theme's text colour inside the pane.
-    let pane = cx
-        .debug_bounds("terminal-pane")
-        .expect("the pane has bounds");
-    let (left, top) = (f32::from(pane.origin.x), f32::from(pane.origin.y));
-    let right = left + f32::from(pane.size.width);
-    let bottom = top + f32::from(pane.size.height);
-    let scale = cx.update(|window, _| window.scale_factor());
-    let painted = cx.update(|window, _| {
-        let text: gpui_kit::Hsla = gpui_kit::rgb(crate::theme::text()).into();
-        window.painted_quads().into_iter().any(|quad| {
-            // Scene quads are in device pixels; the pane's bounds are logical.
-            let x = quad.bounds.origin.x.as_f32() / scale;
-            let y = quad.bounds.origin.y.as_f32() / scale;
-            let inside = x >= left && y >= top && x < right && y < bottom;
-            inside && quad.background.as_solid() == Some(text)
-        })
-    });
+    let failure = failure.expect("the headless window cannot host a native surface");
+    assert!(!view, "so no surface was created");
+    let (text, is_error) = status.expect("the pane says why it is not running");
+    assert!(is_error, "a terminal that cannot run is an error state");
     assert!(
-        painted,
-        "the cursor cell is painted in the foreground colour"
+        text.contains(&failure),
+        "the failure is the reason shown: {text}"
     );
-
-    // The pane measured its own cell grid; the clock hands that size to the
-    // terminal, so a panel resize reaches the PTY without touching paint.
-    let measured = cx
-        .update(|_, cx| shell.read(cx).terminal_frame.get())
-        .expect("the pane measured its grid at prepaint time");
     assert!(
-        measured.cols > 20 && measured.rows > 5,
-        "the pane filled its body rather than collapsing: {measured:?}"
-    );
-    cx.update(|_, cx| {
-        shell.update(cx, |this, cx| this.sync_terminal(cx));
-    });
-    let (size, dims) = cx.update(|_, cx| {
-        let shell = shell.read(cx);
-        let terminal = shell.right.terminal.as_ref().expect("the terminal");
-        let snapshot = shell.terminal_snapshot.clone();
-        (terminal.size(), (snapshot.cols, snapshot.rows.len()))
-    });
-    assert_eq!(
-        dims,
-        (measured.cols as usize, measured.rows as usize),
-        "the measured grid is the one the terminal holds"
-    );
-    assert_eq!(
-        size,
-        Some((measured.cols, measured.rows)),
-        "and the PTY was told the same size"
+        cx.debug_bounds("terminal-status").is_some(),
+        "and the status line is drawn"
     );
 }
 
-/// The gate is the only door: a deny policy leaves the pane with no process
-/// and with the policy's own refusal copy on screen.
+/// A workspace policy that refuses the shell start leaves the pane with no
+/// process and says so; no surface is created either.
 #[gpui::test]
 fn a_deny_policy_refuses_the_terminal(cx: &mut TestAppContext) {
     init_test_app(cx);
@@ -20175,211 +20013,44 @@ fn a_deny_policy_refuses_the_terminal(cx: &mut TestAppContext) {
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
 
-    cx.update(|_, cx| {
+    cx.update(|window, cx| {
         shell.update(cx, |this, cx| {
-            this.open_right_tab(crate::ui::right_panel::RightTab::Terminal, cx);
+            this.open_right_tab(crate::ui::right_panel::RightTab::Terminal, window, cx);
         });
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
 
-    let (refused, running, status, expected) = cx.update(|_, cx| {
+    let (refused, view, status, expected) = cx.update(|_, cx| {
         let shell = shell.read(cx);
         let terminal = shell.right.terminal.as_ref().expect("the terminal exists");
         (
             terminal.refused,
-            terminal.is_running(),
-            shell.terminal_status_text(),
+            shell.right.terminal_view.is_some(),
+            shell.terminal_status_text(false),
             shell.state.lang.tr("right.terminal.refused"),
         )
     });
     assert!(refused, "the workspace policy refused the shell start");
-    assert!(!running, "so no PTY was spawned");
+    assert!(!view, "so no surface was spawned");
     assert_eq!(
         status,
         Some((expected, true)),
         "the pane names the policy refusal"
     );
-    assert!(
-        cx.debug_bounds("terminal-status").is_some(),
-        "and the refusal is drawn in the pane"
-    );
 }
 
-/// A headless terminal, fed by the test, is the deterministic grid the pointer
-/// tests drag over: no shell output can shift a row between the draw and the
-/// drag.
-fn feed_headless_terminal(shell: &Entity<Shell>, cx: &mut VisualTestContext, bytes: &[u8]) {
-    cx.update(|_, cx| {
-        shell.update(cx, |this, cx| {
-            this.right.terminal = Some(crate::terminal::Terminal::without_process(
-                std::path::PathBuf::new(),
-                Lang::En,
-                40,
-                20,
-            ));
-            this.right
-                .terminal
-                .as_ref()
-                .expect("the terminal")
-                .feed(bytes);
-            this.sync_terminal(cx);
-        });
-    });
-}
-
-/// The centre of one cell, in window coordinates.
-fn terminal_cell_point(
-    frame: crate::ui::right_panel::TerminalFrame,
-    row: usize,
-    col: usize,
-) -> gpui_kit::Point<gpui_kit::Pixels> {
-    gpui_kit::point(
-        frame.origin.x + frame.cell_w * (col as f32 + 0.5),
-        frame.origin.y + frame.cell_h * (row as f32 + 0.5),
-    )
-}
-
-/// A drag over the terminal selects the cells it covers and Cmd-C puts them on
-/// the clipboard; a press with no drag clears the selection again.
-#[gpui::test]
-fn a_drag_over_the_terminal_selects_and_copies(cx: &mut TestAppContext) {
-    init_test_app(cx);
-    let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let state = state_with_workspace_tree("right-terminal-select");
-        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
-        Harness { shell }
-    });
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    cx.update(|_, cx| {
-        shell.update(cx, |this, cx| {
-            this.open_right_tab(crate::ui::right_panel::RightTab::Terminal, cx);
-        });
-    });
-    feed_headless_terminal(&shell, cx, b"\x1b[2J\x1b[H\x1b[6;1Hhello world");
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-
-    let frame = cx
-        .update(|_, cx| shell.read(cx).terminal_frame.get())
-        .expect("the pane measured its grid");
-    let start = terminal_cell_point(frame, 5, 0);
-    let end = terminal_cell_point(frame, 5, 4);
-    cx.simulate_mouse_down(start, gpui_kit::MouseButton::Left, Modifiers::default());
-    cx.simulate_mouse_move(end, Some(gpui_kit::MouseButton::Left), Modifiers::default());
-    cx.simulate_mouse_up(end, gpui_kit::MouseButton::Left, Modifiers::default());
-
-    let copied = cx.update(|_, cx| shell.read(cx).terminal_selection_text());
-    assert_eq!(
-        copied.as_deref(),
-        Some("hello"),
-        "the drag selected the word"
-    );
-    // The copy chord, through the pane's own key handler.
-    cx.simulate_keystrokes("cmd-c");
-    let pasted = cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()));
-    assert_eq!(
-        pasted.as_deref(),
-        Some("hello"),
-        "and copying the selection reached the clipboard"
-    );
-
-    // The selected cells are painted with the theme's selected-row
-    // background, not merely remembered.
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-    let pane = cx.debug_bounds("terminal-pane").expect("the pane");
-    let (left, top) = (f32::from(pane.origin.x), f32::from(pane.origin.y));
-    let right = left + f32::from(pane.size.width);
-    let bottom = top + f32::from(pane.size.height);
-    let scale = cx.update(|window, _| window.scale_factor());
-    let selected: gpui_kit::Hsla = gpui_kit::rgb(crate::theme::selected_row()).into();
-    let painted = cx.update(|window, _| {
-        window.painted_quads().into_iter().any(|quad| {
-            let x = quad.bounds.origin.x.as_f32() / scale;
-            let y = quad.bounds.origin.y.as_f32() / scale;
-            let inside = x >= left && y >= top && x < right && y < bottom;
-            inside && quad.background.as_solid() == Some(selected)
-        })
-    });
-    assert!(
-        painted,
-        "the selected cells paint with the selected-row background"
-    );
-
-    // A press without a drag clears the selection.
-    cx.simulate_click(terminal_cell_point(frame, 5, 10), Modifiers::default());
-    let cleared = cx.update(|_, cx| shell.read(cx).right.terminal_selection);
-    assert_eq!(cleared, None, "a click clears the selection");
-    let copied = cx.update(|_, cx| shell.read(cx).terminal_selection_text());
-    assert_eq!(copied, None);
-}
-
-/// The wheel over the pane browses the retained scrollback: 100 lines into a
-/// 10-row grid, five lines back, and the visible top row moves by five.
-#[gpui::test]
-fn the_terminal_wheel_browses_the_scrollback(cx: &mut TestAppContext) {
-    init_test_app(cx);
-    let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let state = state_with_workspace_tree("right-terminal-scroll");
-        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
-        Harness { shell }
-    });
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    cx.update(|_, cx| {
-        shell.update(cx, |this, cx| {
-            this.open_right_tab(crate::ui::right_panel::RightTab::Terminal, cx);
-        });
-    });
-    let mut lines = String::new();
-    for index in 0..100 {
-        lines.push_str(&format!("line-{index:03}\r\n"));
-    }
-    feed_headless_terminal(&shell, cx, lines.as_bytes());
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-
-    let before = cx.update(|_, cx| shell.read(cx).terminal_snapshot.first_row);
-    let pane = cx
-        .debug_bounds("terminal-pane")
-        .expect("the pane has bounds");
-    cx.simulate_mouse_move(pane.center(), None, Modifiers::default());
-    cx.simulate_event(gpui_kit::ScrollEvent {
-        position: pane.center(),
-        delta: gpui_kit::ScrollDelta::Lines(gpui_kit::point(0.0, 5.0)),
-        modifiers: Modifiers::default(),
-        touch_phase: gpui_kit::TouchPhase::Moved,
-        source: gpui_kit::ScrollSource::Pointer,
-    });
-    let after = cx.update(|_, cx| shell.read(cx).terminal_snapshot.first_row);
-    assert_eq!(
-        after,
-        before - 5,
-        "the wheel moved the visible top row up five rows"
-    );
-
-    // And back down returns to the bottom, where the cursor lives again.
-    cx.simulate_event(gpui_kit::ScrollEvent {
-        position: pane.center(),
-        delta: gpui_kit::ScrollDelta::Lines(gpui_kit::point(0.0, -5.0)),
-        modifiers: Modifiers::default(),
-        touch_phase: gpui_kit::TouchPhase::Moved,
-        source: gpui_kit::ScrollSource::Pointer,
-    });
-    let bottom = cx.update(|_, cx| shell.read(cx).terminal_snapshot.first_row);
-    assert_eq!(bottom, before, "the wheel down came back to the bottom");
-}
-
-/// The input gate's refusal is surfaced in the pane, not only in the gate: the
-/// status line names the refused line.
+/// A refused line is recorded by the gate and named in the status line, which
+/// is the pane's half of the input gate; no surface is needed for it.
 #[gpui::test]
 fn a_refused_input_surfaces_in_the_terminal_status(cx: &mut TestAppContext) {
     init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let state = state_with_workspace_tree("right-terminal-input-deny");
+        let state = state_with_workspace_tree("right-terminal-input");
         let root = state.workspace_root().expect("the scratch workspace root");
         let _ = std::fs::create_dir_all(root.join(".bsh"));
         std::fs::write(
             root.join(".bsh").join("terminal-policy.rego"),
-            "package terminal\n\nallow := false if { input.action == \"input\" }\n",
+            "package terminal\n\ndecision := {\"allow\": false, \"reason\": \"no rm here\"} if {\n    input.action == \"input\"\n    contains(input.command, \"rm -rf\")\n}\n",
         )
         .expect("the policy file");
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -20387,9 +20058,10 @@ fn a_refused_input_surfaces_in_the_terminal_status(cx: &mut TestAppContext) {
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    cx.update(|_, cx| {
+
+    cx.update(|window, cx| {
         shell.update(cx, |this, cx| {
-            this.open_right_tab(crate::ui::right_panel::RightTab::Terminal, cx);
+            this.open_right_tab(crate::ui::right_panel::RightTab::Terminal, window, cx);
         });
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -20397,11 +20069,9 @@ fn a_refused_input_surfaces_in_the_terminal_status(cx: &mut TestAppContext) {
     let (outcome, status) = cx.update(|_, cx| {
         shell.update(cx, |this, _cx| {
             let terminal = this.right.terminal.as_mut().expect("the terminal");
-            for byte in b"rm -rf /" {
-                terminal.send_key(&[*byte]);
-            }
-            let outcome = terminal.send_key(b"\r");
-            (outcome, this.terminal_status_text())
+            terminal.track(crate::terminal::Edit::Text(String::from("rm -rf /")));
+            let outcome = terminal.submit(&mut |_| true);
+            (outcome, this.terminal_status_text(false))
         })
     });
     assert_eq!(outcome, crate::terminal::KeyOutcome::Refused);
@@ -20410,6 +20080,10 @@ fn a_refused_input_surfaces_in_the_terminal_status(cx: &mut TestAppContext) {
     assert!(
         text.contains("rm -rf /"),
         "the refused line is named: {text}"
+    );
+    assert!(
+        text.contains("no rm here"),
+        "and the policy's reason: {text}"
     );
     cx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(
@@ -25484,9 +25158,9 @@ fn the_folded_shell_reserves_the_traffic_lights_for_the_maximised_panel(cx: &mut
 
     // The state the screenshot showed: no sidebar, and the panel asking for the
     // whole row, which squeezes the main column to nothing.
-    cx.update(|_, cx| {
+    cx.update(|window, cx| {
         shell.update(cx, |this, cx| {
-            this.open_right_tab(RightTab::Files, cx);
+            this.open_right_tab(RightTab::Files, window, cx);
             this.right.maximized = true;
             cx.notify();
         })
@@ -25656,7 +25330,7 @@ fn the_folded_shell_reserves_the_traffic_lights_for_the_maximised_panel(cx: &mut
 
     // Fold the panel: the corner returns to the main column, so neither the
     // strip nor an inert gap may survive it.
-    cx.update(|_, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Files, cx)));
+    cx.update(|window, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Files, window, cx)));
     draw_until(cx, "the Files pane is back", DRAW_UNTIL_MAX, |cx| {
         cx.debug_bounds("right-tab").is_some()
     });
@@ -25707,7 +25381,7 @@ fn the_open_shell_keeps_the_panel_tab_strip_where_it_was(cx: &mut TestAppContext
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    cx.update(|_, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Files, cx)));
+    cx.update(|window, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Files, window, cx)));
     draw_until(cx, "the Files tab renders", DRAW_UNTIL_MAX, |cx| {
         cx.debug_bounds("right-tab").is_some()
     });
@@ -25917,7 +25591,7 @@ fn the_browser_pane_renders_loading_and_the_loaded_page(cx: &mut TestAppContext)
             cx.notify();
         })
     });
-    cx.update(|_, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, cx)));
+    cx.update(|window, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, window, cx)));
     cx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(
         cx.debug_bounds("browser-state-empty").is_some(),
@@ -25982,7 +25656,7 @@ fn a_policy_refused_navigation_is_still_attempted(cx: &mut TestAppContext) {
             cx.notify();
         })
     });
-    cx.update(|_, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, cx)));
+    cx.update(|window, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, window, cx)));
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let url = site.url();
     cx.update(|_, cx| shell.update(cx, |this, cx| this.browser_go(url, cx)));
@@ -26028,7 +25702,7 @@ fn switching_tabs_keeps_the_browser_in_its_own_pane(cx: &mut TestAppContext) {
             cx.notify();
         })
     });
-    cx.update(|_, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, cx)));
+    cx.update(|window, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, window, cx)));
     let url = site.url();
     cx.update(|_, cx| shell.update(cx, |this, cx| this.browser_go(url, cx)));
     assert_eq!(
@@ -26040,7 +25714,7 @@ fn switching_tabs_keeps_the_browser_in_its_own_pane(cx: &mut TestAppContext) {
     assert!(cx.debug_bounds("browser-pane").is_some());
 
     // The Files pane takes the body: the browser's controls must go with it.
-    cx.update(|_, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Files, cx)));
+    cx.update(|window, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Files, window, cx)));
     cx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(
         cx.debug_bounds("browser-pane").is_none(),
@@ -26057,7 +25731,7 @@ fn switching_tabs_keeps_the_browser_in_its_own_pane(cx: &mut TestAppContext) {
 
     // Coming back finds the same page: the browser is shell state, not a
     // per-tab scratch buffer.
-    cx.update(|_, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, cx)));
+    cx.update(|window, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, window, cx)));
     cx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(cx.debug_bounds("browser-pane").is_some());
     let view = cx
@@ -26246,7 +25920,7 @@ fn typing_a_url_and_pressing_enter_opens_the_page(cx: &mut TestAppContext) {
             cx.notify();
         })
     });
-    cx.update(|_, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, cx)));
+    cx.update(|window, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, window, cx)));
     cx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(
         cx.debug_bounds("browser-address").is_some(),
@@ -27073,12 +26747,12 @@ fn the_master_sandbox_switch_asks_before_it_releases_heel(cx: &mut TestAppContex
     // The permission menu deliberately does not: its rows are the label and a
     // short qualifier, and the sandbox already has the Settings switch row, the
     // terminal line and each call's audit.
-    cx.update(|_, cx| {
+    cx.update(|window, cx| {
         shell.update(cx, |this, cx| {
-            this.open_right_tab(crate::ui::right_panel::RightTab::Terminal, cx);
+            this.open_right_tab(crate::ui::right_panel::RightTab::Terminal, window, cx);
         })
     });
-    let status = cx.update(|_, cx| shell.read(cx).terminal_status_text());
+    let status = cx.update(|_, cx| shell.read(cx).terminal_status_text(false));
     let (text, _) = status.expect("the pane reports the standing fact");
     assert!(
         text.contains(&crate::i18n::tr(
@@ -27534,10 +27208,10 @@ fn a_flipped_sandbox_reaches_a_new_terminal_but_not_the_open_one(cx: &mut TestAp
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    cx.update(|_window, cx| {
+    cx.update(|window, cx| {
         shell.update(cx, |this, cx| {
             this.right.open = true;
-            this.open_right_tab(RightTab::Terminal, cx);
+            this.open_right_tab(RightTab::Terminal, window, cx);
         });
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -27576,7 +27250,7 @@ fn a_flipped_sandbox_reaches_a_new_terminal_but_not_the_open_one(cx: &mut TestAp
                 .as_ref()
                 .expect("the first terminal")
                 .sandbox_off,
-            shell.terminal_status_text(),
+            shell.terminal_status_text(false),
         )
     });
     assert_eq!(
@@ -27590,10 +27264,10 @@ fn a_flipped_sandbox_reaches_a_new_terminal_but_not_the_open_one(cx: &mut TestAp
     );
 
     // A NEW terminal resolves the flipped setting and is unconfined.
-    cx.update(|_window, cx| {
+    cx.update(|window, cx| {
         shell.update(cx, |this, cx| {
             this.right.terminal = None;
-            this.open_right_tab(RightTab::Terminal, cx);
+            this.open_right_tab(RightTab::Terminal, window, cx);
         });
     });
     let second = cx.update(|_, cx| {
@@ -27633,10 +27307,10 @@ fn a_permission_change_keeps_an_open_terminal_on_its_spawn_spec(cx: &mut TestApp
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    cx.update(|_window, cx| {
+    cx.update(|window, cx| {
         shell.update(cx, |this, cx| {
             this.right.open = true;
-            this.open_right_tab(RightTab::Terminal, cx);
+            this.open_right_tab(RightTab::Terminal, window, cx);
         });
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -27650,7 +27324,7 @@ fn a_permission_change_keeps_an_open_terminal_on_its_spawn_spec(cx: &mut TestApp
             .expect("the terminal")
             .sandbox_label()
             .map(str::to_string);
-        let status = shell.read(cx).terminal_status_text().map(|(text, _)| text);
+        let status = shell.read(cx).terminal_status_text(false).map(|(text, _)| text);
         (terminal, status)
     });
     assert!(
@@ -27675,7 +27349,7 @@ fn a_permission_change_keeps_an_open_terminal_on_its_spawn_spec(cx: &mut TestApp
         let terminal = shell.right.terminal.as_ref().expect("the terminal");
         (
             terminal.sandbox_label().map(str::to_string),
-            shell.terminal_status_text().map(|(text, _)| text),
+            shell.terminal_status_text(false).map(|(text, _)| text),
         )
     });
     assert_eq!(
@@ -28637,7 +28311,7 @@ fn a_double_click_and_a_right_click_reach_the_live_page(cx: &mut TestAppContext)
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    cx.update(|_, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, cx)));
+    cx.update(|window, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, window, cx)));
     let url = format!("http://{addr}/");
     cx.update(|_, cx| shell.update(cx, |this, cx| this.browser_go(url.clone(), cx)));
 
@@ -28848,7 +28522,7 @@ fn a_drag_over_the_live_page_selects_the_text(cx: &mut TestAppContext) {
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    cx.update(|_, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, cx)));
+    cx.update(|window, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, window, cx)));
     let url = format!("http://{addr}/");
     cx.update(|_, cx| shell.update(cx, |this, cx| this.browser_go(url.clone(), cx)));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -29046,7 +28720,7 @@ fn typing_into_a_live_page_field_keeps_every_character(cx: &mut TestAppContext) 
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    cx.update(|_, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, cx)));
+    cx.update(|window, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, window, cx)));
     let url = format!("http://{addr}/");
     cx.update(|_, cx| shell.update(cx, |this, cx| this.browser_go(url.clone(), cx)));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -29215,7 +28889,7 @@ fn tab_walks_the_page_focus_order_both_ways(cx: &mut TestAppContext) {
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    cx.update(|_, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, cx)));
+    cx.update(|window, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, window, cx)));
     let url = format!("http://{addr}/");
     cx.update(|_, cx| shell.update(cx, |this, cx| this.browser_go(url.clone(), cx)));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -29376,7 +29050,7 @@ fn an_ime_commit_inserts_its_string_once_without_a_keydown(cx: &mut TestAppConte
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    cx.update(|_, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, cx)));
+    cx.update(|window, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, window, cx)));
     let url = format!("http://{addr}/");
     cx.update(|_, cx| shell.update(cx, |this, cx| this.browser_go(url.clone(), cx)));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -29508,7 +29182,7 @@ fn a_shift_click_reaches_the_page_as_shift_key(cx: &mut TestAppContext) {
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    cx.update(|_, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, cx)));
+    cx.update(|window, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, window, cx)));
     let url = format!("http://{addr}/");
     cx.update(|_, cx| shell.update(cx, |this, cx| this.browser_go(url.clone(), cx)));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -29651,7 +29325,7 @@ fn enter_in_the_address_bar_starts_a_navigation(cx: &mut TestAppContext) {
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    cx.update(|_, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, cx)));
+    cx.update(|window, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, window, cx)));
     // The reader's route: CLICK into the field (which is what focuses it in
     // the app), then press Enter. `set_value` stands in for typing, which other
     // tests already cover.

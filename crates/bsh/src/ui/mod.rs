@@ -29,6 +29,7 @@ pub(crate) mod shell;
 mod shell_tests;
 pub(crate) mod sidebar;
 pub(crate) mod statusbar;
+pub(crate) mod terminal_view;
 pub(crate) mod todo_panel;
 pub(crate) mod trajectory;
 pub(crate) mod transcript;
@@ -296,7 +297,7 @@ pub(crate) fn run(startup: Startup) {
                         // The deep link lands on the pane it names, with the
                         // same navigation a press of Go performs.
                         shell.update(cx, |shell, cx| {
-                            shell.open_right_tab(right_panel::RightTab::Browser, cx);
+                            shell.open_right_tab(right_panel::RightTab::Browser, window, cx);
                             shell.browser_go(url, cx);
                         });
                     }

@@ -326,7 +326,7 @@ const TERMINAL_HEADER: &str = r#"# =============================================
 #                         applies: nothing is refused.
 #   a file that parses    decides. It can only NARROW, because the shipped
 #                         allow-all baseline stays underneath it.
-#   a file that does      closes ALL THREE gates - start, input and output. An
+#   a file that does      closes BOTH gates - start and input. An
 #   NOT parse             unusable rule must never widen the gate it was meant
 #                         to narrow: on the first load the pane reports the
 #                         refusal and spawns nothing. A broken RELOAD keeps the
@@ -334,13 +334,13 @@ const TERMINAL_HEADER: &str = r#"# =============================================
 #                         in the audit ring and the status line; deleting the
 #                         file restores the allow-all default.
 #
-# This gate is the INTERACTIVE PANE's: the shell it spawns, the line a reader
-# submits, and the chunk read back from the PTY. It is NOT the workspace tool
+# This gate is the INTERACTIVE PANE's: the shell it spawns and the line a
+# reader submits. It is NOT the workspace tool
 # policy - .bsh/policy.rego, whose template is policy.rego.tpl beside this file,
 # gates TOOL CALLS (read, write, egress, spawn, capability). The two are
 # separate seams answering different questions, and neither widens the other.
 #
-# The body below documents the exact input and answer shapes and carries three
+# The body below documents the exact input and answer shapes and carries two
 # worked examples behind one switch.
 # =============================================================================
 
@@ -761,8 +761,8 @@ mod tests {
         // The loader's package: the gate evaluates data.terminal.verdict.
         assert!(text.contains("package terminal"), "the loader's package");
 
-        // The three decisions, by the field the gate actually sends.
-        for action in ["start", "input", "output"] {
+        // The two decisions, by the field the gate actually sends.
+        for action in ["start", "input"] {
             assert!(
                 text.contains(&format!("input.action == \"{action}\"")),
                 "the template no longer names the {action} action"
@@ -773,24 +773,28 @@ mod tests {
             "\"command\": <shell path>",
             "\"shell\": <shell path>",
             "\"cwd\": <workspace>",
-            "\"text\": <one chunk read from the PTY>",
             "\"deny\": false",
         ] {
             assert!(text.contains(shape), "the {shape} field is undocumented");
         }
-        // The answer shapes: a boolean, or {allow, reason, redact}.
+        // The answer shapes: a boolean, or {allow, reason}.
         assert!(text.contains("Answer with a BOOLEAN"));
         assert!(text.contains("{\"allow\": true}"));
         assert!(text.contains("{\"allow\": false, \"reason\": "));
-        assert!(text.contains("\"redact\":"));
+        // The retired output point is named as retired, so a policy author is
+        // not left believing an output rule is enforced.
+        assert!(
+            text.contains("Rules that mention action \"output\" are accepted and ignored"),
+            "the template must say output rules are inert"
+        );
 
         // The three facts the header must carry.
         assert!(text.contains("TEMPLATE (not enforced)"));
         assert!(text.contains("bsh reads .bsh/terminal-policy.rego, NOT this file"));
         assert!(text.contains("The file is TRI-STATE"));
         assert!(
-            text.contains("closes ALL THREE gates"),
-            "a broken file closes every gate"
+            text.contains("closes BOTH gates"),
+            "a broken file closes both gates"
         );
         assert!(
             text.contains("LAST GOOD policy"),
@@ -885,16 +889,10 @@ mod tests {
             inert.input("rm -rf build", &root).allowed(),
             "an empty command list refuses no line"
         );
-        assert!(
-            inert.output("AKIAIOSFODNN7EXAMPLE").redaction().is_none(),
-            "an empty pattern list redacts nothing"
-        );
-
-        // One value per list: all three examples fire.
+        // One value per list: both examples fire.
         let active = template
             .replace("examples := false", "examples := true")
             .replace("    # \"rm -rf\",", "    \"rm -rf\",")
-            .replace("    # `AKIA[0-9A-Z]{16}`,", "    `AKIA[0-9A-Z]{16}`,")
             .replace("    # \"/bin/bash\",", "    \"/bin/bash\",");
         assert_ne!(active, template, "an example anchor moved");
         std::fs::write(bsh.join("terminal-policy.rego"), &active).expect("the live examples");
@@ -918,18 +916,6 @@ mod tests {
             Some("this shell is not used in this workspace")
         );
         assert!(gate.start(Path::new("/bin/zsh"), &root).allowed());
-
-        let redacted = gate.output("token AKIAIOSFODNN7EXAMPLE");
-        assert!(
-            redacted.allowed(),
-            "a redaction still lets the chunk through"
-        );
-        assert_eq!(
-            redacted.redaction(),
-            Some("[redacted]"),
-            "the matched secret is replaced, not dropped"
-        );
-        assert_eq!(gate.output("nothing secret").redaction(), None);
     }
 
     /// The terminal loader reads the exact enforced name: the .tpl beside it is

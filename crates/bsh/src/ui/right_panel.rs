@@ -1,5 +1,5 @@
-//! The right panel: Workspace Files, and the frame the terminal and browser
-//! panes will hang off.
+//! The right panel: Workspace Files, the managed terminal, the diff surface
+//! and the browser, behind one tab strip.
 //!
 //! The panel is the reference's own right column: a tab strip that carries one
 //! chip per open pane, a header of controls on its right edge, and either the
@@ -34,6 +34,8 @@ use crate::browser::engine::cdp::PointerButton;
 use crate::files::{self, Kind};
 use crate::model::Role;
 use crate::terminal::KeyOutcome;
+use super::terminal_view::TerminalView;
+use gpui_libghostty::TerminalOptions;
 use crate::theme;
 
 // Save the file the panel is showing, bound to cmd-s.
@@ -142,103 +144,54 @@ fn io_msg(error: &std::io::Error) -> String {
     error.to_string()
 }
 
-/// The terminal pane's measured geometry for one frame.
+/// The editing meaning of one keystroke, for the input gate's mirror.
 ///
-/// The prepaint pass records it, the terminal clock hands its grid to the PTY,
-/// and the mouse handlers turn a pointer position into the cell under it.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct TerminalFrame {
-    /// The grid's top-left corner on the window, in logical pixels.
-    pub(crate) origin: Point<Pixels>,
-    /// One cell's width.
-    pub(crate) cell_w: Pixels,
-    /// One cell's height.
-    pub(crate) cell_h: Pixels,
-    /// The grid this frame measured.
-    pub(crate) cols: u16,
-    /// The rows this frame measured.
-    pub(crate) rows: u16,
-    /// The size the grid was measured at.
-    pub(crate) font_size: f32,
-}
-
-/// The bytes a keystroke sends to a real terminal.
-///
-/// Printable characters go as their UTF-8, Enter as a carriage return (which
-/// is what a terminal's line discipline expects), and the editing and arrow
-/// keys as the CSI sequences xterm defines. A cmd chord is deliberately not
-/// translated: on macOS it belongs to the application, not to the shell.
-fn terminal_key_bytes(keystroke: &Keystroke) -> Option<Vec<u8>> {
+/// Only what changes the line the reader is typing is mirrored: printable text,
+/// Backspace, and the line editor's kill chords. Arrows, history recall and
+/// completion are deliberately absent - they are not gated, and what they do to
+/// the line is the shell's business, not the policy's.
+fn terminal_edit(keystroke: &Keystroke) -> Option<crate::terminal::Edit> {
+    use crate::terminal::Edit;
     if keystroke.modifiers.platform {
         return None;
     }
-    let control = keystroke.modifiers.control;
-    let alt = keystroke.modifiers.alt;
     let key = keystroke.key.as_str();
-    if control && key == "space" {
-        return Some(vec![0x00]);
+    if keystroke.modifiers.control {
+        return match key {
+            "u" | "c" => Some(Edit::KillLine),
+            "w" | "backspace" => Some(Edit::KillWord),
+            _ => None,
+        };
     }
-    let mut bytes: Vec<u8> = match key {
-        "enter" => b"\r".to_vec(),
-        "backspace" => vec![0x7f],
-        "tab" => b"\t".to_vec(),
-        "escape" => vec![0x1b],
-        "up" => b"\x1b[A".to_vec(),
-        "down" => b"\x1b[B".to_vec(),
-        "right" => b"\x1b[C".to_vec(),
-        "left" => b"\x1b[D".to_vec(),
-        "home" => b"\x1b[H".to_vec(),
-        "end" => b"\x1b[F".to_vec(),
-        "pageup" => b"\x1b[5~".to_vec(),
-        "pagedown" => b"\x1b[6~".to_vec(),
-        "insert" => b"\x1b[2~".to_vec(),
-        "delete" => b"\x1b[3~".to_vec(),
+    match key {
+        "backspace" => Some(Edit::Backspace),
+        // Enter is the submit itself, and the other editing keys move the
+        // cursor rather than the line.
+        "enter" | "tab" | "escape" | "up" | "down" | "left" | "right" | "home" | "end"
+        | "pageup" | "pagedown" | "insert" | "delete" => None,
+        "space" => Some(Edit::Text(String::from(" "))),
         _ => {
-            if control {
-                let upper = key.to_ascii_uppercase();
-                let first = upper.as_bytes().first().copied()?;
-                let byte = if upper.len() == 1 && first.is_ascii_uppercase() {
-                    first & 0x1f
-                } else {
-                    match upper.as_str() {
-                        "@" => 0x00,
-                        "2" => 0x00,
-                        "3" => 0x1b,
-                        "4" => 0x1c,
-                        "5" => 0x1d,
-                        "6" => 0x1e,
-                        "7" => 0x1f,
-                        "/" => 0x1f,
-                        _ => return None,
-                    }
-                };
-                vec![byte]
-            } else {
-                let text = keystroke.key_char.as_deref().unwrap_or(key);
-                let mut chars = text.chars();
-                let ch = chars.next()?;
-                if chars.next().is_some() {
-                    return None;
-                }
-                let mut buffer = [0u8; 4];
-                ch.encode_utf8(&mut buffer).as_bytes().to_vec()
-            }
+            let text = keystroke.key_char.as_deref()?;
+            // A composition or a dead key can deliver more than one character;
+            // a control character is not text the line editor adds.
+            let printable = text
+                .chars()
+                .all(|ch| !ch.is_control() && ch != '\n' && ch != '\r');
+            printable.then(|| Edit::Text(text.to_string()))
         }
-    };
-    if alt && key != "escape" {
-        bytes.insert(0, 0x1b);
     }
-    Some(bytes)
 }
 
-/// Whether a keystroke asks for the terminal's selection on the clipboard.
+/// Whether a keystroke is the Enter the input gate decides.
 ///
-/// Both spellings a terminal user reaches for work: Cmd-C on macOS and
-/// Ctrl-Shift-C where Control is the modifier that owns the clipboard.
-fn terminal_copy_shortcut(keystroke: &Keystroke) -> bool {
-    let key = keystroke.key.as_str();
-    (keystroke.modifiers.platform && key == "c")
-        || (keystroke.modifiers.control && keystroke.modifiers.shift && key == "c")
+/// A chord with the platform modifier belongs to the application, so it is not
+/// the shell's Enter; a Ctrl or Alt Enter is a different key for a terminal
+/// program, not a line submit.
+fn terminal_is_enter(keystroke: &Keystroke) -> bool {
+    keystroke.key == "enter"
+        && !keystroke.modifiers.platform
+        && !keystroke.modifiers.control
+        && !keystroke.modifiers.alt
 }
 
 impl gpui::EntityInputHandler for Shell {
@@ -325,8 +278,15 @@ impl gpui::EntityInputHandler for Shell {
             cx.notify();
             return;
         }
+        // A committed composition is text, never a line submit: an IME does not
+        // press Enter, so the gate is not asked here, and a newline a commit
+        // happens to carry is dropped rather than run un-gated.
+        let text = text.replace(['\r', '\n'], "");
         if let Some(terminal) = self.right.terminal.as_mut() {
-            terminal.send_key(text.as_bytes());
+            terminal.track(crate::terminal::Edit::Text(text.clone()));
+        }
+        if let Some(view) = self.right.terminal_view.clone() {
+            view.update(cx, |view, _| view.commit_text(&text));
         }
         cx.notify();
     }
@@ -361,169 +321,13 @@ impl gpui::EntityInputHandler for Shell {
     }
 }
 
-/// Paint one snapshot of the terminal grid into the pane's bounds.
-///
-/// Each row is shaped as one line with a run per style span, so the cursor's
-/// inverse cell and every coloured span cost one shape call for the row rather
-/// than one per cell. The block cursor is a plain cell in the grid - painted,
-/// not blinked - so no clock owns it.
-fn paint_terminal_grid(
-    bounds: Bounds<Pixels>,
-    frame: &TerminalFrame,
-    snapshot: &crate::terminal::Snapshot,
-    selection: Option<crate::terminal::Selection>,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    window.paint_quad(fill(bounds, rgb(theme::page())));
-    let default_fg: Hsla = rgb(theme::text()).into();
-    let default_bg: Hsla = rgb(theme::page()).into();
-    let selected_bg: Hsla = rgb(theme::selected_row()).into();
-    // The four faces a run can be shaped in, built once per paint: a grid is
-    // mostly monochrome text, but a single styled cell used to rebuild the Font
-    // (and its family string) for every run it opened.
-    let fonts = grid_fonts();
-    for (row_index, cells) in snapshot.rows.iter().enumerate() {
-        let document_row = snapshot.first_row + row_index as u64;
-        let mut text = String::with_capacity(cells.len());
-        let mut runs: Vec<TextRun> = Vec::new();
-        let mut style: Option<(Hsla, Hsla, bool, bool, bool, bool)> = None;
-        for (col, cell) in cells.iter().take(snapshot.cols).enumerate() {
-            // The trailing half of a double-width glyph is covered by that
-            // glyph's own advance; it must never paint a second character.
-            if cell.is_continuation() {
-                continue;
-            }
-            let mut fg = terminal_color(cell.fg, default_fg);
-            let mut bg = terminal_color(cell.bg, default_bg);
-            if cell.inverse() {
-                std::mem::swap(&mut fg, &mut bg);
-            }
-            if snapshot.cursor == Some((row_index, col)) {
-                fg = default_bg;
-                bg = default_fg;
-            } else if selection.is_some_and(|selection| selection.contains(document_row, col)) {
-                bg = selected_bg;
-            }
-            if cell.dim() {
-                fg.a *= 0.6;
-            }
-            cell.push_text(&mut text);
-            let len = cell.text_len();
-            let key = (
-                fg,
-                bg,
-                cell.bold(),
-                cell.italic(),
-                cell.underline(),
-                cell.strike(),
-            );
-            if style == Some(key) {
-                if let Some(run) = runs.last_mut() {
-                    run.len += len;
-                }
-            } else {
-                let font = fonts[(cell.bold() as usize) | ((cell.italic() as usize) << 1)].clone();
-                runs.push(TextRun {
-                    len,
-                    font,
-                    color: fg,
-                    background_color: Some(bg),
-                    underline: cell.underline().then_some(UnderlineStyle {
-                        color: Some(fg),
-                        thickness: px(1.0),
-                        wavy: false,
-                    }),
-                    strikethrough: cell.strike().then_some(StrikethroughStyle {
-                        color: Some(fg),
-                        thickness: px(1.0),
-                    }),
-                });
-                style = Some(key);
-            }
-        }
-        if text.is_empty() {
-            continue;
-        }
-        let origin = point(
-            bounds.origin.x,
-            bounds.origin.y + frame.cell_h * row_index as f32,
-        );
-        let line = window
-            .text_system()
-            .shape_line(text.into(), px(frame.font_size), &runs, None);
-        let _ = line.paint_background(origin, frame.cell_h, TextAlign::Left, None, window, cx);
-        let _ = line.paint(origin, frame.cell_h, TextAlign::Left, None, window, cx);
-    }
-}
-
-/// The four monospace faces a grid run can carry, indexed by
-/// `bold | italic << 1`.
-///
-/// Measured once per paint rather than once per run: a Font owns its family
-/// string, and a line of tinted text opens a run per style change.
-fn grid_fonts() -> [Font; 4] {
-    let face = |weight: FontWeight, style: FontStyle| Font {
-        family: "monospace".into(),
-        weight,
-        style,
-        ..Default::default()
-    };
-    [
-        face(FontWeight::NORMAL, FontStyle::Normal),
-        face(FontWeight::BOLD, FontStyle::Normal),
-        face(FontWeight::NORMAL, FontStyle::Italic),
-        face(FontWeight::BOLD, FontStyle::Italic),
-    ]
-}
-
-/// Resolve a cell colour against the theme's default for that slot.
-fn terminal_color(color: crate::terminal::Color, fallback: Hsla) -> Hsla {
-    use crate::terminal::Color;
-    match color {
-        Color::Default => fallback,
-        Color::Indexed(index) => rgb(indexed_color(index)).into(),
-        Color::Rgb(red, green, blue) => {
-            let hex = ((red as u32) << 16) | ((green as u32) << 8) | blue as u32;
-            rgb(hex).into()
-        }
-    }
-}
-
-/// The xterm 256-colour palette as 0xRRGGBB.
-///
-/// The first sixteen are xterm's own ANSI values, 16..=231 are the 6x6x6 cube
-/// and 232..=255 the grey ramp. A shell's default colours come from the theme
-/// instead, so this table is only what a program asked for by number.
-fn indexed_color(index: u8) -> u32 {
-    const ANSI: [u32; 16] = [
-        0x000000, 0xcd0000, 0x00cd00, 0xcdcd00, 0x0000ee, 0xcd00cd, 0x00cdcd, 0xe5e5e5, 0x7f7f7f,
-        0xff0000, 0x00ff00, 0xffff00, 0x5c5cff, 0xff00ff, 0x00ffff, 0xffffff,
-    ];
-    match index {
-        0..=15 => ANSI[index as usize],
-        16..=231 => {
-            let value = (index - 16) as u32;
-            let steps = [0u32, 95, 135, 175, 215, 255];
-            let red = steps[(value / 36) as usize];
-            let green = steps[((value % 36) / 6) as usize];
-            let blue = steps[(value % 6) as usize];
-            (red << 16) | (green << 8) | blue
-        }
-        _ => {
-            let grey = 8 + (index - 232) as u32 * 10;
-            (grey << 16) | (grey << 8) | grey
-        }
-    }
-}
-
 /// Which pane the right panel is showing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum RightTab {
     /// The workspace file browser and editor.
     Files,
-    /// The managed terminal: a real interactive shell on a persistent PTY,
-    /// drawn from its own cell grid.
+    /// The managed terminal: a real interactive shell on its own PTY, parsed
+    /// and drawn by libghostty.
     Terminal,
     /// The comparison surface: a patch, a conflicted file, or a file on its
     /// own, drawn in unified or split. It is the one pane whose VIEW the reader
@@ -592,10 +396,12 @@ pub(crate) struct RightPanel {
     pub(crate) drag: Option<SideDrag>,
     /// The managed terminal, spawned when the Terminal tab is first opened.
     pub(crate) terminal: Option<crate::terminal::Terminal>,
-    /// The terminal's text selection, in the grid's document coordinates.
-    pub(crate) terminal_selection: Option<crate::terminal::Selection>,
-    /// The cell a terminal press started on, while a drag is in flight.
-    pub(crate) terminal_anchor: Option<(u64, usize)>,
+    /// The native libghostty surface the terminal pane draws, created with
+    /// the terminal and dropped with it.
+    pub(crate) terminal_view: Option<Entity<super::terminal_view::TerminalView>>,
+    /// The focus subscriptions that tell the surface whether the pane owns the
+    /// keyboard; replaced when the surface is replaced.
+    pub(crate) terminal_view_subs: Vec<Subscription>,
     /// The comparison surface's own state: what it is showing, and how.
     pub(crate) diff: super::diff_pane::DiffView,
 }
@@ -1059,7 +865,7 @@ impl Shell {
             .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
             .child(icon(tab.glyph(), 14.0, theme::muted()))
             .on_click(cx.listener(move |this, _event, window, cx| {
-                this.open_right_tab(tab, cx);
+                this.open_right_tab(tab, window, cx);
                 // A terminal is a text surface: opening it puts the cursor
                 // where the reader's next keystroke will land.
                 if tab == RightTab::Terminal {
@@ -1184,6 +990,7 @@ impl Shell {
             .on_click(cx.listener(|this, _event, _window, cx| {
                 this.right.open = false;
                 this.browser_pane_closed();
+                this.hide_terminal_view(cx);
                 cx.notify();
             }))
     }
@@ -1645,34 +1452,22 @@ impl Shell {
         row
     }
 
-    /// The managed terminal's surface: one full-bleed cell grid painted from
-    /// the shell's own screen.
+    /// The terminal pane: libghostty's own surface, drawn by Ghostty.
     ///
-    /// The shell is an interactive process on a persistent PTY, so its prompt,
-    /// its colours, its line editor and its history are the ones on screen:
-    /// bsh draws no prompt of its own and has no separate input line. Typing is
-    /// captured by this pane and written to the PTY as raw bytes, and the
-    /// parser above turns the shell's answer into the cells painted here.
-    ///
-    /// The pane's cell metrics are measured at prepaint time into
-    /// terminal_frame, so the terminal clock can resize the PTY from what the
-    /// pane actually occupies rather than from a constant, and the pointer
-    /// handlers can turn a drag position into the cell under it.
+    /// The pane keeps the key path because the policy gates a submitted line
+    /// before the shell sees it; everything else - the grid, the cursor, the
+    /// scrollback, selection and mouse reporting - belongs to Ghostty.
     fn terminal_pane(&self, cx: &mut Context<Self>) -> AnyElement {
         if self.right.terminal.is_none() {
             return self
                 .right_pane_placeholder(RightTab::Terminal)
                 .into_any_element();
         }
-        let snapshot = std::rc::Rc::clone(&self.terminal_snapshot);
         // The IME reaches a view only through the window's input handler, which
         // is set during paint; without it a Chinese keyboard composes nothing
         // the shell can read.
         let ime_focus = self.terminal_focus.clone();
         let ime_panel = cx.entity();
-        let measured = std::rc::Rc::clone(&self.terminal_frame);
-        let font_size = theme::BODY_SIZE - 1.0;
-        let selection = self.right.terminal_selection;
         let mut pane = div()
             .debug_selector(|| String::from("terminal-pane"))
             .id("terminal-pane")
@@ -1694,44 +1489,56 @@ impl Shell {
             .on_action(cx.listener(|this, _: &TerminalTab, _window, cx| {
                 this.terminal_tab(cx);
             }))
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
-                this.terminal_key(event, cx);
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                this.terminal_key(event, window, cx);
             }))
-            // A press clears the old selection and arms a new drag; the move
-            // handler grows it while the button is held, and the release keeps
-            // whatever was selected. A click alone therefore selects nothing.
+            .on_key_up(cx.listener(|this, event: &KeyUpEvent, _window, cx| {
+                this.terminal_key_up(event, cx);
+            }))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                    window.focus(&this.terminal_focus, cx);
-                    this.terminal_press(event.position, cx);
+                    this.terminal_press(event, window, cx);
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    this.terminal_press(event, window, cx);
                 }),
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
-                if event.pressed_button == Some(MouseButton::Left) {
-                    this.terminal_drag(event.position, cx);
-                }
+                this.terminal_move(event, cx);
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
-                    this.terminal_release(cx);
+                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
+                    this.terminal_release(event, cx);
                 }),
             )
-            // The wheel browses the retained scrollback; the pane stays at the
-            // bottom until the reader scrolls away from it.
+            .on_mouse_up(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
+                    this.terminal_release(event, cx);
+                }),
+            )
             .on_scroll(cx.listener(|this, event: &ScrollEvent, _window, cx| {
-                this.terminal_wheel(event, cx);
+                this.terminal_scroll(event, cx);
             }));
-        if let Some((text, is_error)) = self.terminal_status_text() {
+        // The strip sits ABOVE the surface instead of over it: the native view
+        // is a layer of the window, so anything the pane paints underneath it
+        // would be covered.
+        let running = self
+            .right
+            .terminal_view
+            .as_ref()
+            .is_some_and(|view| view.read(cx).is_alive());
+        if let Some((text, is_error)) = self.terminal_status_text(running) {
             pane = pane.child(
                 div()
                     .debug_selector(|| String::from("terminal-status"))
                     .id("terminal-status")
-                    .absolute()
-                    .top(px(0.0))
-                    .left(px(0.0))
-                    .right(px(0.0))
+                    .flex_none()
                     .px(px(12.0))
                     .py(px(8.0))
                     .bg(rgb(theme::page()))
@@ -1746,188 +1553,262 @@ impl Shell {
                     )),
             );
         }
-        pane.child(
-            canvas(
-                move |bounds, window, _cx| {
-                    let font = Font {
-                        family: "monospace".into(),
-                        ..Default::default()
-                    };
-                    let font_id = window.text_system().resolve_font(&font);
-                    let mut cell_w = window
-                        .text_system()
-                        .layout_width(font_id, px(font_size), 'M');
-                    if cell_w <= px(0.0) {
-                        cell_w = px(font_size * 0.6);
-                    }
-                    let cell_h = px(font_size * 1.4);
-                    let cols = ((bounds.size.width / cell_w).floor() as i32).clamp(1, 500) as u16;
-                    let rows = ((bounds.size.height / cell_h).floor() as i32).clamp(1, 300) as u16;
-                    let frame = TerminalFrame {
-                        origin: bounds.origin,
-                        cell_w,
-                        cell_h,
-                        cols,
-                        rows,
-                        font_size,
-                    };
-                    measured.set(Some(frame));
-                    frame
-                },
-                move |bounds, frame, window, cx| {
-                    window.handle_input(
-                        &ime_focus,
-                        gpui::ElementInputHandler::new(bounds, ime_panel.clone()),
-                        cx,
-                    );
-                    paint_terminal_grid(bounds, &frame, &snapshot, selection, window, cx);
-                },
-            )
-            .flex_1()
-            .min_h(px(0.0))
-            .w_full(),
-        )
-        .into_any_element()
+        match self.right.terminal_view.clone() {
+            Some(view) => {
+                pane = pane.child(
+                    div()
+                        .relative()
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .w_full()
+                        .child(view)
+                        .child(
+                            canvas(
+                                move |bounds, window, cx| {
+                                    window.handle_input(
+                                        &ime_focus,
+                                        gpui::ElementInputHandler::new(
+                                            bounds,
+                                            ime_panel.clone(),
+                                        ),
+                                        cx,
+                                    );
+                                },
+                                |_, _, _, _| {},
+                            )
+                            .absolute()
+                            .size_full(),
+                        ),
+                );
+            }
+            // No surface: the start gate refused it, Ghostty could not attach
+            // to this window, or the first spawn failed. The strip above says
+            // which, and Enter is the way back.
+            None => {
+                pane = pane.child(div().flex_1().min_h(px(0.0)).w_full());
+            }
+        }
+        pane.into_any_element()
     }
 
     /// One keystroke to the shell.
     ///
-    /// Every key is translated to the bytes a real terminal sends: printable
-    /// characters as their UTF-8, Enter as a carriage return, the arrows and
-    /// the editing block as their CSI sequences, and control chords as C0. A
-    /// cmd chord is left alone so the shell does not swallow app shortcuts.
-    pub(crate) fn terminal_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
-        // Copy takes the chord only while there is a selection: with none it
-        // falls through to the shell, so Cmd-C still means what it always did.
-        if terminal_copy_shortcut(&event.keystroke) && self.terminal_copy(cx) {
-            cx.stop_propagation();
-            return;
-        }
-        let Some(bytes) = terminal_key_bytes(&event.keystroke) else {
-            crate::terminal::trace_key(&event.keystroke.key, None);
-            return;
-        };
-        crate::terminal::trace_key(&event.keystroke.key, Some(&bytes));
-        let Some(terminal) = self.right.terminal.as_mut() else {
-            return;
-        };
-        match terminal.send_key(&bytes) {
-            KeyOutcome::Sent => cx.stop_propagation(),
-            KeyOutcome::Refused => {
-                // The status line names the refusal, so the pane has to redraw.
-                cx.notify();
-                cx.stop_propagation();
+    /// Every key but a submitted line goes straight to libghostty, which owns
+    /// the terminal's input encoding (arrows, control chords, the kitty
+    /// protocol, mouse reporting). Enter is the one gated key: the line this
+    /// pane has mirrored since the last submit is shown to the policy, and a
+    /// refusal sends Ctrl-U so the shell's line editor erases what it echoed,
+    /// instead of the carriage return.
+    pub(crate) fn terminal_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let keystroke = &event.keystroke;
+        if keystroke.modifiers.platform {
+            // Copy and paste belong to the terminal: Ghostty owns the
+            // selection and the clipboard, so it has to see those two chords.
+            // Everything else with the platform modifier stays the
+            // application's - the shell never sees Cmd-Q, and Ghostty's own
+            // Cmd-W would close the surface under the pane.
+            let key = keystroke.key.as_str();
+            if key == "c" || key == "v" {
+                if let Some(view) = self.right.terminal_view.clone() {
+                    view.update(cx, |view, _| view.key_down(keystroke, event.is_held));
+                }
             }
-            // No shell to write to: the status line already says why.
-            KeyOutcome::Closed => {}
+            return;
         }
+        let Some(view) = self.right.terminal_view.clone() else {
+            crate::terminal::trace_key(&keystroke.key, None);
+            return;
+        };
+        if terminal_is_enter(keystroke) {
+            crate::terminal::trace_key(&keystroke.key, Some(b"\r"));
+            cx.stop_propagation();
+            if !view.read(cx).is_alive() {
+                // A dead pane's Enter is the way back: a fresh shell, under the
+                // same start gate.
+                self.restart_terminal(window, cx);
+                return;
+            }
+            let outcome = self.right.terminal.as_mut().map(|terminal| {
+                terminal.submit(&mut |emission| {
+                    view.update(cx, |view, _| view.emission(emission));
+                    true
+                })
+            });
+            // A refusal is shown in the status line, so the pane has to redraw.
+            if matches!(outcome, Some(KeyOutcome::Refused)) {
+                cx.notify();
+            }
+            return;
+        }
+        if let Some(edit) = terminal_edit(keystroke) {
+            if let Some(terminal) = self.right.terminal.as_mut() {
+                terminal.track(edit);
+            }
+        }
+        crate::terminal::trace_key(&keystroke.key, None);
+        view.update(cx, |view, _| {
+            view.set_focused(true);
+            view.key_down(keystroke, event.is_held);
+        });
+        cx.stop_propagation();
+    }
+
+    /// Forward a released key: the kitty protocol reports releases.
+    pub(crate) fn terminal_key_up(&mut self, event: &KeyUpEvent, cx: &mut Context<Self>) {
+        let Some(view) = self.right.terminal_view.clone() else {
+            return;
+        };
+        view.update(cx, |view, _| view.key_up(&event.keystroke));
     }
 
     /// Tab belongs to the shell.
     ///
     /// The macOS input handler passes an unbound Tab to AppKit's key-view
     /// loop, which moves focus out of the pane before the shell sees the byte,
-    /// so Tab is bound to this action in the pane's `terminal` key context and
-    /// forwarded exactly as a keystroke would be.
+    /// so Tab is bound to this action in the pane's terminal key context and
+    /// forwarded to Ghostty as the key it is.
     pub(crate) fn terminal_tab(&mut self, cx: &mut Context<Self>) {
+        let Some(view) = self.right.terminal_view.clone() else {
+            return;
+        };
+        view.update(cx, |view, _| view.tab());
+        cx.stop_propagation();
+    }
+
+    /// A press puts the keyboard in the pane and tells Ghostty where it landed.
+    ///
+    /// Selection, word selection and copy-on-select are Ghostty's own: it sees
+    /// the press and every move that follows.
+    pub(crate) fn terminal_press(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.terminal_focus, cx);
+        if let Some(view) = self.right.terminal_view.clone() {
+            view.update(cx, |view, _| {
+                view.set_focused(true);
+                view.mouse_move(event.position, event.modifiers);
+                view.mouse_down(event.position, event.button, event.modifiers);
+            });
+        }
+    }
+
+    /// A pointer move: hover, a drag's selection, and a motion report.
+    pub(crate) fn terminal_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if let Some(view) = self.right.terminal_view.clone() {
+            view.update(cx, |view, _| {
+                view.mouse_move(event.position, event.modifiers);
+            });
+        }
+    }
+
+    /// A release ends whatever the press began.
+    pub(crate) fn terminal_release(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
+        if let Some(view) = self.right.terminal_view.clone() {
+            view.update(cx, |view, _| {
+                view.mouse_move(event.position, event.modifiers);
+                view.mouse_up(event.position, event.button, event.modifiers);
+            });
+        }
+    }
+
+    /// The wheel: Ghostty scrolls its own retained scrollback.
+    pub(crate) fn terminal_scroll(&mut self, event: &ScrollEvent, cx: &mut Context<Self>) {
+        if let Some(view) = self.right.terminal_view.clone() {
+            view.update(cx, |view, _| {
+                view.scroll(event.position, event.delta, event.modifiers);
+            });
+            cx.stop_propagation();
+        }
+    }
+
+    /// Tell the surface whether the pane owns the keyboard.
+    fn terminal_focus_changed(&mut self, focused: bool, cx: &mut Context<Self>) {
+        if let Some(view) = self.right.terminal_view.clone() {
+            view.update(cx, |view, _| view.set_focused(focused));
+        }
+    }
+
+    /// Enter on a dead terminal: a fresh surface for the same shell.
+    ///
+    /// The start gate is asked again by the model, so a policy that refuses the
+    /// shell refuses this too. The dead surface is dropped rather than reused:
+    /// Ghostty keeps the exited shell's last frame, and the pane's restart has
+    /// always been a turn of the page.
+    fn restart_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(terminal) = self.right.terminal.as_mut() else {
             return;
         };
-        match terminal.send_key(b"\t") {
-            KeyOutcome::Sent => cx.stop_propagation(),
-            KeyOutcome::Refused => {
-                cx.notify();
-                cx.stop_propagation();
-            }
-            KeyOutcome::Closed => {}
-        }
-    }
-
-    /// The cell a window position names, in the grid's document row and column.
-    fn terminal_cell(&self, position: Point<Pixels>) -> Option<(u64, usize)> {
-        let frame = self.terminal_frame.get()?;
-        let snapshot = &self.terminal_snapshot;
-        if snapshot.rows.is_empty() || snapshot.cols == 0 {
-            return None;
-        }
-        let x = position.x - frame.origin.x;
-        let y = position.y - frame.origin.y;
-        if x < px(0.0) || y < px(0.0) {
-            return None;
-        }
-        let col = (x / frame.cell_w).floor() as usize;
-        let row = (y / frame.cell_h).floor() as usize;
-        if col >= snapshot.cols || row >= snapshot.rows.len() {
-            return None;
-        }
-        Some((snapshot.first_row + row as u64, col))
-    }
-
-    /// A press clears the old selection and arms a new drag.
-    pub(crate) fn terminal_press(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
-        self.right.terminal_selection = None;
-        self.right.terminal_anchor = self.terminal_cell(position);
-        cx.notify();
-    }
-
-    /// A move with the button held grows the selection from the press.
-    pub(crate) fn terminal_drag(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
-        let Some(anchor) = self.right.terminal_anchor else {
-            return;
-        };
-        let Some(head) = self.terminal_cell(position) else {
-            return;
-        };
-        let selection = (head != anchor).then(|| crate::terminal::Selection::new(anchor, head));
-        if self.right.terminal_selection != selection {
-            self.right.terminal_selection = selection;
+        if !terminal.restart() {
             cx.notify();
+            return;
         }
-    }
-
-    /// A release keeps whatever the drag selected; a click alone leaves none.
-    pub(crate) fn terminal_release(&mut self, cx: &mut Context<Self>) {
-        self.right.terminal_anchor = None;
+        self.right.terminal_view = None;
+        self.right.terminal_view_subs.clear();
+        self.ensure_terminal_view(window, cx);
+        self.sync_terminal(cx);
+        window.focus(&self.terminal_focus, cx);
         cx.notify();
     }
 
-    /// The selected text, when a selection covers any.
-    pub(crate) fn terminal_selection_text(&self) -> Option<String> {
-        let selection = self.right.terminal_selection?;
-        let terminal = self.right.terminal.as_ref()?;
-        let text = terminal.selection_text(&selection);
-        (!text.is_empty()).then_some(text)
-    }
-
-    /// Put the selection on the clipboard; whether there was text to copy.
-    pub(crate) fn terminal_copy(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(text) = self.terminal_selection_text() else {
-            return false;
-        };
-        cx.write_to_clipboard(ClipboardItem::new_string(text));
-        true
-    }
-
-    /// The wheel over the pane: one cell per line of scroll, browsing the
-    /// retained scrollback and returning towards the bottom on the way back.
-    pub(crate) fn terminal_wheel(&mut self, event: &ScrollEvent, cx: &mut Context<Self>) {
-        let cell_h = self
-            .terminal_frame
-            .get()
-            .map(|frame| frame.cell_h)
-            .unwrap_or(px(17.0));
-        let pixels = event.delta.pixel_delta(cell_h);
-        let lines = (f32::from(pixels.y) / f32::from(cell_h)).round() as i32;
-        if lines == 0 {
+    /// Create the pane's libghostty surface, once.
+    ///
+    /// The start gate ran when the terminal was built: a refusal or a policy
+    /// error leaves the pane with no surface at all and the status line says
+    /// why. A spawn failure is recorded on the model so the status line reports
+    /// it and Enter can try again.
+    fn ensure_terminal_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.right.terminal_view.clone() {
+            // Coming back from another tab: the surface was hidden, not
+            // dropped, so it keeps the running shell.
+            view.update(cx, |view, _| view.set_visible(true));
             return;
         }
-        let moved = match self.right.terminal.as_mut() {
-            Some(terminal) => terminal.scroll_view(lines),
-            None => false,
+        let Some(terminal) = self.right.terminal.as_ref() else {
+            return;
         };
-        if moved {
-            self.sync_terminal(cx);
-            cx.stop_propagation();
+        if terminal.refused {
+            return;
+        }
+        let options = TerminalOptions::new(terminal.command(), terminal.cwd.clone());
+        match TerminalView::spawn(options, window, cx) {
+            Ok(view) => {
+                let focus_in = cx.on_focus(&self.terminal_focus, window, |this, _window, cx| {
+                    this.terminal_focus_changed(true, cx);
+                });
+                let focus_out = cx.on_blur(&self.terminal_focus, window, |this, _window, cx| {
+                    this.terminal_focus_changed(false, cx);
+                });
+                self.right.terminal_view = Some(view);
+                self.right.terminal_view_subs = vec![focus_in, focus_out];
+                if let Some(terminal) = self.right.terminal.as_mut() {
+                    terminal.failure = None;
+                }
+                self.sync_terminal(cx);
+            }
+            Err(error) => {
+                if let Some(terminal) = self.right.terminal.as_mut() {
+                    terminal.failure = Some(error);
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// Hide the surface when another pane takes the body.
+    ///
+    /// It is a layer of the window's view, so leaving it up would draw the
+    /// terminal over whatever tab replaced it.
+    fn hide_terminal_view(&mut self, cx: &mut Context<Self>) {
+        if let Some(view) = self.right.terminal_view.clone() {
+            view.update(cx, |view, _| view.set_visible(false));
         }
     }
 
@@ -1936,7 +1817,7 @@ impl Shell {
     /// A refused start reports the policy's own copy, and a shell that failed
     /// or exited reports the runtime reason beside it. Both are errors: a
     /// terminal that cannot take a command is not a blank terminal.
-    pub(crate) fn terminal_status_text(&self) -> Option<(String, bool)> {
+    pub(crate) fn terminal_status_text(&self, running: bool) -> Option<(String, bool)> {
         let terminal = self.right.terminal.as_ref()?;
         let lang = self.state.lang;
         if terminal.refused {
@@ -2020,7 +1901,7 @@ impl Shell {
                 &[("count", blocked.to_string())],
             ));
         }
-        if !terminal.is_running() {
+        if !running {
             let mut text = lang.tr("right.terminal.notRunning");
             if let Some(reason) = terminal.failure.as_ref() {
                 text.push_str(": ");
@@ -2179,7 +2060,7 @@ impl Shell {
                 )
             })
             .on_click(cx.listener(move |this, _event, window, cx| {
-                this.open_right_tab(tab, cx);
+                this.open_right_tab(tab, window, cx);
                 // A terminal is a text surface: opening it puts the cursor
                 // where the reader's next keystroke will land.
                 if tab == RightTab::Terminal {
@@ -3779,57 +3660,66 @@ impl Shell {
     /// Files is the pane that has to work now; the other two take the tab and
     /// say they are not built, which is what tells a reader pressing Terminal
     /// that they did press it.
-    pub(crate) fn open_right_tab(&mut self, tab: RightTab, cx: &mut Context<Self>) {
+    pub(crate) fn open_right_tab(
+        &mut self,
+        tab: RightTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.right.open = true;
         self.right.tab = Some(tab);
+        if tab == RightTab::Terminal {
+            if self.right.terminal.is_none() {
+                let cwd = self.state.workspace_root().unwrap_or_default();
+                // The SAME spec the shell tool runs under, derived from the
+                // live policy and the effective permission. A native libghostty
+                // surface owns its own PTY, so the sandbox cannot join the
+                // shell: the model records that answer and the status line says
+                // it.
+                let spec = self.state.sandbox_spec("terminal");
+                // The policy that released it, in the same precedence the build
+                // applies: the settings master switch wins over a preset's arm,
+                // and a permission release sets neither. The sentence is passed
+                // BEFORE the spawn, because it overrides BSH_SANDBOX for the
+                // shell itself and not only the status line.
+                let sandbox = self.state.effective().sandbox;
+                let off = if sandbox.off_by_settings {
+                    Some((
+                        crate::terminal::SandboxOff::Settings,
+                        self.state.lang.tr("right.terminal.sandboxOffSettings"),
+                    ))
+                } else if sandbox.off_by_preset {
+                    Some((
+                        crate::terminal::SandboxOff::Preset,
+                        self.state.lang.tr("right.terminal.sandboxOff"),
+                    ))
+                } else {
+                    None
+                };
+                self.right.terminal = Some(match off {
+                    Some(off) => crate::terminal::Terminal::new_with_sandbox_note(
+                        cwd,
+                        self.state.lang,
+                        spec.as_deref(),
+                        Some(off),
+                    ),
+                    None => crate::terminal::Terminal::new_with_sandbox(
+                        cwd,
+                        self.state.lang,
+                        spec.as_deref(),
+                    ),
+                });
+            }
+            self.ensure_terminal_view(window, cx);
+        } else {
+            self.hide_terminal_view(cx);
+        }
         if tab == RightTab::Files && self.files.roots.is_empty() && self.files.tabs.is_empty() {
             self.refresh_files(cx);
         }
         if tab == RightTab::Browser {
             self.browser_prewarm(cx);
         }
-        if tab == RightTab::Terminal && self.right.terminal.is_none() {
-            let cwd = self.state.workspace_root().unwrap_or_default();
-            // The SAME spec the shell tool runs under, derived from the live
-            // policy and the effective permission. The pane cannot be confined
-            // by it today - heel cannot host a caller-owned PTY - so the
-            // terminal records that answer and the status line says it.
-            let spec = self.state.sandbox_spec("terminal");
-            // The policy that released it, in the same precedence the build
-            // applies: the settings master switch wins over a preset's arm, and
-            // a permission release sets neither. The sentence is passed BEFORE
-            // the spawn, because it overrides BSH_SANDBOX to "none" for the
-            // shell itself and not only the status line.
-            let sandbox = self.state.effective().sandbox;
-            let off = if sandbox.off_by_settings {
-                Some((
-                    crate::terminal::SandboxOff::Settings,
-                    self.state.lang.tr("right.terminal.sandboxOffSettings"),
-                ))
-            } else if sandbox.off_by_preset {
-                Some((
-                    crate::terminal::SandboxOff::Preset,
-                    self.state.lang.tr("right.terminal.sandboxOff"),
-                ))
-            } else {
-                None
-            };
-            self.right.terminal = Some(match off {
-                Some(off) => crate::terminal::Terminal::new_with_sandbox_note(
-                    cwd,
-                    self.state.lang,
-                    spec.as_deref(),
-                    Some(off),
-                ),
-                None => crate::terminal::Terminal::new_with_sandbox(
-                    cwd,
-                    self.state.lang,
-                    spec.as_deref(),
-                ),
-            });
-        }
-        // A shell that already printed its first output would otherwise wait for
-        // the next tick, so take the copy the spawn produced right away.
         self.sync_terminal(cx);
         cx.notify();
     }
@@ -4813,34 +4703,30 @@ impl Shell {
         }
     }
 
-    /// Apply the pane's measured size and copy the terminal's screen.
+    /// Keep the pane's surface in step with the window.
     ///
-    /// Both jobs ride the terminal clock rather than the paint phase: the PTY
-    /// resize and the screen copy are state changes, and the window must not be
-    /// mutated while it is painting. The pane's prepaint stores the cell grid
-    /// it measured, so this is where a panel resize reaches the shell.
+    /// Both jobs ride the terminal clock rather than the paint phase: the
+    /// palette and the shell's liveness are state, and the window must not be
+    /// mutated while it is painting. Ghostty measures its own grid from the
+    /// frame the pane's canvas hands it, so a panel resize needs nothing here.
     pub(crate) fn sync_terminal(&mut self, cx: &mut Context<Self>) {
-        if let Some(frame) = self.terminal_frame.get() {
-            if let Some(terminal) = self.right.terminal.as_mut() {
-                terminal.resize(frame.cols, frame.rows);
-            }
-        }
-        // A shell that exited is noticed here rather than only by the reader:
-        // the pane keeps a slave description open for a sandboxed shell, so the
-        // master does not EOF on its own. The child is the authority.
-        if let Some(terminal) = self.right.terminal.as_mut() {
-            terminal.poll();
-        }
-        let Some(terminal) = self.right.terminal.as_ref() else {
+        let Some(view) = self.right.terminal_view.clone() else {
             return;
         };
-        let version = terminal.version();
-        if version == self.terminal_version {
-            return;
+        // The palette follows the window's theme; applying it is a compare and,
+        // only on a real change, one configuration reload.
+        let theme = super::terminal_view::terminal_theme();
+        if view.update(cx, |view, _| view.sync_theme(theme)) {
+            cx.notify();
         }
-        self.terminal_version = version;
-        self.terminal_snapshot = std::rc::Rc::new(terminal.snapshot());
-        cx.notify();
+        // A shell that exited is noticed through Ghostty's own answer; the
+        // surface keeps the last frame, so the status line is what says the
+        // shell is gone.
+        let alive = view.read(cx).is_alive();
+        if alive != self.terminal_running {
+            self.terminal_running = alive;
+            cx.notify();
+        }
     }
 
     /// The panel resize strip's press: the same origin/base dance the sidebar
@@ -6441,13 +6327,12 @@ fn terminal_confinement(
 #[cfg(test)]
 mod tests {
     use gpui_kit::{
-        point, px, size, Bounds, FontStyle, FontWeight, Keystroke, Modifiers, MouseButton, Pixels,
-        ScrollDelta,
+        point, px, size, Bounds, Keystroke, Modifiers, MouseButton, Pixels, ScrollDelta,
     };
 
     use super::{
-        anchor_line, chord_modifiers, grid_fonts, named_key, page_point, page_wheel,
-        terminal_key_bytes, typed_text, BrowserClick, BROWSER_WHEEL_GAIN,
+        anchor_line, chord_modifiers, named_key, page_point, page_wheel, typed_text,
+        BrowserClick, BROWSER_WHEEL_GAIN,
     };
 
     fn key(key: &str, key_char: Option<&str>) -> Keystroke {
@@ -6456,23 +6341,6 @@ mod tests {
             key_char: key_char.map(str::to_string),
             modifiers: Modifiers::default(),
         }
-    }
-
-    #[test]
-    fn enter_sends_a_carriage_return() {
-        assert_eq!(terminal_key_bytes(&key("enter", None)), Some(vec![b'\r']));
-    }
-
-    #[test]
-    fn printable_keys_send_their_utf8() {
-        assert_eq!(
-            terminal_key_bytes(&key("a", Some("a"))),
-            Some(b"a".to_vec())
-        );
-        assert_eq!(
-            terminal_key_bytes(&key("s", Some("ß"))),
-            Some("ß".as_bytes().to_vec())
-        );
     }
 
     #[test]
@@ -6516,48 +6384,52 @@ mod tests {
     }
 
     #[test]
-    fn arrows_send_their_csi_sequences() {
-        assert_eq!(
-            terminal_key_bytes(&key("up", None)),
-            Some(b"\x1b[A".to_vec())
-        );
-        assert_eq!(
-            terminal_key_bytes(&key("left", None)),
-            Some(b"\x1b[D".to_vec())
-        );
-    }
-
-    #[test]
-    fn a_control_chord_sends_its_c0_byte() {
-        let mut chord = key("c", Some("c"));
-        chord.modifiers.control = true;
-        assert_eq!(terminal_key_bytes(&chord), Some(vec![0x03]));
-    }
-
-    /// The painter picks a run's face with `bold | italic << 1`, so the table's
-    /// order is part of the contract: a wrong index draws bold text upright or
-    /// italic text roman, which no other assertion would catch.
-    #[test]
-    fn grid_fonts_index_by_bold_and_italic() {
-        let fonts = grid_fonts();
-        assert_eq!(fonts[0].weight, FontWeight::NORMAL);
-        assert_eq!(fonts[0].style, FontStyle::Normal);
-        assert_eq!(fonts[1].weight, FontWeight::BOLD);
-        assert_eq!(fonts[1].style, FontStyle::Normal);
-        assert_eq!(fonts[2].weight, FontWeight::NORMAL);
-        assert_eq!(fonts[2].style, FontStyle::Italic);
-        assert_eq!(fonts[3].weight, FontWeight::BOLD);
-        assert_eq!(fonts[3].style, FontStyle::Italic);
-        for font in fonts {
-            assert_eq!(&*font.family, "monospace");
-        }
-    }
-
-    #[test]
-    fn cmd_chords_are_left_to_the_application() {
-        let mut chord = key("p", Some("p"));
+    fn enter_is_the_one_gated_key() {
+        let enter = key("enter", None);
+        assert!(super::terminal_is_enter(&enter));
+        // A chord with the platform modifier belongs to the application.
+        let mut chord = enter.clone();
         chord.modifiers.platform = true;
-        assert_eq!(terminal_key_bytes(&chord), None);
+        assert!(!super::terminal_is_enter(&chord));
+        // A modified Enter is a different key for a terminal program.
+        let mut chord = enter;
+        chord.modifiers.control = true;
+        assert!(!super::terminal_is_enter(&chord));
+    }
+
+    #[test]
+    fn the_mirror_follows_typing_and_its_kill_chords() {
+        use crate::terminal::Edit;
+        assert_eq!(
+            super::terminal_edit(&key("a", Some("a"))),
+            Some(Edit::Text(String::from("a")))
+        );
+        assert_eq!(
+            super::terminal_edit(&key("s", Some("ß"))),
+            Some(Edit::Text(String::from("ß")))
+        );
+        assert_eq!(
+            super::terminal_edit(&key("space", None)),
+            Some(Edit::Text(String::from(" ")))
+        );
+        assert_eq!(
+            super::terminal_edit(&key("backspace", None)),
+            Some(Edit::Backspace)
+        );
+        // Motion is not editing, and the gate does not see it.
+        for name in ["up", "left", "tab", "escape"] {
+            assert_eq!(super::terminal_edit(&key(name, None)), None, "{name}");
+        }
+        let mut kill = key("u", Some("u"));
+        kill.modifiers.control = true;
+        assert_eq!(super::terminal_edit(&kill), Some(Edit::KillLine));
+        let mut word = key("w", Some("w"));
+        word.modifiers.control = true;
+        assert_eq!(super::terminal_edit(&word), Some(Edit::KillWord));
+        // A cmd chord never reaches the shell's line.
+        let mut chord = key("k", Some("k"));
+        chord.modifiers.platform = true;
+        assert_eq!(super::terminal_edit(&chord), None);
     }
 
     /// The platform's count is used as-is, bounded at three, and a different

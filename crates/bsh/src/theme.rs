@@ -1195,6 +1195,52 @@ fn mix(a: Hsla, b: Hsla, t: f32) -> u32 {
     (ch(a.r, b.r) << 16) | (ch(a.g, b.g) << 8) | ch(a.b, b.b)
 }
 
+/// Whether a packed colour is light, by its relative luminance.
+///
+/// The terminal palette has to know which way its neutrals run: "black" is the
+/// text colour on a light window and a dark surface on a dark one.
+fn is_light(color: u32) -> bool {
+    let ch = |shift: u32| ((color >> shift) & 0xff) as f32 / 255.0;
+    0.2126 * ch(16) + 0.7152 * ch(8) + 0.0722 * ch(0) > 0.5
+}
+
+/// The sixteen ANSI colours the terminal pane hands libghostty.
+///
+/// The kit theme carries no terminal palette, so the hues come from the tokens
+/// the reference uses for the same meanings (danger, success, warning, the
+/// business primary) and the neutrals from the surface scale. A "bright" entry
+/// is its base mixed towards the page, which lightens it on a light window and
+/// darkens it on a dark one - bright relative to the background, which is what
+/// a terminal means by it.
+pub(crate) fn terminal_palette() -> [u32; 16] {
+    let page = page();
+    let fg = text();
+    let light = is_light(page);
+    let black = if light { fg } else { blend(fg, page, 0.85) };
+    let white = if light { blend(fg, page, 0.92) } else { fg };
+    let magenta = blend(error(), accent(), 0.5);
+    let cyan = blend(success(), accent(), 0.5);
+    let bright = |color: u32| blend(color, page, 0.25);
+    [
+        black,
+        error(),
+        success(),
+        warn(),
+        accent(),
+        magenta,
+        cyan,
+        blend(fg, page, 0.45),
+        blend(black, page, 0.35),
+        bright(error()),
+        bright(success()),
+        bright(warn()),
+        bright(accent()),
+        bright(magenta),
+        bright(cyan),
+        white,
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::THEME_SET;

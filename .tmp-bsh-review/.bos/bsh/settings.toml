@@ -1,0 +1,104 @@
+schema_version = 0
+mcp_servers = []
+extensions = []
+schedules = []
+default_preset = "standard"
+
+[general]
+theme_mode = "system"
+lang = "en"
+content_font_size = 14
+sidebar_width = 283.0
+transcript_view = "standard"
+traj_actual_duration = false
+traj_actual_time = true
+link_opening = "sidebar"
+composer_enter = "queue"
+performance_usage = "detailed"
+developer_tools = true
+diff_mode = "split"
+diff_wrap = true
+session_sort = ""
+active_workspace = "eb333678-6804-4ef0-8e09-8f69186b2e23"
+active_session = "d8331102-8cc8-4c46-9ad6-3ce22bd0967f"
+
+[[skill_sources]]
+name = "Bos"
+path = "~/.bos/skills"
+enabled = true
+
+[[skill_sources]]
+name = "DSH"
+path = "~/.dsh/skills"
+enabled = true
+
+[[skill_sources]]
+name = "Agents"
+path = "~/.agents/skills"
+enabled = false
+
+[[skill_sources]]
+name = "Claude"
+path = "~/.claude/skills"
+enabled = true
+
+[[skill_sources]]
+name = "Codebuddy"
+path = "~/.codebuddy/skills"
+enabled = false
+
+[[skill_sources]]
+name = "Codex"
+path = "~/.codex/skills"
+enabled = true
+
+[providers.nvidia]
+name = "NVIDIA"
+base_url = "http://127.0.0.1:11436/v1"
+api_key_vault = "llm.local.api_key"
+api_mode = "chat"
+
+[providers.nvidia."deepseek-ai/deepseek-v4.1-flash"]
+model = "deepseek-ai/deepseek-v4.1-flash"
+name = "deepseek-ai/deepseek-v4.1-flash"
+
+[providers.nvidia."minimaxai/minimax-m3.1-flash"]
+model = "minimaxai/minimax-m3.1-flash"
+name = "minimaxai/minimax-m3.1-flash"
+
+[providers.nvidia."poolside/laguna-xs-2.1"]
+model = "poolside/laguna-xs-2.1"
+name = "poolside/laguna-xs-2.1"
+
+[providers.nvidia."stepfun-ai/step-5-preview"]
+model = "stepfun-ai/step-5-preview"
+name = "stepfun-ai/step-5-preview"
+
+[providers.nvidia."z-ai/glm-5.3-flash"]
+model = "z-ai/glm-5.3-flash"
+name = "z-ai/glm-5.3-flash"
+
+[presets]
+
+[[workspaces]]
+id = "eb333678-6804-4ef0-8e09-8f69186b2e23"
+name = "hello"
+root = "/Users/gaosg/Projects/hello"
+created_at = 1793074837
+updated_at = 1793074837
+
+[web_search]
+base_url = "https://api.tavily.com"
+results_per_search = 10
+method = "post"
+path = "search"
+query_key = "query"
+count_key = "count"
+results_key = "results"
+url_key = "url"
+title_key = "title"
+snippet_key = "snippet"
+date_key = "date"
+
+[web_search.body]
+need_content = false

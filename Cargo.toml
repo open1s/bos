@@ -29,23 +29,20 @@ thiserror = "2.0.21"
 # methods, which trips clippy 1.99 double_must_use under -D warnings.
 async-trait = "0.1.92"
 tracing = "0.1"
-uuid = { version = "1.28.0", features = ["v4"] }
+uuid = { version = "1.29.0", features = ["v4"] }
 futures = "0.3"
 tokio-stream = "0.1.19"
 async-stream = "0.3"
 chrono = { version = "0.4.45", features = ["serde"] }
 reqwest = { version = "0.13.5", features = ["json", "query"] }
-zenoh = "1.10.1"
+zenoh = "1.10.2"
 rkyv = { version = "0.8.18", features = ["unaligned"] }
 rkyv_derive = "0.8.18"
-notify = "8"
+notify = "8.2.1"
 async-channel = "2.5"
 shellexpand = "3.1"
 bus = { path = "crates/bus" }
-portable-pty = "0.9.0"
-regorus = "0.13.0"
-vte = "0.15.0"
-unicode-width = "0.2"
+regorus = "0.14.0"
 # The admin-key vault: a memory-hard KDF, an XChaCha20-Poly1305 AEAD, and the
 # zeroizing wrappers that keep a derived key and its plaintext out of ordinary
 # allocations once they are dropped.

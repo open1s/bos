@@ -3536,3 +3536,49 @@ Traps:
   frames/400 ms here against a bar of 10: one capture costs ~120 ms on this
   sandbox, so the pump is at its ceiling, not at its budget. The bar holds where
   a capture costs the 8 ms the substrate doc records.
+## Round 126: the terminal pane is libghostty now
+
+The right pane's terminal is no longer bsh's own vte grid. Ghostty renders it:
+`gpui-libghostty` (0.3.1) builds the vendored Ghostty (1.3.2-dev) into a static
+Metal library at build time and bsh attaches its surface to the window's NSView.
+`crates/bsh/src/terminal.rs` keeps what a renderer cannot own - the Rego gate,
+the audit ring, the line mirror, the shell choice, the sandbox answer - and
+`crates/bsh/src/ui/terminal_view.rs` is the surface seam (frame, keys, pointer,
+wheel, palette, wakeup pump).
+
+What changed in the contract, deliberately:
+
+- **The output gate is retired.** Ghostty reads the PTY itself, so no chunk
+  passes through bsh. `docs/bsh-terminal-policy.md` says output rules are
+  accepted and ignored, and the seeded template's redaction example is gone.
+  The user chose this over a pty-proxy process.
+- **The shell is not sandboxed.** The sandbox joins a caller-owned PTY by opening
+  its tty path; Ghostty owns this PTY, so a confined turn's terminal reports
+  `unsupported-pty` (in `$BSH_SANDBOX` and the status line) and runs unconfined.
+  The start and input gates still decide everything they decided before.
+- **The start gate still runs before any surface exists**, and Enter on a dead
+  pane asks it again and replaces the surface.
+
+Traps, all measured:
+
+- The vendored Ghostty pins **Zig 0.16 exactly**. This machine's `zig` on PATH
+  was Homebrew 0.17; build with `ZIG=/path/to/zig-0.16 cargo build`. Zig's own
+  package fetch also failed once with `HttpConnectionClosing` when Ghostty
+  fetched six packages at once - a retry succeeded, so do not chase the network.
+- `gpui-libghostty`'s build script compiles its ObjC shim with
+  `<xcode-select -p>/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang`, which
+  a CLT-only machine does not have. The vendored copy in `vendor/gpui-libghostty`
+  adds the `<developer_dir>/usr/bin` fallback; `VENDOR.md` records it.
+- **The native surface is a layer of the window view, above everything GPUI
+  paints.** So the status strip is a flex sibling ABOVE the terminal area (an
+  absolute overlay would be covered), and switching tabs must call
+  `set_visible(false)` or the terminal keeps drawing over the new pane.
+- `spawn_surface` needs a real AppKit view. The headless harness cannot host
+  one, so pane tests assert the REPORTED failure (status line) rather than a
+  painted grid; the gate itself is tested on the model with a recording writer.
+- bsh does not use `bind_gpui!`: the generated adapter owns its key handler, and
+  the policy must see Enter before the shell does. `TerminalView` is the same
+  seam the macro expands to (`__private`), with bsh owning the key path.
+- Ghostty runs the command as `login -flp <user> bash -c "exec -l <command>"`,
+  so the shell is a **login shell** and `env BSH_SANDBOX=... shell` is how an env
+  value reaches it.

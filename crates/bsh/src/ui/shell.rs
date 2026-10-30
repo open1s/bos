@@ -680,17 +680,12 @@ pub(crate) struct Shell {
     pub(crate) sidebar_user_w: Option<f32>,
     /// The sidebar resize in flight, if any.
     pub(crate) sidebar_drag: Option<SideDrag>,
-    /// The terminal's screen as of its last version, shared with the paint.
-    pub(crate) terminal_snapshot: std::rc::Rc<crate::terminal::Snapshot>,
-    /// The terminal screen version that copy was taken at.
-    pub(crate) terminal_version: u64,
-    /// The terminal pane's own focus, so typing reaches its PTY.
+    /// The terminal pane's own focus, so typing reaches its shell.
     pub(crate) terminal_focus: FocusHandle,
-    /// The cell grid the pane's last prepaint measured, applied on the
-    /// terminal clock so the PTY is resized outside the paint phase, and read
-    /// by the pointer handlers to turn a position into a cell.
-    pub(crate) terminal_frame:
-        std::rc::Rc<std::cell::Cell<Option<super::right_panel::TerminalFrame>>>,
+    /// Whether Ghostty's shell was alive at the last terminal-clock tick. The
+    /// status line and the restart hint read it, so a shell that exits is
+    /// noticed without touching the surface on the render path.
+    pub(crate) terminal_running: bool,
 
     /// The session being renamed, by id, with the field that renames it.
     pub(crate) renaming_session: Option<String>,
@@ -1752,11 +1747,9 @@ impl Shell {
             skills_dirs_open: false,
             skill_filter: SkillFilter::All,
             trash_entries: Vec::new(),
-            terminal_snapshot: std::rc::Rc::new(crate::terminal::Snapshot::default()),
-            terminal_version: 0,
             terminal_focus: cx.focus_handle(),
+            terminal_running: false,
             browser_focus: cx.focus_handle(),
-            terminal_frame: std::rc::Rc::new(std::cell::Cell::new(None)),
             right_hover: false,
             right: super::right_panel::RightPanel::default(),
             files: super::right_panel::FilesPane::new(files_new, files_rename, files_note),
@@ -1776,8 +1769,8 @@ impl Shell {
             .push(cx.observe_window_appearance(window, |this, window, cx| {
                 this.appearance_changed(window, cx);
             }));
-        // The terminal clock: the PTY's reader thread fills the scrollback on
-        // its own, so the pane takes a copy whenever the version moved. A quiet
+        // The terminal clock: Ghostty draws and scrolls on its own, so the pane
+        // only re-reads the surface's liveness and the palette here. A quiet
         // terminal costs one compare, which is why the cadence can be fine.
         cx.spawn(async move |this, cx| loop {
             cx.background_executor()
@@ -5250,8 +5243,8 @@ impl Render for Shell {
             // from wherever focus sits inside it - the composer, a field, a list
             // row. They act on the session the reader has open.
             .on_action(
-                cx.listener(|this, _: &super::right_panel::BrowserTab, _window, cx| {
-                    this.open_right_tab(super::right_panel::RightTab::Browser, cx);
+                cx.listener(|this, _: &super::right_panel::BrowserTab, window, cx| {
+                    this.open_right_tab(super::right_panel::RightTab::Browser, window, cx);
                 }),
             )
             .on_action(
