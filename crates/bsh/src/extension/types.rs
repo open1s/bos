@@ -251,6 +251,8 @@ pub(crate) enum RuntimeKind {
     Declarative,
     /// An external process speaking the platform's JSON-RPC protocol.
     Process,
+    /// An external Model Context Protocol server over stdio.
+    Mcp,
     /// A WebAssembly Component. The contract is published in `wit/`; this
     /// build refuses to activate one until the Wasmtime runtime lands.
     WasmComponent,
@@ -263,6 +265,7 @@ impl RuntimeKind {
             Self::Builtin => "builtin",
             Self::Declarative => "declarative",
             Self::Process => "process",
+            Self::Mcp => "mcp",
             Self::WasmComponent => "wasm-component",
         }
     }

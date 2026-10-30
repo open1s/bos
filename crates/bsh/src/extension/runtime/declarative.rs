@@ -21,7 +21,7 @@ use super::{
 };
 use crate::extension::manifest::{validate_relative_path, Manifest};
 use crate::extension::types::{ContributionId, ExtensionError, ExtensionId, RuntimeKind};
-use crate::extension::ui::{UiDocument, UiSession};
+use crate::extension::ui::{PanelLocation, PanelVisibility, UiDocument, UiSession};
 
 /// The largest declarative contribution file.
 pub(crate) const MAX_CONTRIBUTION_BYTES: u64 = 256 * 1024;
@@ -66,6 +66,10 @@ pub(crate) struct PanelContribution {
     pub(crate) title: String,
     /// Optional package-relative icon path.
     pub(crate) icon: Option<String>,
+    /// Where the host mounts it.
+    pub(crate) location: PanelLocation,
+    /// Whether it starts visible.
+    pub(crate) visibility: PanelVisibility,
     /// The validated view.
     pub(crate) view: UiDocument,
 }
@@ -314,6 +318,8 @@ pub(crate) fn load_contributions(
             id: id.clone(),
             title: file.title,
             icon: file.icon,
+            location: file.location,
+            visibility: file.visibility,
             view: session.document().clone(),
         });
     }
@@ -432,6 +438,10 @@ struct PanelFile {
     title: String,
     #[serde(default)]
     icon: Option<String>,
+    #[serde(default)]
+    location: PanelLocation,
+    #[serde(default, rename = "default_visibility")]
+    visibility: PanelVisibility,
     view: UiDocument,
 }
 

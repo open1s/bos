@@ -849,6 +849,9 @@ pub(crate) struct Shell {
     /// tool list instead of showing the previous build's capabilities.
     pub(crate) caps_generation: u64,
     pub(crate) plugins: Vec<crate::plugins::PluginInfo>,
+    /// The declarative extension panel host, created when the pane opens.
+    pub(crate) extension_panels:
+        Option<Entity<crate::ui::extension_panel::ExtensionPanelView>>,
     /// The settings dialog's text fields.
     pub(crate) settings_inputs: SettingsInputs,
     /// The Vault pane's text fields.
@@ -1651,6 +1654,7 @@ impl Shell {
             caps: Vec::new(),
             caps_generation: 0,
             plugins: Vec::new(),
+            extension_panels: None,
             settings_inputs,
             vault_inputs,
             vault_revealed: None,

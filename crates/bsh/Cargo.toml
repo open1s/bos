@@ -55,7 +55,7 @@ log = "0.4.29"
 async-trait = { workspace = true }
 # Remote plugin-market index fetches run on the shell's tokio runtime; reqwest
 # is the workspace's HTTP client and already in the build through `agent`.
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["blocking"] }
 
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -128,6 +128,26 @@ walkdir = "2.5"
 # The extension platform's structured errors. The workspace already builds
 # thiserror for agent/react; naming it here adds no package.
 thiserror = { workspace = true }
+# The third-party sandboxed runtime. Wasmtime's Component Model is the contract
+# published in crates/bsh/wit; defaults are off so the binary does not carry
+# GC, async fibers or the profiling stacks the platform does not use.
+wasmtime = { version = "50.0.1", default-features = false, features = [
+    "component-model",
+    "cranelift",
+    "parallel-compilation",
+    "runtime",
+    "std",
+    "wat",
+] }
+# Publisher signatures for package verification. Ed25519 is the design's named
+# signature scheme; the key bytes never leave the trust store except as the
+# public half recorded with a package.
+ed25519-dalek = "3.0.0"
+# Local package archives and downloaded registry tarballs. Both crates are
+# already in the workspace graph (flate2 through the image stack), so this adds
+# no new compression implementation.
+flate2 = "1"
+tar = "0.4"
 
 # The Vault's cryptography. The admin key is derived with Argon2id, the file is
 # sealed with XChaCha20-Poly1305, and every key and plaintext buffer is held in

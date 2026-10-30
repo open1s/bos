@@ -22,8 +22,11 @@ use super::package::{write_atomic, ExtensionStore, Package};
 use super::resolver;
 use super::runtime::builtin::{BuiltinRuntime, ClosureExtension};
 use super::runtime::declarative::{self, DeclarativeContributions};
+use super::runtime::mcp::McpRuntime;
 use super::runtime::process::ProcessRuntime;
+use super::runtime::wasm::WasmRuntime;
 use super::runtime::{empty_schema, LazyRuntime, Runtime, ToolDescriptor};
+use super::ui::{PanelLocation, PanelVisibility, UiDocument};
 use super::types::{
     ContributionId, ExtensionError, ExtensionId, ExtensionSource, LifecycleState, RuntimeKind,
     StartupPolicy, TrustLevel, ValidationReport, EXTENSION_API_VERSION, HOST_VERSION,
@@ -162,6 +165,33 @@ pub(crate) struct ExtensionStatus {
     pub(crate) installed_at: u64,
     /// Declared dependency ids.
     pub(crate) dependencies: Vec<String>,
+    /// Signature verdict: unsigned, verified, untrusted or invalid.
+    pub(crate) signature: String,
+    /// Publisher name from the signature, when one was present.
+    pub(crate) publisher: Option<String>,
+}
+
+/// One panel the host can mount in the UI.
+#[derive(Clone)]
+pub(crate) struct PanelSurface {
+    /// Qualified panel id for the host surface.
+    pub(crate) panel_id: String,
+    /// Contribution id the runtime answers for.
+    pub(crate) contribution_id: String,
+    /// Panel title.
+    pub(crate) title: String,
+    /// Optional package-relative icon.
+    pub(crate) icon: Option<String>,
+    /// Where the host should mount it.
+    pub(crate) location: PanelLocation,
+    /// Whether it starts visible.
+    pub(crate) visibility: PanelVisibility,
+    /// The runtime that serves it.
+    pub(crate) runtime: Arc<dyn Runtime>,
+    /// The owning extension, for validation and action ownership.
+    pub(crate) owner: ExtensionId,
+    /// A declarative view that is ready without a call, when one exists.
+    pub(crate) initial: Option<UiDocument>,
 }
 
 /// One diagnostic line.
@@ -329,6 +359,8 @@ impl ExtensionHost {
                     trust: TrustLevel::Builtin,
                     hash: String::new(),
                     installed_at: 0,
+                    signature: None,
+                    verification: crate::extension::signing::SignatureVerification::Missing,
                 };
                 let tools = runtime.descriptors();
                 self.builtins.push(BuiltinLoaded {
@@ -366,7 +398,7 @@ impl ExtensionHost {
         for failure in failures {
             issues.push(format!("{}: {}", failure.path.display(), failure.error));
         }
-        for package in packages {
+        for package in select_active_versions(packages, &self.store) {
             let id = package.id().clone();
             if loaded.contains_key(id.as_str()) {
                 issues.push(format!(
@@ -507,6 +539,8 @@ impl ExtensionHost {
     }
 
     fn build_runtime(&self, package: &Package) -> Result<BuiltRuntime, ExtensionError> {
+        let data_root = self.store.data_dir(package.id());
+        let config = super::config::load(&package.manifest, &package.root, &data_root)?;
         match package.manifest.runtime.kind {
             RuntimeKind::Declarative => {
                 let runtime =
@@ -520,7 +554,8 @@ impl ExtensionHost {
                 ))
             }
             RuntimeKind::Process => {
-                let runtime = ProcessRuntime::new(&package.manifest, &package.root)?;
+                let runtime = ProcessRuntime::new(&package.manifest, &package.root)?
+                    .with_config(config.to_json());
                 let tools = runtime.descriptors();
                 let contributions =
                     declarative::load_contributions(&package.root, &package.manifest)?;
@@ -530,9 +565,38 @@ impl ExtensionHost {
                     contributions,
                 ))
             }
-            RuntimeKind::WasmComponent => Err(ExtensionError::UnsupportedRuntime {
-                kind: "wasm-component".to_string(),
-            }),
+            RuntimeKind::Mcp => {
+                let runtime = McpRuntime::new(
+                    &package.manifest,
+                    &package.root,
+                    config.to_json(),
+                )?;
+                let tools = runtime.descriptors()?;
+                let contributions = runtime.contributions()?;
+                Ok((
+                    Arc::new(LazyRuntime::new(Arc::new(runtime))),
+                    tools,
+                    contributions,
+                ))
+            }
+            RuntimeKind::WasmComponent => {
+                let runtime = WasmRuntime::new(
+                    &package.manifest,
+                    &package.root,
+                    &data_root,
+                    Arc::clone(&self.policy),
+                    Arc::clone(&self.events),
+                    self.config.workspace.clone(),
+                    config.to_json(),
+                    package.trust,
+                )?;
+                let tools = runtime.descriptors()?;
+                Ok((
+                    Arc::new(LazyRuntime::new(Arc::new(runtime))),
+                    tools,
+                    DeclarativeContributions::default(),
+                ))
+            }
             RuntimeKind::Builtin => Err(ExtensionError::Manifest {
                 path: package.root.join("extension.toml"),
                 message: "the builtin runtime is linked in; an installed package cannot claim it"
@@ -633,6 +697,51 @@ impl ExtensionHost {
             .collect()
     }
 
+    /// Every panel an applied extension offers, ready for the host UI.
+    pub(crate) fn panel_surfaces(&self) -> Vec<PanelSurface> {
+        let mut surfaces = Vec::new();
+        for entry in self.loaded.values() {
+            if !entry.applied || entry.error.is_some() {
+                continue;
+            }
+            let Some(runtime) = &entry.runtime else {
+                continue;
+            };
+            let mut declared = std::collections::BTreeSet::new();
+            for panel in &entry.contributions.panels {
+                declared.insert(panel.id.as_str().to_string());
+                surfaces.push(PanelSurface {
+                    panel_id: entry.package.id().qualify(&panel.id),
+                    contribution_id: panel.id.as_str().to_string(),
+                    title: panel.title.clone(),
+                    icon: panel.icon.clone(),
+                    location: panel.location,
+                    visibility: panel.visibility,
+                    runtime: Arc::clone(runtime),
+                    owner: entry.package.id().clone(),
+                    initial: Some(panel.view.clone()),
+                });
+            }
+            for id in &entry.package.manifest.contributes.panels {
+                if declared.contains(id.as_str()) {
+                    continue;
+                }
+                surfaces.push(PanelSurface {
+                    panel_id: entry.package.id().qualify(id),
+                    contribution_id: id.as_str().to_string(),
+                    title: id.local_name().to_string(),
+                    icon: None,
+                    location: PanelLocation::Right,
+                    visibility: PanelVisibility::Visible,
+                    runtime: Arc::clone(runtime),
+                    owner: entry.package.id().clone(),
+                    initial: None,
+                });
+            }
+        }
+        surfaces
+    }
+
     fn status_of(&self, entry: &LoadedExtension) -> ExtensionStatus {
         let id = entry.package.id();
         let record = self.manager.get(id.as_str());
@@ -716,6 +825,12 @@ impl ExtensionHost {
                 .keys()
                 .map(|id| id.as_str().to_string())
                 .collect(),
+            signature: entry.package.verification.label().to_string(),
+            publisher: entry
+                .package
+                .signature
+                .as_ref()
+                .map(|signature| signature.publisher.clone()),
         }
     }
 
@@ -745,12 +860,38 @@ impl ExtensionHost {
                             "installed files no longer match the hash recorded at install time",
                         ));
                     }
-                    if record.signature.is_some() {
-                        issues.push(DiagnosticIssue::new(
+                    match &entry.package.verification {
+                        crate::extension::signing::SignatureVerification::Verified { publisher } => {
+                            issues.push(DiagnosticIssue::new(
+                                "info",
+                                Some(id),
+                                format!("package signature verified for publisher {publisher}"),
+                            ));
+                        }
+                        crate::extension::signing::SignatureVerification::Untrusted {
+                            publisher,
+                            reason,
+                        } => issues.push(DiagnosticIssue::new(
                             "warning",
                             Some(id),
-                            "a signature is recorded but this build does not verify signatures yet",
-                        ));
+                            format!("signature by {publisher} is untrusted: {reason}"),
+                        )),
+                        crate::extension::signing::SignatureVerification::Invalid { reason } => {
+                            issues.push(DiagnosticIssue::new(
+                                "error",
+                                Some(id),
+                                format!("package signature is invalid: {reason}"),
+                            ));
+                        }
+                        crate::extension::signing::SignatureVerification::Missing => {
+                            if entry.package.signature.is_some() {
+                                issues.push(DiagnosticIssue::new(
+                                    "warning",
+                                    Some(id),
+                                    "package ships signature metadata but has not been verified",
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -796,6 +937,45 @@ impl ExtensionHost {
             issues,
         }
     }
+}
+
+/// Pick one version per id: the pinned active version, else the highest.
+///
+/// Every version stays on disk for rollback; only the selected one is loaded,
+/// so two versions cannot register the same tool namespace.
+fn select_active_versions(
+    packages: Vec<Package>,
+    store: &ExtensionStore,
+) -> Vec<Package> {
+    let mut by_id: BTreeMap<String, Vec<Package>> = BTreeMap::new();
+    for package in packages {
+        by_id
+            .entry(package.id().as_str().to_string())
+            .or_default()
+            .push(package);
+    }
+    let mut selected = Vec::new();
+    for (id, mut versions) in by_id {
+        let active = ExtensionId::parse(id.clone())
+            .ok()
+            .and_then(|id| store.active_version(&id));
+        if let Some(active) = active {
+            if let Some(position) = versions
+                .iter()
+                .position(|package| package.version() == active)
+            {
+                selected.push(versions.swap_remove(position));
+                continue;
+            }
+        }
+        versions.sort_by(|left, right| {
+            left.manifest.extension.version.cmp(&right.manifest.extension.version)
+        });
+        if let Some(package) = versions.pop() {
+            selected.push(package);
+        }
+    }
+    selected
 }
 
 fn startup_allows(package: &Package, config: &HostConfig) -> bool {
@@ -849,6 +1029,39 @@ pub(crate) fn install(
     guard
         .as_ref()
         .map(|host| host.apply(agent, registry))
+        .unwrap_or_default()
+}
+
+/// The panels the current configuration offers, for the host UI.
+pub(crate) fn panels(
+    settings: &crate::settings::Settings,
+    workspace: Option<&Path>,
+    preset_allowed: Option<&[String]>,
+) -> Vec<PanelSurface> {
+    let config =
+        HostConfig::from_settings(settings, workspace.map(Path::to_path_buf), preset_allowed);
+    let slot = HOST.get_or_init(|| Mutex::new(None));
+    let mut guard = match slot.lock() {
+        Ok(guard) => guard,
+        Err(_) => return Vec::new(),
+    };
+    let reopen = guard.as_ref().is_none_or(|host| host.config != config);
+    if reopen {
+        match ExtensionHost::open(config) {
+            Ok(host) => *guard = Some(host),
+            Err(error) => {
+                log::warn!("extension host could not open: {error}");
+                return Vec::new();
+            }
+        }
+    } else if let Some(host) = guard.as_mut() {
+        if let Err(error) = host.ensure_fresh() {
+            log::warn!("extension host could not refresh: {error}");
+        }
+    }
+    guard
+        .as_ref()
+        .map(ExtensionHost::panel_surfaces)
         .unwrap_or_default()
 }
 

@@ -24,7 +24,7 @@ use crate::theme;
 
 /// The rail, in display order; the index is the section number narrowest the
 /// state stores. Public within the crate so the command line can deep-link.
-pub(crate) const SECTIONS: [&str; 17] = [
+pub(crate) const SECTIONS: [&str; 18] = [
     "settings.account",
     "settings.vault",
     "settings.general",
@@ -42,6 +42,7 @@ pub(crate) const SECTIONS: [&str; 17] = [
     "settings.automation",
     "settings.policy",
     "settings.web-search",
+    "settings.extensions",
 ];
 
 /// The rail's cells: the reference's five, plus the Vault.
@@ -1127,6 +1128,7 @@ impl Shell {
             14 => self.section_automation(cx),
             15 => self.section_policy(cx),
             16 => self.section_web_search(cx),
+            17 => self.section_extensions(cx),
             _ => self.section_policy(cx),
         };
 
@@ -6509,6 +6511,73 @@ impl Shell {
         ("settings.plugin-inventory", "settings.pluginListHint", rows)
     }
 
+    /// The declarative extension panels the installed packages offer.
+    ///
+    /// The host owns the tree; this pane owns only the selected revision and
+    /// the loading/error state. Actions are routed back to the owning runtime
+    /// with the revision they were rendered from.
+    fn section_extensions(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> (&'static str, &'static str, Vec<AnyElement>) {
+        let workspace = {
+            let root = self.state.settings.active_workspace_root();
+            (!root.is_empty()).then(|| std::path::PathBuf::from(root))
+        };
+        if self.extension_panels.is_none() {
+            let panels = crate::extension::panels(&self.state.settings, workspace.as_deref(), None);
+            self.extension_panels = Some(cx.new(|_| {
+                crate::ui::extension_panel::ExtensionPanelView::new(panels)
+            }));
+        }
+        let view = self.extension_panels.clone().expect("panel view");
+        let refresh_settings = self.state.settings.clone();
+        let refresh_workspace = workspace;
+        let refresh_view = view.clone();
+        let refresh = div()
+            .id("extension-panels-refresh")
+            .debug_selector(|| "extension-panels-refresh".to_string())
+            .h(px(32.0))
+            .px(px(12.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .rounded(px(9.0))
+            .bg(rgb(theme::new_session_fill()))
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(theme::hover())))
+            .child(icon(IconName::RefreshCw, 13.0, theme::muted()))
+            .child(txt(
+                tr(self.state.lang, "settings.extensionsRefresh"),
+                12.0,
+                theme::text(),
+            ))
+            .on_click(cx.listener(move |_this, _event, _window, cx| {
+                let panels = crate::extension::panels(
+                    &refresh_settings,
+                    refresh_workspace.as_deref(),
+                    None,
+                );
+                refresh_view.update(cx, |view, cx| {
+                    view.set_panels(panels);
+                    cx.notify();
+                });
+            }));
+        let rows = vec![
+            div().mb(px(10.0)).child(refresh).into_any_element(),
+            div()
+                .debug_selector(|| "extension-panels".to_string())
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h(px(0.0))
+                .child(view)
+                .into_any_element(),
+        ];
+        ("settings.extensions", "settings.extensionsHint", rows)
+    }
+
     /// The reference own Automation tasks page.
     ///
     /// The reference renders it as a sidebar PANEL whose id is `schedules`;
@@ -7921,6 +7990,14 @@ impl Shell {
         let lang = self.state.lang;
         let mut rows = Vec::new();
         for (id, title, description, pane, glyph, color) in [
+            (
+                "extensions",
+                "settings.extensions",
+                "settings.extensionsHint",
+                "extensions",
+                IconName::PanelRight,
+                theme::accent(),
+            ),
             (
                 "web-search",
                 "settings.webToolsTitle",

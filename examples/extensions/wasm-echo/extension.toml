@@ -1,0 +1,29 @@
+schema_version = "1.0"
+
+[extension]
+id = "com.example.wasm-echo"
+name = "Wasm Echo"
+version = "1.0.0"
+description = "An echo tool implemented as a WebAssembly component"
+authors = ["BSH Example"]
+license = "MIT"
+
+[compatibility]
+bsh = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+
+[runtime]
+kind = "wasm-component"
+entry = "wasm/extension.wasm"
+startup = "on-demand"
+
+[capabilities]
+required = ["agent.tools.register"]
+
+[contributes]
+tools = ["echo"]
+
+[resources]
+max_memory_mb = 64
+max_execution_ms = 2000
+max_output_bytes = 65536

@@ -401,11 +401,15 @@ impl Manifest {
                     );
                 }
             }
-            RuntimeKind::Process => {
+            RuntimeKind::Process | RuntimeKind::Mcp => {
                 match &self.runtime.entry {
                     None => report.error(
                         "runtime.entry",
-                        "the process runtime needs a package-relative executable or an allowlisted command",
+                        if self.runtime.kind == RuntimeKind::Mcp {
+                            "the MCP runtime needs a server command or a package-relative executable"
+                        } else {
+                            "the process runtime needs a package-relative executable or an allowlisted command"
+                        },
                     ),
                     Some(entry) => {
                         if let Err(reason) = validate_process_entry(entry) {
@@ -414,10 +418,15 @@ impl Manifest {
                     }
                 }
                 if let Some(protocol) = &self.runtime.protocol {
-                    if protocol != "jsonrpc-2.0" {
+                    let expected = if self.runtime.kind == RuntimeKind::Mcp {
+                        "mcp"
+                    } else {
+                        "jsonrpc-2.0"
+                    };
+                    if protocol != expected {
                         report.error(
                             "runtime.protocol",
-                            "the only supported process protocol is \"jsonrpc-2.0\"",
+                            format!("the supported protocol for this runtime is \"{expected}\""),
                         );
                     }
                 }

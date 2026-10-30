@@ -7,7 +7,9 @@
 
 pub(crate) mod builtin;
 pub(crate) mod declarative;
+pub(crate) mod mcp;
 pub(crate) mod process;
+pub(crate) mod wasm;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -105,6 +107,30 @@ pub(crate) trait Runtime: Send + Sync {
         arguments: Value,
         context: &CallContext,
     ) -> Result<Value, ExtensionError>;
+
+    /// Execute one command contribution. A runtime without commands refuses.
+    async fn command(
+        &self,
+        id: &str,
+        _arguments: Value,
+    ) -> Result<Value, ExtensionError> {
+        Err(ExtensionError::UnsupportedRuntime {
+            kind: format!("{} command {id}", self.kind()),
+        })
+    }
+
+    /// Fetch one panel's current declarative document. A runtime without
+    /// panels refuses.
+    async fn panel(&self, id: &str) -> Result<Value, ExtensionError> {
+        Err(ExtensionError::UnsupportedRuntime {
+            kind: format!("{} panel {id}", self.kind()),
+        })
+    }
+
+    /// Deliver any event the host queued for a subscriber.
+    async fn pump(&self) -> Result<(), ExtensionError> {
+        Ok(())
+    }
 }
 
 /// The on-disk tool descriptor every declarative and process package ships for

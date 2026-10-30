@@ -349,6 +349,8 @@ tools = ["echo"]
             trust: TrustLevel::Local,
             hash: format!("hash-{id}-{version}"),
             installed_at: 0,
+            signature: None,
+            verification: crate::extension::signing::SignatureVerification::Missing,
         }
     }
 

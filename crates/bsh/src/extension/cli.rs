@@ -14,7 +14,12 @@ use crate::extension::manifest::MANIFEST_FILE;
 use crate::extension::package::{package_hash, ExtensionStore, Package};
 use crate::extension::resolver;
 use crate::extension::runtime::declarative::{load_contributions, DeclarativeRuntime};
+use crate::extension::runtime::mcp::McpRuntime;
 use crate::extension::runtime::process::ProcessRuntime;
+use crate::extension::signing::{
+    generate_key, sign_package, verify_package, SignatureVerification, TrustStore,
+};
+use crate::extension::sources::{self, RegistryList};
 use crate::extension::types::{ExtensionId, ExtensionSource, RuntimeKind, TrustLevel};
 
 const USAGE: &str = "bsh ext <command> [options]
@@ -23,17 +28,33 @@ Commands:
   new <id> [--dir <path>] [--force]   scaffold a declarative extension package
   validate <path>                     parse and validate a package
   hash <path>                         print the canonical package hash
-  install <path>                      install a package into the managed store
+  install <path|archive|git+url>      install a package into the managed store
+              [--registry <name|url> <id>[@version]]
   uninstall <id> [--purge-data]       remove a package; keep data by default
   list                                list installed and built-in extensions
   info <id>                           show one extension in detail
   enable <id>                         enable an extension
   disable <id>                        disable an extension
+  versions <id>                      list installed versions and the active one
+  update <path>                      install a new version and activate it
+  rollback <id>                      activate the previous installed version
+  quarantine <id> [--reason <text>]  move code to quarantine and disable it
   grant <id> <capability> [options]   grant a capability (--scope, --note)
   revoke <id> <capability>            revoke a capability
   capabilities                        list the capability vocabulary
   logs <id>                           show the audit and runtime logs for an id
   doctor                              check the store, hashes, dependencies and policy
+  keygen <publisher> [--out <path>]   create an Ed25519 publisher key pair
+  sign <path> --publisher <name> --key <file-or-base64>
+                                      write package.sig over id, version and hash
+  verify <path>                       verify a package signature against the trust store
+  trust <publisher> <public-key>      trust a publisher key
+  untrust <publisher>                 remove a trusted publisher
+  publishers                          list trusted publishers
+  registry add <name> <url>           add an official or private registry
+  registry list                       list configured registries
+  registry remove <name>              remove a registry
+  search [query] [--registry <name>]  search configured registries
 
 Global options:
   --root <path>   override the managed extension root ($BSH_EXTENSION_ROOT)
@@ -82,11 +103,23 @@ pub(crate) fn run(args: &[String]) -> i32 {
         "list" => command_list(root.clone(), json),
         "info" => command_info(&rest[1..], root.clone(), json),
         "enable" | "disable" => command_toggle(&command, &rest[1..], root.clone()),
+        "versions" => command_versions(&rest[1..], root.clone()),
+        "update" => command_install(&rest[1..], root.clone()),
+        "rollback" => command_rollback(&rest[1..], root.clone()),
+        "quarantine" => command_quarantine(&rest[1..], root.clone()),
         "grant" => command_grant(&rest[1..], root.clone()),
         "revoke" => command_revoke(&rest[1..], root.clone()),
         "capabilities" => command_capabilities(),
         "logs" => command_logs(&rest[1..], root.clone()),
         "doctor" => command_doctor(root.clone(), json),
+        "keygen" => command_keygen(&rest[1..]),
+        "sign" => command_sign(&rest[1..]),
+        "verify" => command_verify(&rest[1..], root.clone()),
+        "trust" => command_trust(&rest[1..], root.clone()),
+        "untrust" => command_untrust(&rest[1..], root.clone()),
+        "publishers" => command_publishers(root.clone()),
+        "registry" => command_registry(&rest[1..], root.clone()),
+        "search" => command_search(&rest[1..], root.clone()),
         other => {
             eprintln!("unknown command {other:?}");
             println!("{USAGE}");
@@ -289,6 +322,9 @@ fn validate_runtime(package: &Package) -> Result<(), String> {
                 .map(|_| ())
                 .map_err(|error| error.to_string())
         }
+        RuntimeKind::Mcp => McpRuntime::new(&package.manifest, &package.root, "{}".to_string())
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
         _ => Ok(()),
     }
 }
@@ -305,10 +341,64 @@ fn command_hash(args: &[String]) -> Result<i32, String> {
 }
 
 fn command_install(args: &[String], root: Option<PathBuf>) -> Result<i32, String> {
-    let path = PathBuf::from(one_argument(args, "bsh ext install <path>")?);
+    let mut spec = one_argument(args, "bsh ext install <path|archive|git+url>")?;
     let store = ExtensionStore::open(config(root).root).map_err(|error| error.to_string())?;
-    let candidate = Package::load(&path, ExtensionSource::Development, TrustLevel::Local)
-        .map_err(|error| error.to_string())?;
+    let mut registry: Option<String> = None;
+    let mut requested_version: Option<String> = None;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--registry" => {
+                registry = Some(
+                    args.get(index + 1)
+                        .ok_or_else(|| "--registry needs a name or URL".to_string())?
+                        .clone(),
+                );
+                spec = args
+                    .get(index + 2)
+                    .cloned()
+                    .ok_or_else(|| "--registry needs a package id".to_string())?;
+                index += 3;
+            }
+            "--version" => {
+                requested_version = Some(
+                    args.get(index + 1)
+                        .ok_or_else(|| "--version needs a value".to_string())?
+                        .clone(),
+                );
+                index += 2;
+            }
+            other => return Err(format!("unknown option {other:?}")),
+        }
+    }
+    let fetched = match registry {
+        Some(registry) => {
+            let url = if registry.starts_with("http://") || registry.starts_with("https://") {
+                registry
+            } else {
+                RegistryList::load(&store.state_root())
+                    .map_err(|error| error.to_string())?
+                    .registries
+                    .get(&registry)
+                    .map(|entry| entry.url.clone())
+                    .ok_or_else(|| format!("unknown registry {registry:?}"))?
+            };
+            let (id, version) = match spec.split_once('@') {
+                Some((id, version)) => (id.to_string(), Some(version.to_string())),
+                None => (spec, requested_version),
+            };
+            sources::fetch_index_package(&url, &id, version.as_deref(), &store.cache_root())
+                .map_err(|error| error.to_string())?
+        }
+        None => sources::resolve(&spec, &store.cache_root())
+            .map_err(|error| error.to_string())?,
+    };
+    let candidate = Package::load(
+        &fetched.root,
+        fetched.origin.clone(),
+        TrustLevel::Local,
+    )
+    .map_err(|error| error.to_string())?;
     if !candidate.report.is_valid() {
         return Err(format!(
             "manifest is invalid: {}",
@@ -323,8 +413,10 @@ fn command_install(args: &[String], root: Option<PathBuf>) -> Result<i32, String
     if let Err(error) = resolver::resolve(&available, &roots) {
         return Err(format!("dependencies do not resolve: {error}"));
     }
-    let package = store.install(&path).map_err(|error| error.to_string())?;
+    let package = sources::install_fetched(&store, &fetched)
+        .map_err(|error| error.to_string())?;
     println!("installed {} {}", package.id(), package.version());
+    println!("source:  {}", fetched.origin.label());
     println!("hash:    {}", package.hash);
     println!("path:    {}", package.root.display());
     Ok(0)
@@ -407,6 +499,10 @@ fn print_status(status: &ExtensionStatus) {
             &status.hash
         }
     );
+    println!("signature:   {}", status.signature);
+    if let Some(publisher) = &status.publisher {
+        println!("publisher:   {publisher}");
+    }
     println!("state:       {}", status.state);
     println!("health:      {}", status.health.as_str());
     println!("configured:  {}", status.configured);
@@ -639,3 +735,316 @@ fn command_doctor(root: Option<PathBuf>, json: bool) -> Result<i32, String> {
     println!("{errors} error(s), {warnings} warning(s)");
     Ok(if errors > 0 { 1 } else { 0 })
 }
+
+fn command_keygen(args: &[String]) -> Result<i32, String> {
+    let publisher = one_argument(args, "bsh ext keygen <publisher> [--out <path>]")?;
+    let mut output = PathBuf::from(format!("{publisher}.key"));
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--out" => {
+                output = PathBuf::from(
+                    args.get(index + 1)
+                        .ok_or_else(|| "--out needs a path".to_string())?,
+                );
+                index += 2;
+            }
+            other => return Err(format!("unknown option {other:?}")),
+        }
+    }
+    let (secret, public) = generate_key();
+    if let Some(parent) = output.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+    }
+    std::fs::write(&output, format!("{secret}\n")).map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o600));
+    }
+    println!("publisher: {publisher}");
+    println!("secret:    {} (keep it private)", output.display());
+    println!("public:    {public}");
+    println!(
+        "next:      bsh ext trust {publisher} {public}"
+    );
+    Ok(0)
+}
+
+fn command_sign(args: &[String]) -> Result<i32, String> {
+    let path = PathBuf::from(one_argument(
+        args,
+        "bsh ext sign <path> --publisher <name> --key <file-or-base64>",
+    )?);
+    let mut publisher = None;
+    let mut key = None;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--publisher" => {
+                publisher = Some(
+                    args.get(index + 1)
+                        .ok_or_else(|| "--publisher needs a name".to_string())?
+                        .clone(),
+                );
+                index += 2;
+            }
+            "--key" => {
+                key = Some(
+                    args.get(index + 1)
+                        .ok_or_else(|| "--key needs a file or base64 seed".to_string())?
+                        .clone(),
+                );
+                index += 2;
+            }
+            other => return Err(format!("unknown option {other:?}")),
+        }
+    }
+    let publisher = publisher.ok_or_else(|| "--publisher is required".to_string())?;
+    let key = key.ok_or_else(|| "--key is required".to_string())?;
+    let key = if std::path::Path::new(&key).is_file() {
+        std::fs::read_to_string(&key)
+            .map_err(|error| error.to_string())?
+            .trim()
+            .to_string()
+    } else {
+        key
+    };
+    let signature = sign_package(&path, &publisher, &key).map_err(|error| error.to_string())?;
+    println!("signed {publisher}");
+    println!("algorithm: {}", signature.algorithm);
+    println!("public:    {}", signature.public_key);
+    Ok(0)
+}
+
+fn command_verify(args: &[String], root: Option<PathBuf>) -> Result<i32, String> {
+    let path = PathBuf::from(one_argument(args, "bsh ext verify <path>")?);
+    let manifest = crate::extension::manifest::Manifest::load(&path)
+        .map_err(|error| error.to_string())?;
+    let hash = package_hash(&path).map_err(|error| error.to_string())?;
+    let store = ExtensionStore::open(config(root).root).map_err(|error| error.to_string())?;
+    let trust = TrustStore::load(store.trust_path()).map_err(|error| error.to_string())?;
+    let verification = verify_package(
+        &path,
+        manifest.id().as_str(),
+        &manifest.version().to_string(),
+        &hash,
+        &trust,
+    );
+    println!("signature: {}", verification.label());
+    match &verification {
+        SignatureVerification::Verified { publisher } => println!("publisher: {publisher}"),
+        SignatureVerification::Untrusted { publisher, reason } => {
+            println!("publisher: {publisher}");
+            println!("reason:    {reason}");
+        }
+        SignatureVerification::Invalid { reason } => println!("reason:    {reason}"),
+        SignatureVerification::Missing => {}
+    }
+    Ok(if matches!(verification, SignatureVerification::Invalid { .. }) {
+        1
+    } else {
+        0
+    })
+}
+
+fn command_trust(args: &[String], root: Option<PathBuf>) -> Result<i32, String> {
+    let publisher = one_argument(args, "bsh ext trust <publisher> <public-key>")?;
+    let public_key = args
+        .get(1)
+        .ok_or_else(|| "usage: bsh ext trust <publisher> <public-key>".to_string())?
+        .clone();
+    let note = args
+        .windows(2)
+        .find(|pair| pair[0] == "--note")
+        .map(|pair| pair[1].clone());
+    let store = ExtensionStore::open(config(root).root).map_err(|error| error.to_string())?;
+    let mut trust = TrustStore::load(store.trust_path()).map_err(|error| error.to_string())?;
+    trust
+        .trust(&publisher, &public_key, note)
+        .map_err(|error| error.to_string())?;
+    println!("trusted {publisher}");
+    Ok(0)
+}
+
+fn command_untrust(args: &[String], root: Option<PathBuf>) -> Result<i32, String> {
+    let publisher = one_argument(args, "bsh ext untrust <publisher>")?;
+    let store = ExtensionStore::open(config(root).root).map_err(|error| error.to_string())?;
+    let mut trust = TrustStore::load(store.trust_path()).map_err(|error| error.to_string())?;
+    let removed = trust
+        .revoke(&publisher)
+        .map_err(|error| error.to_string())?;
+    println!(
+        "{} {publisher}",
+        if removed { "untrusted" } else { "no trust for" }
+    );
+    Ok(0)
+}
+
+fn command_publishers(root: Option<PathBuf>) -> Result<i32, String> {
+    let store = ExtensionStore::open(config(root).root).map_err(|error| error.to_string())?;
+    let trust = TrustStore::load(store.trust_path()).map_err(|error| error.to_string())?;
+    let publishers = trust.publishers();
+    if publishers.is_empty() {
+        println!("no trusted publishers");
+        return Ok(0);
+    }
+    for (name, publisher) in publishers {
+        println!("{name}\t{}", publisher.public_key);
+    }
+    Ok(0)
+}
+
+
+fn command_versions(args: &[String], root: Option<PathBuf>) -> Result<i32, String> {
+    let id = ExtensionId::parse(one_argument(args, "bsh ext versions <id>")?)
+        .map_err(|error| error.to_string())?;
+    let store = ExtensionStore::open(config(root).root).map_err(|error| error.to_string())?;
+    let versions = store.versions(&id).map_err(|error| error.to_string())?;
+    let active = store.active_version(&id);
+    for version in versions {
+        println!(
+            "{version}{}",
+            if active.as_deref() == Some(version.as_str()) {
+                " (active)"
+            } else {
+                ""
+            }
+        );
+    }
+    Ok(0)
+}
+
+fn command_rollback(args: &[String], root: Option<PathBuf>) -> Result<i32, String> {
+    let id = ExtensionId::parse(one_argument(args, "bsh ext rollback <id>")?)
+        .map_err(|error| error.to_string())?;
+    let store = ExtensionStore::open(config(root).root).map_err(|error| error.to_string())?;
+    let versions = store.versions(&id).map_err(|error| error.to_string())?;
+    let active = store.active_version(&id);
+    let target = match active
+        .as_deref()
+        .and_then(|active| versions.iter().position(|version| version == active))
+    {
+        Some(0) => None,
+        Some(position) => Some(versions[position - 1].clone()),
+        None => versions.last().cloned(),
+    };
+    let Some(target) = target else {
+        return Err("no earlier version to roll back to".to_string());
+    };
+    store
+        .set_active(&id, &target)
+        .map_err(|error| error.to_string())?;
+    println!("activated {id} {target}");
+    Ok(0)
+}
+
+fn command_quarantine(args: &[String], root: Option<PathBuf>) -> Result<i32, String> {
+    let id = ExtensionId::parse(one_argument(args, "bsh ext quarantine <id>")?)
+        .map_err(|error| error.to_string())?;
+    let reason = args
+        .windows(2)
+        .find(|pair| pair[0] == "--reason")
+        .map(|pair| pair[1].clone())
+        .unwrap_or_else(|| "reader requested".to_string());
+    let store = ExtensionStore::open(config(root).root).map_err(|error| error.to_string())?;
+    let destination = store
+        .quarantine(&id, &reason)
+        .map_err(|error| error.to_string())?;
+    println!("quarantined {id} at {}", destination.display());
+    Ok(0)
+}
+
+
+fn command_registry(args: &[String], root: Option<PathBuf>) -> Result<i32, String> {
+    let action = args
+        .first()
+        .cloned()
+        .ok_or_else(|| "usage: bsh ext registry add|list|remove ...".to_string())?;
+    let store = ExtensionStore::open(config(root).root).map_err(|error| error.to_string())?;
+    let mut registries =
+        RegistryList::load(&store.state_root()).map_err(|error| error.to_string())?;
+    match action.as_str() {
+        "add" => {
+            let name = args
+                .get(1)
+                .ok_or_else(|| "usage: bsh ext registry add <name> <url>".to_string())?;
+            let url = args
+                .get(2)
+                .ok_or_else(|| "usage: bsh ext registry add <name> <url>".to_string())?;
+            registries.add(name, url);
+            registries
+                .save(&store.state_root())
+                .map_err(|error| error.to_string())?;
+            println!("added registry {name} -> {url}");
+        }
+        "list" => {
+            if registries.registries.is_empty() {
+                println!("no registries");
+            }
+            for (name, registry) in registries.registries {
+                println!("{name}\t{}", registry.url);
+            }
+        }
+        "remove" => {
+            let name = args
+                .get(1)
+                .ok_or_else(|| "usage: bsh ext registry remove <name>".to_string())?;
+            registries.registries.remove(name);
+            registries
+                .save(&store.state_root())
+                .map_err(|error| error.to_string())?;
+            println!("removed registry {name}");
+        }
+        other => return Err(format!("unknown registry action {other:?}")),
+    }
+    Ok(0)
+}
+
+fn command_search(args: &[String], root: Option<PathBuf>) -> Result<i32, String> {
+    let query = args
+        .first()
+        .filter(|value| !value.starts_with("--"))
+        .cloned()
+        .unwrap_or_default();
+    let only = args
+        .windows(2)
+        .find(|pair| pair[0] == "--registry")
+        .map(|pair| pair[1].clone());
+    let store = ExtensionStore::open(config(root).root).map_err(|error| error.to_string())?;
+    let registries =
+        RegistryList::load(&store.state_root()).map_err(|error| error.to_string())?;
+    let mut found = 0usize;
+    for (name, registry) in registries.registries {
+        if only.as_deref().is_some_and(|only| only != name) {
+            continue;
+        }
+        let index = sources::fetch_index(&registry.url).map_err(|error| error.to_string())?;
+        for package in index.packages {
+            if !query.is_empty()
+                && !package.id.contains(&query)
+                && !package
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.contains(&query))
+            {
+                continue;
+            }
+            println!(
+                "{}\t{}\t{}\t{}",
+                package.id,
+                package.version,
+                package.name.unwrap_or_default(),
+                package.description.unwrap_or_default()
+            );
+            found += 1;
+        }
+    }
+    if found == 0 {
+        println!("no matching packages");
+    }
+    Ok(0)
+}
+

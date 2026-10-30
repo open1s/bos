@@ -58,6 +58,32 @@ impl Default for UiLimits {
     }
 }
 
+/// Where the host mounts a panel.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum PanelLocation {
+    /// The right-hand panel rail.
+    #[default]
+    Right,
+    /// The left-hand sidebar.
+    Left,
+    /// A bottom dock.
+    Bottom,
+    /// The main content column.
+    Center,
+}
+
+/// Whether a panel is shown by default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum PanelVisibility {
+    /// Shown when the host surface opens.
+    #[default]
+    Visible,
+    /// Registered but collapsed.
+    Hidden,
+}
+
 /// A button's visual weight.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

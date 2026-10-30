@@ -214,6 +214,7 @@ pub(crate) struct ProcessRuntime {
     tools: Vec<ToolDescriptor>,
     max_execution_ms: u64,
     max_output_bytes: u64,
+    config: String,
     session: Mutex<Option<ProcessSession>>,
 }
 
@@ -251,6 +252,7 @@ impl ProcessRuntime {
             tools,
             max_execution_ms: manifest.resources.execution_ms(),
             max_output_bytes: manifest.resources.output_bytes(),
+            config: "{}".to_string(),
             session: Mutex::new(None),
         })
     }
@@ -258,6 +260,12 @@ impl ProcessRuntime {
     /// The tool descriptors, without spawning the process.
     pub(crate) fn descriptors(&self) -> Vec<ToolDescriptor> {
         self.tools.clone()
+    }
+
+    /// Attach the effective configuration sent in the initialize handshake.
+    pub(crate) fn with_config(mut self, config: String) -> Self {
+        self.config = config;
+        self
     }
 
     async fn start(&self) -> Result<ProcessSession, ExtensionError> {
@@ -356,6 +364,7 @@ impl ProcessRuntime {
                     "protocolVersion": PROTOCOL_VERSION,
                     "extensionId": self.extension.as_str(),
                     "host": { "name": "bsh", "version": HOST_VERSION },
+                    "config": self.config,
                 }),
                 HANDSHAKE_MS,
                 &self.extension,

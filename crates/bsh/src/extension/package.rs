@@ -22,6 +22,7 @@ use walkdir::WalkDir;
 
 use super::capability::unix_now;
 use super::manifest::{Manifest, MANIFEST_FILE};
+use super::signing::{PackageSignature, SignatureVerification, TrustStore, SIGNATURE_FILE};
 use super::types::{ExtensionError, ExtensionId, ExtensionSource, TrustLevel, ValidationReport};
 
 /// The largest package tree the installer will copy or hash.
@@ -50,6 +51,10 @@ pub(crate) struct Package {
     pub(crate) hash: String,
     /// Unix seconds the package was installed, zero when unknown.
     pub(crate) installed_at: u64,
+    /// Signature metadata shipped with the package, if any.
+    pub(crate) signature: Option<PackageSignature>,
+    /// The trust store's verdict on that signature.
+    pub(crate) verification: SignatureVerification,
 }
 
 impl Package {
@@ -61,6 +66,7 @@ impl Package {
     ) -> Result<Self, ExtensionError> {
         let manifest = Manifest::load(root)?;
         let report = manifest.validate();
+        let signature = PackageSignature::load(root)?;
         let hash = if report.is_valid() {
             package_hash(root)?
         } else {
@@ -80,6 +86,8 @@ impl Package {
             trust,
             hash,
             installed_at,
+            signature,
+            verification: SignatureVerification::Missing,
         })
     }
 
@@ -96,6 +104,8 @@ impl Package {
             trust: TrustLevel::Builtin,
             hash: String::new(),
             installed_at: 0,
+            signature: None,
+            verification: SignatureVerification::Missing,
         })
     }
 
@@ -160,7 +170,11 @@ pub(crate) fn package_hash(root: &Path) -> Result<String, ExtensionError> {
                 ),
             });
         }
-        if is_ignored(entry.path()) {
+        if is_ignored(entry.path())
+            || entry.file_name().to_str() == Some(SIGNATURE_FILE)
+        {
+            // The signature covers the tree, so it cannot be part of the hash
+            // it signs; copy_tree still installs it.
             continue;
         }
         files += 1;
@@ -355,6 +369,12 @@ pub(crate) struct ExtensionState {
     /// Unix seconds the version was installed.
     #[serde(default)]
     pub(crate) installed_at: u64,
+    /// The exact version the host resolves for this id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) active_version: Option<String>,
+    /// The data schema version the migrations last produced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) data_version: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -369,6 +389,8 @@ impl Default for ExtensionState {
             last_error: None,
             last_started: None,
             installed_at: 0,
+            active_version: None,
+            data_version: None,
         }
     }
 }
@@ -416,9 +438,12 @@ pub(crate) struct InstalledRecord {
     /// Dependency ranges the manifest declared.
     #[serde(default)]
     pub(crate) dependencies: BTreeMap<String, String>,
-    /// Signature metadata, recorded but not yet verified by this build.
+    /// The trust store's verdict on the package signature.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) signature: Option<String>,
+    pub(crate) verification: Option<SignatureVerification>,
+    /// Publisher name from the signature, when one was present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) publisher: Option<String>,
 }
 
 fn default_trust() -> TrustLevel {
@@ -563,6 +588,11 @@ impl ExtensionStore {
         self.state_root().join("grants.toml")
     }
 
+    /// The publisher trust document.
+    pub(crate) fn trust_path(&self) -> PathBuf {
+        self.state_root().join("trust.toml")
+    }
+
     /// The capability audit log.
     pub(crate) fn audit_path(&self) -> PathBuf {
         self.log_root().join("audit.jsonl")
@@ -667,6 +697,97 @@ impl ExtensionStore {
         self.update_state(id, |state| state.enabled = enabled)
     }
 
+    /// Every installed version of an extension, sorted ascending.
+    pub(crate) fn versions(&self, id: &ExtensionId) -> Result<Vec<String>, ExtensionError> {
+        let directory = self.installed_root().join(id.as_str());
+        if !directory.is_dir() {
+            return Err(ExtensionError::NotInstalled {
+                id: id.to_string(),
+            });
+        }
+        let mut versions: Vec<String> = std::fs::read_dir(&directory)
+            .map_err(|source| ExtensionError::Io {
+                path: directory.clone(),
+                source,
+            })?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().join(MANIFEST_FILE).is_file())
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+            .collect();
+        versions.sort_by_key(|version| {
+            semver::Version::parse(version).unwrap_or_else(|_| semver::Version::new(0, 0, 0))
+        });
+        Ok(versions)
+    }
+
+    /// Pin the version the host resolves for an extension.
+    pub(crate) fn set_active(
+        &self,
+        id: &ExtensionId,
+        version: &str,
+    ) -> Result<ExtensionState, ExtensionError> {
+        if !self.version_root(id, version).join(MANIFEST_FILE).is_file() {
+            return Err(ExtensionError::NotInstalled {
+                id: format!("{id} {version}"),
+            });
+        }
+        self.update_state(id, |state| {
+            state.active_version = Some(version.to_string());
+            state.last_error = None;
+        })
+    }
+
+    /// The pinned version, if one was recorded.
+    pub(crate) fn active_version(&self, id: &ExtensionId) -> Option<String> {
+        self.state_of(id).active_version
+    }
+
+    /// Move every installed version of an extension into quarantine.
+    ///
+    /// This is the last-resort control: the code is no longer loadable, the
+    /// state record is removed and the data is retained for a later review or
+    /// deliberate purge.
+    pub(crate) fn quarantine(
+        &self,
+        id: &ExtensionId,
+        reason: &str,
+    ) -> Result<PathBuf, ExtensionError> {
+        let source = self.installed_root().join(id.as_str());
+        if !source.exists() {
+            return Err(ExtensionError::NotInstalled {
+                id: id.to_string(),
+            });
+        }
+        let destination = self
+            .quarantine_root()
+            .join(format!("{}-{}", id.as_str(), unix_now()));
+        std::fs::create_dir_all(&destination).map_err(|source| ExtensionError::Io {
+            path: destination.clone(),
+            source,
+        })?;
+        std::fs::rename(&source, &destination).map_err(|error| ExtensionError::Io {
+            path: source.clone(),
+            source: error,
+        })?;
+        let mut registry = self.read_registry()?;
+        if registry.remove(id.as_str()) {
+            self.write_registry(&registry)?;
+        }
+        let mut state = self.read_state()?;
+        if state.extensions.remove(id.as_str()).is_some() {
+            self.write_state(&state)?;
+        }
+        let note = destination.join("QUARANTINE.txt");
+        let _ = std::fs::write(
+            &note,
+            format!(
+                "quarantined at {}\nreason: {reason}\n",
+                unix_now()
+            ),
+        );
+        Ok(destination)
+    }
+
     /// Scan every installed version.
     pub(crate) fn scan_installed(
         &self,
@@ -734,6 +855,9 @@ impl ExtensionStore {
                     Ok(mut package) => {
                         if let Some(record) = record {
                             package.installed_at = record.installed_at;
+                            package.verification = record
+                                .verification
+                                .unwrap_or(SignatureVerification::Missing);
                         }
                         packages.push(package);
                     }
@@ -754,6 +878,15 @@ impl ExtensionStore {
     /// than overwritten, so an upgrade is an explicit uninstall/install pair or
     /// a new version directory.
     pub(crate) fn install(&self, source: &Path) -> Result<Package, ExtensionError> {
+        self.install_with(source, ExtensionSource::Installed)
+    }
+
+    /// Install a package and record where it came from.
+    pub(crate) fn install_with(
+        &self,
+        source: &Path,
+        origin: ExtensionSource,
+    ) -> Result<Package, ExtensionError> {
         let staged = Package::load(source, ExtensionSource::Development, TrustLevel::Local)?;
         if !staged.report.is_valid() {
             return Err(ExtensionError::Manifest {
@@ -763,6 +896,21 @@ impl ExtensionStore {
         }
         let id = staged.id().clone();
         let version = staged.version().to_string();
+        let trust = TrustStore::load(self.trust_path())?;
+        let verification =
+            super::signing::verify_package(source, id.as_str(), &version, &staged.hash, &trust);
+        if let super::signing::SignatureVerification::Invalid { reason } = &verification {
+            return Err(ExtensionError::Denied {
+                extension: id.to_string(),
+                capability: "package.signature".to_string(),
+                reason: reason.clone(),
+            });
+        }
+        let trust_level = verification.trust_level(TrustLevel::Local);
+        let publisher = staged
+            .signature
+            .as_ref()
+            .map(|signature| signature.publisher.clone());
         let destination = self.version_root(&id, &version);
         if destination.exists() {
             return Err(ExtensionError::AlreadyInstalled {
@@ -803,10 +951,11 @@ impl ExtensionStore {
             path: destination.clone(),
             source: error,
         })?;
-        let mut package =
-            Package::load(&destination, ExtensionSource::Installed, TrustLevel::Local)?;
+        let mut package = Package::load(&destination, origin.clone(), trust_level)?;
         package.hash = hash.clone();
         package.installed_at = unix_now();
+        package.verification = verification.clone();
+        package.signature = staged.signature.clone();
         let mut registry = self.read_registry()?;
         registry.insert(
             id.as_str(),
@@ -814,8 +963,8 @@ impl ExtensionStore {
             InstalledRecord {
                 path: format!("installed/{}/{version}", id.as_str()),
                 hash,
-                source: ExtensionSource::Installed,
-                trust: TrustLevel::Local,
+                source: origin,
+                trust: trust_level,
                 installed_at: package.installed_at,
                 dependencies: staged
                     .manifest
@@ -823,7 +972,8 @@ impl ExtensionStore {
                     .iter()
                     .map(|(id, requirement)| (id.to_string(), requirement.to_string()))
                     .collect(),
-                signature: None,
+                verification: Some(verification),
+                publisher,
             },
         );
         self.write_registry(&registry)?;
@@ -831,6 +981,7 @@ impl ExtensionStore {
             state.enabled = true;
             state.installed_at = package.installed_at;
             state.last_error = None;
+            state.active_version = Some(version.clone());
         })?;
         Ok(package)
     }

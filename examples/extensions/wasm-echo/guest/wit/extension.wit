@@ -1,0 +1,125 @@
+// The BSH extension component contract, version 1.0.
+//
+// This is the portable form of the runtime contract implemented in
+// crates/bsh/src/extension/runtime. The JSON-RPC process runtime carries the
+// same operations; a wasm component imports host and exports extension. The
+// host owns authorization, limits and the lifetime of every resource, so the
+// imports are requests the host may deny, never ambient authority.
+
+package bsh:extension@1.0.0;
+
+interface types {
+    /// One tool the component offers. The id is the contribution id declared
+    /// in the manifest; arguments and results are JSON text.
+    record tool-definition {
+        id: string,
+        description: string,
+        input-schema: string,
+    }
+
+    /// The value returned by a tool call.
+    record tool-result {
+        content: string,
+        is-error: bool,
+    }
+
+    /// The envelope every event uses.
+    record event {
+        id: string,
+        source: string,
+        event-type: string,
+        schema-version: string,
+        timestamp: u64,
+        correlation-id: option<string>,
+        payload: string,
+    }
+
+    /// The lifecycle vocabulary shared with the native host.
+    enum lifecycle-state {
+        discovered,
+        validating,
+        resolved,
+        installing,
+        installed,
+        loading,
+        starting,
+        active,
+        suspending,
+        suspended,
+        stopping,
+        unloaded,
+        failed,
+    }
+
+    /// A normalized host failure. The categories match the native error
+    /// categories so a host can render the same message on every runtime.
+    variant host-error {
+        denied(string),
+        not-found(string),
+        limited(string),
+        runtime(string),
+        timeout(string),
+    }
+
+    /// Diagnostic severity for host logging.
+    enum log-level {
+        trace,
+        debug,
+        info,
+        warn,
+        error,
+    }
+}
+
+/// Services the host exposes to an extension. Every function is authorized
+/// against the manifest's capabilities and the reader's grants before the host
+/// performs it. Paths are package-relative or workspace-relative; the host
+/// applies containment and refuses an escape.
+interface host {
+    use types.{event, host-error, log-level};
+
+    log: func(level: log-level, message: string);
+
+    emit: func(event: event) -> result<_, host-error>;
+    subscribe: func(topic: string) -> result<u64, host-error>;
+    unsubscribe: func(subscription: u64);
+
+    read-file: func(path: string) -> result<list<u8>, host-error>;
+    write-file: func(path: string, bytes: list<u8>) -> result<_, host-error>;
+    fetch: func(url: string, method: string, body: option<list<u8>>) -> result<list<u8>, host-error>;
+
+    storage-get: func(key: string) -> result<option<list<u8>>, host-error>;
+    storage-set: func(key: string, value: list<u8>) -> result<_, host-error>;
+    storage-list: func(prefix: string) -> result<list<string>, host-error>;
+
+    read-secret: func(name: string) -> result<string, host-error>;
+    configuration: func() -> string;
+
+    now-millis: func() -> u64;
+}
+
+/// Operations a component exports. The host calls them in this order:
+/// initialize, activate, then tools/call, command or panel as needed, then
+/// deactivate and shutdown. A component that fails any call is marked
+/// unhealthy and stops receiving new work.
+interface extension {
+    use types.{event, host-error, tool-definition, tool-result};
+
+    initialize: func(host-version: string, config: string) -> result<_, host-error>;
+    activate: func() -> result<_, host-error>;
+    deactivate: func() -> result<_, host-error>;
+    shutdown: func() -> result<_, host-error>;
+
+    tools: func() -> list<tool-definition>;
+    call-tool: func(id: string, arguments: string, correlation-id: string) -> result<tool-result, host-error>;
+
+    command: func(id: string, arguments: string) -> result<string, host-error>;
+    panel: func(id: string) -> result<string, host-error>;
+
+    on-event: func(event: event);
+}
+
+world bsh-extension {
+    import host;
+    export extension;
+}
