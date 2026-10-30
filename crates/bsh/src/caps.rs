@@ -899,6 +899,20 @@ fn build_agent_for_session_inner(
         }
     }
 
+    // The BSH extension platform. Its enabled packages contribute tools,
+    // commands, panels, prompts and contexts through the same agent and plugin
+    // seams the built-in bundles use, and they are gated by the preset's own
+    // extension allowlist and the workspace's disabled list. A failure here is
+    // logged and reflected in the status/doctor surfaces; it never stops the
+    // turn from being built.
+    plugins.extend(crate::extension::install(
+        &mut agent,
+        &mut registry,
+        settings,
+        root.as_deref(),
+        eff.preset_extensions.as_deref(),
+    ));
+
     // The MCP HTTP path is the tool boundary's network egress. The pool shares
     // one slot with every live transport, so installing this turn's gate here
     // updates connections that were opened before the turn without respawning
@@ -5246,8 +5260,8 @@ mod tests {
         carrying.sort();
         assert_eq!(
             carrying,
-            vec!["shell".to_string()],
-            "the preset allows bash only, so every other bundle keeps no tool"
+            vec!["com.bos.bsh.extensions".to_string(), "shell".to_string()],
+            "the preset allows bash and the enabled built-in extension, so every other bundle keeps no tool"
         );
         let shell = built
             .plugins
@@ -5484,6 +5498,7 @@ mod tests {
             vec![
                 "bash".to_string(),
                 "edit_file".to_string(),
+                "extensions__list".to_string(),
                 "glob".to_string(),
                 "grep".to_string(),
                 "job_kill".to_string(),
@@ -5499,6 +5514,7 @@ mod tests {
         assert_eq!(
             names(&read_only),
             vec![
+                "extensions__list".to_string(),
                 "glob".to_string(),
                 "grep".to_string(),
                 "list_dir".to_string(),

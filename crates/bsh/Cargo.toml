@@ -113,6 +113,22 @@ grep = "0.4"
 # to borrow.
 base64 = "0.23.1"
 
+# The extension platform's version algebra. semver is already in the lock graph
+# (cargo and rustc components pull it in), so naming it is not a new package;
+# `serde` lets a manifest express compatibility ranges as TOML strings.
+semver = { version = "1.0.28", features = ["serde"] }
+# The extension platform's canonical package hash. SHA-256 is the one hash the
+# design standardises on, and sha2 0.10 is already built for `resource` in
+# this workspace, so no second crypto implementation enters the graph.
+sha2 = "0.10"
+# The package hash walk and the installer's copy both need a deterministic,
+# symlink-aware directory traversal. walkdir is already in the graph through
+# ripgrep's ignore crate, the engine the glob tool uses.
+walkdir = "2.5"
+# The extension platform's structured errors. The workspace already builds
+# thiserror for agent/react; naming it here adds no package.
+thiserror = { workspace = true }
+
 # The Vault's cryptography. The admin key is derived with Argon2id, the file is
 # sealed with XChaCha20-Poly1305, and every key and plaintext buffer is held in
 # a zeroizing wrapper.

@@ -1,0 +1,1111 @@
+//! The extension host: discovery, resolution, authorization, lifecycle and the
+//! one seam the rest of BSH uses.
+//!
+//! The host is opened once per configuration and cached in a process global.
+//! A build calls install(); the host refreshes only when the store or the state
+//! files changed, so a render pass never re-reads every manifest. All extension
+//! execution is behind LazyRuntime: the build stays synchronous and a process
+//! or wasm runtime starts its work on the first call that needs it.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::SystemTime;
+
+use serde::Serialize;
+
+use super::agent as contribution;
+use super::capability::{CallScope, Decision, PolicyEngine, PolicyMode};
+use super::events::{lifecycle_event, topics, EventBus};
+use super::lifecycle::{Health, LifecycleManager};
+use super::package::{write_atomic, ExtensionStore, Package};
+use super::resolver;
+use super::runtime::builtin::{BuiltinRuntime, ClosureExtension};
+use super::runtime::declarative::{self, DeclarativeContributions};
+use super::runtime::process::ProcessRuntime;
+use super::runtime::{empty_schema, LazyRuntime, Runtime, ToolDescriptor};
+use super::types::{
+    ContributionId, ExtensionError, ExtensionId, ExtensionSource, LifecycleState, RuntimeKind,
+    StartupPolicy, TrustLevel, ValidationReport, EXTENSION_API_VERSION, HOST_VERSION,
+};
+
+/// The configuration that decides which store and which packages a host owns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostConfig {
+    /// The managed extension root.
+    pub(crate) root: PathBuf,
+    /// The workspace open for this build, used for scoped grants.
+    pub(crate) workspace: Option<PathBuf>,
+    /// Extension ids the workspace disabled.
+    pub(crate) disabled: BTreeSet<String>,
+    /// The preset's explicit allowlist, if it has one.
+    pub(crate) preset_allowed: Option<BTreeSet<String>>,
+}
+
+impl HostConfig {
+    /// Build the configuration for one agent build.
+    pub(crate) fn from_settings(
+        settings: &crate::settings::Settings,
+        workspace: Option<PathBuf>,
+        preset_allowed: Option<&[String]>,
+    ) -> Self {
+        let root = extension_root(settings);
+        Self {
+            root,
+            workspace,
+            disabled: settings
+                .workspace
+                .disabled
+                .extensions
+                .iter()
+                .cloned()
+                .collect(),
+            preset_allowed: preset_allowed.map(|ids| ids.iter().cloned().collect()),
+        }
+    }
+
+    /// Whether a package is enabled by configuration alone.
+    pub(crate) fn allows(&self, id: &ExtensionId) -> bool {
+        if self.disabled.contains(id.as_str()) {
+            return false;
+        }
+        self.preset_allowed
+            .as_ref()
+            .is_none_or(|allowed| allowed.contains(id.as_str()))
+    }
+}
+
+/// The managed extension root for one settings tree.
+///
+/// A test build must never read or write the reader's real extension store:
+/// beside the settings, the legacy market and a future package manager also use
+/// that path. A test's save_root is its scratch store, so the platform root
+/// follows it. A test that has no save_root gets one process-wide scratch root
+/// instead of $HOME.
+fn extension_root(settings: &crate::settings::Settings) -> PathBuf {
+    if let Some(save_root) = &settings.save_root {
+        return save_root.join("extensions");
+    }
+    if let Some(raw) = std::env::var_os("BSH_EXTENSION_ROOT") {
+        return PathBuf::from(shellexpand::tilde(&raw.to_string_lossy()).into_owned());
+    }
+    #[cfg(test)]
+    {
+        static TEST_ROOT: OnceLock<PathBuf> = OnceLock::new();
+        TEST_ROOT
+            .get_or_init(|| {
+                std::env::temp_dir().join(format!("bsh-ext-test-{}", std::process::id()))
+            })
+            .clone()
+    }
+    #[cfg(not(test))]
+    {
+        crate::settings::dir().join("extensions")
+    }
+}
+
+/// One capability's decision for a status row.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct CapabilityStatus {
+    /// Capability id.
+    pub(crate) capability: String,
+    /// Whether policy allows it.
+    pub(crate) allowed: bool,
+    /// The scope it was allowed under.
+    pub(crate) scope: Option<String>,
+    /// Why it was denied.
+    pub(crate) reason: Option<String>,
+    /// The risk bucket.
+    pub(crate) risk: String,
+}
+
+/// One extension as a status row.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ExtensionStatus {
+    /// Extension id.
+    pub(crate) id: String,
+    /// Display name.
+    pub(crate) name: String,
+    /// Version.
+    pub(crate) version: String,
+    /// Runtime kind.
+    pub(crate) runtime: String,
+    /// Trust level.
+    pub(crate) trust: String,
+    /// Source label.
+    pub(crate) source: String,
+    /// Package root.
+    pub(crate) root: String,
+    /// Package hash.
+    pub(crate) hash: String,
+    /// Lifecycle state.
+    pub(crate) state: LifecycleState,
+    /// Health.
+    pub(crate) health: Health,
+    /// Whether configuration enabled it.
+    pub(crate) configured: bool,
+    /// Whether it is loaded and its contributions are applied.
+    pub(crate) applied: bool,
+    /// Qualified tool names.
+    pub(crate) tools: Vec<String>,
+    /// Qualified command names.
+    pub(crate) commands: Vec<String>,
+    /// Qualified panel names.
+    pub(crate) panels: Vec<String>,
+    /// Capability decisions.
+    pub(crate) capabilities: Vec<CapabilityStatus>,
+    /// The last failure.
+    pub(crate) error: Option<String>,
+    /// Activation duration.
+    pub(crate) startup_ms: u64,
+    /// Unix seconds of installation.
+    pub(crate) installed_at: u64,
+    /// Declared dependency ids.
+    pub(crate) dependencies: Vec<String>,
+}
+
+/// One diagnostic line.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct DiagnosticIssue {
+    /// error, warning or info.
+    pub(crate) severity: String,
+    /// The extension the issue belongs to, when one does.
+    pub(crate) extension: Option<String>,
+    /// What is wrong.
+    pub(crate) message: String,
+}
+
+impl DiagnosticIssue {
+    fn new(
+        severity: impl Into<String>,
+        extension: Option<&str>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            severity: severity.into(),
+            extension: extension.map(str::to_string),
+            message: message.into(),
+        }
+    }
+}
+
+/// The doctor's full report.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct DiagnosticsReport {
+    /// Host version.
+    pub(crate) host_version: String,
+    /// Extension API generation.
+    pub(crate) extension_api: String,
+    /// The managed root.
+    pub(crate) root: String,
+    /// Every known extension.
+    pub(crate) extensions: Vec<ExtensionStatus>,
+    /// Problems and warnings.
+    pub(crate) issues: Vec<DiagnosticIssue>,
+}
+
+struct BuiltinLoaded {
+    package: Package,
+    runtime: Arc<dyn Runtime>,
+    tools: Vec<ToolDescriptor>,
+}
+
+/// A runtime plus the descriptors and file contributions loaded for it.
+type BuiltRuntime = (
+    Arc<dyn Runtime>,
+    Vec<ToolDescriptor>,
+    DeclarativeContributions,
+);
+
+struct LoadedExtension {
+    package: Package,
+    runtime: Option<Arc<dyn Runtime>>,
+    tools: Vec<ToolDescriptor>,
+    contributions: DeclarativeContributions,
+    configured: bool,
+    applied: bool,
+    error: Option<String>,
+}
+
+/// The extension host.
+pub(crate) struct ExtensionHost {
+    config: HostConfig,
+    store: ExtensionStore,
+    policy: Arc<PolicyEngine>,
+    events: Arc<EventBus>,
+    manager: LifecycleManager,
+    loaded: BTreeMap<String, LoadedExtension>,
+    builtins: Vec<BuiltinLoaded>,
+    issues: Vec<String>,
+    status_cache: Arc<Mutex<Vec<ExtensionStatus>>>,
+    last_stamp: Option<SystemTime>,
+}
+
+impl ExtensionHost {
+    /// Open a host: create the store, load policy, register built-ins and
+    /// perform the first scan.
+    pub(crate) fn open(config: HostConfig) -> Result<Self, ExtensionError> {
+        let store = ExtensionStore::open(&config.root)?;
+        let policy = Arc::new(PolicyEngine::open(
+            store.grants_path(),
+            store.audit_path(),
+            PolicyMode::Enforce,
+        )?);
+        let events = EventBus::new();
+        let status_cache = Arc::new(Mutex::new(Vec::new()));
+        let mut host = Self {
+            config,
+            store,
+            policy,
+            events,
+            manager: LifecycleManager::new(),
+            loaded: BTreeMap::new(),
+            builtins: Vec::new(),
+            issues: Vec::new(),
+            status_cache,
+            last_stamp: None,
+        };
+        host.register_builtins();
+        host.rebuild()?;
+        Ok(host)
+    }
+
+    /// The managed root.
+    pub(crate) fn root(&self) -> &Path {
+        self.store.root()
+    }
+
+    /// The policy engine, for the CLI's grant commands.
+    pub(crate) fn policy(&self) -> &Arc<PolicyEngine> {
+        &self.policy
+    }
+
+    /// The event bus.
+    pub(crate) fn events(&self) -> &Arc<EventBus> {
+        &self.events
+    }
+
+    /// The store, for the CLI.
+    pub(crate) fn store(&self) -> &ExtensionStore {
+        &self.store
+    }
+
+    /// The lifecycle manager, for the CLI.
+    pub(crate) fn manager(&self) -> &LifecycleManager {
+        &self.manager
+    }
+
+    fn register_builtins(&mut self) {
+        let cache = Arc::clone(&self.status_cache);
+        let extension = ClosureExtension::new(
+            INSPECTOR_MANIFEST,
+            vec![ToolDescriptor {
+                id: ContributionId::parse("list").expect("built-in tool id"),
+                description:
+                    "List the BSH extensions installed on this machine, with their lifecycle state, capabilities and tool names."
+                        .to_string(),
+                input_schema: empty_schema(),
+                capabilities: Vec::new(),
+            }],
+            move |_name, _arguments| {
+                let extensions = cache
+                    .lock()
+                    .map(|statuses| serde_json::to_value(&*statuses).unwrap_or_default())
+                    .unwrap_or(serde_json::Value::Null);
+                Ok(serde_json::json!({
+                    "host": HOST_VERSION,
+                    "extensionApi": EXTENSION_API_VERSION,
+                    "extensions": extensions,
+                }))
+            },
+        );
+        match BuiltinRuntime::new(Arc::new(extension)) {
+            Ok(runtime) => {
+                let package = Package {
+                    root: PathBuf::from("<builtin>"),
+                    manifest: runtime.manifest().clone(),
+                    report: ValidationReport::default(),
+                    source: ExtensionSource::Builtin,
+                    trust: TrustLevel::Builtin,
+                    hash: String::new(),
+                    installed_at: 0,
+                };
+                let tools = runtime.descriptors();
+                self.builtins.push(BuiltinLoaded {
+                    package,
+                    runtime: Arc::new(LazyRuntime::new(Arc::new(runtime))),
+                    tools,
+                });
+            }
+            Err(error) => log::warn!("built-in extension inspector was not registered: {error}"),
+        }
+    }
+
+    fn rebuild(&mut self) -> Result<(), ExtensionError> {
+        let mut manager = LifecycleManager::new();
+        let mut loaded: BTreeMap<String, LoadedExtension> = BTreeMap::new();
+        let mut issues: Vec<String> = Vec::new();
+        for builtin in &self.builtins {
+            let id = builtin.package.id().clone();
+            let configured = self.store.state_of(&id).enabled && self.config.allows(&id);
+            manager.register(id.as_str(), configured);
+            loaded.insert(
+                id.as_str().to_string(),
+                LoadedExtension {
+                    package: builtin.package.clone(),
+                    runtime: Some(Arc::clone(&builtin.runtime)),
+                    tools: builtin.tools.clone(),
+                    contributions: DeclarativeContributions::default(),
+                    configured,
+                    applied: false,
+                    error: None,
+                },
+            );
+        }
+        let (packages, failures) = self.store.scan_installed()?;
+        for failure in failures {
+            issues.push(format!("{}: {}", failure.path.display(), failure.error));
+        }
+        for package in packages {
+            let id = package.id().clone();
+            if loaded.contains_key(id.as_str()) {
+                issues.push(format!(
+                    "{}: a second package with this id is installed at {}",
+                    id,
+                    package.root.display()
+                ));
+                continue;
+            }
+            let configured = self.store.state_of(&id).enabled && self.config.allows(&id);
+            manager.register(id.as_str(), configured);
+            let mut entry = LoadedExtension {
+                package: package.clone(),
+                runtime: None,
+                tools: Vec::new(),
+                contributions: DeclarativeContributions::default(),
+                configured,
+                applied: false,
+                error: None,
+            };
+            if !package.report.is_valid() {
+                let message = package.error_message();
+                entry.error = Some(message.clone());
+                manager.fail(id.as_str(), message);
+                loaded.insert(id.as_str().to_string(), entry);
+                continue;
+            }
+            match self.build_runtime(&package) {
+                Ok((runtime, tools, contributions)) => {
+                    entry.runtime = Some(runtime);
+                    entry.tools = tools;
+                    entry.contributions = contributions;
+                    manager
+                        .transition(id.as_str(), LifecycleState::Validating)
+                        .ok();
+                    manager
+                        .transition(id.as_str(), LifecycleState::Resolved)
+                        .ok();
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    entry.error = Some(message.clone());
+                    manager.fail(id.as_str(), message);
+                }
+            }
+            loaded.insert(id.as_str().to_string(), entry);
+        }
+
+        // Resolve the enabled roots. A dependency error fails the roots it
+        // touches rather than loading a partial graph: a tool from a package
+        // whose dependency is missing may call into code that was never
+        // installed.
+        let available: Vec<Package> = loaded
+            .values()
+            // A disabled package is not a candidate, even as a dependency: the
+            // reader switched it off, and resolving it anyway would run code a
+            // dependent named but the reader did not enable.
+            .filter(|entry| entry.configured && entry.error.is_none() && entry.runtime.is_some())
+            .map(|entry| entry.package.clone())
+            .collect();
+        let roots: Vec<ExtensionId> = loaded
+            .values()
+            .filter(|entry| entry.configured && startup_allows(&entry.package, &self.config))
+            .filter(|entry| entry.error.is_none() && entry.runtime.is_some())
+            .map(|entry| entry.package.id().clone())
+            .collect();
+        let mut ordered: BTreeSet<String> = BTreeSet::new();
+        match resolver::resolve(&available, &roots) {
+            Ok(resolution) => {
+                for package in &resolution.packages {
+                    ordered.insert(package.id().as_str().to_string());
+                }
+                if let Err(error) = write_atomic(
+                    &self.store.lock_path(),
+                    resolution.lock.to_toml()?.as_bytes(),
+                ) {
+                    issues.push(format!("lockfile was not written: {error}"));
+                }
+            }
+            Err(error) => {
+                issues.push(format!("dependency resolution failed: {error}"));
+                for root in &roots {
+                    if let Some(entry) = loaded.get_mut(root.as_str()) {
+                        entry.error = Some(error.to_string());
+                        manager.fail(root.as_str(), error.to_string());
+                    }
+                }
+            }
+        }
+        let scope = self.host_scope();
+        for (id, entry) in loaded.iter_mut() {
+            if !ordered.contains(id) {
+                continue;
+            }
+            if let Err(error) = self.policy.authorize_required(
+                id,
+                entry.package.trust,
+                &entry.package.manifest.capabilities.required,
+                &scope,
+            ) {
+                entry.error = Some(error.to_string());
+                manager.fail(id, error.to_string());
+                continue;
+            }
+            entry.applied = true;
+            manager.transition(id, LifecycleState::Loading).ok();
+            manager.transition(id, LifecycleState::Starting).ok();
+            manager.activated(id, 0).ok();
+        }
+
+        self.manager = manager;
+        self.loaded = loaded;
+        self.issues = issues;
+        for entry in self.loaded.values() {
+            if entry.applied {
+                if let Ok(event) =
+                    lifecycle_event(entry.package.id(), topics::EXTENSION_LOADED, "active", None)
+                {
+                    let _ = self.events.publish(&event);
+                }
+            } else if let Some(error) = &entry.error {
+                if let Ok(event) = lifecycle_event(
+                    entry.package.id(),
+                    topics::EXTENSION_FAILED,
+                    "failed",
+                    Some(error),
+                ) {
+                    let _ = self.events.publish(&event);
+                }
+            }
+        }
+        let statuses = self.statuses();
+        if let Ok(mut cache) = self.status_cache.lock() {
+            *cache = statuses;
+        }
+        self.last_stamp = self.stamp();
+        Ok(())
+    }
+
+    fn build_runtime(&self, package: &Package) -> Result<BuiltRuntime, ExtensionError> {
+        match package.manifest.runtime.kind {
+            RuntimeKind::Declarative => {
+                let runtime =
+                    declarative::DeclarativeRuntime::new(&package.root, &package.manifest)?;
+                let tools = runtime.descriptors();
+                let contributions = runtime.contributions().clone();
+                Ok((
+                    Arc::new(LazyRuntime::new(Arc::new(runtime))),
+                    tools,
+                    contributions,
+                ))
+            }
+            RuntimeKind::Process => {
+                let runtime = ProcessRuntime::new(&package.manifest, &package.root)?;
+                let tools = runtime.descriptors();
+                let contributions =
+                    declarative::load_contributions(&package.root, &package.manifest)?;
+                Ok((
+                    Arc::new(LazyRuntime::new(Arc::new(runtime))),
+                    tools,
+                    contributions,
+                ))
+            }
+            RuntimeKind::WasmComponent => Err(ExtensionError::UnsupportedRuntime {
+                kind: "wasm-component".to_string(),
+            }),
+            RuntimeKind::Builtin => Err(ExtensionError::Manifest {
+                path: package.root.join("extension.toml"),
+                message: "the builtin runtime is linked in; an installed package cannot claim it"
+                    .to_string(),
+            }),
+        }
+    }
+
+    fn host_scope(&self) -> CallScope {
+        CallScope {
+            workspace: self.config.workspace.clone(),
+            path: self.config.workspace.clone(),
+            ..CallScope::default()
+        }
+    }
+
+    fn stamp(&self) -> Option<SystemTime> {
+        let mut newest = None;
+        for path in [
+            self.config.root.clone(),
+            self.store.installed_root(),
+            self.store.state_path(),
+            self.store.registry_path(),
+            self.store.grants_path(),
+        ] {
+            if let Ok(modified) = std::fs::metadata(path).and_then(|metadata| metadata.modified()) {
+                newest = Some(match newest {
+                    Some(current) if current >= modified => current,
+                    _ => modified,
+                });
+            }
+        }
+        newest
+    }
+
+    /// Refresh if a store or state file changed since the last scan.
+    pub(crate) fn ensure_fresh(&mut self) -> Result<(), ExtensionError> {
+        if self.stamp() != self.last_stamp {
+            self.rebuild()?;
+        }
+        Ok(())
+    }
+
+    /// Apply every enabled extension to one agent build.
+    pub(crate) fn apply(
+        &self,
+        agent: &mut ::agent::Agent,
+        registry: &mut ::agent::plugins::PluginRegistry,
+    ) -> Vec<crate::plugins::PluginInfo> {
+        let mut infos = Vec::new();
+        for entry in self.loaded.values() {
+            if !entry.applied || entry.error.is_some() {
+                continue;
+            }
+            let Some(runtime) = &entry.runtime else {
+                continue;
+            };
+            let contributions = &entry.contributions;
+            let has_agent_contribution = !entry.tools.is_empty()
+                || !contributions.commands.is_empty()
+                || !contributions.panels.is_empty()
+                || !contributions.prompts.is_empty()
+                || !contributions.contexts.is_empty();
+            if !has_agent_contribution {
+                continue;
+            }
+            let contributed = contribution::Contributed {
+                extension: entry.package.id().clone(),
+                name: entry.package.manifest.extension.name.clone(),
+                runtime: Arc::clone(runtime),
+                trust: entry.package.trust,
+                tools: entry.tools.clone(),
+                commands: contributions.commands.clone(),
+                panels: contributions.panels.clone(),
+                prompts: contributions.prompts.clone(),
+                contexts: contributions.contexts.clone(),
+                workflows: contributions.workflows.clone(),
+                themes: contributions.themes.clone(),
+                timeout_ms: entry.package.manifest.resources.execution_ms(),
+            };
+            infos.push(contribution::install(
+                agent,
+                registry,
+                &contributed,
+                Arc::clone(&self.policy),
+                Arc::clone(&self.events),
+                self.config.workspace.clone(),
+            ));
+        }
+        infos
+    }
+
+    /// Every known extension as a status row.
+    pub(crate) fn statuses(&self) -> Vec<ExtensionStatus> {
+        self.loaded
+            .values()
+            .map(|entry| self.status_of(entry))
+            .collect()
+    }
+
+    fn status_of(&self, entry: &LoadedExtension) -> ExtensionStatus {
+        let id = entry.package.id();
+        let record = self.manager.get(id.as_str());
+        let state = record
+            .map(|record| record.state)
+            .unwrap_or(LifecycleState::Discovered);
+        let health = record
+            .map(|record| record.health())
+            .unwrap_or(Health::Unknown);
+        let error = entry
+            .error
+            .clone()
+            .or_else(|| record.and_then(|record| record.last_error.clone()));
+        let scope = self.host_scope();
+        let mut capabilities = Vec::new();
+        let mut seen = BTreeSet::new();
+        for capability in entry
+            .package
+            .manifest
+            .capabilities
+            .required
+            .iter()
+            .chain(entry.package.manifest.capabilities.optional.iter())
+        {
+            if !seen.insert(*capability) {
+                continue;
+            }
+            let decision =
+                self.policy
+                    .preview(id.as_str(), entry.package.trust, *capability, &scope);
+            let (allowed, granted_scope, reason) = match &decision {
+                Decision::Allow { scope } => (true, Some(scope.to_string()), None),
+                Decision::Deny { reason } => (false, None, Some(reason.clone())),
+            };
+            capabilities.push(CapabilityStatus {
+                capability: capability.as_str().to_string(),
+                allowed,
+                scope: granted_scope,
+                reason,
+                risk: capability.risk().as_str().to_string(),
+            });
+        }
+        ExtensionStatus {
+            id: id.as_str().to_string(),
+            name: entry.package.manifest.extension.name.clone(),
+            version: entry.package.manifest.extension.version.to_string(),
+            runtime: entry.package.manifest.runtime.kind.as_str().to_string(),
+            trust: entry.package.trust.as_str().to_string(),
+            source: entry.package.source.label(),
+            root: entry.package.root.display().to_string(),
+            hash: entry.package.hash.clone(),
+            state,
+            health,
+            configured: entry.configured,
+            applied: entry.applied && error.is_none(),
+            tools: entry
+                .tools
+                .iter()
+                .map(|tool| id.qualify(&tool.id))
+                .collect(),
+            commands: entry
+                .contributions
+                .commands
+                .iter()
+                .map(|command| id.qualify(&command.id))
+                .collect(),
+            panels: entry
+                .contributions
+                .panels
+                .iter()
+                .map(|panel| id.qualify(&panel.id))
+                .collect(),
+            capabilities,
+            error,
+            startup_ms: record.map(|record| record.startup_ms).unwrap_or(0),
+            installed_at: entry.package.installed_at,
+            dependencies: entry
+                .package
+                .manifest
+                .dependencies
+                .keys()
+                .map(|id| id.as_str().to_string())
+                .collect(),
+        }
+    }
+
+    /// The doctor's report.
+    pub(crate) fn doctor(&self) -> DiagnosticsReport {
+        let statuses = self.statuses();
+        let mut issues: Vec<DiagnosticIssue> = self
+            .issues
+            .iter()
+            .map(|message| DiagnosticIssue::new("error", None, message.clone()))
+            .collect();
+        let registry = self.store.read_registry().ok();
+        let mut tool_names: BTreeMap<String, String> = BTreeMap::new();
+        for entry in self.loaded.values() {
+            let id = entry.package.id().as_str();
+            if entry.package.source != ExtensionSource::Builtin {
+                if let Some(record) = registry.as_ref().and_then(|registry| {
+                    registry.record(id, &entry.package.manifest.extension.version.to_string())
+                }) {
+                    if !record.hash.is_empty()
+                        && !entry.package.hash.is_empty()
+                        && record.hash != entry.package.hash
+                    {
+                        issues.push(DiagnosticIssue::new(
+                            "error",
+                            Some(id),
+                            "installed files no longer match the hash recorded at install time",
+                        ));
+                    }
+                    if record.signature.is_some() {
+                        issues.push(DiagnosticIssue::new(
+                            "warning",
+                            Some(id),
+                            "a signature is recorded but this build does not verify signatures yet",
+                        ));
+                    }
+                }
+            }
+            if entry.package.manifest.runtime.kind == RuntimeKind::WasmComponent {
+                issues.push(DiagnosticIssue::new(
+                    "warning",
+                    Some(id),
+                    "the wasm-component runtime is not implemented in this build",
+                ));
+            }
+            for warning in &entry.package.report.warnings {
+                issues.push(DiagnosticIssue::new(
+                    "warning",
+                    Some(id),
+                    warning.to_string(),
+                ));
+            }
+            if entry.applied && entry.error.is_none() {
+                for tool in &entry.tools {
+                    let qualified = entry.package.id().qualify(&tool.id);
+                    if let Some(previous) = tool_names.insert(qualified.clone(), id.to_string()) {
+                        issues.push(DiagnosticIssue::new(
+                            "error",
+                            Some(id),
+                            format!("tool name {qualified} is also claimed by {previous}"),
+                        ));
+                    }
+                }
+            }
+        }
+        if self.loaded.is_empty() {
+            issues.push(DiagnosticIssue::new(
+                "warning",
+                None,
+                "no extensions are installed or registered",
+            ));
+        }
+        DiagnosticsReport {
+            host_version: HOST_VERSION.to_string(),
+            extension_api: EXTENSION_API_VERSION.to_string(),
+            root: self.store.root().display().to_string(),
+            extensions: statuses,
+            issues,
+        }
+    }
+}
+
+fn startup_allows(package: &Package, config: &HostConfig) -> bool {
+    match package.manifest.runtime.startup {
+        StartupPolicy::OnStartup | StartupPolicy::OnDemand => true,
+        StartupPolicy::OnWorkspaceOpen => config.workspace.is_some(),
+        StartupPolicy::Manual => false,
+    }
+}
+
+/// The process-wide host. One per configuration; a changed configuration opens
+/// a fresh host and drops the previous runtimes.
+static HOST: OnceLock<Mutex<Option<ExtensionHost>>> = OnceLock::new();
+
+/// Install every enabled extension into one agent build.
+///
+/// This is the only function the rest of BSH needs. It never panics and never
+/// fails a build: a broken extension is logged and reported through the status
+/// and doctor surfaces, not by making the harness unusable.
+pub(crate) fn install(
+    agent: &mut ::agent::Agent,
+    registry: &mut ::agent::plugins::PluginRegistry,
+    settings: &crate::settings::Settings,
+    workspace: Option<&Path>,
+    preset_allowed: Option<&[String]>,
+) -> Vec<crate::plugins::PluginInfo> {
+    let config =
+        HostConfig::from_settings(settings, workspace.map(Path::to_path_buf), preset_allowed);
+    let slot = HOST.get_or_init(|| Mutex::new(None));
+    let mut guard = match slot.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            log::warn!("extension host lock is poisoned; extensions are not loaded");
+            return Vec::new();
+        }
+    };
+    let reopen = guard.as_ref().is_none_or(|host| host.config != config);
+    if reopen {
+        match ExtensionHost::open(config) {
+            Ok(host) => *guard = Some(host),
+            Err(error) => {
+                log::warn!("extension host could not open: {error}");
+                return Vec::new();
+            }
+        }
+    } else if let Some(host) = guard.as_mut() {
+        if let Err(error) = host.ensure_fresh() {
+            log::warn!("extension host could not refresh: {error}");
+        }
+    }
+    guard
+        .as_ref()
+        .map(|host| host.apply(agent, registry))
+        .unwrap_or_default()
+}
+
+/// Open a host for the CLI or a test, without touching the process global.
+pub(crate) fn open(
+    settings: &crate::settings::Settings,
+    workspace: Option<&Path>,
+) -> Result<ExtensionHost, ExtensionError> {
+    ExtensionHost::open(HostConfig::from_settings(
+        settings,
+        workspace.map(Path::to_path_buf),
+        None,
+    ))
+}
+
+/// A build that only needs the report (the CLI doctor path).
+pub(crate) fn doctor_report(config: HostConfig) -> Result<DiagnosticsReport, ExtensionError> {
+    Ok(ExtensionHost::open(config)?.doctor())
+}
+
+/// The manifest of the built-in extension inspector.
+const INSPECTOR_MANIFEST: &str = r#"
+schema_version = "1.0"
+
+[extension]
+id = "com.bos.bsh.extensions"
+name = "Extension Inspector"
+version = "1.0.0"
+description = "Reports the extensions installed on this machine and their host state"
+authors = ["BrickOS Team"]
+license = "MIT"
+
+[compatibility]
+bsh = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+
+[runtime]
+kind = "builtin"
+entry = "inspector"
+startup = "on-demand"
+
+[capabilities]
+required = ["agent.tools.register"]
+
+[contributes]
+tools = ["list"]
+"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+    fn scratch(label: &str) -> PathBuf {
+        let index = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "bsh-ext-host-{label}-{}-{index}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("scratch");
+        path
+    }
+
+    fn config(root: &Path) -> HostConfig {
+        HostConfig {
+            root: root.to_path_buf(),
+            workspace: Some(root.join("workspace")),
+            disabled: BTreeSet::new(),
+            preset_allowed: None,
+        }
+    }
+
+    fn write_package(root: &Path) {
+        std::fs::create_dir_all(root.join("tools")).expect("tools");
+        std::fs::write(
+            root.join("extension.toml"),
+            r#"
+schema_version = "1.0"
+
+[extension]
+id = "com.example.hosted"
+name = "Hosted"
+version = "1.0.0"
+description = "A hosted declarative package"
+
+[compatibility]
+bsh = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+
+[runtime]
+kind = "declarative"
+
+[capabilities]
+required = ["agent.tools.register"]
+
+[contributes]
+tools = ["echo"]
+"#,
+        )
+        .expect("manifest");
+        std::fs::write(
+            root.join("tools/echo.json"),
+            r#"{"description":"Echo","implementation":{"kind":"echo_arguments"}}"#,
+        )
+        .expect("tool");
+    }
+
+    fn write_dependent(root: &Path, id: &str, dependency: &str) {
+        std::fs::create_dir_all(root.join("tools")).expect("tools");
+        let manifest = format!(
+            r#"
+schema_version = "1.0"
+
+[extension]
+id = "{id}"
+name = "Dependent"
+version = "1.0.0"
+description = "A package that depends on another"
+
+[compatibility]
+bsh = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+
+[runtime]
+kind = "declarative"
+
+[capabilities]
+required = ["agent.tools.register"]
+
+[contributes]
+tools = ["echo"]
+
+[dependencies]
+"{dependency}" = "^1.0"
+"#
+        );
+        std::fs::write(root.join("extension.toml"), manifest).expect("manifest");
+        std::fs::write(
+            root.join("tools/echo.json"),
+            r#"{"description":"Echo","implementation":{"kind":"echo_arguments"}}"#,
+        )
+        .expect("tool");
+    }
+
+    #[test]
+    fn the_builtin_inspector_is_registered_and_applied() {
+        let root = scratch("builtin");
+        let host = ExtensionHost::open(config(&root)).expect("host");
+        let status = host
+            .statuses()
+            .into_iter()
+            .find(|status| status.id == "com.bos.bsh.extensions")
+            .expect("inspector");
+        assert!(status.applied);
+        assert_eq!(status.tools, vec!["extensions__list"]);
+        assert_eq!(status.state, LifecycleState::Active);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_installed_package_is_discovered_and_applied() {
+        let root = scratch("installed");
+        let source = root.join("source");
+        write_package(&source);
+        let store = ExtensionStore::open(root.join("extensions")).expect("store");
+        store.install(&source).expect("install");
+        let host = ExtensionHost::open(config(&root.join("extensions"))).expect("host");
+        let status = host
+            .statuses()
+            .into_iter()
+            .find(|status| status.id == "com.example.hosted")
+            .expect("hosted");
+        assert!(status.applied, "{status:?}");
+        assert_eq!(status.tools, vec!["hosted__echo"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_disabled_package_is_listed_but_not_applied() {
+        let root = scratch("disabled");
+        let source = root.join("source");
+        write_package(&source);
+        let store = ExtensionStore::open(root.join("extensions")).expect("store");
+        store.install(&source).expect("install");
+        let id = ExtensionId::parse("com.example.hosted").expect("id");
+        store.set_enabled(&id, false).expect("disable");
+        let host = ExtensionHost::open(config(&root.join("extensions"))).expect("host");
+        let status = host
+            .statuses()
+            .into_iter()
+            .find(|status| status.id == "com.example.hosted")
+            .expect("hosted");
+        assert!(!status.applied);
+        assert!(!status.configured);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_disabled_dependency_fails_the_dependent() {
+        let root = scratch("disabled-dependency");
+        let base = root.join("source-base");
+        let dependent = root.join("source-dependent");
+        write_package(&base);
+        write_dependent(&dependent, "com.example.dependent", "com.example.hosted");
+        let store = ExtensionStore::open(root.join("extensions")).expect("store");
+        store.install(&base).expect("base");
+        store.install(&dependent).expect("dependent");
+        let base_id = ExtensionId::parse("com.example.hosted").expect("id");
+        store.set_enabled(&base_id, false).expect("disable");
+        let host = ExtensionHost::open(config(&root.join("extensions"))).expect("host");
+        let status = host
+            .statuses()
+            .into_iter()
+            .find(|status| status.id == "com.example.dependent")
+            .expect("dependent");
+        assert!(!status.applied);
+        assert!(status.error.is_some(), "{status:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn doctor_reports_a_hash_tampered_package() {
+        let root = scratch("tamper");
+        let source = root.join("source");
+        write_package(&source);
+        let store = ExtensionStore::open(root.join("extensions")).expect("store");
+        store.install(&source).expect("install");
+        let installed = store
+            .installed_root()
+            .join("com.example.hosted")
+            .join("1.0.0");
+        std::fs::write(installed.join("extra.txt"), "changed").expect("tamper");
+        let host = ExtensionHost::open(config(&root.join("extensions"))).expect("host");
+        let report = host.doctor();
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| issue.message.contains("hash")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_preset_allowlist_also_gates_a_builtin() {
+        let root = scratch("preset-builtin");
+        let mut narrowed = config(&root);
+        narrowed.preset_allowed = Some(BTreeSet::new());
+        let host = ExtensionHost::open(narrowed).expect("host");
+        let status = host
+            .statuses()
+            .into_iter()
+            .find(|status| status.id == "com.bos.bsh.extensions")
+            .expect("inspector");
+        assert!(!status.configured);
+        assert!(!status.applied);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

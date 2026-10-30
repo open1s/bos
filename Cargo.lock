@@ -1390,14 +1390,18 @@ dependencies = [
  "regorus 0.14.0",
  "reqwest",
  "rust-i18n",
+ "semver",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "shellexpand",
  "smallvec",
+ "thiserror 2.0.21",
  "tokio",
  "toml 1.1.8+spec-1.1.0",
  "tungstenite 0.30.0",
  "uuid",
+ "walkdir",
  "zeroize",
 ]
 

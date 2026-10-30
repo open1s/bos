@@ -1,0 +1,9 @@
+{
+  "description": "Echo the arguments through an external JSON-RPC process",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "text": { "type": "string", "description": "Text to echo" }
+    }
+  }
+}

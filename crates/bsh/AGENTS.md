@@ -21,6 +21,31 @@ against feature parity. Three consequences:
 
 When a change trades one against the other, say which won and why.
 
+## Extension platform: the BSH standard (2026-10-30)
+
+`src/extension/` is BSH's runtime-independent extension platform: manifest
+validation, a hashed package store, dependency resolution, scoped capability
+grants with an audit log, a lifecycle state machine, built-in/declarative/process
+runtimes, a bounded event bus, per-extension storage, a declarative UI contract,
+agent tool registration, diagnostics and `bsh ext ...`.
+
+- The normative contract is `docs/bsh-extension-standard.md`; the walkthrough is
+  `docs/bsh-extension-dev-guide.md`; the WIT contract is `crates/bsh/wit/extension.wit`;
+  examples are `examples/extensions/{hello,process-echo}`.
+- It is wired into `caps::build_agent_for_session_inner` with one call to
+  `crate::extension::install`, after the built-in bundles and before MCP. It
+  contributes tools/commands/panels/prompts through the same seams as the
+  built-in bundles.
+- The module carries one scoped `#![allow(dead_code)]` because the contract
+  ships complete (storage, event subscriptions, UI actions) before every host
+  consumer lands; tests cover the unused surface. Keep new accepts outside the
+  module wired.
+- Tests: `cargo test -p bsh --lib extension::` (78 tests). CLI smoke:
+  `cargo run -p bsh -- ext --root /tmp/bsh-ext list`.
+- The legacy Codex/DSH shim in `crates/agent/src/extensions` still backs the old
+  installed-plugin inventory. Do not extend it for new work; new packages target
+  `extension.toml` and the BSH standard.
+
 ## Standing rule: every UI increment ends with a gap check
 
 When a UI feature is finished in `bsh`, compare it against the real DeepSeek

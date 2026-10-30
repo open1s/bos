@@ -1,0 +1,10 @@
+{
+  "description": "Echo the arguments back to the model. Useful for testing a package end to end.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "text": { "type": "string", "description": "Text to echo" }
+    }
+  },
+  "implementation": { "kind": "echo_arguments" }
+}

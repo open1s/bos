@@ -6,6 +6,13 @@ problem_type: reference
 
 # Extension standards: what DSH and Codex plugins can actually do here
 
+> **Historical reference.** This document measures the Codex and DeepSeek
+> Harness plugin formats and the legacy shim in `crates/agent/src/extensions`.
+> It is kept for the old inventory pane and for comparison. BSH's own extension
+> standard, implemented by `crates/bsh/src/extension`, is
+> `docs/bsh-extension-standard.md`; new packages target that manifest
+> (`extension.toml`), not the DSH or Codex formats described here.
+
 Measured 2026-10-23 against the shipped artefacts on this machine, not against
 the fixtures. Every number and quotation below is reproducible with the recipe
 in the appendix.

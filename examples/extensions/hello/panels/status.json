@@ -1,0 +1,14 @@
+{
+  "title": "Hello",
+  "view": {
+    "schema_version": "1.0",
+    "root": {
+      "type": "column",
+      "children": [
+        { "type": "heading", "text": "Hello", "level": 2 },
+        { "type": "text", "text": "The declarative extension is active." },
+        { "type": "button", "label": "Echo", "action": "echo", "style": "primary" }
+      ]
+    }
+  }
+}

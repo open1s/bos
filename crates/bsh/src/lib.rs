@@ -16,6 +16,7 @@ pub(crate) mod caps;
 pub(crate) mod context;
 mod editors;
 pub(crate) mod export;
+pub(crate) mod extension;
 pub(crate) mod files;
 pub(crate) mod glob;
 pub(crate) mod grep;
@@ -45,6 +46,15 @@ pub(crate) mod vault;
 /// The local web-search tool: the model's own search client.
 pub(crate) mod web;
 pub(crate) mod workspace_templates;
+
+/// Run the extension developer CLI and return its exit code.
+///
+/// The entry point is public because the binary answers `bsh ext ...` before
+/// it builds a window; everything behind it stays crate-private so the
+/// platform's internal types are not a second public API.
+pub fn extension_cli(args: &[String]) -> i32 {
+    extension::cli(args)
+}
 
 /// Launch the BOS Harness desktop window. Blocks until the window closes.
 pub fn run() {
