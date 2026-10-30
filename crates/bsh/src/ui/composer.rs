@@ -5,7 +5,6 @@ use gpui_kit::component::input::Textarea;
 use gpui_kit::component::menu::DropdownMenu as _;
 use gpui_kit::component::menu::PopupMenuItem;
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::Disableable as _;
 use gpui_kit::*;
 
 use std::sync::Arc;
@@ -87,8 +86,12 @@ pub(crate) fn permission_modes() -> [(&'static str, &'static str); 3] {
 /// AND the draft is empty (`primaryStops = running && subagent === null &&
 /// (empty || blocked)`). With text in the draft the reference sends - which for
 /// bsh is the queue path the dock already shows.
-pub(crate) fn primary_stops(streaming: bool, can_send: bool) -> bool {
-    streaming && !can_send
+///
+/// The `subagent === null` term is real: a selected child owns the composer, so
+/// the control must never stop the PARENT turn the reader is not looking at. In
+/// a child view an empty draft shows the disabled send control instead.
+pub(crate) fn primary_stops(streaming: bool, can_send: bool, subagent: bool) -> bool {
+    !subagent && streaming && !can_send
 }
 
 /// The measured rule for the primary control's enabled look.
@@ -561,7 +564,6 @@ impl Shell {
                                     .child(self.permission_chip(
                                         permission,
                                         permission_rows,
-                                        streaming,
                                         lang,
                                         cx,
                                     ))
@@ -940,11 +942,23 @@ impl Shell {
             )
     }
 
+    /// The permission trigger and the three-row menu it opens.
+    ///
+    /// The trigger takes the press in EVERY session state. The reference's
+    /// `PermissionSelect` disables it on `locked || busy` only - another client
+    /// holding the session, or its own submit or confirmation still in flight -
+    /// never on a running turn: the busy mark belongs to the model chip
+    /// (`busy ? StateDot : chevron`), while this trigger keeps its chevron. bsh
+    /// passed `any_streaming()` in here, so the chip went inert for the length
+    /// of every turn - the one state the `permission.nextTurn` notice exists
+    /// for, since a running turn's tool set and sandbox are baked at spawn and a
+    /// mode chosen now lands on the next turn. The chip also refused the press
+    /// without changing its look, which is what a reader reports as "cannot
+    /// change the permission".
     fn permission_chip(
         &self,
         permission: crate::settings::resolve::PermissionResolution,
         choices: Vec<super::permission::ModeChoice>,
-        streaming: bool,
         lang: crate::i18n::Lang,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -978,9 +992,8 @@ impl Shell {
         );
         div()
             .debug_selector(|| "composer-permission".to_string())
-            .child(chip.disabled(streaming).dropdown_menu_with_anchor(
-                Anchor::TopLeft,
-                move |menu, _, _| {
+            .child(
+                chip.dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
                     // Short rows fit the kit's own 500px ceiling on one line;
                     // the 330 minimum is the reference's. No warning line sits
                     // above them: the menu says what a mode permits and nothing
@@ -999,8 +1012,8 @@ impl Shell {
                         }));
                     }
                     menu
-                },
-            ))
+                }),
+            )
     }
 
     /// The reference's draft-attachment rail: one 64px tile per image, under
@@ -1095,7 +1108,7 @@ impl Shell {
         lang: crate::i18n::Lang,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let stops = primary_stops(streaming, can_send);
+        let stops = primary_stops(streaming, can_send, self.state.subagent.is_some());
         let enabled = stops || can_send;
         let label: SharedString = lang
             .tr(if stops { "input.stop" } else { "input.send" })

@@ -14,12 +14,13 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use agent::goal::Goal;
 use agent::memory::{FileMemory, MemoryStore};
 use agent::policy::{
     Action, EgressGate, EgressRuleSet, PolicyData, PolicyInput, PolicySet, PolicySource,
     SystemResolver, Target,
 };
-use agent::tools::{BashTool, FunctionTool, PlanTool};
+use agent::tools::{BashTool, FunctionTool, GetGoalTool, GoalStore, PlanTool, UpdateGoalTool};
 use agent::{Agent, AgentConfig, ToolError};
 use futures::StreamExt;
 use log::warn;
@@ -420,6 +421,13 @@ pub(crate) struct BuiltAgent {
     /// than from a second `effective_for` call, so the facts the model reads
     /// and the facts the tools enforce cannot diverge.
     pub(crate) effective: Effective,
+    /// The goal handle this turn's model tools write through, when the session
+    /// has a goal.
+    ///
+    /// The shell keeps it for the turn and settles the transition the model
+    /// recorded when the turn ends; a build without a goal (a pricing build, or
+    /// a session that never set one) carries none.
+    pub(crate) goal: Option<GoalStore>,
 }
 
 /// Build the agent for one session.
@@ -471,6 +479,9 @@ pub(crate) fn build_agent_for_session(
         // the tool schema must be the one a real turn sends, and nothing a
         // pricing build does may reach the reader's pane.
         Arc::new(crate::browser::BrowserHandle::new()),
+        // A pricing build carries no goal: it is pricing what a turn would
+        // send, and the goal tools are added only to a real turn's build.
+        None,
     )
 }
 
@@ -497,6 +508,9 @@ pub(crate) fn build_agent_for_session_with_subagents(
         subagents,
         Arc::new(agent::jobs::JobRegistry::new()),
         Arc::new(crate::browser::BrowserHandle::new()),
+        // The delegation wrapper is a pricing/tool probe path: no goal rides
+        // here. A real turn comes through the _and_jobs entry with its goal.
+        None,
     )
 }
 
@@ -504,7 +518,9 @@ pub(crate) fn build_agent_for_session_with_subagents(
 ///
 /// The roster is created once per app and handed to every build, so a job a
 /// previous turn started stays readable and killable by the next one. The
-/// tools and the header draw the same registry.
+/// tools and the header draw the same registry. The session goal, when there
+/// is one, rides in the same way: the model tools write through its store and
+/// the shell settles it at the turn's end.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_agent_for_session_with_subagents_and_jobs(
     settings: &Settings,
@@ -516,6 +532,7 @@ pub(crate) fn build_agent_for_session_with_subagents_and_jobs(
     subagents: Arc<crate::subagent::SubagentRegistry>,
     jobs: Arc<agent::jobs::JobRegistry>,
     browser: Arc<crate::browser::BrowserHandle>,
+    goal: Option<Goal>,
 ) -> BuiltAgent {
     build_agent_for_session_inner(
         settings,
@@ -526,6 +543,7 @@ pub(crate) fn build_agent_for_session_with_subagents_and_jobs(
         Some((parent, subagents)),
         jobs,
         browser,
+        goal,
     )
 }
 
@@ -539,6 +557,7 @@ fn build_agent_for_session_inner(
     subagents: Option<(&str, Arc<crate::subagent::SubagentRegistry>)>,
     jobs: Arc<agent::jobs::JobRegistry>,
     browser: Arc<crate::browser::BrowserHandle>,
+    goal: Option<Goal>,
 ) -> BuiltAgent {
     let eff = settings.effective_for(choice);
     // A contributed provider may declare that it needs no credential - an open
@@ -678,8 +697,11 @@ fn build_agent_for_session_inner(
     // - Workspace Write is the confined build: the shell validator and the file
     //   tools' root are both installed.
     // - Full access hands the shell `workspace_root: None`, which is the one
-    //   switch that drops BashTool's destructive and elevated-privilege guards,
-    //   and releases the file tools' escape refusal.
+    //   switch that drops BashTool's destructive and elevated-privilege guards.
+    //   The shell still STARTS in the workspace (its own cwd), and the file
+    //   tools keep their root at every tier: the release widens the SANDBOX, it
+    //   does not make the project forgettable. The policy still confines every
+    //   file path to the workspace, so the root costs nothing to keep.
     // The preset's permission is a ceiling, never a grant: a read-only preset
     // keeps a Full-access session read-only, while a full-access preset cannot
     // lift a read-only session.
@@ -688,7 +710,6 @@ fn build_agent_for_session_inner(
     // in place; the policy engine gets the same effective value as data, so a
     // tool that is reached another way is still refused (defence in depth).
     let permission = eff.permission.effective.clone();
-    let confined = is_confined(&permission);
     // The SHELL's confinement is its own resolved fact: a preset may force heel
     // under full access, or (only at full access) turn it off. The file tools
     // keep following the permission tier, which the preset already caps.
@@ -774,11 +795,23 @@ fn build_agent_for_session_inner(
         }
     }
     if eff.file_tools_enabled && !off_bundle("files") {
-        let files_root = if confined { root.clone() } else { None };
+        // The workspace root is what a RELATIVE path resolves against, so every
+        // file tool keeps it at EVERY tier. The release arm used to pass None
+        // here, which did not widen anything - the policy still denies reads
+        // and writes outside the workspace at full access, and only the SHELL
+        // may spawn anywhere - but it broke relative paths outright ("no
+        // workspace root is open for this turn") and left grep/glob walking the
+        // app's launch directory instead of the project.
+        let files_root = root.clone();
+        // The escape pre-check belongs to the confined tier; a released turn
+        // leaves the decision to the policy, whose rule name is what the
+        // reader and the audit see.
+        let enforce_escape = is_confined(&permission);
         let mut files: Vec<Arc<dyn agent::tools::Tool>> = Vec::new();
         if !off_tool("glob") {
             files.push(Arc::new(glob_tool(
                 files_root.clone(),
+                enforce_escape,
                 policy.clone(),
                 session.to_string(),
                 preset.clone(),
@@ -787,6 +820,7 @@ fn build_agent_for_session_inner(
         if !off_tool("grep") {
             files.push(Arc::new(grep_tool(
                 files_root.clone(),
+                enforce_escape,
                 policy.clone(),
                 session.to_string(),
                 preset.clone(),
@@ -795,6 +829,7 @@ fn build_agent_for_session_inner(
         if !off_tool("read_file") {
             files.push(Arc::new(read_file_tool(
                 files_root.clone(),
+                enforce_escape,
                 policy.clone(),
                 session.to_string(),
                 preset.clone(),
@@ -803,6 +838,7 @@ fn build_agent_for_session_inner(
         if writes && !off_tool("write_file") {
             files.push(Arc::new(write_file_tool(
                 files_root.clone(),
+                enforce_escape,
                 policy.clone(),
                 session.to_string(),
                 preset.clone(),
@@ -811,6 +847,7 @@ fn build_agent_for_session_inner(
         if writes && !off_tool("edit_file") {
             files.push(Arc::new(edit_file_tool(
                 files_root.clone(),
+                enforce_escape,
                 policy.clone(),
                 session.to_string(),
                 preset.clone(),
@@ -819,6 +856,7 @@ fn build_agent_for_session_inner(
         if !off_tool("list_dir") {
             files.push(Arc::new(list_dir_tool(
                 files_root.clone(),
+                enforce_escape,
                 policy.clone(),
                 session.to_string(),
                 preset.clone(),
@@ -831,6 +869,24 @@ fn build_agent_for_session_inner(
     if !off_bundle("plan") && !off_tool("update_plan") {
         let tool: Arc<dyn agent::tools::Tool> = Arc::new(PlanTool::new(agent.plan()));
         bundles.push(plugins::Bundle::new("plan", vec![tool]));
+    }
+
+    // The model's way to settle a goal. This is session-durable state rather
+    // than a preset capability, so it answers to the per-tool switches and NOT
+    // to the preset's bundle list: a preset that names `shell`, `files` and
+    // `plan` must not silently withdraw the one path that can complete a goal
+    // (which is exactly the dormant-completion state this seam closes).
+    let mut goal_store = None;
+    if let Some(goal) = goal {
+        if !off_tool("get_goal") && !off_tool("update_goal") {
+            let store = GoalStore::new(goal);
+            let tools: Vec<Arc<dyn agent::tools::Tool>> = vec![
+                Arc::new(GetGoalTool::new(store.clone())),
+                Arc::new(UpdateGoalTool::new(store.clone())),
+            ];
+            goal_store = Some(store);
+            bundles.push(plugins::Bundle::new("goal", tools));
+        }
     }
 
     // The registry is the source of the agent's tools: install the bundles,
@@ -1122,6 +1178,7 @@ fn build_agent_for_session_inner(
         credential_error,
         policy,
         effective: eff,
+        goal: goal_store,
     }
 }
 
@@ -1399,7 +1456,7 @@ pub(crate) fn expand_path(raw: &str) -> PathBuf {
 /// An existing target resolves to its real path, so a read or an edit through a
 /// symlink reaches the file the link points at and the policy sees that same
 /// file rather than the link's name.
-fn resolve_path(root: Option<&Path>, raw: &str) -> Result<PathBuf, String> {
+fn resolve_path(root: Option<&Path>, raw: &str, enforce: bool) -> Result<PathBuf, String> {
     if raw.trim().is_empty() {
         return Err("path must not be empty".to_string());
     }
@@ -1426,11 +1483,17 @@ fn resolve_path(root: Option<&Path>, raw: &str) -> Result<PathBuf, String> {
     // A relative path may only walk within the root. An absolute one may name
     // the root through another spelling (a symlinked /var on macOS), which the
     // real-path check below resolves without a lexical exemption.
-    if !raw_path.is_absolute() && !candidate.starts_with(root) {
+    //
+    // `enforce` is the permission tier's rule: a CONFINED turn refuses an
+    // escape here, while a released one leaves the decision to the policy
+    // (which still denies reads and writes outside the workspace, and whose
+    // rule name is what the reader and the audit see). The root is passed at
+    // every tier either way, because a relative path has to resolve somewhere.
+    if enforce && !raw_path.is_absolute() && !candidate.starts_with(root) {
         return Err(escape(raw));
     }
     let real = real_path(&candidate);
-    if !real.starts_with(root) {
+    if enforce && !real.starts_with(root) {
         return Err(escape(raw));
     }
     Ok(real)
@@ -1597,6 +1660,16 @@ impl SubagentContext {
 
     /// Build a child and, below the depth cap, give it the subagent tool too.
     fn child(&self, child_id: &str) -> Agent {
+        self.child_with_delegation(child_id, true)
+    }
+
+    /// Build a child, optionally without the delegation tool.
+    ///
+    /// The spawn path always wants it (the parent turn only owns the tool when
+    /// the capability gate allowed it), while a rebuilt child asks the gate
+    /// itself: the same predicate that gated the parent turn decides whether
+    /// the restored child may delegate again.
+    fn child_with_delegation(&self, child_id: &str, delegate: bool) -> Agent {
         let mut config = self.config.clone();
         config.name = "subagent".to_string();
         // The child runs on the parent's own budget. It used to be capped at 12
@@ -1632,7 +1705,7 @@ impl SubagentContext {
                 );
             }
         }
-        if self.depth < 1 {
+        if delegate && self.depth < 1 {
             let nested = SubagentContext::new(
                 &child,
                 self.session.clone(),
@@ -1649,6 +1722,63 @@ impl SubagentContext {
         }
         child
     }
+}
+
+/// Rebuild the live child behind a settled run.
+///
+/// A child runs on the parent turn's Tokio runtime and its process does not
+/// survive the app, so a prompt sent to a settled run used to have nowhere to
+/// go. This rebuilds the child from the same resolution the run was spawned
+/// under - the session's model and tools, the focused-child persona, and (at
+/// the delegation depths) the subagent tool, gated by the same capability
+/// predicate - so the reader can continue it exactly like any other session.
+///
+/// The caller replays the stored transcript into the returned agent before the
+/// next turn; this function builds and gates, it does not run.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rebuild_child_agent(
+    settings: &Settings,
+    vault: &Vault,
+    choice: &crate::settings::resolve::SessionChoice,
+    mcp: &crate::mcp::McpPool,
+    run_session: &str,
+    child_id: &str,
+    parent: &str,
+    depth: usize,
+    registry: Arc<crate::subagent::SubagentRegistry>,
+) -> Result<Agent, VaultError> {
+    // The parent turn's build is the inheritance: the child runs on the same
+    // model, the same tools and the same policy, which is why a rebuild goes
+    // through the ordinary builder instead of inventing a config.
+    let built = build_agent_for_session(settings, vault, choice, mcp, run_session);
+    if let Some(error) = built.credential_error {
+        return Err(error);
+    }
+    // The delegation tool is a capability, not a free attachment: ask the same
+    // predicate the parent turn asked, with the run's own session principal.
+    let gates = tool_gates_for(
+        &built.effective.permission.effective,
+        built.effective.preset_tools.as_deref(),
+        &built.policy,
+        run_session,
+    );
+    let root = workspace_root(&built.effective)
+        .map(|path| path.canonicalize().unwrap_or(path))
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let context = SubagentContext::new(
+        &built.agent,
+        run_session,
+        parent,
+        // The run's depth is the child's; the context sits one level above it.
+        depth.saturating_sub(1),
+        registry,
+        built.policy.clone(),
+        built.effective.preset_id.clone(),
+        root,
+        crate::context::RuntimeFacts::from_effective(&built.effective),
+    );
+    Ok(context.child_with_delegation(child_id, gates.subagent))
 }
 
 /// Flatten a child's session into the rows the read-only view draws.
@@ -1809,8 +1939,7 @@ pub(crate) fn attach_subagent_tool(agent: &mut Agent, context: SubagentContext) 
                     ));
                 };
                 let child = context.child(&id);
-                let turn_context =
-                    crate::context::TurnContext::from_facts(&context.runtime, true);
+                let turn_context = crate::context::TurnContext::from_facts(&context.runtime, true);
                 let registry = context.registry.clone();
                 let task_id = id.clone();
                 let task_title = title.clone();
@@ -1820,14 +1949,9 @@ pub(crate) fn attach_subagent_tool(agent: &mut Agent, context: SubagentContext) 
                 // handle the header and subagent_result read.
                 tokio::spawn(async move {
                     log::info!("subagent {task_id} started: {task_title}");
-                    let result = stream_child(
-                        &child,
-                        prompt,
-                        registry.clone(),
-                        &task_id,
-                        &turn_context,
-                    )
-                    .await;
+                    let result =
+                        stream_child(&child, prompt, registry.clone(), &task_id, &turn_context)
+                            .await;
                     let usage = child.last_token_usage().unwrap_or((0, 0));
                     let transcript = child_transcript(&child);
                     registry.set_agent(&task_id, Arc::new(tokio::sync::Mutex::new(child)));
@@ -1922,8 +2046,7 @@ fn attach_subagent_result_tool(
                         .collect();
                     return Ok(serde_json::json!({ "runs": runs }));
                 }
-                let deadline =
-                    std::time::Instant::now() + std::time::Duration::from_secs(wait);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
                 loop {
                     let Some(status) = registry.status(&id) else {
                         return Err(ToolError::InvalidInput(format!(
@@ -2959,6 +3082,7 @@ fn glob_empty_hint(pattern: &str, root: &Path, include_ignored: bool) -> String 
 /// glob - list the files under a root whose paths match a pattern.
 fn glob_tool(
     root: Option<PathBuf>,
+    enforce: bool,
     policy: Arc<PolicySet>,
     session: String,
     preset: String,
@@ -2995,7 +3119,7 @@ fn glob_tool(
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
             let search_root =
-                resolve_path(root.as_deref(), &raw).map_err(ToolError::InvalidInput)?;
+                resolve_path(root.as_deref(), &raw, enforce).map_err(ToolError::InvalidInput)?;
             check_path(
                 &policy,
                 &session,
@@ -3034,11 +3158,8 @@ fn glob_tool(
                 "truncated": found.truncated,
             });
             if empty {
-                result["hint"] = serde_json::json!(glob_empty_hint(
-                    &pattern,
-                    &search_root,
-                    include_ignored
-                ));
+                result["hint"] =
+                    serde_json::json!(glob_empty_hint(&pattern, &search_root, include_ignored));
             }
             Ok(result)
         },
@@ -3048,6 +3169,7 @@ fn glob_tool(
 /// grep - search file contents with a ripgrep regular expression.
 fn grep_tool(
     root: Option<PathBuf>,
+    enforce: bool,
     policy: Arc<PolicySet>,
     session: String,
     preset: String,
@@ -3124,7 +3246,7 @@ fn grep_tool(
                 .filter(|pattern| !pattern.trim().is_empty())
                 .map(str::to_string);
             let search_root =
-                resolve_path(root.as_deref(), &raw).map_err(ToolError::InvalidInput)?;
+                resolve_path(root.as_deref(), &raw, enforce).map_err(ToolError::InvalidInput)?;
             check_path(
                 &policy,
                 &session,
@@ -3173,22 +3295,26 @@ fn grep_tool(
                 "truncated": found.truncated,
             });
             if !found.binary.is_empty() {
-                result["binary"] = serde_json::json!(found
-                    .binary
-                    .iter()
-                    .map(|binary| serde_json::json!({
-                        "path": binary.path.to_string_lossy(),
-                        "offset": binary.offset,
-                        "message": binary.message(),
-                    }))
-                    .collect::<Vec<_>>());
+                result["binary"] = serde_json::json!(
+                    found
+                        .binary
+                        .iter()
+                        .map(|binary| serde_json::json!({
+                            "path": binary.path.to_string_lossy(),
+                            "offset": binary.offset,
+                            "message": binary.message(),
+                        }))
+                        .collect::<Vec<_>>()
+                );
             }
             if files_without_match {
-                result["files_without_match"] = serde_json::json!(found
-                    .unmatched
-                    .iter()
-                    .map(|path| path.to_string_lossy())
-                    .collect::<Vec<_>>());
+                result["files_without_match"] = serde_json::json!(
+                    found
+                        .unmatched
+                        .iter()
+                        .map(|path| path.to_string_lossy())
+                        .collect::<Vec<_>>()
+                );
             }
             if empty && found.unmatched.is_empty() {
                 result["hint"] = serde_json::json!(crate::grep::hint(&query, &search_root));
@@ -3201,6 +3327,7 @@ fn grep_tool(
 /// read_file - read a UTF-8 file inside the workspace.
 fn read_file_tool(
     root: Option<PathBuf>,
+    enforce: bool,
     policy: Arc<PolicySet>,
     session: String,
     preset: String,
@@ -3221,7 +3348,8 @@ fn read_file_tool(
             let raw = arg_str(args, "path")?;
             let offset = arg_positive(args, "offset")?;
             let limit = arg_positive(args, "limit")?;
-            let target = resolve_path(root.as_deref(), &raw).map_err(ToolError::InvalidInput)?;
+            let target =
+                resolve_path(root.as_deref(), &raw, enforce).map_err(ToolError::InvalidInput)?;
             check_path(
                 &policy,
                 &session,
@@ -3251,6 +3379,7 @@ fn read_file_tool(
 /// write_file - write a UTF-8 file inside the workspace.
 fn write_file_tool(
     root: Option<PathBuf>,
+    enforce: bool,
     policy: Arc<PolicySet>,
     session: String,
     preset: String,
@@ -3269,7 +3398,8 @@ fn write_file_tool(
         move |args| {
             let raw = arg_str(args, "path")?;
             let content = arg_str(args, "content")?;
-            let target = resolve_path(root.as_deref(), &raw).map_err(ToolError::InvalidInput)?;
+            let target =
+                resolve_path(root.as_deref(), &raw, enforce).map_err(ToolError::InvalidInput)?;
             // The check is BEFORE the parent directory is created: a denied
             // write must not leave the parent's mtime moved as a side effect.
             check_path(
@@ -3304,6 +3434,7 @@ fn write_file_tool(
 /// refused unless `replace_all` says every occurrence is intended.
 fn edit_file_tool(
     root: Option<PathBuf>,
+    enforce: bool,
     policy: Arc<PolicySet>,
     session: String,
     preset: String,
@@ -3332,14 +3463,16 @@ fn edit_file_tool(
             }
             if old == new {
                 return Err(ToolError::InvalidInput(
-                    "old_string and new_string are identical; there is nothing to replace".to_string(),
+                    "old_string and new_string are identical; there is nothing to replace"
+                        .to_string(),
                 ));
             }
             let replace_all = args
                 .get("replace_all")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
-            let target = resolve_path(root.as_deref(), &raw).map_err(ToolError::InvalidInput)?;
+            let target =
+                resolve_path(root.as_deref(), &raw, enforce).map_err(ToolError::InvalidInput)?;
             // Before the read: a denied edit is refused before its content is
             // even observed.
             check_path(
@@ -3383,6 +3516,7 @@ fn edit_file_tool(
 /// list_dir - list a directory's entries.
 fn list_dir_tool(
     root: Option<PathBuf>,
+    enforce: bool,
     policy: Arc<PolicySet>,
     session: String,
     preset: String,
@@ -3397,7 +3531,8 @@ fn list_dir_tool(
         }),
         move |args| {
             let raw = arg_str(args, "path")?;
-            let target = resolve_path(root.as_deref(), &raw).map_err(ToolError::InvalidInput)?;
+            let target =
+                resolve_path(root.as_deref(), &raw, enforce).map_err(ToolError::InvalidInput)?;
             check_path(
                 &policy,
                 &session,
@@ -5374,6 +5509,46 @@ mod tests {
         );
     }
 
+    /// A session with a goal mounts the model's completion tools; a session
+    /// without one carries neither, so the surface is present or absent rather
+    /// than present and dormant. The settle handle rides the same build.
+    #[test]
+    fn a_goal_mounts_the_completion_tools() {
+        use std::sync::Arc;
+        let settings = bare();
+        let goal = agent::goal::Goal::new("ship it", Some(8)).expect("a goal");
+        let built = crate::caps::build_agent_for_session_with_subagents_and_jobs(
+            &settings,
+            &Vault::disabled(),
+            &SessionChoice::default(),
+            &crate::mcp::McpPool::default(),
+            "session",
+            "session",
+            Arc::new(crate::subagent::SubagentRegistry::default()),
+            Arc::new(agent::jobs::JobRegistry::new()),
+            Arc::new(crate::browser::BrowserHandle::new()),
+            Some(goal),
+        );
+        let names = tool_names(&built);
+        assert!(
+            names.iter().any(|name| name == "get_goal")
+                && names.iter().any(|name| name == "update_goal"),
+            "the goal's two tools ride the turn: {names:?}"
+        );
+        let store = built.goal.expect("the settle handle rides the build");
+        assert_eq!(
+            store.snapshot().map(|goal| goal.objective),
+            Some("ship it".to_string())
+        );
+
+        // No goal, no tools: a goal-less session cannot see a dormant surface.
+        let built = build(&settings);
+        let names = tool_names(&built);
+        assert!(!names.iter().any(|name| name == "get_goal"), "{names:?}");
+        assert!(!names.iter().any(|name| name == "update_goal"), "{names:?}");
+        assert!(built.goal.is_none());
+    }
+
     /// The five gated capabilities, in display order.
     type Gates = (bool, bool, bool, bool, bool);
     /// One row of the registration table.
@@ -5798,6 +5973,7 @@ verdict := {{"allow": false, "rule": "{rule}", "reason": "refused by the workspa
             Arc::new(crate::subagent::SubagentRegistry::default()),
             jobs.clone(),
             Arc::new(crate::browser::BrowserHandle::new()),
+            None,
         );
         let registry = built.agent.registry().expect("registry");
         let marker = root.join("marker.txt");
@@ -6618,6 +6794,42 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             .execute("read_file", &serde_json::json!({ "path": "Cargo.toml" }))
             .expect("a relative in-workspace path reads");
         assert_eq!(out["content"], "[package]");
+    }
+
+    /// Full access keeps the root for RESOLUTION too.
+    ///
+    /// The release widens the sandbox and drops the shell's guards; it never
+    /// meant "forget the project". Before this, a Full-access chat resolved no
+    /// relative path at all ("no workspace root is open for this turn"), and
+    /// grep/glob walked the app's launch directory instead of the workspace.
+    /// Outside paths are still refused, by the policy, exactly as before.
+    #[test]
+    fn full_access_still_resolves_relative_paths_inside_the_workspace() {
+        let root = scratch("full-access-relative");
+        std::fs::write(root.join("Cargo.toml"), "[package]").expect("file");
+        let mut settings = rooted(&root);
+        settings.workspace.agent.permission = FULL_ACCESS.to_string();
+        let built = build(&settings);
+        let registry = built.agent.registry().expect("registry");
+        let out = registry
+            .execute("read_file", &serde_json::json!({ "path": "Cargo.toml" }))
+            .expect("a relative in-workspace path reads at full access");
+        assert_eq!(out["content"], "[package]");
+
+        let outside = scratch("full-access-outside");
+        std::fs::write(outside.join("secret.txt"), "secret").expect("file");
+        let error = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({
+                    "path": outside.join("secret.txt").to_string_lossy()
+                }),
+            )
+            .expect_err("outside reads stay confined at full access");
+        assert!(
+            error.to_string().contains("read-outside-workspace"),
+            "the policy still decides outside paths at full access: {error}"
+        );
     }
 
     /// A file past the ceiling is refused with the arguments that read a

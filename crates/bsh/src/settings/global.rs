@@ -906,7 +906,7 @@ where
                 other => {
                     return Err(E::custom(format!(
                         "level: expected an integer 0..={MAX_PRESET_LEVEL} (or a legacy name), got '{other}'"
-                    )))
+                    )));
                 }
             };
             Ok(Some(level))
@@ -1433,10 +1433,11 @@ fn preset_deny_paths() -> Vec<String> {
 ///   UNRESTRICTED egress: that is what "allowed by default" means here. Once a
 ///   file exists the same inheritance is constrained by it, and a preset can
 ///   never widen that floor. `creator` is the same.
-/// - `read-only` keeps only `read_file`, `list_dir` and `update_plan` - none of
-///   which opens a socket - so it declares `egress = []`, which DENIES ALL local
-///   egress. A read of the workspace needs no network, and the derived proxy
-///   set is empty, so the kernel denies outbound traffic with no proxy running.
+/// - `read-only` keeps only the read-side tools (`glob`, `grep`, `read_file`,
+///   `list_dir`), `update_plan` and the two goal tools - none of which opens a
+///   socket - so it declares `egress = []`, which DENIES ALL local egress. A
+///   read of the workspace needs no network, and the derived proxy set is
+///   empty, so the kernel denies outbound traffic with no proxy running.
 ///
 /// The `egress` field governs every tool that opens a socket under this host -
 /// the shell, MCP and the local `web_search` tool - and `web_search` decides
@@ -1509,10 +1510,12 @@ pub(crate) fn built_in_preset(id: &str) -> Option<Preset> {
             deny: preset_deny_paths(),
             plugins: vec!["files".to_string(), "plan".to_string()],
             tools: Some(vec![
+                "get_goal".to_string(),
                 "glob".to_string(),
                 "grep".to_string(),
                 "read_file".to_string(),
                 "list_dir".to_string(),
+                "update_goal".to_string(),
                 "update_plan".to_string(),
             ]),
             skills: Some(Vec::new()),

@@ -74,10 +74,6 @@
 "goal.phaseCompleted": "complete"
 "goal.phaseBlocked": "blocked"
 "goal.showTitle": "Goal"
-"goal.createdTitle": "Goal created"
-"goal.updatedTitle": "Goal updated"
-"goal.pausedTitle": "Goal paused"
-"goal.resumedTitle": "Goal resumed"
 "goal.status": "Status: {phase}"
 "goal.blocker": "Blocker: {code}: {message}"
 "goal.objective": "Objective: {objective}"
@@ -1336,7 +1332,6 @@
 "subagents.roleTool": "Tool"
 "subagents.busy": "This subagent is still running."
 "subagents.unavailable": "This subagent is no longer available."
-"subagents.finishedToParent": "This subagent run has finished, so your message continues in the main conversation."
 "subagents.select": "Select subagent"
 # The changed-files card a turn tail closes with, and the hover preview that
 # opens off one of its rows. Wording measured from the reference

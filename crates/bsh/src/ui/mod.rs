@@ -89,6 +89,31 @@ pub(crate) fn icon(name: IconName, size: f32, color: u32) -> Div {
     div().text_size(px(size)).text_color(rgb(color)).child(name)
 }
 
+/// A raw SVG glyph, sized and coloured like a line icon.
+///
+/// The reference's workspace folder and disclosure triangle are not in the
+/// kit's Lucide catalog, and both carry a 16px viewBox of their own, so they
+/// travel as bundled SVG bytes and render through GPUI's data path.
+/// `quarter_turns` turns the drawing without moving its box: the reference
+/// rotates its caret 90 degrees when a workspace opens (`rotate(90deg)` on
+/// `.arrow`).
+pub(crate) fn asset_icon(bytes: &'static [u8], size: f32, color: u32, quarter_turns: f32) -> Div {
+    let mut glyph = svg()
+        .data(bytes)
+        .flex_shrink_0()
+        .size(px(size))
+        .text_color(rgb(color));
+    if quarter_turns != 0.0 {
+        glyph = glyph.with_transformation(Transformation::rotate(radians(
+            std::f32::consts::FRAC_PI_2 * quarter_turns,
+        )));
+    }
+    div()
+        .text_size(px(size))
+        .text_color(rgb(color))
+        .child(glyph)
+}
+
 /// The reference draws its hairlines at `.5px`, which the kit's whole-pixel
 /// border macros cannot express, so the measured width goes straight into the
 /// refinement. The kit's border macros are whole-pixel only.

@@ -2398,10 +2398,16 @@ mod tests {
         let candidates: &[(&str, &[&str])] = &[
             ("/usr/sbin/ipconfig", &["getifaddr", "en0"]),
             ("/usr/sbin/ipconfig", &["getifaddr", "en1"]),
-            ("/bin/sh", &["-c", "hostname -I 2>/dev/null | awk '{print $1}'"]),
             (
                 "/bin/sh",
-                &["-c", "ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1"],
+                &["-c", "hostname -I 2>/dev/null | awk '{print $1}'"],
+            ),
+            (
+                "/bin/sh",
+                &[
+                    "-c",
+                    "ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1",
+                ],
             ),
         ];
         for (program, args) in candidates {

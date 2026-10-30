@@ -1,6 +1,7 @@
 //! The root view: state ownership, layout, and the streaming pump.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::text::TextViewState;
@@ -1772,20 +1773,22 @@ impl Shell {
         // The terminal clock: Ghostty draws and scrolls on its own, so the pane
         // only re-reads the surface's liveness and the palette here. A quiet
         // terminal costs one compare, which is why the cadence can be fine.
-        cx.spawn(async move |this, cx| loop {
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(120))
-                .await;
-            if this
-                .update(cx, |this, cx| {
-                    // The policy file's stamp is checked here, not per frame:
-                    // an edited policy takes effect without a restart.
-                    this.refresh_terminal_policy(cx);
-                    this.sync_terminal(cx);
-                })
-                .is_err()
-            {
-                break;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(120))
+                    .await;
+                if this
+                    .update(cx, |this, cx| {
+                        // The policy file's stamp is checked here, not per frame:
+                        // an edited policy takes effect without a restart.
+                        this.refresh_terminal_policy(cx);
+                        this.sync_terminal(cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             }
         })
         .detach();
@@ -1810,23 +1813,35 @@ impl Shell {
         // subagent rows and the selected transcript need their own fast clock.
         // It is idle-cheap: the update is a lock check and a notify only while
         // a child is actually running.
-        cx.spawn(async move |this, cx| loop {
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(100))
-                .await;
-            if this
-                .update(cx, |this, cx| {
-                    if this.state.subagents.running_count() == 0 {
-                        return;
-                    }
-                    if this.state.subagent.is_some() {
-                        this.state.refresh_subagent_preview();
-                    }
-                    this.frame_notify("subagent-clock", cx);
-                })
-                .is_err()
-            {
-                break;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(100))
+                    .await;
+                if this
+                    .update(cx, |this, cx| {
+                        // Idle only when no child runs AND no child has a prompt
+                        // waiting: a queued prompt is the clock's own work.
+                        if this.state.subagents.running_count() == 0
+                            && !this.state.subagents.any_pending()
+                        {
+                            return;
+                        }
+                        if this.state.subagent.is_some() {
+                            this.state.refresh_subagent_preview();
+                        }
+                        // A running child has nothing to drain, and the snapshot
+                        // clones every transcript: ask the cheap flag first so a
+                        // tick that only watches a live run pays no clone.
+                        if this.state.subagents.any_pending() {
+                            this.drain_subagent_prompts(cx);
+                        }
+                        this.frame_notify("subagent-clock", cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             }
         })
         .detach();
@@ -2722,15 +2737,16 @@ impl Shell {
                 .is_some_and(|id| self.state.is_streaming(id) && self.state.has_queued(id))
     }
 
-    /// Empty the composer after a submission left it.
     /// Continue the selected child run with a follow-up prompt.
     ///
-    /// A child whose run row is gone (an app restart) or whose live handle no
-    /// longer resolves is NOT a dead end for the reader: a finished run means
-    /// the prompt is for the MAIN agent, so the shell returns to the parent
-    /// conversation and opens the turn there. Only a run that claims to be
-    /// RUNNING with no reachable process refuses, because steering it is
-    /// impossible and queueing to the parent would be the wrong target.
+    /// A child behaves like any other agent:
+    ///
+    /// - while its turn still streams, the prompt is QUEUED and starts as the
+    ///   next child turn when the current one settles, the way the main
+    ///   composer queues behind a running session;
+    /// - when no live process is left (a restart, or a run the store restored),
+    ///   the child is REBUILT from its saved transcript and the prompt runs
+    ///   there. The reader's message never jumps into the parent conversation.
     fn send_to_subagent(
         &mut self,
         id: String,
@@ -2738,37 +2754,25 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let run = self
-            .state
-            .subagents
-            .snapshot()
-            .into_iter()
-            .find(|run| run.id == id);
-        let agent = self.state.subagents.agent(&id);
-        // The running flag is read BEFORE the destructuring: the let-else
-        // moves the row, and the refusal branch still needs it.
-        let live = run.as_ref().is_some_and(|run| run.status.is_running());
-        let (Some(agent), Some(run)) = (agent, run) else {
-            if live {
-                self.state
-                    .notice(crate::i18n::tr(self.state.lang, "subagents.unavailable").to_string());
-                return;
-            }
-            self.state.leave_subagent();
+        let Some(run) = self.state.subagents.run(&id) else {
             self.state
-                .notice(crate::i18n::tr(self.state.lang, "subagents.finishedToParent").to_string());
-            cx.notify();
-            let attachments = std::mem::take(&mut self.state.attachments);
-            match self.submit(prompt, attachments, cx) {
-                Submit::Accepted => self.clear_composer(window, cx),
-                // A refusal leaves the chips where the reader can retry them.
-                Submit::Refused(attachments) => self.state.attachments = attachments,
-            }
+                .notice(crate::i18n::tr(self.state.lang, "subagents.unavailable").to_string());
             return;
         };
+        if run.status.is_running() {
+            if !self.state.subagents.queue_followup(&id, &prompt) {
+                self.state
+                    .notice(crate::i18n::tr(self.state.lang, "subagents.busy").to_string());
+                return;
+            }
+            self.state.refresh_subagent_preview();
+            self.clear_composer(window, cx);
+            cx.notify();
+            return;
+        }
         // A follow-up is another child turn, so it asks the same spawn
-        // question the tool asks. The check runs before `begin_followup`
-        // mutates the run: a denial leaves the child exactly as it was.
+        // question the tool asks. The check runs before the run is mutated: a
+        // denial leaves the child exactly as it was.
         let eff = self.state.effective_in(&run.session);
         let policy = crate::caps::policy_for_effective(&self.state.settings, &eff);
         if let Err(refusal) =
@@ -2777,32 +2781,108 @@ impl Shell {
             self.state.notice(refusal);
             return;
         }
+        let agent = match self.child_agent_for(&run) {
+            Ok(agent) => agent,
+            Err(message) => {
+                self.state.notice(message);
+                return;
+            }
+        };
         if !self.state.subagents.begin_followup(&id, &prompt) {
             self.state
                 .notice(crate::i18n::tr(self.state.lang, "subagents.busy").to_string());
             return;
         }
         self.state.refresh_subagent_preview();
-        self.state.persist_subagents();
         self.clear_composer(window, cx);
+        self.spawn_child_turn(&id, agent, prompt, eff, cx);
+    }
+
+    /// The live child behind a run, rebuilt from its saved transcript when the
+    /// process that ran it is gone.
+    ///
+    /// A rebuilt child is the same agent the parent turn delegated to: the
+    /// session's model and tools, the focused-child persona, and the delegation
+    /// tool where the capability gate allows it. The stored rows are replayed
+    /// into it before the next turn, so the child answers with its own history
+    /// rather than a stranger's.
+    fn child_agent_for(
+        &mut self,
+        run: &crate::subagent::SubagentRun,
+    ) -> Result<Arc<tokio::sync::Mutex<agent::Agent>>, String> {
+        if let Some(agent) = self.state.subagents.agent(&run.id) {
+            return Ok(agent);
+        }
+        // A child that was never saved has no Session to read a model from; it
+        // ran on the parent's resolution, so that is the one to restore.
+        let choice = if self.state.store.session(&run.id).is_some() {
+            self.state.session_choice(&run.id)
+        } else {
+            self.state.session_choice(&run.session)
+        };
+        // A model the trees no longer define is refused where the reader can
+        // see it, exactly as the parent send path refuses it, instead of
+        // rebuilding a child against a name nobody chose.
+        if let Some(key) = self.state.settings.refusal_for(&choice) {
+            return Err(crate::i18n::tr(self.state.lang, key));
+        }
+        let child = crate::caps::rebuild_child_agent(
+            &self.state.settings,
+            &self.state.vault,
+            &choice,
+            &self.state.mcp,
+            &run.session,
+            &run.id,
+            &run.parent,
+            run.depth,
+            self.state.subagents.clone(),
+        )
+        .map_err(|error| error.message(self.state.lang))?;
+        // The saved child Session is what the child itself saw. A row restored
+        // from disk carries the same history in the registry, so either source
+        // replays the same conversation.
+        let history = self
+            .state
+            .store
+            .session(&run.id)
+            .map(|session| session.messages.clone())
+            .unwrap_or_else(|| run.chat_messages());
+        crate::runner::Runner::seed_session(&child, &history);
+        let agent = Arc::new(tokio::sync::Mutex::new(child));
+        self.state.subagents.set_agent(&run.id, agent.clone());
+        Ok(agent)
+    }
+
+    /// Start one child turn that answers the reader's prompt.
+    ///
+    /// The run has already been reopened by the caller (an idle send, or the
+    /// queue drain). The engine awaits a Tokio timer for its LLM timeout and
+    /// GPUI's executor has no reactor, so the stream runs on the runner's
+    /// runtime and only the result is awaited from the UI task.
+    fn spawn_child_turn(
+        &mut self,
+        id: &str,
+        agent: Arc<tokio::sync::Mutex<agent::Agent>>,
+        prompt: String,
+        eff: crate::settings::Effective,
+        cx: &mut Context<Self>,
+    ) {
+        // The UI task outlives this frame, so the id it reports against is
+        // owned rather than borrowed from the caller.
+        let id = id.to_string();
         let registry = self.state.subagents.clone();
         let stream_registry = self.state.subagents.clone();
         let stream_id = id.clone();
         // A follow-up is a child turn too, so it carries a freshly rendered
-        // snapshot and the delegation context, from the same resolution the
-        // spawn check above used. The facts are pure; the render (and its
-        // instruction stat/read) happens on the runner's own task.
+        // snapshot and the delegation context, from the resolution the spawn
+        // check used. The facts are pure; the render (and its instruction
+        // stat/read) happens on the runner's own task.
         let facts = crate::context::RuntimeFacts::from_effective(&eff);
-        // The engine awaits a Tokio timer for its LLM timeout; GPUI's executor
-        // is not a Tokio runtime, so the child turn must be spawned on the
-        // runner's runtime and only its result awaited from the UI task.
         let handle = self.state.runner.spawn_task(async move {
             let turn_context = crate::context::TurnContext::from_facts(&facts, true);
             let guard = agent.lock().await;
             // A follow-up is a child turn too, so it ends on the child's own
-            // rule: its model stops asking for tools. The 600-second wall clock
-            // here was the same cap the spawn path carried, and it aborted real
-            // work while reporting "subagent timed out" as a finished run.
+            // rule: its model stops asking for tools.
             let result = crate::caps::stream_child(
                 &guard,
                 prompt,
@@ -2840,6 +2920,52 @@ impl Shell {
             });
         });
         self.keep_task(task);
+    }
+
+    /// Start the prompt a child accepted while its last turn still streamed.
+    ///
+    /// A child is a normal agent, so a mid-turn submission waits behind the
+    /// turn instead of being refused. The child clock calls this, which is what
+    /// makes a prompt queued against a run the MODEL spawned (a run with no UI
+    /// task behind it) start the same way.
+    ///
+    /// A refusal - the spawn policy or a missing credential - drops the waiting
+    /// prompt after saying why. Retrying it on every tick would spam the notice
+    /// line and never make progress.
+    pub(crate) fn drain_subagent_prompts(&mut self, cx: &mut Context<Self>) {
+        for run in self.state.subagents.snapshot() {
+            if run.status.is_running() || run.pending.is_empty() {
+                continue;
+            }
+            let eff = self.state.effective_in(&run.session);
+            let policy = crate::caps::policy_for_effective(&self.state.settings, &eff);
+            if let Err(refusal) = crate::caps::check_spawn(
+                &policy,
+                "subagent",
+                &run.session,
+                &eff.preset_id,
+                &eff.root,
+            ) {
+                self.state.notice(refusal);
+                self.state.subagents.drop_pending(&run.id);
+                continue;
+            }
+            let agent = match self.child_agent_for(&run) {
+                Ok(agent) => agent,
+                Err(message) => {
+                    self.state.notice(message);
+                    self.state.subagents.drop_pending(&run.id);
+                    continue;
+                }
+            };
+            // One prompt per settled run; the rest wait for this turn, so the
+            // child never writes two answers over one transcript.
+            let Some(prompt) = self.state.subagents.take_pending(&run.id) else {
+                continue;
+            };
+            self.state.refresh_subagent_preview();
+            self.spawn_child_turn(&run.id, agent, prompt, eff, cx);
+        }
     }
 
     /// Condense the active session's older history into a model-written
@@ -2927,6 +3053,8 @@ impl Shell {
             self.refuse_compact(&id, lang.tr("slash.compactNoModel"), true, cx);
             return;
         }
+        // The summarizer is not the turn: it carries no goal tools, so no goal
+        // store is built for it.
         let built = crate::caps::build_agent_for_session_with_subagents_and_jobs(
             &self.state.settings,
             &self.state.vault,
@@ -2937,6 +3065,7 @@ impl Shell {
             self.state.subagents.clone(),
             self.state.jobs.clone(),
             self.state.browser.clone(),
+            None,
         );
         if let Some(error) = built.credential_error.as_ref() {
             // The vault's refusal is the real cause and names what is missing;
@@ -3110,6 +3239,7 @@ impl Shell {
         self.compact_history(cx);
     }
 
+    /// Empty the composer after a submission left it.
     fn clear_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.composer
             .update(cx, |input, cx| input.set_value("", window, cx));
@@ -3144,6 +3274,7 @@ impl Shell {
             self.state.notice(why);
             return;
         }
+        let goal = self.state.goal(&id);
         let built = crate::caps::build_agent_for_session_with_subagents_and_jobs(
             &self.state.settings,
             &self.state.vault,
@@ -3154,6 +3285,7 @@ impl Shell {
             self.state.subagents.clone(),
             self.state.jobs.clone(),
             self.state.browser.clone(),
+            goal,
         );
         if let Some(error) = &built.credential_error {
             // No turn opens without a credential: a locked vault names itself
@@ -3172,6 +3304,10 @@ impl Shell {
         // arrives after the reader changes the preset or permission would join
         // this baked build, so the queue compares against this record.
         self.state.record_turn_generation(&id);
+        // A goal rides the turn's build: the model tools write through this
+        // store, and the pump settles the recorded transition when the turn
+        // ends, before it decides whether to continue.
+        let goal_store = built.goal.clone();
         let agent = built.agent;
         // The reader's `/name` gesture loads that skill into THIS turn - the
         // reference's pre-step listener - and the block is recorded on the
@@ -3183,6 +3319,11 @@ impl Shell {
         // The agent shares this store with its `update_plan` tool, so the
         // to-do panel reads the running plan through it.
         self.state.attach_plan(&id, agent.plan());
+        // The goal tools write through this store; settling it at the turn's
+        // end is what lets a completed goal stop the round loop.
+        if let Some(store) = goal_store {
+            self.state.attach_goal(&id, store);
+        }
         // The queue dock steers into this turn through the agent's own
         // mailbox. It is attached here, at the one turn-opening path, and
         // dropped when the turn ends - so only a live turn can be steered.
@@ -3419,46 +3560,48 @@ impl Shell {
         // and repaints only when the second differs from the one the last frame
         // painted. Notifying unconditionally repainted an idle, silent turn at
         // the display's cadence and kept doing it after the stream was gone.
-        let clock = cx.spawn(async move |this, cx| loop {
-            let wait = this
-                .update(cx, |this, cx| {
-                    // No stream, no clock. A dead channel clears its marker
-                    // below, which is what lets this loop end.
-                    if !this.state.any_streaming() {
-                        return None;
-                    }
-                    let painted = this.painted_elapsed_seconds();
-                    if let Some(seconds) = painted {
-                        if this.elapsed_painted != Some(seconds) {
-                            this.frame_notify("elapsed-clock", cx);
+        let clock = cx.spawn(async move |this, cx| {
+            loop {
+                let wait = this
+                    .update(cx, |this, cx| {
+                        // No stream, no clock. A dead channel clears its marker
+                        // below, which is what lets this loop end.
+                        if !this.state.any_streaming() {
+                            return None;
                         }
-                    }
-                    Some(match painted {
-                        Some(_) => {
-                            // Wake exactly when the label's second turns over.
-                            let elapsed = this
-                                .state
-                                .turn_started
-                                .map(|started| started.elapsed())
-                                .unwrap_or_default();
-                            let millis = u64::from(elapsed.subsec_millis());
-                            std::time::Duration::from_millis(if millis == 0 {
-                                1_000
-                            } else {
-                                1_000 - millis
-                            })
+                        let painted = this.painted_elapsed_seconds();
+                        if let Some(seconds) = painted {
+                            if this.elapsed_painted != Some(seconds) {
+                                this.frame_notify("elapsed-clock", cx);
+                            }
                         }
-                        // No running line on screen: nothing to advance. Keep
-                        // watching for a session switch that puts one back; the
-                        // frame that draws it records the second itself.
-                        None => std::time::Duration::from_millis(250),
+                        Some(match painted {
+                            Some(_) => {
+                                // Wake exactly when the label's second turns over.
+                                let elapsed = this
+                                    .state
+                                    .turn_started
+                                    .map(|started| started.elapsed())
+                                    .unwrap_or_default();
+                                let millis = u64::from(elapsed.subsec_millis());
+                                std::time::Duration::from_millis(if millis == 0 {
+                                    1_000
+                                } else {
+                                    1_000 - millis
+                                })
+                            }
+                            // No running line on screen: nothing to advance. Keep
+                            // watching for a session switch that puts one back; the
+                            // frame that draws it records the second itself.
+                            None => std::time::Duration::from_millis(250),
+                        })
                     })
-                })
-                .ok()
-                .flatten();
-            match wait {
-                Some(wait) => cx.background_executor().timer(wait).await,
-                None => break,
+                    .ok()
+                    .flatten();
+                match wait {
+                    Some(wait) => cx.background_executor().timer(wait).await,
+                    None => break,
+                }
             }
         });
         self.keep_task(clock);
@@ -3523,6 +3666,10 @@ impl Shell {
                     // frame the batch asks for.
                     if let Some(failed) = terminal {
                         shell.state.finish_plan(&session_id);
+                        // A goal the model settled during the turn takes
+                        // effect BEFORE the loop decides to continue: a
+                        // completed or blocked goal must not start round n+1.
+                        shell.state.settle_goal(&session_id);
                         shell.state.persist_subagents();
                         // A finished turn can append trajectory rows, so a page
                         // the trace had exhausted is worth asking for again.
@@ -3561,6 +3708,10 @@ impl Shell {
                     shell.frame_notify("stream-ended", cx);
                 }
                 shell.state.finish_plan(&id);
+                // A stop still settles what the model already recorded: a
+                // completion committed before the reader stopped the round is
+                // not thrown away.
+                shell.state.settle_goal(&id);
                 shell.state.persist_subagents();
                 shell.trace_done = false;
                 shell.drain_inbox(&id, cx);

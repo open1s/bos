@@ -3612,3 +3612,21 @@ Traps, all measured:
   frames from the turn pump's `tail`/`stream-ended` notifies (traced), one
   browser reap pair and one video test, and one deny-glob test fails on a
   `..`-bearing scratch path. None of them touch the terminal code.
+
+Round 126 took a deliberate step AWAY from reference parity on the status bar
+(user requirement, with the DSH screenshot marking the goal block): a goal
+**state change** no longer prints the multi-line report on the status bar. The
+report still exists for the one explicit query, bare `/goal`, but create, edit,
+pause and resume - from the slash line AND from the goal bar's pause/resume
+buttons - report through the goal bar itself (`header.rs` `goal_row`: phase
+label, objective, valid actions, blocker as the tooltip), and refusals plus
+`Goal cleared.` / `No goal to clear.` stay as the one-line notices the status
+bar exists for. The four `goal.*Title` keys went with the reports.
+The trap worth keeping: `AppState.notice` is a single **persistent** slot, so
+"do not set a notice" leaves the PREVIOUS line on the bar - after `/goal x` the
+bar still read `No goal is currently set.` from an earlier query. A successful
+mutation must therefore withdraw the line (`AppState::clear_notice`), which is
+what makes "the status bar stays quiet" true rather than "it shows something
+stale". Evidence: the 15 goal tests are green and clippy is clean; the five
+unrelated failures in the shared working copy are the ones the note above
+already records.

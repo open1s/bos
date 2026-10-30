@@ -2551,7 +2551,8 @@ fn the_compaction_marker_expands_to_the_checkpoint(cx: &mut TestAppContext) {
     // no-op, so the row is scrolled to first.
     let transcript = cx.debug_bounds("transcript").expect("the transcript pane");
     assert!(
-        row.origin.y >= transcript.origin.y && centre.y <= transcript.origin.y + transcript.size.height,
+        row.origin.y >= transcript.origin.y
+            && centre.y <= transcript.origin.y + transcript.size.height,
         "the premise: the marker is inside the transcript viewport, row={row:?} pane={transcript:?}"
     );
     cx.simulate_click(centre, Modifiers::default());
@@ -2660,8 +2661,7 @@ fn the_compaction_marker_sits_between_the_messages_it_follows(cx: &mut TestAppCo
     );
     assert!(
         marker.origin.y >= transcript.origin.y
-            && marker.origin.y + marker.size.height
-                <= transcript.origin.y + transcript.size.height,
+            && marker.origin.y + marker.size.height <= transcript.origin.y + transcript.size.height,
         "the marker is a transcript row, not a floating slot: marker={marker:?} transcript={transcript:?}"
     );
 }
@@ -2987,8 +2987,7 @@ fn a_compaction_at_the_end_sits_after_the_last_message_inside_the_scroller(
     );
     assert!(
         marker.origin.y >= transcript.origin.y
-            && marker.origin.y + marker.size.height
-                <= transcript.origin.y + transcript.size.height,
+            && marker.origin.y + marker.size.height <= transcript.origin.y + transcript.size.height,
         "and it is INSIDE the scroller, not between the scroller and the composer: marker={marker:?} transcript={transcript:?}"
     );
     // Parent-scroller identity: the scroller records a painted bound for every
@@ -3335,16 +3334,181 @@ fn a_running_turn_folds_under_the_group_too(cx: &mut TestAppContext) {
     }
 }
 
-/// A finished subagent is not a dead end for the composer: with the child's
-/// view open, a submission returns to the PARENT conversation and opens the
-/// turn there, because a finished run has nothing left to steer. (A run with
-/// no reachable process at all - a restart - behaves the same: its row is
-/// gone, so the prompt belongs to the parent.)
+/// A prompt typed while the child still works is QUEUED, like a normal
+/// conversation's: it waits behind the running turn, shows in the child's
+/// transcript, and never opens a turn in the parent.
 #[gpui::test]
-fn a_finished_subagent_returns_the_prompt_to_the_parent(cx: &mut TestAppContext) {
+fn a_running_subagent_queues_the_prompt(cx: &mut TestAppContext) {
     init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let mut state = state_with_turns("subagent-finished", 1);
+        let mut state = state_with_turns("subagent-queue", 1);
+        let parent = state.active_id.clone().expect("a session");
+        let id = state.subagents.begin(
+            &parent,
+            &parent,
+            1,
+            0,
+            "Inspect the files",
+            "List the workspace files",
+        );
+        // Still Running, and no live process behind it: queueing must not
+        // depend on a handle that only exists while the child works.
+        state.show_subagent(&id);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    // The shell's assembly restores the PARENT session, so the child is
+    // selected after the window exists, the way a click selects it.
+    let id = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .subagents
+            .snapshot()
+            .first()
+            .expect("the run")
+            .id
+            .clone()
+    });
+    cx.update(|_, cx| shell.update(cx, |this, _| this.state.show_subagent(&id)));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.set_composer_text("pwd", window, cx);
+            this.send(window, cx);
+        });
+    });
+    let (view, pending, draft, parent_rows, child_rows) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        let view = shell.state.subagent.as_ref().map(|view| view.id.clone());
+        let pending = view
+            .as_deref()
+            .and_then(|id| shell.state.subagents.run(id))
+            .map(|run| run.pending.clone())
+            .unwrap_or_default();
+        let parent_rows = shell
+            .state
+            .active_id
+            .as_deref()
+            .and_then(|id| shell.state.store.session(id))
+            .map(|session| session.messages.len())
+            .unwrap_or(0);
+        let child_rows = shell
+            .state
+            .subagent
+            .as_ref()
+            .map(|view| view.session.messages.len())
+            .unwrap_or(0);
+        (
+            view,
+            pending,
+            shell.composer_value.clone(),
+            parent_rows,
+            child_rows,
+        )
+    });
+    assert!(view.is_some(), "the reader stays on the child");
+    assert_eq!(
+        pending,
+        vec!["pwd".to_string()],
+        "the prompt waits behind the running turn"
+    );
+    assert!(draft.is_empty(), "the composer was consumed");
+    assert_eq!(
+        parent_rows, 2,
+        "the parent conversation did not open a turn"
+    );
+    assert_eq!(
+        child_rows, 2,
+        "the queued prompt and the running placeholder are the child's rows"
+    );
+}
+
+/// The queue a child accepted mid-turn is drained once the turn settles: the
+/// next prompt reopens the run and streams into the SAME child.
+#[gpui::test]
+fn a_queued_subagent_prompt_starts_when_the_child_settles(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("subagent-drain", 1);
+        let parent = state.active_id.clone().expect("a session");
+        let id = state
+            .subagents
+            .begin(&parent, &parent, 1, 0, "Task", "first");
+        // The reader typed while the child worked, then the child settled.
+        assert!(state.subagents.queue_followup(&id, "second"));
+        state
+            .subagents
+            .finish(&id, "first done".to_string(), (1, 2), Vec::new());
+        // The live child the settled run keeps. Its endpoint fails at once, so
+        // the turn this test starts ends without touching the network traffic
+        // of a real provider.
+        let child = agent::Agent::from_config(agent::agent::AgentConfig {
+            name: "subagent".to_string(),
+            model: "work/fast".to_string(),
+            base_url: "http://127.0.0.1:1/v1".to_string(),
+            ..Default::default()
+        });
+        state
+            .subagents
+            .set_agent(&id, std::sync::Arc::new(tokio::sync::Mutex::new(child)));
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let id = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .subagents
+            .snapshot()
+            .first()
+            .expect("the run")
+            .id
+            .clone()
+    });
+    cx.update(|_, cx| shell.update(cx, |this, cx| this.drain_subagent_prompts(cx)));
+    let (status, pending, tail) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        let run = shell.state.subagents.run(&id).expect("the run");
+        (
+            run.status,
+            run.pending.clone(),
+            run.transcript.last().map(|row| row.content.clone()),
+        )
+    });
+    assert_eq!(
+        status,
+        crate::subagent::SubagentStatus::Running,
+        "the queued prompt reopened the child"
+    );
+    assert!(
+        pending.is_empty(),
+        "the queue handed its prompt to the turn"
+    );
+    assert_eq!(
+        tail.as_deref(),
+        Some("second"),
+        "the prompt is the next row"
+    );
+
+    // The drain started a real child turn, so let the runtime finish it before
+    // the shell goes away.
+    cx.dispatcher.allow_parking();
+    cx.run_until_parked();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    cx.run_until_parked();
+}
+
+/// A settled child whose process is gone is not a dead end either: the prompt
+/// rebuilds the child and opens the turn THERE, so the message never jumps into
+/// the parent conversation.
+#[gpui::test]
+fn a_finished_subagent_takes_the_prompt_itself(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("subagent-continue", 1);
         let parent = state.active_id.clone().expect("a session");
         let id = state.subagents.begin(
             &parent,
@@ -3358,24 +3522,27 @@ fn a_finished_subagent_returns_the_prompt_to_the_parent(cx: &mut TestAppContext)
             &id,
             "the files are listed".to_string(),
             (1200, 3400),
-            vec![crate::subagent::SubagentMessage {
-                role: "assistant".to_string(),
-                content: "the files are listed".to_string(),
-                tool: None,
-            }],
+            vec![
+                crate::subagent::SubagentMessage {
+                    role: "user".to_string(),
+                    content: "List the workspace files".to_string(),
+                    tool: None,
+                },
+                crate::subagent::SubagentMessage {
+                    role: "assistant".to_string(),
+                    content: "the files are listed".to_string(),
+                    tool: None,
+                },
+            ],
         );
-        // NO set_agent call: this run has no live process behind it, which is
-        // exactly the state that used to refuse every send forever.
-        state.show_subagent(&id);
-        // A resolvable model target, so the parent turn OPENS rather than
-        // being refused by the send gate the fixture would otherwise hit. The
-        // request itself fails against the unresolvable endpoint, which no
-        // assertion depends on.
-        // The COMMITTED tree: the send gate reads it, not the dialog draft.
+        // A resolvable target that fails immediately: the request itself is not
+        // what the assertion is about, but a child that never started would
+        // leave the run Running with no live process. It is chosen BEFORE the
+        // child is saved, because the save copies the session's model.
         state
             .settings
             .global
-            .add_provider("work", "", "https://work.example/v1", &[]);
+            .add_provider("work", "", "http://127.0.0.1:1/v1", &[]);
         let _ = state
             .settings
             .global
@@ -3384,69 +3551,70 @@ fn a_finished_subagent_returns_the_prompt_to_the_parent(cx: &mut TestAppContext)
             session.provider = Some("work".to_string());
             session.model = Some("fast".to_string());
         }
+        // The app saves a settled child; the rebuild reads that Session for its
+        // model and its history, exactly like a restart would.
+        state.persist_subagents();
+        state.show_subagent(&id);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
     });
-    cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    // The shell's assembly restores the PARENT session, so the child is
+    // selected after the window exists, the way a click selects it.
+    let id = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .subagents
+            .snapshot()
+            .first()
+            .expect("the run")
+            .id
+            .clone()
+    });
+    cx.update(|_, cx| shell.update(cx, |this, _| this.state.show_subagent(&id)));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
     cx.update(|window, cx| {
         shell.update(cx, |this, cx| {
             this.set_composer_text("pwd", window, cx);
             this.send(window, cx);
         });
     });
-    let (view, draft, last) = cx.update(|_, cx| {
+    let (view, live, tail, parent_rows) = cx.update(|_, cx| {
         let shell = shell.read(cx);
-        let session = shell
+        let view = shell.state.subagent.as_ref().map(|view| view.id.clone());
+        let live = view
+            .as_deref()
+            .is_some_and(|id| shell.state.subagents.agent(id).is_some());
+        let tail = view
+            .as_deref()
+            .and_then(|id| shell.state.subagents.run(id))
+            .and_then(|run| run.transcript.last().map(|row| row.content.clone()))
+            .unwrap_or_default();
+        let parent_rows = shell
             .state
             .active_id
             .as_deref()
             .and_then(|id| shell.state.store.session(id))
-            .map(|session| session.messages.len());
-        (
-            shell.state.subagent.is_none(),
-            shell.composer_value.is_empty(),
-            session,
-        )
+            .map(|session| session.messages.len())
+            .unwrap_or(0);
+        (view, live, tail, parent_rows)
     });
-    assert!(view, "the shell returned to the parent conversation");
-    assert!(draft, "the composer was consumed");
-    // The seeded session held 2 rows (user + assistant); the send appended the
-    // prompt's user row and the turn's own streaming assistant row.
+    assert!(view.is_some(), "the reader stays on the child");
+    assert!(live, "the child was rebuilt behind the run");
+    assert_eq!(tail, "pwd", "the prompt is the child's next user row");
     assert_eq!(
-        last,
-        Some(4),
-        "the prompt opened a turn in the parent: user + assistant rows follow"
+        parent_rows, 2,
+        "the parent conversation did not open a turn"
     );
 
-    // This test opens a REAL turn against an unreachable endpoint, so it must
-    // end it here. A runtime event that wakes the GPUI pump after this test's
-    // scheduler has finished is the suite's SIGABRT (gpui-pre asserts the
-    // waking thread, async-task turns the panic into abort()). Parking is the
-    // kit's seam for a test that performs cross-thread I/O; the stop joins the
-    // turn and the two pumps let the pump observe the closed channel.
+    // The rebuilt turn is a real request, so let the runtime finish it before
+    // the shell goes away (the same parking rule the other live-turn tests
+    // follow).
     cx.dispatcher.allow_parking();
-    cx.update(|_, cx| {
-        shell.update(cx, |this, _| {
-            if let Some(id) = this.state.active_id.clone() {
-                this.state.stop(&id);
-            }
-        });
-    });
     cx.run_until_parked();
     std::thread::sleep(std::time::Duration::from_millis(50));
     cx.run_until_parked();
-    assert!(
-        !cx.update(|_, cx| {
-            let shell = shell.read(cx);
-            shell
-                .state
-                .active_id
-                .as_deref()
-                .is_some_and(|id| shell.state.is_streaming(id))
-        }),
-        "the turn is stopped before the test ends, so no runtime work outlives it"
-    );
 }
 
 /// The models pane is the reference card list: the head carries identity and
@@ -12006,19 +12174,23 @@ fn the_composer_primary_button_is_the_measured_34_round_action(cx: &mut TestAppC
 #[test]
 fn the_primary_control_stops_only_while_the_draft_is_empty() {
     assert!(
-        super::composer::primary_stops(true, false),
+        super::composer::primary_stops(true, false, false),
         "a running turn with an empty draft stops"
     );
     assert!(
-        !super::composer::primary_stops(true, true),
+        !super::composer::primary_stops(true, true, false),
         "a draft typed while running sends (queues) instead of stopping"
     );
     assert!(
-        !super::composer::primary_stops(false, true),
+        !super::composer::primary_stops(false, true, false),
         "an idle shell sends"
     );
     assert!(
-        !super::composer::primary_stops(false, false),
+        !super::composer::primary_stops(true, false, true),
+        "a selected child never stops the parent turn"
+    );
+    assert!(
+        !super::composer::primary_stops(false, false, false),
         "and an idle shell with nothing to send only dims"
     );
 }
@@ -12440,6 +12612,108 @@ fn the_permission_chip_writes_the_mode_its_menu_offers(cx: &mut TestAppContext) 
         reloaded_settings(&home).workspace.agent.permission,
         crate::caps::FULL_ACCESS,
         "the file a relaunch loads holds the chosen mode"
+    );
+}
+
+/// A running turn does not lock the permission chip: the mode chosen now is the
+/// one the NEXT turn obeys, and the notice says so.
+///
+/// The reference's `PermissionSelect` disables its trigger on `locked || busy`
+/// only - another client holding the session, or its own submit still in flight
+/// - never on a running turn: the busy mark belongs to the MODEL chip, while
+/// this trigger keeps its chevron. bsh passed `any_streaming()` into the chip,
+/// so it refused the press for the whole length of every turn, which is exactly
+/// the state the `permission.nextTurn` notice exists for - the control looked
+/// unchanged while swallowing the click. This pins the affordance under a
+/// running turn and the write behind the row the menu offers.
+#[gpui::test]
+fn the_permission_chip_takes_the_press_while_a_turn_runs(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let home = scratch_home("composer-permission-streaming");
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("composer-permission-streaming", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let idle = cx
+        .debug_bounds("composer-permission")
+        .expect("the permission chip draws");
+    let id = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .active_id
+            .clone()
+            .expect("a session is active")
+    });
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            assert!(
+                this.state.begin_turn_in(&id, "run").is_some(),
+                "the seeded turn opens"
+            );
+            cx.notify();
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.update(|_, cx| shell.read(cx).state.any_streaming()),
+        "the premise: a turn is running"
+    );
+
+    // The chip keeps the box and the chevron it has when idle. The kit's popup
+    // body carries no debug selector, so the drawn affordance is the
+    // observable: a chip that keeps its own chevron is one the reference leaves
+    // pressable (the model chip is the one that swaps the chevron for the dot).
+    let live = cx
+        .debug_bounds("composer-permission")
+        .expect("the chip still draws under a running turn");
+    assert_eq!(
+        (live.size.width, live.size.height),
+        (idle.size.width, idle.size.height),
+        "the running turn does not re-flow the trigger"
+    );
+    assert!(
+        cx.debug_bounds("composer-permission-chevron").is_some(),
+        "the permission trigger keeps its chevron while the model chip shows the busy dot"
+    );
+    cx.simulate_click(live.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // The row the open menu offers is the mode write itself, and on a running
+    // turn it lands on the next turn with the notice that says so.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.request_permission(crate::caps::READ_ONLY, cx)
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let (committed, notice) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (
+            shell.state.settings.workspace.agent.permission.clone(),
+            shell.state.notice.clone().unwrap_or_default(),
+        )
+    });
+    assert_eq!(
+        committed,
+        crate::caps::READ_ONLY,
+        "the press writes the committed mode, so the next turn is built with it"
+    );
+    assert!(
+        notice.contains(crate::i18n::tr(Lang::En, "permission.nextTurn").as_str()),
+        "the chip states that the running turn keeps its permission: {notice:?}"
+    );
+    assert_eq!(
+        reloaded_settings(&home).workspace.agent.permission,
+        crate::caps::READ_ONLY,
+        "and a relaunch loads the mode the chip offered"
+    );
+    assert!(
+        cx.debug_bounds("permission-chip-read-only").is_some(),
+        "the trigger now names the mode the next turn obeys"
     );
 }
 
@@ -21960,10 +22234,8 @@ fn the_goal_command_line_creates_edits_pauses_resumes_and_clears(cx: &mut TestAp
     assert!(created.activation.is_armed());
     assert_eq!(
         notice(cx),
-        format!(
-            "Goal created\nStatus: active\nObjective: ship the slash palette\nRounds: 0/256\nActivation: armed\n\n{active_commands}"
-        ),
-        "the created report is the reference's own line order"
+        "",
+        "the goal bar reports the create; the status bar stays quiet"
     );
     assert_eq!(
         cx.update(|_, cx| shell.read(cx).composer_value.clone()),
@@ -22017,9 +22289,8 @@ fn the_goal_command_line_creates_edits_pauses_resumes_and_clears(cx: &mut TestAp
     assert_eq!(goal(cx).unwrap().state, GoalState::Active);
     assert_eq!(
         notice(cx),
-        format!(
-            "Goal updated\nStatus: active\nObjective: ship it even better\nRounds: 0/256\nActivation: armed\n\n{active_commands}"
-        )
+        "",
+        "the goal bar reports the edit; the status bar stays quiet"
     );
     run(cx, "/goal edit");
     assert_eq!(
@@ -22038,9 +22309,8 @@ fn the_goal_command_line_creates_edits_pauses_resumes_and_clears(cx: &mut TestAp
     assert!(!goal(cx).unwrap().activation.is_armed());
     assert_eq!(
         notice(cx),
-        format!(
-            "Goal paused\nStatus: paused\nObjective: ship it even better\nRounds: 0/256\nActivation: disarmed\n\n{stopped_commands}"
-        )
+        "",
+        "the goal bar reports the pause; the status bar stays quiet"
     );
     run(cx, "/goal ");
     assert_eq!(
@@ -22055,9 +22325,8 @@ fn the_goal_command_line_creates_edits_pauses_resumes_and_clears(cx: &mut TestAp
     assert!(goal(cx).unwrap().activation.is_armed());
     assert_eq!(
         notice(cx),
-        format!(
-            "Goal resumed\nStatus: active\nObjective: ship it even better\nRounds: 0/256\nActivation: armed\n\n{active_commands}"
-        )
+        "",
+        "the goal bar reports the resume; the status bar stays quiet"
     );
     run(cx, "/goal clear");
     assert!(goal(cx).is_none());
@@ -22161,7 +22430,14 @@ fn the_goal_command_reports_the_references_refusals(cx: &mut TestAppContext) {
     run(cx, "/goal edit a fresh aim");
     assert_eq!(
         notice(cx),
-        "Goal created\nStatus: active\nObjective: a fresh aim\nRounds: 0/256\nActivation: armed\n\nCommands: /goal edit <objective>, /goal pause, /goal clear"
+        "",
+        "replacing a completed goal is a state change, so the bar reports it"
+    );
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).state.goal(&id))
+            .map(|goal| goal.objective),
+        Some("a fresh aim".to_string()),
+        "the fresh identity is live"
     );
 
     // A blocked goal shows its policy code and explanation, and offers resume.
@@ -22183,12 +22459,20 @@ fn the_goal_command_reports_the_references_refusals(cx: &mut TestAppContext) {
         "Goal\nStatus: blocked\nBlocker: round-limit: the cap is spent\nObjective: a fresh aim\nRounds: 0/256\nActivation: disarmed\n\nCommands: /goal edit <objective>, /goal resume, /goal clear"
     );
     run(cx, "/goal resume");
+    let resumed = cx
+        .update(|_, cx| shell.read(cx).state.goal(&id))
+        .expect("the resumed goal");
     assert!(
-        !notice(cx).contains("Blocker:"),
-        "resuming a blocked goal clears the blocker: {}",
-        notice(cx)
+        resumed.blocked_reason.is_none(),
+        "resume clears the blocker"
     );
-    assert!(notice(cx).contains("Status: active"));
+    assert_eq!(resumed.state, GoalState::Active);
+    assert!(resumed.activation.is_armed(), "resume re-arms it");
+    assert_eq!(
+        notice(cx),
+        "",
+        "the bar reports the resume, not the status bar"
+    );
 
     // At the cap, show prints the cap and resume refuses.
     cx.update(|_, cx| {
@@ -23471,6 +23755,54 @@ fn a_goal_at_its_round_cap_is_blocked_with_round_limit(cx: &mut TestAppContext) 
     );
 }
 
+/// A goal the model settles during a round stops the loop: the pump applies the
+/// recorded transition before it decides to continue, so a completed goal opens
+/// no round n+1 and the turn's store is dropped.
+#[gpui::test]
+fn a_model_recorded_completion_stops_the_goal_loop(cx: &mut TestAppContext) {
+    use agent::goal::GoalState;
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("goal-settle", 2);
+        let id = state.active_id.clone().expect("an active session");
+        state.set_goal(&id, Some("ship the palette"));
+        state.begin_goal_turn_in(&id).expect("a goal round");
+        // What spawn_turn attaches for the tools: the goal after the round
+        // advanced, wrapped in the store the model writes through.
+        let goal = state.goal(&id).expect("the seeded goal");
+        state.attach_goal(&id, agent::tools::GoalStore::new(goal));
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let id = cx
+        .update(|_, cx| shell.read(cx).state.active_id.clone())
+        .expect("the active session");
+    // The model's update_goal, from the runner thread's side of the seam.
+    let store = cx
+        .update(|_, cx| shell.read(cx).state.goal_store(&id))
+        .expect("the turn's live goal store");
+    assert!(store.complete());
+    // The round ends; the production pump settles and then gates the loop.
+    let (tx, rx) = async_channel::unbounded();
+    cx.update(|_, cx| shell.update(cx, |this, cx| this.pump_for_test(id.clone(), rx, cx)));
+    tx.try_send(crate::runner::AgentEvent::Done)
+        .expect("the terminal event");
+    cx.run_until_parked();
+    let goal = cx
+        .update(|_, cx| shell.read(cx).state.goal(&id))
+        .expect("the goal");
+    assert_eq!(goal.state, GoalState::Completed);
+    assert!(!goal.activation.is_armed());
+    assert!(
+        cx.update(|_, cx| shell.read(cx).state.goal_store(&id))
+            .is_none(),
+        "the turn's store is settled away"
+    );
+    let next = cx.update(|_, cx| shell.update(cx, |this, _cx| this.state.begin_goal_turn_in(&id)));
+    assert!(next.is_none(), "a completed goal starts no round");
+}
+
 /// A goal created while a turn is already running arms, but opens no second
 /// turn: the next round waits for the idle edge, which is the reference
 /// driver's rule (a round starts only at whole-agent idle).
@@ -23512,7 +23844,10 @@ fn a_goal_created_during_a_running_turn_waits_for_idle(cx: &mut TestAppContext) 
                 .unwrap_or(0),
         )
     });
-    assert!(notice.starts_with("Goal created"), "{notice}");
+    assert_eq!(
+        notice, "",
+        "the goal bar reports the create, not the status bar"
+    );
     assert!(streaming, "the original turn still owns the session");
     assert_eq!(rounds, 0, "no goal round starts over a running turn");
     assert_eq!(messages, before, "no second turn opened");
@@ -26519,13 +26854,15 @@ fn the_master_preset_switch_turns_every_preset_off_after_a_gate(cx: &mut TestApp
     draw_until(cx, "the gate closes on cancel", DRAW_UNTIL_MAX, |cx| {
         cx.debug_bounds("preset-risk").is_none()
     });
-    assert!(cx.update(|_, cx| shell
-        .read(cx)
-        .state
-        .settings
-        .global
-        .general
-        .presets_active()));
+    assert!(cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .settings
+            .global
+            .general
+            .presets_active()
+    }));
     assert_eq!(
         cx.update(|_, cx| shell.read(cx).state.policy_generation),
         generation,
@@ -26754,13 +27091,15 @@ fn the_master_sandbox_switch_asks_before_it_releases_heel(cx: &mut TestAppContex
     draw_until(cx, "the gate closes on cancel", DRAW_UNTIL_MAX, |cx| {
         cx.debug_bounds("preset-risk").is_none()
     });
-    assert!(cx.update(|_, cx| shell
-        .read(cx)
-        .state
-        .settings
-        .global
-        .general
-        .sandbox_active()));
+    assert!(cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .settings
+            .global
+            .general
+            .sandbox_active()
+    }));
     assert_eq!(
         cx.update(|_, cx| shell.read(cx).state.policy_generation),
         generation,
@@ -26806,13 +27145,15 @@ fn the_master_sandbox_switch_asks_before_it_releases_heel(cx: &mut TestAppContex
         cx.update(|_, cx| shell.read(cx).state.effective().preset_id),
         "confined"
     );
-    assert!(cx.update(|_, cx| shell
-        .read(cx)
-        .state
-        .settings
-        .global
-        .general
-        .presets_active()));
+    assert!(cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .settings
+            .global
+            .general
+            .presets_active()
+    }));
 
     // Persisted where a relaunch reads it, and the preset switch is untouched.
     let reloaded = reloaded_settings(&scratch_home("sandbox-master-switch"));
@@ -27903,7 +28244,10 @@ fn a_streaming_long_thought_keeps_its_frame_cost_flat(cx: &mut TestAppContext) {
             f32::from(this.transcript_scroll.max_offset().y),
         )
     });
-    eprintln!("LONG THOUGHT small={small_ms:.2}ms huge={huge_ms:.2}ms bytes={bytes} height={height:.0}px parsed={parsed_before}->{}", crate::ui::shell::bodies_parsed());
+    eprintln!(
+        "LONG THOUGHT small={small_ms:.2}ms huge={huge_ms:.2}ms bytes={bytes} height={height:.0}px parsed={parsed_before}->{}",
+        crate::ui::shell::bodies_parsed()
+    );
 
     assert!(
         bytes > 200 * 1024,

@@ -1484,14 +1484,18 @@ impl Shell {
         true
     }
 
-    /// Apply one /goal request and report it.
+    /// Apply one /goal request and report only what the goal bar cannot.
     ///
-    /// The output is the reference command's own: a title, Status, an optional
-    /// Blocker, Objective, Rounds, Activation, a blank line, and the commands
-    /// that are meaningful from the live state. It stays a UI notice and never
-    /// enters a model request.
+    /// A state change is reported by the goal bar above the composer, which
+    /// already carries the phase, the objective and the valid actions. The
+    /// multi-line status dump is not repeated on the status bar, which speaks
+    /// only in the one-line refusals and errors it exists for. A bare /goal is
+    /// the one explicit query, so it keeps the reference command's own output -
+    /// a title, Status, an optional Blocker, Objective, Rounds, Activation, a
+    /// blank line and the commands meaningful from the live state - as a UI
+    /// notice that never enters a model request.
     fn run_goal_line(&mut self, request: crate::state::GoalRequest, cx: &mut Context<Self>) {
-        use crate::state::{GoalChange, GoalRefusal, GoalRequest};
+        use crate::state::{GoalRefusal, GoalRequest};
         let Some(id) = self.state.active_id.clone() else {
             return;
         };
@@ -1508,101 +1512,79 @@ impl Shell {
         }
         let attachments = self.state.attachments.clone();
         let notice = match request {
-            GoalRequest::Show => match self.state.goal(&id) {
+            GoalRequest::Show => Some(match self.state.goal(&id) {
                 None => format!("{}\n{}", lang.tr("goal.none"), usage),
                 Some(goal) => goal_report(lang, &lang.tr("goal.showTitle"), &goal),
-            },
+            }),
             GoalRequest::Create(objective) => match self.state.create_goal(&id, &objective) {
                 Ok(_) => {
-                    let report = self
-                        .state
-                        .goal(&id)
-                        .map(|goal| goal_report(lang, &lang.tr("goal.createdTitle"), &goal))
-                        .unwrap_or_default();
                     self.submit_goal_attachments(&id, &attachments);
                     // Creating arms the goal; an idle session starts its first
-                    // round now, exactly as the reference driver does. The
-                    // output above is the created view, before that round.
+                    // round now, exactly as the reference driver does.
                     self.continue_goal(&id, cx);
-                    report
+                    None
                 }
-                Err(GoalRefusal::AlreadyExists(state)) => crate::i18n::tr_args(
+                Err(GoalRefusal::AlreadyExists(state)) => Some(crate::i18n::tr_args(
                     lang,
                     "goal.already",
                     &[("phase", goal_phase_label(lang, state))],
-                ),
-                Err(_) => lang.tr("goal.invalid"),
+                )),
+                Err(_) => Some(lang.tr("goal.invalid")),
             },
             GoalRequest::Edit(objective) => match self.state.edit_goal(&id, &objective) {
-                Ok(change) => {
-                    // A completed goal was replaced with a fresh identity; the
-                    // reference reports that as "Goal created", not "updated".
-                    let title = if change == GoalChange::Replaced {
-                        lang.tr("goal.createdTitle")
-                    } else {
-                        lang.tr("goal.updatedTitle")
-                    };
-                    let report = self
-                        .state
-                        .goal(&id)
-                        .map(|goal| goal_report(lang, &title, &goal))
-                        .unwrap_or_default();
+                Ok(_) => {
                     self.submit_goal_attachments(&id, &attachments);
                     self.continue_goal(&id, cx);
-                    report
+                    None
                 }
-                Err(GoalRefusal::Missing) => crate::i18n::tr_args(
+                Err(GoalRefusal::Missing) => Some(crate::i18n::tr_args(
                     lang,
                     "goal.missing",
                     &[("action", "edit".to_string()), ("usage", usage)],
-                ),
-                Err(GoalRefusal::InvalidObjective) => {
-                    crate::i18n::tr_args(lang, "goal.needObjective", &[("usage", usage)])
-                }
-                Err(_) => lang.tr("goal.invalid"),
+                )),
+                Err(GoalRefusal::InvalidObjective) => Some(crate::i18n::tr_args(
+                    lang,
+                    "goal.needObjective",
+                    &[("usage", usage)],
+                )),
+                Err(_) => Some(lang.tr("goal.invalid")),
             },
-            GoalRequest::InvalidEdit => {
-                crate::i18n::tr_args(lang, "goal.needObjective", &[("usage", usage)])
-            }
+            GoalRequest::InvalidEdit => Some(crate::i18n::tr_args(
+                lang,
+                "goal.needObjective",
+                &[("usage", usage)],
+            )),
             GoalRequest::Pause => match self.state.pause_goal(&id) {
-                Ok(()) => self
-                    .state
-                    .goal(&id)
-                    .map(|goal| goal_report(lang, &lang.tr("goal.pausedTitle"), &goal))
-                    .unwrap_or_default(),
-                Err(GoalRefusal::Missing) => crate::i18n::tr_args(
+                Ok(()) => None,
+                Err(GoalRefusal::Missing) => Some(crate::i18n::tr_args(
                     lang,
                     "goal.missing",
                     &[("action", "pause".to_string()), ("usage", usage)],
-                ),
-                Err(_) => lang.tr("goal.invalid"),
+                )),
+                Err(_) => Some(lang.tr("goal.invalid")),
             },
             GoalRequest::Resume => match self.state.resume_goal(&id) {
                 Ok(()) => {
-                    let report = self
-                        .state
-                        .goal(&id)
-                        .map(|goal| goal_report(lang, &lang.tr("goal.resumedTitle"), &goal))
-                        .unwrap_or_default();
                     self.continue_goal(&id, cx);
-                    report
+                    None
                 }
-                Err(GoalRefusal::Missing) => crate::i18n::tr_args(
+                Err(GoalRefusal::Missing) => Some(crate::i18n::tr_args(
                     lang,
                     "goal.missing",
                     &[("action", "resume".to_string()), ("usage", usage)],
-                ),
-                Err(_) => lang.tr("goal.invalid"),
+                )),
+                Err(_) => Some(lang.tr("goal.invalid")),
             },
-            GoalRequest::Clear => {
-                if self.state.clear_goal(&id) {
-                    lang.tr("goal.cleared")
-                } else {
-                    lang.tr("goal.noClear")
-                }
-            }
+            GoalRequest::Clear => Some(if self.state.clear_goal(&id) {
+                lang.tr("goal.cleared")
+            } else {
+                lang.tr("goal.noClear")
+            }),
         };
-        self.state.notice(notice);
+        match notice {
+            Some(notice) => self.state.notice(notice),
+            None => self.state.clear_notice(),
+        }
         cx.notify();
     }
 
@@ -1742,15 +1724,13 @@ impl Shell {
             return;
         };
         let lang = self.state.lang;
-        let notice = match self.state.pause_goal(&id) {
-            Ok(()) => self
-                .state
-                .goal(&id)
-                .map(|goal| goal_report(lang, &lang.tr("goal.pausedTitle"), &goal))
-                .unwrap_or_default(),
-            Err(_) => lang.tr("goal.invalid"),
-        };
-        self.state.notice(notice);
+        match self.state.pause_goal(&id) {
+            Ok(()) => self.state.clear_notice(),
+            Err(_) => {
+                let notice = lang.tr("goal.invalid");
+                self.state.notice(notice);
+            }
+        }
         cx.notify();
     }
 
@@ -1760,19 +1740,16 @@ impl Shell {
             return;
         };
         let lang = self.state.lang;
-        let notice = match self.state.resume_goal(&id) {
+        match self.state.resume_goal(&id) {
             Ok(()) => {
-                let report = self
-                    .state
-                    .goal(&id)
-                    .map(|goal| goal_report(lang, &lang.tr("goal.resumedTitle"), &goal))
-                    .unwrap_or_default();
+                self.state.clear_notice();
                 self.continue_goal(&id, cx);
-                report
             }
-            Err(_) => lang.tr("goal.invalid"),
-        };
-        self.state.notice(notice);
+            Err(_) => {
+                let notice = lang.tr("goal.invalid");
+                self.state.notice(notice);
+            }
+        }
         cx.notify();
     }
 

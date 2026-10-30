@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent::goal::GoalState;
+use agent::tools::{GoalSettle, GoalStore};
 use agent::SteerMailbox;
 
 use crate::i18n::Lang;
@@ -419,6 +420,7 @@ fn restore_subagents(
             error,
             revision: 0,
             transcript,
+            pending: Vec::new(),
         };
         persisted.insert(id, (run.status, run.revision, run.finished_at));
         registry.restore(run);
@@ -463,6 +465,13 @@ pub(crate) struct AppState {
     /// turn's plan is read from here and the finished copy is saved onto the
     /// session it belongs to.
     plans: HashMap<String, PlanStore>,
+    /// The live goal store of every session whose turn is still running.
+    ///
+    /// The agent's `get_goal` / `update_goal` tools write through it, and the
+    /// transition the model records is settled onto the session's durable goal
+    /// when the turn ends - which is what stops a completed goal from starting
+    /// another round.
+    goals: HashMap<String, GoalStore>,
     /// Child runs spawned by any turn, shared with the header and the tool.
     pub(crate) subagents: Arc<crate::subagent::SubagentRegistry>,
     /// The selected child, presented as the same Session model the chat uses.
@@ -779,6 +788,7 @@ impl AppState {
             streams: HashMap::new(),
             jobs: Arc::new(agent::jobs::JobRegistry::new()),
             plans: HashMap::new(),
+            goals: HashMap::new(),
             subagents,
             subagent: None,
             persisted_subagents,
@@ -1797,6 +1807,15 @@ impl AppState {
         self.notice = Some(text.into());
     }
 
+    /// Withdraw the notice line.
+    ///
+    /// A goal state change is reported by the goal bar, so its command leaves
+    /// no line behind: keeping the previous one (often a refusal about the old
+    /// state) would contradict what the bar now shows.
+    pub(crate) fn clear_notice(&mut self) {
+        self.notice = None;
+    }
+
     /// The active transcript as plain text, for the copy control.
     pub(crate) fn transcript_text(&self) -> String {
         let Some(session) = self.active_session() else {
@@ -2001,7 +2020,7 @@ impl AppState {
             session.model = parent.model.clone();
             session.agent_preset = parent.agent_preset.clone();
         }
-        session.messages = run.chat_messages();
+        session.messages = run.preview_messages();
         if run.status.is_running() {
             session
                 .messages
@@ -2295,6 +2314,16 @@ impl AppState {
         self.plans.insert(id.to_string(), store);
     }
 
+    /// Attach the goal store a turn about to start writes through.
+    ///
+    /// The store is shared with the `get_goal` / `update_goal` tools; the
+    /// transition the model records is settled when the turn ends. A session
+    /// without a goal attaches nothing, which is why the tools are absent from
+    /// that turn's request.
+    pub(crate) fn attach_goal(&mut self, id: &str, store: GoalStore) {
+        self.goals.insert(id.to_string(), store);
+    }
+
     /// The plan to render for one session.
     ///
     /// A running turn reads through its live store; otherwise the copy its
@@ -2426,6 +2455,12 @@ impl AppState {
             .and_then(|session| session.goal.clone())
     }
 
+    /// The live goal store of a running turn, for a test that plays the model.
+    #[cfg(test)]
+    pub(crate) fn goal_store(&self, id: &str) -> Option<GoalStore> {
+        self.goals.get(id).cloned()
+    }
+
     /// Whether one session's goal is armed: active, not exhausted, and its
     /// process-local continuation flag is set.
     pub(crate) fn goal_can_advance(&self, id: &str) -> bool {
@@ -2517,6 +2552,39 @@ impl AppState {
             self.save_session(id);
         }
         changed
+    }
+
+    /// Apply the settle transition a running turn's goal tools recorded.
+    ///
+    /// The model writes through a [`GoalStore`] on the runner thread; the
+    /// durable goal stays this store's own. Applying the recorded transition
+    /// here, at the turn's end, is what lets the goal loop see a completed or
+    /// blocked goal and stop instead of starting round n+1. A turn that
+    /// recorded nothing leaves the goal untouched (it stays active for the next
+    /// round), and the turn's store is dropped either way.
+    pub(crate) fn settle_goal(&mut self, id: &str) -> Option<GoalSettle> {
+        let store = self.goals.remove(id)?;
+        let settle = store.take_settle()?;
+        let changed = {
+            let Some(session) = self.store.session_mut(id) else {
+                return Some(settle);
+            };
+            let Some(goal) = session.goal.as_mut() else {
+                return Some(settle);
+            };
+            let changed = match &settle {
+                GoalSettle::Complete => goal.complete(),
+                GoalSettle::Blocked { code, message } => goal.block(code, message),
+            };
+            if changed {
+                session.updated_at = now();
+            }
+            changed
+        };
+        if changed {
+            self.save_session(id);
+        }
+        Some(settle)
     }
 
     /// Remove the current goal while retaining the session's history.
@@ -5652,6 +5720,77 @@ mod tests {
         let state = super::AppState::with_store(crate::store::Store::open_at(dir));
         let id = state.active_id.clone().expect("a session");
         (state, id)
+    }
+
+    /// A model completion settles onto the durable goal and the loop refuses
+    /// another round: the transition the tool recorded is applied once, at the
+    /// turn's end, and the turn's store is dropped.
+    #[test]
+    fn a_model_completion_settles_the_goal_and_stops_the_loop() {
+        use agent::goal::GoalState;
+        use agent::tools::{GoalSettle, GoalStore};
+        let (mut state, id) = goal_state("model-complete");
+        assert_eq!(
+            state.create_goal(&id, "ship it"),
+            Ok(super::GoalChange::Created)
+        );
+        // The store is seeded from the goal at spawn, after the round advanced.
+        let goal = state.goal(&id).expect("the goal");
+        let store = GoalStore::new(goal);
+        state.attach_goal(&id, store.clone());
+        assert!(store.complete(), "the model's tool call");
+        assert_eq!(
+            state.settle_goal(&id),
+            Some(GoalSettle::Complete),
+            "the pump takes the recorded transition"
+        );
+        let settled = state.goal(&id).expect("the goal");
+        assert_eq!(settled.state, GoalState::Completed);
+        assert!(!settled.activation.is_armed());
+        assert!(!state.goal_can_advance(&id));
+        assert!(
+            state.begin_goal_turn_in(&id).is_none(),
+            "a completed goal starts no round"
+        );
+        assert!(
+            state.settle_goal(&id).is_none(),
+            "the turn's store is settled away, so one turn settles once"
+        );
+    }
+
+    /// A model blocker is recorded with the stable model-reported code, and an
+    /// empty turn (no recorded transition) leaves the goal where it was.
+    #[test]
+    fn a_model_blocker_settles_and_an_unsignalled_turn_changes_nothing() {
+        use agent::goal::GoalState;
+        use agent::tools::GoalStore;
+        let (mut state, id) = goal_state("model-block");
+        state.create_goal(&id, "ship it").expect("the goal");
+        let goal = state.goal(&id).expect("the goal");
+        let store = GoalStore::new(goal);
+        state.attach_goal(&id, store.clone());
+        assert!(store.block(agent::goal::MODEL_REPORTED, "the vault is locked"));
+        assert!(state.settle_goal(&id).is_some());
+        let settled = state.goal(&id).expect("the goal");
+        assert_eq!(settled.state, GoalState::Blocked);
+        assert_eq!(
+            settled
+                .blocked_reason
+                .as_ref()
+                .map(|reason| reason.code.as_str()),
+            Some(agent::goal::MODEL_REPORTED)
+        );
+        assert!(!state.goal_can_advance(&id));
+        // No transition recorded: the goal stays active for the next round.
+        assert!(state.clear_goal(&id));
+        assert_eq!(
+            state.create_goal(&id, "try again"),
+            Ok(super::GoalChange::Created)
+        );
+        let goal = state.goal(&id).expect("the goal");
+        state.attach_goal(&id, GoalStore::new(goal));
+        assert!(state.settle_goal(&id).is_none(), "nothing was recorded");
+        assert_eq!(state.goal(&id).expect("the goal").state, GoalState::Active);
     }
 
     /// Every /goal verb's transition and refusal, against the reference domain.

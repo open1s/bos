@@ -75,6 +75,12 @@ pub(crate) struct SubagentRun {
     pub(crate) revision: u64,
     /// The child's flattened transcript.
     pub(crate) transcript: Vec<SubagentMessage>,
+    /// Prompts the reader sent while the child was still working, oldest
+    /// first. They are drawn after the transcript and start a child turn of
+    /// their own once the current one settles, exactly like a normal session's
+    /// queue. They are deliberately not part of the transcript: a saved child
+    /// must never carry a prompt no turn ever answered.
+    pub(crate) pending: Vec<String>,
 }
 
 impl SubagentStatus {
@@ -168,6 +174,20 @@ impl SubagentRun {
         out
     }
 
+    /// The transcript the main chat draws for this run: the settled rows plus
+    /// the prompts still waiting behind the current turn.
+    ///
+    /// The pending rows are view-only. A child that is saved keeps
+    /// [`Self::chat_messages`] as its transcript, so a prompt the child never
+    /// answered cannot reappear as history after a restart.
+    pub(crate) fn preview_messages(&self) -> Vec<crate::model::ChatMessage> {
+        let mut out = self.chat_messages();
+        for prompt in &self.pending {
+            out.push(crate::model::ChatMessage::user(prompt.clone()));
+        }
+        out
+    }
+
     /// The metadata document saved beside the child's transcript.
     pub(crate) fn meta(&self) -> crate::model::SubagentMeta {
         crate::model::SubagentMeta {
@@ -245,6 +265,7 @@ impl SubagentRegistry {
             error: None,
             revision: 0,
             transcript: Vec::new(),
+            pending: Vec::new(),
         };
         if let Ok(mut runs) = self.runs.lock() {
             runs.push(run);
@@ -286,6 +307,7 @@ impl SubagentRegistry {
             error: None,
             revision: 0,
             transcript: Vec::new(),
+            pending: Vec::new(),
         };
         let mut runs = self.runs.lock().ok()?;
         if runs.iter().filter(|run| run.status.is_running()).count() >= limit {
@@ -385,17 +407,69 @@ impl SubagentRegistry {
         if run.status.is_running() {
             return false;
         }
-        run.status = SubagentStatus::Running;
-        run.revision += 1;
-        run.finished_at = None;
-        run.result = None;
-        run.error = None;
-        run.transcript.push(SubagentMessage {
-            role: "user".to_string(),
-            content: prompt.to_string(),
-            tool: None,
-        });
+        reopen(run, prompt);
         true
+    }
+
+    /// Accept a prompt behind a child's CURRENT turn.
+    ///
+    /// A running child is not a dead end: a normal session queues a submission
+    /// made while its turn streams, and a child that behaves like one queues it
+    /// too. The prompt is shown after the transcript and starts a child turn of
+    /// its own when the current one settles.
+    pub(crate) fn queue_followup(&self, id: &str, prompt: &str) -> bool {
+        let Ok(mut runs) = self.runs.lock() else {
+            return false;
+        };
+        let Some(run) = runs.iter_mut().find(|run| run.id == id) else {
+            return false;
+        };
+        if !run.status.is_running() {
+            return false;
+        }
+        run.pending.push(prompt.to_string());
+        run.revision += 1;
+        true
+    }
+
+    /// Whether any settled run still has a prompt waiting.
+    pub(crate) fn any_pending(&self) -> bool {
+        self.runs
+            .lock()
+            .map(|runs| runs.iter().any(|run| !run.pending.is_empty()))
+            .unwrap_or(false)
+    }
+
+    /// Take the oldest queued prompt and reopen the run for its turn.
+    ///
+    /// The run must be settled: a prompt that is taken while the child still
+    /// works would open a second stream over the same transcript. The caller
+    /// starts the turn that answers it.
+    pub(crate) fn take_pending(&self, id: &str) -> Option<String> {
+        let mut runs = self.runs.lock().ok()?;
+        let run = runs.iter_mut().find(|run| run.id == id)?;
+        if run.status.is_running() || run.pending.is_empty() {
+            return None;
+        }
+        let prompt = run.pending.remove(0);
+        reopen(run, &prompt);
+        Some(prompt)
+    }
+
+    /// Drop the prompts waiting behind one run.
+    ///
+    /// Used when the shell can never start them - the spawn policy or the
+    /// credential refuses - so a refusal is reported once instead of being
+    /// retried on every clock tick.
+    pub(crate) fn drop_pending(&self, id: &str) {
+        if let Ok(mut runs) = self.runs.lock() {
+            if let Some(run) = runs.iter_mut().find(|run| run.id == id) {
+                if !run.pending.is_empty() {
+                    run.pending.clear();
+                    run.revision += 1;
+                }
+            }
+        }
     }
 
     /// Append streamed assistant text to the live transcript.
@@ -531,6 +605,24 @@ impl SubagentRegistry {
     }
 }
 
+/// Put one settled run back into Running with the reader's prompt appended.
+///
+/// Both the idle send and the drained queue come through here, so a reopened
+/// run always clears the old outcome and carries the prompt as its next user
+/// row.
+fn reopen(run: &mut SubagentRun, prompt: &str) {
+    run.status = SubagentStatus::Running;
+    run.revision += 1;
+    run.finished_at = None;
+    run.result = None;
+    run.error = None;
+    run.transcript.push(SubagentMessage {
+        role: "user".to_string(),
+        content: prompt.to_string(),
+        tool: None,
+    });
+}
+
 /// Epoch milliseconds.
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -644,6 +736,56 @@ mod tests {
             !registry.begin_followup(&id, "while busy"),
             "a running child refuses a second follow-up"
         );
+    }
+
+    /// A prompt sent while the child still works waits behind the turn and is
+    /// shown in the view, but never enters the transcript a save reads.
+    #[test]
+    fn a_prompt_sent_while_the_child_runs_queues_behind_it() {
+        let registry = SubagentRegistry::default();
+        let id = registry.begin("session", "session", 1, 0, "Task", "first");
+        registry.append_text(&id, "working");
+        assert!(registry.queue_followup(&id, "second"));
+        assert!(registry.queue_followup(&id, "third"));
+        assert!(registry.any_pending());
+        let run = registry.run(&id).expect("the run");
+        assert_eq!(run.pending, vec!["second", "third"]);
+        assert_eq!(run.status, SubagentStatus::Running);
+        let preview = run.preview_messages();
+        assert_eq!(preview.last().map(|row| row.text.as_str()), Some("third"));
+        assert_eq!(
+            run.chat_messages().len(),
+            1,
+            "an unanswered prompt is not transcript history"
+        );
+    }
+
+    /// The queue is drained one prompt per settled turn: the next prompt waits
+    /// for the turn it did not start.
+    #[test]
+    fn a_queued_prompt_reopens_the_run_once() {
+        let registry = SubagentRegistry::default();
+        let id = registry.begin("session", "session", 1, 0, "Task", "first");
+        registry.queue_followup(&id, "second");
+        registry.queue_followup(&id, "third");
+        registry.finish(&id, "done".to_string(), (1, 2), Vec::new());
+        assert_eq!(registry.take_pending(&id).as_deref(), Some("second"));
+        let run = registry.run(&id).expect("the run");
+        assert_eq!(run.status, SubagentStatus::Running);
+        assert_eq!(run.pending, vec!["third"]);
+        assert_eq!(
+            run.transcript.last().map(|row| row.content.as_str()),
+            Some("second")
+        );
+        assert!(
+            registry.take_pending(&id).is_none(),
+            "the next prompt waits for this turn"
+        );
+        // A settled run takes a direct follow-up instead of a queued one.
+        registry.finish(&id, "again".to_string(), (1, 2), Vec::new());
+        assert!(!registry.queue_followup(&id, "late"));
+        registry.drop_pending(&id);
+        assert!(!registry.any_pending());
     }
 
     #[test]

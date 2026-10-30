@@ -6,7 +6,7 @@ use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::*;
 
 use super::shell::Shell;
-use super::{hairline_all, icon, txt, DivExt, IconName};
+use super::{asset_icon, hairline_all, icon, txt, DivExt, IconName};
 use crate::state::age;
 use crate::theme;
 
@@ -142,6 +142,36 @@ fn hover_actions(
             .group_hover(group, move |s| s.w(px(width))),
     )
     .into_any_element()
+}
+
+/// The reference's workspace folder, expanded: a back shell, a front panel
+/// tinted to 16 percent, and that panel's 1px outline in a 16px viewBox.
+const WORKSPACE_FOLDER_OPEN: &[u8] = include_bytes!("../assets/workspace-folder-open.svg");
+/// The reference's workspace folder while the row is folded.
+const WORKSPACE_FOLDER_CLOSED: &[u8] = include_bytes!("../assets/workspace-folder-closed.svg");
+/// The reference's filled disclosure triangle (`IconTriangleRightFillRegular`):
+/// a 16px viewBox drawn at 14px and turned 90 degrees while the row is open.
+const WORKSPACE_CARET: &[u8] = include_bytes!("../assets/workspace-caret.svg");
+
+/// The folder a workspace row shows at rest, and the ink it takes.
+///
+/// Measured from the reference's `ProjectRowItem`: the icon is
+/// `IconFolderOpenRegular` while the row is expanded and
+/// `IconFolderCloseRegular` while it is folded, coloured `label-tertiary`
+/// until the workspace contains the session on screen, where it takes the
+/// business primary (`.folderActive`).
+fn workspace_folder(folded: bool, active: bool) -> (&'static [u8], u32) {
+    let folder = if folded {
+        WORKSPACE_FOLDER_CLOSED
+    } else {
+        WORKSPACE_FOLDER_OPEN
+    };
+    let ink = if active {
+        theme::accent()
+    } else {
+        theme::faint()
+    };
+    (folder, ink)
 }
 
 impl Shell {
@@ -373,6 +403,13 @@ impl Shell {
             .flex()
             .flex_col();
         let mut window = TreeWindow::new(&self.side_scroll, self.viewport_h);
+        // The folder mark follows the session on screen, as the reference's
+        // `containsCurrent` does; the workspace a session is tagged with is the
+        // stable id, not the root.
+        let current_workspace = self
+            .state
+            .active_session()
+            .map(|session| session.workspace.clone());
 
         for workspace in &self.state.settings.global.workspaces {
             let folded = self.state.collapsed.contains(&workspace.id);
@@ -386,6 +423,10 @@ impl Shell {
             let row_shell = cx.entity();
             let ws_lang = self.state.lang;
             let renaming = self.renaming_workspace.as_deref() == Some(ws_id.as_str());
+            // The reference tints the folder only while the row is open: a
+            // folded row hides the session that proves the workspace current.
+            let active = !folded && current_workspace.as_deref() == Some(ws_id.as_str());
+            let (folder, folder_ink) = workspace_folder(folded, active);
             // A row being renamed keeps its field: it is on screen by definition.
             let show = window.take(TREE_HEADER_H) || renaming;
             if !show {
@@ -405,16 +446,48 @@ impl Shell {
                         .gap(px(6.0))
                         .cursor_pointer()
                         .hover(|s| s.bg(rgb(theme::hover())))
-                        .child(icon(
-                            if folded {
-                                IconName::ChevronRight
-                            } else {
-                                IconName::ChevronDown
-                            },
-                            13.0,
-                            theme::muted(),
-                        ))
-                        .child(icon(IconName::Folder, 14.0, theme::muted()))
+                        // The reference's icon gutter: the folder states open or
+                        // closed at rest and the pointer swaps it for the
+                        // disclosure triangle in the same 16x20 box, so the title
+                        // never moves. The triangle points right while folded and
+                        // down while open, the reference's 90-degree turn.
+                        .child(
+                            div()
+                                .relative()
+                                .flex_none()
+                                .w(px(16.0))
+                                .h(px(20.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .group_hover(row_group.clone(), |s| s.opacity(0.0))
+                                        .child(asset_icon(folder, 16.0, folder_ink, 0.0)),
+                                )
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .top(px(0.0))
+                                        .left(px(0.0))
+                                        .w_full()
+                                        .h_full()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .opacity(0.0)
+                                        .group_hover(row_group.clone(), |s| s.opacity(1.0))
+                                        .child(asset_icon(
+                                            WORKSPACE_CARET,
+                                            14.0,
+                                            theme::faint(),
+                                            if folded { 0.0 } else { 1.0 },
+                                        )),
+                                ),
+                        )
                         .child(if renaming {
                             // The rename happens in place, and the wrapper takes its
                             // own id so a press inside the field does not collapse
@@ -1226,5 +1299,28 @@ impl Shell {
             .hover(|s| s.bg(rgb(theme::hover())))
             .child(mark)
             .on_click(cx.listener(move |this, _event, window, cx| this.open_settings(window, cx)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{workspace_folder, WORKSPACE_FOLDER_CLOSED, WORKSPACE_FOLDER_OPEN};
+    use crate::theme;
+
+    /// The measured reference pair: expanded rows carry the open folder,
+    /// folded rows the closed one. A single always-open glyph would read as
+    /// "every workspace is open" and lose the fold state.
+    #[test]
+    fn the_workspace_folder_states_whether_the_row_is_open() {
+        assert_eq!(workspace_folder(false, false).0, WORKSPACE_FOLDER_OPEN);
+        assert_eq!(workspace_folder(true, false).0, WORKSPACE_FOLDER_CLOSED);
+    }
+
+    /// The folder of the workspace on screen is the business primary, as the
+    /// reference's `.folderActive` is; every other folder stays tertiary.
+    #[test]
+    fn the_workspace_on_screen_takes_the_accent() {
+        assert_eq!(workspace_folder(false, false).1, theme::faint());
+        assert_eq!(workspace_folder(false, true).1, theme::accent());
     }
 }

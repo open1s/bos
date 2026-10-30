@@ -1,4 +1,4 @@
-# The reference goal feature, measured (round 126)
+# The reference goal feature, measured (round 126; model completion tools added round 127)
 
 Source: the shipped asar at
 /Applications/DeepSeek Harness.app/Contents/Resources/app.asar. The goal
@@ -152,6 +152,7 @@ at idle, armed and with room.
 | inline edit disabled on empty, never clears | commit_note | mirrored |
 | round prompt exact, cap blocker round-limit, idle-only, failed round disarms | goal_round_input / continue_goal / disarm_goal_on_error | mirrored |
 | round retained as a goal-sourced user message in history ("Continuing goal" trigger) | bsh passes the identical prompt as the turn input and stores no user row | deliberately different: bsh has no goal-source transcript row; storing the block would render raw XML. Later rounds do not resend earlier round prompts. |
-| get_goal/create_goal/update_goal model tools | none | impossible here: no goal tool surface. Model completion/blocked paths are dormant, exactly as the reference documents without its tool package. |
+| get_goal/create_goal/update_goal model tools | get_goal + update_goal (actions complete/blocked) mounted on any turn whose session has a goal; a recorded transition settles onto the durable goal when the turn ends | mirrored for the two settlings an automatic round may make, which is what the round prompt asks for; create_goal, edit, pause and resume stay operator-side (the /goal command and the goal bar own them), and there is no CAS because the shell is the only writer |
+| model completion ends the continuation loop | the pump settles the recorded transition BEFORE continue_goal decides, so a completed or blocked goal starts no round n+1; a failed round still disarms | mirrored: the dormant-completion gap this table recorded is closed |
 | CAS id/revision, tombstones, goal/change events | none | deliberately different: one UI thread mutates through AppState; the command never exposes ids/revisions, so no CAS is needed |
 | specific-menu fill, exact hover colour shift, per-field help aria | page fill + hover background; a11y not exposed by GPUI | stylesheet approximation |

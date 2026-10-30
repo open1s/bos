@@ -54,10 +54,23 @@ The guidance explicitly excludes trivial single steps and tightly coupled
 sequential work. A leaf child does not inherit the delegation instruction,
 because it has no subagent tool.
 
-The child agent is retained in the registry after it settles. Selecting it opens
-its transcript, but the composer stays available: a follow-up prompt is sent into
-the SAME child agent, appended to its transcript, and the run returns to Running
-until the answer settles. A running child refuses a second follow-up.
+The child behaves like a normal agent to the reader. Selecting it opens its
+transcript, the composer stays available, and a submission is handled the way a
+session's own submission is:
+
+- while the child still streams, the prompt is queued behind that turn. It is
+  drawn after the transcript as the reader's next row (view-only: a saved child
+  never carries a prompt no turn answered) and starts a child turn of its own
+  when the current one settles, one prompt per turn;
+- a prompt sent to a settled child continues the SAME child agent while its live
+  process exists, and otherwise rebuilds the child from its saved Session - same
+  model, same tools, same focused-child persona, stored history replayed - so a
+  restart is not a dead end;
+- the prompt is never redirected into the parent conversation, and a selected
+  child never offers the parent turn's stop control.
+
+A refusal - the spawn policy, a missing credential - is said once and the
+waiting prompt is dropped rather than retried on every tick.
 
 ## Registry
 
@@ -90,10 +103,10 @@ transcript is flattened back into the menu registry, and the menu is restored
 with the same titles, counts, statuses and transcripts. Run ids are UUIDs, so a
 restart cannot collide with an earlier child's file.
 
-A follow-up needs the live child Agent; after a restart the transcript and
-trajectory are read-only until a new run is started. The registry no longer
-evicts settled runs, so live children stay continuable for the life of the
-process.
+A follow-up uses the live child Agent while it exists. After a restart the
+registry restores only the transcript, so the first prompt rebuilds the child
+from its saved Session (see the rebuild note above). The registry no longer
+evicts settled runs, so a child stays continuable for the life of the process.
 
 ## UI (DSH mirror)
 
@@ -151,8 +164,12 @@ executor has no Tokio reactor. The UI task only awaits the runner JoinHandle.
 - Child sessions are not listed in the left pane, by design. The child runs
   inside the parent turn; a follow-up is a new child react call, not a steer
   into a running parent turn.
-- A child can be continued while its live Agent exists: for the life of the
-  process; after a restart the restored transcript is read-only.
+- A child turn is TEXT: the child's composer accepts a prompt, while attachments
+  and the slash commands (including `/compact`) stay the parent conversation's.
+- A child can be continued for the life of the process, and after a restart the
+  first prompt rebuilds it from the saved Session. The rebuilt child is a new
+  process: its pre-restart tool arguments are replayed as capped history rows,
+  so a tool call whose result was truncated stays truncated.
 - Token figures update from stream Usage events; while none has arrived the
   header shows a rough estimate (~prompt/4 + 2k).
 - A run is painted by a 100ms child clock, not the 1s jobs clock. Settled runs
