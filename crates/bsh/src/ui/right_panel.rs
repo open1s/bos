@@ -29,14 +29,14 @@ use gpui_kit::*;
 
 use super::diff_pane::{self, DiffSource};
 use super::shell::{Shell, SideDrag};
+use super::terminal_view::TerminalView;
 use super::{hairline_left, handle_bar, icon, txt, DivExt, IconName};
 use crate::browser::engine::cdp::PointerButton;
 use crate::files::{self, Kind};
 use crate::model::Role;
 use crate::terminal::KeyOutcome;
-use super::terminal_view::TerminalView;
-use gpui_libghostty::TerminalOptions;
 use crate::theme;
+use gpui_libghostty::TerminalOptions;
 
 // Save the file the panel is showing, bound to cmd-s.
 //
@@ -1563,18 +1563,17 @@ impl Shell {
                         .w_full()
                         .child(view)
                         .child(
+                            // The input handler is registered during PAINT:
+                            // Window::handle_input refuses to run in prepaint.
                             canvas(
-                                move |bounds, window, cx| {
+                                |_, _, _| {},
+                                move |bounds, _, window, cx| {
                                     window.handle_input(
                                         &ime_focus,
-                                        gpui::ElementInputHandler::new(
-                                            bounds,
-                                            ime_panel.clone(),
-                                        ),
+                                        gpui::ElementInputHandler::new(bounds, ime_panel.clone()),
                                         cx,
                                     );
                                 },
-                                |_, _, _, _| {},
                             )
                             .absolute()
                             .size_full(),
@@ -1806,7 +1805,7 @@ impl Shell {
     ///
     /// It is a layer of the window's view, so leaving it up would draw the
     /// terminal over whatever tab replaced it.
-    fn hide_terminal_view(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn hide_terminal_view(&mut self, cx: &mut Context<Self>) {
         if let Some(view) = self.right.terminal_view.clone() {
             view.update(cx, |view, _| view.set_visible(false));
         }
@@ -3616,9 +3615,46 @@ fn browser_shortcut(
 impl Shell {
     /// Fold or unfold the panel, the way the header's left control folds the
     /// sidebar. A fold keeps the pane, so reopening lands where the reader was.
-    pub(crate) fn toggle_right_panel(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_right_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.right.open = !self.right.open;
+        if self.right.open {
+            // Reopening on the terminal has to bring the native surface back:
+            // a tab switch hid it, and nothing else paints it again.
+            if self.right.tab == Some(RightTab::Terminal) {
+                self.ensure_terminal_view(window, cx);
+            }
+        } else {
+            self.hide_terminal_view(cx);
+        }
         cx.notify();
+    }
+
+    /// Whether the terminal's native surface should be on screen this frame.
+    ///
+    /// Three facts decide it: the panel is open on the Terminal tab, and no
+    /// full-window overlay (the settings dialog, the image lightbox) is up.
+    /// The surface is a layer of the window's view, so an overlay would be
+    /// painted UNDER it if the terminal stayed visible.
+    pub(crate) fn terminal_surface_wanted(&self) -> bool {
+        self.right.open
+            && self.right.tab == Some(RightTab::Terminal)
+            && self.state.overlay == crate::state::Overlay::None
+            && self.image_lightbox.is_none()
+    }
+
+    /// Show `tab` in the panel, taking the terminal's native layer down when
+    /// the body becomes something else.
+    ///
+    /// Every open path except `open_right_tab` (which may also have to spawn
+    /// the surface) goes through this: the terminal is a layer of the window's
+    /// view, so it has to be hidden explicitly or it keeps painting over the
+    /// pane that replaced it.
+    pub(crate) fn show_right_tab(&mut self, tab: RightTab, cx: &mut Context<Self>) {
+        self.right.open = true;
+        self.right.tab = Some(tab);
+        if tab != RightTab::Terminal {
+            self.hide_terminal_view(cx);
+        }
     }
 
     /// Reveal or hide the seam's bar.
@@ -3817,7 +3853,11 @@ impl Shell {
         // Nothing to show yet: a native view on `about:blank` would cover the
         // pane's empty state (the globe and prompt) with a white rectangle.
         // The view is built by the first navigation, which sets the address.
-        if self.state.browser.read(|browser| browser.address().is_empty()) {
+        if self
+            .state
+            .browser
+            .read(|browser| browser.address().is_empty())
+        {
             return;
         }
         self.browser_webview_pending = true;
@@ -3910,7 +3950,6 @@ impl Shell {
                     webview.update(cx, |view, _| view.load_url(&url));
                     let _ = job.reply.send(Ok(String::new()));
                 }
-
             }
         }
         let visible = self.right.open
@@ -5416,8 +5455,7 @@ impl Shell {
             return;
         }
         // Answer the click now: the pane is where the result is going.
-        self.right.tab = Some(RightTab::Diff);
-        self.right.open = true;
+        self.show_right_tab(RightTab::Diff, cx);
         self.right.diff.error = None;
         cx.notify();
         let rel = rel.to_path_buf();
@@ -5465,8 +5503,7 @@ impl Shell {
         self.right.diff.error = Some(text);
         // A refusal replaces whatever the pane was showing, turn list included.
         self.right.diff.turn = None;
-        self.right.tab = Some(RightTab::Diff);
-        self.right.open = true;
+        self.show_right_tab(RightTab::Diff, cx);
         cx.notify();
     }
 
@@ -5505,8 +5542,7 @@ impl Shell {
             _ => {
                 self.right.diff.error = Some(self.state.lang.tr("diff.error"));
                 self.right.diff.turn = None;
-                self.right.tab = Some(RightTab::Diff);
-                self.right.open = true;
+                self.show_right_tab(RightTab::Diff, cx);
                 cx.notify();
                 return;
             }
@@ -5574,8 +5610,7 @@ impl Shell {
         // Nothing is resolved the moment a conflicted file opens; the flag is
         // recomputed on every resolution rather than assumed.
         self.right.diff.resolved = conflicts == 0;
-        self.right.tab = Some(RightTab::Diff);
-        self.right.open = true;
+        self.show_right_tab(RightTab::Diff, cx);
         cx.notify();
     }
 
@@ -5898,8 +5933,7 @@ impl Shell {
             commands,
         });
         self.right.diff.error = None;
-        self.right.tab = Some(RightTab::Diff);
-        self.right.open = true;
+        self.show_right_tab(RightTab::Diff, cx);
         cx.notify();
     }
 
@@ -6331,8 +6365,8 @@ mod tests {
     };
 
     use super::{
-        anchor_line, chord_modifiers, named_key, page_point, page_wheel, typed_text,
-        BrowserClick, BROWSER_WHEEL_GAIN,
+        anchor_line, chord_modifiers, named_key, page_point, page_wheel, typed_text, BrowserClick,
+        BROWSER_WHEEL_GAIN,
     };
 
     fn key(key: &str, key_char: Option<&str>) -> Keystroke {

@@ -352,10 +352,10 @@ mod tests {
             "message.turnUsage.input",
             "message.turnUsage.cacheRead",
             "message.turnUsage.output",
-            // The terminal's policy surfaces: the refused input, the output
-            // marker, the compact blocked count and the policy parse error.
+            // The terminal's policy surfaces: the refused input, the compact
+            // blocked count and the policy parse error. (The output marker left
+            // with the output gate when the pane moved to libghostty.)
             "right.terminal.inputRefused",
-            "right.terminal.outputBlocked",
             "right.terminal.policyBlocked",
             "right.terminal.policyError",
         ] {

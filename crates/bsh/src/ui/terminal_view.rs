@@ -19,8 +19,8 @@ use std::sync::Arc;
 
 use gpui_kit::*;
 use gpui_libghostty::__private::{
-    spawn_surface, KeyAction, Modifiers, MouseButton as GhosttyButton,
-    NativeSurface, TerminalThemeState,
+    spawn_surface, KeyAction, Modifiers, MouseButton as GhosttyButton, NativeSurface,
+    TerminalThemeState,
 };
 use gpui_libghostty::{
     ClipboardApproval, ClipboardOperation, TerminalColor, TerminalConfiguration, TerminalOptions,
@@ -69,9 +69,8 @@ impl TerminalView {
         options.quiet_login = true;
         // SAFETY: GPUI owns the parent view; this entity services and drops its
         // native child on the window's UI thread, as the generated adapter does.
-        let (surface, theme_state) = unsafe {
-            spawn_surface(options, window, f64::from(window.scale_factor()))?
-        };
+        let (surface, theme_state) =
+            unsafe { spawn_surface(options, window, f64::from(window.scale_factor()))? };
         Ok(cx.new(|_| Self {
             surface,
             theme: theme_state,
@@ -113,8 +112,8 @@ impl TerminalView {
 
     /// Place the surface at the pane's measured bounds.
     ///
-    /// Called from the paint pass with window coordinates, which is exactly
-    /// what the shim converts into the parent view's own frame.
+    /// Called from the pane's measure pass with window coordinates, which is
+    /// exactly what the shim converts into the parent view's own frame.
     pub(crate) fn update_frame(&mut self, bounds: Bounds<Pixels>, scale_factor: f64) {
         self.frame = bounds;
         self.surface.set_frame(
@@ -168,12 +167,14 @@ impl TerminalView {
     /// kill-whole-line.
     pub(crate) fn emission(&mut self, emission: Emission) {
         match emission {
-            Emission::Enter => self
-                .surface
-                .send_key(KeyAction::Press, "enter", None, Modifiers::empty()),
-            Emission::KillLine => self
-                .surface
-                .send_key(KeyAction::Press, "u", None, Modifiers::CONTROL),
+            Emission::Enter => {
+                self.surface
+                    .send_key(KeyAction::Press, "enter", None, Modifiers::empty())
+            }
+            Emission::KillLine => {
+                self.surface
+                    .send_key(KeyAction::Press, "u", None, Modifiers::CONTROL)
+            }
         }
     }
 
@@ -191,7 +192,8 @@ impl TerminalView {
     pub(crate) fn mouse_move(&mut self, position: Point<Pixels>, modifiers: gpui::Modifiers) {
         let x = f64::from(f32::from(position.x - self.frame.origin.x));
         let y = f64::from(f32::from(position.y - self.frame.origin.y));
-        self.surface.mouse_position(x, y, ghostty_modifiers(modifiers));
+        self.surface
+            .mouse_position(x, y, ghostty_modifiers(modifiers));
     }
 
     /// A pointer button press.
@@ -274,10 +276,7 @@ impl TerminalView {
             wakeup.wait().await;
             // Ghostty draws its native child during the tick; GPUI has no
             // terminal pixels to repaint for this wakeup.
-            if view
-                .update(cx, |view, _| view.surface.tick())
-                .is_err()
-            {
+            if view.update(cx, |view, _| view.surface.tick()).is_err() {
                 break;
             }
         }));

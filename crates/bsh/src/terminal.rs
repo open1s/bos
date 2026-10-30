@@ -1,26 +1,26 @@
 //! The terminal pane's model: the policy gate, its audit ring, and the line the
 //! gate is shown.
 //!
-//! The pane's backend is libghostty ('gpui-libghostty'): Ghostty owns the PTY,
-//! the parser, the scrollback and the drawing (see 'ui/terminal_view.rs'), so
+//! The pane's backend is libghostty (`gpui-libghostty`): Ghostty owns the PTY,
+//! the parser, the scrollback and the drawing (see `ui/terminal_view.rs`), so
 //! this module no longer keeps a screen. What stays is everything the pane
 //! decides BEFORE bytes reach the shell: the workspace's Rego policy
-//! ('<workspace>/.bsh/terminal-policy.rego'), the start gate, the Enter gate on
-//! the mirrored line, and the bounded audit ring both answer through.
+//! (`.bsh/terminal-policy.rego`), the start gate, the Enter gate on the
+//! mirrored line, and the bounded audit ring both answer through.
 //!
 //! # The gate
 //!
-//! One Rego module (package 'terminal') decides two points. Each evaluation
-//! receives an 'input' object and the gate reads 'data.terminal.verdict'; the
-//! shim builds that rule from the policy's own 'decision' (a boolean or an
-//! object) and falls back to its plain 'allow' rule, so a policy may be either
+//! One Rego module (package `terminal`) decides two points. Each evaluation
+//! receives an `input` object and the gate reads `data.terminal.verdict`; the
+//! shim builds that rule from the policy's own `decision` (a boolean or an
+//! object) and falls back to its plain `allow` rule, so a policy may be either
 //! shape:
 //!
-//! - **start**: '{action: "start", command, shell, cwd, deny}', asked before
+//! - **start**: `{action: "start", command, shell, cwd, deny}`, asked before
 //!   any process exists. A refused start spawns nothing, and that stays the
 //!   only door that guarantees no process runs.
-//! - **input**: '{action: "input", command: <the submitted line, exactly>,
-//!   cwd, deny}', asked on Enter before the submitting carriage return is
+//! - **input**: `{action: "input", command: <the submitted line, exactly>,
+//!   cwd, deny}`, asked on Enter before the submitting carriage return is
 //!   written. A refusal writes no line; the pane sends Ctrl-U instead so the
 //!   shell's line editor erases the text it has already echoed, and the
 //!   refusal is shown in the pane's status line and recorded in the audit ring.
@@ -37,11 +37,11 @@
 //! browsing. Those are line editing and window management, not commands, and a
 //! live echo means the line exists in the shell's editor before Enter. Because
 //! the line is a mirror of what this pane typed, a shell-side edit (history
-//! recall, a mid-line cursor jump) can differ from it. The input object's 'cwd'
+//! recall, a mid-line cursor jump) can differ from it. The input object's `cwd`
 //! is the directory the terminal was started in; bsh keeps no mirror of the
-//! shell's live directory, so a 'cd' the shell made is invisible to the policy.
+//! shell's live directory, so a `cd` the shell made is invisible to the policy.
 //!
-//! The policy file is '<workspace>/.bsh/terminal-policy.rego'. A missing file is
+//! The policy file is the workspace's .bsh/terminal-policy.rego. A missing file is
 //! the documented default (allow everything, the shipped policy module). A file
 //! that exists but does not parse closes every gate, so an unusable rule can
 //! never widen the gate it was meant to narrow. The file is re-read when its
@@ -52,7 +52,7 @@
 //! reports a compact count once something was refused. There is no settings
 //! surface for policies: the file, its reload and the audit are the management
 //! surface. The contract and worked examples are in
-//! 'docs/bsh-terminal-policy.md'.
+//! `docs/bsh-terminal-policy.md`.
 //!
 //! # The sandbox
 //!
@@ -901,7 +901,7 @@ impl Terminal {
     /// promises it.
     ///
     /// Ghostty's command string is a shell command it hands to
-    /// 'login -flp <user> bash -c "exec -l <command>"' on macOS, so an 'env'
+    /// `login -flp <user> bash -c "exec -l <command>"` on macOS, so an `env`
     /// prefix is how a value reaches the shell without a wrapper process of our
     /// own. TERM and COLORTERM are set by Ghostty itself; the rest is what bsh
     /// has always promised the pane's shell.
@@ -915,10 +915,7 @@ impl Terminal {
             // A pane with no rc files would otherwise draw monochrome: BSD ls
             // reads these two, and git's colour.ui already defaults to auto.
             assignments.push("CLICOLOR=1".to_string());
-            assignments.push(format!(
-                "LSCOLORS={}",
-                shell_word("ExFxCxDxBxegedabagacad")
-            ));
+            assignments.push(format!("LSCOLORS={}", shell_word("ExFxCxDxBxegedabagacad")));
         }
         let shell = shell_word(&self.shell.display().to_string());
         if assignments.is_empty() {
@@ -1304,6 +1301,10 @@ decision := {"allow": false, "reason": "no rm here"} if {
             })
         );
         assert_eq!(terminal.blocked_decisions(), 1);
+        assert_eq!(
+            terminal.refused_inputs(),
+            vec![String::from("rm -rf build")]
+        );
 
         let (outcome, emitted) = submit(&mut terminal, "ls");
         assert_eq!(outcome, KeyOutcome::Sent);
@@ -1354,12 +1355,10 @@ decision := {"allow": false, "reason": "no rm here"} if {
             "the refusal names the file: {:?}",
             terminal.policy_error()
         );
-        assert!(
-            terminal
-                .audit()
-                .iter()
-                .any(|row| row.action == "policy" && !row.allow)
-        );
+        assert!(terminal
+            .audit()
+            .iter()
+            .any(|row| row.action == "policy" && !row.allow));
     }
 
     #[test]
@@ -1475,7 +1474,11 @@ decision := {"allow": false, "reason": "no shells"} if { input.action == "start"
             ("/bin/sh", "/bin/sh"),
         ]);
         assert_eq!(
-            shell_choice(TerminalPlatform::MacOs, Some(Path::new("/bin/bash")), &present),
+            shell_choice(
+                TerminalPlatform::MacOs,
+                Some(Path::new("/bin/bash")),
+                &present
+            ),
             PathBuf::from("/bin/bash")
         );
         assert_eq!(
@@ -1553,7 +1556,10 @@ decision := {{"allow": false, "reason": "{reason}"}} if {{ input.action == "inpu
         let mut terminal = Terminal::new(root, Lang::En);
         submit(&mut terminal, "ls");
         let row = terminal.audit().pop().expect("one row");
-        assert_eq!(row.reason.map(|reason| reason.len()), Some(AUDIT_REASON_CAP));
+        assert_eq!(
+            row.reason.map(|reason| reason.len()),
+            Some(AUDIT_REASON_CAP)
+        );
     }
 
     #[test]

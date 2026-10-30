@@ -942,8 +942,7 @@ impl Shell {
                 match rel.strip_prefix(&root) {
                     Ok(inside) => rel = inside.to_path_buf(),
                     Err(_) => {
-                        self.right.open = true;
-                        self.right.tab = Some(crate::ui::right_panel::RightTab::Files);
+                        self.show_right_tab(crate::ui::right_panel::RightTab::Files, cx);
                         self.files.error = Some(self.state.lang.tr("right.files.outside"));
                         cx.notify();
                         return;
@@ -951,8 +950,7 @@ impl Shell {
                 }
             }
         }
-        self.right.open = true;
-        self.right.tab = Some(crate::ui::right_panel::RightTab::Files);
+        self.show_right_tab(crate::ui::right_panel::RightTab::Files, cx);
         self.open_file(&rel, window, cx);
         cx.notify();
     }

@@ -4799,6 +4799,15 @@ impl Drop for Shell {
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The terminal is a native layer ABOVE everything GPUI paints, so its
+        // presence is derived from the state that owns it rather than trusting
+        // each path that switches tabs or opens a dialog to take it down: a
+        // frame that shows another pane, or an overlay, must not leave the
+        // surface drawing over it.
+        if let Some(view) = self.right.terminal_view.clone() {
+            let wanted = self.terminal_surface_wanted();
+            view.update(cx, |view, _| view.set_visible(wanted));
+        }
         // Release the atlas tiles of browser frames this pane has replaced.
         // `paint_image` caches a tile per `RenderImage::id` and every captured
         // frame carries a new one, so a replaced frame's tile would otherwise

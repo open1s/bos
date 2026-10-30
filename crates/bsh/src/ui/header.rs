@@ -1741,7 +1741,7 @@ impl Shell {
                     this.toggle_sidebar_at(window.viewport_size().width.as_f32(), cx);
                 }
                 "hdr-show-right-panel" => {
-                    this.toggle_right_panel(cx);
+                    this.toggle_right_panel(window, cx);
                 }
                 _ => {
                     this.open_settings(window, cx);

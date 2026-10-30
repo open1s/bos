@@ -1179,8 +1179,7 @@ impl Shell {
             return;
         }
         let rel = std::path::Path::new(path);
-        self.right.open = true;
-        self.right.tab = Some(super::right_panel::RightTab::Files);
+        self.show_right_tab(super::right_panel::RightTab::Files, cx);
         self.open_file(rel, window, cx);
         cx.notify();
     }
