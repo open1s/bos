@@ -1196,6 +1196,11 @@ impl AppState {
     pub(crate) fn adopt_workspace(&mut self, name: &str, root: &str) -> String {
         let id = self.settings.note_workspace(name, root);
         self.sync_store_roots();
+        // A live draft keeps its own copy of the registry; without this mirror
+        // the pane's next Save would hand the draft (which predates the
+        // registration) back as the committed tree. `commit_settings` also
+        // carries the registry forward, so both orders are safe.
+        self.sync_workspaces_to_draft();
         // Registration never seeds an ENFORCING file: a fresh workspace has no
         // egress allowlist, which is the UNRESTRICTED state, and auto-writing
         // the starter would turn that into a deny-all the reader never chose.
@@ -1203,6 +1208,19 @@ impl AppState {
         // the reader has something to copy the moment the workspace exists.
         self.ensure_templates_at(root);
         id
+    }
+
+    /// Copy the committed workspace registry and active id into a live draft.
+    ///
+    /// The sidebar owns the registry; a settings pane edits other fields. This
+    /// keeps the draft from resurrecting a registry that predates an adoption
+    /// on its next Save.
+    pub(crate) fn sync_workspaces_to_draft(&mut self) {
+        if let Some(draft) = self.draft.as_mut() {
+            draft.global.workspaces = self.settings.global.workspaces.clone();
+            draft.global.general.active_workspace =
+                self.settings.global.general.active_workspace.clone();
+        }
     }
 
     /// Retitle a workspace.
@@ -3239,8 +3257,22 @@ impl AppState {
                 // arms exist so the match stays exhaustive by the type.
                 AgentEvent::AutoCompacted { .. }
                 | AgentEvent::Steered { .. }
-                | AgentEvent::SteerWithdrawn { .. }
-                | AgentEvent::Done => {}
+                | AgentEvent::SteerWithdrawn { .. } => {}
+                // A turn that ends with nothing to show is a failure the
+                // reader must see. A reasoning model can spend every step in
+                // `reasoning_content` and never write an answer; the engine
+                // nudges once, and when even that comes back blank the turn
+                // closes on silence that reads as a hung app.
+                AgentEvent::Done => {
+                    if let Some(message) = session.messages.last_mut() {
+                        if message.text.is_empty()
+                            && message.tools.is_empty()
+                            && message.error.is_none()
+                        {
+                            message.error = Some(crate::i18n::tr(self.lang, "turn.noAnswer"));
+                        }
+                    }
+                }
             }
             if terminal {
                 session.updated_at = now();
@@ -3811,7 +3843,17 @@ impl AppState {
     /// the pane, its scroll position and every other edit in view. Closing is
     /// the close control's own action (or Cancel, which discards the draft).
     pub(crate) fn commit_settings(&mut self) -> std::io::Result<()> {
-        if let Some(draft) = self.draft.take() {
+        if let Some(mut draft) = self.draft.take() {
+            // The workspace REGISTRY is the sidebar's state, not a pane field:
+            // adopting, renaming or deleting a workspace writes the committed
+            // tree only. A draft cloned before that change used to erase it on
+            // Save, and a chat in the lost workspace then built with no root -
+            // every file tool refused and the shell fell back to the launch
+            // directory. Carry the registry (and the window's active id)
+            // forward so a Save can never undo it.
+            draft.global.workspaces = self.settings.global.workspaces.clone();
+            draft.global.general.active_workspace =
+                self.settings.global.general.active_workspace.clone();
             self.settings = draft;
         }
         self.settings.ensure_workspace();
@@ -5806,6 +5848,35 @@ mod tests {
         assert!(
             texts.iter().any(|text| text.contains("the answer")),
             "the streamed answer survives the stop: {texts:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A turn that ENDS (Done) with no text, no tools and no error is named a
+    /// failure the reader can see.
+    ///
+    /// A reasoning model can spend every step in `reasoning_content` and never
+    /// write an answer; the turn used to close on silence that read as a hung
+    /// app. A stopped turn keeps its cancelled marker instead (see the test
+    /// below), so the two outcomes stay distinguishable.
+    #[test]
+    fn a_done_turn_with_no_answer_is_named() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("bsh-done-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut state = super::AppState::with_store(crate::store::Store::open_at(dir.clone()));
+        let id = state.active_id.clone().expect("a session");
+        state.begin_turn_in(&id, "hello").expect("a turn opens");
+        state.apply_event(&id, crate::runner::AgentEvent::Done);
+        let session = state.store.session(&id).expect("the session");
+        let last = session.messages.last().expect("the assistant row");
+        assert!(last.text.is_empty());
+        assert!(
+            last.error
+                .as_deref()
+                .is_some_and(|error| error.contains("no answer")),
+            "the silent turn is named: {last:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

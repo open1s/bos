@@ -314,7 +314,8 @@ impl NativeTools {
 
     fn toolchain(&self) -> PathBuf {
         // A full Xcode keeps clang under its XcodeDefault.xctoolchain...
-        let xcode = Path::new(&self.developer_dir).join("Toolchains/XcodeDefault.xctoolchain/usr/bin");
+        let xcode =
+            Path::new(&self.developer_dir).join("Toolchains/XcodeDefault.xctoolchain/usr/bin");
         if xcode.join("clang").exists() {
             return xcode;
         }

@@ -72,6 +72,15 @@ fn offers_web_search(enabled: bool, api_mode: &str) -> bool {
     enabled && api_mode == "responses"
 }
 
+/// The smallest foldable span, in estimated tokens, worth a summarizer call.
+///
+/// A checkpoint's framing alone prices about 75 tokens, and a model-written
+/// summary of a span this small routinely prices larger than the span (the
+/// `NotSmaller` refusal), so below this floor a model-written compaction can
+/// only cost time. The mechanical mid-turn compaction still holds the hard
+/// send-side ceiling without any model call.
+const COMPACT_MIN_SPAN_TOKENS: usize = 512;
+
 impl Agent {
     /// Prepare context with tools and skills populated from the agent's state.
     /// Shared by react() and stream() to avoid code duplication.
@@ -102,6 +111,15 @@ impl Agent {
                 }
             }
 
+            // The tool array is part of the provider's cached prompt prefix, so
+            // its order must not depend on the registry's map iteration. A shell
+            // rebuilds the agent every turn, and a fresh map walks in a fresh
+            // order: the schemas then differ between two otherwise identical
+            // requests and the provider re-prefills the whole prompt. One sort
+            // makes the array a function of the registered set, which is what
+            // lets a turn-start request reuse the previous turn's cache.
+            tools.sort_by(|a, b| a.name.cmp(&b.name));
+
             context.tools = tools;
         }
 
@@ -117,7 +135,7 @@ impl Agent {
         // reader's to invoke (the composer's `/name` gesture loads it), and
         // advertising it here would invite a tool call the same policy refuses.
         // The registered list keeps it, so the gesture still resolves it.
-        context.skills = self
+        let mut skills: Vec<react::llm::Skill> = self
             .skills
             .iter()
             .filter(|s| !s.metadata.user_only)
@@ -127,6 +145,12 @@ impl Agent {
                 description: s.metadata.description.clone(),
             })
             .collect();
+        // Same prefix-cache rule as the tool array above: the catalogue is
+        // rendered into the system prompt, so its order must be a function of
+        // the catalogue, not of the registration path this turn happened to
+        // take.
+        skills.sort_by(|a, b| a.name.cmp(&b.name));
+        context.skills = skills;
 
         context
     }
@@ -152,6 +176,10 @@ impl Agent {
             .llm_timeout(self.config.timeout_secs)
             .parallel_tool_calls(self.config.parallel_tool_calls)
             .context_budget(self.context_budget)
+            // The host's tool-output setting caps what one result may add to
+            // the MODEL's session, not only what the UI displays; zero keeps
+            // the engine default.
+            .tool_result_cap(self.config.tool_output_cap)
             .model(self.config.model.clone())
             .app(app);
         // A zero budget is "no budget": the loop ends when the model stops
@@ -488,6 +516,23 @@ impl Agent {
                 .sum();
             (removed, priced)
         };
+        // A span this small cannot pay for its own summarizer call. The
+        // automatic trigger prices the whole request - system prompt, tool
+        // schemas and messages - while only the message span is foldable, so a
+        // shell with a large fixed overhead trips the trigger every turn while
+        // the foldable part stays in the hundreds of tokens. Each of those
+        // calls is a full completion on the turn's critical path, and a
+        // checkpoint framed from a tiny span routinely prices LARGER than the
+        // span it replaces (the NotSmaller refusal). Below this floor the
+        // honest outcome is "nothing worth folding": skip the call, keep the
+        // history, and let the mechanical mid-turn compaction hold the hard
+        // send-side ceiling.
+        if before_tokens < COMPACT_MIN_SPAN_TOKENS {
+            log::debug!(
+                "compaction skipped: foldable span {before_tokens} tokens is under the {COMPACT_MIN_SPAN_TOKENS} floor"
+            );
+            return Ok(None);
+        }
 
         // The summarizer reads the shadowed span as plain text and answers with
         // the checkpoint. Tools are withheld: the instruction forbids acting,

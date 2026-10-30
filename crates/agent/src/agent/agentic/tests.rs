@@ -865,6 +865,47 @@ async fn react_records_per_run_tool_deltas() {
 
 /* ---- MCP attach (Agent::add_mcp_tool) ---- */
 
+/// The request's tool array is NAME-SORTED, whatever order the tools were
+/// registered in.
+///
+/// The registry is a concurrent map, and a shell rebuilds its agent every
+/// turn: a fresh map walks in a fresh order, so the schemas used to arrive in
+/// a different arrangement on every turn start. The tool array is part of the
+/// provider's cached prompt prefix, so that reshuffle re-keyed the cache and
+/// every turn re-prefilled the whole request.
+#[test]
+fn prepare_context_lists_tools_in_name_order() {
+    let provider = {
+        let mut provider = LlmProvider::new();
+        provider.register_vendor(
+            "toolmock".to_string(),
+            Box::new(ToolCallLlm {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+        );
+        provider
+    };
+    let mut agent = Agent::new(AgentConfig::default(), Arc::new(provider));
+    for name in ["zulu_tool", "alpha_tool", "mike_tool", "bravo_tool"] {
+        let owned = name.to_string();
+        agent.add_tool(Arc::new(FunctionTool::new(
+            name,
+            "a registered tool",
+            serde_json::json!({"type":"object"}),
+            move |_args| Ok(serde_json::json!(owned.clone())),
+        )));
+    }
+    let names: Vec<String> = agent
+        .prepare_context()
+        .tools
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect();
+    let mut sorted = names.clone();
+    sorted.sort();
+    assert_eq!(names, sorted, "the tool array is name-sorted: {names:?}");
+}
+
 /// A lazily-created HTTP client: no network I/O happens until a request is
 /// made, which these registration tests never do.
 fn lazy_mcp_client() -> Arc<crate::mcp::McpClient> {
@@ -1551,10 +1592,10 @@ async fn compact_now_installs_a_model_written_checkpoint() {
         let mut session = agent.session();
         // Long enough that the framed checkpoint (the preamble alone is ~75
         // tokens) is genuinely smaller than the span it replaces.
-        session.add_user(format!("old one {}", "x".repeat(400)));
-        session.add_assistant(format!("reply one {}", "y".repeat(400)));
-        session.add_user(format!("old two {}", "x".repeat(400)));
-        session.add_assistant(format!("reply two {}", "y".repeat(400)));
+        session.add_user(format!("old one {}", "x".repeat(1200)));
+        session.add_assistant(format!("reply one {}", "y".repeat(1200)));
+        session.add_user(format!("old two {}", "x".repeat(1200)));
+        session.add_assistant(format!("reply two {}", "y".repeat(1200)));
     }
     let signal = std::sync::atomic::AtomicBool::new(false);
     let outcome = agent
@@ -1598,10 +1639,10 @@ async fn the_compaction_request_carries_the_pinned_instruction() {
     let (agent, seen) = agent_with_script(Ok("checkpoint".to_string()), 0);
     {
         let mut session = agent.session();
-        session.add_user(format!("old one {}", "x".repeat(400)));
-        session.add_assistant(format!("reply one {}", "y".repeat(400)));
-        session.add_user(format!("old two {}", "x".repeat(400)));
-        session.add_assistant(format!("reply two {}", "y".repeat(400)));
+        session.add_user(format!("old one {}", "x".repeat(1200)));
+        session.add_assistant(format!("reply one {}", "y".repeat(1200)));
+        session.add_user(format!("old two {}", "x".repeat(1200)));
+        session.add_assistant(format!("reply two {}", "y".repeat(1200)));
     }
     let signal = std::sync::atomic::AtomicBool::new(false);
     let _ = agent
@@ -1623,6 +1664,39 @@ async fn the_compaction_request_carries_the_pinned_instruction() {
     assert!(
         !prompt.starts_with(crate::agent::context::COMPACTION_INSTRUCTION),
         "the conversation digest comes before the instruction"
+    );
+}
+
+/// A foldable span under the floor folds NOTHING and pays no summarizer call.
+///
+/// The automatic trigger prices the whole request while only messages fold, so
+/// a shell with a large fixed overhead used to reach here every turn with a
+/// span of a few hundred tokens - each visit a full completion that a verbose
+/// checkpoint then refused as NotSmaller. The floor returns the honest
+/// "nothing worth folding" before any request is made.
+#[tokio::test]
+async fn compact_now_skips_a_span_that_cannot_pay_for_its_own_call() {
+    let (agent, seen) = agent_with_script(Ok("checkpoint".to_string()), 0);
+    {
+        let mut session = agent.session();
+        session.add_user("old one".to_string());
+        session.add_assistant("reply one".to_string());
+        session.add_user("old two".to_string());
+    }
+    let signal = std::sync::atomic::AtomicBool::new(false);
+    let outcome = agent
+        .compact_now(0, &signal)
+        .await
+        .expect("the compaction request");
+    assert!(outcome.is_none(), "a tiny span folds nothing: {outcome:?}");
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "no summarizer request was paid for the tiny span"
+    );
+    assert_eq!(
+        agent.session().messages().len(),
+        3,
+        "the history is untouched when the span is under the floor"
     );
 }
 
@@ -1740,10 +1814,12 @@ fn agent_with_script(
 
 fn four_messages(agent: &Agent) {
     let mut session = agent.session();
-    session.add_user("old one".to_string());
-    session.add_assistant("reply one".to_string());
-    session.add_user("old two".to_string());
-    session.add_assistant("reply two".to_string());
+    // Long enough to clear the compact_now span floor: these tests pin the
+    // summarizer contract, which only runs once a span is worth a call.
+    session.add_user(format!("old one {}", "x".repeat(1200)));
+    session.add_assistant(format!("reply one {}", "y".repeat(1200)));
+    session.add_user(format!("old two {}", "x".repeat(1200)));
+    session.add_assistant(format!("reply two {}", "y".repeat(1200)));
 }
 
 #[tokio::test]

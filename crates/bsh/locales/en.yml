@@ -254,6 +254,7 @@
 "turn.completed": "Completed"
 "turn.stopped": "Stopped"
 "turn.failed": "Failed"
+"turn.noAnswer": "The model returned no answer this turn (it produced only reasoning). Try again or switch models."
 "stream.deepDiving": "Deep diving"
 "context.aria": "{percent} of context used"
 "context.system": "System prompt"

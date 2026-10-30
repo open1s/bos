@@ -86,6 +86,9 @@ impl From<TomlAgentConfig> for AgentConfig {
             // The TOML surface has no compaction budget yet; the direct builder
             // (`AgentConfig::compaction_input_tokens`) is how a host sets it.
             compaction_input_tokens: AgentConfig::default().compaction_input_tokens,
+            // The TOML surface has no tool-output cap yet; the direct builder
+            // (`AgentConfig::tool_output_cap`) is how a host sets it.
+            tool_output_cap: 0,
             // A TOML agent config carries no switch for these yet; the host sets
             // the fields on the AgentConfig it builds directly.
             web_search: false,

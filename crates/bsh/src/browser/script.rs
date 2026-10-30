@@ -102,10 +102,7 @@ impl ScriptBridge {
             let Ok(mut jobs) = self.jobs.lock() else {
                 return Err(String::from("the browser view is gone"));
             };
-            jobs.push(ScriptJob {
-                command,
-                reply: tx,
-            });
+            jobs.push(ScriptJob { command, reply: tx });
         }
         match rx.recv_timeout(ANSWER_TIMEOUT) {
             Ok(answer) => answer,
@@ -156,8 +153,7 @@ impl ScriptBridge {
 /// JSON: decoding twice is what turns that back into the object the caller
 /// meant. An object answer is used as it is.
 pub(crate) fn decode_answer(out: &str) -> Result<serde_json::Value, String> {
-    let outer: serde_json::Value =
-        serde_json::from_str(out).unwrap_or(serde_json::Value::Null);
+    let outer: serde_json::Value = serde_json::from_str(out).unwrap_or(serde_json::Value::Null);
     match outer {
         serde_json::Value::String(text) => serde_json::from_str(&text)
             .map_err(|error| format!("the page answered with text that is not JSON: {error}")),

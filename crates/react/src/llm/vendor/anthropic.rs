@@ -453,11 +453,21 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
 
         let body = self.build_request(&persona, &request, session, context);
         let url = self.messages_url();
+        let wire = serde_json::to_string(&body).unwrap_or_default();
         if log::log_enabled!(log::Level::Info) {
-            info!(
-                "anthropic request: {}",
-                serde_json::to_string(&body).unwrap_or_default()
-            );
+            // A one-line summary, not the whole body: the full payload rode
+            // this INFO line for every call, images included.
+            info!("anthropic request: {} chars", wire.chars().count());
+        }
+        if log::log_enabled!(log::Level::Trace) {
+            if crate::llm::vendor::wire_bodies_enabled() {
+                log::trace!("anthropic request body: {wire}");
+            } else {
+                log::trace!(
+                    "anthropic request body head: {}",
+                    crate::llm::vendor::wire_body_head(&wire)
+                );
+            }
         }
 
         let response = self

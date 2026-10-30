@@ -777,6 +777,27 @@ impl Settings {
             .filter(|id| !id.trim().is_empty())
             .unwrap_or(&self.global.general.active_workspace);
         let entry = self.global.workspaces.iter().find(|w| w.id == workspace_id);
+        // A chat whose workspace record is missing must still run in the
+        // project the window is looking at. Without this fallback the build
+        // resolves an EMPTY root: every file tool refuses ("reads are confined
+        // to the workspace") and the shell falls back to the process's launch
+        // directory, so a reader working in `hello` sees tools rooted in
+        // whatever directory the app was started from. `Store::rehome_orphans`
+        // already applies this same rule on disk.
+        let entry = entry.or_else(|| {
+            let active = self
+                .global
+                .workspaces
+                .iter()
+                .find(|w| w.id == self.global.general.active_workspace);
+            if active.is_some() && !workspace_id.trim().is_empty() {
+                log::warn!(
+                    "session workspace '{workspace_id}' is not in the registry; using the active workspace '{}'",
+                    self.global.general.active_workspace
+                );
+            }
+            active
+        });
         // The catalogue comes from the cache, keyed by the settings that name
         // it: a frame resolves several times, and only the first may touch disk.
         let (skill_sources, skills) = self.skill_cache.resolve(&self.global, &self.workspace);
@@ -1083,6 +1104,29 @@ mod tests {
             settings.effective_for(&unnamed).root,
             "/tmp/bsh-bos",
             "no workspace on the session falls back to the active one"
+        );
+    }
+
+    /// A fresh install ships no endpoint, so the first run asks for one rather
+    /// than pretending a provider is configured.
+    #[test]
+    fn a_stale_session_workspace_falls_back_to_the_active_one() {
+        let mut settings = Settings::default();
+        let hello = settings.note_workspace("hello", "/Users/gaosg/Projects/hello");
+        settings.global.general.active_workspace = hello.clone();
+        // The chat names a workspace the registry no longer carries (a deleted
+        // entry, or a settings tree another instance replaced). The build must
+        // still confine its tools to the project the window is looking at: an
+        // empty root refuses every path and drops the shell into the launch
+        // directory.
+        let stale = crate::settings::resolve::SessionChoice {
+            workspace: Some("gone-workspace-id".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            settings.effective_for(&stale).root,
+            "/Users/gaosg/Projects/hello",
+            "a stale workspace id falls back to the active workspace root"
         );
     }
 

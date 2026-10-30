@@ -10,6 +10,8 @@ impl<A: ReActApp> ReActEngineBuilder<A> {
             // for tools, which is the contract the shipped shell relies on.
             max_steps: None,
             context_budget: 0,
+            // The engine default applies until a host passes its own cap.
+            tool_result_cap: TOOL_RESULT_CAP,
             parallel_tool_calls: false,
             telemetry: Telemetry::new(),
             resilience: None,
@@ -59,6 +61,16 @@ impl<A: ReActApp> ReActEngineBuilder<A> {
     /// already prices a context window passes that ceiling here.
     pub fn context_budget(mut self, tokens: usize) -> Self {
         self.context_budget = tokens;
+        self
+    }
+
+    /// Set the most text one tool result may add to the model context.
+    ///
+    /// Zero selects the engine default. A host with a workspace-level
+    /// tool-output setting passes that limit here, so the session the model
+    /// reads obeys the same cap its UI does instead of an engine constant.
+    pub fn tool_result_cap(mut self, cap: usize) -> Self {
+        self.tool_result_cap = if cap == 0 { TOOL_RESULT_CAP } else { cap };
         self
     }
 
@@ -157,6 +169,7 @@ impl<A: ReActApp + Default> ReActEngineBuilder<A> {
             tools,
             max_steps: self.max_steps,
             context_budget: self.context_budget,
+            tool_result_cap: self.tool_result_cap,
             parallel_tool_calls: self.parallel_tool_calls,
             telemetry: self.telemetry,
             llm_timeout_secs: self.llm_timeout_secs,

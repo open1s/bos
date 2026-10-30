@@ -83,7 +83,14 @@ fn log_request(request: &OpenAiRequest) {
         return;
     };
     if log::log_enabled!(log::Level::Trace) {
-        log::trace!("Req: {json}");
+        // The full payload used to ride every TRACE step, which put a whole
+        // turn into the log for every request. Bodies are opt-in; the head
+        // keeps a bounded fingerprint either way.
+        if crate::llm::vendor::wire_bodies_enabled() {
+            log::trace!("Req: {json}");
+        } else {
+            log::trace!("Req: {}", crate::llm::vendor::wire_body_head(&json));
+        }
     }
     if log::log_enabled!(log::Level::Info) {
         info!(
@@ -528,7 +535,7 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
         }
 
         let t2 = std::time::Instant::now();
-        let body: ChatCompletionResponse = response.json().await.map_err(|e| {
+        let mut body: ChatCompletionResponse = response.json().await.map_err(|e| {
             let err = LlmError::Parse(e.to_string());
             context.notify_error(&err);
             err
@@ -536,14 +543,35 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
         info!("[TIMING] response.json(): {:?}", t2.elapsed());
         info!("[TIMING] complete total: {:?}", t0.elapsed());
 
+        // The blocking path carries the same wire-markup risk as the stream:
+        // strip it before anything records the text.
+        for choice in &mut body.choices {
+            if let Some(content) = &mut choice.message.content {
+                *content = crate::llm::vendor::strip_special_tokens(content);
+            }
+            if let Some(reasoning) = &mut choice.message.reasoning_content {
+                *reasoning = crate::llm::vendor::strip_special_tokens(reasoning);
+            }
+        }
+
         let resp = LlmResponse::OpenAI(body);
 
         if log::log_enabled!(log::Level::Info) {
-            info!(
-                "Resp: {}",
-                serde_json::to_string(&resp)
-                    .unwrap_or_else(|_| "Failed to serialize response".into())
-            );
+            // The whole response used to be serialized into this INFO line:
+            // a full transcript with base64 images in one log row, for every
+            // blocking call. The body is a TRACE head like the request's.
+            info!("Resp: complete");
+        }
+        if log::log_enabled!(log::Level::Trace) {
+            let json = serde_json::to_string(&resp).unwrap_or_default();
+            if crate::llm::vendor::wire_bodies_enabled() {
+                log::trace!("Resp body: {json}");
+            } else {
+                log::trace!(
+                    "Resp body head: {}",
+                    crate::llm::vendor::wire_body_head(&json)
+                );
+            }
         }
 
         context.notify_response(&resp);
@@ -654,6 +682,10 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
             let mut byte_stream = response.bytes_stream();
             let mut extractor = OpenAIExtractor::new(JsonExtractor::default());
             let mut acc = StreamToolCallAccumulator::new();
+            // Drops wire markup a gateway leaves in `content` even though it
+            // parsed the structured tool calls (measured: `<｜DSML｜ calls>`
+            // reached the transcript as prose).
+            let mut special = crate::llm::vendor::SpecialTokenFilter::default();
             // A transport chunk may split a multi-byte character; keep the
             // incomplete tail and decode it with the next chunk.
             let mut utf8_tail: Vec<u8> = Vec::new();
@@ -682,11 +714,14 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                                     }
                                     if let Some(content) = &choice.delta.content {
                                         if !content.is_empty() {
-                                            first_token.get_or_insert_with(|| started.elapsed());
-                                            on_chunk.as_ref().inspect(|cb| cb(content));
-                                            let _ = tx
-                                                .send(Ok(StreamToken::Text(content.clone())))
-                                                .await;
+                                            let cleaned = special.push(content);
+                                            if !cleaned.is_empty() {
+                                                first_token
+                                                    .get_or_insert_with(|| started.elapsed());
+                                                on_chunk.as_ref().inspect(|cb| cb(&cleaned));
+                                                let _ =
+                                                    tx.send(Ok(StreamToken::Text(cleaned))).await;
+                                            }
                                         }
                                     }
                                     if let Some(calls) = &choice.delta.tool_calls {
@@ -778,6 +813,12 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                         return;
                     }
                 }
+            }
+            // Flush whatever the special-token filter still holds: a
+            // trailing partial span is the model's last words, not a marker.
+            let tail = special.finish();
+            if !tail.is_empty() {
+                let _ = tx.send(Ok(StreamToken::Text(tail))).await;
             }
             for (name, args_val, id) in acc.drain() {
                 let _ = tx

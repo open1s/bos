@@ -130,10 +130,9 @@ impl Tool for PlanTool {
          skip it for trivial single-step tasks. Add one item per concrete step \
          before you start. Pass `items` as the COMPLETE list of steps — each \
          `{text, status}` with status `pending`, `in_progress`, or `completed` — \
-         because every call overwrites the previous plan. While work remains, keep \
+         every call overwrites the previous plan. While work remains, keep \
          exactly one item `in_progress`. Mark each item `completed` as soon as it \
-         is done, and pass an empty list when the plan no longer applies. The plan \
-         is shown to the user and persisted."
+         is done, and pass an empty list when the plan no longer applies."
             .to_string()
     }
 

@@ -132,14 +132,15 @@ impl Runner {
 
     /// Re-seed the agent session from the UI transcript.
     ///
-    /// Only the stored history is replayed here; the turn's runtime snapshot and
-    /// workspace instructions are injected by [`Runner::spawn`] after
-    /// compaction, immediately before the stream, so the fresh context is never
-    /// folded into the checkpoint it was meant to supersede.
+    /// The stored history replays in the model's own order: text, then each
+    /// tool call with its result. The runtime snapshot and workspace
+    /// instructions are injected by [`Runner::spawn`] after compaction,
+    /// immediately before the stream, so the fresh context is never folded
+    /// into the checkpoint it was meant to supersede.
     pub(crate) fn seed_session(agent: &Agent, transcript: &[ChatMessage]) {
         let mut session = agent.session();
         session.restore_messages(Vec::new());
-        for message in transcript {
+        for (row_index, message) in transcript.iter().enumerate() {
             match message.role {
                 // A stored user row with images replays as the same multimodal
                 // content its live turn sent, which is how the /goal attachment
@@ -149,10 +150,35 @@ impl Runner {
                         session.add_user_content(content);
                     }
                 }
-                Role::Assistant if !message.text.is_empty() => {
-                    session.add_assistant(message.text.clone());
+                Role::Assistant => {
+                    if !message.text.is_empty() {
+                        session.add_assistant(message.text.clone());
+                    }
+                    // The tool traffic replays too. Dropping it used to make
+                    // every turn re-do the last turn's reads - the model
+                    // re-read the same files each turn because the results it
+                    // already held were gone - and it moved the request
+                    // prefix, so the provider's prompt cache never carried
+                    // across turns. The stored outputs are the capped ones the
+                    // request sent; the ids are seed-local and only need to
+                    // pair call with result inside this history.
+                    for (call_index, event) in message.tools.iter().enumerate() {
+                        let call_id = format!("seed-{row_index}-{call_index}");
+                        let args: serde_json::Value =
+                            serde_json::from_str(&event.args).unwrap_or(serde_json::json!({}));
+                        session.push(react::llm::LlmMessage::AssistantToolCall {
+                            tool_call_id: call_id.clone(),
+                            name: event.name.clone(),
+                            args,
+                        });
+                        session.push(react::llm::LlmMessage::ToolResult {
+                            tool_call_id: call_id,
+                            content: event.output.clone().unwrap_or_else(|| {
+                                "The tool call produced no recorded result.".to_string()
+                            }),
+                        });
+                    }
                 }
-                _ => {}
             }
         }
     }
@@ -395,7 +421,7 @@ mod tests {
             },
             std::sync::Arc::new(provider),
         ));
-        let long = "detail ".repeat(60);
+        let long = "detail ".repeat(200);
         let transcript = vec![
             ChatMessage::user(format!("one {long}")),
             ChatMessage::assistant(),
@@ -451,19 +477,36 @@ mod tests {
             "the turn still streams after the checkpoint"
         );
         let session = agent.session();
-        match session.messages().first() {
-            Some(react::LlmMessage::User { content }) => match content {
-                react::llm::Content::Text(text) => {
-                    assert!(text.contains("<compacted-summary>"));
-                    assert!(text.contains("auto checkpoint"));
-                }
-                _ => panic!("the checkpoint is text"),
-            },
-            other => panic!("the checkpoint is a user message: {other:?}"),
-        }
+        let messages = session.messages();
+        // The turn's frame is injected at the HEAD of the request (the stable
+        // prefix a provider cache can hit across turns), so the checkpoint
+        // follows the snapshot instead of occupying slot 0.
+        let checkpoint = messages
+            .iter()
+            .position(|message| {
+                matches!(
+                    message,
+                    react::LlmMessage::User { content }
+                        if content.as_text().is_some_and(|text| {
+                            text.contains("<compacted-summary>")
+                                && text.contains("auto checkpoint")
+                        })
+                )
+            })
+            .expect("the checkpoint is a user message");
+        assert!(
+            messages[..checkpoint].iter().all(|message| matches!(
+                message,
+                react::LlmMessage::User { content }
+                    if content
+                        .as_text()
+                        .is_some_and(|text| text.starts_with(crate::context::RUNTIME_CONTEXT_PREAMBLE))
+            )),
+            "only the injected frame precedes the checkpoint: {messages:?}"
+        );
         assert!(
             matches!(
-                session.messages().get(1),
+                messages.get(checkpoint + 1),
                 Some(react::LlmMessage::Assistant { content }) if content.starts_with("r3")
             ),
             "the retained tail survives the automatic checkpoint"
@@ -698,6 +741,122 @@ mod tests {
             transcript.iter().any(|row| row.content == "do the task"),
             "the child's own prompt is still shown: {transcript:?}"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The stored tool traffic replays into the next turn's session.
+    ///
+    /// Dropping it used to make every turn re-do the last turn's reads - the
+    /// model re-read the same files each turn because the results it already
+    /// held were gone - and it moved the request prefix between turns. The
+    /// replay pairs each call with its result under a seed-local id.
+    #[test]
+    fn seeding_replays_tool_calls_with_their_results() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let agent = capturing_agent(seen);
+        let mut assistant = crate::model::ChatMessage::assistant();
+        assistant.text = "reading".to_string();
+        assistant.tools = vec![
+            crate::model::ToolEvent {
+                name: "read_file".to_string(),
+                args: "{\"path\":\"src/main.rs\"}".to_string(),
+                output: Some("fn main() {}".to_string()),
+                ms: Some(3),
+                at: None,
+            },
+            crate::model::ToolEvent {
+                name: "grep".to_string(),
+                args: "{\"pattern\":\"fn\"}".to_string(),
+                output: Some("src/main.rs:1:fn main".to_string()),
+                ms: Some(1),
+                at: None,
+            },
+        ];
+        let transcript = vec![
+            crate::model::ChatMessage::user("look at main".to_string()),
+            assistant,
+        ];
+        Runner::seed_session(&agent, &transcript);
+        let session = agent.session();
+        let messages = session.messages();
+        let mut calls = 0usize;
+        let mut results = 0usize;
+        for (index, message) in messages.iter().enumerate() {
+            match message {
+                react::LlmMessage::AssistantToolCall {
+                    tool_call_id,
+                    name,
+                    args,
+                } => {
+                    calls += 1;
+                    let expected_name = if calls == 1 { "read_file" } else { "grep" };
+                    assert_eq!(name, expected_name);
+                    if calls == 1 {
+                        assert_eq!(args["path"], "src/main.rs");
+                    }
+                    match messages.get(index + 1) {
+                        Some(react::LlmMessage::ToolResult {
+                            tool_call_id: result_id,
+                            content,
+                        }) => {
+                            assert_eq!(result_id, tool_call_id, "the pair shares its id");
+                            assert!(
+                                content.contains("fn main"),
+                                "the result is the stored output: {content}"
+                            );
+                        }
+                        other => panic!("a call is followed by its result: {other:?}"),
+                    }
+                }
+                react::LlmMessage::ToolResult { .. } => results += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            (calls, results),
+            (2, 2),
+            "both calls replay with their results: {messages:?}"
+        );
+    }
+
+    /// The injected frame sits at the HEAD of a turn that carries history.
+    ///
+    /// Appending it behind the history moved the frame one turn's worth every
+    /// time, which diverged the request prefix at the second row and kept the
+    /// provider's prompt cache from ever carrying across turns.
+    #[test]
+    fn the_frame_precedes_the_replayed_history() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let agent = capturing_agent(seen.clone());
+        let root = workspace("frame-head");
+        let facts = crate::context::RuntimeFacts {
+            cwd: root.to_string_lossy().to_string(),
+            confined: true,
+            sandbox_reason: None,
+            permission: "workspace-write".to_string(),
+            preset: "standard".to_string(),
+            presets_disabled: false,
+        };
+        let transcript = vec![crate::model::ChatMessage::user("earlier line".to_string())];
+        let mut runner = Runner::new();
+        let receiver = runner.spawn(
+            "frame-turn",
+            agent,
+            react::llm::Content::Text("now".to_string()),
+            transcript,
+            facts,
+            None,
+            1_000,
+        );
+        drain(receiver);
+        let rows = seen.lock().unwrap().clone();
+        assert_eq!(rows.len(), 3, "snapshot, history, input: {rows:?}");
+        assert!(
+            rows[0].starts_with(crate::context::RUNTIME_CONTEXT_PREAMBLE),
+            "the frame is the first message: {rows:?}"
+        );
+        assert_eq!(rows[1], "earlier line", "the replayed history follows it");
+        assert_eq!(rows[2], "now", "the reader's line comes last");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

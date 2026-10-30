@@ -250,6 +250,7 @@
 "turn.completed": "已完成"
 "turn.stopped": "已停止"
 "turn.failed": "失败"
+"turn.noAnswer": "本轮模型没有给出回答（只产生了推理内容）。请重试或切换模型。"
 "stream.deepDiving": "深入思考"
 "context.aria": "上下文已用 {percent}"
 "context.system": "系统提示词"

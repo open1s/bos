@@ -79,6 +79,8 @@ impl RepeatedFailure {
 
 /// The most text one tool result may add to the model context.
 ///
+/// The engine default for [`Self::tool_result_cap`]; a host may pass its own.
+///
 /// A tool that prints a megabyte (a build log, a base64 dump) must not become
 /// the next request. The head and tail are kept because the failure and the
 /// summary usually sit at opposite ends; the middle is the part a model can
@@ -86,12 +88,12 @@ impl RepeatedFailure {
 const TOOL_RESULT_CAP: usize = 48 * 1024;
 
 /// Cap one tool result, preserving both ends and naming what was dropped.
-fn cap_tool_result(text: &str) -> String {
-    if text.len() <= TOOL_RESULT_CAP {
+fn cap_tool_result(text: &str, cap: usize) -> String {
+    if text.len() <= cap {
         return text.to_string();
     }
     // Reserve room for the omission marker so the cap never grows a result.
-    let half = TOOL_RESULT_CAP.saturating_sub(256) / 2;
+    let half = cap.saturating_sub(256) / 2;
     let mut head_end = half;
     while head_end > 0 && !text.is_char_boundary(head_end) {
         head_end -= 1;
@@ -164,6 +166,10 @@ pub struct ReActEngine<A: ReActApp> {
     tools: Arc<ToolRegistry>,
     /// Send-side ceiling for one request; 0 disables mid-turn compaction.
     context_budget: usize,
+    /// The most text one tool result may add to the model context. 0 keeps the
+    /// engine default; a host with a workspace-level tool-output setting passes
+    /// that limit so the session the model reads obeys the cap its UI does.
+    tool_result_cap: usize,
     /// The step guard, when the caller asks for one. `None` is the harness
     /// contract: a turn ends when the MODEL stops asking for tools, and a
     /// healthy run must not be cut off by a number. The bound exists for
@@ -189,6 +195,7 @@ pub struct ReActEngineBuilder<A: ReActApp> {
     tools: ToolRegistry,
     max_steps: Option<usize>,
     context_budget: usize,
+    tool_result_cap: usize,
     parallel_tool_calls: bool,
     telemetry: Telemetry,
     resilience: Option<ReActResilience>,
@@ -467,6 +474,17 @@ skill_dir: {}
                                     }
                                 }
 
+                                // One cap for the whole result: the same
+                                // ceiling the streaming loop applies, applied
+                                // before anything reaches the session.
+                                let result_text = cap_tool_result(
+                                    &match &result {
+                                        Ok(ret) => ret.to_string(),
+                                        Err(error) => format!("Error: {error:?}"),
+                                    },
+                                    self.tool_result_cap,
+                                );
+
                                 if let Ok(ret) = &result {
                                     if name == "load_skill" {
                                         let skill_name =
@@ -501,7 +519,7 @@ skill_dir: {}
                                     });
                                     session.push(LlmMessage::ToolResult {
                                         tool_call_id: call_id,
-                                        content: ret.to_string(),
+                                        content: result_text.clone(),
                                     });
                                 } else {
                                     session.push(LlmMessage::AssistantToolCall {
@@ -511,13 +529,10 @@ skill_dir: {}
                                     });
                                     session.push(LlmMessage::ToolResult {
                                         tool_call_id: call_id,
-                                        content: format!("Error: {:?}", result),
+                                        content: result_text.clone(),
                                     });
                                 }
-                                let failure_text = match &result {
-                                    Ok(ret) => ret.to_string(),
-                                    Err(error) => format!("Error: {error:?}"),
-                                };
+                                let failure_text = result_text;
                                 if repeated.note(&name, &failure_text) {
                                     closing = true;
                                     session.push(LlmMessage::user_text(REPEAT_FAILURE_NOTE));
@@ -667,6 +682,17 @@ skill_dir: {}
                                     }
                                 }
 
+                                // One cap for the whole result: the same
+                                // ceiling the streaming loop applies, applied
+                                // before anything reaches the session.
+                                let result_text = cap_tool_result(
+                                    &match &result {
+                                        Ok(ret) => ret.to_string(),
+                                        Err(error) => format!("Error: {error:?}"),
+                                    },
+                                    self.tool_result_cap,
+                                );
+
                                 if let Ok(ret) = &result {
                                     if name == "load_skill" {
                                         let skill_name =
@@ -701,7 +727,7 @@ skill_dir: {}
                                     });
                                     session.push(LlmMessage::ToolResult {
                                         tool_call_id: call_id,
-                                        content: ret.to_string(),
+                                        content: result_text.clone(),
                                     });
                                 } else {
                                     session.push(LlmMessage::AssistantToolCall {
@@ -711,13 +737,10 @@ skill_dir: {}
                                     });
                                     session.push(LlmMessage::ToolResult {
                                         tool_call_id: call_id,
-                                        content: format!("Error: {:?}", result),
+                                        content: result_text.clone(),
                                     });
                                 }
-                                let failure_text = match &result {
-                                    Ok(ret) => ret.to_string(),
-                                    Err(error) => format!("Error: {error:?}"),
-                                };
+                                let failure_text = result_text;
                                 if repeated.note(&name, &failure_text) {
                                     closing = true;
                                     session.push(LlmMessage::user_text(REPEAT_FAILURE_NOTE));
@@ -1000,7 +1023,7 @@ skill_dir: {}
                                 }
                                 Err(ref e) => format!("Error: {}", e),
                             };
-                            let result_text = cap_tool_result(&result_text);
+                            let result_text = cap_tool_result(&result_text, self.tool_result_cap);
 
                             // A failed call is the one line the log was
                             // missing: policy refusals, broken environments and
@@ -1227,7 +1250,7 @@ mod repeat_guard_tests {
     #[test]
     fn a_huge_tool_result_keeps_both_ends_and_names_the_drop() {
         let text = format!("HEAD{}TAIL", "x".repeat(TOOL_RESULT_CAP));
-        let capped = cap_tool_result(&text);
+        let capped = cap_tool_result(&text, TOOL_RESULT_CAP);
         assert!(capped.starts_with("HEAD"));
         assert!(capped.ends_with("TAIL"));
         assert!(capped.contains("bytes omitted"));
@@ -1236,6 +1259,22 @@ mod repeat_guard_tests {
             "the cap actually drops bytes: {} vs {}",
             capped.len(),
             text.len()
+        );
+    }
+
+    /// A host's own cap replaces the engine default: the same huge result is
+    /// clipped to the passed ceiling, not to the engine's 48 KiB.
+    #[test]
+    fn a_host_cap_replaces_the_engine_default() {
+        let text = format!("HEAD{}TAIL", "x".repeat(4_000));
+        let capped = cap_tool_result(&text, 2_048);
+        assert!(capped.starts_with("HEAD"));
+        assert!(capped.ends_with("TAIL"));
+        assert!(capped.contains("bytes omitted"));
+        assert!(
+            capped.len() < 2_048 + 256,
+            "the host cap bounds the result: {} chars",
+            capped.len()
         );
     }
 

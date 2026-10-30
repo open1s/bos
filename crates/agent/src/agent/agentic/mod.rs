@@ -99,6 +99,12 @@ pub struct AgentConfig {
     /// summary's own output is capped separately. Zero disables the bound and
     /// keeps the legacy whole-span request.
     pub compaction_input_tokens: usize,
+    /// The most text one tool result may add to the model context.
+    ///
+    /// Zero keeps the engine default. A shell with a workspace-level
+    /// tool-output setting passes that limit so the session the model reads
+    /// obeys the same cap its UI does.
+    pub tool_output_cap: usize,
     /// Offer the model a hosted web-search tool.
     ///
     /// A HOSTED tool, not a local one: the provider runs the search and returns
@@ -148,6 +154,7 @@ impl Default for AgentConfig {
             timeout_secs: 60,
             max_steps: 10,
             compaction_input_tokens: 24_000,
+            tool_output_cap: 0,
             web_search: false,
             parallel_tool_calls: false,
             api_mode: "chat".to_string(),
@@ -211,6 +218,12 @@ impl AgentConfig {
     /// Set the input-token ceiling for one compaction (summarizer) request.
     pub fn compaction_input_tokens(mut self, tokens: usize) -> Self {
         self.compaction_input_tokens = tokens;
+        self
+    }
+    /// Set the most text one tool result may add to the model context.
+    /// Zero keeps the engine default.
+    pub fn tool_output_cap(mut self, cap: usize) -> Self {
+        self.tool_output_cap = cap;
         self
     }
     /// Run one response's tool calls concurrently instead of one at a time.

@@ -589,6 +589,11 @@ fn build_agent_for_session_inner(
         // the provider whole and came back as an error the UI called a useless
         // summary.
         compaction_input_tokens: compaction_input_tokens(&eff),
+        // The workspace's tool-output cap governs what one result may add to
+        // the MODEL's session too, not only what the UI displays: a 16 KB cap
+        // halves the context growth per big tool call against the engine's
+        // 48 KB default, which is what kept the auto-compaction trigger hot.
+        tool_output_cap: eff.tool_output_cap,
         // No ceiling: the loop ends when the model stops asking for tools, so a
         // long but healthy turn is never cut off by a number. A zero budget is
         // the engine's "unbounded" contract.
@@ -623,6 +628,17 @@ fn build_agent_for_session_inner(
     // policy data and the shell cwd must carry the same spelling of the root or
     // a symlinked workspace would look outside itself.
     let root = workspace_root(&eff).map(|path| path.canonicalize().unwrap_or(path));
+    // A turn with file or shell tools and NO root can only refuse every path,
+    // which the model reads as "the workspace is unreadable". A fresh install
+    // or a settings tree that names no workspace is exactly this state, so say
+    // it here, once, with the ids that explain where it came from.
+    if root.is_none() && (eff.file_tools_enabled || eff.bash_enabled) {
+        log::warn!(
+            "turn for session {session} has file/shell tools but no workspace root (session workspace {:?}, active workspace {:?}); every path will be refused",
+            choice.workspace,
+            settings.global.general.active_workspace
+        );
+    }
     // The tool-boundary policy is compiled ONCE for this turn. Every file and
     // shell tool below holds a clone of this Arc, so a check costs an engine
     // eval and nothing else; there is no parse, no disk read and no data
@@ -706,6 +722,12 @@ fn build_agent_for_session_inner(
                 } else {
                     None
                 },
+                // The directory the command STARTS in is the project the reader
+                // is working on, whatever the confinement says: a released
+                // shell that inherited the app's launch directory ran `pwd` in
+                // the wrong project entirely (measured: a chat in `hello`
+                // reported the BOS checkout).
+                cwd: root.as_ref().map(|r| r.to_string_lossy().to_string()),
                 timeout_secs: eff.shell_timeout_secs,
                 ..Default::default()
             };
@@ -1383,7 +1405,17 @@ fn resolve_path(root: Option<&Path>, raw: &str) -> Result<PathBuf, String> {
     }
     let raw_path = Path::new(raw);
     let Some(root) = root else {
-        return Ok(raw_path.to_path_buf());
+        // A turn with no workspace root has nothing to resolve a RELATIVE path
+        // against. Handing the bare relative string to the policy produced the
+        // misleading "reads are confined to the workspace" refusal; name the
+        // real cause so the model (and the reader) can act on it. An absolute
+        // path still goes to the policy, which decides on its own terms.
+        if raw_path.is_absolute() {
+            return Ok(raw_path.to_path_buf());
+        }
+        return Err(format!(
+            "no workspace root is open for this turn, so `{raw}` cannot be resolved; open a folder and retry"
+        ));
     };
     let joined = if raw_path.is_absolute() {
         raw_path.to_path_buf()
@@ -1717,7 +1749,7 @@ pub(crate) fn attach_subagent_tool(agent: &mut Agent, context: SubagentContext) 
     let result_session = context.session.clone();
     let tool = agent::tools::AsyncFunctionTool::from_fn(
         "subagent",
-        "Delegate ONE self-contained part of a large job to a focused child agent with its own context. Use this whenever the work can be split into independent parts (multi-file changes, parallel research, independent reviews); write a complete prompt and run up to three children at once. Returns immediately with a subagent_id; the child keeps running in the background and you collect it with subagent_result. Do not use it for a trivial single step or tightly coupled sequential work.",
+        "Delegate ONE self-contained part of a large job to a focused child agent with its own context; write a complete prompt and run up to three children at once. Returns immediately with a subagent_id; the child keeps running in the background and you collect it with subagent_result. Do not use it for a trivial single step or tightly coupled sequential work.",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -1831,6 +1863,15 @@ pub(crate) fn attach_subagent_tool(agent: &mut Agent, context: SubagentContext) 
 /// Without it the parent has no way to read a detached child's answer: the
 /// child's only durable handle is the registry, and the turn should not have to
 /// end just to learn what a delegated run found.
+/// The longest one `subagent_result` call blocks for a running child.
+///
+/// A shell child routinely runs one to three minutes, so a one-minute ceiling
+/// turned every collection into a poll: the model called the tool again and
+/// again, and each round trip re-prefilled the request while the child ran.
+/// A five-minute ceiling lets one call wait out a normal child; a longer child
+/// still reports `still running` and the model decides.
+const SUBAGENT_RESULT_WAIT_CAP_SECS: u64 = 300;
+
 fn attach_subagent_result_tool(
     agent: &mut Agent,
     registry: Arc<crate::subagent::SubagentRegistry>,
@@ -1838,12 +1879,12 @@ fn attach_subagent_result_tool(
 ) {
     let tool = agent::tools::AsyncFunctionTool::from_fn(
         "subagent_result",
-        "Collect a background subagent's result, or list this session's runs. Omit subagent_id to list; pass wait_seconds to block up to 60 seconds. Call this before finishing a turn that started subagents.",
+        "Collect a background subagent's result, or list this session's runs. Omit subagent_id to list; pass wait_seconds to block until the child finishes (up to 300 seconds), which is cheaper than polling. Call this before finishing a turn that started subagents.",
         serde_json::json!({
             "type": "object",
             "properties": {
                 "subagent_id": { "type": "string", "description": "The id subagent returned; omit to list runs." },
-                "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 60, "description": "Wait up to this long for a running child; 0 returns immediately." }
+                "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 300, "description": "Block up to this long for a running child; 0 polls once and returns immediately." }
             }
         }),
         move |args| {
@@ -1860,7 +1901,7 @@ fn attach_subagent_result_tool(
                     .get("wait_seconds")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0)
-                    .min(60);
+                    .min(SUBAGENT_RESULT_WAIT_CAP_SECS);
                 if id.is_empty() {
                     let runs: Vec<serde_json::Value> = registry
                         .snapshot()
@@ -1915,7 +1956,7 @@ fn attach_subagent_result_tool(
                         }
                         if run.status.is_running() {
                             payload["note"] = serde_json::Value::String(
-                                "still running; call again or pass wait_seconds".to_string(),
+                                "still running; pass a larger wait_seconds (up to 300) instead of polling".to_string(),
                             );
                         }
                         return Ok(payload);
@@ -3013,7 +3054,7 @@ fn grep_tool(
 ) -> FunctionTool {
     FunctionTool::new(
         "grep",
-        "Search file contents with a ripgrep regular expression. Returns each matching line with its file and 1-based line number. path may be a directory, searched recursively, or a single file. Ignored and hidden files, and dependency or build trees, are skipped unless include_ignored is set; a path that names one file is searched whatever its name, ignore status or include glob. Matching is case-sensitive unless case_insensitive is set. include takes one glob filter for which files the walk searches (negation is not supported); invert reports the lines that do NOT match; context adds that many lines on each side of a match; files_without_match returns the paths of files with no match instead of lines; text searches binary files as text. A binary file reports the lines matched before its first NUL byte, plus a binary row naming that offset.",
+        "Search file contents with a ripgrep regular expression. Returns each matching line with its file and 1-based line number. path may be a directory, searched recursively, or a single file, which is always searched whatever its ignore status or include glob. Ignored and hidden files, and dependency or build trees, are skipped unless include_ignored is set. Matching is case-sensitive unless case_insensitive is set. include takes one glob filter for the walk (negation unsupported); invert reports the lines that do NOT match; context adds that many lines on each side of a match; files_without_match returns the paths of files with no match; text searches binary files as text.",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -5830,6 +5871,63 @@ verdict := {{"allow": false, "rule": "{rule}", "reason": "refused by the workspa
         assert_eq!(build(&settings).agent.config().max_steps, 0);
     }
 
+    /// The tool array's wire size stays inside a budget.
+    ///
+    /// The schemas ride EVERY request as part of the provider's cached prompt
+    /// prefix, so each essay-length description is re-prefilled on every cache
+    /// miss and burns window the conversation needs. The shipped set measured
+    /// ~15 KB of JSON before the trim pass; this ceiling keeps it there.
+    #[test]
+    fn the_tool_array_stays_inside_its_wire_budget() {
+        const WIRE_BUDGET_CHARS: usize = 12_000;
+        let built = build(&bare());
+        let registry = built
+            .agent
+            .registry()
+            .expect("the default build registers tools");
+        let mut schemas: Vec<String> = Vec::new();
+        for (name, tool) in registry.iter() {
+            schemas.push(
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": tool.description(),
+                        "parameters": tool.json_schema(),
+                    }
+                })
+                .to_string(),
+            );
+        }
+        for name in registry.async_tool_names() {
+            if let Some(tool) = registry.get_async(&name) {
+                schemas.push(
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": tool.name(),
+                            "description": tool.description(),
+                            "parameters": tool.json_schema(),
+                        }
+                    })
+                    .to_string(),
+                );
+            }
+        }
+        let chars: usize = schemas.iter().map(|s| s.len()).sum();
+        println!(
+            "tool array wire size: {chars} chars across {} tools (budget {WIRE_BUDGET_CHARS})",
+            schemas.len()
+        );
+        assert!(
+            chars <= WIRE_BUDGET_CHARS,
+            "the tool array is {chars} chars across {} tools (budget \
+             {WIRE_BUDGET_CHARS}); a new essay-length description went in. \
+             Trim it - the schema rides every request.",
+            schemas.len()
+        );
+    }
+
     /// A vault in a scratch directory, unlocked, holding one entry.
     fn vault_holding(label: &str, name: &str, secret: &str) -> Vault {
         let directory =
@@ -6502,6 +6600,24 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         let message = error.to_string();
         assert!(message.contains("escapes the workspace"), "{message}");
         assert!(!message.contains("outside-secret"), "the file was read");
+    }
+
+    /// A RELATIVE path is resolved against the workspace root, not refused.
+    ///
+    /// The model names files the way a person does (`Cargo.toml`, `src/main.rs`).
+    /// A build that handed the policy the bare relative string compared it
+    /// against the root and called it outside the workspace, so every read in a
+    /// fresh chat came back "reads are confined to the workspace".
+    #[test]
+    fn a_relative_path_reads_inside_the_workspace() {
+        let root = scratch("relative-read");
+        std::fs::write(root.join("Cargo.toml"), "[package]").expect("file");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+        let out = registry
+            .execute("read_file", &serde_json::json!({ "path": "Cargo.toml" }))
+            .expect("a relative in-workspace path reads");
+        assert_eq!(out["content"], "[package]");
     }
 
     /// A file past the ceiling is refused with the arguments that read a
@@ -7739,7 +7855,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             .get_async("subagent")
             .expect("the parent turn carries the subagent tool");
         assert!(
-            tool.description().contains("split into independent parts"),
+            tool.description().contains("a focused child agent"),
             "the tool description tells the model to split a large job"
         );
         let prompt = &built.agent.config().system_prompt;

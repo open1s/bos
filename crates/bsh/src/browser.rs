@@ -1671,10 +1671,7 @@ fn settle_live(handle: &BrowserHandle) -> Result<(), ToolError> {
 // ---------------------------------------------------------------------------
 
 /// Evaluate JavaScript against the native view and read its JSON answer.
-fn web_eval(
-    bridge: &dyn script::ScriptRunner,
-    js: String,
-) -> Result<serde_json::Value, ToolError> {
+fn web_eval(bridge: &dyn script::ScriptRunner, js: String) -> Result<serde_json::Value, ToolError> {
     let out = bridge
         .run(script::ScriptCommand::Eval(js))
         .map_err(ToolError::Failed)?;
@@ -1808,8 +1805,14 @@ fn web_click(
             "{reference} is not on this page. Call browser_snapshot.",
         )));
     }
-    let action = value.get("action").and_then(|v| v.as_str()).unwrap_or("click");
-    let kind = value.get("kind").and_then(|v| v.as_str()).unwrap_or("button");
+    let action = value
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("click");
+    let kind = value
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("button");
     let label = value.get("label").and_then(|v| v.as_str()).unwrap_or("");
     if action == "focus" {
         if let Some(id) = parse_ref(reference) {
@@ -1891,8 +1894,14 @@ fn web_type(
     if let Some(id) = parse_ref(reference) {
         handle.mutate(|browser| browser.focused = Some(id));
     }
-    let kind = value.get("kind").and_then(|v| v.as_str()).unwrap_or("input");
-    let secret = value.get("secret").and_then(|v| v.as_bool()).unwrap_or(false);
+    let kind = value
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("input");
+    let secret = value
+        .get("secret")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let stored = value.get("value").and_then(|v| v.as_str()).unwrap_or("");
     let mut payload = serde_json::json!({
         "ref": reference,
@@ -1967,7 +1976,11 @@ fn web_press(
             "next": "Nothing is focused. Call browser_click on a field to focus it."
         }));
     }
-    let mut href = value.get("href").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let mut href = value
+        .get("href")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     // A submit starts a navigation ASYNCHRONOUSLY, so the URL can still be the
     // old one immediately after the key event. Give it a moment: MEASURED,
     // Baidu answered `rsv_enter=1` a fraction of a second later, and reading
@@ -2248,7 +2261,7 @@ pub(crate) fn attach(agent: &mut Agent, tools: Tools) {
 
     add(AsyncFunctionTool::from_fn(
         "browser_open",
-        "Open an http(s) URL in the built-in Browser pane and return its title, final URL and a structured snapshot of the readable text plus every interactive element. The navigation waits for the page to go network-idle (500 ms with at most two requests in flight, capped by the timeout), so content a late subresource writes is usually already in the returned snapshot. The workspace policy decides reachability BEFORE any request, so a refused URL names the rule that refused it and makes no network request. Only http and https are accepted. The returned snapshot is the same payload browser_snapshot returns, so one call is usually enough.",
+        "Open an http(s) URL in the built-in Browser pane and return its title, final URL and a structured snapshot of the readable text plus every interactive element. The navigation waits for the page to go network-idle, so content a late subresource writes is usually already in the snapshot. The workspace policy decides reachability BEFORE any request: a refused URL names the rule and makes no network request. Only http and https are accepted. The snapshot payload is the same one browser_snapshot returns, so one call is usually enough.",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -2288,13 +2301,13 @@ pub(crate) fn attach(agent: &mut Agent, tools: Tools) {
 
     add(AsyncFunctionTool::from_fn(
         "browser_snapshot",
-        "Return the page on screen as a bounded structured view: title, final URL, readable text capped at 4000 characters (the cap and the total are stated in the payload) and every interactive element with a short stable ref such as e3. Refs stay valid while this document is on screen; any navigation mints new ones, and an old ref then returns an error telling you to snapshot again. When the rendered engine is available this reads the LIVE DOM, so text a page script wrote is included; without it the fetched text is used. Pass html=true only when the markup itself matters.",
+        "Return the page on screen as a bounded structured view: title, final URL, readable text capped at 4000 characters and every interactive element with a short stable ref such as e3. Refs stay valid while this document is on screen; any navigation mints new ones, and an old ref returns an error telling you to snapshot again. The rendered engine reads the LIVE DOM, so page-written text is included. Pass html=true only when the markup itself matters.",
         serde_json::json!({
             "type": "object",
             "properties": {
                 "html": {
                     "type": "boolean",
-                    "description": "Also return the raw HTML, capped at 6000 characters. Off by default: the text and element view is what you act on."
+                    "description": "Also return the raw HTML, capped at 6000 characters."
                 }
             }
         }),
@@ -2326,7 +2339,7 @@ pub(crate) fn attach(agent: &mut Agent, tools: Tools) {
 
     add(AsyncFunctionTool::from_fn(
         "browser_click",
-        "Activate an element by the ref its snapshot gave you. A link navigates and the response carries the new snapshot, so no follow-up call is needed. An input, textarea or select takes focus for browser_type. A submit control submits its form with GET. A ref that is no longer on screen returns an error naming the page change and asking for a fresh snapshot - it never silently succeeds. With the rendered engine available the click is a real input event, so a control that acts through page JavaScript also works; the text view refuses one and says so. The result's via field says which activation ran: 'pointer' is a synthesized mouse event at a real box, and 'script' is the DOM's own click(), used only when the target genuinely has no box to hit.",
+        "Activate an element by the ref its snapshot gave you. A link navigates and the response carries the new snapshot, so no follow-up call is needed. An input, textarea or select takes focus for browser_type; a submit control submits its form with GET. A ref that is no longer on screen returns an error naming the page change and asking for a fresh snapshot — it never silently succeeds.",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -2375,7 +2388,7 @@ pub(crate) fn attach(agent: &mut Agent, tools: Tools) {
 
     add(AsyncFunctionTool::from_fn(
         "browser_type",
-        "Replace the value of an input, textarea or select named by a ref. For a select, the text picks the option whose label matches exactly or by prefix, case-insensitively. Typing does not submit: call browser_press with Enter when the field is inside a form, or browser_click the form's submit control. The response echoes what was stored. A password field accepts text but never returns it.",
+        "Replace the value of an input, textarea or select named by a ref. For a select, the text picks the option whose label matches exactly or by prefix, case-insensitively. Typing does not submit: call browser_press with Enter when the field is inside a form, or browser_click the form's submit control. A password field accepts text but never returns it.",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -2422,7 +2435,7 @@ pub(crate) fn attach(agent: &mut Agent, tools: Tools) {
 
     add(AsyncFunctionTool::from_fn(
         "browser_press",
-        "Press a key on the focused element. Enter activates it: a link navigates, a submit control submits its form, and an input or textarea inside a GET form submits that form with its current values. Tab and ArrowDown focus the next element; Shift+Tab and ArrowUp focus the previous one; Escape clears the focus. With the rendered engine available the page itself receives the key, and Backspace, Delete, Home, End, PageUp, PageDown and the left/right arrows edit and move within a field too. Any other key is refused with the list this view supports.",
+        "Press a key on the focused element. Enter activates it: a link navigates, a submit control submits its form, and a field inside a GET form submits that form with its current values. Tab and ArrowDown focus the next element; Shift+Tab and ArrowUp the previous one; Escape clears the focus. With the rendered engine the page itself receives the key and the editing keys also work within a field. Any other key is refused with the list this view supports.",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -4128,8 +4141,7 @@ mod tests {
 
         let url = format!("http://{addr}/");
         let seq = handle.mutate(|browser| browser.begin(&url));
-        load(&handle, &url, seq, engine::Settle::Idle)
-            .expect("the page loads through the runner");
+        load(&handle, &url, seq, engine::Settle::Idle).expect("the page loads through the runner");
 
         let snapshot = snapshot_live(&handle).expect("a snapshot");
         let elements = snapshot["snapshot"]["elements"]

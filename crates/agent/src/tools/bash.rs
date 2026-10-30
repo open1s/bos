@@ -16,6 +16,15 @@ use serde_json::Value;
 pub struct BashToolConfig {
     /// Workspace root; when set, commands are validated against it.
     pub workspace_root: Option<String>,
+    /// The directory commands START in, independent of validation.
+    ///
+    /// `workspace_root` doubles as the confinement switch, and a host that
+    /// releases confinement passes none - which used to drop the shell into the
+    /// app's launch directory instead of the project the reader is working in.
+    /// This field carries the working directory on its own, so an unconfined
+    /// shell still starts at the workspace root.
+    #[serde(default)]
+    pub cwd: Option<String>,
     /// Optional allowlist of command names.
     pub allowed_commands: Option<Vec<String>>,
     /// Optional denylist of command names.
@@ -30,6 +39,7 @@ impl Default for BashToolConfig {
     fn default() -> Self {
         Self {
             workspace_root: None,
+            cwd: None,
             allowed_commands: None,
             denied_commands: None,
             timeout_secs: 300,
@@ -752,8 +762,9 @@ impl Tool for BashTool {
 
         let cwd = self
             .config
-            .workspace_root
+            .cwd
             .as_deref()
+            .or(self.config.workspace_root.as_deref())
             .map(PathBuf::from)
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_default();
@@ -1301,6 +1312,43 @@ mod tests {
                 .is_some_and(|properties| properties.contains_key("run_in_background")),
             "the OpenAI projection carries the background flag too"
         );
+    }
+
+    /// A released shell keeps its START directory: the cwd is separate from the
+    /// confinement switch, so unconfined does not mean "wherever the app was
+    /// launched from".
+    #[test]
+    fn an_unconfined_shell_still_starts_in_its_workspace() {
+        let dir =
+            std::env::temp_dir().join(format!("bsh-bash-cwd-released-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the scratch workspace");
+        std::fs::write(dir.join("probe.txt"), b"x").expect("the probe file");
+        // No workspace_root: that is the released arm, which installs no
+        // validator. The cwd is what keeps the shell in the project.
+        let tool = BashTool::new("bash").with_config(BashToolConfig {
+            cwd: Some(dir.to_string_lossy().to_string()),
+            ..BashToolConfig::default()
+        });
+        assert!(
+            tool.validator.is_none(),
+            "the release arm installs no confinement validator"
+        );
+        let result = tool
+            .run(&serde_json::json!({ "command": "pwd" }))
+            .expect("the command runs");
+        let stdout = result["stdout"]
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let expected = std::fs::canonicalize(&dir).expect("the real workspace path");
+        assert_eq!(
+            stdout,
+            expected.to_string_lossy(),
+            "the shell starts in its workspace, not the app's launch directory"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A configured workspace is the command's working directory, so `ls` lists

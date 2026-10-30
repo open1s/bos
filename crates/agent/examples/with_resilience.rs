@@ -79,6 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         timeout_secs: 60,
         max_steps: 10,
         compaction_input_tokens: 24_000,
+        tool_output_cap: 0,
         // Use the Responses API (`/v1/responses`) with `high` reasoning effort.
         api_mode: "responses".to_string(),
         reasoning_effort: Some("high".to_string()),

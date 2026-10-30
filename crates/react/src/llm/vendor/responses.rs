@@ -301,8 +301,12 @@ pub struct ResponsesUsage {
 
 impl ResponsesResponse {
     /// Concatenate all `output_text` parts of `message` items in order.
+    ///
+    /// Wire markup a gateway leaves in a text part is dropped here too, so a
+    /// special-token span never becomes the turn's answer.
     pub fn output_text(&self) -> String {
-        self.output
+        let joined: String = self
+            .output
             .iter()
             .filter_map(|item| match item {
                 ResponsesItem::Message { content, .. } => {
@@ -314,7 +318,8 @@ impl ResponsesResponse {
                 _ => None,
             })
             .flatten()
-            .collect()
+            .collect();
+        super::strip_special_tokens(&joined)
     }
 
     /// Map Responses API usage onto the Chat-Completions-shaped [`crate::llm::vendor::openaicompatible::Usage`].
@@ -866,12 +871,22 @@ impl ResponsesTransport {
 
         let url = format!("{}/responses", self.endpoint);
 
+        let wire = serde_json::to_string(&responses_req)
+            .unwrap_or_else(|_| "Failed to serialize request".into());
         if log::log_enabled!(log::Level::Info) {
-            info!(
-                "Req: {}",
-                serde_json::to_string(&responses_req)
-                    .unwrap_or_else(|_| "Failed to serialize request".into())
-            );
+            // A one-line summary, not the whole body: the full payload rode
+            // this INFO line for every call, images included.
+            info!("Req: {} chars", wire.chars().count());
+        }
+        if log::log_enabled!(log::Level::Trace) {
+            if crate::llm::vendor::wire_bodies_enabled() {
+                log::trace!("Req body: {wire}");
+            } else {
+                log::trace!(
+                    "Req body head: {}",
+                    crate::llm::vendor::wire_body_head(&wire)
+                );
+            }
         }
 
         let response = self

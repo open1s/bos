@@ -103,19 +103,34 @@ impl TurnContext {
         }
     }
 
-    /// Append the context ahead of the turn's input.
+    /// Place the context at the head of the turn's request.
     ///
     /// The agent's session is re-seeded from the stored transcript on every
-    /// turn, so these messages live for one request and are refreshed by the
-    /// next turn's build instead of accumulating in the durable transcript.
+    /// turn, and these rows go IN FRONT of that history rather than behind it:
+    /// a frame that sat after the history moved one turn's worth every time,
+    /// which diverged the request prefix at the second row and kept the
+    /// provider's prompt cache from ever carrying across turns. At the head the
+    /// prefix is stable, the frame is the first thing the model reads, and the
+    /// compaction path still cannot fold it - the runner injects only after
+    /// the checkpoint is installed.
     pub(crate) fn inject(&self, agent: &Agent) {
-        let mut session = agent.session();
+        let mut injected: Vec<react::llm::LlmMessage> = Vec::new();
         if !self.snapshot.is_empty() {
-            session.add_user_content(react::llm::Content::Text(self.snapshot.clone()));
+            injected.push(react::llm::LlmMessage::User {
+                content: react::llm::Content::Text(self.snapshot.clone()),
+            });
         }
         if let Some(instructions) = &self.instructions {
-            session.add_user_content(react::llm::Content::Text(instructions.clone()));
+            injected.push(react::llm::LlmMessage::User {
+                content: react::llm::Content::Text(instructions.clone()),
+            });
         }
+        if injected.is_empty() {
+            return;
+        }
+        let mut session = agent.session();
+        injected.extend(session.messages().iter().cloned());
+        session.restore_messages(injected);
     }
 
     /// The messages [`Self::inject`] would append, in order.
