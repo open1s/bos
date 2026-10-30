@@ -41,6 +41,15 @@ all `target="_blank"`: clicking one did nothing at all, while the same click
 with the handler in place landed on the destination
 (`https://python.bd.cylsoft.cn/?...`).
 
+The address bar navigates on ENTER as well as on the Go control: the field's
+`PressEnter` is what a reader actually uses, and both routes call
+`browser_submit`, which normalizes a bare host to `https://` and then takes the
+pane's path. The FIRST navigation is special: with no view built yet, the clock
+must not start Chromium or fetch the text - the render builds the native view
+from the address the Enter just set. Before that rule the first Enter launched
+the CDP engine, and where it could not start the pane fell back to the text
+view, which is what made the key look inert.
+
 The address bar follows the page through Wry's navigation handler, which
 reports every navigation - a link click, a redirect, a history move. This is
 deliberately NOT `WebView::url()`: that unwraps a nil `NSURL` and ABORTS the

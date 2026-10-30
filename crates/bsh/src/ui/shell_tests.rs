@@ -29635,3 +29635,61 @@ fn a_shift_click_reaches_the_page_as_shift_key(cx: &mut TestAppContext) {
         "an unmodified click must not claim shiftKey: {unmodified}"
     );
 }
+
+/// Enter in the address bar starts a navigation.
+///
+/// The Go control is the mouse route to `browser_submit`; the keyboard route
+/// is the one a reader actually uses, so it has to reach the same call.
+#[gpui::test]
+fn enter_in_the_address_bar_starts_a_navigation(cx: &mut TestAppContext) {
+    use gpui_kit::Focusable as _;
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(|window, cx| {
+        let state = AppState::with_store(scratch_store("browser-address-enter"));
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Browser, cx)));
+    // The reader's route: CLICK into the field (which is what focuses it in
+    // the app), then press Enter. `set_value` stands in for typing, which other
+    // tests already cover.
+    let bounds = cx
+        .debug_bounds("browser-address")
+        .expect("the address field is drawn");
+    let point = bounds.center();
+    cx.simulate_event(gpui_kit::MouseDownEvent {
+        position: point,
+        modifiers: Modifiers::default(),
+        button: gpui_kit::MouseButton::Left,
+        click_count: 1,
+        first_mouse: false,
+    });
+    cx.simulate_event(gpui_kit::MouseUpEvent {
+        position: point,
+        modifiers: Modifiers::default(),
+        button: gpui_kit::MouseButton::Left,
+        click_count: 1,
+    });
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            window.focus(&this.browser_url.read(cx).focus_handle(cx), cx);
+            this.browser_url
+                .update(cx, |state, cx| state.set_value("http://127.0.0.1:9/", window, cx));
+        });
+    });
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    let address = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .browser
+            .read(|browser| browser.address().to_string())
+    });
+    assert!(
+        address.contains("127.0.0.1"),
+        "Enter in the address bar must start a navigation, got {address:?}"
+    );
+}

@@ -3861,6 +3861,14 @@ impl Shell {
         }
         self.browser_refresh_pane();
         cx.notify();
+        // The FIRST navigation from the address bar has no view yet: the render
+        // builds one from the address this call just set. Spawning the
+        // text/CDP load here would start Chromium for a page the view is about
+        // to render, and where Chromium cannot start it replaced the page with
+        // the text view - which is what made the first Enter look inert.
+        if self.browser_webview.is_none() && !cfg!(test) {
+            return;
+        }
         // The native view is the page: load it there and stop. The HTTP fetch
         // below feeds the TEXT model the agent tools read; the reader's pane
         // does not need it, and its failures would draw a banner over a page
