@@ -23,6 +23,7 @@ use super::package::{write_atomic, ExtensionStore, Package};
 use super::resolver;
 use super::runtime::builtin::{BuiltinRuntime, ClosureExtension};
 use super::runtime::declarative::{self, DeclarativeContributions};
+use super::runtime::extism::ExtismRuntime;
 use super::runtime::mcp::McpRuntime;
 use super::runtime::process::ProcessRuntime;
 use super::runtime::wasm::WasmRuntime;
@@ -710,6 +711,26 @@ impl ExtensionHost {
                     contributions,
                 ))
             }
+            RuntimeKind::Extism => {
+                let runtime = ExtismRuntime::new(
+                    &package.manifest,
+                    &package.root,
+                    &data_root,
+                    Arc::clone(&self.policy),
+                    Arc::clone(&self.events),
+                    self.config.workspace.clone(),
+                    config.to_json(),
+                    package.trust,
+                )?;
+                let tools = runtime.descriptors()?;
+                let contributions =
+                    declarative::load_contributions(&package.root, &package.manifest)?;
+                Ok((
+                    Arc::new(LazyRuntime::new(Arc::new(runtime))),
+                    tools,
+                    contributions,
+                ))
+            }
             RuntimeKind::Mcp => {
                 let runtime = McpRuntime::new(&package.manifest, &package.root, config.to_json())?;
                 let tools = runtime.descriptors()?;
@@ -906,6 +927,70 @@ impl ExtensionHost {
         commands
     }
 
+    /// Model providers a package contributes, keyed by a host-owned id.
+    pub(crate) fn model_provider_surfaces(
+        &self,
+    ) -> BTreeMap<String, crate::settings::global::Provider> {
+        let mut providers = BTreeMap::new();
+        for entry in self.loaded.values() {
+            if !entry.applied {
+                continue;
+            }
+            for contribution in &entry.contributions.model_providers {
+                let Ok(text) = std::fs::read_to_string(&contribution.path) else {
+                    continue;
+                };
+                if let Ok(provider) =
+                    serde_json::from_str::<crate::settings::global::Provider>(&text)
+                {
+                    providers.insert(
+                        format!(
+                            "ext.{}.{}",
+                            entry.package.id().as_str(),
+                            contribution.id.as_str()
+                        ),
+                        provider,
+                    );
+                }
+            }
+        }
+        providers
+    }
+
+    /// Agent presets a package contributes, keyed by a host-owned id.
+    pub(crate) fn preset_surfaces(&self) -> BTreeMap<String, crate::settings::global::Preset> {
+        let mut presets = BTreeMap::new();
+        for entry in self.loaded.values() {
+            if !entry.applied {
+                continue;
+            }
+            for (kind, contributions) in [
+                ("", &entry.contributions.presets),
+                ("agent.", &entry.contributions.agent_providers),
+            ] {
+                for contribution in contributions {
+                    let Ok(text) = std::fs::read_to_string(&contribution.path) else {
+                        continue;
+                    };
+                    if let Ok(preset) =
+                        serde_json::from_str::<crate::settings::global::Preset>(&text)
+                    {
+                        presets.insert(
+                            format!(
+                                "ext.{}.{}{}",
+                                entry.package.id().as_str(),
+                                kind,
+                                contribution.id.as_str()
+                            ),
+                            preset,
+                        );
+                    }
+                }
+            }
+        }
+        presets
+    }
+
     /// Every model and agent provider descriptor an applied package declares.
     pub(crate) fn provider_descriptors(&self) -> Vec<serde_json::Value> {
         let mut providers = Vec::new();
@@ -916,6 +1001,7 @@ impl ExtensionHost {
             for (kind, contributions) in [
                 ("model", &entry.contributions.model_providers),
                 ("agent", &entry.contributions.agent_providers),
+                ("preset", &entry.contributions.presets),
             ] {
                 for contribution in contributions {
                     let descriptor = std::fs::read_to_string(&contribution.path)
@@ -1117,13 +1203,6 @@ impl ExtensionHost {
                     }
                 }
             }
-            if entry.package.manifest.runtime.kind == RuntimeKind::WasmComponent {
-                issues.push(DiagnosticIssue::new(
-                    "warning",
-                    Some(id),
-                    "the wasm-component runtime is not implemented in this build",
-                ));
-            }
             for warning in &entry.package.report.warnings {
                 issues.push(DiagnosticIssue::new(
                     "warning",
@@ -1292,6 +1371,30 @@ pub(crate) fn record_tool_call(millis: u64, bytes: u64, ok: bool) {
     }
 }
 
+/// Model providers from the already-open host.
+pub(crate) fn cached_model_providers() -> BTreeMap<String, crate::settings::global::Provider> {
+    let slot = HOST.get_or_init(|| Mutex::new(None));
+    let Ok(guard) = slot.lock() else {
+        return BTreeMap::new();
+    };
+    guard
+        .as_ref()
+        .map(ExtensionHost::model_provider_surfaces)
+        .unwrap_or_default()
+}
+
+/// Agent presets from the already-open host.
+pub(crate) fn cached_presets() -> BTreeMap<String, crate::settings::global::Preset> {
+    let slot = HOST.get_or_init(|| Mutex::new(None));
+    let Ok(guard) = slot.lock() else {
+        return BTreeMap::new();
+    };
+    guard
+        .as_ref()
+        .map(ExtensionHost::preset_surfaces)
+        .unwrap_or_default()
+}
+
 /// Commands from the already-open host, without opening one.
 pub(crate) fn cached_commands() -> Vec<CommandSurface> {
     let slot = HOST.get_or_init(|| Mutex::new(None));
@@ -1385,6 +1488,7 @@ tools = ["list"]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extension::capability::GrantScope;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
@@ -1481,6 +1585,90 @@ tools = ["echo"]
         .expect("tool");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn every_runtime_loads_through_one_host() {
+        let root = scratch("all-runtimes");
+        std::fs::create_dir_all(root.join("workspace")).expect("workspace");
+        let store = ExtensionStore::open(&root).expect("store");
+        let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/extensions");
+        let mut packages = Vec::new();
+        for name in [
+            "hello",
+            "process-echo",
+            "wasm-echo",
+            "mcp-echo",
+            "extism-echo",
+        ] {
+            let package = store.install(&examples.join(name)).expect(name);
+            packages.push(package);
+        }
+        let policy =
+            PolicyEngine::open(store.grants_path(), store.audit_path(), PolicyMode::Enforce)
+                .expect("policy");
+        for package in &packages {
+            for capability in &package.manifest.capabilities.required {
+                policy
+                    .grant(package.id().as_str(), *capability, GrantScope::Any, None)
+                    .expect("grant");
+            }
+        }
+        drop(policy);
+        let host = ExtensionHost::open(config(&root)).expect("host");
+        for id in [
+            "com.example.hello",
+            "com.example.process-echo",
+            "com.example.wasm-echo",
+            "com.example.mcp-echo",
+            "com.example.extism-echo",
+        ] {
+            let status = host
+                .statuses()
+                .into_iter()
+                .find(|status| status.id == id)
+                .unwrap_or_else(|| panic!("{id} is missing"));
+            assert!(status.applied, "{id}: {:?}", status.error);
+            assert!(status.error.is_none(), "{id}: {:?}", status.error);
+        }
+        let tools: Vec<String> = host
+            .statuses()
+            .into_iter()
+            .flat_map(|status| status.tools)
+            .collect();
+        for qualified in [
+            "hello__echo",
+            "process-echo__echo",
+            "wasm-echo__echo",
+            "mcp-echo__echo",
+            "extism-echo__echo",
+        ] {
+            assert!(
+                tools.iter().any(|tool| tool == qualified),
+                "{qualified} in {tools:?}"
+            );
+        }
+        let providers = host.provider_descriptors();
+        for kind in ["model", "agent", "preset"] {
+            assert!(
+                providers.iter().any(
+                    |provider| provider["extension"] == "com.example.extism-echo"
+                        && provider["kind"] == kind
+                ),
+                "{kind} is missing from {providers:?}"
+            );
+        }
+        let panels = host.panel_surfaces();
+        assert!(panels
+            .iter()
+            .any(|panel| panel.owner.as_str() == "com.example.extism-echo"));
+        assert!(host
+            .model_provider_surfaces()
+            .contains_key("ext.com.example.extism-echo.example"));
+        let presets = host.preset_surfaces();
+        assert!(presets.contains_key("ext.com.example.extism-echo.reader"));
+        assert!(presets.contains_key("ext.com.example.extism-echo.agent.helper"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
     #[test]
     fn the_builtin_inspector_is_registered_and_applied() {
         let root = scratch("builtin");

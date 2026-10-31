@@ -253,6 +253,8 @@ pub(crate) enum RuntimeKind {
     Process,
     /// An external Model Context Protocol server over stdio.
     Mcp,
+    /// An Extism plugin (core Wasm + PDK).
+    Extism,
     /// A WebAssembly Component. The contract is published in `wit/`; this
     /// build refuses to activate one until the Wasmtime runtime lands.
     WasmComponent,
@@ -266,6 +268,7 @@ impl RuntimeKind {
             Self::Declarative => "declarative",
             Self::Process => "process",
             Self::Mcp => "mcp",
+            Self::Extism => "extism",
             Self::WasmComponent => "wasm-component",
         }
     }

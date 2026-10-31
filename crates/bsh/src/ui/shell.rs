@@ -1071,6 +1071,10 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Self {
         state.restore_session();
+        // Extension providers and presets are runtime state: refresh them from
+        // the open extension host after the settings tree has loaded, so a
+        // contributed model/preset is selectable without a relaunch.
+        crate::caps::refresh_plugin_providers(&mut state.settings);
         // A workspace file written before the model became session-scoped
         // still names one. It is handed to the session that is now open, once,
         // so an upgrade does not strand the reader on "Select model".

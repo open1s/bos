@@ -93,6 +93,8 @@ my-extension/
   extension.toml          required
   README.md               recommended
   LICENSE                 recommended
+  plugin.wasm             Extism plugin (runtime.entry)
+  wasm/<name>.wasm        Component (runtime.entry)
   tools/<id>.json         one per declared tool
   commands/<id>.md        one per declared command
   prompts/<id>.md         one per declared prompt
@@ -102,6 +104,7 @@ my-extension/
   themes/<id>.json        one per declared theme (recorded)
   providers/models/<id>.json   model provider descriptors
   providers/agents/<id>.json   agent role descriptors
+  presets/<id>.json            agent/module preset descriptors
   migrations/<name>.toml  data migrations, applied on version change
   schemas/                configuration schemas
   assets/                 icons and images referenced as asset/...
@@ -156,8 +159,8 @@ name is 1 to 128 characters, description 1 to 4096 bytes. authors has at most
 
 ~~~toml
 [runtime]
-kind = "declarative"        # builtin | declarative | process | wasm-component
-entry = "bin/server"        # process and wasm only
+kind = "declarative"        # builtin | declarative | process | wasm-component | extism | mcp
+entry = "bin/server"        # process, wasm, extism and mcp
 args = ["--stdio"]          # process only
 startup = "on-demand"       # on-startup | on-demand | on-workspace-open | manual
 protocol = "jsonrpc-2.0"    # process only
@@ -171,9 +174,18 @@ LOG_LEVEL = "info"
 - process: entry is required. It is either a package-relative executable or one
   of the allowlisted launchers: python3, python, node, bun, deno, sh, bash.
   Package-relative paths may not be absolute and may not contain "..".
-- wasm-component: entry must be a package-relative .wasm file. The contract is
-  published in crates/bsh/wit. This build refuses activation with
-  UnsupportedRuntime; it does not pretend to run wasm.
+- wasm-component: entry must be a package-relative .wasm component. The
+  contract is published in crates/bsh/wit; host calls are policy-checked.
+- extism: entry must be a package-relative .wasm Extism plugin. The plugin
+  exports bsh_tools, bsh_call_tool, bsh_command, bsh_panel and bsh_event, and
+  reaches the host only through the policy-checked bsh_host function. WASI is
+  disabled so the bridge is the only filesystem/network path. bsh_host takes a
+  JSON request and returns {"ok":true,"value":...} or {"ok":false,"error":...};
+  ops are read_file, write_file, fetch, storage_get, storage_set, storage_list,
+  read_secret, emit, subscribe, config, now_millis and log. Every op is checked
+  against the same capability policy as the component runtime.
+- mcp: entry is a stdio Model Context Protocol server; tools, resources and
+  prompts are mapped to BSH tools, contexts and prompts.
 
 startup defaults to on-demand. manual packages are never applied automatically.
 
@@ -223,8 +235,9 @@ max_output_bytes = 1048576   # 1..=16777216, default 1048576
 ~~~
 
 A manifest asking above a ceiling is invalid rather than silently clamped. The
-host applies max_execution_ms and max_output_bytes today. max_memory_mb is for
-the wasm runtime, which is not implemented. max_concurrent_calls is a declared
+host applies max_execution_ms and max_output_bytes today. max_memory_mb bounds
+the component and Extism runtimes (StoreLimits / Extism memory pages) and is
+translated to RLIMIT_AS for process children. max_concurrent_calls is a declared
 allowance: the process runtime serializes calls through one child, so its
 effective concurrency is one until a pooled transport lands.
 
@@ -676,22 +689,24 @@ A host that implements this standard must enforce:
 These are stated so a package author does not design around a promise that is
 not kept:
 
-1. The wasm-component runtime is specified in WIT but not implemented; a wasm
-   package validates and then refuses activation with a clear error.
-2. Signatures are recorded, not verified.
-3. Workflows and themes are recorded in status but have no executor or applier.
-4. The declarative UI is validated and exposed as a contract; the GPUI renderer
-   is the next consumer, so a panel currently appears as a registered id/title.
-5. The built-in runtime is for first-party code linked into bsh; an installed
+1. Tool progress is real for process tools (`$/progress`) and for runtimes that
+   call the progress callback, but WASM and MCP guests do not emit incremental
+   progress yet; run_streaming still delivers their final result as chunks.
+2. Model, agent and preset provider descriptors are discovered and listed, but
+   they are not yet selectable adapters in the model or preset panes.
+3. Theme tokens apply to the extension's own panels, not to the whole shell.
+4. Lockfile reproduction covers Git/registry remotes; an Installed-only lock has
+   no remote and cannot be rebuilt from the file alone.
+5. Process children get RLIMIT ceilings and a process group, not a filesystem
+   sandbox profile or Linux namespace.
+6. Cancellation stops the waiting call and asks the runtime to stop, but a WASM
+   guest or child process may take a moment to disappear.
+7. Windows/Linux process limits are compiled but not exercised in this macOS
+   environment.
+8. The built-in runtime is for first-party code linked into bsh; an installed
    package cannot claim it.
-6. The extension root is ~/.bos/bsh/extensions (BSH's existing home) rather than
+9. The extension root is ~/.bos/bsh/extensions (BSH's existing home) rather than
    ~/.bsh as the design sketched; BSH_EXTENSION_ROOT overrides both paths.
-7. The event bus is implemented and tested, but no host service subscribes yet;
-   extension tools and lifecycle transitions already publish on it.
-8. Command contributions register in the host plugin registry and appear in
-   status, but the composer's command palette is still a hardcoded list, so a
-   reader typing / does not see them yet. Panel contributions are registered and
-   validated but wait on the declarative renderer (item 4).
 
 ## 16. Example
 

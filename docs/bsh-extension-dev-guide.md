@@ -402,3 +402,49 @@ built-in rows. Choosing one replaces the slash token with the command's Markdown
 template, which is the same path a hand-typed prompt takes. The row also appears
 when the `+` control is open, filtered by the same substring test.
 
+
+## Extism plugins
+
+An Extism package selects `runtime.kind = "extism"` and names a
+package-relative `.wasm` plugin in `runtime.entry`. WASI is disabled so every
+host effect goes through one policy-checked function:
+
+```rust
+#[host_fn]
+extern "ExtismHost" {
+    fn bsh_host(input: String) -> String;
+}
+```
+
+A request is a JSON object with an `op`:
+
+~~~json
+{"op":"read_file","path":"src/main.rs"}
+{"op":"write_file","path":"out.txt","data":"hello"}
+{"op":"fetch","url":"https://example.com","method":"GET"}
+{"op":"storage_set","key":"counter","data":"1"}
+{"op":"read_secret","name":"token"}
+{"op":"emit","topic":"tool.completed","payload":{}}
+{"op":"subscribe","topic":"workspace.changed"}
+{"op":"config"}
+{"op":"now_millis"}
+~~~
+
+The response is `{"ok":true,"value":...}` or `{"ok":false,"error":"..."}`.
+Every file, network, storage and secret op is authorized by the same policy as
+the component runtime. `emit` is limited to `contributes.publishes`;
+`subscribe` is limited to `contributes.events`.
+
+Exports:
+
+- `bsh_tools` -> JSON array of tool descriptors;
+- `bsh_call_tool` -> JSON result (text/structured content);
+- `bsh_command` -> JSON command result;
+- `bsh_panel` -> a declarative UiDocument;
+- `bsh_event` -> one subscribed event.
+
+The package can also declare prompts, contexts, commands, panels, themes,
+workflows, migrations, model/agent/preset descriptors exactly like any other
+runtime; those files are loaded by the host, so an Extism package can enhance
+every host surface, not only tools.
+

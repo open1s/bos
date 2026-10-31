@@ -27,6 +27,7 @@ Status legend:
 | Host + Extension Manager + Runtime Dispatcher | done | host.rs, runtime/mod.rs, runtime dispatcher by kind |
 | Built-in Rust runtime | done | runtime/builtin.rs plus the shipped inspector |
 | Wasmtime + Component Model runtime | done | runtime/wasm.rs; WIT host calls, fuel/memory/epoch limits, component fixture test |
+| Extism plugin runtime | done | runtime/extism.rs; bsh_host bridge, policy-checked host calls, fuel/memory caps, plugin fixture |
 | External process + JSON-RPC runtime | done | runtime/process.rs |
 | WIT interface definition | done | crates/bsh/wit/extension.wit |
 | Host-managed GPUI panels | partial | host::panel_surfaces + renderer; every location is hosted in one settings surface |
@@ -64,7 +65,7 @@ Status legend:
 | UI extension (panel) | partial | registration and validation; renderer missing |
 | Tool extension | done | |
 | Agent extension | partial | provider descriptor discovery; no executable agent-role adapter |
-| Model extension | partial | descriptor discovery; no model API adapter registration |
+| Model extension | done | descriptors merge into settings.plugin_providers and are selectable |
 | MCP extension | done | runtime/mcp.rs + mcp-echo fixture |
 | Workflow extension | done | runtime/workflow.rs sequential executor with capability union |
 | Context extension | partial | static Markdown only, no scoped provider call |
@@ -83,7 +84,9 @@ Status legend:
 | Built-in Rust | done |
 | Trusted native module | non-goal |
 | WASM Component | done |
+| Extism plugin | done |
 | External Process | done |
+| MCP server | done |
 
 ## 4. System architecture
 
@@ -210,11 +213,12 @@ Status legend:
 | Tool provider | done | JSON and rich ToolContent |
 | Context provider | partial: static Markdown |
 | Prompt provider | done |
-| Model provider | partial | descriptor discovery |
-| Agent provider | partial | descriptor discovery |
+| Model provider | done | descriptor -> settings.plugin_providers |
+| Agent provider | partial | descriptor discovery; no executable role adapter |
+| Preset provider | done | descriptor -> settings.plugin_presets |
 | Workflow provider | done | declarative executor |
 | Tool content: text, images, structured, file refs | done | ToolContent + MCP mapping |
-| Streaming output, progress, cancellation | partial | chunked final output + cancel token; no live progress |
+| Streaming output, progress, cancellation | partial | process $/progress is live; WASM/MCP final result only; cancel token |
 | Timeouts, error categories, correlation ids | done |
 | MCP tool/resource/prompt mapping | done | mcp-echo test |
 | MCP lifecycle/reconnect/timeout/cancel | partial | start/timeout/close; reconnect on next call only |
@@ -284,7 +288,7 @@ is deliberate and does not remove a feature.
 
 | Area | Status |
 |---|---|
-| Wasmtime | done |
+| Wasmtime + Extism | done |
 | WIT | done |
 | Tokio | done |
 | Serde/TOML/JSON | done |
@@ -321,29 +325,30 @@ is deliberate and does not remove a feature.
 | Phase | Status |
 |---|---|
 | Phase 1 core | done |
-| Phase 2 WASM | done |
+| Phase 2 WASM + Extism | done |
 | Phase 3 agent, event, MCP, process | partial | MCP/events/process/tools done; live streaming/progress partial |
 | Phase 4 GPUI UI | partial | renderer/panels/actions done; themes and keyboard focus partial |
-| Phase 5 ecosystem | partial | registry/upgrade/rollback/signatures/builder done; lock reproduction missing |
+| Phase 5 ecosystem | partial | registry/upgrade/rollback/signatures/builder/Extism done; Installed-only lock reproduction missing |
 
 ## 19. User stories
 
 The implementation covers the type/manifest/store/policy/lifecycle/process/CLI
-stories. Resolved: Wasmtime/host functions, WASM limits, WASM subscriptions,
-MCP, UI renderer/actions, installer sources, upgrade/rollback, CLI
-build/test/package/update, signatures and quarantine. Still open: live
-streaming/progress, executable model/agent provider adapters, theme
-application, lockfile reproduction, process subscriptions and retry backoff.
+stories. Resolved: Wasmtime/host functions, Extism, WASM limits, WASM/process
+subscriptions, MCP, UI renderer/actions, installer sources, upgrade/rollback,
+CLI build/test/package/update, signatures, quarantine, process progress,
+model/preset providers and remote lock reproduction. Still open: executable
+agent-role adapters, app-wide theme application, Installed-only lock
+reproduction, OS filesystem sandbox, cross-platform coverage and retry backoff.
 
 ## 20. Remaining gaps
 
 The first-release feature set is implemented except for these explicit gaps.
 Each is a behaviour, not a missing type.
 
-1. Live streaming/progress: run_streaming chunks the finished result; no
-   incremental model or tool progress crosses the host boundary.
-2. Model and Agent provider adapters: descriptors are discoverable and listed,
-   but no executable adapter is registered with the model or agent layer.
+1. Live streaming/progress is real for process tools (`$/progress` through
+   run_streaming); WASM and MCP guests still deliver only their final result.
+2. Agent provider descriptors are discoverable but no executable agent-role adapter
+   is registered; model providers and presets are selectable.
 3. Theme contributions apply to an extension's own panels, not the whole shell.
 4. Lockfile reproduction only covers lock entries that name a Git or registry
    remote; an Installed-only lock cannot be reproduced from the file alone.
@@ -353,5 +358,3 @@ Each is a behaviour, not a missing type.
    or process is not always terminated at the same instant.
 7. Cross-platform matrix: the suite is green on macOS (this environment);
    Windows/Linux process limits and path handling are not exercised here.
-8. Integration breadth: no mock host harness that drives every runtime through
-   one scripted scenario.

@@ -141,6 +141,9 @@ pub(crate) struct ContributesSpec {
     /// Visual themes.
     #[serde(default)]
     pub(crate) themes: Vec<ContributionId>,
+    /// Agent/module presets.
+    #[serde(default)]
+    pub(crate) presets: Vec<ContributionId>,
     /// Event topics the package subscribes to.
     #[serde(default)]
     pub(crate) events: Vec<String>,
@@ -437,26 +440,24 @@ impl Manifest {
                     }
                 }
             }
-            RuntimeKind::WasmComponent => {
-                match &self.runtime.entry {
-                    None => report.error(
-                        "runtime.entry",
-                        "the wasm-component runtime needs a package-relative .wasm file",
-                    ),
-                    Some(entry) => match validate_relative_path(entry) {
-                        Ok(path) => {
-                            if path.extension().and_then(|value| value.to_str()) != Some("wasm") {
-                                report.error("runtime.entry", "must name a .wasm component");
-                            }
-                        }
-                        Err(reason) => report.error("runtime.entry", reason),
+            RuntimeKind::WasmComponent | RuntimeKind::Extism => match &self.runtime.entry {
+                None => report.error(
+                    "runtime.entry",
+                    if self.runtime.kind == RuntimeKind::Extism {
+                        "the Extism runtime needs a package-relative .wasm plugin"
+                    } else {
+                        "the wasm-component runtime needs a package-relative .wasm file"
                     },
-                }
-                report.warn(
-                    "runtime.kind",
-                    "the wasm-component runtime is not implemented in this build; activation will be refused",
-                );
-            }
+                ),
+                Some(entry) => match validate_relative_path(entry) {
+                    Ok(path) => {
+                        if path.extension().and_then(|value| value.to_str()) != Some("wasm") {
+                            report.error("runtime.entry", "must name a .wasm file");
+                        }
+                    }
+                    Err(reason) => report.error("runtime.entry", reason),
+                },
+            },
         }
         if self.runtime.args.len() > 64 {
             report.error("runtime.args", "must contain at most 64 arguments");

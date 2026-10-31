@@ -7,6 +7,7 @@
 
 pub(crate) mod builtin;
 pub(crate) mod declarative;
+pub(crate) mod extism;
 pub(crate) mod mcp;
 pub(crate) mod process;
 pub(crate) mod wasm;
@@ -291,6 +292,21 @@ pub(crate) trait Runtime: Send + Sync {
             .map(ToolResult::from_value)
     }
 
+    /// Invoke one tool and forward runtime progress notifications.
+    ///
+    /// A runtime that cannot stream ignores the sender and returns the same
+    /// result as call_tool_result.
+    async fn call_tool_progress(
+        &self,
+        name: &str,
+        arguments: Value,
+        context: &CallContext,
+        progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+    ) -> Result<ToolResult, ExtensionError> {
+        let _ = progress;
+        self.call_tool_result(name, arguments, context).await
+    }
+
     /// Execute one command contribution. A runtime without commands refuses.
     async fn command(&self, id: &str, _arguments: Value) -> Result<Value, ExtensionError> {
         Err(ExtensionError::UnsupportedRuntime {
@@ -541,6 +557,19 @@ impl Runtime for LazyRuntime {
     ) -> Result<ToolResult, ExtensionError> {
         self.ensure().await?;
         self.inner.call_tool_result(name, arguments, context).await
+    }
+
+    async fn call_tool_progress(
+        &self,
+        name: &str,
+        arguments: Value,
+        context: &CallContext,
+        progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+    ) -> Result<ToolResult, ExtensionError> {
+        self.ensure().await?;
+        self.inner
+            .call_tool_progress(name, arguments, context, progress)
+            .await
     }
 
     async fn command(&self, id: &str, arguments: Value) -> Result<Value, ExtensionError> {

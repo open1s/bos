@@ -7,9 +7,9 @@
 **Target:** BSH (Rust + GPUI AI Agent Harness)  
 **Primary objective:** Define a secure, extensible, runtime-independent extension platform for BSH.
 
-> **Implementation:** Phase 1 (core), Phase 2's runtime contract (with the wasm
-> adapter deferred) and Phase 3's agent, process and event surfaces are
-> implemented in `crates/bsh/src/extension/`. The normative package and wire
+> **Implementation:** Phase 1 (core), Phase 2's Wasmtime, Extism and process
+> runtimes, and Phase 3's agent, MCP and event surfaces are implemented in
+> `crates/bsh/src/extension/`. The normative package and wire
 > standard is `docs/bsh-extension-standard.md`; the developer walkthrough is
 > `docs/bsh-extension-dev-guide.md`. See section 25 for the mapping and the
 > deliberate limits.
@@ -1212,15 +1212,16 @@ Acceptance criteria:
 - Lifecycle failures do not crash BSH.
 - Extension state and configuration are stored separately from package code.
 
-### Phase 2 — WASM Runtime
+### Phase 2 — WASM and Extism Runtimes
 
 Deliver:
 - WIT core contract.
 - Wasmtime integration.
 - Component loader.
 - Host function binding.
+- Extism PDK adapter and bsh_host bridge.
 - Resource limits.
-- WASM error normalization.
+- WASM/Extism error normalization.
 - Package integrity verification.
 
 Acceptance criteria:
@@ -1505,6 +1506,7 @@ exhaustive requirement matrix is `docs/bsh-extension-conformance.md`.
 | Declarative runtime | runtime/declarative.rs: tools, commands, prompts, contexts, panels, workflows, providers |
 | Process runtime | runtime/process.rs: JSON-RPC 2.0, handshake, timeouts, env filtering, rlimits, line caps |
 | WASM Component runtime | runtime/wasm.rs: Wasmtime 50, WIT host functions, fuel, StoreLimits, epoch timeout |
+| Extism runtime | runtime/extism.rs: PDK plugin, bsh_host bridge, policy-checked fs/network/storage/secrets/events, fuel and memory limits |
 | MCP adapter | runtime/mcp.rs: initialize, tools/resources/prompts, stdio, timeouts, reconnect on next call |
 | Workflow executor | runtime/workflow.rs: sequential same-package tools, capability union, templates |
 | Runtime-neutral invocation | runtime/mod.rs: Runtime trait, rich ToolContent/ToolResult, LazyRuntime delegation, pump |
@@ -1516,7 +1518,7 @@ exhaustive requirement matrix is `docs/bsh-extension-conformance.md`.
 | Host orchestration | host.rs: discovery, resolution, authorization, status rows, panels, metrics, doctor |
 | Developer CLI | cli.rs: new, validate, hash, build/package, test, install, sources, versions, rollback, quarantine, keygen, sign, trust, verify, config, metrics, providers, logs, doctor |
 | WIT contract | crates/bsh/wit/extension.wit |
-| Examples | examples/extensions/{hello,process-echo,wasm-echo,mcp-echo} |
+| Examples | examples/extensions/{hello,process-echo,wasm-echo,mcp-echo,extism-echo} |
 
 **Acceptance evidence:** the extension suite covers the manifest, hash, install,
 signature/trust, sources, resolver, lifecycle, policy, event bounds, storage
@@ -1526,13 +1528,14 @@ host vertical slice. The CLI is exercised end to end: new -> validate -> build -
 install -> list -> info -> grant -> doctor -> uninstall, plus keygen/sign/verify,
 registry install, versions/rollback and config.
 
-**Deliberate limits, stated rather than hidden:** run_streaming chunks a
-completed result rather than live progress; model and agent providers are
-discoverable descriptors, not executable adapters; theme contributions are
-applied to their extension's panels but not app-wide; lockfile reproduction covers
-Git/registry remotes but not an Installed-only lock; the process child has RLIMIT limits but no filesystem
-sandbox profile; cancellation stops the tool future but does not always kill the
-guest at the same instant. The legacy Codex/DSH shim in
+**Deliberate limits, stated rather than hidden:** process tools deliver live
+`$/progress` through run_streaming, while WASM and MCP guests still deliver only
+their final result; model, agent and preset providers are discoverable
+descriptors rather than selectable adapters; theme contributions apply to their
+extension's panels but not app-wide; lockfile reproduction covers Git/registry
+remotes but not an Installed-only lock; the process child has RLIMIT limits but
+no filesystem sandbox profile; cancellation stops the tool future but does not
+always kill the guest at the same instant. The legacy Codex/DSH shim in
 `crates/agent/src/extensions` still backs the old inventory pane; it is not used
 by this platform.
 
@@ -1540,11 +1543,12 @@ by this platform.
 
 ## Final Recommendation
 
-Build BSH's extension system as a runtime-independent platform with three execution modes:
+Build BSH's extension system as a runtime-independent platform with four execution modes:
 
 1. **Built-in Rust** for first-party core functionality.
-2. **Wasmtime + WIT** for sandboxed, portable third-party extensions.
-3. **External Process + JSON-RPC** for MCP, CLI, language services, and independent integrations.
+2. **Wasmtime + WIT** for sandboxed, portable third-party components.
+3. **Extism** for PDK plugins whose host surface is one policy-checked bridge.
+4. **External Process + JSON-RPC** for MCP, CLI, language services, and independent integrations.
 
 Keep GPUI behind a host-owned UI adapter. Start with host-managed panels and a declarative UI contract. Treat embedded guest GPUI as a separate research project.
 

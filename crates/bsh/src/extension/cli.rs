@@ -339,6 +339,7 @@ fn validate_runtime(package: &Package) -> Result<(), String> {
         RuntimeKind::Mcp => McpRuntime::new(&package.manifest, &package.root, "{}".to_string())
             .map(|_| ())
             .map_err(|error| error.to_string()),
+        RuntimeKind::Extism => Ok(()),
         _ => Ok(()),
     }
 }

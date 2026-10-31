@@ -169,6 +169,17 @@ pub(crate) fn refresh_plugin_providers(settings: &mut Settings) {
         }
     }
 
+    for (id, provider) in crate::extension::cached_model_providers() {
+        if settings.global.providers.contains_key(&id) || providers.contains_key(&id) {
+            continue;
+        }
+        providers.insert(id.clone(), provider);
+        keys.insert(id.clone(), true);
+        owners.insert(id, "extension".to_string());
+    }
+    settings
+        .global
+        .set_plugin_presets(crate::extension::cached_presets());
     settings
         .global
         .set_plugin_providers(providers, keys, owners);

@@ -59,6 +59,7 @@ pub(crate) struct Contributed {
 }
 
 /// One extension tool exposed to the agent.
+#[derive(Clone)]
 pub(crate) struct ExtensionTool {
     owner: ExtensionId,
     runtime: Arc<dyn Runtime>,
@@ -168,6 +169,56 @@ impl react::tool::registry::AsyncTool for ExtensionTool {
     }
 
     async fn run(&self, arguments: &Value) -> Result<Value, agent::tools::ToolError> {
+        self.invoke(arguments, None).await
+    }
+
+    async fn run_streaming(
+        &self,
+        input: &Value,
+    ) -> Result<
+        std::pin::Pin<Box<dyn Stream<Item = Result<String, agent::tools::ToolError>> + Send>>,
+        agent::tools::ToolError,
+    > {
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        let (stream_tx, stream_rx) =
+            tokio::sync::mpsc::unbounded_channel::<Result<String, agent::tools::ToolError>>();
+        let tool = self.clone();
+        let input = input.clone();
+        tokio::spawn(async move {
+            let progress_stream = stream_tx.clone();
+            let forward = tokio::spawn(async move {
+                while let Some(value) = progress_rx.recv().await {
+                    let _ = progress_stream.send(Ok(value.to_string()));
+                }
+            });
+            let result = tool.invoke(&input, Some(progress_tx)).await;
+            let _ = forward.await;
+            match result {
+                Ok(value) => {
+                    let text = match value {
+                        Value::String(text) => text,
+                        other => serde_json::to_string(&other).unwrap_or_default(),
+                    };
+                    let _ = stream_tx.send(Ok(text));
+                }
+                Err(error) => {
+                    let _ = stream_tx.send(Err(error));
+                }
+            }
+        });
+        Ok(Box::pin(futures::stream::unfold(
+            stream_rx,
+            |mut receiver| async move { receiver.recv().await.map(|item| (item, receiver)) },
+        )))
+    }
+}
+
+impl ExtensionTool {
+    async fn invoke(
+        &self,
+        arguments: &Value,
+        progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+    ) -> Result<Value, agent::tools::ToolError> {
         self.cancelled.store(false, Ordering::SeqCst);
         let started = std::time::Instant::now();
         let correlation = uuid::Uuid::new_v4().to_string();
@@ -200,9 +251,19 @@ impl react::tool::registry::AsyncTool for ExtensionTool {
             self.workspace.clone(),
             self.timeout_ms,
         );
-        let call =
-            self.runtime
-                .call_tool_result(self.descriptor.id.as_str(), arguments.clone(), &context);
+        let call = match progress {
+            Some(progress) => self.runtime.call_tool_progress(
+                self.descriptor.id.as_str(),
+                arguments.clone(),
+                &context,
+                Some(progress),
+            ),
+            None => self.runtime.call_tool_result(
+                self.descriptor.id.as_str(),
+                arguments.clone(),
+                &context,
+            ),
+        };
         let cancel = Arc::clone(&self.cancelled);
         let cancelled = async move {
             while !cancel.load(Ordering::SeqCst) {
@@ -260,27 +321,6 @@ impl react::tool::registry::AsyncTool for ExtensionTool {
                 Err(error.to_tool_error())
             }
         }
-    }
-
-    async fn run_streaming(
-        &self,
-        input: &Value,
-    ) -> Result<
-        std::pin::Pin<Box<dyn Stream<Item = Result<String, agent::tools::ToolError>> + Send>>,
-        agent::tools::ToolError,
-    > {
-        let value = self.run(input).await?;
-        let text = match value {
-            Value::String(text) => text,
-            other => serde_json::to_string(&other)
-                .map_err(|error| agent::tools::ToolError::Failed(error.to_string()))?,
-        };
-        let characters: Vec<char> = text.chars().collect();
-        let chunks: Vec<Result<String, agent::tools::ToolError>> = characters
-            .chunks(4096)
-            .map(|chunk| Ok(chunk.iter().collect()))
-            .collect();
-        Ok(Box::pin(futures::stream::iter(chunks)))
     }
 }
 
@@ -465,6 +505,40 @@ mod tests {
         }
     }
 
+    struct ProgressRuntime;
+
+    #[async_trait]
+    impl Runtime for ProgressRuntime {
+        fn kind(&self) -> RuntimeKind {
+            RuntimeKind::Builtin
+        }
+
+        async fn tools(&self) -> Result<Vec<ToolDescriptor>, ExtensionError> {
+            Ok(Vec::new())
+        }
+
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: Value,
+            _context: &CallContext,
+        ) -> Result<Value, ExtensionError> {
+            Ok(Value::String("done".to_string()))
+        }
+
+        async fn call_tool_progress(
+            &self,
+            _name: &str,
+            _arguments: Value,
+            _context: &CallContext,
+            progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+        ) -> Result<crate::extension::runtime::ToolResult, ExtensionError> {
+            if let Some(sender) = progress {
+                let _ = sender.send(serde_json::json!({"message": "half"}));
+            }
+            Ok(crate::extension::runtime::ToolResult::text("done"))
+        }
+    }
     fn policy(scratch: &Scratch) -> Arc<PolicyEngine> {
         Arc::new(
             PolicyEngine::open(
@@ -515,6 +589,31 @@ mod tests {
             .await
             .expect("run");
         assert_eq!(result["x"], 1);
+    }
+
+    #[tokio::test]
+    async fn run_streaming_forwards_progress_and_the_final_value() {
+        use futures::StreamExt as _;
+        let scratch = Scratch::new("stream");
+        let mut contributed = contributed(vec![], TrustLevel::Builtin);
+        contributed.runtime = Arc::new(ProgressRuntime);
+        let tool = ExtensionTool::new(
+            &contributed,
+            contributed.tools[0].clone(),
+            policy(&scratch),
+            EventBus::new(),
+            None,
+        );
+        let mut stream =
+            react::tool::registry::AsyncTool::run_streaming(&tool, &serde_json::json!({}))
+                .await
+                .expect("stream");
+        let mut items = Vec::new();
+        while let Some(item) = stream.next().await {
+            items.push(item.expect("item"));
+        }
+        assert!(items.iter().any(|item| item.contains("half")), "{items:?}");
+        assert_eq!(items.last().map(String::as_str), Some("done"));
     }
 
     #[tokio::test]

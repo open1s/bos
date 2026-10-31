@@ -1,0 +1,37 @@
+schema_version = "1.0"
+
+[extension]
+id = "com.example.extism-echo"
+name = "Extism Echo"
+version = "1.0.0"
+description = "An Extism plugin contributing tools, panels, commands, prompts, contexts and provider descriptors"
+authors = ["BSH Example"]
+license = "MIT"
+
+[compatibility]
+bsh = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+
+[runtime]
+kind = "extism"
+entry = "plugin.wasm"
+startup = "on-demand"
+
+[capabilities]
+required = ["agent.tools.register", "ui.panels", "ui.commands", "agent.prompts.provide", "agent.context.provide"]
+
+[contributes]
+tools = ["echo"]
+commands = ["greet"]
+panels = ["status"]
+prompts = ["hello"]
+contexts = ["guide"]
+themes = ["midnight"]
+presets = ["reader"]
+model_providers = ["example"]
+agent_providers = ["helper"]
+events = ["workspace.changed"]
+
+[resources]
+max_memory_mb = 64
+max_execution_ms = 2000

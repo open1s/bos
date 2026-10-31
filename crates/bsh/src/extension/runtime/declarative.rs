@@ -96,8 +96,10 @@ pub(crate) struct DeclarativeContributions {
     pub(crate) panels: Vec<PanelContribution>,
     /// Workflows, executed by the workflow wrapper.
     pub(crate) workflows: Vec<RawContribution>,
-    /// Themes, recorded but not applied.
+    /// Themes, applied to the extension's panels.
     pub(crate) themes: Vec<RawContribution>,
+    /// Agent/module presets.
+    pub(crate) presets: Vec<RawContribution>,
     /// Model provider descriptors.
     pub(crate) model_providers: Vec<RawContribution>,
     /// Agent role descriptors.
@@ -113,6 +115,9 @@ impl DeclarativeContributions {
             && self.panels.is_empty()
             && self.workflows.is_empty()
             && self.themes.is_empty()
+            && self.presets.is_empty()
+            && self.model_providers.is_empty()
+            && self.agent_providers.is_empty()
     }
 }
 
@@ -336,6 +341,11 @@ pub(crate) fn load_contributions(
         contributions
             .themes
             .push(raw_contribution(root, "themes", "json", id)?);
+    }
+    for id in &manifest.contributes.presets {
+        contributions
+            .presets
+            .push(raw_contribution(root, "presets", "json", id)?);
     }
     for id in &manifest.contributes.model_providers {
         contributions

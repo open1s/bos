@@ -19,7 +19,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
-use super::{load_tool_descriptors, CallContext, Runtime, ToolDescriptor};
+use super::{load_tool_descriptors, CallContext, Runtime, ToolDescriptor, ToolResult};
 use crate::extension::events::{EventBus, EventFilter, ExtensionEvent, Subscription};
 use crate::extension::manifest::{is_allowlisted_command, validate_relative_path, Manifest};
 use crate::extension::types::{ExtensionError, ExtensionId, RuntimeKind, HOST_VERSION};
@@ -51,6 +51,18 @@ impl ProcessSession {
         params: Value,
         timeout_ms: u64,
         extension: &ExtensionId,
+    ) -> Result<Value, ExtensionError> {
+        self.request_with_progress(method, params, timeout_ms, extension, None)
+            .await
+    }
+
+    async fn request_with_progress(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout_ms: u64,
+        extension: &ExtensionId,
+        progress: Option<&tokio::sync::mpsc::UnboundedSender<Value>>,
     ) -> Result<Value, ExtensionError> {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
@@ -110,8 +122,15 @@ impl ProcessSession {
                     });
                 }
                 if value.get("id").and_then(Value::as_u64) != Some(id) {
-                    // A notification or an earlier response; skip it rather
-                    // than treating it as this call's answer.
+                    // A notification or an earlier response. Progress
+                    // notifications are forwarded; everything else is skipped.
+                    if let Some(sender) = progress {
+                        if value.get("method").and_then(Value::as_str) == Some("$/progress") {
+                            if let Some(params) = value.get("params") {
+                                let _ = sender.send(params.clone());
+                            }
+                        }
+                    }
                     continue;
                 }
                 if let Some(error) = value.get("error") {
@@ -370,6 +389,73 @@ impl ProcessRuntime {
         self
     }
 
+    async fn call_tool_inner(
+        &self,
+        name: &str,
+        arguments: Value,
+        context: &CallContext,
+        progress: Option<&tokio::sync::mpsc::UnboundedSender<Value>>,
+    ) -> Result<Value, ExtensionError> {
+        if !self.tools.iter().any(|tool| tool.id.as_str() == name) {
+            return Err(ExtensionError::NotFound {
+                id: format!("{}::{name}", self.extension),
+            });
+        }
+        let wait = Duration::from_millis(context.timeout_ms.max(1));
+        let mut guard = match tokio::time::timeout(wait, self.session.lock()).await {
+            Ok(guard) => guard,
+            Err(_) => {
+                return Err(ExtensionError::Timeout {
+                    extension: self.extension.to_string(),
+                    operation: format!("{name} (waiting for the process)"),
+                    millis: context.timeout_ms,
+                });
+            }
+        };
+        if guard.is_none() {
+            *guard = Some(self.start().await?);
+        }
+        let session = guard.as_mut().expect("session was just started");
+        let result = session
+            .request_with_progress(
+                "tools/call",
+                json!({
+                    "name": name,
+                    "arguments": arguments,
+                    "correlationId": context.correlation_id,
+                }),
+                context.timeout_ms.max(1).min(self.max_execution_ms),
+                &self.extension,
+                progress,
+            )
+            .await;
+        match result {
+            Ok(value) => {
+                let bytes = serde_json::to_vec(&value)
+                    .map(|bytes| bytes.len())
+                    .unwrap_or(0);
+                if bytes as u64 > self.max_output_bytes {
+                    *guard = None;
+                    return Err(ExtensionError::Limit {
+                        extension: self.extension.to_string(),
+                        message: format!(
+                            "tool result is {bytes} bytes; the ceiling is {}",
+                            self.max_output_bytes
+                        ),
+                    });
+                }
+                Ok(value)
+            }
+            Err(error) => {
+                // A timed-out or broken exchange leaves the pipe in an unknown
+                // state, so the next call starts a fresh process instead of
+                // reading a response that belongs to the previous call.
+                *guard = None;
+                Err(error)
+            }
+        }
+    }
+
     async fn start(&self) -> Result<ProcessSession, ExtensionError> {
         let program = if is_allowlisted_command(&self.entry) {
             PathBuf::from(&self.entry)
@@ -536,63 +622,30 @@ impl Runtime for ProcessRuntime {
         arguments: Value,
         context: &CallContext,
     ) -> Result<Value, ExtensionError> {
-        if !self.tools.iter().any(|tool| tool.id.as_str() == name) {
-            return Err(ExtensionError::NotFound {
-                id: format!("{}::{name}", self.extension),
-            });
-        }
-        let wait = Duration::from_millis(context.timeout_ms.max(1));
-        let mut guard = match tokio::time::timeout(wait, self.session.lock()).await {
-            Ok(guard) => guard,
-            Err(_) => {
-                return Err(ExtensionError::Timeout {
-                    extension: self.extension.to_string(),
-                    operation: format!("{name} (waiting for the process)"),
-                    millis: context.timeout_ms,
-                });
-            }
-        };
-        if guard.is_none() {
-            *guard = Some(self.start().await?);
-        }
-        let session = guard.as_mut().expect("session was just started");
-        let result = session
-            .request(
-                "tools/call",
-                json!({
-                    "name": name,
-                    "arguments": arguments,
-                    "correlationId": context.correlation_id,
-                }),
-                context.timeout_ms.max(1).min(self.max_execution_ms),
-                &self.extension,
-            )
-            .await;
-        match result {
-            Ok(value) => {
-                let bytes = serde_json::to_vec(&value)
-                    .map(|bytes| bytes.len())
-                    .unwrap_or(0);
-                if bytes as u64 > self.max_output_bytes {
-                    *guard = None;
-                    return Err(ExtensionError::Limit {
-                        extension: self.extension.to_string(),
-                        message: format!(
-                            "tool result is {bytes} bytes; the ceiling is {}",
-                            self.max_output_bytes
-                        ),
-                    });
-                }
-                Ok(value)
-            }
-            Err(error) => {
-                // A timed-out or broken exchange leaves the pipe in an unknown
-                // state, so the next call starts a fresh process instead of
-                // reading a response that belongs to the previous call.
-                *guard = None;
-                Err(error)
-            }
-        }
+        self.call_tool_inner(name, arguments, context, None).await
+    }
+
+    async fn call_tool_result(
+        &self,
+        name: &str,
+        arguments: Value,
+        context: &CallContext,
+    ) -> Result<ToolResult, ExtensionError> {
+        self.call_tool_inner(name, arguments, context, None)
+            .await
+            .map(ToolResult::from_value)
+    }
+
+    async fn call_tool_progress(
+        &self,
+        name: &str,
+        arguments: Value,
+        context: &CallContext,
+        progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+    ) -> Result<ToolResult, ExtensionError> {
+        self.call_tool_inner(name, arguments, context, progress.as_ref())
+            .await
+            .map(ToolResult::from_value)
     }
 
     async fn pump(&self) -> Result<(), ExtensionError> {
@@ -806,6 +859,42 @@ done
         runtime.shutdown().await.expect("shutdown");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_tool_call_forwards_progress_notifications() {
+        let scratch = Scratch::new("progress");
+        std::fs::write(
+            scratch.0.join("tools/echo.json"),
+            r#"{"description":"Echo","input_schema":{"type":"object"}}"#,
+        )
+        .expect("tool");
+        std::fs::write(
+            scratch.0.join("server.sh"),
+            r#"while IFS= read -r line; do
+  case "$line" in
+    *'"initialize"'*) echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"1.0"}}' ;;
+    *'"tools/call"'*)
+      echo '{"jsonrpc":"2.0","method":"$/progress","params":{"message":"half"}}'
+      echo '{"jsonrpc":"2.0","id":2,"result":{"ok":true}}'
+      ;;
+    *) : ;;
+  esac
+done
+"#,
+        )
+        .expect("server");
+        let runtime = ProcessRuntime::new(&manifest(), &scratch.0).expect("runtime");
+        let context = CallContext::new(manifest().id().clone(), "progress", None, 2000);
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let result = runtime
+            .call_tool_progress("echo", serde_json::json!({"x": 1}), &context, Some(sender))
+            .await
+            .expect("call");
+        assert_eq!(result.to_value()["ok"], true);
+        let progress = receiver.recv().await.expect("one progress");
+        assert_eq!(progress["message"], "half");
+        runtime.shutdown().await.expect("shutdown");
+    }
     #[cfg(unix)]
     #[tokio::test]
     async fn a_missing_entry_is_an_error_not_a_panic() {

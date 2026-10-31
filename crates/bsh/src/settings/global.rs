@@ -362,6 +362,11 @@ pub(crate) struct GlobalSettings {
     /// reader declared by hand.
     #[serde(skip)]
     pub(crate) plugin_providers: BTreeMap<String, Provider>,
+    /// Agent presets contributed by installed extension packages.
+    ///
+    /// Runtime state, never serialized; a declared preset with the same id wins.
+    #[serde(skip)]
+    pub(crate) plugin_presets: BTreeMap<String, Preset>,
     /// Whether a contributed provider needs a credential.
     ///
     /// A package that serves an open or anonymous lane declares
@@ -419,6 +424,7 @@ impl Default for GlobalSettings {
             mcp_servers: Vec::new(),
             providers: BTreeMap::new(),
             plugin_providers: BTreeMap::new(),
+            plugin_presets: BTreeMap::new(),
             plugin_provider_keys: BTreeMap::new(),
             plugin_provider_owners: BTreeMap::new(),
             presets: BTreeMap::new(),
@@ -1949,6 +1955,9 @@ impl GlobalSettings {
         if let Some(declared) = self.presets.get(id) {
             return Some(declared.clone());
         }
+        if let Some(contributed) = self.plugin_presets.get(id) {
+            return Some(contributed.clone());
+        }
         built_in_preset(id)
     }
 
@@ -1957,10 +1966,11 @@ impl GlobalSettings {
         let mut rows: Vec<(i64, String)> = self
             .presets
             .iter()
+            .chain(self.plugin_presets.iter())
             .map(|(id, preset)| (preset.order.unwrap_or(0), id.clone()))
             .collect();
         for id in BUILT_IN_PRESET_IDS {
-            if !self.presets.contains_key(*id) {
+            if !self.presets.contains_key(*id) && !self.plugin_presets.contains_key(*id) {
                 let order = built_in_preset(id)
                     .and_then(|preset| preset.order)
                     .unwrap_or(0);
@@ -2036,6 +2046,11 @@ impl GlobalSettings {
         self.plugin_provider_owners = owners;
     }
 
+    /// Replace the contributed preset set.
+    pub(crate) fn set_plugin_presets(&mut self, presets: BTreeMap<String, Preset>) {
+        self.plugin_presets = presets;
+    }
+
     /// Every provider id, the reader's first then the contributed ones.
     ///
     /// Order is the contract: the panes and the composer draw this, and a
@@ -2055,6 +2070,45 @@ impl GlobalSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn a_contributed_preset_is_visible_and_cannot_shadow_a_declared_one() {
+        let mut settings = GlobalSettings::default();
+        let mut contributed = BTreeMap::new();
+        contributed.insert(
+            "ext.com.example.reader".to_string(),
+            Preset {
+                plugins: vec!["files".to_string()],
+                name: Some("Reader".to_string()),
+                ..Preset::default()
+            },
+        );
+        settings.set_plugin_presets(contributed);
+        assert!(settings
+            .preset_ids()
+            .iter()
+            .any(|id| id == "ext.com.example.reader"));
+        assert_eq!(
+            settings
+                .preset("ext.com.example.reader")
+                .and_then(|preset| preset.name),
+            Some("Reader".to_string())
+        );
+        settings.presets.insert(
+            "ext.com.example.reader".to_string(),
+            Preset {
+                plugins: vec!["shell".to_string()],
+                ..Preset::default()
+            },
+        );
+        assert_eq!(
+            settings
+                .preset("ext.com.example.reader")
+                .map(|preset| preset.plugins),
+            Some(vec!["shell".to_string()])
+        );
+    }
 
     const ROOTED: &str = r#"
 schema_version = 1

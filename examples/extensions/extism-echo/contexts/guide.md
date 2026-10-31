@@ -1,0 +1,1 @@
+The Extism example supplies this context.
