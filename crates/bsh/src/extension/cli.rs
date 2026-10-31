@@ -39,6 +39,7 @@ Commands:
   enable <id>                         enable an extension
   disable <id>                        disable an extension
   versions <id>                      list installed versions and the active one
+  reproduce <lock>                    reinstall exactly the locked versions
   update <path>                      install a new version and activate it
   rollback <id>                      activate the previous installed version
   quarantine <id> [--reason <text>]  move code to quarantine and disable it
@@ -113,6 +114,7 @@ pub(crate) fn run(args: &[String]) -> i32 {
         "info" => command_info(&rest[1..], root.clone(), json),
         "enable" | "disable" => command_toggle(&command, &rest[1..], root.clone()),
         "versions" => command_versions(&rest[1..], root.clone()),
+        "reproduce" => command_reproduce(&rest[1..], root.clone()),
         "update" => command_install(&rest[1..], root.clone()),
         "rollback" => command_rollback(&rest[1..], root.clone()),
         "quarantine" => command_quarantine(&rest[1..], root.clone()),
@@ -1240,6 +1242,69 @@ fn command_providers(root: Option<PathBuf>) -> Result<i32, String> {
         "{}",
         serde_json::to_string_pretty(&providers).map_err(|error| error.to_string())?
     );
+    Ok(0)
+}
+
+fn command_reproduce(args: &[String], root: Option<PathBuf>) -> Result<i32, String> {
+    let lock_path = PathBuf::from(one_argument(args, "bsh ext reproduce <lock>")?);
+    let text = std::fs::read_to_string(&lock_path).map_err(|error| error.to_string())?;
+    let lock: crate::extension::resolver::LockFile =
+        toml::from_str(&text).map_err(|error| error.to_string())?;
+    let store = ExtensionStore::open(config(root).root).map_err(|error| error.to_string())?;
+    for locked in &lock.packages {
+        let installed = store
+            .versions(
+                &crate::extension::types::ExtensionId::parse(locked.id.clone())
+                    .map_err(|error| error.to_string())?,
+            )
+            .ok()
+            .is_some_and(|versions| versions.iter().any(|version| version == &locked.version));
+        if installed {
+            println!("present {} {}", locked.id, locked.version);
+            continue;
+        }
+        let id = crate::extension::types::ExtensionId::parse(locked.id.clone())
+            .map_err(|error| error.to_string())?;
+        let fetched = match &locked.source {
+            ExtensionSource::Git {
+                repository,
+                revision,
+            } => sources::fetch_git(repository, Some(revision), None, &store.cache_root())
+                .map_err(|error| error.to_string())?,
+            ExtensionSource::Registry { url } => sources::fetch_index_package(
+                url,
+                locked.id.as_str(),
+                Some(&locked.version),
+                &store.cache_root(),
+            )
+            .map_err(|error| error.to_string())?,
+            ExtensionSource::Builtin => continue,
+            ExtensionSource::Installed | ExtensionSource::Development => {
+                return Err(format!(
+                    "{} {} is not installed and its lock has no remote source",
+                    locked.id, locked.version
+                ));
+            }
+        };
+        let package =
+            sources::install_fetched(&store, &fetched).map_err(|error| error.to_string())?;
+        if package.id() != &id || package.version() != locked.version {
+            return Err(format!(
+                "lock expected {} {} but the source provided {} {}",
+                locked.id,
+                locked.version,
+                package.id(),
+                package.version()
+            ));
+        }
+        if !locked.hash.is_empty() && package.hash != locked.hash {
+            return Err(format!(
+                "{} {} hash {} does not match the lock {}",
+                locked.id, locked.version, package.hash, locked.hash
+            ));
+        }
+        println!("installed {} {}", locked.id, locked.version);
+    }
     Ok(0)
 }
 

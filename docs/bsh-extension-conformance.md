@@ -270,7 +270,7 @@ Status legend:
 | Upgrade must not overwrite data | done by versioned dirs |
 | Lockfile id/version/hash/source/revision/deps/api/signature/installation metadata | partial | signature/revision/metadata recorded in registry; lockfile fields partial |
 | Upgrade and rollback | done | versions/set_active/rollback CLI |
-| Reproduce from lockfile | missing |
+| Reproduce from lockfile | partial | bsh ext reproduce reinstalls Git/registry locks and checks hashes; an Installed-only lock has no remote |
 | Package integrity verification on load | done | doctor + install signature/hash |
 
 ## 14. Rust workspace proposal

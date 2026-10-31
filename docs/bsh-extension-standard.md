@@ -608,6 +608,7 @@ bsh ext info <id> [--json]
 bsh ext enable <id>
 bsh ext disable <id>
 bsh ext versions <id>
+bsh ext reproduce <lock>
 bsh ext update <path>
 bsh ext rollback <id>
 bsh ext quarantine <id> [--reason <text>]
