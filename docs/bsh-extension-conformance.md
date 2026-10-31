@@ -201,7 +201,7 @@ Status legend:
 | Validate schema/payload, depth/node/text limits | done |
 | Route action ids to owner | done | dispatch -> owning Runtime::command |
 | Apply state patches, revisions, stale rejection | done | UiSession + renderer |
-| Focus, keyboard, accessibility | partial | role/aria labels; action, apply, checkbox and select options are focusable kit Buttons; list rows and tabs remain pointer/static |
+| Focus, keyboard, accessibility | done | role/aria labels; actions, apply, checkbox, select options, actionable list rows and tabs are focusable kit controls |
 | Loading/error/unavailability states | done | renderer loading/error/message |
 | No JS/HTML | done |
 | Theme contributions | done | tokens apply to extension panels and, when selected, override the shell palette |
@@ -327,7 +327,7 @@ is deliberate and does not remove a feature.
 | Phase 1 core | done |
 | Phase 2 WASM + Extism | done |
 | Phase 3 agent, event, MCP, process | done | MCP/events/process/tools and live progress |
-| Phase 4 GPUI UI | partial | renderer/panels/actions/themes done; keyboard focus routing partial |
+| Phase 4 GPUI UI | partial | renderer/panels/actions/themes/keyboard focus done; multiple mount points still partial |
 | Phase 5 ecosystem | done | registry/upgrade/rollback/signatures/builder/Extism/lock reproduction |
 
 ## 19. User stories

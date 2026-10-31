@@ -86,6 +86,8 @@ pub(crate) struct ExtensionPanelView {
     error: Option<String>,
     message: Option<String>,
     palette: Palette,
+    /// Selected index per tabs path, so switching a tab is host state.
+    tabs: std::collections::BTreeMap<String, usize>,
 }
 
 impl ExtensionPanelView {
@@ -114,6 +116,7 @@ impl ExtensionPanelView {
             error: None,
             message: None,
             palette,
+            tabs: std::collections::BTreeMap::new(),
         };
         if let Some(panel) = view.panels.get(selected) {
             if let Some(document) = &panel.initial {
@@ -454,29 +457,42 @@ impl ExtensionPanelView {
             UiNode::List { items } => {
                 let mut list = div().flex().flex_col().gap(px(2.0)).w_full();
                 for (index, item) in items.iter().enumerate() {
-                    let mut row = div()
-                        .id(SharedString::from(format!("extension-list-{path}-{index}")))
-                        .w_full()
-                        .px(px(8.0))
-                        .py(px(6.0))
-                        .rounded(px(7.0))
-                        .flex()
-                        .flex_col()
-                        .hover(|style| style.bg(rgb(self.palette.hover)));
+                    let mut content = vec![txt(item.title.clone(), 13.0, self.palette.text)];
+                    if !item.detail.is_empty() {
+                        content.push(txt(item.detail.clone(), 11.0, self.palette.faint));
+                    }
                     if let Some(action) = &item.action {
                         let action = action.clone();
-                        row = row
-                            .role(Role::Button)
-                            .cursor_pointer()
+                        let mut row = Button::new(format!("extension-list-{path}-{index}"))
+                            .debug_selector(|| format!("extension-list-{path}-{index}"))
+                            .w_full()
+                            .px(px(8.0))
+                            .py(px(6.0))
+                            .rounded(px(7.0))
+                            .flex()
+                            .flex_col()
+                            .items_start()
                             .on_click(cx.listener(move |this, _event, _window, cx| {
                                 this.dispatch(&action, json!({ "index": index }), cx)
                             }));
+                        for child in content {
+                            row = row.child(child);
+                        }
+                        list = list.child(row);
+                    } else {
+                        let mut row = div()
+                            .id(SharedString::from(format!("extension-list-{path}-{index}")))
+                            .w_full()
+                            .px(px(8.0))
+                            .py(px(6.0))
+                            .rounded(px(7.0))
+                            .flex()
+                            .flex_col();
+                        for child in content {
+                            row = row.child(child);
+                        }
+                        list = list.child(row);
                     }
-                    row = row.child(txt(item.title.clone(), 13.0, self.palette.text));
-                    if !item.detail.is_empty() {
-                        row = row.child(txt(item.detail.clone(), 11.0, self.palette.faint));
-                    }
-                    list = list.child(row);
                 }
                 list.into_any_element()
             }
@@ -512,14 +528,53 @@ impl ExtensionPanelView {
                 tree.into_any_element()
             }
             UiNode::Tabs { tabs } => {
+                let selected = self
+                    .tabs
+                    .get(path)
+                    .copied()
+                    .unwrap_or(0)
+                    .min(tabs.len().saturating_sub(1));
                 let mut body = div().flex().flex_col().gap(px(8.0)).w_full();
-                let mut strip = div().flex().flex_row().gap(px(12.0));
-                for tab in tabs {
-                    strip = strip.child(txt(tab.label.clone(), 12.0, self.palette.muted));
+                let mut strip = div().flex().flex_row().gap(px(6.0));
+                let tab_path = path.to_string();
+                for (index, tab) in tabs.iter().enumerate() {
+                    let active = index == selected;
+                    let mut control = Button::new(format!("extension-tab-{path}-{index}"))
+                        .debug_selector(|| format!("extension-tab-{path}-{index}"))
+                        .accessibility_label(tab.label.clone())
+                        .h(px(26.0))
+                        .px(px(8.0))
+                        .rounded(px(7.0));
+                    if active {
+                        control = control.bg(rgb(self.palette.new_session_fill));
+                    }
+                    strip = strip.child(
+                        control
+                            .child(txt(
+                                tab.label.clone(),
+                                12.0,
+                                if active {
+                                    self.palette.text
+                                } else {
+                                    self.palette.muted
+                                },
+                            ))
+                            .on_click(cx.listener({
+                                let tab_path = tab_path.clone();
+                                move |this, _event, _window, cx| {
+                                    this.tabs.insert(tab_path.clone(), index);
+                                    cx.notify();
+                                }
+                            })),
+                    );
                 }
                 body = body.child(strip);
-                if let Some(first) = tabs.first() {
-                    body = body.child(self.render_node(&first.content, &format!("{path}-tab"), cx));
+                if let Some(tab) = tabs.get(selected) {
+                    body = body.child(self.render_node(
+                        &tab.content,
+                        &format!("{path}-tab-{selected}"),
+                        cx,
+                    ));
                 }
                 body.into_any_element()
             }
