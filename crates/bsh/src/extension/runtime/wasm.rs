@@ -19,7 +19,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use serde_json::Value;
 use wasmtime::component::{bindgen, Component, HasSelf, Linker};
-use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{Config, Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder};
 
 use super::{CallContext, Runtime, ToolDescriptor, ToolResult};
 use crate::extension::capability::{CallScope, Capability, PolicyEngine};
@@ -64,6 +64,55 @@ fn engine() -> &'static Engine {
     })
 }
 
+/// Store limits plus the current linear-memory high-water mark.
+struct TrackingLimiter {
+    limits: StoreLimits,
+    used: Arc<AtomicU64>,
+}
+
+impl ResourceLimiter for TrackingLimiter {
+    fn memory_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        let allowed = self.limits.memory_growing(current, desired, maximum)?;
+        let size = if allowed { desired } else { current };
+        self.used.store(size as u64, Ordering::Relaxed);
+        Ok(allowed)
+    }
+
+    fn memory_grow_failed(&mut self, error: wasmtime::Error) -> wasmtime::Result<()> {
+        self.limits.memory_grow_failed(error)
+    }
+
+    fn table_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        self.limits.table_growing(current, desired, maximum)
+    }
+
+    fn table_grow_failed(&mut self, error: wasmtime::Error) -> wasmtime::Result<()> {
+        self.limits.table_grow_failed(error)
+    }
+
+    fn instances(&self) -> usize {
+        self.limits.instances()
+    }
+
+    fn tables(&self) -> usize {
+        self.limits.tables()
+    }
+
+    fn memories(&self) -> usize {
+        self.limits.memories()
+    }
+}
+
 /// State passed to every host function.
 struct HostState {
     extension: ExtensionId,
@@ -74,7 +123,7 @@ struct HostState {
     workspace: Option<PathBuf>,
     publishes: Vec<String>,
     config: String,
-    limits: StoreLimits,
+    limits: TrackingLimiter,
     subscriptions: BTreeMap<u64, crate::extension::events::Subscription>,
     next_subscription: u64,
     deadline: Instant,
@@ -437,6 +486,7 @@ pub(crate) struct WasmRuntime {
     instance: Mutex<Option<Instance>>,
     fuel_budget: AtomicU64,
     fuel_used: AtomicU64,
+    memory_used: Arc<AtomicU64>,
 }
 
 impl WasmRuntime {
@@ -490,6 +540,7 @@ impl WasmRuntime {
             cancelled: Arc::new(AtomicBool::new(false)),
             fuel_budget: AtomicU64::new(0),
             fuel_used: AtomicU64::new(0),
+            memory_used: Arc::new(AtomicU64::new(0)),
             instance: Mutex::new(None),
         })
     }
@@ -521,7 +572,10 @@ impl WasmRuntime {
             workspace: self.workspace.clone(),
             publishes: self.publishes.clone(),
             config: self.config.clone(),
-            limits,
+            limits: TrackingLimiter {
+                limits,
+                used: Arc::clone(&self.memory_used),
+            },
             subscriptions: BTreeMap::new(),
             next_subscription: 1,
             deadline: Instant::now() + Duration::from_millis(self.resources.execution_ms()),
@@ -680,6 +734,10 @@ impl Runtime for WasmRuntime {
 
     fn memory_limit(&self) -> Option<u64> {
         Some(self.resources.memory_mb().saturating_mul(1024 * 1024))
+    }
+
+    fn memory_used(&self) -> Option<u64> {
+        Some(self.memory_used.load(Ordering::Relaxed))
     }
 
     async fn activate(&self) -> Result<(), ExtensionError> {
@@ -953,6 +1011,7 @@ mod tests {
         let panel = runtime.panel("status").await.expect("panel");
         assert_eq!(panel["schema_version"], "1.0");
         assert!(runtime.fuel_used().unwrap_or(0) > 0);
+        assert!(runtime.memory_used().unwrap_or(0) > 0);
         runtime.shutdown().await.expect("shutdown");
         let _ = std::fs::remove_dir_all(&scratch);
     }

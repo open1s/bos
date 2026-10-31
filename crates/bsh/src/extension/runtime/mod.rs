@@ -258,6 +258,11 @@ pub(crate) trait Runtime: Send + Sync {
         None
     }
 
+    /// Current linear-memory usage, when the runtime tracks it.
+    fn memory_used(&self) -> Option<u64> {
+        None
+    }
+
     /// Prepare the runtime. A process runtime may defer the first spawn; a
     /// wasm runtime may compile here.
     async fn activate(&self) -> Result<(), ExtensionError> {
@@ -534,6 +539,10 @@ impl Runtime for LazyRuntime {
 
     fn memory_limit(&self) -> Option<u64> {
         self.inner.memory_limit()
+    }
+
+    fn memory_used(&self) -> Option<u64> {
+        self.inner.memory_used()
     }
 
     async fn activate(&self) -> Result<(), ExtensionError> {

@@ -254,6 +254,8 @@ pub(crate) struct HostMetrics {
     pub(crate) fuel_used: u64,
     /// Sum of the memory ceilings the loaded runtimes declared.
     pub(crate) memory_limit_bytes: u64,
+    /// Sum of the current linear-memory usage the runtimes report.
+    pub(crate) memory_used_bytes: u64,
     /// Current load failures.
     pub(crate) failures: Vec<String>,
     /// The last recorded load failures, retained across host opens.
@@ -1118,6 +1120,12 @@ impl ExtensionHost {
                 .values()
                 .filter_map(|entry| entry.runtime.as_ref())
                 .filter_map(|runtime| runtime.memory_limit())
+                .sum(),
+            memory_used_bytes: self
+                .loaded
+                .values()
+                .filter_map(|entry| entry.runtime.as_ref())
+                .filter_map(|runtime| runtime.memory_used())
                 .sum(),
             failures: self
                 .loaded
