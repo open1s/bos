@@ -316,7 +316,7 @@ is deliberate and does not remove a feature.
 | Requirement | Status |
 |---|---|
 | Unit: manifest, ids, resolver, lifecycle, capability, events, UI, paths, lock determinism | done |
-| Integration: built-in registration, WASM load/invoke, process start/stop, tools, cancellation, UI action routing, patches, denial, crash isolation, upgrade/rollback, data preservation | partial | runtime cancellation covered; crash isolation and cross-platform remain partial |
+| Integration: built-in registration, WASM load/invoke, process start/stop, tools, cancellation, UI action routing, patches, denial, crash isolation, upgrade/rollback, data preservation | partial | cancellation and scan/load crash isolation covered; cross-platform execution remains partial |
 | Security tests: traversal, unauthorized fs/network, process denial, oversized messages, nested UI, event flood, resource exhaustion, malformed payloads, stale actions, revoked capability, package tampering/signatures | partial | signature/UI/traversal covered; network flood/process exhaustion missing |
 | Cross-platform matrix | not run in this environment |
 

@@ -1775,6 +1775,48 @@ tools = ["echo"]
             .contains_key("ext.com.example.extism-echo.midnight"));
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn a_broken_package_does_not_stop_a_good_one() {
+        let root = scratch("isolation");
+        let good = root.join("good");
+        write_package(&good);
+        let bad = root.join("bad");
+        write_package(&bad);
+        let bad_manifest = std::fs::read_to_string(bad.join("extension.toml"))
+            .expect("bad manifest")
+            .replace("com.example.hosted", "com.example.broken");
+        std::fs::write(bad.join("extension.toml"), bad_manifest).expect("bad manifest");
+        let store = ExtensionStore::open(&root).expect("store");
+        store.install(&good).expect("good install");
+        store.install(&bad).expect("bad install");
+        std::fs::write(
+            store
+                .installed_root()
+                .join("com.example.broken/1.0.0/extension.toml"),
+            "not toml",
+        )
+        .expect("corrupt manifest");
+        let host = ExtensionHost::open(config(&root)).expect("host");
+        let metrics = host.metrics();
+        assert_eq!(
+            metrics.applied, 2,
+            "the builtin inspector and good package still apply"
+        );
+        let statuses = host.statuses();
+        assert!(
+            statuses
+                .iter()
+                .any(|status| status.id == "com.example.hosted"),
+            "the good package is still listed"
+        );
+        assert!(
+            !statuses
+                .iter()
+                .any(|status| status.id == "com.example.broken"),
+            "the broken package is isolated from the good one"
+        );
+    }
     #[test]
     fn the_builtin_inspector_is_registered_and_applied() {
         let root = scratch("builtin");
