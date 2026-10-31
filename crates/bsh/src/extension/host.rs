@@ -592,6 +592,7 @@ impl ExtensionHost {
             if !ordered.contains(id) {
                 continue;
             }
+            let started = std::time::Instant::now();
             if let Err(error) = self.policy.authorize_required(
                 id,
                 entry.package.trust,
@@ -605,7 +606,9 @@ impl ExtensionHost {
             entry.applied = true;
             manager.transition(id, LifecycleState::Loading).ok();
             manager.transition(id, LifecycleState::Starting).ok();
-            manager.activated(id, 0).ok();
+            manager
+                .activated(id, started.elapsed().as_millis() as u64)
+                .ok();
         }
 
         self.manager = manager;

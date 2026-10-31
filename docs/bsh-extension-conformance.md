@@ -155,7 +155,7 @@ Status legend:
 |---|---|
 | No GPUI types across boundary | done |
 | No host file descriptors | done |
-| Explicit request/response schemas | partial | tool/UI schemas; command/event payloads JSON- and depth-checked only |
+| Explicit request/response schemas | done | tool input JSON schemas, UI/event schema versions, typed JSON command/event envelopes with depth checks |
 | Correlation ids and cancellation | done | correlation + cancel token + runtime stop |
 | Bounded payload and stream rate | done | event/tool caps + a 200-per-second progress window |
 | Version every transported/persisted schema | done for manifest, UI, events, lock, state; grants/registry format 1 |
