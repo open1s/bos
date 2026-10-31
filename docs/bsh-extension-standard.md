@@ -640,6 +640,7 @@ bsh ext validate <path>
 bsh ext hash <path>
 bsh ext build|package <path> [--out <dir>]
 bsh ext test <path>
+bsh ext mock <path> [tool] [json]       run one tool against a permissive mock host
 bsh ext install <path|archive|git+url> [--registry <name|url> <id>[@version]]
 bsh ext uninstall <id> [--purge-data]
 bsh ext list [--json]

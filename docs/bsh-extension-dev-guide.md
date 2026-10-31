@@ -221,6 +221,7 @@ exactly if a scoped grant must match.
 ~~~text
 bsh ext validate <path>       # every manifest error in one run
 bsh ext hash <path>           # canonical hash; changes whenever content changes
+bsh ext mock <path> [tool] [json]  # run one tool against a permissive mock host
 bsh ext doctor                # hash drift, dependency failures, policy gaps
 bsh ext logs <id>             # audit decisions and per-extension logs
 bsh ext info <id> --json      # the full status row for a script

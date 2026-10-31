@@ -309,7 +309,7 @@ is deliberate and does not remove a feature.
 | Installed version/source, runtime kind, lifecycle, capabilities, errors, dependencies | done |
 | Startup duration, request count/latency, memory/fuel, active tasks/subscriptions, crash history | partial | startup/calls/events/subscribers/failed/active/fuel/retained crash history; memory gauge missing |
 | CLI new/validate/build/test/package/install/list/info/enable/disable/update/uninstall/logs/doctor | done | plus versions/rollback/quarantine/keygen/sign/trust/config/registry/metrics |
-| Templates, WIT bindings/examples, local dev, mock host, integration harness, logs/traces, compatibility checker, package builder, security diagnostics | partial | examples/builder/doctor; mock host missing |
+| Templates, WIT bindings/examples, local dev, mock host, integration harness, logs/traces, compatibility checker, package builder, security diagnostics | done | templates/WIT/examples/builder/doctor + `bsh ext mock` for every runtime |
 
 ## 17. Testing
 

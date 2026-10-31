@@ -255,8 +255,8 @@ pub(crate) enum RuntimeKind {
     Mcp,
     /// An Extism plugin (core Wasm + PDK).
     Extism,
-    /// A WebAssembly Component. The contract is published in `wit/`; this
-    /// build refuses to activate one until the Wasmtime runtime lands.
+    /// A WebAssembly Component. The contract is published in `wit/` and
+    /// executed by the Wasmtime component runtime.
     WasmComponent,
 }
 

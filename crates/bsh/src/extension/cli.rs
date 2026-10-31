@@ -31,6 +31,7 @@ Commands:
   build <path> [--out <dir>]          validate and build a .tar.gz release
   package <path> [--out <dir>]        alias for build
   test <path>                         validate the package and its contributions
+  mock <path> [tool] [json]           run one tool against a permissive mock host
   install <path|archive|git+url>      install a package into the managed store
               [--registry <name|url> <id>[@version]]
   uninstall <id> [--purge-data]       remove a package; keep data by default
@@ -108,6 +109,7 @@ pub(crate) fn run(args: &[String]) -> i32 {
         "hash" => command_hash(&rest[1..]),
         "build" | "package" => command_package(&rest[1..]),
         "test" => command_test(&rest[1..]),
+        "mock" => command_mock(&rest[1..]),
         "install" => command_install(&rest[1..], root.clone()),
         "uninstall" => command_uninstall(&rest[1..], root.clone()),
         "list" => command_list(root.clone(), json),
@@ -1143,6 +1145,148 @@ fn command_test(args: &[String]) -> Result<i32, String> {
     Ok(0)
 }
 
+fn command_mock(args: &[String]) -> Result<i32, String> {
+    let path = PathBuf::from(
+        args.first()
+            .ok_or_else(|| "usage: bsh ext mock <path> [tool] [json]".to_string())?,
+    );
+    let package = Package::load(&path, ExtensionSource::Development, TrustLevel::Local)
+        .map_err(|error| error.to_string())?;
+    if !package.report.is_valid() {
+        return Err(format!("invalid: {}", package.error_message()));
+    }
+    let tool = args.get(1).cloned();
+    let arguments = args
+        .get(2)
+        .map(|text| {
+            serde_json::from_str::<serde_json::Value>(text)
+                .map_err(|error| format!("arguments are not JSON: {error}"))
+        })
+        .transpose()?
+        .unwrap_or_else(|| serde_json::json!({}));
+    let root = std::env::temp_dir().join(format!(
+        "bsh-ext-mock-{}-{}",
+        std::process::id(),
+        crate::settings::unix_now()
+    ));
+    let data_root = root.join("data");
+    std::fs::create_dir_all(&data_root).map_err(|error| error.to_string())?;
+    let policy = std::sync::Arc::new(
+        crate::extension::capability::PolicyEngine::open(
+            root.join("grants.toml"),
+            root.join("audit.jsonl"),
+            crate::extension::capability::PolicyMode::Enforce,
+        )
+        .map_err(|error| error.to_string())?,
+    );
+    for capability in Capability::ALL {
+        policy
+            .grant(package.id().as_str(), capability, GrantScope::Any, None)
+            .map_err(|error| error.to_string())?;
+    }
+    let events = std::sync::Arc::new(crate::extension::events::EventBus::new());
+    let id = package.id().clone();
+    let config = serde_json::json!({ "mock": true }).to_string();
+    let runtime: std::sync::Arc<dyn crate::extension::runtime::Runtime> =
+        match package.manifest.runtime.kind {
+            RuntimeKind::Declarative => std::sync::Arc::new(
+                DeclarativeRuntime::new(&path, &package.manifest)
+                    .map_err(|error| error.to_string())?,
+            ),
+            RuntimeKind::Process => std::sync::Arc::new(
+                ProcessRuntime::new(&package.manifest, &path)
+                    .map_err(|error| error.to_string())?
+                    .with_config(config.clone())
+                    .with_events(
+                        std::sync::Arc::clone(&events),
+                        &package.manifest.contributes.events,
+                    ),
+            ),
+            RuntimeKind::Mcp => std::sync::Arc::new(
+                McpRuntime::new(&package.manifest, &path, config.clone())
+                    .map_err(|error| error.to_string())?,
+            ),
+            RuntimeKind::WasmComponent => std::sync::Arc::new(
+                crate::extension::runtime::wasm::WasmRuntime::new(
+                    &package.manifest,
+                    &path,
+                    &data_root,
+                    std::sync::Arc::clone(&policy),
+                    std::sync::Arc::clone(&events),
+                    None,
+                    config.clone(),
+                    TrustLevel::Local,
+                )
+                .map_err(|error| error.to_string())?,
+            ),
+            RuntimeKind::Extism => std::sync::Arc::new(
+                crate::extension::runtime::extism::ExtismRuntime::new(
+                    &package.manifest,
+                    &path,
+                    &data_root,
+                    std::sync::Arc::clone(&policy),
+                    std::sync::Arc::clone(&events),
+                    None,
+                    config,
+                    TrustLevel::Local,
+                )
+                .map_err(|error| error.to_string())?,
+            ),
+            RuntimeKind::Builtin => {
+                return Err("the built-in runtime has no development mock".to_string());
+            }
+        };
+    let runtime_for_call = std::sync::Arc::clone(&runtime);
+    let result = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?
+        .block_on(async move {
+            runtime_for_call
+                .activate()
+                .await
+                .map_err(|error| error.to_string())?;
+            let tools = runtime_for_call
+                .tools()
+                .await
+                .map_err(|error| error.to_string())?;
+            let tool_id = match tool {
+                Some(tool) => tool,
+                None => tools
+                    .first()
+                    .map(|tool| tool.id.as_str().to_string())
+                    .ok_or_else(|| format!("{id} contributes no tools"))?,
+            };
+            if !tools.iter().any(|tool| tool.id.as_str() == tool_id) {
+                return Err(format!("{id} has no tool {tool_id}"));
+            }
+            let context =
+                crate::extension::runtime::CallContext::new(id.clone(), "mock", None, 30_000);
+            let (progress_tx, mut progress_rx) =
+                tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+            let printer = tokio::spawn(async move {
+                while let Some(value) = progress_rx.recv().await {
+                    eprintln!("progress: {value}");
+                }
+            });
+            let result = runtime_for_call
+                .call_tool_progress(&tool_id, arguments, &context, Some(progress_tx))
+                .await
+                .map_err(|error| error.to_string())?;
+            let _ = printer.await;
+            runtime_for_call
+                .shutdown()
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok::<_, String>(result.to_value())
+        })?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&result).map_err(|error| error.to_string())?
+    );
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(0)
+}
 fn command_config(args: &[String], root: Option<PathBuf>) -> Result<i32, String> {
     let id = ExtensionId::parse(one_argument(
         args,
@@ -1321,6 +1465,21 @@ fn command_reproduce(args: &[String], root: Option<PathBuf>) -> Result<i32, Stri
 #[cfg(test)]
 mod tests {
     use super::command_package;
+
+    #[test]
+    fn the_mock_host_runs_one_tool() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/extensions/hello");
+        assert_eq!(
+            super::command_mock(&[
+                root.display().to_string(),
+                "echo".to_string(),
+                "{\"x\":1}".to_string()
+            ])
+            .expect("mock"),
+            0
+        );
+    }
 
     #[test]
     fn an_installed_only_lock_reproduces_from_its_source_path() {
