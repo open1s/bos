@@ -30,7 +30,7 @@ Status legend:
 | Extism plugin runtime | done | runtime/extism.rs; bsh_host bridge, policy-checked host calls, fuel/memory caps, plugin fixture |
 | External process + JSON-RPC runtime | done | runtime/process.rs |
 | WIT interface definition | done | crates/bsh/wit/extension.wit |
-| Host-managed GPUI panels | partial | settings hosts every location; right panel hosts Right; bottom dock hosts Bottom; Left/Center remain in Settings |
+| Host-managed GPUI panels | done | Settings hosts all; left sidebar, right panel, bottom composer dock and center tab host their declared locations |
 | Declarative UI | done | contract, validation, GPUI renderer, action routing and stale-revision refusal |
 | Unified tool/context/prompt contracts | done | agent.rs |
 | Capability authorization, quotas, audit | partial | authorization and audit done; quotas partial |
@@ -195,7 +195,7 @@ Status legend:
 
 | Requirement | Status |
 |---|---|
-| Mode A panel contribution with id/title/icon/location/visibility | partial | fields recorded; Settings hosts all, right panel honors Right, bottom dock honors Bottom; Left/Center have no dedicated dock |
+| Mode A panel contribution with id/title/icon/location/visibility | done | fields recorded; each location has a dedicated host plus the all-panel Settings surface |
 | Mode B declarative components | done | ui/extension_panel.rs; image draws source label, not pixels |
 | Mode C embedded guest GPUI | non-goal |
 | Validate schema/payload, depth/node/text limits | done |
@@ -327,7 +327,7 @@ is deliberate and does not remove a feature.
 | Phase 1 core | done |
 | Phase 2 WASM + Extism | done |
 | Phase 3 agent, event, MCP, process | done | MCP/events/process/tools and live progress |
-| Phase 4 GPUI UI | partial | renderer/panels/actions/themes/keyboard focus done; multiple mount points still partial |
+| Phase 4 GPUI UI | done | renderer, panels, actions, themes, keyboard focus and all four panel locations |
 | Phase 5 ecosystem | done | registry/upgrade/rollback/signatures/builder/Extism/lock reproduction |
 
 ## 19. User stories

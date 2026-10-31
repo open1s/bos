@@ -19717,6 +19717,27 @@ fn the_right_panel_offers_an_extensions_pane(cx: &mut TestAppContext) {
         "the Extensions tab opens its own pane"
     );
 }
+
+#[gpui::test]
+fn the_center_tab_renders_an_extensions_surface(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("center-extensions");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    shell.update(cx, |this, cx| {
+        this.state.tab = crate::state::Tab::Extensions;
+        cx.notify();
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("extension-center-empty").is_some(),
+        "the center Extensions tab renders its surface"
+    );
+}
 /// The Files card opens the browser, directories lead, and a file opens in the
 /// editor with the save control beside it.
 #[gpui::test]

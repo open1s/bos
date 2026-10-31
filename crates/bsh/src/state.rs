@@ -238,6 +238,8 @@ pub(crate) enum Tab {
     Trajectory,
     /// The deterministic tool-call and refusal audit.
     Audit,
+    /// Extension panels declared for the main column.
+    Extensions,
 }
 
 /// One message waiting for its session's running turn to finish.

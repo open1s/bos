@@ -246,12 +246,25 @@ impl Shell {
             Tab::Chat => self.render_transcript(cx).into_any_element(),
             Tab::Trajectory => self.render_trajectory(cx).into_any_element(),
             Tab::Audit => self.render_audit(cx).into_any_element(),
+            Tab::Extensions => match self.center_extension_panels.clone() {
+                Some(view) => view.into_any_element(),
+                None => div()
+                    .debug_selector(|| "extension-center-empty".to_string())
+                    .flex_1()
+                    .p(px(24.0))
+                    .child(txt(
+                        "No center extension panels are installed.",
+                        13.0,
+                        theme::muted(),
+                    ))
+                    .into_any_element(),
+            },
         };
         let goal = match self.state.tab {
             Tab::Chat => self.goal_row(cx),
-            // The trajectory pane already shows the goal as a card, and the
-            // audit is about tool calls rather than the plan.
-            Tab::Trajectory | Tab::Audit => None,
+            // The trajectory pane already shows the goal as a card, the audit is
+            // about tool calls, and an extension panel is not the conversation.
+            Tab::Trajectory | Tab::Audit | Tab::Extensions => None,
         };
         let column = div()
             .debug_selector(|| String::from("main-column"))
@@ -1720,6 +1733,14 @@ impl Shell {
                     "tab-trajectory",
                     "tab.trajectory",
                     Tab::Trajectory,
+                    cx,
+                ))
+            })
+            .when_some(self.center_extension_panels.clone(), |strip, _| {
+                strip.child(entry(
+                    "tab-extensions",
+                    "tab.extensions",
+                    Tab::Extensions,
                     cx,
                 ))
             })

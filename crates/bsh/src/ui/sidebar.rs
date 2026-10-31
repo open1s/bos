@@ -221,6 +221,16 @@ impl Shell {
             .child(self.titlebar_row(cx))
             .child(self.brand_row())
             .child(self.new_session_button(cx))
+            .when_some(self.left_extension_panels.clone(), |sidebar, view| {
+                sidebar.child(
+                    div()
+                        .debug_selector(|| "extension-left-dock".to_string())
+                        .w_full()
+                        .h(px(180.0))
+                        .pb(px(8.0))
+                        .child(view),
+                )
+            })
             // The tree is the column's only flexible region, so a long session
             // list scrolls INSIDE the sidebar instead of pushing the account row
             // off the bottom of the window.

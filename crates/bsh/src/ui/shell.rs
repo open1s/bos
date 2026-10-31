@@ -853,7 +853,13 @@ pub(crate) struct Shell {
     pub(crate) extension_commands: Vec<crate::extension::CommandSurface>,
     /// The declarative extension panel host, created when the pane opens.
     pub(crate) extension_panels: Option<Entity<crate::ui::extension_panel::ExtensionPanelView>>,
-    /// Panels declared for the right panel, the one location-specific mount.
+    /// Panels declared for the left sidebar.
+    pub(crate) left_extension_panels:
+        Option<Entity<crate::ui::extension_panel::ExtensionPanelView>>,
+    /// Panels declared for the main column.
+    pub(crate) center_extension_panels:
+        Option<Entity<crate::ui::extension_panel::ExtensionPanelView>>,
+    /// Panels declared for the right panel mount.
     pub(crate) right_extension_panels:
         Option<Entity<crate::ui::extension_panel::ExtensionPanelView>>,
     /// Panels declared for the bottom dock.
@@ -1115,6 +1121,28 @@ impl Shell {
             let root = state.settings.active_workspace_root();
             let workspace = (!root.is_empty()).then(|| std::path::PathBuf::from(root));
             let panels = crate::extension::panels(&state.settings, workspace.as_deref(), None);
+            (!panels.is_empty())
+                .then(|| cx.new(|_| crate::ui::extension_panel::ExtensionPanelView::new(panels)))
+        };
+        let center_extension_panels = {
+            let root = state.settings.active_workspace_root();
+            let workspace = (!root.is_empty()).then(|| std::path::PathBuf::from(root));
+            let panels: Vec<_> =
+                crate::extension::panels(&state.settings, workspace.as_deref(), None)
+                    .into_iter()
+                    .filter(|panel| panel.location == crate::extension::ui::PanelLocation::Center)
+                    .collect();
+            (!panels.is_empty())
+                .then(|| cx.new(|_| crate::ui::extension_panel::ExtensionPanelView::new(panels)))
+        };
+        let left_extension_panels = {
+            let root = state.settings.active_workspace_root();
+            let workspace = (!root.is_empty()).then(|| std::path::PathBuf::from(root));
+            let panels: Vec<_> =
+                crate::extension::panels(&state.settings, workspace.as_deref(), None)
+                    .into_iter()
+                    .filter(|panel| panel.location == crate::extension::ui::PanelLocation::Left)
+                    .collect();
             (!panels.is_empty())
                 .then(|| cx.new(|_| crate::ui::extension_panel::ExtensionPanelView::new(panels)))
         };
@@ -1726,6 +1754,8 @@ impl Shell {
             plugins: Vec::new(),
             extension_commands: crate::extension::cached_commands(),
             extension_panels,
+            center_extension_panels,
+            left_extension_panels,
             right_extension_panels,
             bottom_extension_panels,
             extension_themes: Some(extension_themes),
@@ -5122,6 +5152,7 @@ impl Render for Shell {
                     crate::state::Tab::Chat => "chat",
                     crate::state::Tab::Trajectory => "trajectory",
                     crate::state::Tab::Audit => "audit",
+                    crate::state::Tab::Extensions => "extensions",
                 },
                 streaming,
                 offset: f32::from(self.transcript_scroll.offset().y),
