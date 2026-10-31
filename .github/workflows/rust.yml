@@ -23,6 +23,8 @@ jobs:
 
       - name: Setup Rust 1.98.1
         uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: rustfmt, clippy
 
       - name: Cache cargo
         uses: actions/cache@v4
