@@ -157,19 +157,20 @@ impl Bridge {
                 if parsed.scheme() != "https" && parsed.scheme() != "http" {
                     return Err("only http and https are allowed".to_string());
                 }
-                self.authorize(
-                    Capability::NetworkHttp,
-                    CallScope {
-                        domain: parsed.host_str().map(str::to_string),
-                        ..CallScope::default()
-                    },
-                )
-                .map_err(|error| error.to_string())?;
                 let method = request
                     .get("method")
                     .and_then(Value::as_str)
                     .unwrap_or("GET")
                     .to_ascii_uppercase();
+                self.authorize(
+                    Capability::NetworkHttp,
+                    CallScope {
+                        domain: parsed.host_str().map(str::to_string),
+                        method: Some(method.clone()),
+                        ..CallScope::default()
+                    },
+                )
+                .map_err(|error| error.to_string())?;
                 let method = reqwest::Method::from_bytes(method.as_bytes())
                     .map_err(|error| error.to_string())?;
                 let client = reqwest::blocking::Client::builder()

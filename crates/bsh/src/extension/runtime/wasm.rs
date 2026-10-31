@@ -298,6 +298,7 @@ impl self::bsh::extension::host::Host for HostState {
             Capability::NetworkHttp,
             CallScope {
                 domain: parsed.host_str().map(str::to_string),
+                method: Some(method.to_ascii_uppercase()),
                 ..CallScope::default()
             },
         )?;

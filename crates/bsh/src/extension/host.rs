@@ -699,6 +699,7 @@ impl ExtensionHost {
             RuntimeKind::Process => {
                 let runtime = ProcessRuntime::new(&package.manifest, &package.root)?
                     .with_config(config.to_json())
+                    .with_policy(Arc::clone(&self.policy), package.trust)
                     .with_workspace(self.config.workspace.clone())
                     .with_data_root(Some(data_root.clone()))
                     .with_events(

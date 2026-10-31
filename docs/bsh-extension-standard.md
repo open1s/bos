@@ -338,6 +338,9 @@ Scopes:
 | workspace | a call with an open workspace |
 | path:/prefix | a call whose path (or workspace) starts with the prefix |
 | domain:example.com | that host and its subdomains |
+| domain:example.com:POST | that host, only for the named HTTP method |
+| program:python3 | that declared executable |
+| program:python3:--version | that executable with exactly those arguments |
 | secret:NAME | that one named secret |
 
 A grant scoped to one path does not cover another path. A call that does not

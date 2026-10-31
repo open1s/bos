@@ -20,9 +20,10 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
 use super::{load_tool_descriptors, CallContext, Runtime, ToolDescriptor, ToolResult};
+use crate::extension::capability::{CallScope, Capability, PolicyEngine};
 use crate::extension::events::{EventBus, EventFilter, ExtensionEvent, Subscription};
 use crate::extension::manifest::{is_allowlisted_command, validate_relative_path, Manifest};
-use crate::extension::types::{ExtensionError, ExtensionId, RuntimeKind, HOST_VERSION};
+use crate::extension::types::{ExtensionError, ExtensionId, RuntimeKind, TrustLevel, HOST_VERSION};
 
 /// The protocol generation a process must speak.
 pub(crate) const PROTOCOL_VERSION: &str = "1.0";
@@ -357,6 +358,7 @@ pub(crate) struct ProcessRuntime {
     config: String,
     workspace: Option<PathBuf>,
     data_root: Option<PathBuf>,
+    policy: Option<(Arc<PolicyEngine>, TrustLevel)>,
     sandbox: bool,
     session: Mutex<Option<ProcessSession>>,
     subscriptions: std::sync::Mutex<Vec<Subscription>>,
@@ -401,6 +403,7 @@ impl ProcessRuntime {
             config: "{}".to_string(),
             workspace: None,
             data_root: None,
+            policy: None,
             sandbox: cfg!(target_os = "macos"),
             session: Mutex::new(None),
             subscriptions: std::sync::Mutex::new(Vec::new()),
@@ -415,6 +418,12 @@ impl ProcessRuntime {
     /// Attach the effective configuration sent in the initialize handshake.
     pub(crate) fn with_config(mut self, config: String) -> Self {
         self.config = config;
+        self
+    }
+
+    /// Attach the policy engine and trust level used for per-spawn checks.
+    pub(crate) fn with_policy(mut self, policy: Arc<PolicyEngine>, trust: TrustLevel) -> Self {
+        self.policy = Some((policy, trust));
         self
     }
 
@@ -552,6 +561,18 @@ impl ProcessRuntime {
             }
             canonical
         };
+        if let Some((policy, trust)) = &self.policy {
+            policy.authorize_call(
+                self.extension.as_str(),
+                *trust,
+                Capability::ProcessExecute,
+                &CallScope {
+                    program: Some(self.entry.clone()),
+                    args: Some(self.args.clone()),
+                    ..CallScope::default()
+                },
+            )?;
+        }
         let mut command = if self.sandbox && cfg!(target_os = "macos") {
             let mut command = Command::new("/usr/bin/sandbox-exec");
             command

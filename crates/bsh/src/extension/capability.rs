@@ -175,6 +175,9 @@ impl FromStr for Capability {
     type Err = ExtensionError;
 
     fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        if raw == "terminal.execute" {
+            return Ok(Capability::ProcessExecute);
+        }
         Capability::ALL
             .iter()
             .copied()
@@ -237,6 +240,12 @@ pub(crate) enum GrantScope {
     Path(PathBuf),
     /// One DNS name and its subdomains.
     Domain(String),
+    /// One DNS name (and its subdomains) restricted to one HTTP method.
+    DomainMethod(String, String),
+    /// One executable, by the name the manifest declares.
+    Program(String),
+    /// One executable and the exact argument vector.
+    ProgramArgs(String, Vec<String>),
     /// One named secret.
     Secret(String),
 }
@@ -248,6 +257,11 @@ impl fmt::Display for GrantScope {
             Self::Workspace => formatter.write_str("workspace"),
             Self::Path(path) => write!(formatter, "path:{}", path.display()),
             Self::Domain(domain) => write!(formatter, "domain:{domain}"),
+            Self::DomainMethod(domain, method) => write!(formatter, "domain:{domain}:{method}"),
+            Self::Program(program) => write!(formatter, "program:{program}"),
+            Self::ProgramArgs(program, args) => {
+                write!(formatter, "program:{program}:{}", args.join(","))
+            }
             Self::Secret(secret) => write!(formatter, "secret:{secret}"),
         }
     }
@@ -273,7 +287,33 @@ impl FromStr for GrantScope {
             if domain.trim().is_empty() {
                 return Err("domain scope needs a host".to_string());
             }
+            if let Some((host, method)) = domain.split_once(':') {
+                if host.trim().is_empty() || method.trim().is_empty() {
+                    return Err("method scope needs a host and a method".to_string());
+                }
+                return Ok(Self::DomainMethod(
+                    host.to_string(),
+                    method.to_ascii_uppercase(),
+                ));
+            }
             return Ok(Self::Domain(domain.to_string()));
+        }
+        if let Some(program) = raw.strip_prefix("program:") {
+            if program.trim().is_empty() {
+                return Err("program scope needs an executable".to_string());
+            }
+            if let Some((program, args)) = program.split_once(':') {
+                if program.trim().is_empty() {
+                    return Err("program scope needs an executable".to_string());
+                }
+                let args = args
+                    .split(',')
+                    .filter(|arg| !arg.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                return Ok(Self::ProgramArgs(program.to_string(), args));
+            }
+            return Ok(Self::Program(program.to_string()));
         }
         if let Some(secret) = raw.strip_prefix("secret:") {
             if secret.trim().is_empty() {
@@ -282,7 +322,7 @@ impl FromStr for GrantScope {
             return Ok(Self::Secret(secret.to_string()));
         }
         Err(format!(
-            "unknown scope {raw:?}; use any, workspace, path:..., domain:... or secret:..."
+            "unknown scope {raw:?}; use any, workspace, path:..., domain:..., program:... or secret:..."
         ))
     }
 }
@@ -460,8 +500,22 @@ pub(crate) struct CallScope {
     pub(crate) path: Option<PathBuf>,
     /// The DNS host being reached.
     pub(crate) domain: Option<String>,
+    /// The HTTP method, when the call is a network request.
+    pub(crate) method: Option<String>,
+    /// The declared executable of a process call.
+    pub(crate) program: Option<String>,
+    /// The arguments of a process call.
+    pub(crate) args: Option<Vec<String>>,
     /// The secret being read.
     pub(crate) secret: Option<String>,
+}
+
+/// Whether a DNS host equals a domain or is one of its subdomains.
+fn host_matches(host: &str, domain: &str) -> bool {
+    host.eq_ignore_ascii_case(domain)
+        || host
+            .to_ascii_lowercase()
+            .ends_with(&format!(".{}", domain.to_ascii_lowercase()))
 }
 
 impl GrantScope {
@@ -475,12 +529,29 @@ impl GrantScope {
                 .as_ref()
                 .or(call.workspace.as_ref())
                 .is_some_and(|path| path.starts_with(prefix)),
-            Self::Domain(domain) => call.domain.as_ref().is_some_and(|host| {
-                host.eq_ignore_ascii_case(domain)
-                    || host
-                        .to_ascii_lowercase()
-                        .ends_with(&format!(".{}", domain.to_ascii_lowercase()))
-            }),
+            Self::Domain(domain) => call
+                .domain
+                .as_ref()
+                .is_some_and(|host| host_matches(host, domain)),
+            Self::DomainMethod(domain, method) => {
+                call.domain
+                    .as_ref()
+                    .is_some_and(|host| host_matches(host, domain))
+                    && call
+                        .method
+                        .as_ref()
+                        .is_some_and(|actual| actual.eq_ignore_ascii_case(method))
+            }
+            Self::Program(program) => call
+                .program
+                .as_ref()
+                .is_some_and(|actual| actual == program),
+            Self::ProgramArgs(program, args) => {
+                call.program
+                    .as_ref()
+                    .is_some_and(|actual| actual == program)
+                    && call.args.as_ref().is_some_and(|actual| actual == args)
+            }
             Self::Secret(secret) => call.secret.as_ref().is_some_and(|name| name == secret),
         }
     }
@@ -641,6 +712,16 @@ impl PolicyEngine {
         scope: &CallScope,
     ) -> Result<(), ExtensionError> {
         for capability in required {
+            // A process grant can name the executable or its argument vector;
+            // the load-time scope has neither, so the per-spawn check is the
+            // one that enforces it. Requiring the grant to exist here keeps a
+            // missing grant a load error.
+            if *capability == Capability::ProcessExecute
+                && scope.program.is_none()
+                && self.grants_for(extension).contains_key(capability.as_str())
+            {
+                continue;
+            }
             if let Decision::Deny { reason } = self.evaluate(extension, trust, *capability, scope) {
                 return Err(ExtensionError::MissingCapability {
                     extension: extension.to_string(),
@@ -836,12 +917,57 @@ mod tests {
     }
 
     #[test]
+    fn a_domain_scope_can_restrict_the_http_method() {
+        let scope: GrantScope = "domain:api.example.com:POST".parse().expect("scope");
+        assert_eq!(
+            scope,
+            GrantScope::DomainMethod("api.example.com".to_string(), "POST".to_string())
+        );
+        assert!(scope.covers(&CallScope {
+            domain: Some("api.example.com".to_string()),
+            method: Some("POST".to_string()),
+            ..CallScope::default()
+        }));
+        assert!(!scope.covers(&CallScope {
+            domain: Some("api.example.com".to_string()),
+            method: Some("GET".to_string()),
+            ..CallScope::default()
+        }));
+        assert_eq!(scope.to_string(), "domain:api.example.com:POST");
+    }
+
+    #[test]
+    fn a_process_scope_can_restrict_the_executable_and_arguments() {
+        let scope: GrantScope = "program:python3:--version".parse().expect("scope");
+        assert_eq!(
+            scope,
+            GrantScope::ProgramArgs("python3".to_string(), vec!["--version".to_string()])
+        );
+        assert!(scope.covers(&CallScope {
+            program: Some("python3".to_string()),
+            args: Some(vec!["--version".to_string()]),
+            ..CallScope::default()
+        }));
+        assert!(!scope.covers(&CallScope {
+            program: Some("python3".to_string()),
+            args: Some(vec!["-c".to_string()]),
+            ..CallScope::default()
+        }));
+        let program: GrantScope = "program:sh".parse().expect("scope");
+        assert_eq!(program, GrantScope::Program("sh".to_string()));
+    }
+
+    #[test]
     fn capability_strings_round_trip() {
         for capability in Capability::ALL {
             let parsed: Capability = capability.as_str().parse().expect("capability");
             assert_eq!(parsed, capability);
         }
         assert!("workspace.teleport".parse::<Capability>().is_err());
+        assert_eq!(
+            "terminal.execute".parse::<Capability>().expect("alias"),
+            Capability::ProcessExecute
+        );
     }
 
     #[test]

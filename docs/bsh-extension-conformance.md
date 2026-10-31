@@ -243,9 +243,9 @@ Status legend:
 
 | Requirement | Status |
 |---|---|
-| Capability categories including terminal.execute | partial: process.execute only; alias missing |
-| Network domain/method policy | partial: domain scope; method policy not enforced |
-| Process executable/argument policy | partial: allowlist and args; no argument policy |
+| Capability categories including terminal.execute | done | process.execute plus the terminal.execute alias |
+| Network domain/method policy | done | domain scope and optional method-restricted domain scope |
+| Process executable/argument policy | done | allowlist, explicit grant, program and program+args scopes checked per spawn |
 | CPU/fuel and wall clock | done | wall clock + wasm fuel + process RLIMIT_CPU |
 | Memory/concurrency | partial | wasm StoreLimits + process RLIMIT_AS; concurrency per runtime mutex |
 | Host-call authorization | done | WASM host functions call PolicyEngine |
