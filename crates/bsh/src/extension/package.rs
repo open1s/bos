@@ -605,6 +605,45 @@ impl ExtensionStore {
         self.log_root().join("audit.jsonl")
     }
 
+    /// The retained load-crash history.
+    pub(crate) fn crashes_path(&self) -> PathBuf {
+        self.log_root().join("crashes.jsonl")
+    }
+
+    /// Append one load failure unless it repeats the last recorded line.
+    pub(crate) fn record_crash(&self, id: &str, error: &str) {
+        let path = self.crashes_path();
+        let line = format!("{}\t{id}\t{error}\n", crate::settings::unix_now());
+        if let Ok(existing) = std::fs::read_to_string(&path) {
+            if existing.lines().last() == Some(line.trim_end()) {
+                return;
+            }
+        }
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        use std::io::Write as _;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
+
+    /// The last `limit` recorded load failures, newest last.
+    pub(crate) fn crash_history(&self, limit: usize) -> Vec<String> {
+        let Ok(text) = std::fs::read_to_string(self.crashes_path()) else {
+            return Vec::new();
+        };
+        let lines: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
+        lines[lines.len().saturating_sub(limit)..]
+            .iter()
+            .map(|line| line.to_string())
+            .collect()
+    }
+
     /// One extension's log directory.
     pub(crate) fn log_dir(&self, id: &ExtensionId) -> PathBuf {
         self.log_root().join(id.as_str())
@@ -1070,6 +1109,22 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn crash_history_is_retained_and_deduplicates_the_last_line() {
+        let scratch = Scratch::new("crashes");
+        let store = ExtensionStore::open(&scratch.0).expect("store");
+        store.record_crash("com.example.bad", "boom");
+        store.record_crash("com.example.bad", "boom");
+        store.record_crash("com.example.worse", "kaput");
+        let history = store.crash_history(16);
+        assert_eq!(history.len(), 2);
+        assert!(history[0].contains("com.example.bad"));
+        assert!(history[1].contains("com.example.worse"));
+        drop(store);
+        let reopened = ExtensionStore::open(&scratch.0).expect("reopen");
+        assert_eq!(reopened.crash_history(16).len(), 2);
+    }
 
     struct Scratch(PathBuf);
 

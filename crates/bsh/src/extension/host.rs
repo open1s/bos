@@ -250,8 +250,10 @@ pub(crate) struct HostMetrics {
     pub(crate) startup_millis: u64,
     /// Fuel consumed by the latest WASM call across runtimes.
     pub(crate) fuel_used: u64,
-    /// Current load failures, retained as a short crash history.
+    /// Current load failures.
     pub(crate) failures: Vec<String>,
+    /// The last recorded load failures, retained across host opens.
+    pub(crate) crash_history: Vec<String>,
 }
 
 /// One diagnostic line.
@@ -332,6 +334,7 @@ pub(crate) struct ExtensionHost {
     pump_generation: Arc<AtomicU64>,
     calls: Mutex<CallMetrics>,
     startup_millis: u64,
+    crash_history: Vec<String>,
 }
 
 impl ExtensionHost {
@@ -361,9 +364,11 @@ impl ExtensionHost {
             pump_generation: Arc::new(AtomicU64::new(0)),
             calls: Mutex::new(CallMetrics::default()),
             startup_millis: 0,
+            crash_history: Vec::new(),
         };
         host.register_builtins();
         host.rebuild()?;
+        host.crash_history = host.store.crash_history(16);
         host.startup_millis = started.elapsed().as_millis() as u64;
         Ok(host)
     }
@@ -608,6 +613,7 @@ impl ExtensionHost {
                     let _ = self.events.publish(&event);
                 }
             } else if let Some(error) = &entry.error {
+                self.store.record_crash(entry.package.id().as_str(), error);
                 if let Ok(event) = lifecycle_event(
                     entry.package.id(),
                     topics::EXTENSION_FAILED,
@@ -1098,6 +1104,7 @@ impl ExtensionHost {
                         .map(|error| format!("{}: {error}", entry.package.id().as_str()))
                 })
                 .collect(),
+            crash_history: self.crash_history.clone(),
         }
     }
 
