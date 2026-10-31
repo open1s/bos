@@ -159,11 +159,21 @@ impl Shared {
 
     /// Mark one paused request as answered.
     fn settled(&self) {
-        let _ = self
-            .inflight
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |inflight| {
-                Some(inflight.saturating_sub(1))
-            });
+        // A compare-exchange loop rather than fetch_update/try_update: the
+        // method was renamed in newer Rust, and this form is stable across the
+        // declared MSRV and current stable.
+        let mut inflight = self.inflight.load(Ordering::Relaxed);
+        while inflight > 0 {
+            match self.inflight.compare_exchange_weak(
+                inflight,
+                inflight - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => inflight = actual,
+            }
+        }
         self.touch();
     }
 
