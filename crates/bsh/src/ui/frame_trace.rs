@@ -5,7 +5,9 @@
 //! requested all live inside the view. This module writes exactly that, one
 //! bounded line per painted frame, when the reader asks for it:
 //!
-//!     BSH_FRAME_TRACE=/tmp/bsh-frames.log ./target/debug/bsh
+//! ~~~text
+//! BSH_FRAME_TRACE=/tmp/bsh-frames.log ./target/debug/bsh
+//! ~~~
 //!
 //! With the variable unset the shell keeps None and the render path only
 //! matches that option: no file, no buffer, no allocation. The environment is
