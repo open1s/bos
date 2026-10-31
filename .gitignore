@@ -29,6 +29,12 @@ jsbos.node
 target/
 dist/
 build/
+# Ghostty's Zig build logic lives in a directory named build/; it is source,
+# not an artifact, and the Linux harness cannot compile the terminal without it.
+!vendor/gpui-libghostty/vendor/ghostty/src/build/
+!vendor/gpui-libghostty/vendor/ghostty/src/build/**
+!vendor/gpui-libghostty/vendor/ghostty/src/apprt/gtk/build/
+!vendor/gpui-libghostty/vendor/ghostty/src/apprt/gtk/build/**
 *.egg-info/
 *.egg
 .eggs/
