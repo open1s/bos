@@ -50,6 +50,8 @@ pub(crate) struct Contributed {
     pub(crate) prompts: Vec<super::runtime::declarative::TextContribution>,
     /// Contexts.
     pub(crate) contexts: Vec<super::runtime::declarative::TextContribution>,
+    /// Workspace open for this build, used to scope contexts.
+    pub(crate) workspace: Option<std::path::PathBuf>,
     /// Workflows, recorded only.
     pub(crate) workflows: Vec<super::runtime::declarative::RawContribution>,
     /// Themes, recorded only.
@@ -375,6 +377,28 @@ fn truncate(text: &str, limit: usize) -> String {
 /// a built-in: the load order of two packages must not decide which body the
 /// model calls. Commands and panels share the host plugin namespace, which has
 /// the same collision rule.
+/// Whether a context's workspace globs match the open workspace.
+///
+/// An empty scope is unscoped and always matches; a scoped context with no open
+/// workspace never matches, because there is no path tree to test.
+fn context_matches(
+    context: &super::runtime::declarative::TextContribution,
+    workspace: Option<&std::path::Path>,
+) -> bool {
+    if context.scope.is_empty() {
+        return true;
+    }
+    let Some(workspace) = workspace else {
+        return false;
+    };
+    context.scope.iter().any(|pattern| {
+        let joined = workspace.join(pattern);
+        glob::glob(&joined.to_string_lossy())
+            .ok()
+            .is_some_and(|mut matches| matches.any(|entry| entry.is_ok()))
+    })
+}
+
 pub(crate) fn install(
     agent: &mut agent::Agent,
     registry: &mut agent::plugins::PluginRegistry,
@@ -438,6 +462,9 @@ pub(crate) fn install(
         );
     }
     for context in &contributed.contexts {
+        if !context_matches(context, contributed.workspace.as_deref()) {
+            continue;
+        }
         append_prompt(
             agent,
             &contributed.extension,
@@ -514,6 +541,25 @@ mod tests {
         assert!(window.allow_at(start + PROGRESS_WINDOW + Duration::from_millis(1)));
     }
 
+
+    #[test]
+    fn a_context_scope_matches_workspace_globs() {
+        let scratch = Scratch::new("context-scope");
+        std::fs::create_dir_all(scratch.0.join("src")).expect("src");
+        std::fs::write(scratch.0.join("src/lib.rs"), "fn main() {}").expect("file");
+        let mut context = super::super::runtime::declarative::TextContribution {
+            id: crate::extension::types::ContributionId::parse("scoped").expect("id"),
+            description: "Scoped".to_string(),
+            text: "Text".to_string(),
+            scope: vec!["src/**/*.rs".to_string()],
+        };
+        assert!(context_matches(&context, Some(&scratch.0)));
+        assert!(!context_matches(&context, None));
+        context.scope = vec!["tests/**/*.rs".to_string()];
+        assert!(!context_matches(&context, Some(&scratch.0)));
+        context.scope.clear();
+        assert!(context_matches(&context, None));
+    }
     struct Scratch(PathBuf);
 
     impl Scratch {
@@ -619,6 +665,7 @@ mod tests {
             panels: Vec::new(),
             prompts: Vec::new(),
             contexts: Vec::new(),
+            workspace: None,
             workflows: Vec::new(),
             themes: Vec::new(),
             timeout_ms: 1000,

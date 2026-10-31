@@ -870,6 +870,7 @@ impl ExtensionHost {
                 panels: contributions.panels.clone(),
                 prompts: contributions.prompts.clone(),
                 contexts: contributions.contexts.clone(),
+                workspace: self.config.workspace.clone(),
                 workflows: contributions.workflows.clone(),
                 themes: contributions.themes.clone(),
                 timeout_ms: entry.package.manifest.resources.execution_ms(),

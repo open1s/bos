@@ -30,6 +30,7 @@ parquet = { version = "60.0.0", features = ["arrow"] }
 # plain text however its extension is named; the panel's file table is only half
 # of "the editor supports this type", the compiled grammar is the other half.
 gpui-kit = { version = "=0.8.1", features = ["tree-sitter-languages"] }
+glob = "0.3"
 
 # The WebView backend: a native Wry view (WKWebView on macOS) hosted in the
 # GPUI window, replacing the CDP capture pipeline in the browser pane. Built on

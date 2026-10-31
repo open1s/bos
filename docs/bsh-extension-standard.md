@@ -765,6 +765,19 @@ description: Greet the reader
 Say hello and name the open workspace.
 ~~~
 
+A context file may add a `paths:` frontmatter line: a comma-separated list of
+workspace-relative globs. The host injects the context only when at least one
+glob matches a file in the open workspace; an empty or absent scope is
+unscoped. For example:
+
+~~~markdown
+---
+description: Rust workspace facts
+paths: src/**/*.rs, tests/**/*.rs
+---
+This workspace is a Rust crate.
+~~~
+
 Run:
 
 ~~~text

@@ -490,6 +490,7 @@ impl McpRuntime {
                                 .unwrap_or(uri)
                                 .to_string(),
                             text: text.chars().take(64 * 1024).collect(),
+                            scope: Vec::new(),
                         });
                     }
                 }
@@ -533,6 +534,7 @@ impl McpRuntime {
                                 .unwrap_or(name)
                                 .to_string(),
                             text: text.chars().take(64 * 1024).collect(),
+                            scope: Vec::new(),
                         });
                     }
                 }

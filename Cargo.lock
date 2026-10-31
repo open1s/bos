@@ -1387,6 +1387,7 @@ dependencies = [
  "extism",
  "flate2",
  "futures",
+ "glob",
  "gpui-kit",
  "gpui-libghostty",
  "gpui-pre",

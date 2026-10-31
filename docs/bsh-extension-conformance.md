@@ -68,7 +68,7 @@ Status legend:
 | Model extension | done | descriptors merge into settings.plugin_providers and are selectable |
 | MCP extension | done | runtime/mcp.rs + mcp-echo fixture |
 | Workflow extension | done | runtime/workflow.rs sequential executor with capability union |
-| Context extension | partial | static Markdown only, no scoped provider call |
+| Context extension | done | Markdown contexts with optional `paths:` frontmatter scoped by workspace globs |
 | Prompt extension | done | Markdown appended to system prompt |
 | Command extension | done | registered and inserted from the composer slash palette |
 | Event extension | done | WASM/process subscriptions, workspace/model/agent/tool publishers |
@@ -211,7 +211,7 @@ Status legend:
 | Requirement | Status |
 |---|---|
 | Tool provider | done | JSON and rich ToolContent |
-| Context provider | partial: static Markdown |
+| Context provider | done | static text with workspace-glob scope filtering |
 | Prompt provider | done |
 | Model provider | done | descriptor -> settings.plugin_providers |
 | Agent provider | done | descriptor -> settings.plugin_presets |

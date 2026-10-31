@@ -55,6 +55,8 @@ pub(crate) struct TextContribution {
     pub(crate) description: String,
     /// Body text.
     pub(crate) text: String,
+    /// Workspace-relative globs that scope this context; empty means always.
+    pub(crate) scope: Vec<String>,
 }
 
 /// A declarative panel.
@@ -275,7 +277,7 @@ pub(crate) fn load_contributions(
     for id in &manifest.contributes.commands {
         let path = contribution_path(root, "commands", id)?;
         let text = read_text(&path)?;
-        let (description, template) = parse_markdown(&text, id);
+        let (description, template, _) = parse_markdown(&text, id);
         contributions.commands.push(CommandContribution {
             id: id.clone(),
             description,
@@ -394,12 +396,13 @@ fn text_contribution(
     path: &Path,
 ) -> Result<TextContribution, ExtensionError> {
     let text = read_text(path)?;
-    let (description, body) = parse_markdown(&text, id);
+    let (description, body, scope) = parse_markdown(&text, id);
     let _ = root;
     Ok(TextContribution {
         id: id.clone(),
         description,
         text: body,
+        scope,
     })
 }
 
@@ -408,9 +411,10 @@ fn text_contribution(
 /// Only the two keys this standard defines are read: description and name.
 /// Unknown keys are ignored so a shared frontmatter vocabulary does not make a
 /// package unreadable.
-fn parse_markdown(text: &str, id: &ContributionId) -> (String, String) {
+fn parse_markdown(text: &str, id: &ContributionId) -> (String, String, Vec<String>) {
     let trimmed = text.trim_start_matches('\u{feff}');
     let mut description = None;
+    let mut scope = Vec::new();
     let mut body = trimmed;
     if let Some(rest) = trimmed.strip_prefix("---") {
         let rest = rest
@@ -426,6 +430,15 @@ fn parse_markdown(text: &str, id: &ContributionId) -> (String, String) {
                     if description.is_none() {
                         description = Some(value.trim().trim_matches('"').to_string());
                     }
+                } else if let Some(value) = line.strip_prefix("paths:") {
+                    scope = value
+                        .trim()
+                        .trim_matches('"')
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|path| !path.is_empty())
+                        .map(str::to_string)
+                        .collect();
                 }
             }
             let after = &rest[end + 4..];
@@ -439,7 +452,7 @@ fn parse_markdown(text: &str, id: &ContributionId) -> (String, String) {
     let description = description
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| first_line_summary(&body, id));
-    (description, body)
+    (description, body, scope)
 }
 
 fn first_line_summary(body: &str, id: &ContributionId) -> String {
@@ -634,14 +647,16 @@ max_output_bytes = 4096
     #[test]
     fn frontmatter_is_read_and_unknown_keys_are_ignored() {
         let id = ContributionId::parse("refresh").expect("id");
-        let (description, body) = parse_markdown(
-            "---\ndescription: Refresh\nowner: someone\n---\nBody\n",
+        let (description, body, scope) = parse_markdown(
+            "---\ndescription: Refresh\nowner: someone\npaths: src/**/*.rs, tests\n---\nBody\n",
             &id,
         );
         assert_eq!(description, "Refresh");
         assert_eq!(body, "Body");
-        let (description, body) = parse_markdown("# Title\n\nBody", &id);
+        assert_eq!(scope, vec!["src/**/*.rs", "tests"]);
+        let (description, body, scope) = parse_markdown("# Title\n\nBody", &id);
         assert_eq!(description, "Title");
         assert_eq!(body, "# Title\n\nBody");
+        assert!(scope.is_empty());
     }
 }
