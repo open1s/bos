@@ -47,13 +47,13 @@ Status legend:
 | Runtime-independent contracts | done | no GPUI/Wasmtime types in manifest, policy or UI schema |
 | Capability declaration is a request | done | policy.rs |
 | Least privilege and scopes | done | path/domain/secret scopes |
-| Agent-native contributions | partial | tools/prompts/contexts/workflows; model/agent providers are discoverable descriptors, not executable adapters |
+| Agent-native contributions | done | tools/prompts/contexts/workflows; model/agent/preset descriptors are selectable |
 | UI-hosted | done at contract level; renderer pending | no GPUI object crosses the boundary |
-| Command/event/stream distinction | partial | RPC and events; run_streaming yields bounded chunks after completion, not live progress |
+| Command/event/stream distinction | done | RPC, events and live process/MCP/WASM progress through run_streaming |
 | Versioned contracts | done | manifest 1.0, API 1.0, UI 1.0, WIT package 1.0 |
 | Fault containment | partial | timeout/lazy runtime/cancel token; retry backoff missing |
 | Observable by default | partial | status/audit/doctor + host call/event metrics; memory/fuel/task gauges partial |
-| Reproducible installation | partial | lockfile, sources, upgrade/rollback; lockfile reproduction command missing |
+| Reproducible installation | done | lockfile, sources, upgrade/rollback, reproduce from remote or recorded local path |
 | Data survives code upgrades | done | data root separated; migrations executed on version change |
 
 ## 3. Taxonomy
@@ -62,7 +62,7 @@ Status legend:
 
 | Contribution | Status | Gap |
 |---|---|---|
-| UI extension (panel) | partial | registration and validation; renderer missing |
+| UI extension (panel) | done | declarative renderer, actions, themes, settings host |
 | Tool extension | done | |
 | Agent extension | done | agent descriptor maps to a selectable Preset (plugins, permission, level) |
 | Model extension | done | descriptors merge into settings.plugin_providers and are selectable |
@@ -71,10 +71,10 @@ Status legend:
 | Context extension | partial | static Markdown only, no scoped provider call |
 | Prompt extension | done | Markdown appended to system prompt |
 | Command extension | done | registered and inserted from the composer slash palette |
-| Event extension | partial | WASM subscribe/on-event + workspace/model publishers; process subscriptions missing |
+| Event extension | done | WASM/process subscriptions, workspace/model/agent/tool publishers |
 | Theme extension | done | panel theme plus an app-wide palette override selected in Settings |
 | Language extension | missing | no language contribution kind |
-| Storage extension | partial | namespace API exists; no guest host-function binding |
+| Storage extension | done | namespace API + WASM/WIT and Extism bsh_host bindings |
 | Integration extension | missing | no GitHub/browser/terminal adapter contribution |
 
 ### 3.2 Execution runtimes
@@ -93,7 +93,7 @@ Status legend:
 | Boundary | Status | Gap |
 |---|---|---|
 | GPUI host owns App/Window/Entity | done | extension module imports no GPUI |
-| Agent runtime owns tool discovery/invocation/cancel | partial | discovery/invocation/cancel token; runtime child kill on cancel not complete |
+| Agent runtime owns tool discovery/invocation/cancel | done | discovery/invocation/cancel token + runtime stop/trap |
 | Extension manager discovers, validates, resolves, dispatches, tracks health | done | host.rs |
 | Capability manager evaluates, scopes, audits, revokes | done | capability.rs |
 | Runtime dispatcher routes lifecycle/RPC/command/event | done | command/panel/pump delegated through LazyRuntime |
@@ -128,7 +128,7 @@ Status legend:
 | Layer | Status |
 |---|---|
 | Core API: lifecycle, metadata, context, errors, logging, cancellation | done |
-| Domain API: agent, tools, workflow, events, storage | partial: workflows/tools/storage/events; model/agent adapters descriptors only |
+| Domain API: agent, tools, workflow, events, storage | done: workflows/tools/storage/events and selectable model/agent/preset providers |
 | UI API: panels, commands, declarative views | done | renderer + commands + actions + composer palette |
 
 ### 6.1 API modules
@@ -139,12 +139,12 @@ Status legend:
 | core/cancellation | done | AsyncTool token -> Runtime::cancel |
 | capabilities/filesystem | done | WASM read_file/write_file host functions with policy |
 | capabilities/network | done | WASM fetch host function with policy |
-| capabilities/process | partial | policy + spawn + rlimits; no filesystem sandbox profile |
+| capabilities/process | partial | policy + spawn + rlimits + macOS write profile; Linux namespace absent |
 | capabilities/storage | done | WASM storage_get/set/list |
 | capabilities/secrets | done | WASM read_secret |
 | agent/tool, prompt, context_provider | tool/prompt done, context static |
-| agent/agent_provider | partial | descriptor discovery |
-| agent/model_provider | partial | descriptor discovery |
+| agent/agent_provider | done | descriptor -> selectable preset |
+| agent/model_provider | done | descriptor -> settings.plugin_providers |
 | workflow/trigger, action, execution | done | sequential workflow executor; no triggers |
 | events/publisher, subscriber | done | publisher + WASM and process subscribers |
 | ui/panel, view, command, notification, theme | done | panels/views/commands/notifications + panel and app-wide theme |
@@ -221,15 +221,15 @@ Status legend:
 | Streaming output, progress, cancellation | done | process $/progress, MCP notifications/progress, WASM host progress; cancel token |
 | Timeouts, error categories, correlation ids | done |
 | MCP tool/resource/prompt mapping | done | mcp-echo test |
-| MCP lifecycle/reconnect/timeout/cancel | partial | start/timeout/close; reconnect on next call only |
+| MCP lifecycle/reconnect/timeout/cancel | done | lazy start, timeout, close, fresh session on next call |
 
 ## 11. Events
 
 | Requirement | Status |
 |---|---|
 | Envelope | done |
-| All listed topics | partial | workspace.changed/model.* published; agent turn topics not yet published by shell |
-| Topic allowlists and subscription filters | partial | filters + WASM publishes allowlist; process publisher not checked |
+| All listed topics | done | workspace, model, agent turn and tool topics published |
+| Topic allowlists and subscription filters | done | filters + WASM/Extism publishes allowlist; process children receive events only |
 | Schema versioning, correlation ids | done |
 | Bounded queues/backpressure | done |
 | Payload and rate limits | done | 256 KiB payload + 200 events/second per publisher |
@@ -326,7 +326,7 @@ is deliberate and does not remove a feature.
 |---|---|
 | Phase 1 core | done |
 | Phase 2 WASM + Extism | done |
-| Phase 3 agent, event, MCP, process | partial | MCP/events/process/tools done; live streaming/progress partial |
+| Phase 3 agent, event, MCP, process | done | MCP/events/process/tools and live progress |
 | Phase 4 GPUI UI | partial | renderer/panels/actions/themes done; keyboard focus routing partial |
 | Phase 5 ecosystem | done | registry/upgrade/rollback/signatures/builder/Extism/lock reproduction |
 

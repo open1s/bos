@@ -2548,13 +2548,18 @@ impl Shell {
         let model = self.state.effective().model_name;
         match self.submit(text, attachments, cx) {
             Submit::Accepted => {
+                let session_id = self.state.active_session();
                 crate::extension::publish(
                     crate::extension::topics::MODEL_REQUESTED,
                     serde_json::json!({
                         "model": model,
-                        "session": self.state.active_session(),
+                        "session": session_id,
                         "bytes": bytes,
                     }),
+                );
+                crate::extension::publish(
+                    crate::extension::topics::AGENT_STARTED,
+                    serde_json::json!({ "session": session_id }),
                 );
                 self.clear_composer(window, cx);
             }
@@ -3725,6 +3730,14 @@ impl Shell {
                                 "session": session_id,
                                 "failed": failed,
                             }),
+                        );
+                        crate::extension::publish(
+                            if failed {
+                                crate::extension::topics::AGENT_FAILED
+                            } else {
+                                crate::extension::topics::AGENT_COMPLETED
+                            },
+                            serde_json::json!({ "session": session_id }),
                         );
                         shell.state.finish_plan(&session_id);
                         // A goal the model settled during the turn takes
