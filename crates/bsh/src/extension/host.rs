@@ -250,6 +250,8 @@ pub(crate) struct HostMetrics {
     pub(crate) startup_millis: u64,
     /// Fuel consumed by the latest WASM call across runtimes.
     pub(crate) fuel_used: u64,
+    /// Sum of the memory ceilings the loaded runtimes declared.
+    pub(crate) memory_limit_bytes: u64,
     /// Current load failures.
     pub(crate) failures: Vec<String>,
     /// The last recorded load failures, retained across host opens.
@@ -1094,6 +1096,12 @@ impl ExtensionHost {
                 .filter_map(|entry| entry.runtime.as_ref())
                 .filter_map(|runtime| runtime.fuel_used())
                 .sum(),
+            memory_limit_bytes: self
+                .loaded
+                .values()
+                .filter_map(|entry| entry.runtime.as_ref())
+                .filter_map(|runtime| runtime.memory_limit())
+                .sum(),
             failures: self
                 .loaded
                 .values()
@@ -1773,6 +1781,10 @@ tools = ["echo"]
         assert!(host
             .theme_surfaces()
             .contains_key("ext.com.example.extism-echo.midnight"));
+        assert!(
+            host.metrics().memory_limit_bytes > 0,
+            "the loaded runtimes report their memory ceilings"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

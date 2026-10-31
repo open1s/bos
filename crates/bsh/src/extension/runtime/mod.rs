@@ -253,6 +253,11 @@ pub(crate) trait Runtime: Send + Sync {
         None
     }
 
+    /// The memory ceiling the manifest requested, in bytes.
+    fn memory_limit(&self) -> Option<u64> {
+        None
+    }
+
     /// Prepare the runtime. A process runtime may defer the first spawn; a
     /// wasm runtime may compile here.
     async fn activate(&self) -> Result<(), ExtensionError> {
@@ -525,6 +530,10 @@ impl Runtime for LazyRuntime {
 
     fn fuel_used(&self) -> Option<u64> {
         self.inner.fuel_used()
+    }
+
+    fn memory_limit(&self) -> Option<u64> {
+        self.inner.memory_limit()
     }
 
     async fn activate(&self) -> Result<(), ExtensionError> {

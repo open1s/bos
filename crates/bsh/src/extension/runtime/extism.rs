@@ -547,6 +547,10 @@ impl Runtime for ExtismRuntime {
         RuntimeKind::Extism
     }
 
+    fn memory_limit(&self) -> Option<u64> {
+        Some(self.memory_mb.saturating_mul(1024 * 1024))
+    }
+
     async fn activate(&self) -> Result<(), ExtensionError> {
         self.ensure_plugin()
     }

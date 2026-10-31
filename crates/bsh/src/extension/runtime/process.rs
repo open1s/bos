@@ -766,6 +766,10 @@ impl Runtime for ProcessRuntime {
         RuntimeKind::Process
     }
 
+    fn memory_limit(&self) -> Option<u64> {
+        Some(self.memory_bytes)
+    }
+
     async fn activate(&self) -> Result<(), ExtensionError> {
         // The descriptors are the contract; the process starts on the first
         // call so an enabled package costs no memory until it is used.

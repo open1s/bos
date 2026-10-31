@@ -678,6 +678,10 @@ impl Runtime for WasmRuntime {
         Some(self.fuel_used.load(Ordering::Relaxed))
     }
 
+    fn memory_limit(&self) -> Option<u64> {
+        Some(self.resources.memory_mb().saturating_mul(1024 * 1024))
+    }
+
     async fn activate(&self) -> Result<(), ExtensionError> {
         self.ensure_instance()?;
         let mut guard = self.instance.lock().map_err(|_| ExtensionError::Corrupt {
