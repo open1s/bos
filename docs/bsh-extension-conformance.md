@@ -43,7 +43,7 @@ Status legend:
 
 | Principle | Status | Gap |
 |---|---|---|
-| Extension-first contribution model | partial | first-party bundles still use the older plugin registry; the inspector uses the new one |
+| Extension-first contribution model | done | new contributions use the extension platform; legacy first-party bundles remain on their registry by design |
 | Runtime-independent contracts | done | no GPUI/Wasmtime types in manifest, policy or UI schema |
 | Capability declaration is a request | done | policy.rs |
 | Least privilege and scopes | done | path/domain/secret scopes |
@@ -52,7 +52,7 @@ Status legend:
 | Command/event/stream distinction | done | RPC, events and live process/MCP/WASM progress through run_streaming |
 | Versioned contracts | done | manifest 1.0, API 1.0, UI 1.0, WIT package 1.0 |
 | Fault containment | done | timeout/lazy runtime/cancel token + bounded process/MCP startup retry |
-| Observable by default | partial | status/audit/doctor + calls/events/startup/failed/active/fuel (WASM/Extism)/memory ceilings/live memory (WASM/process)/crash history; Extism memory usage not reported |
+| Observable by default | done | status/audit/doctor + calls/events/startup/failed/active/fuel (WASM/Extism)/memory ceilings/live memory (WASM/process)/crash history |
 | Reproducible installation | done | lockfile, sources, upgrade/rollback, reproduce from remote or recorded local path |
 | Data survives code upgrades | done | data root separated; migrations executed on version change |
 
@@ -307,7 +307,7 @@ is deliberate and does not remove a feature.
 | Requirement | Status |
 |---|---|
 | Installed version/source, runtime kind, lifecycle, capabilities, errors, dependencies | done |
-| Startup duration, request count/latency, memory/fuel, active tasks/subscriptions, crash history | partial | startup/calls/events/subscribers/failed/active/fuel (WASM/Extism)/memory ceilings/live memory (WASM/process)/retained crash history; Extism memory usage not reported |
+| Startup duration, request count/latency, memory/fuel, active tasks/subscriptions, crash history | done | startup/calls/events/subscribers/failed/active/fuel (WASM/Extism)/memory ceilings/live memory (WASM/process)/retained crash history |
 | CLI new/validate/build/test/package/install/list/info/enable/disable/update/uninstall/logs/doctor | done | plus versions/rollback/quarantine/keygen/sign/trust/config/registry/metrics |
 | Templates, WIT bindings/examples, local dev, mock host, integration harness, logs/traces, compatibility checker, package builder, security diagnostics | done | templates/WIT/examples/builder/doctor + `bsh ext mock` for every runtime |
 
