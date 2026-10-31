@@ -139,7 +139,7 @@ Status legend:
 | core/cancellation | done | AsyncTool token -> Runtime::cancel |
 | capabilities/filesystem | done | WASM read_file/write_file host functions with policy |
 | capabilities/network | done | WASM fetch host function with policy |
-| capabilities/process | partial | policy + spawn + rlimits + macOS write profile; Linux namespace absent |
+| capabilities/process | partial | policy + spawn + rlimits + macOS profile + Linux bwrap plan; Windows limits and memory-cap stress absent |
 | capabilities/storage | done | WASM storage_get/set/list |
 | capabilities/secrets | done | WASM read_secret |
 | agent/tool, prompt, context_provider | tool/prompt done, context static |
