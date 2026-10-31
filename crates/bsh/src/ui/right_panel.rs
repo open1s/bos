@@ -335,6 +335,8 @@ pub(crate) enum RightTab {
     Diff,
     /// The builtin browser. Not built yet; see [`RightTab::Terminal`].
     Browser,
+    /// Extension-contributed declarative panels.
+    Extensions,
 }
 
 impl RightTab {
@@ -345,6 +347,7 @@ impl RightTab {
             RightTab::Terminal => "right.tab.terminal",
             RightTab::Diff => "right.tab.diff",
             RightTab::Browser => "right.tab.browser",
+            RightTab::Extensions => "right.tab.extensions",
         }
     }
 
@@ -355,6 +358,7 @@ impl RightTab {
             RightTab::Terminal => IconName::SquareTerminal,
             RightTab::Diff => IconName::GitCompareArrows,
             RightTab::Browser => IconName::Globe,
+            RightTab::Extensions => IconName::Puzzle,
         }
     }
 
@@ -367,15 +371,17 @@ impl RightTab {
             RightTab::Terminal => "terminal",
             RightTab::Diff => "diff",
             RightTab::Browser => "browser",
+            RightTab::Extensions => "extensions",
         }
     }
 
     /// Every pane the Start screen offers, in the order it lists them.
-    const ALL: [RightTab; 4] = [
+    const ALL: [RightTab; 5] = [
         RightTab::Files,
         RightTab::Diff,
         RightTab::Terminal,
         RightTab::Browser,
+        RightTab::Extensions,
     ];
 }
 
@@ -1016,6 +1022,19 @@ impl Shell {
             Some(RightTab::Terminal) => body.child(self.terminal_pane(cx)),
             Some(RightTab::Diff) => body.child(self.diff_pane(cx)),
             Some(RightTab::Browser) => body.child(self.browser_pane(cx)),
+            Some(RightTab::Extensions) => body.child(match &self.extension_panels {
+                Some(view) => view.clone().into_any_element(),
+                None => div()
+                    .debug_selector(|| "right-extensions-empty".to_string())
+                    .flex_1()
+                    .px(px(theme::RIGHT_PAD * 2.0))
+                    .child(txt(
+                        self.state.lang.tr("right.extensions.empty"),
+                        theme::CHIP_SIZE,
+                        theme::faint(),
+                    ))
+                    .into_any_element(),
+            }),
         }
     }
 
@@ -2000,6 +2019,7 @@ impl Shell {
             RightTab::Diff => None,
             RightTab::Terminal => Some("\u{2325}`"),
             RightTab::Browser => Some("\u{2318}T"),
+            RightTab::Extensions => None,
         };
         div()
             .id(SharedString::from(format!("right-card-{}", tab.key())))
@@ -2050,6 +2070,7 @@ impl Shell {
                                 RightTab::Diff => "right.diff.hint",
                                 RightTab::Terminal => "right.terminal.hint",
                                 RightTab::Browser => "right.browser.hint",
+                                RightTab::Extensions => "right.extensions.hint",
                             }),
                             theme::RIGHT_HINT_SIZE,
                             theme::faint(),

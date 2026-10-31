@@ -19696,6 +19696,27 @@ fn the_header_opens_the_right_panel_on_its_start_screen(cx: &mut TestAppContext)
     }
 }
 
+#[gpui::test]
+fn the_right_panel_offers_an_extensions_pane(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("right-extensions");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    shell.update(cx, |this, cx| {
+        this.right.open = true;
+        this.right.tab = Some(crate::ui::right_panel::RightTab::Extensions);
+        cx.notify();
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("right-extensions-empty").is_some(),
+        "the Extensions tab opens its own pane"
+    );
+}
 /// The Files card opens the browser, directories lead, and a file opens in the
 /// editor with the save control beside it.
 #[gpui::test]

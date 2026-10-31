@@ -682,7 +682,13 @@ fn summarize(value: &Value) -> String {
 impl Render for ExtensionPanelView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_loaded(cx);
-        let mut root = div().flex().flex_col().gap(px(12.0)).w_full().h_full();
+        let mut root = div()
+            .debug_selector(|| "extension-panel-view".to_string())
+            .flex()
+            .flex_col()
+            .gap(px(12.0))
+            .w_full()
+            .h_full();
         if self.panels.is_empty() {
             return root.child(txt(
                 "No extension panels are installed.",
