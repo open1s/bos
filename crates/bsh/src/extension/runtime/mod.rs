@@ -248,6 +248,11 @@ pub(crate) trait Runtime: Send + Sync {
     /// The runtime kind.
     fn kind(&self) -> RuntimeKind;
 
+    /// Fuel consumed by the most recent WASM call, when the runtime meters it.
+    fn fuel_used(&self) -> Option<u64> {
+        None
+    }
+
     /// Prepare the runtime. A process runtime may defer the first spawn; a
     /// wasm runtime may compile here.
     async fn activate(&self) -> Result<(), ExtensionError> {
@@ -516,6 +521,10 @@ impl LazyRuntime {
 impl Runtime for LazyRuntime {
     fn kind(&self) -> RuntimeKind {
         self.inner.kind()
+    }
+
+    fn fuel_used(&self) -> Option<u64> {
+        self.inner.fuel_used()
     }
 
     async fn activate(&self) -> Result<(), ExtensionError> {

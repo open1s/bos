@@ -12,7 +12,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -435,6 +435,8 @@ pub(crate) struct WasmRuntime {
     trust: TrustLevel,
     cancelled: Arc<AtomicBool>,
     instance: Mutex<Option<Instance>>,
+    fuel_budget: AtomicU64,
+    fuel_used: AtomicU64,
 }
 
 impl WasmRuntime {
@@ -486,6 +488,8 @@ impl WasmRuntime {
             resources: manifest.resources.clone(),
             trust,
             cancelled: Arc::new(AtomicBool::new(false)),
+            fuel_budget: AtomicU64::new(0),
+            fuel_used: AtomicU64::new(0),
             instance: Mutex::new(None),
         })
     }
@@ -564,14 +568,24 @@ impl WasmRuntime {
     fn prepare_call(&self, instance: &mut Instance, timeout_ms: u64) -> Result<(), ExtensionError> {
         let ticks = timeout_ms.max(1).div_ceil(EPOCH_TICK_MS);
         instance.store.set_epoch_deadline(ticks);
+        let fuel = timeout_ms.saturating_mul(10_000);
+        self.fuel_budget.store(fuel, Ordering::Relaxed);
+        self.fuel_used.store(0, Ordering::Relaxed);
         instance
             .store
-            .set_fuel(timeout_ms.saturating_mul(10_000))
+            .set_fuel(fuel)
             .map_err(|error| ExtensionError::Runtime {
                 extension: self.extension.to_string(),
                 message: error.to_string(),
             })?;
         Ok(())
+    }
+
+    fn record_fuel(&self, store: &Store<HostState>) {
+        let budget = self.fuel_budget.load(Ordering::Relaxed);
+        let remaining = store.get_fuel().unwrap_or(0);
+        self.fuel_used
+            .store(budget.saturating_sub(remaining), Ordering::Relaxed);
     }
 
     fn deliver_events(&self, instance: &mut Instance) -> Result<(), ExtensionError> {
@@ -658,6 +672,10 @@ impl WasmRuntime {
 impl Runtime for WasmRuntime {
     fn kind(&self) -> RuntimeKind {
         RuntimeKind::WasmComponent
+    }
+
+    fn fuel_used(&self) -> Option<u64> {
+        Some(self.fuel_used.load(Ordering::Relaxed))
     }
 
     async fn activate(&self) -> Result<(), ExtensionError> {
@@ -765,6 +783,7 @@ impl Runtime for WasmRuntime {
                 extension: self.extension.to_string(),
                 message: error.to_string(),
             })?;
+        self.record_fuel(&instance.store);
         let result = result.map_err(|error| host_failure(&self.extension, error))?;
         self.deliver_events(instance)?;
         if result.is_error {
@@ -817,6 +836,7 @@ impl Runtime for WasmRuntime {
                 extension: self.extension.to_string(),
                 message: error.to_string(),
             })?;
+        self.record_fuel(&instance.store);
         let text = text.map_err(|error| host_failure(&self.extension, error))?;
         self.deliver_events(instance)?;
         Ok(serde_json::from_str(&text).unwrap_or(Value::String(text)))
@@ -837,6 +857,7 @@ impl Runtime for WasmRuntime {
                 extension: self.extension.to_string(),
                 message: error.to_string(),
             })?;
+        self.record_fuel(&instance.store);
         let text = text.map_err(|error| host_failure(&self.extension, error))?;
         self.deliver_events(instance)?;
         serde_json::from_str(&text).map_err(|error| ExtensionError::Runtime {
@@ -927,6 +948,7 @@ mod tests {
         assert_eq!(command, serde_json::json!("command"));
         let panel = runtime.panel("status").await.expect("panel");
         assert_eq!(panel["schema_version"], "1.0");
+        assert!(runtime.fuel_used().unwrap_or(0) > 0);
         runtime.shutdown().await.expect("shutdown");
         let _ = std::fs::remove_dir_all(&scratch);
     }

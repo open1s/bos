@@ -248,6 +248,10 @@ pub(crate) struct HostMetrics {
     pub(crate) active_tasks: usize,
     /// Host open-to-ready duration in milliseconds.
     pub(crate) startup_millis: u64,
+    /// Fuel consumed by the latest WASM call across runtimes.
+    pub(crate) fuel_used: u64,
+    /// Current load failures, retained as a short crash history.
+    pub(crate) failures: Vec<String>,
 }
 
 /// One diagnostic line.
@@ -1078,6 +1082,22 @@ impl ExtensionHost {
                 .count(),
             active_tasks: self.loaded.values().filter(|entry| entry.applied).count(),
             startup_millis: self.startup_millis,
+            fuel_used: self
+                .loaded
+                .values()
+                .filter_map(|entry| entry.runtime.as_ref())
+                .filter_map(|runtime| runtime.fuel_used())
+                .sum(),
+            failures: self
+                .loaded
+                .values()
+                .filter_map(|entry| {
+                    entry
+                        .error
+                        .as_ref()
+                        .map(|error| format!("{}: {error}", entry.package.id().as_str()))
+                })
+                .collect(),
         }
     }
 
