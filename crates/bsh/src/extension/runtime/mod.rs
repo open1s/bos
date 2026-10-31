@@ -263,6 +263,11 @@ pub(crate) trait Runtime: Send + Sync {
         self.deactivate().await
     }
 
+    /// Stop outstanding work, keeping the runtime loadable.
+    async fn cancel(&self) -> Result<(), ExtensionError> {
+        self.deactivate().await
+    }
+
     /// The tools this runtime offers.
     async fn tools(&self) -> Result<Vec<ToolDescriptor>, ExtensionError>;
 
@@ -507,6 +512,10 @@ impl Runtime for LazyRuntime {
 
     async fn shutdown(&self) -> Result<(), ExtensionError> {
         self.inner.shutdown().await
+    }
+
+    async fn cancel(&self) -> Result<(), ExtensionError> {
+        self.inner.cancel().await
     }
 
     async fn tools(&self) -> Result<Vec<ToolDescriptor>, ExtensionError> {

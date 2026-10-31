@@ -516,7 +516,7 @@ impl Shell {
             Trigger::Command => {
                 let entries = entries(self.state.any_streaming());
                 let query = slash_query(&self.composer_value).unwrap_or("");
-                filter_indices(&entries, query, self.state.lang)
+                let mut rows: Vec<CardRow> = filter_indices(&entries, query, self.state.lang)
                     .into_iter()
                     .map(|index| CardRow {
                         id: entries[index].id.to_string(),
@@ -524,7 +524,23 @@ impl Shell {
                         detail: self.state.lang.tr(entries[index].detail).to_string(),
                         action: CardAction::Run(entries[index].run),
                     })
-                    .collect()
+                    .collect();
+                let needle = query.trim().to_lowercase();
+                for command in &self.extension_commands {
+                    if !needle.is_empty()
+                        && !command.name.to_lowercase().contains(&needle)
+                        && !command.description.to_lowercase().contains(&needle)
+                    {
+                        continue;
+                    }
+                    rows.push(CardRow {
+                        id: format!("ext-command-{}", command.name),
+                        label: command.name.clone(),
+                        detail: command.description.clone(),
+                        action: CardAction::Insert(command.template.clone()),
+                    });
+                }
+                rows
             }
             Trigger::Reference => {
                 let query = at_query(&self.composer_value).unwrap_or("");

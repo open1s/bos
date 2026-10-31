@@ -1529,12 +1529,12 @@ registry install, versions/rollback and config.
 **Deliberate limits, stated rather than hidden:** run_streaming chunks a
 completed result rather than live progress; model and agent providers are
 discoverable descriptors, not executable adapters; theme contributions are
-recorded but not applied; the composer palette does not yet list extension
-commands; process event subscriptions and lockfile reproduction are open; the
-process child has RLIMIT limits but no filesystem sandbox profile; cancellation
-stops the tool future but does not always kill the guest at the same instant. The
-legacy Codex/DSH shim in `crates/agent/src/extensions` still backs the old
-inventory pane; it is not used by this platform.
+applied to their extension's panels but not app-wide; lockfile reproduction covers
+Git/registry remotes but not an Installed-only lock; the process child has RLIMIT limits but no filesystem
+sandbox profile; cancellation stops the tool future but does not always kill the
+guest at the same instant. The legacy Codex/DSH shim in
+`crates/agent/src/extensions` still backs the old inventory pane; it is not used
+by this platform.
 
 ---
 

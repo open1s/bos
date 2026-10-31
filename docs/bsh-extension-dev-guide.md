@@ -374,3 +374,31 @@ Registries are HTTP JSON indexes:
 `bsh ext registry add official https://example/index.json`, then
 `bsh ext search` and `bsh ext install --registry official com.example.x@1.0.0`.
 Git sources use `git+https://github.com/owner/repo#revision`.
+
+## Panel themes
+
+A package may ship `themes/<id>.json`:
+
+~~~json
+{
+  "name": "Midnight",
+  "colors": {
+    "page": "#0b0d10",
+    "text": "#e6e8eb",
+    "accent": "#4176e6"
+  }
+}
+~~~
+
+The first declared theme applies to that extension's panels. Known tokens are
+page, text, muted, faint, border, border-soft, accent, error, success, warn,
+new-session-fill and hover; unknown tokens are ignored and missing tokens fall
+back to the host palette. A theme does not re-theme the whole shell.
+
+## Extension commands in the composer
+
+`contributes.commands` entries are listed in the composer's `/` card after the
+built-in rows. Choosing one replaces the slash token with the command's Markdown
+template, which is the same path a hand-typed prompt takes. The row also appears
+when the `+` control is open, filtered by the same substring test.
+

@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -19,6 +20,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
 use super::{load_tool_descriptors, CallContext, Runtime, ToolDescriptor};
+use crate::extension::events::{EventBus, EventFilter, ExtensionEvent, Subscription};
 use crate::extension::manifest::{is_allowlisted_command, validate_relative_path, Manifest};
 use crate::extension::types::{ExtensionError, ExtensionId, RuntimeKind, HOST_VERSION};
 
@@ -129,6 +131,45 @@ impl ProcessSession {
                 millis: timeout_ms,
             }),
         }
+    }
+
+    async fn notify(
+        &mut self,
+        method: &str,
+        params: Value,
+        extension: &ExtensionId,
+    ) -> Result<(), ExtensionError> {
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        });
+        let mut line =
+            serde_json::to_vec(&notification).map_err(|error| ExtensionError::Protocol {
+                extension: extension.to_string(),
+                message: error.to_string(),
+            })?;
+        if line.len() > MAX_LINE_BYTES {
+            return Err(ExtensionError::Limit {
+                extension: extension.to_string(),
+                message: "event notification exceeds the line ceiling".to_string(),
+            });
+        }
+        line.push(b'\n');
+        self.stdin
+            .write_all(&line)
+            .await
+            .map_err(|source| ExtensionError::Io {
+                path: PathBuf::from("<process stdin>"),
+                source,
+            })?;
+        self.stdin
+            .flush()
+            .await
+            .map_err(|source| ExtensionError::Io {
+                path: PathBuf::from("<process stdin>"),
+                source,
+            })
     }
 }
 
@@ -259,6 +300,7 @@ pub(crate) struct ProcessRuntime {
     cpu_seconds: u64,
     config: String,
     session: Mutex<Option<ProcessSession>>,
+    subscriptions: std::sync::Mutex<Vec<Subscription>>,
 }
 
 impl ProcessRuntime {
@@ -299,6 +341,7 @@ impl ProcessRuntime {
             cpu_seconds: (manifest.resources.execution_ms() / 1000).max(1) + 2,
             config: "{}".to_string(),
             session: Mutex::new(None),
+            subscriptions: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -310,6 +353,20 @@ impl ProcessRuntime {
     /// Attach the effective configuration sent in the initialize handshake.
     pub(crate) fn with_config(mut self, config: String) -> Self {
         self.config = config;
+        self
+    }
+
+    /// Subscribe the process to the topics the manifest declares.
+    pub(crate) fn with_events(self, events: Arc<EventBus>, topics: &[String]) -> Self {
+        let mut subscriptions = Vec::new();
+        for topic in topics {
+            if let Ok(filter) = EventFilter::from_topics(std::slice::from_ref(topic)) {
+                subscriptions.push(events.subscribe(filter, 64));
+            }
+        }
+        if let Ok(mut slot) = self.subscriptions.lock() {
+            *slot = subscriptions;
+        }
         self
     }
 
@@ -537,6 +594,29 @@ impl Runtime for ProcessRuntime {
             }
         }
     }
+
+    async fn pump(&self) -> Result<(), ExtensionError> {
+        let events: Vec<ExtensionEvent> = match self.subscriptions.lock() {
+            Ok(subscriptions) => subscriptions
+                .iter()
+                .filter_map(Subscription::try_recv)
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        if events.is_empty() {
+            return Ok(());
+        }
+        let mut guard = self.session.lock().await;
+        let Some(session) = guard.as_mut() else {
+            return Ok(());
+        };
+        for event in events {
+            session
+                .notify("events/event", json!({ "event": event }), &self.extension)
+                .await?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -625,6 +705,76 @@ max_execution_ms = 2000
         assert!(read_limited_line(&mut short, 8, &id).await.is_err());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_declared_event_is_forwarded_to_the_process() {
+        let scratch = Scratch::new("events");
+        std::fs::write(
+            scratch.0.join("tools/echo.json"),
+            r#"{"description":"Echo","input_schema":{"type":"object"}}"#,
+        )
+        .expect("tool");
+        std::fs::write(
+            scratch.0.join("server.sh"),
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"initialize"'*) echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"1.0"}}' ;;
+    *'tools/call'*) echo '{"jsonrpc":"2.0","id":2,"result":{"ok":true}}' ;;
+    *'events/event'*) echo "$line" >> events.log ;;
+  esac
+done
+"#,
+        )
+        .expect("server");
+        let manifest = Manifest::parse(
+            r#"
+schema_version = "1.0"
+
+[extension]
+id = "com.example.events"
+name = "Events"
+version = "1.0.0"
+description = "A process event subscriber"
+
+[compatibility]
+bsh = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+
+[runtime]
+kind = "process"
+entry = "sh"
+args = ["server.sh"]
+
+[capabilities]
+required = ["process.execute"]
+
+[contributes]
+tools = ["echo"]
+events = ["workspace.changed"]
+"#,
+            Path::new("extension.toml"),
+        )
+        .expect("manifest");
+        let bus = EventBus::new();
+        let runtime = ProcessRuntime::new(&manifest, &scratch.0)
+            .expect("runtime")
+            .with_events(Arc::clone(&bus), &manifest.contributes.events);
+        runtime.activate().await.expect("activate");
+        let context = CallContext::new(manifest.id().clone(), "events", None, 2000);
+        runtime
+            .call_tool("echo", json!({}), &context)
+            .await
+            .expect("first call starts the process");
+        let event = ExtensionEvent::new("bsh", "workspace.changed", json!({"root": "/tmp"}))
+            .expect("event");
+        bus.publish(&event).expect("publish");
+        runtime.pump().await.expect("pump");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let logged = std::fs::read_to_string(scratch.0.join("events.log")).expect("events log");
+        assert!(logged.contains("workspace.changed"), "{logged}");
+        runtime.shutdown().await.expect("shutdown");
+    }
     #[cfg(unix)]
     #[tokio::test]
     async fn a_process_answers_the_handshake_and_a_tool_call() {

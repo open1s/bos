@@ -42,7 +42,7 @@ pub(crate) mod types;
 pub(crate) mod ui;
 
 pub(crate) use events::topics;
-pub(crate) use host::{install, panels, publish};
+pub(crate) use host::{cached_commands, install, panels, publish, CommandSurface};
 
 /// Run the developer CLI and return the process exit code.
 pub(crate) fn cli(args: &[String]) -> i32 {

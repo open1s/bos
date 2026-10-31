@@ -58,6 +58,34 @@ impl Default for UiLimits {
     }
 }
 
+/// A theme contribution's colour tokens.
+///
+/// Values are CSS-style hex strings. The host validates the file and the GPUI
+/// renderer parses the tokens it knows, falling back to the host palette for
+/// anything absent, so a partial theme is a refinement rather than a broken
+/// frame.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ThemePalette {
+    /// Optional display name.
+    #[serde(default)]
+    pub(crate) name: String,
+    /// token name -> #rrggbb / #rrggbbaa.
+    #[serde(default)]
+    pub(crate) colors: std::collections::BTreeMap<String, String>,
+}
+
+impl ThemePalette {
+    /// Parse one token as RGB, ignoring alpha.
+    pub(crate) fn color(&self, token: &str) -> Option<u32> {
+        let raw = self.colors.get(token)?.trim();
+        let hex = raw.strip_prefix('#').unwrap_or(raw);
+        if hex.len() != 6 && hex.len() != 8 {
+            return None;
+        }
+        u32::from_str_radix(&hex[..6], 16).ok()
+    }
+}
+
 /// Where the host mounts a panel.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

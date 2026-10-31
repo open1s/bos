@@ -12,11 +12,68 @@ use gpui_kit::*;
 
 use crate::extension::host::PanelSurface;
 use crate::extension::ui::{
-    ButtonStyle, NotificationLevel, PanelLocation, UiActionRequest, UiDocument, UiNode, UiSession,
+    ButtonStyle, NotificationLevel, PanelLocation, ThemePalette, UiActionRequest, UiDocument,
+    UiNode, UiSession,
 };
 use crate::theme;
 
 use super::{icon, txt, IconName};
+
+/// The host palette with a panel's theme tokens layered over it.
+struct Palette {
+    page: u32,
+    text: u32,
+    muted: u32,
+    faint: u32,
+    border: u32,
+    border_soft: u32,
+    accent: u32,
+    error: u32,
+    success: u32,
+    warn: u32,
+    new_session_fill: u32,
+    hover: u32,
+}
+
+impl Palette {
+    fn new(theme: Option<&ThemePalette>) -> Self {
+        let mut palette = Self {
+            page: theme::page(),
+            text: theme::text(),
+            muted: theme::muted(),
+            faint: theme::faint(),
+            border: theme::border(),
+            border_soft: theme::border_soft(),
+            accent: theme::accent(),
+            error: theme::error(),
+            success: theme::success(),
+            warn: theme::warn(),
+            new_session_fill: theme::new_session_fill(),
+            hover: theme::hover(),
+        };
+        if let Some(theme) = theme {
+            for (token, slot) in [
+                ("page", &mut palette.page),
+                ("text", &mut palette.text),
+                ("muted", &mut palette.muted),
+                ("faint", &mut palette.faint),
+                ("border", &mut palette.border),
+                ("border-soft", &mut palette.border_soft),
+                ("accent", &mut palette.accent),
+                ("error", &mut palette.error),
+                ("success", &mut palette.success),
+                ("warn", &mut palette.warn),
+                ("new-session-fill", &mut palette.new_session_fill),
+                ("hover", &mut palette.hover),
+            ] {
+                if let Some(color) = theme.color(token) {
+                    *slot = color;
+                }
+            }
+        }
+        palette
+    }
+}
 
 /// One extension panel surface in the settings dialog.
 pub(crate) struct ExtensionPanelView {
@@ -27,6 +84,7 @@ pub(crate) struct ExtensionPanelView {
     loading: bool,
     error: Option<String>,
     message: Option<String>,
+    palette: Palette,
 }
 
 impl ExtensionPanelView {
@@ -41,6 +99,11 @@ impl ExtensionPanelView {
                 )
             })
             .unwrap_or(0);
+        let palette = panels
+            .get(selected)
+            .and_then(|panel| panel.theme.as_ref())
+            .map(|theme| Palette::new(Some(theme)))
+            .unwrap_or_else(|| Palette::new(None));
         let mut view = Self {
             panels,
             selected,
@@ -49,6 +112,7 @@ impl ExtensionPanelView {
             loading: false,
             error: None,
             message: None,
+            palette,
         };
         if let Some(panel) = view.panels.get(selected) {
             if let Some(document) = &panel.initial {
@@ -79,6 +143,11 @@ impl ExtensionPanelView {
         self.error = None;
         self.message = None;
         self.loading = false;
+        let theme = self
+            .panels
+            .get(self.selected)
+            .and_then(|panel| panel.theme.as_ref());
+        self.palette = Palette::new(theme);
         if let Some(panel) = self.panels.get(self.selected) {
             if let Some(document) = &panel.initial {
                 if let Ok(session) = UiSession::open(panel.owner.clone(), document.clone()) {
@@ -99,6 +168,8 @@ impl ExtensionPanelView {
         self.error = None;
         self.message = None;
         self.loading = false;
+        let theme = self.panels[index].theme.as_ref();
+        self.palette = Palette::new(theme);
         if let Some(document) = self.panels[index].initial.clone() {
             match UiSession::open(self.panels[index].owner.clone(), document) {
                 Ok(session) => {
@@ -217,7 +288,7 @@ impl ExtensionPanelView {
                 }
                 row.into_any_element()
             }
-            UiNode::Text { text } => txt(text.clone(), 13.0, theme::text()).into_any_element(),
+            UiNode::Text { text } => txt(text.clone(), 13.0, self.palette.text).into_any_element(),
             UiNode::Heading { text, level } => {
                 let size = match level {
                     1 => 21.0,
@@ -226,21 +297,23 @@ impl ExtensionPanelView {
                     4 => 16.0,
                     _ => 14.0,
                 };
-                txt(text.clone(), size, theme::text())
+                txt(text.clone(), size, self.palette.text)
                     .font_weight(FontWeight::SEMIBOLD)
                     .into_any_element()
             }
-            UiNode::Markdown { text } => txt(text.clone(), 13.0, theme::text()).into_any_element(),
+            UiNode::Markdown { text } => {
+                txt(text.clone(), 13.0, self.palette.text).into_any_element()
+            }
             UiNode::Button {
                 label,
                 action,
                 style,
             } => {
                 let (fill, ink) = match style {
-                    ButtonStyle::Primary => (theme::accent(), theme::page()),
-                    ButtonStyle::Danger => (theme::error(), theme::page()),
-                    ButtonStyle::Ghost => (theme::page(), theme::muted()),
-                    ButtonStyle::Secondary => (theme::new_session_fill(), theme::text()),
+                    ButtonStyle::Primary => (self.palette.accent, self.palette.page),
+                    ButtonStyle::Danger => (self.palette.error, self.palette.page),
+                    ButtonStyle::Ghost => (self.palette.page, self.palette.muted),
+                    ButtonStyle::Secondary => (self.palette.new_session_fill, self.palette.text),
                 };
                 let action = action.clone();
                 div()
@@ -255,7 +328,7 @@ impl ExtensionPanelView {
                     .rounded(px(8.0))
                     .bg(rgb(fill))
                     .border_1()
-                    .border_color(rgb(theme::border_soft()))
+                    .border_color(rgb(self.palette.border_soft))
                     .cursor_pointer()
                     .hover(|style| style.opacity(0.9))
                     .child(txt(label.clone(), 13.0, ink))
@@ -276,7 +349,7 @@ impl ExtensionPanelView {
                     .flex()
                     .flex_col()
                     .gap(px(4.0))
-                    .child(txt(label.clone(), 12.0, theme::muted()))
+                    .child(txt(label.clone(), 12.0, self.palette.muted))
                     .child(
                         div()
                             .flex()
@@ -291,10 +364,10 @@ impl ExtensionPanelView {
                                     .flex()
                                     .items_center()
                                     .rounded(px(8.0))
-                                    .bg(rgb(theme::page()))
+                                    .bg(rgb(self.palette.page))
                                     .border_1()
-                                    .border_color(rgb(theme::border()))
-                                    .child(txt(current.clone(), 13.0, theme::text())),
+                                    .border_color(rgb(self.palette.border))
+                                    .child(txt(current.clone(), 13.0, self.palette.text)),
                             )
                             .child(
                                 div()
@@ -306,9 +379,9 @@ impl ExtensionPanelView {
                                     .flex()
                                     .items_center()
                                     .rounded(px(8.0))
-                                    .bg(rgb(theme::accent()))
+                                    .bg(rgb(self.palette.accent))
                                     .cursor_pointer()
-                                    .child(txt("Apply", 12.0, theme::page()))
+                                    .child(txt("Apply", 12.0, self.palette.page))
                                     .on_click(cx.listener(move |this, _event, _window, cx| {
                                         this.dispatch(&action, json!({}), cx)
                                     })),
@@ -330,7 +403,7 @@ impl ExtensionPanelView {
                         format!("{label}: {value}")
                     },
                     12.0,
-                    theme::muted(),
+                    self.palette.muted,
                 ));
                 let mut chips = div().flex().flex_row().flex_wrap().gap(px(6.0));
                 for option in options {
@@ -346,9 +419,9 @@ impl ExtensionPanelView {
                             .flex()
                             .items_center()
                             .rounded(px(7.0))
-                            .bg(rgb(theme::new_session_fill()))
+                            .bg(rgb(self.palette.new_session_fill))
                             .cursor_pointer()
-                            .child(txt(option.label.clone(), 12.0, theme::text()))
+                            .child(txt(option.label.clone(), 12.0, self.palette.text))
                             .on_click(cx.listener(move |this, _event, _window, cx| {
                                 this.dispatch(&action, json!({ "value": option_value.clone() }), cx)
                             })),
@@ -374,17 +447,17 @@ impl ExtensionPanelView {
                     .gap(px(8.0))
                     .cursor_pointer()
                     .child(if *checked {
-                        icon(IconName::Check, 14.0, theme::accent()).into_any_element()
+                        icon(IconName::Check, 14.0, self.palette.accent).into_any_element()
                     } else {
                         div()
                             .w(px(14.0))
                             .h(px(14.0))
                             .rounded(px(3.0))
                             .border_1()
-                            .border_color(rgb(theme::border()))
+                            .border_color(rgb(self.palette.border))
                             .into_any_element()
                     })
-                    .child(txt(label.clone(), 13.0, theme::text()))
+                    .child(txt(label.clone(), 13.0, self.palette.text))
                     .on_click(cx.listener(move |this, _event, _window, cx| {
                         this.dispatch(&action, json!({ "checked": next }), cx)
                     }))
@@ -401,7 +474,7 @@ impl ExtensionPanelView {
                         .rounded(px(7.0))
                         .flex()
                         .flex_col()
-                        .hover(|style| style.bg(rgb(theme::hover())));
+                        .hover(|style| style.bg(rgb(self.palette.hover)));
                     if let Some(action) = &item.action {
                         let action = action.clone();
                         row = row
@@ -411,9 +484,9 @@ impl ExtensionPanelView {
                                 this.dispatch(&action, json!({ "index": index }), cx)
                             }));
                     }
-                    row = row.child(txt(item.title.clone(), 13.0, theme::text()));
+                    row = row.child(txt(item.title.clone(), 13.0, self.palette.text));
                     if !item.detail.is_empty() {
-                        row = row.child(txt(item.detail.clone(), 11.0, theme::faint()));
+                        row = row.child(txt(item.detail.clone(), 11.0, self.palette.faint));
                     }
                     list = list.child(row);
                 }
@@ -426,7 +499,7 @@ impl ExtensionPanelView {
                     header = header.child(div().flex_1().child(txt(
                         column.clone(),
                         12.0,
-                        theme::muted(),
+                        self.palette.muted,
                     )));
                 }
                 table = table.child(header);
@@ -436,7 +509,7 @@ impl ExtensionPanelView {
                         line = line.child(div().flex_1().child(txt(
                             cell.clone(),
                             12.0,
-                            theme::text(),
+                            self.palette.text,
                         )));
                     }
                     table = table.child(line);
@@ -454,7 +527,7 @@ impl ExtensionPanelView {
                 let mut body = div().flex().flex_col().gap(px(8.0)).w_full();
                 let mut strip = div().flex().flex_row().gap(px(12.0));
                 for tab in tabs {
-                    strip = strip.child(txt(tab.label.clone(), 12.0, theme::muted()));
+                    strip = strip.child(txt(tab.label.clone(), 12.0, self.palette.muted));
                 }
                 body = body.child(strip);
                 if let Some(first) = tabs.first() {
@@ -469,19 +542,19 @@ impl ExtensionPanelView {
                     .flex()
                     .flex_col()
                     .gap(px(4.0))
-                    .child(txt(label.clone(), 12.0, theme::muted()))
+                    .child(txt(label.clone(), 12.0, self.palette.muted))
                     .child(
                         div()
                             .w(px(220.0))
                             .h(px(6.0))
                             .rounded(px(3.0))
-                            .bg(rgb(theme::new_session_fill()))
+                            .bg(rgb(self.palette.new_session_fill))
                             .child(
                                 div()
                                     .w(px(width))
                                     .h(px(6.0))
                                     .rounded(px(3.0))
-                                    .bg(rgb(theme::accent())),
+                                    .bg(rgb(self.palette.accent)),
                             ),
                     )
                     .into_any_element()
@@ -493,11 +566,11 @@ impl ExtensionPanelView {
                     .gap(px(2.0))
                     .p(px(8.0))
                     .rounded(px(7.0))
-                    .bg(rgb(theme::new_session_fill()));
+                    .bg(rgb(self.palette.new_session_fill));
                 if !language.is_empty() {
-                    code = code.child(txt(language.clone(), 11.0, theme::faint()));
+                    code = code.child(txt(language.clone(), 11.0, self.palette.faint));
                 }
-                code.child(txt(value.clone(), 12.0, theme::text()))
+                code.child(txt(value.clone(), 12.0, self.palette.text))
                     .into_any_element()
             }
             UiNode::Image { src, alt } => div()
@@ -511,23 +584,23 @@ impl ExtensionPanelView {
                         alt.clone()
                     },
                     12.0,
-                    theme::muted(),
+                    self.palette.muted,
                 ))
-                .child(txt(src.clone(), 11.0, theme::faint()))
+                .child(txt(src.clone(), 11.0, self.palette.faint))
                 .into_any_element(),
             UiNode::Notification { level, text } => {
                 let color = match level {
-                    NotificationLevel::Info => theme::accent(),
-                    NotificationLevel::Warning => theme::warn(),
-                    NotificationLevel::Error => theme::error(),
-                    NotificationLevel::Success => theme::success(),
+                    NotificationLevel::Info => self.palette.accent,
+                    NotificationLevel::Warning => self.palette.warn,
+                    NotificationLevel::Error => self.palette.error,
+                    NotificationLevel::Success => self.palette.success,
                 };
                 txt(text.clone(), 12.0, color).into_any_element()
             }
             UiNode::Divider => div()
                 .h(px(1.0))
                 .w_full()
-                .bg(rgb(theme::border_soft()))
+                .bg(rgb(self.palette.border_soft))
                 .into_any_element(),
             UiNode::Spacer { size } => div().h(px(*size as f32)).into_any_element(),
         }
@@ -543,7 +616,7 @@ impl ExtensionPanelView {
         column = column.child(div().pl(px(depth as f32 * 12.0)).child(txt(
             node.label.clone(),
             12.0,
-            theme::text(),
+            self.palette.text,
         )));
         for (index, child) in node.children.iter().enumerate() {
             column =
@@ -571,7 +644,7 @@ impl Render for ExtensionPanelView {
             return root.child(txt(
                 "No extension panels are installed.",
                 13.0,
-                theme::muted(),
+                self.palette.muted,
             ));
         }
         let mut tabs = div().flex().flex_row().flex_wrap().gap(px(6.0));
@@ -595,18 +668,18 @@ impl Render for ExtensionPanelView {
                     .items_center()
                     .rounded(px(7.0))
                     .bg(rgb(if selected {
-                        theme::accent()
+                        self.palette.accent
                     } else {
-                        theme::new_session_fill()
+                        self.palette.new_session_fill
                     }))
                     .cursor_pointer()
                     .child(txt(
                         format!("{} · {location}", panel.title),
                         12.0,
                         if selected {
-                            theme::page()
+                            self.palette.page
                         } else {
-                            theme::text()
+                            self.palette.text
                         },
                     ))
                     .on_click(cx.listener(move |this, _event, _window, cx| this.select(index, cx))),
@@ -614,13 +687,17 @@ impl Render for ExtensionPanelView {
         }
         root = root.child(tabs);
         if self.loading {
-            root = root.child(txt("Loading panel…", 12.0, theme::muted()));
+            root = root.child(txt("Loading panel…", 12.0, self.palette.muted));
         }
         if let Some(error) = &self.error {
-            root = root.child(txt(format!("Panel error: {error}"), 12.0, theme::error()));
+            root = root.child(txt(
+                format!("Panel error: {error}"),
+                12.0,
+                self.palette.error,
+            ));
         }
         if let Some(message) = &self.message {
-            root = root.child(txt(message.clone(), 12.0, theme::muted()));
+            root = root.child(txt(message.clone(), 12.0, self.palette.muted));
         }
         if let Some(document) = &self.document {
             let mut body = div()
@@ -643,7 +720,8 @@ mod tests {
     use crate::extension::host::PanelSurface;
     use crate::extension::runtime::{CallContext, Runtime, ToolDescriptor};
     use crate::extension::types::{ExtensionError, ExtensionId, RuntimeKind};
-    use crate::extension::ui::{PanelLocation, UiDocument};
+    use crate::extension::ui::{PanelLocation, ThemePalette, UiDocument};
+    use crate::theme;
     use async_trait::async_trait;
     use serde_json::Value;
     use std::sync::Arc;
@@ -678,6 +756,7 @@ mod tests {
             visibility: crate::extension::ui::PanelVisibility::Visible,
             runtime: Arc::new(Noop),
             owner: ExtensionId::parse("com.example.ui").expect("id"),
+            theme: None,
             initial: Some(document),
         }
     }
@@ -701,5 +780,27 @@ mod tests {
         assert!(view.document.is_some());
         assert!(view.error.is_none());
         assert_eq!(view.panels.len(), 1);
+    }
+
+    #[test]
+    fn a_panel_theme_overrides_the_host_palette() {
+        let document: UiDocument = serde_json::from_value(serde_json::json!({
+            "schema_version": "1.0",
+            "revision": 1,
+            "root": {"type": "text", "text": "Themed"}
+        }))
+        .expect("document");
+        let mut surface = panel(document);
+        let mut colors = std::collections::BTreeMap::new();
+        colors.insert("page".to_string(), "#112233".to_string());
+        colors.insert("accent".to_string(), "#445566".to_string());
+        surface.theme = Some(ThemePalette {
+            name: "Test theme".to_string(),
+            colors,
+        });
+        let view = ExtensionPanelView::new(vec![surface]);
+        assert_eq!(view.palette.page, 0x112233);
+        assert_eq!(view.palette.accent, 0x445566);
+        assert_eq!(view.palette.text, theme::text());
     }
 }

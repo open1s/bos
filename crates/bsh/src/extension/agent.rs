@@ -159,6 +159,12 @@ impl react::tool::registry::AsyncTool for ExtensionTool {
 
     fn cancel(&self, _call_id: &str) {
         self.cancelled.store(true, Ordering::SeqCst);
+        let runtime = Arc::clone(&self.runtime);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = runtime.cancel().await;
+            });
+        }
     }
 
     async fn run(&self, arguments: &Value) -> Result<Value, agent::tools::ToolError> {

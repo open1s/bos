@@ -32,7 +32,7 @@ use super::types::{
     ContributionId, ExtensionError, ExtensionId, ExtensionSource, LifecycleState, RuntimeKind,
     StartupPolicy, TrustLevel, ValidationReport, EXTENSION_API_VERSION, HOST_VERSION,
 };
-use super::ui::{PanelLocation, PanelVisibility, UiDocument};
+use super::ui::{PanelLocation, PanelVisibility, ThemePalette, UiDocument};
 
 /// The configuration that decides which store and which packages a host owns.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,6 +173,17 @@ pub(crate) struct ExtensionStatus {
     pub(crate) publisher: Option<String>,
 }
 
+/// One command the composer palette can insert.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommandSurface {
+    /// Qualified command name.
+    pub(crate) name: String,
+    /// One-line description.
+    pub(crate) description: String,
+    /// Prompt body inserted when chosen.
+    pub(crate) template: String,
+}
+
 /// One panel the host can mount in the UI.
 #[derive(Clone)]
 pub(crate) struct PanelSurface {
@@ -192,6 +203,8 @@ pub(crate) struct PanelSurface {
     pub(crate) runtime: Arc<dyn Runtime>,
     /// The owning extension, for validation and action ownership.
     pub(crate) owner: ExtensionId,
+    /// The first theme the extension declares, if any.
+    pub(crate) theme: Option<ThemePalette>,
     /// A declarative view that is ready without a call, when one exists.
     pub(crate) initial: Option<UiDocument>,
 }
@@ -683,7 +696,11 @@ impl ExtensionHost {
             }
             RuntimeKind::Process => {
                 let runtime = ProcessRuntime::new(&package.manifest, &package.root)?
-                    .with_config(config.to_json());
+                    .with_config(config.to_json())
+                    .with_events(
+                        Arc::clone(&self.events),
+                        &package.manifest.contributes.events,
+                    );
                 let tools = runtime.descriptors();
                 let contributions =
                     declarative::load_contributions(&package.root, &package.manifest)?;
@@ -831,6 +848,7 @@ impl ExtensionHost {
             let Some(runtime) = &entry.runtime else {
                 continue;
             };
+            let theme = load_theme(entry);
             let mut declared = std::collections::BTreeSet::new();
             for panel in &entry.contributions.panels {
                 declared.insert(panel.id.as_str().to_string());
@@ -843,6 +861,7 @@ impl ExtensionHost {
                     visibility: panel.visibility,
                     runtime: Arc::clone(runtime),
                     owner: entry.package.id().clone(),
+                    theme: theme.clone(),
                     initial: Some(panel.view.clone()),
                 });
             }
@@ -859,11 +878,32 @@ impl ExtensionHost {
                     visibility: PanelVisibility::Visible,
                     runtime: Arc::clone(runtime),
                     owner: entry.package.id().clone(),
+                    theme: theme.clone(),
                     initial: None,
                 });
             }
         }
         surfaces
+    }
+
+    /// Every command contribution an applied package offers, ready for the
+    /// composer palette.
+    pub(crate) fn command_surfaces(&self) -> Vec<CommandSurface> {
+        let mut commands = Vec::new();
+        for entry in self.loaded.values() {
+            if !entry.applied || entry.error.is_some() {
+                continue;
+            }
+            for command in &entry.contributions.commands {
+                commands.push(CommandSurface {
+                    name: entry.package.id().qualify(&command.id),
+                    description: command.description.clone(),
+                    template: command.template.clone(),
+                });
+            }
+        }
+        commands.sort_by(|left, right| left.name.cmp(&right.name));
+        commands
     }
 
     /// Every model and agent provider descriptor an applied package declares.
@@ -1121,6 +1161,13 @@ impl ExtensionHost {
     }
 }
 
+/// The first declared theme for an extension, if it parses.
+fn load_theme(entry: &LoadedExtension) -> Option<ThemePalette> {
+    let theme = entry.contributions.themes.first()?;
+    let text = std::fs::read_to_string(&theme.path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
 /// Pick one version per id: the pinned active version, else the highest.
 ///
 /// Every version stays on disk for rollback; only the selected one is loaded,
@@ -1243,6 +1290,18 @@ pub(crate) fn record_tool_call(millis: u64, bytes: u64, ok: bool) {
     if let Some(host) = guard.as_ref() {
         host.record_call(millis, bytes, ok);
     }
+}
+
+/// Commands from the already-open host, without opening one.
+pub(crate) fn cached_commands() -> Vec<CommandSurface> {
+    let slot = HOST.get_or_init(|| Mutex::new(None));
+    let Ok(guard) = slot.lock() else {
+        return Vec::new();
+    };
+    guard
+        .as_ref()
+        .map(ExtensionHost::command_surfaces)
+        .unwrap_or_default()
 }
 
 /// The panels the current configuration offers, for the host UI.

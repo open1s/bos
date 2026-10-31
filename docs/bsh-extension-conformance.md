@@ -69,7 +69,7 @@ Status legend:
 | Workflow extension | done | runtime/workflow.rs sequential executor with capability union |
 | Context extension | partial | static Markdown only, no scoped provider call |
 | Prompt extension | done | Markdown appended to system prompt |
-| Command extension | partial | registered in the host plugin registry; composer palette not wired |
+| Command extension | done | registered and inserted from the composer slash palette |
 | Event extension | partial | WASM subscribe/on-event + workspace/model publishers; process subscriptions missing |
 | Theme extension | partial | files recorded; host panel uses the active theme; contribution not applied |
 | Language extension | missing | no language contribution kind |
@@ -126,7 +126,7 @@ Status legend:
 |---|---|
 | Core API: lifecycle, metadata, context, errors, logging, cancellation | partial: cancellation token exposed at tool boundary |
 | Domain API: agent, tools, workflow, events, storage | partial: workflows/tools/storage/events; model/agent adapters descriptors only |
-| UI API: panels, commands, declarative views | done | renderer + commands + actions; command palette wiring partial |
+| UI API: panels, commands, declarative views | done | renderer + commands + actions + composer palette |
 
 ### 6.1 API modules
 
@@ -143,7 +143,7 @@ Status legend:
 | agent/agent_provider | partial | descriptor discovery |
 | agent/model_provider | partial | descriptor discovery |
 | workflow/trigger, action, execution | done | sequential workflow executor; no triggers |
-| events/publisher, subscriber | partial | publisher + WASM subscriber; process subscriber missing |
+| events/publisher, subscriber | done | publisher + WASM and process subscribers |
 | ui/panel, view, command, notification, theme | partial | panels/views/commands/notifications; theme contributions not applied |
 
 ### 6.2 Contract rules
@@ -201,7 +201,7 @@ Status legend:
 | Focus, keyboard, accessibility | partial | role/aria labels; no keyboard focus model or text editing |
 | Loading/error/unavailability states | done | renderer loading/error/message |
 | No JS/HTML | done |
-| Theme contributions | partial | recorded; not applied |
+| Theme contributions | partial | tokens apply to the owning extension panels, not the whole shell |
 
 ## 10. Agent-native API
 
@@ -344,18 +344,14 @@ Each is a behaviour, not a missing type.
    incremental model or tool progress crosses the host boundary.
 2. Model and Agent provider adapters: descriptors are discoverable and listed,
    but no executable adapter is registered with the model or agent layer.
-3. Theme contributions are recorded but not applied; command contributions are
-   registered in the PluginRegistry but the composer palette does not yet list
-   extension commands.
-4. Lockfile reproduction: the lock records versions and hashes, but no command
-   reinstalls a lockfile exactly.
-5. Process event subscriptions: the WASM runtime subscribes and receives
-   on_event; the process protocol has no equivalent subscription frame.
-6. OS filesystem sandbox: process children get RLIMIT ceilings and a process
+3. Theme contributions apply to an extension's own panels, not the whole shell.
+4. Lockfile reproduction only covers lock entries that name a Git or registry
+   remote; an Installed-only lock cannot be reproduced from the file alone.
+5. OS filesystem sandbox: process children get RLIMIT ceilings and a process
    group, not a macOS sandbox profile or Linux namespace.
-7. Guest/runtime cancellation: the tool future stops waiting, but a WASM guest
+6. Guest/runtime cancellation: the tool future stops waiting, but a WASM guest
    or process is not always terminated at the same instant.
-8. Cross-platform matrix: the suite is green on macOS (this environment);
+7. Cross-platform matrix: the suite is green on macOS (this environment);
    Windows/Linux process limits and path handling are not exercised here.
-9. Integration breadth: no mock host harness that drives every runtime through
+8. Integration breadth: no mock host harness that drives every runtime through
    one scripted scenario.

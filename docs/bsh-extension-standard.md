@@ -485,8 +485,8 @@ The host publishes extension.loaded/extension.failed and the shell publishes
 workspace.changed, model.requested, model.completed and config.changed. Every
 extension tool publishes tool.invoked, tool.completed and tool.failed on its own
 source with the call's correlation id. A background pump delivers queued events
-to active runtimes; the WASM guest receives on-event, the process protocol does
-not yet have a subscription frame.
+to active runtimes: the WASM guest receives on-event and a process receives an
+events/event JSON-RPC notification.
 
 ## 10. Declarative UI
 
@@ -529,8 +529,30 @@ Rules:
 - an action carries the revision it was rendered from; a mismatched revision is
   refused, so a control from an old view cannot act on a new one.
 
-The host owns GPUI objects. A panel contribution is registered as an id and a
-title today; the declarative renderer consumes the document next.
+The host owns GPUI objects. The renderer validates the document again, draws
+the supported nodes, and routes each action to the owning runtime's command
+handler with the revision it was rendered from.
+
+A package may also ship themes/<id>.json:
+
+~~~json
+{
+  "name": "Midnight",
+  "colors": {
+    "page": "#0b0d10",
+    "text": "#e6e8eb",
+    "muted": "#9aa0a6",
+    "accent": "#4176e6",
+    "border": "#2a2f36",
+    "new-session-fill": "#171a1f"
+  }
+}
+~~~
+
+Tokens the renderer knows are page, text, muted, faint, border, border-soft,
+accent, error, success, warn, new-session-fill and hover. Missing tokens fall
+back to the active host palette; the first declared theme applies to that
+extension's panels. Themes do not re-theme the whole shell.
 
 ## 11. Storage
 
@@ -541,10 +563,10 @@ inside it. A stored value cannot be a symlink. One value is at most 8 MiB and a
 namespace holds at most 10,000 files. Writes are atomic (temp file, fsync,
 rename).
 
-The namespace is created and purged by the host. The containment API is
-implemented and tested; no runtime host binding is exposed yet, so a package
-cannot call it until the host-function surface lands. No runtime will be able to
-read another namespace through that API when it does.
+The namespace is created and purged by the host. WASM components call
+storage_get, storage_set and storage_list; each call is capability-checked and
+confined to the owning extension's namespace, so one package cannot read
+another's data through that surface.
 
 ## 12. Store, integrity and locking
 

@@ -29885,3 +29885,43 @@ fn the_plugins_header_opens_the_extension_panels(cx: &mut TestAppContext) {
         "the header control opens the panel host"
     );
 }
+
+/// Extension commands join the slash card with their template as the insert.
+#[gpui::test]
+fn extension_commands_join_the_composer_palette(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = AppState::with_store(scratch_store("extension-commands"));
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.extension_commands = vec![crate::extension::CommandSurface {
+                name: "hello__greet".to_string(),
+                description: "Greet the reader".to_string(),
+                template: "Say hello to {{input.name}}.".to_string(),
+            }];
+            this.composer_value = "/hel".to_string();
+            this.command_menu.open = true;
+            this.command_menu.trigger = Some(super::command_menu::Trigger::Command);
+        });
+    });
+    let rows = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .card_rows(super::command_menu::Trigger::Command)
+    });
+    assert!(
+        rows.iter()
+            .any(|row| row.label == "hello__greet" && row.detail == "Greet the reader"),
+        "{:?}",
+        rows.iter().map(|row| &row.label).collect::<Vec<_>>()
+    );
+    assert!(rows.iter().any(|row| matches!(
+        &row.action,
+        super::command_menu::CardAction::Insert(template)
+            if template == "Say hello to {{input.name}}."
+    )));
+}
