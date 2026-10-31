@@ -8,12 +8,15 @@
 //! log, so "the extension said it needed this" and "the host allowed this" are
 //! two different facts that can always be compared.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Outbound requests one extension may authorize in a one-second window.
+const MAX_NETWORK_CALLS_PER_SECOND: usize = 20;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -601,6 +604,7 @@ pub(crate) struct PolicyEngine {
     grants: Mutex<GrantStore>,
     audit: AuditLog,
     mode: PolicyMode,
+    network: Mutex<HashMap<String, VecDeque<Instant>>>,
 }
 
 impl PolicyEngine {
@@ -614,6 +618,7 @@ impl PolicyEngine {
             grants: Mutex::new(GrantStore::load(grants_path)?),
             audit: AuditLog::new(audit_path),
             mode,
+            network: Mutex::new(HashMap::new()),
         })
     }
 
@@ -743,13 +748,44 @@ impl PolicyEngine {
         scope: &CallScope,
     ) -> Result<GrantScope, ExtensionError> {
         match self.evaluate(extension, trust, capability, scope) {
-            Decision::Allow { scope } => Ok(scope),
+            Decision::Allow { scope } => {
+                if capability == Capability::NetworkHttp && !self.meter_network(extension) {
+                    return Err(ExtensionError::Denied {
+                        extension: extension.to_string(),
+                        capability: capability.as_str().to_string(),
+                        reason: format!(
+                            "more than {MAX_NETWORK_CALLS_PER_SECOND} network calls in one second"
+                        ),
+                    });
+                }
+                Ok(scope)
+            }
             Decision::Deny { reason } => Err(ExtensionError::Denied {
                 extension: extension.to_string(),
                 capability: capability.as_str().to_string(),
                 reason,
             }),
         }
+    }
+
+    /// A per-extension fixed window for outbound requests.
+    fn meter_network(&self, extension: &str) -> bool {
+        let Ok(mut calls) = self.network.lock() else {
+            return false;
+        };
+        let now = Instant::now();
+        let window = calls.entry(extension.to_string()).or_default();
+        while window
+            .front()
+            .is_some_and(|started| now.duration_since(*started) >= Duration::from_secs(1))
+        {
+            let _ = window.pop_front();
+        }
+        if window.len() >= MAX_NETWORK_CALLS_PER_SECOND {
+            return false;
+        }
+        window.push_back(now);
+        true
     }
 
     fn decide(
@@ -916,6 +952,43 @@ mod tests {
         .expect("policy engine")
     }
 
+    #[test]
+    fn network_calls_are_rate_limited_per_extension() {
+        let scratch = Scratch::new("network-rate");
+        let policy = engine(&scratch);
+        policy
+            .grant(
+                "com.example.flood",
+                Capability::NetworkHttp,
+                GrantScope::Any,
+                None,
+            )
+            .expect("grant");
+        let scope = CallScope {
+            domain: Some("example.com".to_string()),
+            method: Some("GET".to_string()),
+            ..CallScope::default()
+        };
+        for _ in 0..MAX_NETWORK_CALLS_PER_SECOND {
+            policy
+                .authorize_call(
+                    "com.example.flood",
+                    TrustLevel::Community,
+                    Capability::NetworkHttp,
+                    &scope,
+                )
+                .expect("within the window");
+        }
+        let error = policy
+            .authorize_call(
+                "com.example.flood",
+                TrustLevel::Community,
+                Capability::NetworkHttp,
+                &scope,
+            )
+            .expect_err("over the window");
+        assert!(error.to_string().contains("network calls"), "{error}");
+    }
     #[test]
     fn a_domain_scope_can_restrict_the_http_method() {
         let scope: GrantScope = "domain:api.example.com:POST".parse().expect("scope");

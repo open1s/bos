@@ -33,7 +33,7 @@ Status legend:
 | Host-managed GPUI panels | done | Settings hosts all; left sidebar, right panel, bottom composer dock and center tab host their declared locations |
 | Declarative UI | done | contract, validation, GPUI renderer, action routing and stale-revision refusal |
 | Unified tool/context/prompt contracts | done | agent.rs |
-| Capability authorization, quotas, audit | partial | authorization and audit done; quotas partial |
+| Capability authorization, quotas, audit | done | authorization, audit, memory/time/output/event/progress limits and a 20/s network window |
 | Directory package | done | package.rs |
 | Archive distribution | missing | tar.gz reader not yet wired to install |
 | Local/Git/official/private registries | missing | local directory only |
@@ -247,7 +247,7 @@ Status legend:
 | Network domain/method policy | done | domain scope and optional method-restricted domain scope |
 | Process executable/argument policy | done | allowlist, explicit grant, program and program+args scopes checked per spawn |
 | CPU/fuel and wall clock | done | wall clock + wasm fuel + process RLIMIT_CPU |
-| Memory/concurrency | partial | wasm StoreLimits + process RLIMIT_AS; concurrency per runtime mutex |
+| Memory/concurrency | done | WASM/Extism memory limits, process RLIMIT_AS, serialized per-runtime calls |
 | Host-call authorization | done | WASM host functions call PolicyEngine |
 | IPC authentication and message validation | done | private stdio, per-session handshake token echo, line/JSON/depth validation |
 | Secret redaction | done | read_secret + audit without values |
@@ -317,7 +317,7 @@ is deliberate and does not remove a feature.
 |---|---|
 | Unit: manifest, ids, resolver, lifecycle, capability, events, UI, paths, lock determinism | done |
 | Integration: built-in registration, WASM load/invoke, process start/stop, tools, cancellation, UI action routing, patches, denial, crash isolation, upgrade/rollback, data preservation | partial | cancellation and scan/load crash isolation covered; cross-platform execution remains partial |
-| Security tests: traversal, unauthorized fs/network, process denial, oversized messages, nested UI, event flood, resource exhaustion, malformed payloads, stale actions, revoked capability, package tampering/signatures | partial | signature/UI/traversal/process concurrency covered; network flood and process resource exhaustion remain |
+| Security tests: traversal, unauthorized fs/network, process denial, oversized messages, nested UI, event flood, resource exhaustion, malformed payloads, stale actions, revoked capability, package tampering/signatures | partial | signature/UI/traversal/process concurrency/network flood covered; process resource-exhaustion stress remains |
 | Cross-platform matrix | not run in this environment |
 
 ## 18. Roadmap
