@@ -201,6 +201,36 @@ impl ProcessSession {
     }
 }
 
+/// Kill a child whose resident memory exceeds its manifest ceiling.
+///
+/// RLIMIT_AS is not honoured by macOS, so the host samples RSS and sends
+/// SIGKILL itself; Linux keeps the rlimit as the first line and the sampler as
+/// the same backstop.
+#[cfg(unix)]
+fn spawn_memory_watchdog(pid: u32, limit: u64) {
+    if limit == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            match process_rss_bytes(pid) {
+                Some(rss) if rss > limit => {
+                    // SAFETY: pid names the child this runtime spawned; a
+                    // recycled pid would already be a different process, and
+                    // the session clears its pid on stop.
+                    unsafe {
+                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                    }
+                    break;
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+    });
+}
+
 /// Resident memory of one child, from procfs on Linux or ps on macOS.
 fn process_rss_bytes(pid: u32) -> Option<u64> {
     #[cfg(target_os = "linux")]
@@ -735,6 +765,8 @@ impl ProcessRuntime {
         })?;
         if let Some(pid) = child.id() {
             self.child_pid.store(pid, Ordering::Relaxed);
+            #[cfg(unix)]
+            spawn_memory_watchdog(pid, self.memory_bytes);
         }
         let stdin = child.stdin.take().ok_or_else(|| ExtensionError::Protocol {
             extension: self.extension.to_string(),
@@ -1206,6 +1238,71 @@ max_execution_ms = 500
             .await
             .expect_err("the manifest ceiling wins");
         assert_eq!(error.category(), "timeout");
+        runtime.shutdown().await.expect("shutdown");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_process_memory_ceiling_kills_a_runaway_child() {
+        let scratch = Scratch::new("memory-cap");
+        std::fs::write(
+            scratch.0.join("tools/echo.json"),
+            r#"{"description":"Echo","input_schema":{"type":"object"}}"#,
+        )
+        .expect("tool");
+        std::fs::write(
+            scratch.0.join("server.py"),
+            r#"import json, sys, time
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": "1.0", "token": request.get("params", {}).get("token")}
+    elif method == "tools/call":
+        chunks = []
+        for _ in range(40):
+            chunks.append(bytearray(32 * 1024 * 1024))
+            time.sleep(0.05)
+        result = {"limited": False}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": request.get("id"), "result": result}), flush=True)
+"#,
+        )
+        .expect("server");
+        let manifest = Manifest::parse(
+            r#"
+schema_version = "1.0"
+[extension]
+id = "com.example.process"
+name = "Process"
+version = "1.0.0"
+description = "A process package"
+[compatibility]
+bsh = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+[runtime]
+kind = "process"
+entry = "python3"
+args = ["server.py"]
+[capabilities]
+required = ["process.execute"]
+[contributes]
+tools = ["echo"]
+[resources]
+max_memory_mb = 128
+max_execution_ms = 5000
+"#,
+            &scratch.0.join("extension.toml"),
+        )
+        .expect("manifest");
+        let runtime = ProcessRuntime::new(&manifest, &scratch.0).expect("runtime");
+        let context = CallContext::new(manifest.id().clone(), "memory-cap", None, 5000);
+        let error = runtime
+            .call_tool("echo", json!({}), &context)
+            .await
+            .expect_err("the watchdog kills the child");
+        assert!(matches!(error.category(), "runtime" | "timeout"), "{error}");
         runtime.shutdown().await.expect("shutdown");
     }
     #[cfg(unix)]

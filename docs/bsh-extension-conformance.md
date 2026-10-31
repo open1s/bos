@@ -139,7 +139,7 @@ Status legend:
 | core/cancellation | done | AsyncTool token -> Runtime::cancel |
 | capabilities/filesystem | done | WASM read_file/write_file host functions with policy |
 | capabilities/network | done | WASM fetch host function with policy |
-| capabilities/process | partial | policy + spawn + rlimits + macOS profile + Linux bwrap plan; Windows limits and memory-cap stress absent |
+| capabilities/process | partial | policy + spawn + rlimits + RSS watchdog + macOS profile + Linux bwrap plan; Windows limits absent |
 | capabilities/storage | done | WASM storage_get/set/list |
 | capabilities/secrets | done | WASM read_secret |
 | agent/tool, prompt, context_provider | tool/prompt done, context static |
@@ -317,7 +317,7 @@ is deliberate and does not remove a feature.
 |---|---|
 | Unit: manifest, ids, resolver, lifecycle, capability, events, UI, paths, lock determinism | done |
 | Integration: built-in registration, WASM load/invoke, process start/stop, tools, cancellation, UI action routing, patches, denial, crash isolation, upgrade/rollback, data preservation | partial | cancellation and scan/load crash isolation covered; cross-platform execution remains partial |
-| Security tests: traversal, unauthorized fs/network, process denial, oversized messages, nested UI, event flood, resource exhaustion, malformed payloads, stale actions, revoked capability, package tampering/signatures | partial | signature/UI/traversal/process concurrency/time quota/network flood covered; process memory-cap stress and Windows execution remain |
+| Security tests: traversal, unauthorized fs/network, process denial, oversized messages, nested UI, event flood, resource exhaustion, malformed payloads, stale actions, revoked capability, package tampering/signatures | partial | signature/UI/traversal/process concurrency/time quota/memory cap/network flood covered; Windows execution remains |
 | Cross-platform matrix | not run in this environment |
 
 ## 18. Roadmap
