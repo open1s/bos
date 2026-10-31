@@ -31,7 +31,8 @@ agent tool registration, diagnostics and `bsh ext ...`.
 
 - The normative contract is `docs/bsh-extension-standard.md`; the walkthrough is
   `docs/bsh-extension-dev-guide.md`; the WIT contract is `crates/bsh/wit/extension.wit`;
-  examples are `examples/extensions/{hello,process-echo}`.
+  runtime contracts are in `runtime/{wasm,mcp,workflow}.rs`; examples are
+  `examples/extensions/{hello,process-echo,wasm-echo,mcp-echo}`.
 - It is wired into `caps::build_agent_for_session_inner` with one call to
   `crate::extension::install`, after the built-in bundles and before MCP. It
   contributes tools/commands/panels/prompts through the same seams as the
@@ -40,8 +41,9 @@ agent tool registration, diagnostics and `bsh ext ...`.
   ships complete (storage, event subscriptions, UI actions) before every host
   consumer lands; tests cover the unused surface. Keep new accepts outside the
   module wired.
-- Tests: `cargo test -p bsh --lib extension::` (78 tests). CLI smoke:
-  `cargo run -p bsh -- ext --root /tmp/bsh-ext list`.
+- Tests: `cargo test -p bsh --lib extension::` (90+ tests). CLI smoke:
+  `cargo run -p bsh -- ext --root /tmp/bsh-ext list`, plus
+  `build`, `keygen/sign/trust/verify`, `registry` and `metrics`.
 - The legacy Codex/DSH shim in `crates/agent/src/extensions` still backs the old
   installed-plugin inventory. Do not extend it for new work; new packages target
   `extension.toml` and the BSH standard.

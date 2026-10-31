@@ -6,8 +6,10 @@
 //! length/pattern-by-substring. A package that needs a construct outside the
 //! subset gets a validation error naming the keyword rather than a silent pass.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use serde::Deserialize;
 use serde_json::Value;
 
 use super::manifest::Manifest;
@@ -72,10 +74,12 @@ pub(crate) fn load(
         Some(relative) => {
             let path = root.join(relative);
             let text = read_bounded(&path)?;
-            Some(serde_json::from_str(&text).map_err(|error| ExtensionError::Json {
-                path,
-                message: error.to_string(),
-            })?)
+            Some(
+                serde_json::from_str(&text).map_err(|error| ExtensionError::Json {
+                    path,
+                    message: error.to_string(),
+                })?,
+            )
         }
         None => None,
     };
@@ -85,7 +89,10 @@ pub(crate) fn load(
         if !errors.is_empty() {
             return Err(ExtensionError::Manifest {
                 path: root.join("extension.toml"),
-                message: format!("configuration does not match its schema: {}", errors.join("; ")),
+                message: format!(
+                    "configuration does not match its schema: {}",
+                    errors.join("; ")
+                ),
             });
         }
     }
@@ -107,10 +114,12 @@ pub(crate) fn save(
         Some(relative) => {
             let path = root.join(relative);
             let text = read_bounded(&path)?;
-            Some(serde_json::from_str(&text).map_err(|error| ExtensionError::Json {
-                path,
-                message: error.to_string(),
-            })?)
+            Some(
+                serde_json::from_str(&text).map_err(|error| ExtensionError::Json {
+                    path,
+                    message: error.to_string(),
+                })?,
+            )
         }
         None => None,
     };
@@ -120,7 +129,10 @@ pub(crate) fn save(
         if !errors.is_empty() {
             return Err(ExtensionError::Manifest {
                 path: root.join("extension.toml"),
-                message: format!("configuration does not match its schema: {}", errors.join("; ")),
+                message: format!(
+                    "configuration does not match its schema: {}",
+                    errors.join("; ")
+                ),
             });
         }
     }
@@ -162,6 +174,134 @@ fn read_bounded(path: &Path) -> Result<String, ExtensionError> {
         path: path.to_path_buf(),
         source,
     })
+}
+
+/// One migration file.
+#[derive(Debug, Clone, Deserialize)]
+struct MigrationFile {
+    from: String,
+    to: String,
+    #[serde(default)]
+    set: BTreeMap<String, toml::Value>,
+}
+
+/// Apply every migration between two versions to the user document.
+///
+/// A package ships migrations/ as TOML files named in any order; the chain is
+/// built by matching from to the running version, so the file names are not a
+/// contract. A step that would move backwards is ignored. The final document is
+/// validated against the NEW manifest schema before it is written.
+pub(crate) fn migrate(
+    manifest: &Manifest,
+    root: &Path,
+    data_root: &Path,
+    from: &str,
+    to: &str,
+) -> Result<Option<String>, ExtensionError> {
+    let directory = root.join("migrations");
+    if !directory.is_dir() {
+        return Ok(None);
+    }
+    let target = semver::Version::parse(to).map_err(|error| ExtensionError::InvalidVersion {
+        value: to.to_string(),
+        reason: error.to_string(),
+    })?;
+    let mut files: Vec<MigrationFile> = Vec::new();
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(&directory)
+        .map_err(|source| ExtensionError::Io {
+            path: directory.clone(),
+            source,
+        })?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("toml"))
+        .collect();
+    entries.sort();
+    for path in entries {
+        let text = std::fs::read_to_string(&path).map_err(|source| ExtensionError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let file: MigrationFile =
+            toml::from_str(&text).map_err(|error| ExtensionError::Corrupt {
+                path: path.clone(),
+                message: error.to_string(),
+            })?;
+        files.push(file);
+    }
+    if files.is_empty() {
+        return Ok(None);
+    }
+    let user_path = data_root.join(CONFIG_FILE);
+    let mut value = if user_path.is_file() {
+        let text = read_bounded(&user_path)?;
+        serde_json::from_str(&text).map_err(|error| ExtensionError::Json {
+            path: user_path,
+            message: error.to_string(),
+        })?
+    } else {
+        manifest
+            .configuration
+            .as_ref()
+            .and_then(|configuration| configuration.defaults.as_ref())
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|error| ExtensionError::Json {
+                path: root.join("extension.toml"),
+                message: error.to_string(),
+            })?
+            .unwrap_or_else(|| serde_json::json!({}))
+    };
+    let mut current =
+        semver::Version::parse(from).unwrap_or_else(|_| semver::Version::new(0, 0, 0));
+    let mut applied = false;
+    loop {
+        let next = files.iter().find(|file| {
+            semver::Version::parse(&file.from)
+                .map(|version| version == current)
+                .unwrap_or(false)
+                && semver::Version::parse(&file.to)
+                    .map(|version| version <= target && version > current)
+                    .unwrap_or(false)
+        });
+        let Some(file) = next else {
+            break;
+        };
+        for (key, replacement) in &file.set {
+            let replacement =
+                serde_json::to_value(replacement).map_err(|error| ExtensionError::Json {
+                    path: directory.clone(),
+                    message: error.to_string(),
+                })?;
+            set_path(&mut value, key, replacement);
+        }
+        current = semver::Version::parse(&file.to).expect("the matcher parsed it");
+        applied = true;
+    }
+    if !applied {
+        return Ok(None);
+    }
+    save(manifest, root, data_root, value)?;
+    Ok(Some(current.to_string()))
+}
+
+fn set_path(value: &mut Value, key: &str, replacement: Value) {
+    let mut parts = key.split('.').peekable();
+    let mut cursor = value;
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            if let Some(object) = cursor.as_object_mut() {
+                object.insert(part.to_string(), replacement);
+            }
+            return;
+        }
+        let Some(object) = cursor.as_object_mut() else {
+            return;
+        };
+        cursor = object
+            .entry(part.to_string())
+            .or_insert_with(|| serde_json::json!({}));
+    }
 }
 
 /// Validate a JSON value against the supported schema subset.
@@ -347,10 +487,8 @@ enabled = true
     }
 
     fn scratch(label: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "bsh-ext-config-{label}-{}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("bsh-ext-config-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("scratch");
         path
@@ -364,14 +502,60 @@ enabled = true
         let data = root.join("data");
         let config = load(&package, &root, &data).expect("load");
         assert_eq!(config.value["enabled"], true);
-        let saved = save(&package, &root, &data, serde_json::json!({"enabled": false, "name": "ok"}))
-            .expect("save");
+        let saved = save(
+            &package,
+            &root,
+            &data,
+            serde_json::json!({"enabled": false, "name": "ok"}),
+        )
+        .expect("save");
         assert_eq!(saved.value["enabled"], false);
         let loaded = load(&package, &root, &data).expect("reload");
         assert_eq!(loaded.value["name"], "ok");
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn a_migration_chain_rewrites_the_user_document() {
+        let root = scratch("migrate");
+        manifest(&root);
+        let manifest_text = std::fs::read_to_string(root.join("extension.toml"))
+            .expect("manifest")
+            .replace("version = \"1.0.0\"", "version = \"1.1.0\"");
+        std::fs::write(root.join("extension.toml"), manifest_text).expect("manifest");
+        std::fs::write(
+            root.join("schemas/config.schema.json"),
+            r#"{
+  "type": "object",
+  "properties": {
+    "enabled": { "type": "boolean" },
+    "mode": { "type": "string" }
+  },
+  "required": ["enabled", "mode"]
+}"#,
+        )
+        .expect("schema");
+        std::fs::create_dir_all(root.join("migrations")).expect("migrations");
+        std::fs::write(
+            root.join("migrations/001-mode.toml"),
+            r#"
+from = "1.0.0"
+to = "1.1.0"
+[set]
+mode = "safe"
+"#,
+        )
+        .expect("migration");
+        let data = root.join("data");
+        std::fs::create_dir_all(&data).expect("data");
+        std::fs::write(data.join(CONFIG_FILE), r#"{"enabled":true}"#).expect("config");
+        let package = Manifest::load(&root).expect("manifest");
+        let migrated = migrate(&package, &root, &data, "1.0.0", "1.1.0").expect("migrate");
+        assert_eq!(migrated.as_deref(), Some("1.1.0"));
+        let loaded = load(&package, &root, &data).expect("load");
+        assert_eq!(loaded.value["mode"], "safe");
+        let _ = std::fs::remove_dir_all(&root);
+    }
     #[test]
     fn a_value_outside_the_schema_is_refused() {
         let root = scratch("invalid");

@@ -25,6 +25,9 @@ pub(crate) const MAX_EVENT_BYTES: usize = 256 * 1024;
 /// The default per-subscriber queue depth.
 pub(crate) const DEFAULT_QUEUE_DEPTH: usize = 64;
 
+/// The most events one publisher may emit in a second.
+pub(crate) const MAX_EVENTS_PER_SECOND: u64 = 200;
+
 /// Topics the platform itself publishes. A package may subscribe to any
 /// declared topic; these are the reserved ones its subscriptions are checked
 /// against by documentation, not by a hard allowlist.
@@ -37,6 +40,8 @@ pub(crate) mod topics {
     pub(crate) const WORKSPACE_OPENED: &str = "workspace.opened";
     /// A workspace closed.
     pub(crate) const WORKSPACE_CLOSED: &str = "workspace.closed";
+    /// The active workspace or its open files changed.
+    pub(crate) const WORKSPACE_CHANGED: &str = "workspace.changed";
     /// An agent turn started.
     pub(crate) const AGENT_STARTED: &str = "agent.started";
     /// An agent turn completed.
@@ -55,6 +60,12 @@ pub(crate) mod topics {
     pub(crate) const EXTENSION_UNLOADED: &str = "extension.unloaded";
     /// An extension failed.
     pub(crate) const EXTENSION_FAILED: &str = "extension.failed";
+    /// A model request is about to be sent.
+    pub(crate) const MODEL_REQUESTED: &str = "model.requested";
+    /// A model request finished.
+    pub(crate) const MODEL_COMPLETED: &str = "model.completed";
+    /// The reader changed an extension configuration document.
+    pub(crate) const CONFIG_CHANGED: &str = "config.changed";
 }
 
 /// One event envelope.
@@ -292,6 +303,8 @@ pub(crate) struct EventBus {
     subscribers: Mutex<BTreeMap<u64, Subscriber>>,
     next_id: AtomicU64,
     metrics: Mutex<BusMetrics>,
+    /// publisher -> (unix second, count in that second)
+    rate: Mutex<BTreeMap<String, (u64, u64)>>,
 }
 
 impl Default for EventBus {
@@ -300,6 +313,7 @@ impl Default for EventBus {
             subscribers: Mutex::new(BTreeMap::new()),
             next_id: AtomicU64::new(1),
             metrics: Mutex::new(BusMetrics::default()),
+            rate: Mutex::new(BTreeMap::new()),
         }
     }
 }
@@ -336,6 +350,26 @@ impl EventBus {
                 metrics.rejected = metrics.rejected.saturating_add(1);
             }
             return Err(error);
+        }
+        let second = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default();
+        if let Ok(mut rate) = self.rate.lock() {
+            let entry = rate.entry(event.source.clone()).or_insert((second, 0));
+            if entry.0 != second {
+                *entry = (second, 0);
+            }
+            if entry.1 >= MAX_EVENTS_PER_SECOND {
+                if let Ok(mut metrics) = self.metrics.lock() {
+                    metrics.rejected = metrics.rejected.saturating_add(1);
+                }
+                return Err(ExtensionError::Limit {
+                    extension: event.source.clone(),
+                    message: format!("more than {MAX_EVENTS_PER_SECOND} events in one second"),
+                });
+            }
+            entry.1 = entry.1.saturating_add(1);
         }
         let subscribers = match self.subscribers.lock() {
             Ok(subscribers) => subscribers,
@@ -488,6 +522,20 @@ mod tests {
             "app.started"
         );
         assert!(subscription.try_recv().is_none());
+    }
+
+    #[test]
+    fn one_publisher_cannot_flood_the_bus() {
+        let bus = EventBus::new();
+        let mut last = None;
+        for _ in 0..=MAX_EVENTS_PER_SECOND {
+            let event =
+                ExtensionEvent::new("flood", "app.started", serde_json::json!({})).expect("event");
+            last = Some(bus.publish(&event));
+        }
+        let error = last.expect("a publish").expect_err("over the rate");
+        assert_eq!(error.category(), "limit");
+        assert!(bus.metrics().rejected >= 1);
     }
 
     #[test]

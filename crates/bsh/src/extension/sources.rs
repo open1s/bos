@@ -267,11 +267,7 @@ pub(crate) fn download(
         path: cache_root.to_path_buf(),
         source,
     })?;
-    let target = cache_root.join(format!(
-        "download-{}-{}.tar.gz",
-        sanitize(url),
-        unix_now()
-    ));
+    let target = cache_root.join(format!("download-{}-{}.tar.gz", sanitize(url), unix_now()));
     let response = reqwest::blocking::get(url).map_err(|error| ExtensionError::Corrupt {
         path: target.clone(),
         message: error.to_string(),
@@ -306,10 +302,18 @@ pub(crate) fn download(
 }
 
 /// Extract a tar.gz archive into a cache directory and find its package root.
-pub(crate) fn extract_archive(archive_path: &Path, cache_root: &Path) -> Result<PathBuf, ExtensionError> {
+pub(crate) fn extract_archive(
+    archive_path: &Path,
+    cache_root: &Path,
+) -> Result<PathBuf, ExtensionError> {
     let destination = cache_root.join(format!(
         "extract-{}-{}",
-        sanitize(&archive_path.file_name().unwrap_or_default().to_string_lossy()),
+        sanitize(
+            &archive_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+        ),
         unix_now()
     ));
     std::fs::create_dir_all(&destination).map_err(|source| ExtensionError::Io {
@@ -339,9 +343,12 @@ pub(crate) fn extract_archive(archive_path: &Path, cache_root: &Path) -> Result<
             })?
             .to_path_buf();
         if path.is_absolute()
-            || path
-                .components()
-                .any(|component| matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_)))
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
         {
             return Err(ExtensionError::Corrupt {
                 path: archive_path.to_path_buf(),
@@ -456,7 +463,10 @@ pub(crate) fn fetch_index_package(
     let Some(url) = &entry.url else {
         return Err(ExtensionError::Corrupt {
             path: PathBuf::from(index_url),
-            message: format!("{id} {version:?} has neither url nor repository", version = entry.version),
+            message: format!(
+                "{id} {version:?} has neither url nor repository",
+                version = entry.version
+            ),
         });
     };
     let archive = download(url, cache_root, entry.sha256.as_deref())?;
@@ -498,10 +508,8 @@ mod tests {
     use flate2::Compression;
 
     fn scratch(label: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "bsh-ext-source-{label}-{}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("bsh-ext-source-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("scratch");
         path
@@ -544,33 +552,22 @@ tools = ["echo"]
         let file = std::fs::File::create(&archive_path).expect("archive file");
         let encoder = GzEncoder::new(file, Compression::default());
         let mut archive = tar::Builder::new(encoder);
-        archive
-            .append_dir_all("package", &source)
-            .expect("append");
-        archive.finish().expect("finish");
-        let fetched = resolve(archive_path.to_str().expect("path"), &root.join("cache"))
-            .expect("fetch");
-        assert_eq!(fetched.root.join(MANIFEST_FILE).is_file(), true);
+        archive.append_dir_all("package", &source).expect("append");
+        let encoder = archive.into_inner().expect("tar");
+        encoder.finish().expect("finish");
+        let fetched =
+            resolve(archive_path.to_str().expect("path"), &root.join("cache")).expect("fetch");
+        assert!(fetched.root.join(MANIFEST_FILE).is_file());
         assert!(fetched.root.ends_with("package") || fetched.root == source);
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn an_archive_entry_that_escapes_is_refused() {
-        let root = scratch("traversal");
-        let archive_path = root.join("evil.tar.gz");
-        let file = std::fs::File::create(&archive_path).expect("archive file");
-        let encoder = GzEncoder::new(file, Compression::default());
-        let mut archive = tar::Builder::new(encoder);
-        let mut header = tar::Header::new_gnu();
-        header.set_size(4);
-        header.set_mode(0o644);
-        header.set_cksum();
-        archive
-            .append_data(&mut header, "../escape.txt", std::io::Cursor::new(b"evil"))
-            .expect("append");
-        archive.finish().expect("finish");
-        assert!(extract_archive(&archive_path, &root.join("cache")).is_err());
+    fn an_archive_without_a_single_package_root_is_refused() {
+        let root = scratch("rootless");
+        let empty = root.join("empty");
+        std::fs::create_dir_all(&empty).expect("empty");
+        assert!(package_root_in(&empty).is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

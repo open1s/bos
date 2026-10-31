@@ -6526,9 +6526,8 @@ impl Shell {
         };
         if self.extension_panels.is_none() {
             let panels = crate::extension::panels(&self.state.settings, workspace.as_deref(), None);
-            self.extension_panels = Some(cx.new(|_| {
-                crate::ui::extension_panel::ExtensionPanelView::new(panels)
-            }));
+            self.extension_panels =
+                Some(cx.new(|_| crate::ui::extension_panel::ExtensionPanelView::new(panels)));
         }
         let view = self.extension_panels.clone().expect("panel view");
         let refresh_settings = self.state.settings.clone();
@@ -6554,11 +6553,8 @@ impl Shell {
                 theme::text(),
             ))
             .on_click(cx.listener(move |_this, _event, _window, cx| {
-                let panels = crate::extension::panels(
-                    &refresh_settings,
-                    refresh_workspace.as_deref(),
-                    None,
-                );
+                let panels =
+                    crate::extension::panels(&refresh_settings, refresh_workspace.as_deref(), None);
                 refresh_view.update(cx, |view, cx| {
                     view.set_panels(panels);
                     cx.notify();
@@ -7765,11 +7761,34 @@ impl Shell {
     /// The page header's two controls: Refresh and the filled Add plugin.
     fn plugins_page_actions(&self, cx: &mut Context<Self>) -> AnyElement {
         let lang = self.state.lang;
+        let extension_section = section_index("extensions");
         div()
             .flex()
             .flex_row()
             .items_center()
             .gap(px(8.0))
+            .child(
+                div()
+                    .id("plugins-panels")
+                    .debug_selector(|| "plugins-panels".to_string())
+                    .h(px(32.0))
+                    .px(px(10.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .rounded(px(10.0))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(theme::hover())))
+                    .child(icon(IconName::PanelRight, 13.0, theme::muted()))
+                    .child(txt(tr(lang, "settings.extensions"), 12.0, theme::text()))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        if let Some(section) = extension_section {
+                            this.state.settings_section = section;
+                            cx.notify();
+                        }
+                    })),
+            )
             .child(
                 div()
                     .id("plugins-refresh")
@@ -7990,14 +8009,6 @@ impl Shell {
         let lang = self.state.lang;
         let mut rows = Vec::new();
         for (id, title, description, pane, glyph, color) in [
-            (
-                "extensions",
-                "settings.extensions",
-                "settings.extensionsHint",
-                "extensions",
-                IconName::PanelRight,
-                theme::accent(),
-            ),
             (
                 "web-search",
                 "settings.webToolsTitle",

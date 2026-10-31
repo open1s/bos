@@ -6,7 +6,7 @@
 //! luck. It opens no window and needs no GPUI.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::extension::capability::{Capability, GrantScope};
 use crate::extension::host::{DiagnosticsReport, ExtensionHost, ExtensionStatus, HostConfig};
@@ -28,6 +28,9 @@ Commands:
   new <id> [--dir <path>] [--force]   scaffold a declarative extension package
   validate <path>                     parse and validate a package
   hash <path>                         print the canonical package hash
+  build <path> [--out <dir>]          validate and build a .tar.gz release
+  package <path> [--out <dir>]        alias for build
+  test <path>                         validate the package and its contributions
   install <path|archive|git+url>      install a package into the managed store
               [--registry <name|url> <id>[@version]]
   uninstall <id> [--purge-data]       remove a package; keep data by default
@@ -43,6 +46,10 @@ Commands:
   revoke <id> <capability>            revoke a capability
   capabilities                        list the capability vocabulary
   logs <id>                           show the audit and runtime logs for an id
+  config <id> [set <json|file>|schema]
+                                      read or write an extension's configuration
+  metrics                             print call, event and subscriber counters
+  providers                           list model and agent provider descriptors
   doctor                              check the store, hashes, dependencies and policy
   keygen <publisher> [--out <path>]   create an Ed25519 publisher key pair
   sign <path> --publisher <name> --key <file-or-base64>
@@ -98,6 +105,8 @@ pub(crate) fn run(args: &[String]) -> i32 {
         "new" => command_new(&rest[1..]),
         "validate" => command_validate(&rest[1..]),
         "hash" => command_hash(&rest[1..]),
+        "build" | "package" => command_package(&rest[1..]),
+        "test" => command_test(&rest[1..]),
         "install" => command_install(&rest[1..], root.clone()),
         "uninstall" => command_uninstall(&rest[1..], root.clone()),
         "list" => command_list(root.clone(), json),
@@ -111,7 +120,10 @@ pub(crate) fn run(args: &[String]) -> i32 {
         "revoke" => command_revoke(&rest[1..], root.clone()),
         "capabilities" => command_capabilities(),
         "logs" => command_logs(&rest[1..], root.clone()),
+        "config" => command_config(&rest[1..], root.clone()),
         "doctor" => command_doctor(root.clone(), json),
+        "metrics" => command_metrics(root.clone()),
+        "providers" => command_providers(root.clone()),
         "keygen" => command_keygen(&rest[1..]),
         "sign" => command_sign(&rest[1..]),
         "verify" => command_verify(&rest[1..], root.clone()),
@@ -390,15 +402,10 @@ fn command_install(args: &[String], root: Option<PathBuf>) -> Result<i32, String
             sources::fetch_index_package(&url, &id, version.as_deref(), &store.cache_root())
                 .map_err(|error| error.to_string())?
         }
-        None => sources::resolve(&spec, &store.cache_root())
-            .map_err(|error| error.to_string())?,
+        None => sources::resolve(&spec, &store.cache_root()).map_err(|error| error.to_string())?,
     };
-    let candidate = Package::load(
-        &fetched.root,
-        fetched.origin.clone(),
-        TrustLevel::Local,
-    )
-    .map_err(|error| error.to_string())?;
+    let candidate = Package::load(&fetched.root, fetched.origin.clone(), TrustLevel::Local)
+        .map_err(|error| error.to_string())?;
     if !candidate.report.is_valid() {
         return Err(format!(
             "manifest is invalid: {}",
@@ -413,8 +420,7 @@ fn command_install(args: &[String], root: Option<PathBuf>) -> Result<i32, String
     if let Err(error) = resolver::resolve(&available, &roots) {
         return Err(format!("dependencies do not resolve: {error}"));
     }
-    let package = sources::install_fetched(&store, &fetched)
-        .map_err(|error| error.to_string())?;
+    let package = sources::install_fetched(&store, &fetched).map_err(|error| error.to_string())?;
     println!("installed {} {}", package.id(), package.version());
     println!("source:  {}", fetched.origin.label());
     println!("hash:    {}", package.hash);
@@ -767,9 +773,7 @@ fn command_keygen(args: &[String]) -> Result<i32, String> {
     println!("publisher: {publisher}");
     println!("secret:    {} (keep it private)", output.display());
     println!("public:    {public}");
-    println!(
-        "next:      bsh ext trust {publisher} {public}"
-    );
+    println!("next:      bsh ext trust {publisher} {public}");
     Ok(0)
 }
 
@@ -821,8 +825,8 @@ fn command_sign(args: &[String]) -> Result<i32, String> {
 
 fn command_verify(args: &[String], root: Option<PathBuf>) -> Result<i32, String> {
     let path = PathBuf::from(one_argument(args, "bsh ext verify <path>")?);
-    let manifest = crate::extension::manifest::Manifest::load(&path)
-        .map_err(|error| error.to_string())?;
+    let manifest =
+        crate::extension::manifest::Manifest::load(&path).map_err(|error| error.to_string())?;
     let hash = package_hash(&path).map_err(|error| error.to_string())?;
     let store = ExtensionStore::open(config(root).root).map_err(|error| error.to_string())?;
     let trust = TrustStore::load(store.trust_path()).map_err(|error| error.to_string())?;
@@ -843,11 +847,13 @@ fn command_verify(args: &[String], root: Option<PathBuf>) -> Result<i32, String>
         SignatureVerification::Invalid { reason } => println!("reason:    {reason}"),
         SignatureVerification::Missing => {}
     }
-    Ok(if matches!(verification, SignatureVerification::Invalid { .. }) {
-        1
-    } else {
-        0
-    })
+    Ok(
+        if matches!(verification, SignatureVerification::Invalid { .. }) {
+            1
+        } else {
+            0
+        },
+    )
 }
 
 fn command_trust(args: &[String], root: Option<PathBuf>) -> Result<i32, String> {
@@ -896,7 +902,6 @@ fn command_publishers(root: Option<PathBuf>) -> Result<i32, String> {
     }
     Ok(0)
 }
-
 
 fn command_versions(args: &[String], root: Option<PathBuf>) -> Result<i32, String> {
     let id = ExtensionId::parse(one_argument(args, "bsh ext versions <id>")?)
@@ -957,7 +962,6 @@ fn command_quarantine(args: &[String], root: Option<PathBuf>) -> Result<i32, Str
     Ok(0)
 }
 
-
 fn command_registry(args: &[String], root: Option<PathBuf>) -> Result<i32, String> {
     let action = args
         .first()
@@ -1014,8 +1018,7 @@ fn command_search(args: &[String], root: Option<PathBuf>) -> Result<i32, String>
         .find(|pair| pair[0] == "--registry")
         .map(|pair| pair[1].clone());
     let store = ExtensionStore::open(config(root).root).map_err(|error| error.to_string())?;
-    let registries =
-        RegistryList::load(&store.state_root()).map_err(|error| error.to_string())?;
+    let registries = RegistryList::load(&store.state_root()).map_err(|error| error.to_string())?;
     let mut found = 0usize;
     for (name, registry) in registries.registries {
         if only.as_deref().is_some_and(|only| only != name) {
@@ -1048,3 +1051,261 @@ fn command_search(args: &[String], root: Option<PathBuf>) -> Result<i32, String>
     Ok(0)
 }
 
+fn command_package(args: &[String]) -> Result<i32, String> {
+    let path = PathBuf::from(one_argument(args, "bsh ext build <path> [--out <dir>]")?);
+    let mut out = path.join("dist");
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--out" => {
+                out = PathBuf::from(
+                    args.get(index + 1)
+                        .ok_or_else(|| "--out needs a directory".to_string())?,
+                );
+                index += 2;
+            }
+            other => return Err(format!("unknown option {other:?}")),
+        }
+    }
+    let package = Package::load(&path, ExtensionSource::Development, TrustLevel::Local)
+        .map_err(|error| error.to_string())?;
+    if !package.report.is_valid() {
+        return Err(format!("manifest is invalid: {}", package.error_message()));
+    }
+    validate_runtime(&package)?;
+    let hash = package_hash(&path).map_err(|error| error.to_string())?;
+    std::fs::create_dir_all(&out).map_err(|error| error.to_string())?;
+    let archive_path = out.join(format!("{}-{}.tar.gz", package.id(), package.version()));
+    let temporary = archive_path.with_extension("tar.gz.tmp");
+    let file = std::fs::File::create(&temporary).map_err(|error| error.to_string())?;
+    let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::best());
+    let mut builder = tar::Builder::new(encoder);
+    let prefix = format!("{}-{}", package.id(), package.version());
+    append_tree(&mut builder, &path, Path::new(&prefix)).map_err(|error| error.to_string())?;
+    let encoder = builder.into_inner().map_err(|error| error.to_string())?;
+    encoder.finish().map_err(|error| error.to_string())?;
+    std::fs::rename(&temporary, &archive_path).map_err(|error| error.to_string())?;
+    println!("built {}", archive_path.display());
+    println!("hash:  {hash}");
+    Ok(0)
+}
+
+fn append_tree(
+    builder: &mut tar::Builder<flate2::write::GzEncoder<std::fs::File>>,
+    source: &Path,
+    archive: &Path,
+) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if matches!(
+            name.as_ref(),
+            ".git" | "target" | "node_modules" | ".jj" | "dist"
+        ) {
+            continue;
+        }
+        let path = entry.path();
+        let relative = archive.join(name.as_ref());
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            builder.append_dir(&relative, &path)?;
+            append_tree(builder, &path, &relative)?;
+        } else if metadata.is_file() {
+            builder.append_path_with_name(&path, &relative)?;
+        }
+    }
+    Ok(())
+}
+
+fn command_test(args: &[String]) -> Result<i32, String> {
+    let path = PathBuf::from(one_argument(args, "bsh ext test <path>")?);
+    let package = Package::load(&path, ExtensionSource::Development, TrustLevel::Local)
+        .map_err(|error| error.to_string())?;
+    if !package.report.is_valid() {
+        println!("invalid: {}", package.error_message());
+        return Ok(1);
+    }
+    validate_runtime(&package)?;
+    println!("valid {}", package.id());
+    println!("version: {}", package.version());
+    println!("runtime: {}", package.manifest.runtime.kind);
+    println!("tools: {}", package.manifest.contributes.tools.len());
+    println!("commands: {}", package.manifest.contributes.commands.len());
+    println!("panels: {}", package.manifest.contributes.panels.len());
+    println!(
+        "workflows: {}",
+        package.manifest.contributes.workflows.len()
+    );
+    Ok(0)
+}
+
+fn command_config(args: &[String], root: Option<PathBuf>) -> Result<i32, String> {
+    let id = ExtensionId::parse(one_argument(
+        args,
+        "bsh ext config <id> [set <json|file>|schema]",
+    )?)
+    .map_err(|error| error.to_string())?;
+    let store = ExtensionStore::open(config(root).root).map_err(|error| error.to_string())?;
+    let version = store
+        .active_version(&id)
+        .or_else(|| {
+            store
+                .versions(&id)
+                .ok()
+                .and_then(|versions| versions.last().cloned())
+        })
+        .ok_or_else(|| format!("{id} is not installed"))?;
+    let package_root = store.installed_root().join(id.as_str()).join(&version);
+    let manifest = crate::extension::manifest::Manifest::load(&package_root)
+        .map_err(|error| error.to_string())?;
+    let data_root = store.data_dir(&id);
+    let action = args.get(1).map(String::as_str);
+    match action {
+        Some("schema") => {
+            let Some(schema) = manifest
+                .configuration
+                .as_ref()
+                .and_then(|configuration| configuration.schema.as_deref())
+            else {
+                return Err("this extension declares no configuration schema".to_string());
+            };
+            let text = std::fs::read_to_string(package_root.join(schema))
+                .map_err(|error| error.to_string())?;
+            println!("{text}");
+        }
+        Some("set") => {
+            let raw = args
+                .get(2)
+                .ok_or_else(|| "usage: bsh ext config <id> set <json|file>".to_string())?;
+            let text = if std::path::Path::new(raw).is_file() {
+                std::fs::read_to_string(raw).map_err(|error| error.to_string())?
+            } else {
+                raw.clone()
+            };
+            let value: serde_json::Value =
+                serde_json::from_str(&text).map_err(|error| error.to_string())?;
+            let saved = crate::extension::config::save(&manifest, &package_root, &data_root, value)
+                .map_err(|error| error.to_string())?;
+            crate::extension::publish(
+                crate::extension::topics::CONFIG_CHANGED,
+                serde_json::json!({"extension": id.as_str()}),
+            );
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&saved.value).map_err(|error| error.to_string())?
+            );
+        }
+        Some(other) => return Err(format!("unknown config action {other:?}")),
+        None => {
+            let loaded = crate::extension::config::load(&manifest, &package_root, &data_root)
+                .map_err(|error| error.to_string())?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&loaded.value).map_err(|error| error.to_string())?
+            );
+        }
+    }
+    Ok(0)
+}
+
+fn command_metrics(root: Option<PathBuf>) -> Result<i32, String> {
+    let store = ExtensionStore::open(config(root).root).map_err(|error| error.to_string())?;
+    let host = ExtensionHost::open(HostConfig {
+        root: store.root().to_path_buf(),
+        workspace: None,
+        disabled: BTreeSet::new(),
+        preset_allowed: None,
+    })
+    .map_err(|error| error.to_string())?;
+    let metrics = host.metrics();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&metrics).map_err(|error| error.to_string())?
+    );
+    Ok(0)
+}
+
+fn command_providers(root: Option<PathBuf>) -> Result<i32, String> {
+    let store = ExtensionStore::open(config(root).root).map_err(|error| error.to_string())?;
+    let host = ExtensionHost::open(HostConfig {
+        root: store.root().to_path_buf(),
+        workspace: None,
+        disabled: BTreeSet::new(),
+        preset_allowed: None,
+    })
+    .map_err(|error| error.to_string())?;
+    let providers = host.provider_descriptors();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&providers).map_err(|error| error.to_string())?
+    );
+    Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::command_package;
+
+    #[test]
+    fn a_package_builds_a_readable_tarball() {
+        let root = std::env::temp_dir().join(format!("bsh-cli-package-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("tools")).expect("tools");
+        std::fs::write(
+            root.join("extension.toml"),
+            r#"
+schema_version = "1.0"
+
+[extension]
+id = "com.example.built"
+name = "Built"
+version = "1.0.0"
+description = "A built test package"
+
+[compatibility]
+bsh = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+
+[runtime]
+kind = "declarative"
+
+[contributes]
+tools = ["echo"]
+"#,
+        )
+        .expect("manifest");
+        std::fs::write(
+            root.join("tools/echo.json"),
+            r#"{"description":"Echo","input_schema":{"type":"object"},"implementation":{"kind":"echo_arguments"}}"#,
+        )
+        .expect("tool");
+        let out = root.join("dist");
+        command_package(&[
+            root.display().to_string(),
+            "--out".to_string(),
+            out.display().to_string(),
+        ])
+        .expect("package");
+        let archive = out.join("com.example.built-1.0.0.tar.gz");
+        assert!(archive.is_file(), "{archive:?}");
+        let file = std::fs::File::open(&archive).expect("archive");
+        let decoder = flate2::read::GzDecoder::new(file);
+        let mut tar = tar::Archive::new(decoder);
+        let names: Vec<String> = tar
+            .entries()
+            .expect("entries")
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.path().ok().map(|path| path.display().to_string()))
+            .collect();
+        assert!(
+            names.iter().any(|name| name.ends_with("extension.toml")),
+            "{names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name.ends_with("tools/echo.json")),
+            "{names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

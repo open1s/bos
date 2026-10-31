@@ -9,14 +9,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::SystemTime;
 
 use serde::Serialize;
 
 use super::agent as contribution;
 use super::capability::{CallScope, Decision, PolicyEngine, PolicyMode};
-use super::events::{lifecycle_event, topics, EventBus};
+use super::events::{lifecycle_event, topics, EventBus, ExtensionEvent};
 use super::lifecycle::{Health, LifecycleManager};
 use super::package::{write_atomic, ExtensionStore, Package};
 use super::resolver;
@@ -25,12 +26,13 @@ use super::runtime::declarative::{self, DeclarativeContributions};
 use super::runtime::mcp::McpRuntime;
 use super::runtime::process::ProcessRuntime;
 use super::runtime::wasm::WasmRuntime;
+use super::runtime::workflow::WorkflowRuntime;
 use super::runtime::{empty_schema, LazyRuntime, Runtime, ToolDescriptor};
-use super::ui::{PanelLocation, PanelVisibility, UiDocument};
 use super::types::{
     ContributionId, ExtensionError, ExtensionId, ExtensionSource, LifecycleState, RuntimeKind,
     StartupPolicy, TrustLevel, ValidationReport, EXTENSION_API_VERSION, HOST_VERSION,
 };
+use super::ui::{PanelLocation, PanelVisibility, UiDocument};
 
 /// The configuration that decides which store and which packages a host owns.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,6 +196,40 @@ pub(crate) struct PanelSurface {
     pub(crate) initial: Option<UiDocument>,
 }
 
+/// Aggregate tool-call counters.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub(crate) struct CallMetrics {
+    /// Calls started.
+    pub(crate) tool_calls: u64,
+    /// Calls that returned an error.
+    pub(crate) tool_failures: u64,
+    /// Summed wall-clock milliseconds.
+    pub(crate) total_call_ms: u64,
+    /// Slowest call in milliseconds.
+    pub(crate) max_call_ms: u64,
+    /// Summed serialized result bytes.
+    pub(crate) output_bytes: u64,
+}
+
+/// The host's observability snapshot.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct HostMetrics {
+    /// Registered extensions.
+    pub(crate) extensions: usize,
+    /// Applied extensions.
+    pub(crate) applied: usize,
+    /// Tool-call counters.
+    pub(crate) calls: CallMetrics,
+    /// Events accepted for publication.
+    pub(crate) events_published: u64,
+    /// Event deliveries accepted.
+    pub(crate) events_delivered: u64,
+    /// Event deliveries dropped on a full queue.
+    pub(crate) events_dropped: u64,
+    /// Live event subscribers.
+    pub(crate) subscribers: usize,
+}
+
 /// One diagnostic line.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct DiagnosticIssue {
@@ -269,6 +305,8 @@ pub(crate) struct ExtensionHost {
     issues: Vec<String>,
     status_cache: Arc<Mutex<Vec<ExtensionStatus>>>,
     last_stamp: Option<SystemTime>,
+    pump_generation: Arc<AtomicU64>,
+    calls: Mutex<CallMetrics>,
 }
 
 impl ExtensionHost {
@@ -294,6 +332,8 @@ impl ExtensionHost {
             issues: Vec::new(),
             status_cache,
             last_stamp: None,
+            pump_generation: Arc::new(AtomicU64::new(0)),
+            calls: Mutex::new(CallMetrics::default()),
         };
         host.register_builtins();
         host.rebuild()?;
@@ -426,8 +466,27 @@ impl ExtensionHost {
                 loaded.insert(id.as_str().to_string(), entry);
                 continue;
             }
+            if let Err(error) = self.migrate_package(&package) {
+                let message = error.to_string();
+                entry.error = Some(message.clone());
+                manager.fail(id.as_str(), message);
+                loaded.insert(id.as_str().to_string(), entry);
+                continue;
+            }
             match self.build_runtime(&package) {
                 Ok((runtime, tools, contributions)) => {
+                    let runtime: Arc<dyn Runtime> = runtime;
+                    let (runtime, tools) = if contributions.workflows.is_empty() {
+                        (runtime, tools)
+                    } else {
+                        let wrapped =
+                            WorkflowRuntime::new(runtime, &contributions.workflows, &tools)?;
+                        let tools = wrapped.descriptors();
+                        (
+                            Arc::new(LazyRuntime::new(Arc::new(wrapped))) as Arc<dyn Runtime>,
+                            tools,
+                        )
+                    };
                     entry.runtime = Some(runtime);
                     entry.tools = tools;
                     entry.contributions = contributions;
@@ -535,7 +594,76 @@ impl ExtensionHost {
             *cache = statuses;
         }
         self.last_stamp = self.stamp();
+        self.start_event_pump();
         Ok(())
+    }
+
+    /// Bring an upgraded package's data document to its current schema.
+    fn migrate_package(&self, package: &Package) -> Result<(), ExtensionError> {
+        let id = package.id();
+        let state = self.store.state_of(id);
+        let Some(from) = state.data_version.clone() else {
+            self.store.set_data_version(id, &package.version())?;
+            return Ok(());
+        };
+        let to = package.version();
+        if from == to {
+            return Ok(());
+        }
+        let data_root = self.store.data_dir(id);
+        if let Some(version) =
+            super::config::migrate(&package.manifest, &package.root, &data_root, &from, &to)?
+        {
+            self.store.set_data_version(id, &version)?;
+        }
+        Ok(())
+    }
+
+    /// Deliver subscribed events on a small background runtime.
+    ///
+    /// The thread holds Weak handles, so dropping the host ends it. A new
+    /// rebuild increments the generation and the previous thread exits, which
+    /// keeps one delivery loop per host rather than one per scan.
+    fn start_event_pump(&self) {
+        let runtimes: Vec<Weak<dyn Runtime>> = self
+            .loaded
+            .values()
+            .filter_map(|entry| entry.runtime.as_ref())
+            .map(Arc::downgrade)
+            .collect();
+        if runtimes.is_empty() {
+            return;
+        }
+        let generation = self.pump_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let watched = Arc::clone(&self.pump_generation);
+        std::thread::Builder::new()
+            .name("bsh-extension-events".to_string())
+            .spawn(move || {
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+                loop {
+                    if watched.load(Ordering::SeqCst) != generation {
+                        return;
+                    }
+                    let live: Vec<Arc<dyn Runtime>> =
+                        runtimes.iter().filter_map(Weak::upgrade).collect();
+                    if live.is_empty() {
+                        return;
+                    }
+                    runtime.block_on(async {
+                        for runtime in &live {
+                            let _ = runtime.pump().await;
+                        }
+                    });
+                    drop(live);
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                }
+            })
+            .ok();
     }
 
     fn build_runtime(&self, package: &Package) -> Result<BuiltRuntime, ExtensionError> {
@@ -566,11 +694,7 @@ impl ExtensionHost {
                 ))
             }
             RuntimeKind::Mcp => {
-                let runtime = McpRuntime::new(
-                    &package.manifest,
-                    &package.root,
-                    config.to_json(),
-                )?;
+                let runtime = McpRuntime::new(&package.manifest, &package.root, config.to_json())?;
                 let tools = runtime.descriptors()?;
                 let contributions = runtime.contributions()?;
                 Ok((
@@ -742,6 +866,62 @@ impl ExtensionHost {
         surfaces
     }
 
+    /// Every model and agent provider descriptor an applied package declares.
+    pub(crate) fn provider_descriptors(&self) -> Vec<serde_json::Value> {
+        let mut providers = Vec::new();
+        for entry in self.loaded.values() {
+            if !entry.applied {
+                continue;
+            }
+            for (kind, contributions) in [
+                ("model", &entry.contributions.model_providers),
+                ("agent", &entry.contributions.agent_providers),
+            ] {
+                for contribution in contributions {
+                    let descriptor = std::fs::read_to_string(&contribution.path)
+                        .ok()
+                        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    providers.push(serde_json::json!({
+                        "extension": entry.package.id().as_str(),
+                        "kind": kind,
+                        "id": contribution.id.as_str(),
+                        "path": contribution.path.display().to_string(),
+                        "descriptor": descriptor,
+                    }));
+                }
+            }
+        }
+        providers
+    }
+
+    /// Aggregate counters for the status view and diagnostics.
+    pub(crate) fn metrics(&self) -> HostMetrics {
+        let bus = self.events.metrics();
+        let calls = self.calls.lock().map(|calls| *calls).unwrap_or_default();
+        HostMetrics {
+            extensions: self.loaded.len(),
+            applied: self.loaded.values().filter(|entry| entry.applied).count(),
+            calls,
+            events_published: bus.published,
+            events_delivered: bus.delivered,
+            events_dropped: bus.dropped,
+            subscribers: self.events.subscriber_count(),
+        }
+    }
+
+    fn record_call(&self, millis: u64, bytes: u64, ok: bool) {
+        if let Ok(mut calls) = self.calls.lock() {
+            calls.tool_calls = calls.tool_calls.saturating_add(1);
+            if !ok {
+                calls.tool_failures = calls.tool_failures.saturating_add(1);
+            }
+            calls.total_call_ms = calls.total_call_ms.saturating_add(millis);
+            calls.max_call_ms = calls.max_call_ms.max(millis);
+            calls.output_bytes = calls.output_bytes.saturating_add(bytes);
+        }
+    }
+
     fn status_of(&self, entry: &LoadedExtension) -> ExtensionStatus {
         let id = entry.package.id();
         let record = self.manager.get(id.as_str());
@@ -861,7 +1041,9 @@ impl ExtensionHost {
                         ));
                     }
                     match &entry.package.verification {
-                        crate::extension::signing::SignatureVerification::Verified { publisher } => {
+                        crate::extension::signing::SignatureVerification::Verified {
+                            publisher,
+                        } => {
                             issues.push(DiagnosticIssue::new(
                                 "info",
                                 Some(id),
@@ -943,10 +1125,7 @@ impl ExtensionHost {
 ///
 /// Every version stays on disk for rollback; only the selected one is loaded,
 /// so two versions cannot register the same tool namespace.
-fn select_active_versions(
-    packages: Vec<Package>,
-    store: &ExtensionStore,
-) -> Vec<Package> {
+fn select_active_versions(packages: Vec<Package>, store: &ExtensionStore) -> Vec<Package> {
     let mut by_id: BTreeMap<String, Vec<Package>> = BTreeMap::new();
     for package in packages {
         by_id
@@ -969,7 +1148,10 @@ fn select_active_versions(
             }
         }
         versions.sort_by(|left, right| {
-            left.manifest.extension.version.cmp(&right.manifest.extension.version)
+            left.manifest
+                .extension
+                .version
+                .cmp(&right.manifest.extension.version)
         });
         if let Some(package) = versions.pop() {
             selected.push(package);
@@ -1030,6 +1212,37 @@ pub(crate) fn install(
         .as_ref()
         .map(|host| host.apply(agent, registry))
         .unwrap_or_default()
+}
+
+/// Publish a host event on the process-global bus.
+///
+/// The host never invents a subscriber: a package that did not subscribe
+/// receives nothing, and a full queue is counted rather than blocking the
+/// publisher.
+pub(crate) fn publish(topic: &str, payload: serde_json::Value) {
+    let slot = HOST.get_or_init(|| Mutex::new(None));
+    let Ok(guard) = slot.lock() else {
+        return;
+    };
+    let Some(host) = guard.as_ref() else {
+        return;
+    };
+    if let Ok(event) = ExtensionEvent::new("bsh", topic, payload) {
+        if let Err(error) = host.events.publish(&event) {
+            log::debug!(target: "bsh::extension", "event publish failed: {error}");
+        }
+    }
+}
+
+/// Record one extension tool call on the process-global host.
+pub(crate) fn record_tool_call(millis: u64, bytes: u64, ok: bool) {
+    let slot = HOST.get_or_init(|| Mutex::new(None));
+    let Ok(guard) = slot.lock() else {
+        return;
+    };
+    if let Some(host) = guard.as_ref() {
+        host.record_call(millis, bytes, ok);
+    }
 }
 
 /// The panels the current configuration offers, for the host UI.

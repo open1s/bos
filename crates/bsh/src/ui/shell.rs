@@ -850,8 +850,7 @@ pub(crate) struct Shell {
     pub(crate) caps_generation: u64,
     pub(crate) plugins: Vec<crate::plugins::PluginInfo>,
     /// The declarative extension panel host, created when the pane opens.
-    pub(crate) extension_panels:
-        Option<Entity<crate::ui::extension_panel::ExtensionPanelView>>,
+    pub(crate) extension_panels: Option<Entity<crate::ui::extension_panel::ExtensionPanelView>>,
     /// The settings dialog's text fields.
     pub(crate) settings_inputs: SettingsInputs,
     /// The Vault pane's text fields.
@@ -2266,6 +2265,14 @@ impl Shell {
         // A new workspace means a new tree and new notes, and the open file
         // tabs belonged to the old root.
         self.refile_workspace(cx);
+        crate::extension::publish(
+            crate::extension::topics::WORKSPACE_CHANGED,
+            serde_json::json!({
+                "workspace": self.state.settings.global.general.active_workspace,
+                "root": root,
+                "reason": "opened",
+            }),
+        );
         cx.notify();
     }
 
@@ -2506,8 +2513,20 @@ impl Shell {
             return;
         }
         let attachments = std::mem::take(&mut self.state.attachments);
+        let bytes = text.len();
+        let model = self.state.effective().model_name;
         match self.submit(text, attachments, cx) {
-            Submit::Accepted => self.clear_composer(window, cx),
+            Submit::Accepted => {
+                crate::extension::publish(
+                    crate::extension::topics::MODEL_REQUESTED,
+                    serde_json::json!({
+                        "model": model,
+                        "session": self.state.active_session(),
+                        "bytes": bytes,
+                    }),
+                );
+                self.clear_composer(window, cx);
+            }
             // A refusal leaves the chips where the reader can retry them.
             Submit::Refused(attachments) => self.state.attachments = attachments,
         }
@@ -3669,6 +3688,13 @@ impl Shell {
                     // update as the deltas means the settled frame is the only
                     // frame the batch asks for.
                     if let Some(failed) = terminal {
+                        crate::extension::publish(
+                            crate::extension::topics::MODEL_COMPLETED,
+                            serde_json::json!({
+                                "session": session_id,
+                                "failed": failed,
+                            }),
+                        );
                         shell.state.finish_plan(&session_id);
                         // A goal the model settled during the turn takes
                         // effect BEFORE the loop decides to continue: a

@@ -132,6 +132,12 @@ pub(crate) struct ContributesSpec {
     /// Reusable workflows.
     #[serde(default)]
     pub(crate) workflows: Vec<ContributionId>,
+    /// Model provider descriptors (providers/models/<id>.json).
+    #[serde(default)]
+    pub(crate) model_providers: Vec<ContributionId>,
+    /// Agent role descriptors (providers/agents/<id>.json).
+    #[serde(default)]
+    pub(crate) agent_providers: Vec<ContributionId>,
     /// Visual themes.
     #[serde(default)]
     pub(crate) themes: Vec<ContributionId>,

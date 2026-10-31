@@ -284,3 +284,93 @@ reader has agreed to lose it.
 | agent.rs | tools, commands, panels, prompts and per-call authorization |
 | host.rs | discovery, resolution, activation, status, doctor |
 | cli.rs | bsh ext |
+
+## WASM components
+
+A package selects `runtime.kind = "wasm-component"` and names a component in
+`runtime.entry` (for example `wasm/extension.wasm`). The host validates the
+component against `crates/bsh/wit/extension.wit` and enforces:
+
+- `resources.max_memory_mb` through a Wasmtime `StoreLimits`;
+- `resources.max_execution_ms` through fuel and an epoch deadline;
+- policy on every host call: `read_file`, `write_file`, `fetch`,
+  `storage_*`, `read_secret`, `configuration`, `emit`, `subscribe`.
+
+`examples/extensions/wasm-echo` is the smallest working guest. Build it with
+`cargo build --target wasm32-unknown-unknown --release` and
+`wasm-tools component new`; its README records the exact recipe.
+
+## MCP servers
+
+A package selects `runtime.kind = "mcp"`. The host starts the server, performs
+`initialize` and `notifications/initialized`, then maps:
+
+- `tools/list` to BSH tool descriptors;
+- `resources/list` and `resources/read` to context contributions;
+- `prompts/list` and `prompts/get` to prompt contributions.
+
+`examples/extensions/mcp-echo` is a newline-delimited JSON-RPC Python server.
+The process needs `process.execute` plus the tool/context/prompt registration
+grants, exactly like a process package.
+
+## Workflows
+
+Declare `workflows = ["release"]` and ship `workflows/release.json`:
+
+~~~json
+{
+  "description": "Run the release checks",
+  "input_schema": {"type": "object"},
+  "steps": [
+    {"name": "check", "tool": "lint", "arguments": {"path": "{{input.path}}"}},
+    {"name": "report", "tool": "echo", "arguments": {"lint": "{{steps.check}}"}}
+  ]
+}
+~~~
+
+The workflow is advertised as its own tool. Its descriptor carries the union of
+the steps' capabilities, and every step calls a tool in the SAME package.
+`{{input.x}}` and `{{steps.name.x}}` placeholders are substituted before the
+call.
+
+## Configuration and migrations
+
+`[configuration]` names a JSON Schema and defaults. The host merges defaults
+with `extension-data/<id>/config.json`, validates the result against the
+supported schema subset, and exposes it through the WASM host function and the
+process/MCP initialize handshake.
+
+Ship `migrations/<name>.toml` to move data on upgrade:
+
+~~~toml
+from = "1.0.0"
+to = "1.1.0"
+[set]
+mode = "safe"
+~~~
+
+Migrations run when the package version differs from the recorded data version.
+The final document is validated against the new schema before it is written.
+
+## Signing and registries
+
+~~~text
+bsh ext keygen acme --out acme.key
+bsh ext trust acme <public-key>
+bsh ext sign examples/extensions/hello --publisher acme --key acme.key
+bsh ext verify examples/extensions/hello
+bsh ext install examples/extensions/hello
+~~~
+
+`package.sig` is copied into the package but excluded from the package hash.
+Install refuses an invalid signature and records verified/untrusted status.
+
+Registries are HTTP JSON indexes:
+
+~~~json
+{"format":1,"packages":[{"id":"com.example.x","version":"1.0.0","url":"https://example/x-1.0.0.tar.gz","sha256":"..."}]}
+~~~
+
+`bsh ext registry add official https://example/index.json`, then
+`bsh ext search` and `bsh ext install --registry official com.example.x@1.0.0`.
+Git sources use `git+https://github.com/owner/repo#revision`.

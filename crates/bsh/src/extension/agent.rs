@@ -8,10 +8,12 @@
 //! not a silent no-op.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::Stream;
 use react::tool::registry::AsyncTool as _;
 use serde_json::Value;
 
@@ -67,6 +69,7 @@ pub(crate) struct ExtensionTool {
     workspace: Option<PathBuf>,
     timeout_ms: u64,
     qualified: String,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl ExtensionTool {
@@ -89,6 +92,7 @@ impl ExtensionTool {
             workspace,
             timeout_ms: contributed.timeout_ms,
             qualified,
+            cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -145,7 +149,21 @@ impl react::tool::registry::AsyncTool for ExtensionTool {
         self.descriptor.input_schema.clone()
     }
 
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn is_cancelable(&self) -> bool {
+        true
+    }
+
+    fn cancel(&self, _call_id: &str) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
     async fn run(&self, arguments: &Value) -> Result<Value, agent::tools::ToolError> {
+        self.cancelled.store(false, Ordering::SeqCst);
+        let started = std::time::Instant::now();
         let correlation = uuid::Uuid::new_v4().to_string();
         let scope = self.scope(arguments);
         for capability in &self.descriptor.capabilities {
@@ -176,31 +194,55 @@ impl react::tool::registry::AsyncTool for ExtensionTool {
             self.workspace.clone(),
             self.timeout_ms,
         );
-        let call = self
-            .runtime
-            .call_tool(self.descriptor.id.as_str(), arguments.clone(), &context);
-        let outcome =
-            match tokio::time::timeout(Duration::from_millis(self.timeout_ms.max(1)), call).await {
+        let call =
+            self.runtime
+                .call_tool_result(self.descriptor.id.as_str(), arguments.clone(), &context);
+        let cancel = Arc::clone(&self.cancelled);
+        let cancelled = async move {
+            while !cancel.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let outcome = tokio::select! {
+            _ = cancelled => Err(ExtensionError::Runtime {
+                extension: self.owner.to_string(),
+                message: "cancelled".to_string(),
+            }),
+            result = tokio::time::timeout(
+                Duration::from_millis(self.timeout_ms.max(1)),
+                call,
+            ) => match result {
                 Ok(result) => result,
                 Err(_) => Err(ExtensionError::Timeout {
                     extension: self.owner.to_string(),
                     operation: self.qualified.clone(),
                     millis: self.timeout_ms,
                 }),
-            };
+            },
+        };
         match outcome {
-            Ok(value) => {
+            Ok(result) => {
+                let value = result.to_value();
+                let bytes = serde_json::to_vec(&value)
+                    .map(|bytes| bytes.len())
+                    .unwrap_or(0);
+                super::host::record_tool_call(
+                    started.elapsed().as_millis() as u64,
+                    bytes as u64,
+                    true,
+                );
                 self.emit(
                     topics::TOOL_COMPLETED,
                     serde_json::json!({
                         "tool": self.descriptor.id.as_str(),
-                        "bytes": serde_json::to_vec(&value).map(|bytes| bytes.len()).unwrap_or(0),
+                        "bytes": bytes,
                     }),
                     &correlation,
                 );
                 Ok(value)
             }
             Err(error) => {
+                super::host::record_tool_call(started.elapsed().as_millis() as u64, 0, false);
                 self.emit(
                     topics::TOOL_FAILED,
                     serde_json::json!({
@@ -212,6 +254,27 @@ impl react::tool::registry::AsyncTool for ExtensionTool {
                 Err(error.to_tool_error())
             }
         }
+    }
+
+    async fn run_streaming(
+        &self,
+        input: &Value,
+    ) -> Result<
+        std::pin::Pin<Box<dyn Stream<Item = Result<String, agent::tools::ToolError>> + Send>>,
+        agent::tools::ToolError,
+    > {
+        let value = self.run(input).await?;
+        let text = match value {
+            Value::String(text) => text,
+            other => serde_json::to_string(&other)
+                .map_err(|error| agent::tools::ToolError::Failed(error.to_string()))?,
+        };
+        let characters: Vec<char> = text.chars().collect();
+        let chunks: Vec<Result<String, agent::tools::ToolError>> = characters
+            .chunks(4096)
+            .map(|chunk| Ok(chunk.iter().collect()))
+            .collect();
+        Ok(Box::pin(futures::stream::iter(chunks)))
     }
 }
 

@@ -170,9 +170,7 @@ pub(crate) fn package_hash(root: &Path) -> Result<String, ExtensionError> {
                 ),
             });
         }
-        if is_ignored(entry.path())
-            || entry.file_name().to_str() == Some(SIGNATURE_FILE)
-        {
+        if is_ignored(entry.path()) || entry.file_name().to_str() == Some(SIGNATURE_FILE) {
             // The signature covers the tree, so it cannot be part of the hash
             // it signs; copy_tree still installs it.
             continue;
@@ -701,9 +699,7 @@ impl ExtensionStore {
     pub(crate) fn versions(&self, id: &ExtensionId) -> Result<Vec<String>, ExtensionError> {
         let directory = self.installed_root().join(id.as_str());
         if !directory.is_dir() {
-            return Err(ExtensionError::NotInstalled {
-                id: id.to_string(),
-            });
+            return Err(ExtensionError::NotInstalled { id: id.to_string() });
         }
         let mut versions: Vec<String> = std::fs::read_dir(&directory)
             .map_err(|source| ExtensionError::Io {
@@ -737,6 +733,17 @@ impl ExtensionStore {
         })
     }
 
+    /// Record the data schema version migrations produced.
+    pub(crate) fn set_data_version(
+        &self,
+        id: &ExtensionId,
+        version: &str,
+    ) -> Result<ExtensionState, ExtensionError> {
+        self.update_state(id, |state| {
+            state.data_version = Some(version.to_string());
+        })
+    }
+
     /// The pinned version, if one was recorded.
     pub(crate) fn active_version(&self, id: &ExtensionId) -> Option<String> {
         self.state_of(id).active_version
@@ -754,9 +761,7 @@ impl ExtensionStore {
     ) -> Result<PathBuf, ExtensionError> {
         let source = self.installed_root().join(id.as_str());
         if !source.exists() {
-            return Err(ExtensionError::NotInstalled {
-                id: id.to_string(),
-            });
+            return Err(ExtensionError::NotInstalled { id: id.to_string() });
         }
         let destination = self
             .quarantine_root()
@@ -780,10 +785,7 @@ impl ExtensionStore {
         let note = destination.join("QUARANTINE.txt");
         let _ = std::fs::write(
             &note,
-            format!(
-                "quarantined at {}\nreason: {reason}\n",
-                unix_now()
-            ),
+            format!("quarantined at {}\nreason: {reason}\n", unix_now()),
         );
         Ok(destination)
     }
@@ -982,6 +984,9 @@ impl ExtensionStore {
             state.installed_at = package.installed_at;
             state.last_error = None;
             state.active_version = Some(version.clone());
+            if state.data_version.is_none() {
+                state.data_version = Some(version.clone());
+            }
         })?;
         Ok(package)
     }

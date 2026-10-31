@@ -132,6 +132,47 @@ impl ProcessSession {
     }
 }
 
+/// Apply the manifest's resource ceilings in the child, before exec.
+///
+/// RLIMIT_AS bounds the address space, RLIMIT_CPU is the wall-independent CPU
+/// backstop behind the host's own wall-clock timeout, and RLIMIT_NOFILE keeps a
+/// package from exhausting the process's descriptor table. Failures are
+/// ignored: a platform that refuses a limit still gets the host-side timeout.
+fn configure_process_limits(command: &mut Command, memory: u64, cpu: u64) {
+    #[cfg(unix)]
+    {
+        // SAFETY: pre_exec runs in the forked child before exec. The closure
+        // only calls async-signal-safe setrlimit/setpgid and captures integers.
+        unsafe {
+            command.pre_exec(move || {
+                let memory = memory.max(16 * 1024 * 1024) as libc::rlim_t;
+                let address = libc::rlimit {
+                    rlim_cur: memory,
+                    rlim_max: memory,
+                };
+                let _ = libc::setrlimit(libc::RLIMIT_AS, &address);
+                let cpu = cpu.max(1) as libc::rlim_t;
+                let cpu_limit = libc::rlimit {
+                    rlim_cur: cpu,
+                    rlim_max: cpu,
+                };
+                let _ = libc::setrlimit(libc::RLIMIT_CPU, &cpu_limit);
+                let descriptors = libc::rlimit {
+                    rlim_cur: 256,
+                    rlim_max: 256,
+                };
+                let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &descriptors);
+                let _ = libc::setpgid(0, 0);
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (command, memory, cpu);
+    }
+}
+
 fn jsonrpc_error_message(error: &Value) -> String {
     let code = error.get("code").and_then(Value::as_i64).unwrap_or(0);
     let message = error
@@ -214,6 +255,8 @@ pub(crate) struct ProcessRuntime {
     tools: Vec<ToolDescriptor>,
     max_execution_ms: u64,
     max_output_bytes: u64,
+    memory_bytes: u64,
+    cpu_seconds: u64,
     config: String,
     session: Mutex<Option<ProcessSession>>,
 }
@@ -252,6 +295,8 @@ impl ProcessRuntime {
             tools,
             max_execution_ms: manifest.resources.execution_ms(),
             max_output_bytes: manifest.resources.output_bytes(),
+            memory_bytes: manifest.resources.memory_mb().saturating_mul(1024 * 1024),
+            cpu_seconds: (manifest.resources.execution_ms() / 1000).max(1) + 2,
             config: "{}".to_string(),
             session: Mutex::new(None),
         })
@@ -304,6 +349,7 @@ impl ProcessRuntime {
             canonical
         };
         let mut command = Command::new(&program);
+        configure_process_limits(&mut command, self.memory_bytes, self.cpu_seconds);
         command
             .args(&self.args)
             .current_dir(&self.root)

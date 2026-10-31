@@ -34,14 +34,15 @@ mod lifecycle;
 mod manifest;
 mod package;
 mod resolver;
+pub(crate) mod runtime;
 mod signing;
 mod sources;
-mod runtime;
 mod storage;
-mod types;
+pub(crate) mod types;
 pub(crate) mod ui;
 
-pub(crate) use host::{install, panels, PanelSurface};
+pub(crate) use events::topics;
+pub(crate) use host::{install, panels, publish};
 
 /// Run the developer CLI and return the process exit code.
 pub(crate) fn cli(args: &[String]) -> i32 {

@@ -98,8 +98,11 @@ my-extension/
   prompts/<id>.md         one per declared prompt
   contexts/<id>.md        one per declared context
   panels/<id>.json        one per declared panel
-  workflows/<id>.yaml     recorded only
-  themes/<id>.json        recorded only
+  workflows/<id>.json     one per declared workflow (executed)
+  themes/<id>.json        one per declared theme (recorded)
+  providers/models/<id>.json   model provider descriptors
+  providers/agents/<id>.json   agent role descriptors
+  migrations/<name>.toml  data migrations, applied on version change
   schemas/                configuration schemas
   assets/                 icons and images referenced as asset/...
 ~~~
@@ -460,7 +463,8 @@ Envelope:
 ~~~
 
 Reserved topics: app.started, app.shutdown, workspace.opened,
-workspace.closed, agent.started, agent.completed, agent.failed, tool.invoked,
+workspace.closed, workspace.changed, agent.started, agent.completed,
+agent.failed, model.requested, model.completed, config.changed, tool.invoked,
 tool.completed, tool.failed, extension.loaded, extension.unloaded,
 extension.failed.
 
@@ -471,11 +475,18 @@ Controls:
 - a full queue drops the event and increments a counter; it never blocks the
   publisher and never grows without bound;
 - an event over 256 KiB is refused before publication;
+- one source may publish at most 200 events in a second; beyond that the event
+  is refused with a limit error and counted;
+- a WASM component may publish only topics its manifest lists in
+  contributes.publishes (tool.* is always allowed);
 - subscription drop removes it from the bus.
 
-The host publishes extension.loaded and extension.failed today, and every
+The host publishes extension.loaded/extension.failed and the shell publishes
+workspace.changed, model.requested, model.completed and config.changed. Every
 extension tool publishes tool.invoked, tool.completed and tool.failed on its own
-source with the call's correlation id.
+source with the call's correlation id. A background pump delivers queued events
+to active runtimes; the WASM guest receives on-event, the process protocol does
+not yet have a subscription frame.
 
 ## 10. Declarative UI
 
@@ -558,6 +569,8 @@ The package hash is SHA-256 over each file's relative path, byte length and
 content digest, in sorted path order. Directory metadata, timestamps and modes
 are excluded. .git, .jj, target and node_modules are excluded from both the hash
 and the copy. Symlinks are refused: a package must be self-contained.
+package.sig is copied and installed but is EXCLUDED from the hash it signs;
+including it would make a signature impossible to verify after signing.
 
 Install is staged, hashed, then renamed into place. A failed install leaves the
 staging directory, never a half-populated version. An existing id/version is
@@ -567,10 +580,13 @@ The lockfile records format, host, extension API, and for each package its id,
 exact version, hash, source and resolved dependency versions. It is sorted by id
 and is deterministic for a given resolution.
 
-Signatures: the registry record has a signature field and doctor warns when one
-is present, because this build records signature metadata but does not verify
-it. A hash proves integrity after install; it does not prove who produced the
-package.
+Signatures: package.sig carries an Ed25519 signature over the canonical message
+bsh-package-v1, id, exact version and package hash. Install verifies it against
+extension-state/trust.toml; a valid signature by a trusted publisher sets trust
+to verified, an untrusted publisher is recorded as a warning, and an invalid
+signature refuses installation. bsh ext keygen/sign/trust/untrust/verify manage
+the key and trust lifecycle. A hash proves integrity; only a verified signature
+proves who produced the package.
 
 ## 13. Diagnostics and CLI
 
@@ -583,15 +599,32 @@ startup duration, install time and dependency ids.
 bsh ext new <id> [--dir <path>] [--force]
 bsh ext validate <path>
 bsh ext hash <path>
-bsh ext install <path>
+bsh ext build|package <path> [--out <dir>]
+bsh ext test <path>
+bsh ext install <path|archive|git+url> [--registry <name|url> <id>[@version]]
 bsh ext uninstall <id> [--purge-data]
 bsh ext list [--json]
 bsh ext info <id> [--json]
 bsh ext enable <id>
 bsh ext disable <id>
+bsh ext versions <id>
+bsh ext update <path>
+bsh ext rollback <id>
+bsh ext quarantine <id> [--reason <text>]
 bsh ext grant <id> <capability> [--scope <scope>] [--note <text>]
 bsh ext revoke <id> <capability>
 bsh ext capabilities
+bsh ext config <id> [set <json|file>|schema]
+bsh ext keygen <publisher> [--out <path>]
+bsh ext sign <path> --publisher <name> --key <file-or-base64>
+bsh ext verify <path>
+bsh ext trust <publisher> <public-key>
+bsh ext untrust <publisher>
+bsh ext publishers
+bsh ext registry add|list|remove ...
+bsh ext search [query] [--registry <name>]
+bsh ext providers
+bsh ext metrics
 bsh ext logs <id>
 bsh ext doctor [--json]
 ~~~

@@ -10,6 +10,7 @@ pub(crate) mod declarative;
 pub(crate) mod mcp;
 pub(crate) mod process;
 pub(crate) mod wasm;
+pub(crate) mod workflow;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -42,6 +43,171 @@ pub(crate) struct ToolDescriptor {
     /// Capabilities a call needs. Empty means only the registration
     /// capability, which was authorized at activation.
     pub(crate) capabilities: Vec<Capability>,
+}
+
+/// One part of a tool result.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ToolContent {
+    /// Plain text.
+    Text(String),
+    /// An image, base64 encoded with its media type.
+    Image {
+        /// MIME type such as image/png.
+        media_type: String,
+        /// Base64 bytes.
+        data: String,
+        /// Alternative text.
+        alt: String,
+    },
+    /// A file, base64 encoded with its media type.
+    File {
+        /// Display name.
+        name: String,
+        /// MIME type.
+        media_type: String,
+        /// Base64 bytes.
+        data: String,
+    },
+    /// Arbitrary structured JSON.
+    Json(Value),
+}
+
+/// A rich tool result.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ToolResult {
+    /// Ordered content parts.
+    pub(crate) content: Vec<ToolContent>,
+    /// Machine-readable structured content, when the tool produced one.
+    pub(crate) structured: Option<Value>,
+    /// Whether the tool reported a failure.
+    pub(crate) is_error: bool,
+}
+
+impl ToolResult {
+    /// A single text result.
+    pub(crate) fn text(text: impl Into<String>) -> Self {
+        Self {
+            content: vec![ToolContent::Text(text.into())],
+            structured: None,
+            is_error: false,
+        }
+    }
+
+    /// Wrap a runtime's JSON value, recognizing MCP-shaped content.
+    pub(crate) fn from_value(value: Value) -> Self {
+        if let Value::Object(object) = &value {
+            if let Some(items) = object.get("content").and_then(Value::as_array) {
+                let content = items.iter().map(content_from_value).collect();
+                return Self {
+                    content,
+                    structured: object.get("structuredContent").cloned(),
+                    is_error: object
+                        .get("isError")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                };
+            }
+        }
+        if let Value::String(text) = &value {
+            return Self::text(text.clone());
+        }
+        Self {
+            content: vec![ToolContent::Json(value)],
+            structured: None,
+            is_error: false,
+        }
+    }
+
+    /// Convert back to the JSON shape the agent transcript stores.
+    pub(crate) fn to_value(&self) -> Value {
+        if !self.is_error && self.structured.is_none() && self.content.len() == 1 {
+            match &self.content[0] {
+                ToolContent::Text(text) => return Value::String(text.clone()),
+                ToolContent::Json(value) => return value.clone(),
+                _ => {}
+            }
+        }
+        let mut object = serde_json::Map::new();
+        object.insert(
+            "content".to_string(),
+            Value::Array(self.content.iter().map(content_to_value).collect()),
+        );
+        if let Some(structured) = &self.structured {
+            object.insert("structuredContent".to_string(), structured.clone());
+        }
+        if self.is_error {
+            object.insert("isError".to_string(), Value::Bool(true));
+        }
+        Value::Object(object)
+    }
+}
+
+fn content_from_value(value: &Value) -> ToolContent {
+    match value.get("type").and_then(Value::as_str) {
+        Some("text") => ToolContent::Text(
+            value
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        ),
+        Some("image") => ToolContent::Image {
+            media_type: value
+                .get("mimeType")
+                .and_then(Value::as_str)
+                .unwrap_or("image/png")
+                .to_string(),
+            data: value
+                .get("data")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            alt: value
+                .get("alt")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        },
+        Some("resource") => ToolContent::File {
+            name: value
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("resource")
+                .to_string(),
+            media_type: value
+                .get("mimeType")
+                .and_then(Value::as_str)
+                .unwrap_or("application/octet-stream")
+                .to_string(),
+            data: value
+                .get("data")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        },
+        _ => ToolContent::Json(value.clone()),
+    }
+}
+
+fn content_to_value(content: &ToolContent) -> Value {
+    match content {
+        ToolContent::Text(text) => serde_json::json!({"type":"text","text":text}),
+        ToolContent::Image {
+            media_type,
+            data,
+            alt,
+        } => serde_json::json!({
+            "type":"image","mimeType":media_type,"data":data,"alt":alt
+        }),
+        ToolContent::File {
+            name,
+            media_type,
+            data,
+        } => serde_json::json!({
+            "type":"resource","name":name,"mimeType":media_type,"data":data
+        }),
+        ToolContent::Json(value) => value.clone(),
+    }
 }
 
 /// The per-call context every runtime receives.
@@ -108,12 +274,20 @@ pub(crate) trait Runtime: Send + Sync {
         context: &CallContext,
     ) -> Result<Value, ExtensionError>;
 
-    /// Execute one command contribution. A runtime without commands refuses.
-    async fn command(
+    /// Invoke one tool and preserve rich content parts.
+    async fn call_tool_result(
         &self,
-        id: &str,
-        _arguments: Value,
-    ) -> Result<Value, ExtensionError> {
+        name: &str,
+        arguments: Value,
+        context: &CallContext,
+    ) -> Result<ToolResult, ExtensionError> {
+        self.call_tool(name, arguments, context)
+            .await
+            .map(ToolResult::from_value)
+    }
+
+    /// Execute one command contribution. A runtime without commands refuses.
+    async fn command(&self, id: &str, _arguments: Value) -> Result<Value, ExtensionError> {
         Err(ExtensionError::UnsupportedRuntime {
             kind: format!("{} command {id}", self.kind()),
         })
@@ -348,6 +522,32 @@ impl Runtime for LazyRuntime {
     ) -> Result<Value, ExtensionError> {
         self.ensure().await?;
         self.inner.call_tool(name, arguments, context).await
+    }
+
+    async fn call_tool_result(
+        &self,
+        name: &str,
+        arguments: Value,
+        context: &CallContext,
+    ) -> Result<ToolResult, ExtensionError> {
+        self.ensure().await?;
+        self.inner.call_tool_result(name, arguments, context).await
+    }
+
+    async fn command(&self, id: &str, arguments: Value) -> Result<Value, ExtensionError> {
+        self.ensure().await?;
+        self.inner.command(id, arguments).await
+    }
+
+    async fn panel(&self, id: &str) -> Result<Value, ExtensionError> {
+        self.ensure().await?;
+        self.inner.panel(id).await
+    }
+
+    async fn pump(&self) -> Result<(), ExtensionError> {
+        // Pump must not activate an on-demand package: an idle host with no
+        // subscribers should pay nothing for a package nobody called yet.
+        self.inner.pump().await
     }
 }
 

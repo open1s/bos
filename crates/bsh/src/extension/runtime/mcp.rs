@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use super::declarative::{DeclarativeContributions, TextContribution};
-use super::{CallContext, Runtime, ToolDescriptor};
+use super::{CallContext, Runtime, ToolDescriptor, ToolResult};
 use crate::extension::manifest::{is_allowlisted_command, validate_relative_path, Manifest};
 use crate::extension::types::{
     ContributionId, ExtensionError, ExtensionId, RuntimeKind, HOST_VERSION,
@@ -45,7 +45,12 @@ struct Session {
 }
 
 impl Session {
-    fn request(&mut self, method: &str, params: Value, timeout_ms: u64) -> Result<Value, ExtensionError> {
+    fn request(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout_ms: u64,
+    ) -> Result<Value, ExtensionError> {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
         let request = json!({
@@ -59,10 +64,12 @@ impl Session {
             message: error.to_string(),
         })?;
         line.push(b'\n');
-        self.stdin.write_all(&line).map_err(|error| ExtensionError::Io {
-            path: PathBuf::from("<mcp stdin>"),
-            source: error,
-        })?;
+        self.stdin
+            .write_all(&line)
+            .map_err(|error| ExtensionError::Io {
+                path: PathBuf::from("<mcp stdin>"),
+                source: error,
+            })?;
         self.stdin.flush().map_err(|error| ExtensionError::Io {
             path: PathBuf::from("<mcp stdin>"),
             source: error,
@@ -91,12 +98,11 @@ impl Session {
                         message: "server closed stdout".to_string(),
                     },
                 })?;
-            let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
-                ExtensionError::Protocol {
+            let value: Value =
+                serde_json::from_slice(&bytes).map_err(|error| ExtensionError::Protocol {
                     extension: "mcp".to_string(),
                     message: format!("response is not JSON: {error}"),
-                }
-            })?;
+                })?;
             if value.get("id").and_then(Value::as_u64) != Some(id) {
                 continue;
             }
@@ -165,7 +171,11 @@ struct Catalog {
 
 impl McpRuntime {
     /// Prepare an MCP runtime without starting the server.
-    pub(crate) fn new(manifest: &Manifest, root: &Path, config: String) -> Result<Self, ExtensionError> {
+    pub(crate) fn new(
+        manifest: &Manifest,
+        root: &Path,
+        config: String,
+    ) -> Result<Self, ExtensionError> {
         if manifest.runtime.kind != RuntimeKind::Mcp {
             return Err(ExtensionError::Manifest {
                 path: root.join("extension.toml"),
@@ -203,7 +213,11 @@ impl McpRuntime {
     /// Start the server, handshake, and list its contributions.
     pub(crate) fn descriptors(&self) -> Result<Vec<ToolDescriptor>, ExtensionError> {
         let catalog = self.catalog()?;
-        Ok(catalog.as_ref().expect("catalog was just built").tools.clone())
+        Ok(catalog
+            .as_ref()
+            .expect("catalog was just built")
+            .tools
+            .clone())
     }
 
     /// Context and prompt contributions discovered from resources/prompts.
@@ -249,17 +263,19 @@ impl McpRuntime {
         let program = if is_allowlisted_command(&self.entry) {
             PathBuf::from(&self.entry)
         } else {
-            let relative = validate_relative_path(&self.entry).map_err(|reason| {
-                ExtensionError::Manifest {
+            let relative =
+                validate_relative_path(&self.entry).map_err(|reason| ExtensionError::Manifest {
                     path: self.root.join("extension.toml"),
                     message: reason,
-                }
-            })?;
+                })?;
             let path = self.root.join(relative);
-            let canonical_root = self.root.canonicalize().map_err(|source| ExtensionError::Io {
-                path: self.root.clone(),
-                source,
-            })?;
+            let canonical_root = self
+                .root
+                .canonicalize()
+                .map_err(|source| ExtensionError::Io {
+                    path: self.root.clone(),
+                    source,
+                })?;
             let canonical = path.canonicalize().map_err(|source| ExtensionError::Io {
                 path: path.clone(),
                 source,
@@ -296,10 +312,13 @@ impl McpRuntime {
             extension: self.extension.to_string(),
             message: "MCP stdin was not piped".to_string(),
         })?;
-        let stdout = child.stdout.take().ok_or_else(|| ExtensionError::Protocol {
-            extension: self.extension.to_string(),
-            message: "MCP stdout was not piped".to_string(),
-        })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| ExtensionError::Protocol {
+                extension: self.extension.to_string(),
+                message: "MCP stdout was not piped".to_string(),
+            })?;
         if let Some(stderr) = child.stderr.take() {
             let extension = self.extension.to_string();
             std::thread::spawn(move || {
@@ -408,7 +427,10 @@ impl McpRuntime {
         if let Ok(resources) = session.request("resources/list", json!({}), timeout) {
             if let Some(list) = resources.get("resources").and_then(Value::as_array) {
                 for resource in list.iter().take(MAX_ITEMS) {
-                    let uri = resource.get("uri").and_then(Value::as_str).unwrap_or_default();
+                    let uri = resource
+                        .get("uri")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
                     let name = resource.get("name").and_then(Value::as_str).unwrap_or(uri);
                     let Some(id) = ContributionId::parse(sanitize_id(name)).ok() else {
                         continue;
@@ -444,7 +466,10 @@ impl McpRuntime {
         if let Ok(result) = session.request("prompts/list", json!({}), timeout) {
             if let Some(list) = result.get("prompts").and_then(Value::as_array) {
                 for prompt in list.iter().take(MAX_ITEMS) {
-                    let name = prompt.get("name").and_then(Value::as_str).unwrap_or_default();
+                    let name = prompt
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
                     let Some(id) = ContributionId::parse(sanitize_id(name)).ok() else {
                         continue;
                     };
@@ -480,7 +505,11 @@ impl McpRuntime {
             }
         }
 
-        Ok(Catalog { tools, contexts, prompts })
+        Ok(Catalog {
+            tools,
+            contexts,
+            prompts,
+        })
     }
 }
 
@@ -488,14 +517,20 @@ fn sanitize_id(raw: &str) -> String {
     let sanitized: String = raw
         .chars()
         .map(|character| {
-            if character.is_ascii_alphanumeric() || character == '.' || character == '-' || character == '_' {
+            if character.is_ascii_alphanumeric()
+                || character == '.'
+                || character == '-'
+                || character == '_'
+            {
                 character.to_ascii_lowercase()
             } else {
                 '_'
             }
         })
         .collect();
-    let trimmed = sanitized.trim_matches(|character| character == '.' || character == '_' || character == '-').to_string();
+    let trimmed = sanitized
+        .trim_matches(|character| character == '.' || character == '_' || character == '-')
+        .to_string();
     if trimmed.is_empty() {
         "item".to_string()
     } else {
@@ -551,15 +586,23 @@ impl Runtime for McpRuntime {
         );
         match result {
             Ok(value) => {
-                let bytes = serde_json::to_vec(&value).map(|bytes| bytes.len()).unwrap_or(0);
+                let bytes = serde_json::to_vec(&value)
+                    .map(|bytes| bytes.len())
+                    .unwrap_or(0);
                 if bytes as u64 > self.max_output_bytes {
                     *guard = None;
                     return Err(ExtensionError::Limit {
                         extension: self.extension.to_string(),
-                        message: format!("MCP result is {bytes} bytes; the ceiling is {}", self.max_output_bytes),
+                        message: format!(
+                            "MCP result is {bytes} bytes; the ceiling is {}",
+                            self.max_output_bytes
+                        ),
                     });
                 }
-                let is_error = value.get("isError").and_then(Value::as_bool).unwrap_or(false);
+                let is_error = value
+                    .get("isError")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 if is_error {
                     let message = value
                         .get("content")
@@ -588,6 +631,17 @@ impl Runtime for McpRuntime {
                 Err(error)
             }
         }
+    }
+
+    async fn call_tool_result(
+        &self,
+        name: &str,
+        arguments: Value,
+        context: &CallContext,
+    ) -> Result<ToolResult, ExtensionError> {
+        self.call_tool(name, arguments, context)
+            .await
+            .map(ToolResult::from_value)
     }
 }
 #[cfg(test)]
@@ -632,4 +686,3 @@ mod tests {
         runtime.shutdown().await.expect("shutdown");
     }
 }
-

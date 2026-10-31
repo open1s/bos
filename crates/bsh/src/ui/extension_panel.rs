@@ -16,7 +16,7 @@ use crate::extension::ui::{
 };
 use crate::theme;
 
-use super::{icon, txt, DivExt, IconName};
+use super::{icon, txt, IconName};
 
 /// One extension panel surface in the settings dialog.
 pub(crate) struct ExtensionPanelView {
@@ -35,7 +35,10 @@ impl ExtensionPanelView {
         let selected = panels
             .iter()
             .position(|panel| {
-                matches!(panel.visibility, crate::extension::ui::PanelVisibility::Visible)
+                matches!(
+                    panel.visibility,
+                    crate::extension::ui::PanelVisibility::Visible
+                )
             })
             .unwrap_or(0);
         let mut view = Self {
@@ -63,7 +66,10 @@ impl ExtensionPanelView {
 
     /// Replace the panel list, keeping a selection when the id still exists.
     pub(crate) fn set_panels(&mut self, panels: Vec<PanelSurface>) {
-        let selected_id = self.panels.get(self.selected).map(|panel| panel.panel_id.clone());
+        let selected_id = self
+            .panels
+            .get(self.selected)
+            .map(|panel| panel.panel_id.clone());
         self.panels = panels;
         self.selected = selected_id
             .and_then(|id| self.panels.iter().position(|panel| panel.panel_id == id))
@@ -195,21 +201,12 @@ impl ExtensionPanelView {
         .detach();
     }
 
-    fn render_node(
-        &self,
-        node: &UiNode,
-        path: &str,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_node(&self, node: &UiNode, path: &str, cx: &mut Context<Self>) -> AnyElement {
         match node {
             UiNode::Container { children } | UiNode::Column { children } => {
                 let mut column = div().flex().flex_col().gap(px(8.0)).w_full();
                 for (index, child) in children.iter().enumerate() {
-                    column = column.child(self.render_node(
-                        child,
-                        &format!("{path}-{index}"),
-                        cx,
-                    ));
+                    column = column.child(self.render_node(child, &format!("{path}-{index}"), cx));
                 }
                 column.into_any_element()
             }
@@ -353,11 +350,7 @@ impl ExtensionPanelView {
                             .cursor_pointer()
                             .child(txt(option.label.clone(), 12.0, theme::text()))
                             .on_click(cx.listener(move |this, _event, _window, cx| {
-                                this.dispatch(
-                                    &action,
-                                    json!({ "value": option_value.clone() }),
-                                    cx,
-                                )
+                                this.dispatch(&action, json!({ "value": option_value.clone() }), cx)
                             })),
                     );
                 }
@@ -430,21 +423,21 @@ impl ExtensionPanelView {
                 let mut table = div().flex().flex_col().gap(px(2.0)).w_full();
                 let mut header = div().flex().flex_row().gap(px(8.0)).w_full();
                 for column in columns {
-                    header = header.child(
-                        div()
-                            .flex_1()
-                            .child(txt(column.clone(), 12.0, theme::muted())),
-                    );
+                    header = header.child(div().flex_1().child(txt(
+                        column.clone(),
+                        12.0,
+                        theme::muted(),
+                    )));
                 }
                 table = table.child(header);
                 for row in rows {
                     let mut line = div().flex().flex_row().gap(px(8.0)).w_full();
                     for cell in row {
-                        line = line.child(
-                            div()
-                                .flex_1()
-                                .child(txt(cell.clone(), 12.0, theme::text())),
-                        );
+                        line = line.child(div().flex_1().child(txt(
+                            cell.clone(),
+                            12.0,
+                            theme::text(),
+                        )));
                     }
                     table = table.child(line);
                 }
@@ -465,11 +458,7 @@ impl ExtensionPanelView {
                 }
                 body = body.child(strip);
                 if let Some(first) = tabs.first() {
-                    body = body.child(self.render_node(
-                        &first.content,
-                        &format!("{path}-tab"),
-                        cx,
-                    ));
+                    body = body.child(self.render_node(&first.content, &format!("{path}-tab"), cx));
                 }
                 body.into_any_element()
             }
@@ -498,18 +487,32 @@ impl ExtensionPanelView {
                     .into_any_element()
             }
             UiNode::Code { language, value } => {
-                let mut code = div().flex().flex_col().gap(px(2.0)).p(px(8.0)).rounded(px(7.0))
+                let mut code = div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .p(px(8.0))
+                    .rounded(px(7.0))
                     .bg(rgb(theme::new_session_fill()));
                 if !language.is_empty() {
                     code = code.child(txt(language.clone(), 11.0, theme::faint()));
                 }
-                code.child(txt(value.clone(), 12.0, theme::text())).into_any_element()
+                code.child(txt(value.clone(), 12.0, theme::text()))
+                    .into_any_element()
             }
             UiNode::Image { src, alt } => div()
                 .flex()
                 .flex_col()
                 .gap(px(2.0))
-                .child(txt(if alt.is_empty() { src.clone() } else { alt.clone() }, 12.0, theme::muted()))
+                .child(txt(
+                    if alt.is_empty() {
+                        src.clone()
+                    } else {
+                        alt.clone()
+                    },
+                    12.0,
+                    theme::muted(),
+                ))
                 .child(txt(src.clone(), 11.0, theme::faint()))
                 .into_any_element(),
             UiNode::Notification { level, text } => {
@@ -537,17 +540,14 @@ impl ExtensionPanelView {
         depth: usize,
     ) -> AnyElement {
         let mut column = div().flex().flex_col().gap(px(2.0));
-        column = column.child(
-            div()
-                .pl(px(depth as f32 * 12.0))
-                .child(txt(node.label.clone(), 12.0, theme::text())),
-        );
+        column = column.child(div().pl(px(depth as f32 * 12.0)).child(txt(
+            node.label.clone(),
+            12.0,
+            theme::text(),
+        )));
         for (index, child) in node.children.iter().enumerate() {
-            column = column.child(self.render_tree(
-                child,
-                &format!("{path}-tree-{index}"),
-                depth + 1,
-            ));
+            column =
+                column.child(self.render_tree(child, &format!("{path}-tree-{index}"), depth + 1));
         }
         column.into_any_element()
     }
@@ -603,11 +603,13 @@ impl Render for ExtensionPanelView {
                     .child(txt(
                         format!("{} · {location}", panel.title),
                         12.0,
-                        if selected { theme::page() } else { theme::text() },
+                        if selected {
+                            theme::page()
+                        } else {
+                            theme::text()
+                        },
                     ))
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.select(index, cx)
-                    })),
+                    .on_click(cx.listener(move |this, _event, _window, cx| this.select(index, cx))),
             );
         }
         root = root.child(tabs);
@@ -632,5 +634,72 @@ impl Render for ExtensionPanelView {
             root = root.child(body);
         }
         root
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ExtensionPanelView;
+    use crate::extension::host::PanelSurface;
+    use crate::extension::runtime::{CallContext, Runtime, ToolDescriptor};
+    use crate::extension::types::{ExtensionError, ExtensionId, RuntimeKind};
+    use crate::extension::ui::{PanelLocation, UiDocument};
+    use async_trait::async_trait;
+    use serde_json::Value;
+    use std::sync::Arc;
+
+    struct Noop;
+
+    #[async_trait]
+    impl Runtime for Noop {
+        fn kind(&self) -> RuntimeKind {
+            RuntimeKind::Declarative
+        }
+        async fn tools(&self) -> Result<Vec<ToolDescriptor>, ExtensionError> {
+            Ok(Vec::new())
+        }
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: Value,
+            _context: &CallContext,
+        ) -> Result<Value, ExtensionError> {
+            Ok(Value::Null)
+        }
+    }
+
+    fn panel(document: UiDocument) -> PanelSurface {
+        PanelSurface {
+            panel_id: "com.example.ui.greeting".to_string(),
+            contribution_id: "greeting".to_string(),
+            title: "Greeting".to_string(),
+            icon: None,
+            location: PanelLocation::Right,
+            visibility: crate::extension::ui::PanelVisibility::Visible,
+            runtime: Arc::new(Noop),
+            owner: ExtensionId::parse("com.example.ui").expect("id"),
+            initial: Some(document),
+        }
+    }
+
+    #[test]
+    fn an_initial_document_is_validated_before_it_is_shown() {
+        let document: UiDocument = serde_json::from_value(serde_json::json!({
+            "schema_version": "1.0",
+            "revision": 1,
+            "root": {
+                "type": "column",
+                "children": [
+                    {"type": "heading", "text": "Hello", "level": 1},
+                    {"type": "text", "text": "From an extension"}
+                ]
+            }
+        }))
+        .expect("document");
+        let view = ExtensionPanelView::new(vec![panel(document)]);
+        assert!(view.session.is_some());
+        assert!(view.document.is_some());
+        assert!(view.error.is_none());
+        assert_eq!(view.panels.len(), 1);
     }
 }

@@ -26,11 +26,11 @@ Status legend:
 |---|---|---|
 | Host + Extension Manager + Runtime Dispatcher | done | host.rs, runtime/mod.rs, runtime dispatcher by kind |
 | Built-in Rust runtime | done | runtime/builtin.rs plus the shipped inspector |
-| Wasmtime + Component Model runtime | missing | runtime/wasm.rs is the current work item |
+| Wasmtime + Component Model runtime | done | runtime/wasm.rs; WIT host calls, fuel/memory/epoch limits, component fixture test |
 | External process + JSON-RPC runtime | done | runtime/process.rs |
 | WIT interface definition | done | crates/bsh/wit/extension.wit |
-| Host-managed GPUI panels | partial | panel id/title registered; renderer missing |
-| Declarative UI | partial | contract/validation done; GPUI renderer missing |
+| Host-managed GPUI panels | partial | host::panel_surfaces + renderer; every location is hosted in one settings surface |
+| Declarative UI | done | contract, validation, GPUI renderer, action routing and stale-revision refusal |
 | Unified tool/context/prompt contracts | done | agent.rs |
 | Capability authorization, quotas, audit | partial | authorization and audit done; quotas partial |
 | Directory package | done | package.rs |
@@ -46,14 +46,14 @@ Status legend:
 | Runtime-independent contracts | done | no GPUI/Wasmtime types in manifest, policy or UI schema |
 | Capability declaration is a request | done | policy.rs |
 | Least privilege and scopes | done | path/domain/secret scopes |
-| Agent-native contributions | partial | tools/prompts/contexts; models/agents/workflows missing |
+| Agent-native contributions | partial | tools/prompts/contexts/workflows; model/agent providers are discoverable descriptors, not executable adapters |
 | UI-hosted | done at contract level; renderer pending | no GPUI object crosses the boundary |
-| Command/event/stream distinction | partial | RPC and events; streaming tool output missing |
+| Command/event/stream distinction | partial | RPC and events; run_streaming yields bounded chunks after completion, not live progress |
 | Versioned contracts | done | manifest 1.0, API 1.0, UI 1.0, WIT package 1.0 |
-| Fault containment | partial | timeout/lazy runtime; cancellation and backoff retry missing |
-| Observable by default | partial | status/audit/doctor; per-request metrics partial |
-| Reproducible installation | partial | lockfile and hashes; registry sources and upgrade/rollback missing |
-| Data survives code upgrades | partial | data root separated; migrations not executed |
+| Fault containment | partial | timeout/lazy runtime/cancel token; retry backoff missing |
+| Observable by default | partial | status/audit/doctor + host call/event metrics; memory/fuel/task gauges partial |
+| Reproducible installation | partial | lockfile, sources, upgrade/rollback; lockfile reproduction command missing |
+| Data survives code upgrades | done | data root separated; migrations executed on version change |
 
 ## 3. Taxonomy
 
@@ -63,15 +63,15 @@ Status legend:
 |---|---|---|
 | UI extension (panel) | partial | registration and validation; renderer missing |
 | Tool extension | done | |
-| Agent extension | missing | no agent-role contribution |
-| Model extension | missing | no model/provider adapter contribution |
-| MCP extension | missing | MCP runtime/adapter not implemented |
-| Workflow extension | missing | declared but no executor |
+| Agent extension | partial | provider descriptor discovery; no executable agent-role adapter |
+| Model extension | partial | descriptor discovery; no model API adapter registration |
+| MCP extension | done | runtime/mcp.rs + mcp-echo fixture |
+| Workflow extension | done | runtime/workflow.rs sequential executor with capability union |
 | Context extension | partial | static Markdown only, no scoped provider call |
 | Prompt extension | done | Markdown appended to system prompt |
 | Command extension | partial | registered in the host plugin registry; composer palette not wired |
-| Event extension | partial | tools publish; packages cannot subscribe to host events |
-| Theme extension | missing | themes recorded only |
+| Event extension | partial | WASM subscribe/on-event + workspace/model publishers; process subscriptions missing |
+| Theme extension | partial | files recorded; host panel uses the active theme; contribution not applied |
 | Language extension | missing | no language contribution kind |
 | Storage extension | partial | namespace API exists; no guest host-function binding |
 | Integration extension | missing | no GitHub/browser/terminal adapter contribution |
@@ -82,7 +82,7 @@ Status legend:
 |---|---|
 | Built-in Rust | done |
 | Trusted native module | non-goal |
-| WASM Component | missing |
+| WASM Component | done |
 | External Process | done |
 
 ## 4. System architecture
@@ -90,10 +90,10 @@ Status legend:
 | Boundary | Status | Gap |
 |---|---|---|
 | GPUI host owns App/Window/Entity | done | extension module imports no GPUI |
-| Agent runtime owns tool discovery/invocation/cancel | partial | discovery/invocation yes; cancellation no |
+| Agent runtime owns tool discovery/invocation/cancel | partial | discovery/invocation/cancel token; runtime child kill on cancel not complete |
 | Extension manager discovers, validates, resolves, dispatches, tracks health | done | host.rs |
 | Capability manager evaluates, scopes, audits, revokes | done | capability.rs |
-| Runtime dispatcher routes lifecycle/RPC/command/event | partial | lifecycle/RPC yes; command/event routing partial |
+| Runtime dispatcher routes lifecycle/RPC/command/event | done | command/panel/pump delegated through LazyRuntime |
 | Dependency direction independent of GPUI | done | |
 | Dependency direction independent of Wasmtime outside runtime | done | wasmtime will live in runtime/wasm.rs only |
 
@@ -101,9 +101,9 @@ Status legend:
 
 | Requirement | Status |
 |---|---|
-| extension.toml, assets, schemas, wasm, prompts, workflows, migrations directories | partial: accepted; migrations not executed |
+| extension.toml, assets, schemas, wasm, prompts, workflows, migrations directories | done | migrations run on upgrade |
 | All directories except manifest optional | done |
-| Manifest schema 1.0 fields | done; models/agents/workflows contributions absent |
+| Manifest schema 1.0 fields | done; model_providers/agent_providers/workflows present |
 | Compatibility validated before runtime init | done |
 | Requested capabilities never grants | done |
 | Contribution ids unique and globally qualified | done |
@@ -113,38 +113,38 @@ Status legend:
 | SemVer and reverse-domain ids | done |
 | Optional forward-compat fields | done via serde defaults |
 | Canonical hash | done SHA-256 |
-| Publisher identity | missing |
-| Signature metadata and verification | missing |
-| Source registry and revision recorded | partial: source enum; no registry/Git revision |
+| Publisher identity | done | package.sig + trust.toml |
+| Signature metadata and verification | done | Ed25519, install verification, CLI keygen/sign/trust/verify |
+| Source registry and revision recorded | done | Git revision and registry URL recorded |
 | Exact version recorded | done |
 | Dependency lock recorded | done |
-| Installation timestamp and verification result | timestamp done; verification result missing |
+| Installation timestamp and verification result | done | InstalledRecord.verification |
 
 ## 6. Extension API
 
 | Layer | Status |
 |---|---|
-| Core API: lifecycle, metadata, context, errors, logging, cancellation | partial: cancellation missing |
-| Domain API: agent, tools, workflow, events, storage | partial: workflow/model/agent missing |
-| UI API: panels, commands, declarative views | partial: validation done, renderer/action routing missing |
+| Core API: lifecycle, metadata, context, errors, logging, cancellation | partial: cancellation token exposed at tool boundary |
+| Domain API: agent, tools, workflow, events, storage | partial: workflows/tools/storage/events; model/agent adapters descriptors only |
+| UI API: panels, commands, declarative views | done | renderer + commands + actions; command palette wiring partial |
 
 ### 6.1 API modules
 
 | Module group | Status |
 |---|---|
 | core/lifecycle, metadata, context, errors, logging | done |
-| core/cancellation | missing |
-| capabilities/filesystem | partial: policy only, no guest host function |
-| capabilities/network | partial: policy only, no guest host function |
-| capabilities/process | partial: policy + spawn; no OS sandbox |
-| capabilities/storage | partial: API; no guest binding |
-| capabilities/secrets | partial: policy only |
+| core/cancellation | partial | AsyncTool cancel token |
+| capabilities/filesystem | done | WASM read_file/write_file host functions with policy |
+| capabilities/network | done | WASM fetch host function with policy |
+| capabilities/process | partial | policy + spawn + rlimits; no filesystem sandbox profile |
+| capabilities/storage | done | WASM storage_get/set/list |
+| capabilities/secrets | done | WASM read_secret |
 | agent/tool, prompt, context_provider | tool/prompt done, context static |
-| agent/agent_provider | missing |
-| agent/model_provider | missing |
-| workflow/trigger, action, execution | missing |
-| events/publisher, subscriber | publisher done; subscriber API not exposed |
-| ui/panel, view, command, notification, theme | view contract; the rest partial/missing |
+| agent/agent_provider | partial | descriptor discovery |
+| agent/model_provider | partial | descriptor discovery |
+| workflow/trigger, action, execution | done | sequential workflow executor; no triggers |
+| events/publisher, subscriber | partial | publisher + WASM subscriber; process subscriber missing |
+| ui/panel, view, command, notification, theme | partial | panels/views/commands/notifications; theme contributions not applied |
 
 ### 6.2 Contract rules
 
@@ -152,12 +152,12 @@ Status legend:
 |---|---|
 | No GPUI types across boundary | done |
 | No host file descriptors | done |
-| Explicit request/response schemas | partial: tool/UI yes; command/event payloads not schema-checked |
-| Correlation ids and cancellation | partial: correlation id done; cancellation missing |
-| Bounded payload and stream rate | partial: event/tool caps; stream absent |
+| Explicit request/response schemas | partial | tool/UI schemas; command/event payloads JSON-checked only |
+| Correlation ids and cancellation | partial | correlation + cancel token |
+| Bounded payload and stream rate | partial | event/tool caps; chunked stream no rate limiter |
 | Version every transported/persisted schema | done for manifest, UI, events, lock, state; grants/registry format 1 |
 | Host implementation types private | done |
-| Runtime transport mapped to domain semantics | done for process; wasm pending |
+| Runtime transport mapped to domain semantics | done | process, wasm, mcp, declarative |
 
 ## 7. Lifecycle
 
@@ -167,8 +167,8 @@ Status legend:
 | Compatibility and dependency resolution | done |
 | Install into staging, atomic promotion | done |
 | Lazy loading / on-demand activation | done via LazyRuntime |
-| Graceful deactivate/shutdown | partial: runtime trait; host does not expose suspend/deactivate |
-| Cancellation of outstanding work | missing |
+| Graceful deactivate/shutdown | done | runtime trait delegated through LazyRuntime |
+| Cancellation of outstanding work | partial | tool future select; child process not killed immediately |
 | Health monitoring and crash handling | partial: health/status; crash backoff retry missing |
 | Retry with bounded backoff | missing |
 | State persistence independent of package | done |
@@ -181,55 +181,55 @@ Status legend:
 | Requirement | Status |
 |---|---|
 | Built-in statically linked, internal interface, lifecycle conventions | done |
-| WASM load/validate, host binding, memory/fuel/time limits, authorized host functions, cancellation, error normalization, metrics | missing |
+| WASM load/validate, host binding, memory/fuel/time limits, authorized host functions, cancellation, error normalization, metrics | done except live cancellation/metrics detail |
 | Process JSON-RPC stdio, handshake, structured stderr | done |
 | Process executable allowlist/user approval | partial: allowlist + explicit grant; no per-command approval UI |
 | Environment filtering, cwd restriction, timeout, output limits | done |
-| OS-level sandbox | missing |
+| OS-level sandbox | partial | RLIMIT_AS/CPU/NOFILE + process group; no filesystem profile |
 | Native dynamic libraries | non-goal |
 
 ## 9. UI
 
 | Requirement | Status |
 |---|---|
-| Mode A panel contribution with id/title/icon/location/visibility | partial: id/title/icon; location/visibility missing |
-| Mode B declarative components | contract done all listed components; renderer missing |
+| Mode A panel contribution with id/title/icon/location/visibility | partial | fields recorded and shown; mount points share one surface |
+| Mode B declarative components | done | ui/extension_panel.rs; image draws source label, not pixels |
 | Mode C embedded guest GPUI | non-goal |
 | Validate schema/payload, depth/node/text limits | done |
-| Route action ids to owner | missing (renderer) |
-| Apply state patches, revisions, stale rejection | contract done; renderer missing |
-| Focus, keyboard, accessibility | missing |
-| Loading/error/unavailability states | missing |
+| Route action ids to owner | done | dispatch -> owning Runtime::command |
+| Apply state patches, revisions, stale rejection | done | UiSession + renderer |
+| Focus, keyboard, accessibility | partial | role/aria labels; no keyboard focus model or text editing |
+| Loading/error/unavailability states | done | renderer loading/error/message |
 | No JS/HTML | done |
-| Theme contributions | missing |
+| Theme contributions | partial | recorded; not applied |
 
 ## 10. Agent-native API
 
 | Requirement | Status |
 |---|---|
-| Tool provider | done, but result content types limited to JSON |
+| Tool provider | done | JSON and rich ToolContent |
 | Context provider | partial: static Markdown |
 | Prompt provider | done |
-| Model provider | missing |
-| Agent provider | missing |
-| Workflow provider | missing |
-| Tool content: text, images, structured, file refs | missing (only structured JSON) |
-| Streaming output, progress, cancellation | missing |
+| Model provider | partial | descriptor discovery |
+| Agent provider | partial | descriptor discovery |
+| Workflow provider | done | declarative executor |
+| Tool content: text, images, structured, file refs | done | ToolContent + MCP mapping |
+| Streaming output, progress, cancellation | partial | chunked final output + cancel token; no live progress |
 | Timeouts, error categories, correlation ids | done |
-| MCP tool/resource/prompt mapping | missing |
-| MCP lifecycle/reconnect/timeout/cancel | missing |
+| MCP tool/resource/prompt mapping | done | mcp-echo test |
+| MCP lifecycle/reconnect/timeout/cancel | partial | start/timeout/close; reconnect on next call only |
 
 ## 11. Events
 
 | Requirement | Status |
 |---|---|
 | Envelope | done |
-| All listed topics | partial: workspace.changed, model.requested/completed absent as constants/publishers |
-| Topic allowlists and subscription filters | partial: filters done; publisher allowlist not enforced |
+| All listed topics | partial | workspace.changed/model.* published; agent turn topics not yet published by shell |
+| Topic allowlists and subscription filters | partial | filters + WASM publishes allowlist; process publisher not checked |
 | Schema versioning, correlation ids | done |
 | Bounded queues/backpressure | done |
-| Payload and rate limits | payload done; rate limit missing |
-| Cancellation propagation | missing |
+| Payload and rate limits | done | 256 KiB payload + 200 events/second per publisher |
+| Cancellation propagation | partial | tool token; guest/runtime cancellation incomplete |
 | Delivery semantics documented | done in standard |
 | Error isolation | done |
 | No unbounded history | done |
@@ -242,36 +242,36 @@ Status legend:
 | Capability categories including terminal.execute | partial: process.execute only; alias missing |
 | Network domain/method policy | partial: domain scope; method policy not enforced |
 | Process executable/argument policy | partial: allowlist and args; no argument policy |
-| CPU/fuel and wall clock | partial: wall clock; fuel missing |
-| Memory/concurrency | partial: declared, not enforced |
-| Host-call authorization | missing (no guest host calls yet) |
-| IPC authentication and message validation | partial: length/JSON; no auth |
-| Secret redaction | partial: audit does not log values; no secret API |
+| CPU/fuel and wall clock | done | wall clock + wasm fuel + process RLIMIT_CPU |
+| Memory/concurrency | partial | wasm StoreLimits + process RLIMIT_AS; concurrency per runtime mutex |
+| Host-call authorization | done | WASM host functions call PolicyEngine |
+| IPC authentication and message validation | partial | local child only, length/JSON; no token auth |
+| Secret redaction | done | read_secret + audit without values |
 | Storage isolation | done |
 | Permission revocation | done via grants store |
 | Audit trail | done |
-| Package hash/signature verification | hash done; signature missing |
-| Disable/quarantine | disable done; quarantine directory exists but no flow |
-| Trust levels verified/unknown | partial: enum; no verification path |
+| Package hash/signature verification | done | install + doctor |
+| Disable/quarantine | done | CLI quarantine + directory |
+| Trust levels verified/unknown | done | Ed25519 trust store |
 
 ## 13. Registry, installer, dependencies
 
 | Requirement | Status |
 |---|---|
-| Official registry | missing |
-| Git repository source | missing |
+| Official registry | done | HTTP index source |
+| Git repository source | done | git+URL#revision |
 | Local directory | done |
-| Local package archive | missing |
-| Enterprise/private registry | missing |
-| Install pipeline download/checkout, hash/signature, manifest, compatibility, resolve, staging, promotion | partial: local copy + hash + manifest + compatibility + resolve + staging + promotion |
+| Local package archive | done | tar.gz extractor |
+| Enterprise/private registry | done | named registry CLI |
+| Install pipeline download/checkout, hash/signature, manifest, compatibility, resolve, staging, promotion | done | sources + store |
 | Directory layout installed/cache/staging/quarantine/data/state/logs | done |
 | Data separation | done |
 | Uninstall data policy | done |
 | Upgrade must not overwrite data | done by versioned dirs |
-| Lockfile id/version/hash/source/revision/deps/api/signature/installation metadata | partial: id/version/hash/source/deps/api/host; signature/revision/installation metadata missing |
-| Upgrade and rollback | missing |
+| Lockfile id/version/hash/source/revision/deps/api/signature/installation metadata | partial | signature/revision/metadata recorded in registry; lockfile fields partial |
+| Upgrade and rollback | done | versions/set_active/rollback CLI |
 | Reproduce from lockfile | missing |
-| Package integrity verification on load | partial: hash recorded; no re-verify per load |
+| Package integrity verification on load | done | doctor + install signature/hash |
 
 ## 14. Rust workspace proposal
 
@@ -284,17 +284,17 @@ is deliberate and does not remove a feature.
 
 | Area | Status |
 |---|---|
-| Wasmtime | dependency added; runtime missing |
+| Wasmtime | done |
 | WIT | done |
 | Tokio | done |
 | Serde/TOML/JSON | done |
-| JSON schema for config/tool | tool schema stored; config schema not enforced |
+| JSON schema for config/tool | done | config.rs |
 | BLAKE3 or SHA-256 | SHA-256 done |
-| Ed25519 signatures | dependency added; verification missing |
+| Ed25519 signatures | done |
 | SemVer | done |
 | petgraph or custom resolver | custom resolver |
 | JSON-RPC 2.0 | done |
-| Cancellation tokens | missing |
+| Cancellation tokens | partial | tool token |
 | tracing | done |
 | storage | JSON/TOML per-extension |
 
@@ -303,17 +303,17 @@ is deliberate and does not remove a feature.
 | Requirement | Status |
 |---|---|
 | Installed version/source, runtime kind, lifecycle, capabilities, errors, dependencies | done |
-| Startup duration, request count/latency, memory/fuel, active tasks/subscriptions, crash history | partial: startup/calls/failures; latency/memory/fuel/tasks missing |
-| CLI new/validate/build/test/package/install/list/info/enable/disable/update/uninstall/logs/doctor | partial: new/validate/hash/install/uninstall/list/info/enable/disable/grant/revoke/capabilities/logs/doctor; build/test/package/update missing |
-| Templates, WIT bindings/examples, local dev, mock host, integration harness, logs/traces, compatibility checker, package builder, security diagnostics | partial: examples, local dev, validation, doctor; build/test/package/mock host missing |
+| Startup duration, request count/latency, memory/fuel, active tasks/subscriptions, crash history | partial | call latency/bytes/events/subscribers; memory/fuel/tasks gauges partial |
+| CLI new/validate/build/test/package/install/list/info/enable/disable/update/uninstall/logs/doctor | done | plus versions/rollback/quarantine/keygen/sign/trust/config/registry/metrics |
+| Templates, WIT bindings/examples, local dev, mock host, integration harness, logs/traces, compatibility checker, package builder, security diagnostics | partial | examples/builder/doctor; mock host missing |
 
 ## 17. Testing
 
 | Requirement | Status |
 |---|---|
 | Unit: manifest, ids, resolver, lifecycle, capability, events, UI, paths, lock determinism | done |
-| Integration: built-in registration, WASM load/invoke, process start/stop, tools, cancellation, UI action routing, patches, denial, crash isolation, upgrade/rollback, data preservation | partial: built-in, process, tools, denial, patches at contract level; WASM/cancel/UI routing/upgrade/rollback missing |
-| Security tests: traversal, unauthorized fs/network, process denial, oversized messages, nested UI, event flood, resource exhaustion, malformed payloads, stale actions, revoked capability, package tampering/signatures | partial: many unit tests; signature/network/process-exhaustion missing |
+| Integration: built-in registration, WASM load/invoke, process start/stop, tools, cancellation, UI action routing, patches, denial, crash isolation, upgrade/rollback, data preservation | partial | WASM/UI routing/upgrade/rollback covered; cancellation child kill and crash isolation partial |
+| Security tests: traversal, unauthorized fs/network, process denial, oversized messages, nested UI, event flood, resource exhaustion, malformed payloads, stale actions, revoked capability, package tampering/signatures | partial | signature/UI/traversal covered; network flood/process exhaustion missing |
 | Cross-platform matrix | not run in this environment |
 
 ## 18. Roadmap
@@ -321,32 +321,41 @@ is deliberate and does not remove a feature.
 | Phase | Status |
 |---|---|
 | Phase 1 core | done |
-| Phase 2 WASM | missing |
-| Phase 3 agent, event, MCP, process | partial: tools/prompts/process/events; MCP and streaming missing |
-| Phase 4 GPUI UI | partial: contract; renderer/panels/actions/themes missing |
-| Phase 5 ecosystem | partial: local install/lock/CLI; registry/upgrade/rollback/signatures/package builder missing |
+| Phase 2 WASM | done |
+| Phase 3 agent, event, MCP, process | partial | MCP/events/process/tools done; live streaming/progress partial |
+| Phase 4 GPUI UI | partial | renderer/panels/actions done; themes and keyboard focus partial |
+| Phase 5 ecosystem | partial | registry/upgrade/rollback/signatures/builder done; lock reproduction missing |
 
 ## 19. User stories
 
 The implementation covers the type/manifest/store/policy/lifecycle/process/CLI
-stories. Open items map to EXT-008/009/010 (WIT host functions, Wasmtime),
-EXT-012 (WASM limits), EXT-013 (event subscriptions), EXT-014/015 (agent
-providers), EXT-016 (MCP), EXT-018/019/020 (UI), EXT-021/022 (installer,
-resolver upgrade), EXT-023 (CLI build/test/package/update), EXT-024
-(compatibility/security integration).
+stories. Resolved: Wasmtime/host functions, WASM limits, WASM subscriptions,
+MCP, UI renderer/actions, installer sources, upgrade/rollback, CLI
+build/test/package/update, signatures and quarantine. Still open: live
+streaming/progress, executable model/agent provider adapters, theme
+application, lockfile reproduction, process subscriptions and retry backoff.
 
-## 20. Open items this file exists to close
+## 20. Remaining gaps
 
-1. Wasmtime Component runtime and host functions, with limits, cancellation and metrics.
-2. GPUI declarative renderer, panel location/visibility, action routing, patches, themes, command palette.
-3. MCP runtime/adapter.
-4. Model, Agent and Workflow providers.
-5. Registry sources (Git/HTTP/archive/private), upgrade/rollback, lock reproduction.
-6. Ed25519 publisher signatures and quarantine.
-7. Guest host functions for filesystem/network/secrets/storage in WASM.
-8. Process OS sandbox and memory/concurrency limits.
-9. Richer tool results, streaming and cancellation.
-10. Event subscriptions, publisher allowlists and rate limits.
-11. Config schema enforcement and migrations.
-12. Per-request metrics and the remaining CLI/SDK commands.
-13. Integration/security/cross-platform tests for all of the above.
+The first-release feature set is implemented except for these explicit gaps.
+Each is a behaviour, not a missing type.
+
+1. Live streaming/progress: run_streaming chunks the finished result; no
+   incremental model or tool progress crosses the host boundary.
+2. Model and Agent provider adapters: descriptors are discoverable and listed,
+   but no executable adapter is registered with the model or agent layer.
+3. Theme contributions are recorded but not applied; command contributions are
+   registered in the PluginRegistry but the composer palette does not yet list
+   extension commands.
+4. Lockfile reproduction: the lock records versions and hashes, but no command
+   reinstalls a lockfile exactly.
+5. Process event subscriptions: the WASM runtime subscribes and receives
+   on_event; the process protocol has no equivalent subscription frame.
+6. OS filesystem sandbox: process children get RLIMIT ceilings and a process
+   group, not a macOS sandbox profile or Linux namespace.
+7. Guest/runtime cancellation: the tool future stops waiting, but a WASM guest
+   or process is not always terminated at the same instant.
+8. Cross-platform matrix: the suite is green on macOS (this environment);
+   Windows/Linux process limits and path handling are not exercised here.
+9. Integration breadth: no mock host harness that drives every runtime through
+   one scripted scenario.

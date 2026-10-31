@@ -82,7 +82,10 @@ struct HostState {
 }
 
 /// Map a guest-reported host error back onto the platform error.
-fn host_failure(extension: &ExtensionId, error: self::bsh::extension::types::HostError) -> ExtensionError {
+fn host_failure(
+    extension: &ExtensionId,
+    error: self::bsh::extension::types::HostError,
+) -> ExtensionError {
     use self::bsh::extension::types::HostError;
     match error {
         HostError::Denied(reason) => ExtensionError::Denied {
@@ -137,17 +140,18 @@ impl HostState {
                 "no workspace is open".to_string(),
             ));
         };
-        let relative = validate_relative_path(raw).map_err(self::bsh::extension::types::HostError::Denied)?;
+        let relative =
+            validate_relative_path(raw).map_err(self::bsh::extension::types::HostError::Denied)?;
         let path = workspace.join(relative);
-        let canonical_workspace = workspace.canonicalize().map_err(|error| {
-            self::bsh::extension::types::HostError::Runtime(error.to_string())
-        })?;
+        let canonical_workspace = workspace
+            .canonicalize()
+            .map_err(|error| self::bsh::extension::types::HostError::Runtime(error.to_string()))?;
         let parent = path.parent().unwrap_or(workspace);
         std::fs::create_dir_all(parent)
             .map_err(|error| self::bsh::extension::types::HostError::Runtime(error.to_string()))?;
-        let canonical_parent = parent.canonicalize().map_err(|error| {
-            self::bsh::extension::types::HostError::Runtime(error.to_string())
-        })?;
+        let canonical_parent = parent
+            .canonicalize()
+            .map_err(|error| self::bsh::extension::types::HostError::Runtime(error.to_string()))?;
         if !canonical_parent.starts_with(&canonical_workspace) {
             return Err(self::bsh::extension::types::HostError::Denied(
                 "path escapes the workspace".to_string(),
@@ -214,13 +218,9 @@ impl self::bsh::extension::host::Host for HostState {
         Ok(())
     }
 
-    fn subscribe(
-        &mut self,
-        topic: String,
-    ) -> Result<u64, self::bsh::extension::types::HostError> {
-        let filter = EventFilter::from_topics(&[topic]).map_err(|error| {
-            self::bsh::extension::types::HostError::Denied(error)
-        })?;
+    fn subscribe(&mut self, topic: String) -> Result<u64, self::bsh::extension::types::HostError> {
+        let filter = EventFilter::from_topics(&[topic])
+            .map_err(self::bsh::extension::types::HostError::Denied)?;
         let id = self.next_subscription;
         self.next_subscription = self.next_subscription.saturating_add(1);
         let subscription = self.events.subscribe(filter, 64);
@@ -277,8 +277,7 @@ impl self::bsh::extension::host::Host for HostState {
                 ..CallScope::default()
             },
         )?;
-        write_atomic(&path, &bytes)
-            .map_err(Self::host_error)
+        write_atomic(&path, &bytes).map_err(Self::host_error)
     }
 
     fn fetch(
@@ -388,7 +387,9 @@ impl self::bsh::extension::host::Host for HostState {
         )?;
         let variable = format!("BSH_EXT_SECRET_{}", name.to_ascii_uppercase());
         std::env::var(&variable).map_err(|_| {
-            self::bsh::extension::types::HostError::NotFound(format!("secret {name} is not available"))
+            self::bsh::extension::types::HostError::NotFound(format!(
+                "secret {name} is not available"
+            ))
         })
     }
 
@@ -427,6 +428,7 @@ pub(crate) struct WasmRuntime {
 
 impl WasmRuntime {
     /// Prepare a component runtime. The component is compiled on activation.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         manifest: &Manifest,
         root: &Path,
@@ -445,12 +447,11 @@ impl WasmRuntime {
                 path: root.join("extension.toml"),
                 message: "the wasm-component runtime needs runtime.entry".to_string(),
             })?;
-        let relative = validate_relative_path(&entry).map_err(|reason| {
-            ExtensionError::Manifest {
+        let relative =
+            validate_relative_path(&entry).map_err(|reason| ExtensionError::Manifest {
                 path: root.join("extension.toml"),
                 message: reason,
-            }
-        })?;
+            })?;
         let component = root.join(relative);
         if !component.is_file() {
             return Err(ExtensionError::Io {
@@ -508,8 +509,7 @@ impl WasmRuntime {
             limits,
             subscriptions: BTreeMap::new(),
             next_subscription: 1,
-            deadline: Instant::now()
-                + Duration::from_millis(self.resources.execution_ms()),
+            deadline: Instant::now() + Duration::from_millis(self.resources.execution_ms()),
             cancelled: Arc::clone(&self.cancelled),
         };
         let mut store = Store::new(engine, state);
@@ -521,7 +521,7 @@ impl WasmRuntime {
                 message: error.to_string(),
             })?;
         store.epoch_deadline_trap();
-        let initial_ticks = (self.resources.execution_ms().max(1) + EPOCH_TICK_MS - 1) / EPOCH_TICK_MS;
+        let initial_ticks = self.resources.execution_ms().max(1).div_ceil(EPOCH_TICK_MS);
         store.set_epoch_deadline(initial_ticks);
         let mut linker = Linker::new(engine);
         BshExtension::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state).map_err(
@@ -530,25 +530,27 @@ impl WasmRuntime {
                 message: error.to_string(),
             },
         )?;
-        let bindings = BshExtension::instantiate(&mut store, &component, &linker).map_err(
-            |error| ExtensionError::Runtime {
-                extension: self.extension.to_string(),
-                message: error.to_string(),
-            },
-        )?;
+        let bindings =
+            BshExtension::instantiate(&mut store, &component, &linker).map_err(|error| {
+                ExtensionError::Runtime {
+                    extension: self.extension.to_string(),
+                    message: error.to_string(),
+                }
+            })?;
         bindings
             .bsh_extension_extension()
             .call_initialize(&mut store, HOST_VERSION, &self.config)
             .map_err(|error| ExtensionError::Runtime {
                 extension: self.extension.to_string(),
                 message: error.to_string(),
-            })?;
+            })?
+            .map_err(|error| host_failure(&self.extension, error))?;
         *guard = Some(Instance { store, bindings });
         Ok(())
     }
 
     fn prepare_call(&self, instance: &mut Instance, timeout_ms: u64) -> Result<(), ExtensionError> {
-        let ticks = (timeout_ms.max(1) + EPOCH_TICK_MS - 1) / EPOCH_TICK_MS;
+        let ticks = timeout_ms.max(1).div_ceil(EPOCH_TICK_MS);
         instance.store.set_epoch_deadline(ticks);
         instance
             .store
@@ -661,7 +663,8 @@ impl Runtime for WasmRuntime {
             .map_err(|error| ExtensionError::Runtime {
                 extension: self.extension.to_string(),
                 message: error.to_string(),
-            })?;
+            })?
+            .map_err(|error| host_failure(&self.extension, error))?;
         Ok(())
     }
 
@@ -679,7 +682,8 @@ impl Runtime for WasmRuntime {
                 .map_err(|error| ExtensionError::Runtime {
                     extension: self.extension.to_string(),
                     message: error.to_string(),
-                })?;
+                })?
+                .map_err(|error| host_failure(&self.extension, error))?;
         }
         Ok(())
     }
@@ -797,12 +801,13 @@ impl Runtime for WasmRuntime {
     }
 
     async fn pump(&self) -> Result<(), ExtensionError> {
-        self.ensure_instance()?;
         let mut guard = self.instance.lock().map_err(|_| ExtensionError::Corrupt {
             path: self.component.clone(),
             message: "wasm instance lock is poisoned".to_string(),
         })?;
-        let instance = guard.as_mut().expect("instance");
+        let Some(instance) = guard.as_mut() else {
+            return Ok(());
+        };
         self.deliver_events(instance)
     }
 }
@@ -814,10 +819,8 @@ mod tests {
     use crate::extension::types::TrustLevel as TestTrust;
 
     fn scratch(label: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "bsh-wasm-runtime-{label}-{}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("bsh-wasm-runtime-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("scratch");
         path
@@ -879,4 +882,3 @@ mod tests {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 }
-

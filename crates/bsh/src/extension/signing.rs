@@ -79,18 +79,18 @@ pub(crate) fn sign_package(
 ) -> Result<PackageSignature, ExtensionError> {
     let manifest = Manifest::load(root)?;
     let hash = package_hash(root)?;
-    let secret = STANDARD
-        .decode(secret_key_base64.trim())
-        .map_err(|error| ExtensionError::InvalidVersion {
-            value: "secret key".to_string(),
-            reason: error.to_string(),
-        })?;
-    let secret: [u8; 32] = secret.try_into().map_err(|_| {
+    let secret = STANDARD.decode(secret_key_base64.trim()).map_err(|error| {
         ExtensionError::InvalidVersion {
             value: "secret key".to_string(),
-            reason: "an Ed25519 seed is exactly 32 bytes".to_string(),
+            reason: error.to_string(),
         }
     })?;
+    let secret: [u8; 32] = secret
+        .try_into()
+        .map_err(|_| ExtensionError::InvalidVersion {
+            value: "secret key".to_string(),
+            reason: "an Ed25519 seed is exactly 32 bytes".to_string(),
+        })?;
     let signing = SigningKey::from_bytes(&secret);
     let message = signed_message(
         manifest.id().as_str(),
@@ -239,11 +239,10 @@ impl TrustStore {
     }
 
     fn save(&self) -> Result<(), ExtensionError> {
-        let text =
-            toml::to_string_pretty(&self.file).map_err(|error| ExtensionError::Corrupt {
-                path: self.path.clone(),
-                message: error.to_string(),
-            })?;
+        let text = toml::to_string_pretty(&self.file).map_err(|error| ExtensionError::Corrupt {
+            path: self.path.clone(),
+            message: error.to_string(),
+        })?;
         write_atomic(&self.path, text.as_bytes())
     }
 }
@@ -388,10 +387,8 @@ mod tests {
     use super::*;
 
     fn scratch(label: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "bsh-ext-signing-{label}-{}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("bsh-ext-signing-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(path.join("tools")).expect("scratch");
         path
@@ -442,12 +439,21 @@ tools = ["echo"]
         trust.trust("example", &public, None).expect("trust");
         let verified = verify_package(&root, manifest.id().as_str(), "1.0.0", &hash, &trust);
         assert!(verified.is_verified(), "{verified:?}");
-        assert_eq!(verified.trust_level(TrustLevel::Local), TrustLevel::Verified);
+        assert_eq!(
+            verified.trust_level(TrustLevel::Local),
+            TrustLevel::Verified
+        );
 
         std::fs::write(root.join("tools/echo.json"), "{\"changed\":true}").expect("tamper");
         let tampered_hash = package_hash(&root).expect("hash");
         assert!(matches!(
-            verify_package(&root, manifest.id().as_str(), "1.0.0", &tampered_hash, &trust),
+            verify_package(
+                &root,
+                manifest.id().as_str(),
+                "1.0.0",
+                &tampered_hash,
+                &trust
+            ),
             SignatureVerification::Invalid { .. }
         ));
         let _ = std::fs::remove_dir_all(&root);

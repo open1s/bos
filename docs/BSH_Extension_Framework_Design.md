@@ -1485,44 +1485,56 @@ Use upstream documentation and source as the authority when implementing. Verify
 
 ---
 
-## 25. Implementation status (2026-10-30)
+## 25. Implementation status (2026-10-31)
 
 The platform lives in `crates/bsh/src/extension/` and is independent of GPUI.
-The normative byte-level standard is `docs/bsh-extension-standard.md`.
+The normative byte-level standard is `docs/bsh-extension-standard.md`; the
+exhaustive requirement matrix is `docs/bsh-extension-conformance.md`.
 
 | Design area | Implementation |
 |---|---|
 | Shared types and identity | types.rs: reverse-domain ids, SemVer, lifecycle vocabulary, errors |
-| Manifest and validation | manifest.rs: strict TOML, compatibility, paths, env policy, resources |
-| Registry and package store | package.rs: scan, SHA-256 tree hash, staging, atomic install, uninstall |
+| Manifest and validation | manifest.rs: strict TOML, compatibility, paths, env policy, resources, providers |
+| Registry and package store | package.rs: scan, SHA-256 tree hash, staging, atomic install, active version, quarantine |
+| Signing and trust | signing.rs: Ed25519 package.sig, trust.toml, install verification, keygen/sign/trust/verify |
+| Sources and registries | sources.rs: directory, tar.gz, Git revision, HTTP index, named registries |
 | Dependency resolver and lockfile | resolver.rs: highest satisfying version, cycle/conflict errors, deterministic lock |
 | Lifecycle manager | lifecycle.rs: explicit transition table, health, counters |
 | Capability policy and audit | capability.rs: 18 capabilities, defaults by trust, scoped grants, JSONL audit |
 | Built-in runtime | runtime/builtin.rs: first-party Rust; the inspector ships as an example |
-| Declarative runtime | runtime/declarative.rs: tools, commands, prompts, contexts, panels |
-| Process runtime | runtime/process.rs: JSON-RPC 2.0, handshake, timeouts, env filtering, line caps |
-| Runtime-neutral invocation | runtime/mod.rs: Runtime trait, tool descriptors, LazyRuntime |
-| Agent integration | agent.rs: qualified tools, per-call authorization, commands, panels, prompt budget |
-| Event bus | events.rs: bounded per-subscriber queues, filters, payload ceiling, metrics |
+| Declarative runtime | runtime/declarative.rs: tools, commands, prompts, contexts, panels, workflows, providers |
+| Process runtime | runtime/process.rs: JSON-RPC 2.0, handshake, timeouts, env filtering, rlimits, line caps |
+| WASM Component runtime | runtime/wasm.rs: Wasmtime 50, WIT host functions, fuel, StoreLimits, epoch timeout |
+| MCP adapter | runtime/mcp.rs: initialize, tools/resources/prompts, stdio, timeouts, reconnect on next call |
+| Workflow executor | runtime/workflow.rs: sequential same-package tools, capability union, templates |
+| Runtime-neutral invocation | runtime/mod.rs: Runtime trait, rich ToolContent/ToolResult, LazyRuntime delegation, pump |
+| Agent integration | agent.rs: qualified tools, per-call authorization, cancellation, streaming chunks, metrics |
+| Event bus | events.rs: bounded queues, filters, payload ceiling, workspace/model publishers, metrics |
 | Storage | storage.rs: contained namespace, atomic writes, caps |
-| Declarative UI | ui.rs: versioned tree, limits, actions, revisions, stale-patch refusal |
-| Host orchestration | host.rs: discovery, resolution, authorization, status rows, doctor |
-| Developer CLI | cli.rs: new, validate, hash, install, uninstall, list, info, enable, disable, grant, revoke, capabilities, logs, doctor |
+| Configuration | config.rs: defaults, JSON Schema subset, migrations |
+| Declarative UI | ui.rs + ui/extension_panel.rs: versioned tree, limits, actions, revisions, GPUI renderer |
+| Host orchestration | host.rs: discovery, resolution, authorization, status rows, panels, metrics, doctor |
+| Developer CLI | cli.rs: new, validate, hash, build/package, test, install, sources, versions, rollback, quarantine, keygen, sign, trust, verify, config, metrics, providers, logs, doctor |
 | WIT contract | crates/bsh/wit/extension.wit |
-| Examples | examples/extensions/hello and examples/extensions/process-echo |
+| Examples | examples/extensions/{hello,process-echo,wasm-echo,mcp-echo} |
 
-**Acceptance evidence:** 78 unit tests cover the manifest, hash, install,
-resolver, lifecycle, policy, event bounds, storage containment, UI limits,
-process framing and the host vertical slice. The CLI was exercised end to end:
-new -> validate -> install -> list -> info -> grant -> doctor -> uninstall.
+**Acceptance evidence:** the extension suite covers the manifest, hash, install,
+signature/trust, sources, resolver, lifecycle, policy, event bounds, storage
+containment, UI limits, process framing, WASM component invocation, MCP
+tools/resources/prompts, workflow execution, configuration migrations and the
+host vertical slice. The CLI is exercised end to end: new -> validate -> build ->
+install -> list -> info -> grant -> doctor -> uninstall, plus keygen/sign/verify,
+registry install, versions/rollback and config.
 
-**Deliberate limits, stated rather than hidden:** wasm validates and refuses
-activation (no Wasmtime adapter yet); signatures are recorded but not verified;
-workflows and themes are recorded without an executor/applier; the declarative
-UI is validated but its GPUI renderer is the next consumer; the built-in runtime
-is only for code linked into bsh. The legacy Codex/DSH shim in
-`crates/agent/src/extensions` still backs the old inventory pane; it is not
-used by this platform and new packages target this standard.
+**Deliberate limits, stated rather than hidden:** run_streaming chunks a
+completed result rather than live progress; model and agent providers are
+discoverable descriptors, not executable adapters; theme contributions are
+recorded but not applied; the composer palette does not yet list extension
+commands; process event subscriptions and lockfile reproduction are open; the
+process child has RLIMIT limits but no filesystem sandbox profile; cancellation
+stops the tool future but does not always kill the guest at the same instant. The
+legacy Codex/DSH shim in `crates/agent/src/extensions` still backs the old
+inventory pane; it is not used by this platform.
 
 ---
 

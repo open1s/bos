@@ -29842,3 +29842,46 @@ fn enter_in_the_address_bar_starts_a_navigation(cx: &mut TestAppContext) {
         "Enter in the address bar must start a navigation, got {address:?}"
     );
 }
+
+/// The extensions pane mounts the declarative panel host without a package.
+#[gpui::test]
+fn the_extensions_pane_renders_its_panel_host(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (_harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = AppState::with_store(scratch_store("extension-panels"));
+        let section = section_index("extensions").expect("the rail index");
+        let shell = cx.new(|cx| Shell::build_for_test(window, Some(section), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("extension-panels").is_some(),
+        "the extensions pane draws the panel host"
+    );
+    assert!(
+        cx.debug_bounds("extension-panels-refresh").is_some(),
+        "the pane draws its refresh control"
+    );
+}
+
+/// The plugins header opens the extension panel host.
+#[gpui::test]
+fn the_plugins_header_opens_the_extension_panels(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (_harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = AppState::with_store(scratch_store("extension-panels-header"));
+        let section = section_index("plugins").expect("the plugins index");
+        let shell = cx.new(|cx| Shell::build_for_test(window, Some(section), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let button = cx
+        .debug_bounds("plugins-panels")
+        .expect("the panels control");
+    cx.simulate_click(button.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("extension-panels").is_some(),
+        "the header control opens the panel host"
+    );
+}

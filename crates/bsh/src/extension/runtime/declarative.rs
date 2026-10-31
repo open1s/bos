@@ -94,10 +94,14 @@ pub(crate) struct DeclarativeContributions {
     pub(crate) contexts: Vec<TextContribution>,
     /// Panels.
     pub(crate) panels: Vec<PanelContribution>,
-    /// Workflows, recorded but not executed.
+    /// Workflows, executed by the workflow wrapper.
     pub(crate) workflows: Vec<RawContribution>,
     /// Themes, recorded but not applied.
     pub(crate) themes: Vec<RawContribution>,
+    /// Model provider descriptors.
+    pub(crate) model_providers: Vec<RawContribution>,
+    /// Agent role descriptors.
+    pub(crate) agent_providers: Vec<RawContribution>,
 }
 
 impl DeclarativeContributions {
@@ -326,12 +330,22 @@ pub(crate) fn load_contributions(
     for id in &manifest.contributes.workflows {
         contributions
             .workflows
-            .push(raw_contribution(root, "workflows", "yaml", id)?);
+            .push(raw_contribution(root, "workflows", "json", id)?);
     }
     for id in &manifest.contributes.themes {
         contributions
             .themes
             .push(raw_contribution(root, "themes", "json", id)?);
+    }
+    for id in &manifest.contributes.model_providers {
+        contributions
+            .model_providers
+            .push(raw_contribution(root, "providers/models", "json", id)?);
+    }
+    for id in &manifest.contributes.agent_providers {
+        contributions
+            .agent_providers
+            .push(raw_contribution(root, "providers/agents", "json", id)?);
     }
     Ok(contributions)
 }
