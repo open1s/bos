@@ -1092,6 +1092,15 @@ impl ExtensionStore {
         Ok(())
     }
 
+    /// Clear a persisted failure so the next load can retry.
+    pub(crate) fn clear_failure(&self, id: &ExtensionId) -> Result<(), ExtensionError> {
+        self.update_state(id, |state| {
+            state.last_error = None;
+            state.last_state = Some("loading".to_string());
+        })?;
+        Ok(())
+    }
+
     /// Record a successful activation.
     pub(crate) fn record_started(&self, id: &ExtensionId) -> Result<(), ExtensionError> {
         self.update_state(id, |state| {

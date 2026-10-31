@@ -172,12 +172,12 @@ Status legend:
 | Lazy loading / on-demand activation | done via LazyRuntime |
 | Graceful deactivate/shutdown | done | runtime trait delegated through LazyRuntime |
 | Cancellation of outstanding work | done | Runtime::cancel stops process/MCP children and traps a WASM guest |
-| Health monitoring and crash handling | partial: health/status; crash backoff retry missing |
+| Health monitoring and crash handling | done | health/status, persisted last error, bounded startup retry and `bsh ext retry` |
 | Retry with bounded backoff | missing |
 | State persistence independent of package | done |
 | Explicit uninstall and retention | done |
 | Startup policies on-startup/on-demand/on-workspace-open/manual | done |
-| Failure stops new requests, times out work, releases resources, diagnostics, isolation | partial: new requests skipped, timeout per call, resources lazy; startup retry present, crash isolation partial |
+| Failure stops new requests, times out work, releases resources, diagnostics, isolation | done | requests skipped, per-call timeouts, lazy resources, startup retry and scan/load isolation |
 
 ## 8. Runtimes
 

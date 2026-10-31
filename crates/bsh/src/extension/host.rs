@@ -616,6 +616,7 @@ impl ExtensionHost {
         self.issues = issues;
         for entry in self.loaded.values() {
             if entry.applied {
+                let _ = self.store.record_started(entry.package.id());
                 if let Ok(event) =
                     lifecycle_event(entry.package.id(), topics::EXTENSION_LOADED, "active", None)
                 {
@@ -623,6 +624,7 @@ impl ExtensionHost {
                 }
             } else if let Some(error) = &entry.error {
                 self.store.record_crash(entry.package.id().as_str(), error);
+                let _ = self.store.record_failure(entry.package.id(), error);
                 if let Ok(event) = lifecycle_event(
                     entry.package.id(),
                     topics::EXTENSION_FAILED,
@@ -890,6 +892,13 @@ impl ExtensionHost {
             .values()
             .map(|entry| self.status_of(entry))
             .collect()
+    }
+
+    /// Clear a persisted failure and reload the package set.
+    pub(crate) fn retry(&mut self, id: &str) -> Result<(), ExtensionError> {
+        let id = crate::extension::types::ExtensionId::parse(id.to_string())?;
+        self.store.clear_failure(&id)?;
+        self.rebuild()
     }
 
     /// Grant one process executable and reload the package set.

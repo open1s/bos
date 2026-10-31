@@ -43,6 +43,7 @@ Commands:
   reproduce <lock>                    reinstall exactly the locked versions
   update <path>                      install a new version and activate it
   rollback <id>                      activate the previous installed version
+  retry <id>                         clear a persisted failure and reload
   quarantine <id> [--reason <text>]  move code to quarantine and disable it
   grant <id> <capability> [options]   grant a capability (--scope, --note)
   revoke <id> <capability>            revoke a capability
@@ -119,6 +120,7 @@ pub(crate) fn run(args: &[String]) -> i32 {
         "reproduce" => command_reproduce(&rest[1..], root.clone()),
         "update" => command_install(&rest[1..], root.clone()),
         "rollback" => command_rollback(&rest[1..], root.clone()),
+        "retry" => command_retry(&rest[1..], root.clone()),
         "quarantine" => command_quarantine(&rest[1..], root.clone()),
         "grant" => command_grant(&rest[1..], root.clone()),
         "revoke" => command_revoke(&rest[1..], root.clone()),
@@ -951,6 +953,28 @@ fn command_rollback(args: &[String], root: Option<PathBuf>) -> Result<i32, Strin
     Ok(0)
 }
 
+fn command_retry(args: &[String], root: Option<PathBuf>) -> Result<i32, String> {
+    let id = ExtensionId::parse(one_argument(args, "bsh ext retry <id>")?)
+        .map_err(|error| error.to_string())?;
+    let config = config(root);
+    let store = ExtensionStore::open(config.root.clone()).map_err(|error| error.to_string())?;
+    store
+        .clear_failure(&id)
+        .map_err(|error| error.to_string())?;
+    let mut host = ExtensionHost::open(config).map_err(|error| error.to_string())?;
+    host.retry(id.as_str()).map_err(|error| error.to_string())?;
+    let status = host
+        .statuses()
+        .into_iter()
+        .find(|status| status.id == id.as_str())
+        .ok_or_else(|| format!("{id} is not installed"))?;
+    if let Some(error) = status.error {
+        println!("{id} failed: {error}");
+        return Ok(1);
+    }
+    println!("{id} {}", status.state.as_str());
+    Ok(0)
+}
 fn command_quarantine(args: &[String], root: Option<PathBuf>) -> Result<i32, String> {
     let id = ExtensionId::parse(one_argument(args, "bsh ext quarantine <id>")?)
         .map_err(|error| error.to_string())?;
