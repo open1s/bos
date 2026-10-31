@@ -1531,8 +1531,9 @@ registry install, versions/rollback and config.
 **Deliberate limits, stated rather than hidden:** process tools, MCP servers and
 WASM components deliver live progress through run_streaming; model, agent and
 preset providers are selectable through the settings plugin maps; theme
-contributions apply to their extension's panels but not app-wide; lockfile
-reproduction covers Git, registry and local source paths; the process child has
+contributions style their own panels and can override the shell palette when
+selected in Settings; lockfile reproduction covers Git, registry and local
+source paths; the process child has
 RLIMIT limits and a macOS write sandbox profile but no Linux namespace. The
 legacy Codex/DSH shim in
 `crates/agent/src/extensions` still backs the old inventory pane; it is not used

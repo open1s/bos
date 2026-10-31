@@ -43,7 +43,7 @@ pub(crate) mod ui;
 
 pub(crate) use events::topics;
 pub(crate) use host::{
-    cached_commands, cached_model_providers, cached_presets, install, panels, publish,
+    cached_commands, cached_model_providers, cached_presets, install, panels, publish, themes,
     CommandSurface,
 };
 

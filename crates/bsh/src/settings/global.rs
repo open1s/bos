@@ -515,6 +515,9 @@ fn source_exists(path: &str) -> bool {
 pub(crate) struct General {
     /// The palette mode: "light", "dark" or "system".
     pub(crate) theme_mode: String,
+    /// An extension theme id to apply over the kit palette, when selected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) extension_theme: Option<String>,
     /// The interface language.
     pub(crate) lang: String,
     /// The conversation content size in px.
@@ -612,6 +615,7 @@ impl Default for General {
     fn default() -> Self {
         Self {
             theme_mode: "system".to_string(),
+            extension_theme: None,
             lang: "en".to_string(),
             content_font_size: 14,
             content_width: None,

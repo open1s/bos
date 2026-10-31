@@ -72,7 +72,7 @@ Status legend:
 | Prompt extension | done | Markdown appended to system prompt |
 | Command extension | done | registered and inserted from the composer slash palette |
 | Event extension | partial | WASM subscribe/on-event + workspace/model publishers; process subscriptions missing |
-| Theme extension | partial | files recorded; host panel uses the active theme; contribution not applied |
+| Theme extension | done | panel theme plus an app-wide palette override selected in Settings |
 | Language extension | missing | no language contribution kind |
 | Storage extension | partial | namespace API exists; no guest host-function binding |
 | Integration extension | missing | no GitHub/browser/terminal adapter contribution |
@@ -147,7 +147,7 @@ Status legend:
 | agent/model_provider | partial | descriptor discovery |
 | workflow/trigger, action, execution | done | sequential workflow executor; no triggers |
 | events/publisher, subscriber | done | publisher + WASM and process subscribers |
-| ui/panel, view, command, notification, theme | partial | panels/views/commands/notifications; theme contributions not applied |
+| ui/panel, view, command, notification, theme | done | panels/views/commands/notifications + panel and app-wide theme |
 
 ### 6.2 Contract rules
 
@@ -204,7 +204,7 @@ Status legend:
 | Focus, keyboard, accessibility | partial | role/aria labels; no keyboard focus model or text editing |
 | Loading/error/unavailability states | done | renderer loading/error/message |
 | No JS/HTML | done |
-| Theme contributions | partial | tokens apply to the owning extension panels, not the whole shell |
+| Theme contributions | done | tokens apply to extension panels and, when selected, override the shell palette |
 
 ## 10. Agent-native API
 
@@ -327,7 +327,7 @@ is deliberate and does not remove a feature.
 | Phase 1 core | done |
 | Phase 2 WASM + Extism | done |
 | Phase 3 agent, event, MCP, process | partial | MCP/events/process/tools done; live streaming/progress partial |
-| Phase 4 GPUI UI | partial | renderer/panels/actions done; themes and keyboard focus partial |
+| Phase 4 GPUI UI | partial | renderer/panels/actions/themes done; keyboard focus routing partial |
 | Phase 5 ecosystem | done | registry/upgrade/rollback/signatures/builder/Extism/lock reproduction |
 
 ## 19. User stories
@@ -347,8 +347,7 @@ Each is a behaviour, not a missing type.
 
 1. Agent provider descriptors are selectable presets; there is no separate
    code-level agent adapter API beyond that descriptor contract.
-2. Theme contributions apply to an extension's own panels, not the whole shell.
-3. Filesystem sandbox is macOS-only: a sandbox profile confines writes to the
+2. Filesystem sandbox is macOS-only: a sandbox profile confines writes to the
    package, workspace, data and temp paths; Linux namespaces are not implemented.
-4. Cross-platform matrix: the suite is green on macOS (this environment);
+3. Cross-platform matrix: the suite is green on macOS (this environment);
    Windows/Linux process limits and path handling are not exercised here.

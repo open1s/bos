@@ -10,7 +10,8 @@ use gpui_kit::component::{
     ActiveTheme as _,
 };
 use gpui_kit::*;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 
 /// The 16 colour tokens the views read.
 ///
@@ -67,6 +68,61 @@ thread_local! {
     /// and a process-global copy let one test's `theme::apply` repaint another
     /// test's frame - the race this file's own test note warns about.
     static PALETTE: Cell<Palette> = const { Cell::new(Palette::SHIPPED) };
+
+    /// Colour tokens an extension theme overrides on top of the kit palette.
+    ///
+    /// Kept per-thread for the same reason as PALETTE: a GPUI App paints on one
+    /// thread, and tests run one case per thread.
+    static EXTENSION_TOKENS: RefCell<Vec<(String, u32)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Install extension theme tokens over the active kit palette.
+pub(crate) fn set_extension_tokens(colors: &BTreeMap<String, String>) {
+    let tokens = colors
+        .iter()
+        .filter_map(|(token, raw)| {
+            let hex = raw.trim().strip_prefix('#').unwrap_or(raw.trim());
+            if hex.len() < 6 {
+                return None;
+            }
+            u32::from_str_radix(&hex[..6], 16)
+                .ok()
+                .map(|color| (token.clone(), color))
+        })
+        .collect();
+    EXTENSION_TOKENS.with(|cell| *cell.borrow_mut() = tokens);
+}
+
+/// Remove an extension theme override.
+pub(crate) fn clear_extension_tokens() {
+    EXTENSION_TOKENS.with(|cell| cell.borrow_mut().clear());
+}
+
+/// Apply the override tokens to a palette value.
+fn apply_extension_tokens(palette: &mut Palette) {
+    EXTENSION_TOKENS.with(|cell| {
+        for (token, color) in cell.borrow().iter() {
+            match token.as_str() {
+                "page" => palette.page = *color,
+                "sidebar_bg" | "sidebar" => palette.sidebar_bg = *color,
+                "selected_row" | "selected-row" => palette.selected_row = *color,
+                "new_session_fill" | "new-session-fill" => palette.new_session_fill = *color,
+                "hover" => palette.hover = *color,
+                "text" => palette.text = *color,
+                "muted" => palette.muted = *color,
+                "faint" => palette.faint = *color,
+                "border_soft" | "border-soft" => palette.border_soft = *color,
+                "border" => palette.border = *color,
+                "border_strong" | "border-strong" => palette.border_strong = *color,
+                "accent" => palette.accent = *color,
+                "error" => palette.error = *color,
+                "success" => palette.success = *color,
+                "warn" => palette.warn = *color,
+                "user_bubble" => palette.user_bubble = *color,
+                _ => {}
+            }
+        }
+    });
 }
 
 /// Read one token from the current thread's palette.
@@ -1070,7 +1126,7 @@ pub(crate) fn sync(cx: &App) {
     let fg = t.foreground;
     let bg = t.background;
     PALETTE.with(|cell| {
-        cell.set(Palette {
+        let mut palette = Palette {
             page: hx(t.background),
             sidebar_bg: hx(t.sidebar),
             selected_row: hx(t.sidebar_accent),
@@ -1087,7 +1143,9 @@ pub(crate) fn sync(cx: &App) {
             success: hx(t.success),
             warn: hx(t.warning),
             user_bubble: hx(t.secondary),
-        });
+        };
+        apply_extension_tokens(&mut palette);
+        cell.set(palette);
     });
 }
 /// Switch between the kit's light and dark palettes.
@@ -1253,6 +1311,25 @@ pub(crate) fn terminal_palette() -> [u32; 16] {
 #[cfg(test)]
 mod tests {
     use super::terminal_font_size;
+    use super::{apply_extension_tokens, clear_extension_tokens, set_extension_tokens, Palette};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn extension_theme_tokens_override_only_the_named_fields() {
+        let mut colors = BTreeMap::new();
+        colors.insert("page".to_string(), "#010203".to_string());
+        colors.insert("accent".to_string(), "#a1b2c3".to_string());
+        set_extension_tokens(&colors);
+        let mut palette = Palette::SHIPPED;
+        apply_extension_tokens(&mut palette);
+        assert_eq!(palette.page, 0x010203);
+        assert_eq!(palette.accent, 0xA1B2C3);
+        assert_eq!(palette.text, Palette::SHIPPED.text);
+        clear_extension_tokens();
+        let mut fresh = Palette::SHIPPED;
+        apply_extension_tokens(&mut fresh);
+        assert_eq!(fresh.page, Palette::SHIPPED.page);
+    }
 
     /// The terminal sits one point under the body, at every step of the Font
     /// size setting, so scaling the app scales the terminal with it.

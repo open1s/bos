@@ -853,6 +853,10 @@ pub(crate) struct Shell {
     pub(crate) extension_commands: Vec<crate::extension::CommandSurface>,
     /// The declarative extension panel host, created when the pane opens.
     pub(crate) extension_panels: Option<Entity<crate::ui::extension_panel::ExtensionPanelView>>,
+    /// Extension themes, resolved with the panels so a render does not re-open
+    /// the host on every frame.
+    pub(crate) extension_themes:
+        Option<std::collections::BTreeMap<String, crate::extension::ui::ThemePalette>>,
     /// The settings dialog's text fields.
     pub(crate) settings_inputs: SettingsInputs,
     /// The Vault pane's text fields.
@@ -1075,6 +1079,25 @@ impl Shell {
         // the open extension host after the settings tree has loaded, so a
         // contributed model/preset is selectable without a relaunch.
         crate::caps::refresh_plugin_providers(&mut state.settings);
+        // An extension theme is runtime state too: resolve the stored id against
+        // the host's themes, and fall back to the kit palette when it is gone.
+        let extension_themes = {
+            let root = state.settings.active_workspace_root();
+            let workspace = (!root.is_empty()).then(|| std::path::PathBuf::from(root));
+            let themes = crate::extension::themes(&state.settings, workspace.as_deref());
+            match state
+                .settings
+                .global
+                .general
+                .extension_theme
+                .as_deref()
+                .and_then(|id| themes.get(id))
+            {
+                Some(theme) => crate::theme::set_extension_tokens(&theme.colors),
+                None => crate::theme::clear_extension_tokens(),
+            }
+            themes
+        };
         // A workspace file written before the model became session-scoped
         // still names one. It is handed to the session that is now open, once,
         // so an upgrade does not strand the reader on "Select model".
@@ -1661,6 +1684,7 @@ impl Shell {
             plugins: Vec::new(),
             extension_commands: crate::extension::cached_commands(),
             extension_panels: None,
+            extension_themes: Some(extension_themes),
             settings_inputs,
             vault_inputs,
             vault_revealed: None,

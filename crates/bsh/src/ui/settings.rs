@@ -6530,6 +6530,76 @@ impl Shell {
                 Some(cx.new(|_| crate::ui::extension_panel::ExtensionPanelView::new(panels)));
         }
         let view = self.extension_panels.clone().expect("panel view");
+
+        let theme_surfaces = self.extension_themes.clone().unwrap_or_default();
+        let selected_theme = self.state.draft().global.general.extension_theme.clone();
+        let selected_label = selected_theme
+            .as_ref()
+            .and_then(|id| theme_surfaces.get(id))
+            .map(|theme| {
+                if theme.name.is_empty() {
+                    selected_theme.clone().unwrap_or_default()
+                } else {
+                    theme.name.clone()
+                }
+            })
+            .unwrap_or_else(|| tr(self.state.lang, "settings.themeKit").to_string());
+        let theme_view = cx.entity();
+        let theme_options: Vec<(Option<String>, String)> =
+            std::iter::once((None, tr(self.state.lang, "settings.themeKit").to_string()))
+                .chain(theme_surfaces.iter().map(|(id, theme)| {
+                    let label = if theme.name.is_empty() {
+                        id.clone()
+                    } else {
+                        theme.name.clone()
+                    };
+                    (Some(id.clone()), label)
+                }))
+                .collect();
+        let theme_choices = theme_surfaces.clone();
+        let theme_menu = Button::new("extension-global-theme")
+            .ghost()
+            .debug_selector(|| "extension-global-theme".to_string())
+            .h(px(32.0))
+            .px(px(12.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .rounded(px(9.0))
+            .bg(rgb(theme::new_session_fill()))
+            .cursor_pointer()
+            .child(icon(IconName::Sun, 13.0, theme::muted()))
+            .child(txt(selected_label, 12.0, theme::text()))
+            .child(icon(IconName::ChevronDown, 12.0, theme::faint()))
+            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
+                let mut menu = menu.min_w(px(240.0));
+                let selected = selected_theme.clone();
+                for (id, label) in theme_options.iter() {
+                    let pick = theme_view.clone();
+                    let choice = id.clone();
+                    let colors = choice
+                        .as_ref()
+                        .and_then(|id| theme_choices.get(id))
+                        .map(|theme| theme.colors.clone());
+                    let active = selected.as_deref() == choice.as_deref();
+                    menu = menu.item(PopupMenuItem::new(label.clone()).checked(active).on_click(
+                        move |_, _, cx| {
+                            let choice = choice.clone();
+                            let colors = colors.clone();
+                            pick.update(cx, |this, cx| {
+                                this.state.draft_mut().global.general.extension_theme = choice;
+                                match colors {
+                                    Some(colors) => theme::set_extension_tokens(&colors),
+                                    None => theme::clear_extension_tokens(),
+                                }
+                                cx.notify();
+                            });
+                        },
+                    ));
+                }
+                menu
+            });
         let refresh_settings = self.state.settings.clone();
         let refresh_workspace = workspace;
         let refresh_view = view.clone();
@@ -6552,15 +6622,20 @@ impl Shell {
                 12.0,
                 theme::text(),
             ))
-            .on_click(cx.listener(move |_this, _event, _window, cx| {
+            .on_click(cx.listener(move |this, _event, _window, cx| {
                 let panels =
                     crate::extension::panels(&refresh_settings, refresh_workspace.as_deref(), None);
+                this.extension_themes = Some(crate::extension::themes(
+                    &refresh_settings,
+                    refresh_workspace.as_deref(),
+                ));
                 refresh_view.update(cx, |view, cx| {
                     view.set_panels(panels);
                     cx.notify();
                 });
             }));
         let rows = vec![
+            div().mb(px(10.0)).child(theme_menu).into_any_element(),
             div().mb(px(10.0)).child(refresh).into_any_element(),
             div()
                 .debug_selector(|| "extension-panels".to_string())

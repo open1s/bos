@@ -910,6 +910,30 @@ impl ExtensionHost {
         surfaces
     }
 
+    /// Every theme a package contributes, keyed by a host-owned id.
+    pub(crate) fn theme_surfaces(&self) -> BTreeMap<String, crate::extension::ui::ThemePalette> {
+        let mut themes = BTreeMap::new();
+        for entry in self.loaded.values() {
+            if !entry.applied || entry.error.is_some() {
+                continue;
+            }
+            for theme in &entry.contributions.themes {
+                let Ok(text) = std::fs::read_to_string(&theme.path) else {
+                    continue;
+                };
+                if let Ok(palette) =
+                    serde_json::from_str::<crate::extension::ui::ThemePalette>(&text)
+                {
+                    themes.insert(
+                        format!("ext.{}.{}", entry.package.id().as_str(), theme.id.as_str()),
+                        palette,
+                    );
+                }
+            }
+        }
+        themes
+    }
+
     /// Every command contribution an applied package offers, ready for the
     /// composer palette.
     pub(crate) fn command_surfaces(&self) -> Vec<CommandSurface> {
@@ -1443,6 +1467,37 @@ pub(crate) fn panels(
         .unwrap_or_default()
 }
 
+/// The extension themes the current configuration offers.
+pub(crate) fn themes(
+    settings: &crate::settings::Settings,
+    workspace: Option<&Path>,
+) -> BTreeMap<String, crate::extension::ui::ThemePalette> {
+    let config = HostConfig::from_settings(settings, workspace.map(Path::to_path_buf), None);
+    let slot = HOST.get_or_init(|| Mutex::new(None));
+    let mut guard = match slot.lock() {
+        Ok(guard) => guard,
+        Err(_) => return BTreeMap::new(),
+    };
+    let reopen = guard.as_ref().is_none_or(|host| host.config != config);
+    if reopen {
+        match ExtensionHost::open(config) {
+            Ok(host) => *guard = Some(host),
+            Err(error) => {
+                log::warn!("extension host could not open: {error}");
+                return BTreeMap::new();
+            }
+        }
+    } else if let Some(host) = guard.as_mut() {
+        if let Err(error) = host.ensure_fresh() {
+            log::warn!("extension host could not refresh: {error}");
+        }
+    }
+    guard
+        .as_ref()
+        .map(ExtensionHost::theme_surfaces)
+        .unwrap_or_default()
+}
+
 /// Open a host for the CLI or a test, without touching the process global.
 pub(crate) fn open(
     settings: &crate::settings::Settings,
@@ -1670,6 +1725,9 @@ tools = ["echo"]
         let presets = host.preset_surfaces();
         assert!(presets.contains_key("ext.com.example.extism-echo.reader"));
         assert!(presets.contains_key("ext.com.example.extism-echo.agent.helper"));
+        assert!(host
+            .theme_surfaces()
+            .contains_key("ext.com.example.extism-echo.midnight"));
         let _ = std::fs::remove_dir_all(&root);
     }
     #[test]

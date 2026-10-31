@@ -28,7 +28,7 @@ An extension is a directory with an extension.toml manifest. It may contribute:
 | Prompt | Agent system prompt section | declarative, process, built-in |
 | Context | Agent system prompt section | declarative, process, built-in |
 | Workflow | Recorded; no executor in this build | declarative |
-| Theme | Recorded; no applier in this build | declarative |
+| Theme | Panel theme plus selectable app-wide palette override | declarative |
 
 Registering a contribution and being allowed to perform its operation are two
 different decisions. See section 6.
@@ -565,7 +565,8 @@ A package may also ship themes/<id>.json:
 Tokens the renderer knows are page, text, muted, faint, border, border-soft,
 accent, error, success, warn, new-session-fill and hover. Missing tokens fall
 back to the active host palette; the first declared theme applies to that
-extension's panels. Themes do not re-theme the whole shell.
+extension's panels. The Settings > Extensions pane also offers the theme as a
+global selection, which overlays its named tokens on the shell palette.
 
 ## 11. Storage
 
@@ -695,7 +696,8 @@ not kept:
 2. Model, agent and preset provider descriptors are selectable through the
    settings plugin provider/preset maps; there is no separate code-level adapter
    API beyond that descriptor contract.
-3. Theme tokens apply to the extension's own panels, not to the whole shell.
+3. Theme tokens apply to the extension's own panels; selecting the theme in
+   Settings also overlays its named tokens on the shell palette.
 4. Lockfile reproduction covers Git/registry remotes and the recorded local
    source path of a directory install.
 5. Process children get RLIMIT ceilings, a process group and a macOS write
