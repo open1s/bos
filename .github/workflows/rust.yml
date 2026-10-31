@@ -43,7 +43,7 @@ jobs:
             libjavascriptcoregtk-4.1-dev libsoup-3.0-dev libgdk-pixbuf-2.0-dev \
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
             libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libfontconfig1-dev libfreetype6-dev libssl-dev libasound2-dev libxdo-dev
+            libfontconfig1-dev libfreetype6-dev libssl-dev libasound2-dev libxdo-dev xvfb
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
@@ -62,7 +62,7 @@ jobs:
       # The binding crates are exercised by the jsbos/nbos pipelines; this job
       # covers the pure-Rust framework so a regression there is never silent.
       - name: Test
-        run: cargo test --workspace --exclude jsbos --exclude nbos
+        run: xvfb-run -a cargo test --workspace --exclude jsbos --exclude nbos
 
   msrv:
     name: Build at the declared MSRV
@@ -90,7 +90,7 @@ jobs:
             libjavascriptcoregtk-4.1-dev libsoup-3.0-dev libgdk-pixbuf-2.0-dev \
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
             libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libfontconfig1-dev libfreetype6-dev libssl-dev libasound2-dev libxdo-dev
+            libfontconfig1-dev libfreetype6-dev libssl-dev libasound2-dev libxdo-dev xvfb
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
