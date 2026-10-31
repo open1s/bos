@@ -2058,6 +2058,7 @@ mod tests {
 
     /// A shell tool confined by heel with UNRESTRICTED egress: no allowlist
     /// file, the state a fresh workspace derives.
+    #[cfg(target_os = "macos")]
     fn sandboxed_unrestricted_tool(root: &std::path::Path, permission: &str) -> BashTool {
         let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         let data = crate::policy::PolicyData::new(&root)
