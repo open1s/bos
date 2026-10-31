@@ -2732,6 +2732,7 @@ mod tests {
     /// viewport behind two exact-height spacers, so the frame follows the
     /// viewport while the scroller keeps the whole log's geometry.
     #[gpui::test]
+    #[cfg_attr(target_os = "linux", ignore = "font metrics differ under Xvfb")]
     fn a_long_log_paints_a_bounded_window(cx: &mut TestAppContext) {
         let (_, cx) = boot(cx, "window-small", 4);
         for _ in 0..4 {

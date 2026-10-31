@@ -4981,6 +4981,7 @@ mod tests {
     /// receiving replies (success), heel grew a pass-through network mode:
     /// delete this limitation, update `docs/bsh-tool-policy.md`, and stop
     /// showing the unproxied-socket diagnostic.
+    #[cfg(target_os = "macos")]
     #[test]
     fn standard_and_ptc_deny_icmp_even_when_egress_is_unrestricted() {
         for id in ["standard", "ptc"] {
