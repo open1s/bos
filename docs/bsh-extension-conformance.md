@@ -249,7 +249,7 @@ Status legend:
 | CPU/fuel and wall clock | done | wall clock + wasm fuel + process RLIMIT_CPU |
 | Memory/concurrency | partial | wasm StoreLimits + process RLIMIT_AS; concurrency per runtime mutex |
 | Host-call authorization | done | WASM host functions call PolicyEngine |
-| IPC authentication and message validation | partial | local child only, length/JSON; no token auth |
+| IPC authentication and message validation | partial | private stdio, line/JSON/depth validation; no token auth |
 | Secret redaction | done | read_secret + audit without values |
 | Storage isolation | done |
 | Permission revocation | done via grants store |

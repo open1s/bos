@@ -122,6 +122,12 @@ impl ProcessSession {
                         message: "response is not JSON-RPC 2.0".to_string(),
                     });
                 }
+                if json_depth_ok(&value, 0).is_err() {
+                    return Err(ExtensionError::Protocol {
+                        extension: extension.to_string(),
+                        message: "response nests deeper than 32 levels".to_string(),
+                    });
+                }
                 if value.get("id").and_then(Value::as_u64) != Some(id) {
                     // A notification or an earlier response. Progress
                     // notifications are forwarded; everything else is skipped.
@@ -326,6 +332,22 @@ fn jsonrpc_error_message(error: &Value) -> String {
 }
 
 /// Read one newline-terminated line with a byte ceiling.
+/// Reject a JSON value nested more than 32 levels deep.
+fn json_depth_ok(value: &Value, depth: usize) -> Result<(), ()> {
+    if depth > 32 {
+        return Err(());
+    }
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .try_for_each(|item| json_depth_ok(item, depth + 1)),
+        Value::Object(map) => map
+            .values()
+            .try_for_each(|item| json_depth_ok(item, depth + 1)),
+        _ => Ok(()),
+    }
+}
+
 async fn read_limited_line<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     limit: usize,
@@ -924,6 +946,16 @@ max_execution_ms = 2000
             Path::new("extension.toml"),
         )
         .expect("manifest")
+    }
+
+    #[test]
+    fn deeply_nested_json_is_refused() {
+        let mut value = json!(0);
+        for _ in 0..40 {
+            value = json!([value]);
+        }
+        assert!(json_depth_ok(&value, 0).is_err());
+        assert!(json_depth_ok(&json!({"ok": [1, 2, 3]}), 0).is_ok());
     }
 
     #[tokio::test]
