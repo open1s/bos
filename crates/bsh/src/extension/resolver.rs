@@ -42,6 +42,18 @@ pub(crate) struct LockedPackage {
     /// Local directory or archive this package was installed from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) source_path: Option<String>,
+    /// Git revision, when the source is a repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) revision: Option<String>,
+    /// Installation timestamp in Unix seconds.
+    #[serde(default)]
+    pub(crate) installed_at: u64,
+    /// Signature metadata shipped with the package.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) signature: Option<crate::extension::signing::PackageSignature>,
+    /// Publisher name from the signature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) publisher: Option<String>,
     /// Resolved dependency versions, id -> exact version.
     #[serde(default)]
     pub(crate) dependencies: BTreeMap<String, String>,
@@ -91,6 +103,18 @@ impl LockFile {
                     .source_path
                     .as_ref()
                     .map(|path| path.display().to_string()),
+                revision: match &package.source {
+                    crate::extension::types::ExtensionSource::Git { revision, .. } => {
+                        Some(revision.clone())
+                    }
+                    _ => None,
+                },
+                installed_at: package.installed_at,
+                signature: package.signature.clone(),
+                publisher: package
+                    .signature
+                    .as_ref()
+                    .map(|signature| signature.publisher.clone()),
                 dependencies: package
                     .manifest
                     .dependencies

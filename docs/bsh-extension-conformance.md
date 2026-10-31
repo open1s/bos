@@ -272,7 +272,7 @@ Status legend:
 | Data separation | done |
 | Uninstall data policy | done |
 | Upgrade must not overwrite data | done by versioned dirs |
-| Lockfile id/version/hash/source/revision/deps/api/signature/installation metadata | partial | signature/revision/metadata recorded in registry; lockfile fields partial |
+| Lockfile id/version/hash/source/revision/deps/api/signature/installation metadata | done | lock records source path, Git revision, installed_at, signature and publisher |
 | Upgrade and rollback | done | versions/set_active/rollback CLI |
 | Reproduce from lockfile | done | bsh ext reproduce reinstalls Git/registry locks or the recorded local source path, then checks hashes |
 | Package integrity verification on load | done | doctor + install signature/hash |
