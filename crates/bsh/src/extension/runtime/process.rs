@@ -483,7 +483,7 @@ impl ProcessRuntime {
             }
         };
         if guard.is_none() {
-            *guard = Some(self.start().await?);
+            *guard = Some(self.start_with_retry().await?);
         }
         let session = guard.as_mut().expect("session was just started");
         let result = session
@@ -524,6 +524,22 @@ impl ProcessRuntime {
                 Err(error)
             }
         }
+    }
+
+    /// Start with two bounded retries; a failed handshake leaves no tool side
+    /// effect, so retrying the transport is safe. Delays are 100ms and 250ms.
+    async fn start_with_retry(&self) -> Result<ProcessSession, ExtensionError> {
+        let mut last = None;
+        for delay in [0_u64, 100, 250] {
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+            match self.start().await {
+                Ok(session) => return Ok(session),
+                Err(error) => last = Some(error),
+            }
+        }
+        Err(last.expect("a start attempt ran"))
     }
 
     async fn start(&self) -> Result<ProcessSession, ExtensionError> {

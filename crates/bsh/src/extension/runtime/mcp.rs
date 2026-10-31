@@ -277,6 +277,22 @@ impl McpRuntime {
         }
     }
 
+    /// Start with two bounded retries; a failed handshake has no tool side
+    /// effect, so retrying the transport is safe. Delays are 100ms and 250ms.
+    fn start_with_retry(&self) -> Result<Session, ExtensionError> {
+        let mut last = None;
+        for delay in [0_u64, 100, 250] {
+            if delay > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+            }
+            match self.start() {
+                Ok(session) => return Ok(session),
+                Err(error) => last = Some(error),
+            }
+        }
+        Err(last.expect("a start attempt ran"))
+    }
+
     fn start(&self) -> Result<Session, ExtensionError> {
         let program = if is_allowlisted_command(&self.entry) {
             PathBuf::from(&self.entry)
@@ -540,7 +556,7 @@ impl McpRuntime {
             message: "MCP session lock is poisoned".to_string(),
         })?;
         if guard.is_none() {
-            *guard = Some(self.start()?);
+            *guard = Some(self.start_with_retry()?);
         }
         let session = guard.as_mut().expect("session");
         let result = session.request_with_progress(
@@ -655,7 +671,7 @@ impl Runtime for McpRuntime {
             message: "MCP session lock is poisoned".to_string(),
         })?;
         if guard.is_none() {
-            *guard = Some(self.start()?);
+            *guard = Some(self.start_with_retry()?);
         }
         let session = guard.as_mut().expect("session");
         let result = session.request(

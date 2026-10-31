@@ -51,7 +51,7 @@ Status legend:
 | UI-hosted | done at contract level; renderer pending | no GPUI object crosses the boundary |
 | Command/event/stream distinction | done | RPC, events and live process/MCP/WASM progress through run_streaming |
 | Versioned contracts | done | manifest 1.0, API 1.0, UI 1.0, WIT package 1.0 |
-| Fault containment | partial | timeout/lazy runtime/cancel token; retry backoff missing |
+| Fault containment | done | timeout/lazy runtime/cancel token + bounded process/MCP startup retry |
 | Observable by default | partial | status/audit/doctor + host call/event metrics; memory/fuel/task gauges partial |
 | Reproducible installation | done | lockfile, sources, upgrade/rollback, reproduce from remote or recorded local path |
 | Data survives code upgrades | done | data root separated; migrations executed on version change |
@@ -177,7 +177,7 @@ Status legend:
 | State persistence independent of package | done |
 | Explicit uninstall and retention | done |
 | Startup policies on-startup/on-demand/on-workspace-open/manual | done |
-| Failure stops new requests, times out work, releases resources, diagnostics, isolation | partial: new requests skipped, timeout per call, resources lazy; backoff missing |
+| Failure stops new requests, times out work, releases resources, diagnostics, isolation | partial: new requests skipped, timeout per call, resources lazy; startup retry present, crash isolation partial |
 
 ## 8. Runtimes
 
