@@ -365,17 +365,13 @@ impl ExtensionPanelView {
                                     .child(txt(current.clone(), 13.0, self.palette.text)),
                             )
                             .child(
-                                div()
-                                    .id(format!("extension-apply-{path}"))
-                                    .role(Role::Button)
-                                    .aria_label(label.clone())
+                                Button::new(format!("extension-apply-{path}"))
+                                    .debug_selector(|| format!("extension-apply-{path}"))
+                                    .accessibility_label(label.clone())
                                     .px(px(10.0))
                                     .h(px(30.0))
-                                    .flex()
-                                    .items_center()
                                     .rounded(px(8.0))
                                     .bg(rgb(self.palette.accent))
-                                    .cursor_pointer()
                                     .child(txt("Apply", 12.0, self.palette.page))
                                     .on_click(cx.listener(move |this, _event, _window, cx| {
                                         this.dispatch(&action, json!({}), cx)
@@ -405,17 +401,13 @@ impl ExtensionPanelView {
                     let action = action.clone();
                     let option_value = option.value.clone();
                     chips = chips.child(
-                        div()
-                            .id(format!("extension-option-{path}-{}", option.value))
-                            .role(Role::Button)
-                            .aria_label(option.label.clone())
+                        Button::new(format!("extension-option-{path}-{}", option.value))
+                            .debug_selector(|| format!("extension-option-{path}-{}", option.value))
+                            .accessibility_label(option.label.clone())
                             .px(px(9.0))
                             .h(px(26.0))
-                            .flex()
-                            .items_center()
                             .rounded(px(7.0))
                             .bg(rgb(self.palette.new_session_fill))
-                            .cursor_pointer()
                             .child(txt(option.label.clone(), 12.0, self.palette.text))
                             .on_click(cx.listener(move |this, _event, _window, cx| {
                                 this.dispatch(&action, json!({ "value": option_value.clone() }), cx)
@@ -432,15 +424,16 @@ impl ExtensionPanelView {
             } => {
                 let action = action.clone();
                 let next = !*checked;
-                div()
-                    .id(format!("extension-check-{path}"))
-                    .role(Role::CheckBox)
-                    .aria_label(label.clone())
+                Button::new(format!("extension-check-{path}"))
+                    .debug_selector(|| format!("extension-check-{path}"))
+                    .accessibility_label(label.clone())
+                    .h(px(26.0))
+                    .px(px(6.0))
+                    .rounded(px(6.0))
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap(px(8.0))
-                    .cursor_pointer()
                     .child(if *checked {
                         icon(IconName::Check, 14.0, self.palette.accent).into_any_element()
                     } else {
