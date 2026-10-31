@@ -357,6 +357,21 @@ impl Shell {
                                             )
                                         })
                                 })
+                                .when_some(self.bottom_extension_panels.clone(), |stack, view| {
+                                    stack.child(
+                                        div()
+                                            .debug_selector(|| "extension-bottom-dock".to_string())
+                                            .w_full()
+                                            .h(px(180.0))
+                                            .px(px(10.0))
+                                            .py(px(8.0))
+                                            .rounded(px(12.0))
+                                            .border_1()
+                                            .border_color(rgb(theme::border_soft()))
+                                            .bg(rgb(theme::page()))
+                                            .child(view),
+                                    )
+                                })
                                 .child(self.render_composer(cx)),
                         )
                 }
