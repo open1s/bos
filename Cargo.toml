@@ -71,7 +71,7 @@ heel = { git = "https://github.com/open1s/heel", rev = "6db173aa0baf48ef06c3e946
 [workspace.package]
 version = "3.0.2"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.97"
 authors = ["BrickOS Team"]
 license = "MIT OR Apache-2.0"
 
