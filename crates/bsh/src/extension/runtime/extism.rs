@@ -8,7 +8,7 @@
 //! runtimes.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -329,6 +329,7 @@ pub(crate) struct ExtismRuntime {
     tools: Vec<ToolDescriptor>,
     execution_ms: u64,
     memory_mb: u64,
+    fuel_used: AtomicU64,
     cancelled: Arc<std::sync::atomic::AtomicBool>,
     deadline: Mutex<Option<Instant>>,
 }
@@ -398,6 +399,7 @@ impl ExtismRuntime {
             tools,
             execution_ms: manifest.resources.execution_ms(),
             memory_mb: manifest.resources.memory_mb(),
+            fuel_used: AtomicU64::new(0),
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             deadline: Mutex::new(None),
         })
@@ -463,6 +465,9 @@ impl ExtismRuntime {
             message: error.to_string(),
         })?;
         let output = plugin.call::<&str, String>(name, text.as_str());
+        if let Some(fuel) = plugin.fuel_consumed() {
+            self.fuel_used.store(fuel, Ordering::Relaxed);
+        }
         match output {
             Ok(output) => {
                 serde_json::from_str(&output)
@@ -549,6 +554,10 @@ impl Runtime for ExtismRuntime {
 
     fn memory_limit(&self) -> Option<u64> {
         Some(self.memory_mb.saturating_mul(1024 * 1024))
+    }
+
+    fn fuel_used(&self) -> Option<u64> {
+        Some(self.fuel_used.load(Ordering::Relaxed))
     }
 
     async fn activate(&self) -> Result<(), ExtensionError> {
@@ -693,6 +702,7 @@ mod tests {
         assert_eq!(command["id"], "greet");
         let panel = runtime.panel("status").await.expect("panel");
         assert_eq!(panel["schema_version"], "1.0");
+        assert!(runtime.fuel_used().unwrap_or(0) > 0);
         runtime.shutdown().await.expect("shutdown");
         let _ = std::fs::remove_dir_all(&scratch);
     }
