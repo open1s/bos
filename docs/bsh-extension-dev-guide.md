@@ -311,6 +311,13 @@ A package selects `runtime.kind = "mcp"`. The host starts the server, performs
 - `prompts/list` and `prompts/get` to prompt contributions.
 
 `examples/extensions/mcp-echo` is a newline-delimited JSON-RPC Python server.
+
+`examples/extensions/hook-demo` is a process package that subscribes to every
+host hook topic, records what arrives, and exposes the log through `hook-log`.
+It also carries a command, prompt, scoped context, panel, theme, preset, model
+provider, agent role, workflow and config schema, so it is the reference for
+"one package, every extension point". Run it with
+`bsh ext mock examples/extensions/hook-demo hook-log '{}'`.
 The process needs `process.execute` plus the tool/context/prompt registration
 grants, exactly like a process package.
 

@@ -1,0 +1,5 @@
+{
+  "description": "Read the hook log",
+  "input_schema": {"type": "object"},
+  "steps": [{"name": "log", "tool": "hook-log", "arguments": {}}]
+}

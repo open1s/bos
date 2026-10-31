@@ -1,0 +1,4 @@
+{
+  "description": "Return the hook events this extension has received",
+  "input_schema": {"type": "object"}
+}

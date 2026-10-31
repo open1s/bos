@@ -1,0 +1,7 @@
+{
+  "name": "Hook Demo",
+  "description": "A read-only preset contributed by the hook demo",
+  "level": 1,
+  "permission": "read_only",
+  "plugins": ["shell", "files"]
+}

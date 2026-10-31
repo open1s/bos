@@ -871,6 +871,8 @@ impl ExtensionHost {
                 prompts: contributions.prompts.clone(),
                 contexts: contributions.contexts.clone(),
                 workspace: self.config.workspace.clone(),
+                skills_dir: (!entry.package.manifest.contributes.skills.is_empty())
+                    .then(|| entry.package.root.join("skills")),
                 workflows: contributions.workflows.clone(),
                 themes: contributions.themes.clone(),
                 timeout_ms: entry.package.manifest.resources.execution_ms(),

@@ -32,7 +32,7 @@ agent tool registration, diagnostics and `bsh ext ...`.
 - The normative contract is `docs/bsh-extension-standard.md`; the walkthrough is
   `docs/bsh-extension-dev-guide.md`; the WIT contract is `crates/bsh/wit/extension.wit`;
   runtime contracts are in `runtime/{wasm,extism,mcp,workflow}.rs`; examples are
-  `examples/extensions/{hello,process-echo,wasm-echo,mcp-echo,extism-echo}`.
+  `examples/extensions/{hello,process-echo,wasm-echo,mcp-echo,extism-echo,hook-demo}`.
 - It is wired into `caps::build_agent_for_session_inner` with one call to
   `crate::extension::install`, after the built-in bundles and before MCP. It
   contributes tools/commands/panels/prompts through the same seams as the

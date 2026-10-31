@@ -57,6 +57,8 @@ pub(crate) enum Capability {
     AgentContextProvide,
     /// Supply prompt fragments to the agent.
     AgentPromptsProvide,
+    /// Supply SKILL.md skills to the agent.
+    AgentSkillsProvide,
     /// Register model or provider adapters.
     AgentModelsProvide,
     /// Register agent roles or execution strategies.
@@ -77,7 +79,7 @@ pub(crate) enum Capability {
 
 impl Capability {
     /// Every capability, in declaration order.
-    pub(crate) const ALL: [Capability; 18] = [
+    pub(crate) const ALL: [Capability; 19] = [
         Self::WorkspaceRead,
         Self::WorkspaceWrite,
         Self::NetworkHttp,
@@ -88,6 +90,7 @@ impl Capability {
         Self::AgentToolsRegister,
         Self::AgentContextProvide,
         Self::AgentPromptsProvide,
+        Self::AgentSkillsProvide,
         Self::AgentModelsProvide,
         Self::AgentAgentsProvide,
         Self::AgentWorkflowsProvide,
@@ -111,6 +114,7 @@ impl Capability {
             Self::AgentToolsRegister => "agent.tools.register",
             Self::AgentContextProvide => "agent.context.provide",
             Self::AgentPromptsProvide => "agent.prompts.provide",
+            Self::AgentSkillsProvide => "agent.skills.provide",
             Self::AgentModelsProvide => "agent.models.provide",
             Self::AgentAgentsProvide => "agent.agents.provide",
             Self::AgentWorkflowsProvide => "agent.workflows.provide",
@@ -135,6 +139,7 @@ impl Capability {
             Self::AgentToolsRegister => "register tools the agent can call",
             Self::AgentContextProvide => "supply scoped context to the agent",
             Self::AgentPromptsProvide => "supply prompt fragments to the agent",
+            Self::AgentSkillsProvide => "supply SKILL.md skills to the agent",
             Self::AgentModelsProvide => "register model or provider adapters",
             Self::AgentAgentsProvide => "register agent roles or execution strategies",
             Self::AgentWorkflowsProvide => "register reusable workflows",
@@ -159,9 +164,10 @@ impl Capability {
             | Self::UiPanels
             | Self::UiCommands
             | Self::UiTheme => Risk::Low,
-            Self::AgentModelsProvide | Self::AgentAgentsProvide | Self::AgentWorkflowsProvide => {
-                Risk::Medium
-            }
+            Self::AgentModelsProvide
+            | Self::AgentAgentsProvide
+            | Self::AgentWorkflowsProvide
+            | Self::AgentSkillsProvide => Risk::Medium,
             Self::WorkspaceWrite | Self::NetworkHttp => Risk::High,
             Self::ProcessExecute | Self::ComputerUse | Self::SecretsRead => Risk::Critical,
         }

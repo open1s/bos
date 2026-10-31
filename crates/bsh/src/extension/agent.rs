@@ -52,6 +52,8 @@ pub(crate) struct Contributed {
     pub(crate) contexts: Vec<super::runtime::declarative::TextContribution>,
     /// Workspace open for this build, used to scope contexts.
     pub(crate) workspace: Option<std::path::PathBuf>,
+    /// Package skills directory, when the manifest declares skills.
+    pub(crate) skills_dir: Option<std::path::PathBuf>,
     /// Workflows, recorded only.
     pub(crate) workflows: Vec<super::runtime::declarative::RawContribution>,
     /// Themes, recorded only.
@@ -475,6 +477,17 @@ pub(crate) fn install(
             &mut prompt_budget,
         );
     }
+    if let Some(skills) = &contributed.skills_dir {
+        if skills.is_dir() {
+            if let Err(error) = agent.register_skills_from_dir(skills.clone()) {
+                log::warn!(
+                    target: "bsh::extension",
+                    "{}: skills were declared but could not be read: {error}",
+                    contributed.extension
+                );
+            }
+        }
+    }
     PluginInfo {
         name: contributed.extension.as_str().to_string(),
         tools: installed_tools,
@@ -665,6 +678,7 @@ mod tests {
             prompts: Vec::new(),
             contexts: Vec::new(),
             workspace: None,
+            skills_dir: None,
             workflows: Vec::new(),
             themes: Vec::new(),
             timeout_ms: 1000,

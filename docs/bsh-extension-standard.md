@@ -99,6 +99,7 @@ my-extension/
   commands/<id>.md        one per declared command
   prompts/<id>.md         one per declared prompt
   contexts/<id>.md        one per declared context
+  skills/<id>/SKILL.md    one per declared skill
   panels/<id>.json        one per declared panel
   workflows/<id>.json     one per declared workflow (executed)
   themes/<id>.json        one per declared theme (recorded)
@@ -214,6 +215,7 @@ commands = ["git.refresh"]
 panels = ["git.panel"]
 prompts = ["git.prompt"]
 contexts = ["git.context"]
+skills = ["git.helper"]
 workflows = ["git.release"]
 themes = ["git.dark"]
 events = ["workspace.opened", "tool.*"]
@@ -301,6 +303,7 @@ renders as empty. Tool output is capped by max_output_bytes.
 | agent.tools.register | low | allow | allow | allow |
 | agent.context.provide | low | allow | allow | allow |
 | agent.prompts.provide | low | allow | allow | allow |
+| agent.skills.provide | medium | allow | allow | allow |
 | events.publish | low | allow | allow | allow |
 | events.subscribe | low | allow | allow | allow |
 | ui.panels | low | allow | allow | allow |

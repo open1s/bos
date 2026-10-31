@@ -129,6 +129,9 @@ pub(crate) struct ContributesSpec {
     /// Scoped context providers.
     #[serde(default)]
     pub(crate) contexts: Vec<ContributionId>,
+    /// SKILL.md skill directories under skills/.
+    #[serde(default)]
+    pub(crate) skills: Vec<ContributionId>,
     /// Reusable workflows.
     #[serde(default)]
     pub(crate) workflows: Vec<ContributionId>,
@@ -536,7 +539,20 @@ impl Manifest {
                 );
             }
         }
+        let mut skills = std::collections::BTreeSet::new();
+        for id in &self.contributes.skills {
+            if !skills.insert(id) {
+                report.error(
+                    "contributes.skills",
+                    format!("skill id {id:?} is declared more than once"),
+                );
+            }
+        }
+        if self.contributes.skills.len() > 256 {
+            report.error("contributes.skills", "must contain at most 256 entries");
+        }
         if self.all_contributions().is_empty()
+            && self.contributes.skills.is_empty()
             && self.contributes.events.is_empty()
             && self.contributes.publishes.is_empty()
         {

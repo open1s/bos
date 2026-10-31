@@ -70,6 +70,8 @@ Status legend:
 | Workflow extension | done | runtime/workflow.rs sequential executor with capability union |
 | Context extension | done | Markdown contexts with optional `paths:` frontmatter scoped by workspace globs |
 | Prompt extension | done | Markdown appended to system prompt |
+| Skill extension | done | contributes.skills + skills/<id>/SKILL.md registered through Agent::register_skills_from_dir |
+| Host hooks | done | session, trajectory, skill, instruction, model, MCP, tool, network and audio topics |
 | Command extension | done | registered and inserted from the composer slash palette |
 | Event extension | done | WASM/process subscriptions, workspace/model/agent/tool publishers |
 | Theme extension | done | panel theme plus an app-wide palette override selected in Settings |

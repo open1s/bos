@@ -1,0 +1,78 @@
+schema_version = "1.0"
+
+[extension]
+id = "com.example.hook-demo"
+name = "Hook Demo"
+version = "1.0.0"
+description = "A process extension demonstrating every host hook point and contribution kind"
+authors = ["BSH Example"]
+license = "MIT"
+
+[compatibility]
+bsh = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+
+[runtime]
+kind = "process"
+entry = "python3"
+args = ["server.py"]
+startup = "on-demand"
+
+[capabilities]
+required = [
+  "process.execute",
+  "agent.tools.register",
+  "agent.prompts.provide",
+  "agent.context.provide",
+  "agent.skills.provide",
+  "agent.models.provide",
+  "agent.agents.provide",
+  "agent.workflows.provide",
+  "ui.panels",
+  "ui.commands",
+  "ui.theme",
+  "events.subscribe",
+]
+
+[contributes]
+tools = ["hook-log"]
+commands = ["events"]
+panels = ["status"]
+prompts = ["guide"]
+contexts = ["workspace"]
+skills = ["hook-demo"]
+themes = ["midnight"]
+presets = ["demo"]
+model_providers = ["example"]
+agent_providers = ["helper"]
+workflows = ["inspect"]
+events = [
+  "app.started",
+  "workspace.opened",
+  "session.created",
+  "session.updated",
+  "session.deleted",
+  "trajectory.recorded",
+  "agent.started",
+  "agent.completed",
+  "agent.failed",
+  "skill.loaded",
+  "instruction.build",
+  "model.requested",
+  "model.completed",
+  "mcp.connected",
+  "tool.invoked",
+  "tool.completed",
+  "tool.failed",
+  "network.request",
+  "audio.captured",
+  "extension.loaded",
+]
+publishes = ["tool.completed"]
+
+[configuration]
+schema = "schemas/config.schema.json"
+
+[resources]
+max_memory_mb = 128
+max_execution_ms = 5000
