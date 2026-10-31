@@ -193,6 +193,51 @@ impl ProcessSession {
     }
 }
 
+/// A bubblewrap plan that gives the child a private namespace, a read-only
+/// root, and writable binds only for the package, workspace, data and temp.
+///
+/// Kept platform-independent so the argument plan is testable on macOS even
+/// though it is only executed on Linux.
+fn linux_bwrap_plan(
+    root: &Path,
+    workspace: Option<&Path>,
+    data_root: Option<&Path>,
+    program: &Path,
+    args: &[String],
+) -> Vec<String> {
+    let mut plan = vec![
+        "--die-with-parent".to_string(),
+        "--unshare-all".to_string(),
+        "--share-net".to_string(),
+        "--ro-bind".to_string(),
+        "/".to_string(),
+        "/".to_string(),
+        "--proc".to_string(),
+        "/proc".to_string(),
+        "--dev".to_string(),
+        "/dev".to_string(),
+        "--tmpfs".to_string(),
+        "/tmp".to_string(),
+    ];
+    let mut writable: Vec<&Path> = vec![root];
+    if let Some(workspace) = workspace {
+        writable.push(workspace);
+    }
+    if let Some(data_root) = data_root {
+        writable.push(data_root);
+    }
+    for path in writable {
+        plan.push("--bind".to_string());
+        plan.push(path.display().to_string());
+        plan.push(path.display().to_string());
+    }
+    plan.push("--chdir".to_string());
+    plan.push(root.display().to_string());
+    plan.push(program.display().to_string());
+    plan.extend(args.iter().cloned());
+    plan
+}
+
 /// A macOS profile that allows reads everywhere and writes only inside the
 /// package, the open workspace, temp and device nodes.
 ///
@@ -589,7 +634,19 @@ impl ProcessRuntime {
                 },
             )?;
         }
-        let mut command = if self.sandbox && cfg!(target_os = "macos") {
+        let mut wrapped = false;
+        let mut command = if self.sandbox && cfg!(target_os = "linux") {
+            wrapped = true;
+            let mut command = Command::new("bwrap");
+            command.args(linux_bwrap_plan(
+                &self.root,
+                self.workspace.as_deref(),
+                self.data_root.as_deref(),
+                &program,
+                &self.args,
+            ));
+            command
+        } else if self.sandbox && cfg!(target_os = "macos") {
             let mut command = Command::new("/usr/bin/sandbox-exec");
             command
                 .arg("-p")
@@ -604,8 +661,10 @@ impl ProcessRuntime {
             Command::new(&program)
         };
         configure_process_limits(&mut command, self.memory_bytes, self.cpu_seconds);
+        if !wrapped {
+            command.args(&self.args);
+        }
         command
-            .args(&self.args)
             .current_dir(&self.root)
             .env_clear()
             .stdin(Stdio::piped())
@@ -789,6 +848,24 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn the_linux_plan_binds_only_writable_roots_and_appends_the_command() {
+        let plan = linux_bwrap_plan(
+            Path::new("/pkg"),
+            Some(Path::new("/work")),
+            Some(Path::new("/data")),
+            Path::new("/pkg/server"),
+            &["--flag".to_string()],
+        );
+        assert!(plan.contains(&"--unshare-all".to_string()));
+        assert_eq!(
+            plan.iter().filter(|item| item.as_str() == "--bind").count(),
+            3
+        );
+        assert_eq!(plan[plan.len() - 2], "/pkg/server");
+        assert_eq!(plan[plan.len() - 1], "--flag");
+    }
 
     struct Scratch(PathBuf);
 

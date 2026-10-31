@@ -704,7 +704,8 @@ not kept:
 4. Lockfile reproduction covers Git/registry remotes and the recorded local
    source path of a directory install.
 5. Process children get RLIMIT ceilings, a process group and a macOS write
-   sandbox profile; Linux namespaces are not implemented.
+   sandbox profile, and Linux runs the bubblewrap namespace plan. Linux execution
+   is not exercised in the macOS test environment.
 6. Cancellation traps a WASM guest and stops a process/MCP child; the operating
    system may take a moment to reap the child after the request.
 7. Windows/Linux process limits are compiled but not exercised in this macOS

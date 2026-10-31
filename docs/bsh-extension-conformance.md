@@ -188,7 +188,7 @@ Status legend:
 | Process JSON-RPC stdio, handshake, structured stderr | done |
 | Process executable allowlist/user approval | partial: allowlist + explicit grant; no per-command approval UI |
 | Environment filtering, cwd restriction, timeout, output limits | done |
-| OS-level sandbox | partial | macOS sandbox profile for writes + RLIMIT ceilings; Linux namespaces and process network bridge absent |
+| OS-level sandbox | partial | macOS profile tested; Linux bwrap namespace plan implemented but not executed here; process network bridge absent |
 | Native dynamic libraries | non-goal |
 
 ## 9. UI
@@ -347,7 +347,7 @@ Each is a behaviour, not a missing type.
 
 1. Agent provider descriptors are selectable presets; there is no separate
    code-level agent adapter API beyond that descriptor contract.
-2. Filesystem sandbox is macOS-only: a sandbox profile confines writes to the
-   package, workspace, data and temp paths; Linux namespaces are not implemented.
+2. Filesystem sandbox: macOS profile is tested; the Linux bubblewrap plan is
+   implemented and unit-tested but cannot be executed in this macOS environment.
 3. Cross-platform matrix: the suite is green on macOS (this environment);
    Windows/Linux process limits and path handling are not exercised here.

@@ -1534,7 +1534,8 @@ preset providers are selectable through the settings plugin maps; theme
 contributions style their own panels and can override the shell palette when
 selected in Settings; lockfile reproduction covers Git, registry and local
 source paths; the process child has
-RLIMIT limits and a macOS write sandbox profile but no Linux namespace. The
+RLIMIT limits, a macOS write profile and a Linux bubblewrap plan; the Linux
+path is not exercised in the macOS test environment. The
 legacy Codex/DSH shim in
 `crates/agent/src/extensions` still backs the old inventory pane; it is not used
 by this platform.
