@@ -43,6 +43,7 @@ struct ProcessSession {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
+    token: String,
 }
 
 impl ProcessSession {
@@ -656,6 +657,7 @@ impl ProcessRuntime {
                 },
             )?;
         }
+        let token = uuid::Uuid::new_v4().to_string();
         let mut wrapped = false;
         let mut command = if self.sandbox && cfg!(target_os = "linux") {
             wrapped = true;
@@ -693,6 +695,7 @@ impl ProcessRuntime {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        command.env("BSH_IPC_TOKEN", &token);
         for key in ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"] {
             if let Some(value) = std::env::var_os(key) {
                 command.env(key, value);
@@ -737,6 +740,7 @@ impl ProcessRuntime {
             stdin,
             stdout: BufReader::new(stdout),
             next_id: 1,
+            token: token.clone(),
         };
         let initialized = session
             .request(
@@ -746,6 +750,7 @@ impl ProcessRuntime {
                     "extensionId": self.extension.as_str(),
                     "host": { "name": "bsh", "version": HOST_VERSION },
                     "config": self.config,
+                    "token": session.token.clone(),
                 }),
                 HANDSHAKE_MS,
                 &self.extension,
@@ -762,6 +767,17 @@ impl ProcessRuntime {
                 message: format!(
                     "process speaks protocol {version:?}; this host requires {PROTOCOL_VERSION}"
                 ),
+            });
+        }
+        let echoed = initialized
+            .get("token")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if echoed != session.token.as_str() {
+            let _ = session.child.start_kill();
+            return Err(ExtensionError::Protocol {
+                extension: self.extension.to_string(),
+                message: "process did not echo the handshake token".to_string(),
             });
         }
         Ok(session)
@@ -996,7 +1012,7 @@ max_execution_ms = 2000
             r#"#!/bin/sh
 while IFS= read -r line; do
   case "$line" in
-    *'"initialize"'*) echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"1.0"}}' ;;
+    *'"initialize"'*) printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"1.0","token":"%s"}}\n' "$BSH_IPC_TOKEN" ;;
     *'tools/call'*) echo '{"jsonrpc":"2.0","id":2,"result":{"ok":true}}' ;;
     *'events/event'*) echo "$line" >> events.log ;;
   esac
@@ -1071,7 +1087,7 @@ events = ["workspace.changed"]
             scratch.0.join("server.sh"),
             r#"while IFS= read -r line; do
   case "$line" in
-    *'"initialize"'*) echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"1.0"}}' ;;
+    *'"initialize"'*) printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"1.0","token":"%s"}}\n' "$BSH_IPC_TOKEN" ;;
     *'"tools/call"'*)
       if echo x > "$HOME/bsh-ext-sandbox-probe-PID" 2>/dev/null; then
         echo '{"jsonrpc":"2.0","id":2,"result":{"blocked":false}}'
@@ -1097,6 +1113,36 @@ done
         assert!(!probe.exists());
         runtime.shutdown().await.expect("shutdown");
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_missing_handshake_token_is_refused() {
+        let scratch = Scratch::new("token");
+        std::fs::write(
+            scratch.0.join("tools/echo.json"),
+            r#"{"description":"Echo","input_schema":{"type":"object"}}"#,
+        )
+        .expect("tool");
+        std::fs::write(
+            scratch.0.join("server.sh"),
+            r#"while IFS= read -r line; do
+  case "$line" in
+    *'"initialize"'*) echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"1.0"}}' ;;
+    *'"tools/call"'*) echo '{"jsonrpc":"2.0","id":2,"result":{"ok":true}}' ;;
+  esac
+done
+"#,
+        )
+        .expect("server");
+        let runtime = ProcessRuntime::new(&manifest(), &scratch.0).expect("runtime");
+        let context = CallContext::new(manifest().id().clone(), "token", None, 2000);
+        let error = runtime
+            .call_tool("echo", json!({}), &context)
+            .await
+            .expect_err("token");
+        assert!(error.to_string().contains("token"), "{error}");
+        runtime.shutdown().await.expect("shutdown");
+    }
     #[cfg(unix)]
     #[tokio::test]
     async fn a_process_answers_the_handshake_and_a_tool_call() {
@@ -1110,7 +1156,7 @@ done
             scratch.0.join("server.sh"),
             r#"while IFS= read -r line; do
   case "$line" in
-    *'"initialize"'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"1.0"}}' ;;
+    *'"initialize"'*) printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"1.0","token":"%s"}}\n' "$BSH_IPC_TOKEN" ;;
     *'"tools/call"'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"ok":true}}' ;;
     *) : ;;
   esac
@@ -1141,7 +1187,7 @@ done
             scratch.0.join("server.sh"),
             r#"while IFS= read -r line; do
   case "$line" in
-    *'"initialize"'*) echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"1.0"}}' ;;
+    *'"initialize"'*) printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"1.0","token":"%s"}}\n' "$BSH_IPC_TOKEN" ;;
     *'"tools/call"'*)
       echo '{"jsonrpc":"2.0","method":"$/progress","params":{"message":"half"}}'
       echo '{"jsonrpc":"2.0","id":2,"result":{"ok":true}}'

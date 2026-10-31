@@ -408,18 +408,20 @@ Host sends:
 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{
   "protocolVersion":"1.0",
   "extensionId":"com.example.server",
-  "host":{"name":"bsh","version":"3.0.2"}
+  "host":{"name":"bsh","version":"3.0.2"},
+  "token":"<per-session nonce>"
 }}
 ~~~
 
 Extension answers:
 
 ~~~json
-{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"1.0"}}
+{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"1.0","token":"<the same nonce>"}}
 ~~~
 
-The host kills the process and refuses the package if the result's
-protocolVersion does not start with "1.".
+The same nonce is exported as `BSH_IPC_TOKEN` for launchers that cannot parse
+the params. The host kills the process and refuses the package if the result's
+protocolVersion does not start with "1." or the token does not match.
 
 ### 8.2 Calls
 

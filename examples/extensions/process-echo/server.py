@@ -20,7 +20,10 @@ def main() -> None:
             continue
         method = request.get("method")
         if method == "initialize":
-            result = {"protocolVersion": "1.0"}
+            result = {
+                "protocolVersion": "1.0",
+                "token": request.get("params", {}).get("token"),
+            }
         elif method == "tools/call":
             result = request.get("params", {}).get("arguments", {})
         elif method == "shutdown":
