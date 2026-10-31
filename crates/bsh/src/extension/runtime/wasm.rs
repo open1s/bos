@@ -21,7 +21,7 @@ use serde_json::Value;
 use wasmtime::component::{bindgen, Component, HasSelf, Linker};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 
-use super::{CallContext, Runtime, ToolDescriptor};
+use super::{CallContext, Runtime, ToolDescriptor, ToolResult};
 use crate::extension::capability::{CallScope, Capability, PolicyEngine};
 use crate::extension::events::{EventBus, EventFilter, ExtensionEvent, TopicPattern};
 use crate::extension::manifest::{validate_relative_path, Manifest, ResourcesSpec};
@@ -79,6 +79,7 @@ struct HostState {
     next_subscription: u64,
     deadline: Instant,
     cancelled: Arc<AtomicBool>,
+    progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
 }
 
 /// Map a guest-reported host error back onto the platform error.
@@ -403,6 +404,15 @@ impl self::bsh::extension::host::Host for HostState {
             .map(|duration| duration.as_millis() as u64)
             .unwrap_or_default()
     }
+
+    fn progress(&mut self, value: u32, total: u32) {
+        if let Some(sender) = &self.progress {
+            let _ = sender.send(serde_json::json!({
+                "progress": value,
+                "total": total,
+            }));
+        }
+    }
 }
 
 struct Instance {
@@ -511,6 +521,7 @@ impl WasmRuntime {
             next_subscription: 1,
             deadline: Instant::now() + Duration::from_millis(self.resources.execution_ms()),
             cancelled: Arc::clone(&self.cancelled),
+            progress: None,
         };
         let mut store = Store::new(engine, state);
         store.limiter(|state| &mut state.limits);
@@ -705,6 +716,17 @@ impl Runtime for WasmRuntime {
         Ok(())
     }
 
+    async fn cancel(&self) -> Result<(), ExtensionError> {
+        self.cancelled.store(true, Ordering::SeqCst);
+        if let Ok(mut guard) = self.instance.lock() {
+            if let Some(instance) = guard.as_mut() {
+                instance.store.set_epoch_deadline(0);
+                let _ = instance.store.set_fuel(0);
+            }
+        }
+        Ok(())
+    }
+
     async fn tools(&self) -> Result<Vec<ToolDescriptor>, ExtensionError> {
         self.descriptors()
     }
@@ -754,6 +776,28 @@ impl Runtime for WasmRuntime {
             extension: self.extension.to_string(),
             message: format!("tool result is not JSON: {error}"),
         })
+    }
+
+    async fn call_tool_progress(
+        &self,
+        name: &str,
+        arguments: Value,
+        context: &CallContext,
+        progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+    ) -> Result<ToolResult, ExtensionError> {
+        self.ensure_instance()?;
+        if let Ok(mut guard) = self.instance.lock() {
+            if let Some(instance) = guard.as_mut() {
+                instance.store.data_mut().progress = progress;
+            }
+        }
+        let result = self.call_tool(name, arguments, context).await;
+        if let Ok(mut guard) = self.instance.lock() {
+            if let Some(instance) = guard.as_mut() {
+                instance.store.data_mut().progress = None;
+            }
+        }
+        result.map(ToolResult::from_value)
     }
 
     async fn command(&self, id: &str, arguments: Value) -> Result<Value, ExtensionError> {
@@ -866,11 +910,15 @@ mod tests {
             None,
             5000,
         );
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let echoed = runtime
-            .call_tool("echo", serde_json::json!({"x": 1}), &context)
+            .call_tool_progress("echo", serde_json::json!({"x": 1}), &context, Some(sender))
             .await
-            .expect("call");
+            .expect("call")
+            .to_value();
         assert_eq!(echoed["x"], 1);
+        let progress = receiver.recv().await.expect("progress");
+        assert_eq!(progress["progress"], 1);
         let command = runtime
             .command("test", serde_json::json!({}))
             .await

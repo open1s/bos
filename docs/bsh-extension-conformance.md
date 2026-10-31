@@ -127,7 +127,7 @@ Status legend:
 
 | Layer | Status |
 |---|---|
-| Core API: lifecycle, metadata, context, errors, logging, cancellation | partial: cancellation token exposed at tool boundary |
+| Core API: lifecycle, metadata, context, errors, logging, cancellation | done |
 | Domain API: agent, tools, workflow, events, storage | partial: workflows/tools/storage/events; model/agent adapters descriptors only |
 | UI API: panels, commands, declarative views | done | renderer + commands + actions + composer palette |
 
@@ -136,7 +136,7 @@ Status legend:
 | Module group | Status |
 |---|---|
 | core/lifecycle, metadata, context, errors, logging | done |
-| core/cancellation | partial | AsyncTool cancel token |
+| core/cancellation | done | AsyncTool token -> Runtime::cancel |
 | capabilities/filesystem | done | WASM read_file/write_file host functions with policy |
 | capabilities/network | done | WASM fetch host function with policy |
 | capabilities/process | partial | policy + spawn + rlimits; no filesystem sandbox profile |
@@ -156,7 +156,7 @@ Status legend:
 | No GPUI types across boundary | done |
 | No host file descriptors | done |
 | Explicit request/response schemas | partial | tool/UI schemas; command/event payloads JSON-checked only |
-| Correlation ids and cancellation | partial | correlation + cancel token |
+| Correlation ids and cancellation | done | correlation + cancel token + runtime stop |
 | Bounded payload and stream rate | partial | event/tool caps; chunked stream no rate limiter |
 | Version every transported/persisted schema | done for manifest, UI, events, lock, state; grants/registry format 1 |
 | Host implementation types private | done |
@@ -171,7 +171,7 @@ Status legend:
 | Install into staging, atomic promotion | done |
 | Lazy loading / on-demand activation | done via LazyRuntime |
 | Graceful deactivate/shutdown | done | runtime trait delegated through LazyRuntime |
-| Cancellation of outstanding work | partial | tool future select; child process not killed immediately |
+| Cancellation of outstanding work | done | Runtime::cancel stops process/MCP children and traps a WASM guest |
 | Health monitoring and crash handling | partial: health/status; crash backoff retry missing |
 | Retry with bounded backoff | missing |
 | State persistence independent of package | done |
@@ -184,7 +184,7 @@ Status legend:
 | Requirement | Status |
 |---|---|
 | Built-in statically linked, internal interface, lifecycle conventions | done |
-| WASM load/validate, host binding, memory/fuel/time limits, authorized host functions, cancellation, error normalization, metrics | done except live cancellation/metrics detail |
+| WASM load/validate, host binding, memory/fuel/time limits, authorized host functions, cancellation, error normalization, metrics | done |
 | Process JSON-RPC stdio, handshake, structured stderr | done |
 | Process executable allowlist/user approval | partial: allowlist + explicit grant; no per-command approval UI |
 | Environment filtering, cwd restriction, timeout, output limits | done |
@@ -218,7 +218,7 @@ Status legend:
 | Preset provider | done | descriptor -> settings.plugin_presets |
 | Workflow provider | done | declarative executor |
 | Tool content: text, images, structured, file refs | done | ToolContent + MCP mapping |
-| Streaming output, progress, cancellation | partial | process $/progress and MCP notifications/progress are live; WASM final result only; cancel token |
+| Streaming output, progress, cancellation | done | process $/progress, MCP notifications/progress, WASM host progress; cancel token |
 | Timeouts, error categories, correlation ids | done |
 | MCP tool/resource/prompt mapping | done | mcp-echo test |
 | MCP lifecycle/reconnect/timeout/cancel | partial | start/timeout/close; reconnect on next call only |
@@ -233,7 +233,7 @@ Status legend:
 | Schema versioning, correlation ids | done |
 | Bounded queues/backpressure | done |
 | Payload and rate limits | done | 256 KiB payload + 200 events/second per publisher |
-| Cancellation propagation | partial | tool token; guest/runtime cancellation incomplete |
+| Cancellation propagation | done | tool token -> runtime.cancel |
 | Delivery semantics documented | done in standard |
 | Error isolation | done |
 | No unbounded history | done |
@@ -298,7 +298,7 @@ is deliberate and does not remove a feature.
 | SemVer | done |
 | petgraph or custom resolver | custom resolver |
 | JSON-RPC 2.0 | done |
-| Cancellation tokens | partial | tool token |
+| Cancellation tokens | done | tool token + runtime trap/stop |
 | tracing | done |
 | storage | JSON/TOML per-extension |
 
@@ -316,7 +316,7 @@ is deliberate and does not remove a feature.
 | Requirement | Status |
 |---|---|
 | Unit: manifest, ids, resolver, lifecycle, capability, events, UI, paths, lock determinism | done |
-| Integration: built-in registration, WASM load/invoke, process start/stop, tools, cancellation, UI action routing, patches, denial, crash isolation, upgrade/rollback, data preservation | partial | WASM/UI routing/upgrade/rollback covered; cancellation child kill and crash isolation partial |
+| Integration: built-in registration, WASM load/invoke, process start/stop, tools, cancellation, UI action routing, patches, denial, crash isolation, upgrade/rollback, data preservation | partial | runtime cancellation covered; crash isolation and cross-platform remain partial |
 | Security tests: traversal, unauthorized fs/network, process denial, oversized messages, nested UI, event flood, resource exhaustion, malformed payloads, stale actions, revoked capability, package tampering/signatures | partial | signature/UI/traversal covered; network flood/process exhaustion missing |
 | Cross-platform matrix | not run in this environment |
 
@@ -335,24 +335,20 @@ is deliberate and does not remove a feature.
 The implementation covers the type/manifest/store/policy/lifecycle/process/CLI
 stories. Resolved: Wasmtime/host functions, Extism, WASM limits, WASM/process
 subscriptions, MCP, UI renderer/actions, installer sources, upgrade/rollback,
-CLI build/test/package/update, signatures, quarantine, process progress,
-model/preset providers and local/remote lock reproduction. Still open: WASM
-incremental progress, app-wide theme application, Linux filesystem sandboxing,
-cross-platform coverage and retry backoff.
+CLI build/test/package/update, signatures, quarantine, process/MCP/WASM progress,
+model/preset providers and local/remote lock reproduction. Still open: app-wide
+theme application, Linux filesystem sandboxing, cross-platform coverage and
+retry backoff.
 
 ## 20. Remaining gaps
 
 The first-release feature set is implemented except for these explicit gaps.
 Each is a behaviour, not a missing type.
 
-1. Live streaming/progress is real for process tools (`$/progress`) and MCP
-   (`notifications/progress`); WASM guests still deliver only their final result.
-2. Agent provider descriptors are selectable presets; there is no separate
+1. Agent provider descriptors are selectable presets; there is no separate
    code-level agent adapter API beyond that descriptor contract.
-3. Theme contributions apply to an extension's own panels, not the whole shell.
-4. Filesystem sandbox is macOS-only: a sandbox profile confines writes to the
+2. Theme contributions apply to an extension's own panels, not the whole shell.
+3. Filesystem sandbox is macOS-only: a sandbox profile confines writes to the
    package, workspace, data and temp paths; Linux namespaces are not implemented.
-5. Guest/runtime cancellation: the tool future stops waiting, but a WASM guest
-   or process is not always terminated at the same instant.
-6. Cross-platform matrix: the suite is green on macOS (this environment);
+4. Cross-platform matrix: the suite is green on macOS (this environment);
    Windows/Linux process limits and path handling are not exercised here.

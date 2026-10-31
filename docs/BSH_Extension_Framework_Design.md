@@ -1528,14 +1528,13 @@ host vertical slice. The CLI is exercised end to end: new -> validate -> build -
 install -> list -> info -> grant -> doctor -> uninstall, plus keygen/sign/verify,
 registry install, versions/rollback and config.
 
-**Deliberate limits, stated rather than hidden:** process tools and MCP servers
-deliver live progress through run_streaming, while WASM guests still deliver only
-their final result; model, agent and preset providers are selectable through the
-settings plugin maps; theme contributions apply to their extension's panels but
-not app-wide; lockfile reproduction covers Git, registry and local source paths;
-the process child has RLIMIT limits and a macOS write sandbox profile but no
-Linux namespace; cancellation stops the tool future but does not always kill the
-guest at the same instant. The legacy Codex/DSH shim in
+**Deliberate limits, stated rather than hidden:** process tools, MCP servers and
+WASM components deliver live progress through run_streaming; model, agent and
+preset providers are selectable through the settings plugin maps; theme
+contributions apply to their extension's panels but not app-wide; lockfile
+reproduction covers Git, registry and local source paths; the process child has
+RLIMIT limits and a macOS write sandbox profile but no Linux namespace. The
+legacy Codex/DSH shim in
 `crates/agent/src/extensions` still backs the old inventory pane; it is not used
 by this platform.
 

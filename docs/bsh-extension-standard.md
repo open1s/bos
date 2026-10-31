@@ -689,18 +689,19 @@ A host that implements this standard must enforce:
 These are stated so a package author does not design around a promise that is
 not kept:
 
-1. Tool progress is real for process tools (`$/progress`) and for runtimes that
-   call the progress callback, but WASM and MCP guests do not emit incremental
-   progress yet; run_streaming still delivers their final result as chunks.
-2. Model, agent and preset provider descriptors are discovered and listed, but
-   they are not yet selectable adapters in the model or preset panes.
+1. Tool progress is live for process (`$/progress`), MCP
+   (`notifications/progress`) and WASM (the host `progress` function); a runtime
+   that cannot stream still delivers its final result as chunks.
+2. Model, agent and preset provider descriptors are selectable through the
+   settings plugin provider/preset maps; there is no separate code-level adapter
+   API beyond that descriptor contract.
 3. Theme tokens apply to the extension's own panels, not to the whole shell.
-4. Lockfile reproduction covers Git/registry remotes; an Installed-only lock has
-   no remote and cannot be rebuilt from the file alone.
-5. Process children get RLIMIT ceilings and a process group, a macOS write
+4. Lockfile reproduction covers Git/registry remotes and the recorded local
+   source path of a directory install.
+5. Process children get RLIMIT ceilings, a process group and a macOS write
    sandbox profile; Linux namespaces are not implemented.
-6. Cancellation stops the waiting call and asks the runtime to stop, but a WASM
-   guest or child process may take a moment to disappear.
+6. Cancellation traps a WASM guest and stops a process/MCP child; the operating
+   system may take a moment to reap the child after the request.
 7. Windows/Linux process limits are compiled but not exercised in this macOS
    environment.
 8. The built-in runtime is for first-party code linked into bsh; an installed

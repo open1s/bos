@@ -96,6 +96,7 @@ interface host {
     configuration: func() -> string;
 
     now-millis: func() -> u64;
+    progress: func(value: u32, total: u32);
 }
 
 /// Operations a component exports. The host calls them in this order:

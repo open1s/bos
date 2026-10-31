@@ -12,3 +12,6 @@ wit-bindgen = "0.63.0"
 [profile.release]
 opt-level = "s"
 lto = true
+
+[workspace]
+

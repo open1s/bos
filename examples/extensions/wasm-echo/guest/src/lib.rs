@@ -19,6 +19,7 @@ impl exports::bsh::extension::extension::Guest for Echo {
     }
 
     fn call_tool(_id: String, arguments: String, _correlation_id: String) -> Result<bsh::extension::types::ToolResult, bsh::extension::types::HostError> {
+        bsh::extension::host::progress(1, 2);
         Ok(bsh::extension::types::ToolResult { content: arguments, is_error: false })
     }
 
