@@ -52,7 +52,7 @@ Status legend:
 | Command/event/stream distinction | done | RPC, events and live process/MCP/WASM progress through run_streaming |
 | Versioned contracts | done | manifest 1.0, API 1.0, UI 1.0, WIT package 1.0 |
 | Fault containment | done | timeout/lazy runtime/cancel token + bounded process/MCP startup retry |
-| Observable by default | partial | status/audit/doctor + calls/events/startup/failed/active/fuel/memory ceilings/live WASM memory/crash history; Extism and process usage not reported |
+| Observable by default | partial | status/audit/doctor + calls/events/startup/failed/active/fuel/memory ceilings/live WASM and process memory/crash history; Extism usage not reported |
 | Reproducible installation | done | lockfile, sources, upgrade/rollback, reproduce from remote or recorded local path |
 | Data survives code upgrades | done | data root separated; migrations executed on version change |
 
@@ -307,7 +307,7 @@ is deliberate and does not remove a feature.
 | Requirement | Status |
 |---|---|
 | Installed version/source, runtime kind, lifecycle, capabilities, errors, dependencies | done |
-| Startup duration, request count/latency, memory/fuel, active tasks/subscriptions, crash history | partial | startup/calls/events/subscribers/failed/active/fuel/memory ceilings/live WASM memory/retained crash history; Extism/process usage not reported |
+| Startup duration, request count/latency, memory/fuel, active tasks/subscriptions, crash history | partial | startup/calls/events/subscribers/failed/active/fuel/memory ceilings/live WASM and process memory/retained crash history; Extism usage not reported |
 | CLI new/validate/build/test/package/install/list/info/enable/disable/update/uninstall/logs/doctor | done | plus versions/rollback/quarantine/keygen/sign/trust/config/registry/metrics |
 | Templates, WIT bindings/examples, local dev, mock host, integration harness, logs/traces, compatibility checker, package builder, security diagnostics | done | templates/WIT/examples/builder/doctor + `bsh ext mock` for every runtime |
 

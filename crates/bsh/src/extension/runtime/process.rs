@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -198,6 +199,28 @@ impl ProcessSession {
                 source,
             })
     }
+}
+
+/// Resident memory of one child, from procfs on Linux or ps on macOS.
+fn process_rss_bytes(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string(format!("/proc/{pid}/statm")).ok()?;
+        let pages: u64 = text.split_whitespace().next()?.parse().ok()?;
+        return Some(pages.saturating_mul(4096));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("/bin/ps")
+            .args(["-o", "rss=", "-p", &pid.to_string()])
+            .output()
+            .ok()?;
+        let text = String::from_utf8(output.stdout).ok()?;
+        let kb: u64 = text.trim().parse().ok()?;
+        return Some(kb.saturating_mul(1024));
+    }
+    #[allow(unreachable_code)]
+    None
 }
 
 /// A bubblewrap plan that gives the child a private namespace, a read-only
@@ -428,6 +451,7 @@ pub(crate) struct ProcessRuntime {
     data_root: Option<PathBuf>,
     policy: Option<(Arc<PolicyEngine>, TrustLevel)>,
     sandbox: bool,
+    child_pid: AtomicU32,
     session: Mutex<Option<ProcessSession>>,
     subscriptions: std::sync::Mutex<Vec<Subscription>>,
 }
@@ -473,6 +497,7 @@ impl ProcessRuntime {
             data_root: None,
             policy: None,
             sandbox: cfg!(target_os = "macos"),
+            child_pid: AtomicU32::new(0),
             session: Mutex::new(None),
             subscriptions: std::sync::Mutex::new(Vec::new()),
         })
@@ -708,6 +733,9 @@ impl ProcessRuntime {
             path: program.clone(),
             source,
         })?;
+        if let Some(pid) = child.id() {
+            self.child_pid.store(pid, Ordering::Relaxed);
+        }
         let stdin = child.stdin.take().ok_or_else(|| ExtensionError::Protocol {
             extension: self.extension.to_string(),
             message: "child stdin was not piped".to_string(),
@@ -795,6 +823,7 @@ impl ProcessRuntime {
         .await;
         let _ = session.child.start_kill();
         let _ = session.child.wait().await;
+        self.child_pid.store(0, Ordering::Relaxed);
     }
 }
 
@@ -806,6 +835,11 @@ impl Runtime for ProcessRuntime {
 
     fn memory_limit(&self) -> Option<u64> {
         Some(self.memory_bytes)
+    }
+
+    fn memory_used(&self) -> Option<u64> {
+        let pid = self.child_pid.load(Ordering::Relaxed);
+        (pid > 0).then(|| process_rss_bytes(pid)).flatten()
     }
 
     async fn activate(&self) -> Result<(), ExtensionError> {
@@ -1171,6 +1205,10 @@ done
             .await
             .expect("call");
         assert_eq!(result["ok"], true);
+        assert!(
+            runtime.memory_used().unwrap_or(0) > 0,
+            "the live child reports its resident memory"
+        );
         runtime.shutdown().await.expect("shutdown");
     }
 
