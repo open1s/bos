@@ -8,6 +8,7 @@
 
 use serde_json::{json, Value};
 
+use gpui_kit::component::button::Button;
 use gpui_kit::*;
 
 use crate::extension::host::PanelSurface;
@@ -316,21 +317,15 @@ impl ExtensionPanelView {
                     ButtonStyle::Secondary => (self.palette.new_session_fill, self.palette.text),
                 };
                 let action = action.clone();
-                div()
-                    .id(format!("extension-action-{path}"))
+                Button::new(format!("extension-action-{path}"))
                     .debug_selector(|| format!("extension-action-{path}"))
-                    .role(Role::Button)
-                    .aria_label(label.clone())
+                    .accessibility_label(label.clone())
                     .px(px(12.0))
                     .h(px(30.0))
-                    .flex()
-                    .items_center()
                     .rounded(px(8.0))
                     .bg(rgb(fill))
                     .border_1()
                     .border_color(rgb(self.palette.border_soft))
-                    .cursor_pointer()
-                    .hover(|style| style.opacity(0.9))
                     .child(txt(label.clone(), 13.0, ink))
                     .on_click(cx.listener(move |this, _event, _window, cx| {
                         this.dispatch(&action, json!({}), cx)

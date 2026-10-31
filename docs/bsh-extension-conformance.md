@@ -201,7 +201,7 @@ Status legend:
 | Validate schema/payload, depth/node/text limits | done |
 | Route action ids to owner | done | dispatch -> owning Runtime::command |
 | Apply state patches, revisions, stale rejection | done | UiSession + renderer |
-| Focus, keyboard, accessibility | partial | role/aria labels; no keyboard focus model or text editing |
+| Focus, keyboard, accessibility | partial | role/aria labels; primary actions use focusable kit Buttons; checkbox and select rows remain pointer-only |
 | Loading/error/unavailability states | done | renderer loading/error/message |
 | No JS/HTML | done |
 | Theme contributions | done | tokens apply to extension panels and, when selected, override the shell palette |
