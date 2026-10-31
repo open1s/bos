@@ -541,7 +541,6 @@ mod tests {
         assert!(window.allow_at(start + PROGRESS_WINDOW + Duration::from_millis(1)));
     }
 
-
     #[test]
     fn a_context_scope_matches_workspace_globs() {
         let scratch = Scratch::new("context-scope");
