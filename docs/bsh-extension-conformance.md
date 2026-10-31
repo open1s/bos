@@ -30,7 +30,7 @@ Status legend:
 | Extism plugin runtime | done | runtime/extism.rs; bsh_host bridge, policy-checked host calls, fuel/memory caps, plugin fixture |
 | External process + JSON-RPC runtime | done | runtime/process.rs |
 | WIT interface definition | done | crates/bsh/wit/extension.wit |
-| Host-managed GPUI panels | partial | host::panel_surfaces + renderer; settings surface and right-panel Extensions mount; left/bottom/center still share those hosts |
+| Host-managed GPUI panels | partial | settings hosts every location; the right panel hosts only panels declared Right |
 | Declarative UI | done | contract, validation, GPUI renderer, action routing and stale-revision refusal |
 | Unified tool/context/prompt contracts | done | agent.rs |
 | Capability authorization, quotas, audit | partial | authorization and audit done; quotas partial |
@@ -195,7 +195,7 @@ Status legend:
 
 | Requirement | Status |
 |---|---|
-| Mode A panel contribution with id/title/icon/location/visibility | partial | fields recorded and shown; panels mount in Settings and the right panel, not one dock per location |
+| Mode A panel contribution with id/title/icon/location/visibility | partial | fields recorded and shown; Settings hosts all, right panel honors Right, left/bottom/center have no dedicated dock |
 | Mode B declarative components | done | ui/extension_panel.rs; image draws source label, not pixels |
 | Mode C embedded guest GPUI | non-goal |
 | Validate schema/payload, depth/node/text limits | done |

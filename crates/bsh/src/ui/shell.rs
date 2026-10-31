@@ -853,6 +853,9 @@ pub(crate) struct Shell {
     pub(crate) extension_commands: Vec<crate::extension::CommandSurface>,
     /// The declarative extension panel host, created when the pane opens.
     pub(crate) extension_panels: Option<Entity<crate::ui::extension_panel::ExtensionPanelView>>,
+    /// Panels declared for the right panel, the one location-specific mount.
+    pub(crate) right_extension_panels:
+        Option<Entity<crate::ui::extension_panel::ExtensionPanelView>>,
     /// Extension themes, resolved with the panels so a render does not re-open
     /// the host on every frame.
     pub(crate) extension_themes:
@@ -1109,6 +1112,17 @@ impl Shell {
             let root = state.settings.active_workspace_root();
             let workspace = (!root.is_empty()).then(|| std::path::PathBuf::from(root));
             let panels = crate::extension::panels(&state.settings, workspace.as_deref(), None);
+            (!panels.is_empty())
+                .then(|| cx.new(|_| crate::ui::extension_panel::ExtensionPanelView::new(panels)))
+        };
+        let right_extension_panels = {
+            let root = state.settings.active_workspace_root();
+            let workspace = (!root.is_empty()).then(|| std::path::PathBuf::from(root));
+            let panels: Vec<_> =
+                crate::extension::panels(&state.settings, workspace.as_deref(), None)
+                    .into_iter()
+                    .filter(|panel| panel.location == crate::extension::ui::PanelLocation::Right)
+                    .collect();
             (!panels.is_empty())
                 .then(|| cx.new(|_| crate::ui::extension_panel::ExtensionPanelView::new(panels)))
         };
@@ -1698,6 +1712,7 @@ impl Shell {
             plugins: Vec::new(),
             extension_commands: crate::extension::cached_commands(),
             extension_panels,
+            right_extension_panels,
             extension_themes: Some(extension_themes),
             extension_statuses: Some(extension_statuses),
             settings_inputs,

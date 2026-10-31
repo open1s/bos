@@ -1022,7 +1022,7 @@ impl Shell {
             Some(RightTab::Terminal) => body.child(self.terminal_pane(cx)),
             Some(RightTab::Diff) => body.child(self.diff_pane(cx)),
             Some(RightTab::Browser) => body.child(self.browser_pane(cx)),
-            Some(RightTab::Extensions) => body.child(match &self.extension_panels {
+            Some(RightTab::Extensions) => body.child(match &self.right_extension_panels {
                 Some(view) => view.clone().into_any_element(),
                 None => div()
                     .debug_selector(|| "right-extensions-empty".to_string())
