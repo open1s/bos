@@ -2044,7 +2044,7 @@ mod tests {
             !spec
                 .writable()
                 .iter()
-                .any(|path| path == &std::env::temp_dir() || path.starts_with(std::env::temp_dir())),
+                .any(|path| path == &std::env::temp_dir()),
             "the host temp directory is not writable: {:?}",
             spec.writable()
         );

@@ -2137,7 +2137,9 @@ mod tests {
 
     /// WRITE and EXEC are separate grants: a payload written into the workspace
     /// is there, and running it is refused. A build cache the POLICY granted is
-    /// the deliberate exception, and executes.
+    /// the deliberate exception, and executes. macOS-only: the heel kernel
+    /// enforcement this pins is not available on Linux CI.
+    #[cfg(target_os = "macos")]
     #[test]
     fn heel_refuses_write_then_execute_except_in_a_granted_build_cache() {
         let dir = sandbox_workspace();
@@ -2595,6 +2597,8 @@ mod tests {
     /// kernel refuses ICMP and the result says so in a machine-readable field,
     /// while the network label honestly stays "unrestricted". This is the
     /// user-visible trap: ping fails although the policy allows the network.
+    /// macOS-only for the same reason.
+    #[cfg(target_os = "macos")]
     #[test]
     fn an_unrestricted_heel_sandbox_explains_a_kernel_refused_ping() {
         let dir = sandbox_workspace();
