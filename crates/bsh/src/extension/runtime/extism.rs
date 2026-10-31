@@ -162,6 +162,14 @@ impl Bridge {
                     .and_then(Value::as_str)
                     .unwrap_or("GET")
                     .to_ascii_uppercase();
+                crate::extension::publish(
+                    crate::extension::topics::NETWORK_REQUEST,
+                    json!({
+                        "url": raw,
+                        "method": method,
+                        "domain": parsed.host_str(),
+                    }),
+                );
                 self.authorize(
                     Capability::NetworkHttp,
                     CallScope {

@@ -343,6 +343,14 @@ impl self::bsh::extension::host::Host for HostState {
                 "only http and https are allowed".to_string(),
             ));
         }
+        crate::extension::publish(
+            crate::extension::topics::NETWORK_REQUEST,
+            serde_json::json!({
+                "url": url,
+                "method": method,
+                "domain": parsed.host_str(),
+            }),
+        );
         self.authorize(
             Capability::NetworkHttp,
             CallScope {

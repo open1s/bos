@@ -1032,6 +1032,10 @@ impl AppState {
         self.store.insert(session);
         self.active_id = Some(id.clone());
         self.subagent = None;
+        crate::extension::publish(
+            crate::extension::topics::SESSION_CREATED,
+            serde_json::json!({ "session": id, "workspace": workspace }),
+        );
         Some(id)
     }
 
@@ -1110,6 +1114,14 @@ impl AppState {
         let servers = self.settings.mcp_servers();
         let extensions = crate::mcp::extension_servers(&self.settings);
         let failed = self.mcp.sync_all(self.runner.rt(), &servers, &extensions);
+        crate::extension::publish(
+            crate::extension::topics::MCP_CONNECTED,
+            serde_json::json!({
+                "servers": servers.len(),
+                "extensions": extensions.len(),
+                "failed": failed.clone(),
+            }),
+        );
         if !failed.is_empty() {
             self.notice(crate::i18n::tr_args(
                 self.lang,
@@ -1352,6 +1364,10 @@ impl AppState {
         }
         self.save_session(id);
         self.store.sort();
+        crate::extension::publish(
+            crate::extension::topics::SESSION_UPDATED,
+            serde_json::json!({ "session": id, "title": title }),
+        );
     }
 
     /// Delete a chat, parking it in the recycle bin first.
@@ -1379,6 +1395,10 @@ impl AppState {
             return false;
         }
         self.plans.remove(id);
+        crate::extension::publish(
+            crate::extension::topics::SESSION_DELETED,
+            serde_json::json!({ "session": id, "title": session.title }),
+        );
         if self.active_id.as_deref() == Some(id) {
             let next = self
                 .store

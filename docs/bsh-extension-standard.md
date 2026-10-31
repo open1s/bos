@@ -484,7 +484,26 @@ Reserved topics: app.started, app.shutdown, workspace.opened,
 workspace.closed, workspace.changed, agent.started, agent.completed,
 agent.failed, model.requested, model.completed, config.changed, tool.invoked,
 tool.completed, tool.failed, extension.loaded, extension.unloaded,
-extension.failed.
+extension.failed, session.created, session.updated, session.deleted,
+trajectory.recorded, skill.loaded, instruction.build, network.request,
+mcp.connected, audio.captured.
+
+Hook points are ordinary event subscriptions: declare a topic in
+contributes.events, declare a subscription in the runtime, and receive it
+through the runtime's event delivery. The host publishes at these seams:
+
+| Surface | Topic | When |
+|---|---|---|
+| Session log | session.created / session.updated / session.deleted | session created, retitled/saved, deleted |
+| Trajectory | trajectory.recorded | a turn settles |
+| Skills | skill.loaded | a skill enters the built agent |
+| Instructions | instruction.build | the agent instruction set is composed |
+| Model | model.requested / model.completed | a provider call starts/finishes |
+| MCP | mcp.connected | the MCP inventory is reconciled |
+| Tools | tool.invoked / tool.completed / tool.failed | an extension or built-in tool runs |
+| HTTP | network.request | a WASM/Extism host fetch is about to leave |
+| Audio | audio.captured | an audio attachment is captured |
+| UI | panel actions | a declarative UI action is routed |
 
 Controls:
 

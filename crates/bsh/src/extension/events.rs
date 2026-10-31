@@ -66,6 +66,24 @@ pub(crate) mod topics {
     pub(crate) const MODEL_COMPLETED: &str = "model.completed";
     /// The reader changed an extension configuration document.
     pub(crate) const CONFIG_CHANGED: &str = "config.changed";
+    /// A session was created.
+    pub(crate) const SESSION_CREATED: &str = "session.created";
+    /// A session title or transcript changed.
+    pub(crate) const SESSION_UPDATED: &str = "session.updated";
+    /// A session was deleted.
+    pub(crate) const SESSION_DELETED: &str = "session.deleted";
+    /// One turn settled into the trajectory.
+    pub(crate) const TRAJECTORY_RECORDED: &str = "trajectory.recorded";
+    /// A skill entered the built agent.
+    pub(crate) const SKILL_LOADED: &str = "skill.loaded";
+    /// The agent's instruction set was composed.
+    pub(crate) const INSTRUCTION_BUILD: &str = "instruction.build";
+    /// An extension asked the host for an outbound request.
+    pub(crate) const NETWORK_REQUEST: &str = "network.request";
+    /// The MCP inventory was reconciled.
+    pub(crate) const MCP_CONNECTED: &str = "mcp.connected";
+    /// An audio attachment was captured.
+    pub(crate) const AUDIO_CAPTURED: &str = "audio.captured";
 }
 
 /// One event envelope.
@@ -554,6 +572,23 @@ mod tests {
         let error = last.expect("a publish").expect_err("over the rate");
         assert_eq!(error.category(), "limit");
         assert!(bus.metrics().rejected >= 1);
+    }
+
+    #[test]
+    fn every_hook_topic_is_a_valid_reserved_topic() {
+        for topic in [
+            topics::SESSION_CREATED,
+            topics::SESSION_UPDATED,
+            topics::SESSION_DELETED,
+            topics::TRAJECTORY_RECORDED,
+            topics::SKILL_LOADED,
+            topics::INSTRUCTION_BUILD,
+            topics::NETWORK_REQUEST,
+            topics::MCP_CONNECTED,
+            topics::AUDIO_CAPTURED,
+        ] {
+            ExtensionEvent::new("bsh", topic, serde_json::json!({})).expect(topic);
+        }
     }
 
     #[test]

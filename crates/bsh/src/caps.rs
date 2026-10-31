@@ -1196,6 +1196,25 @@ fn build_agent_for_session_inner(
         );
     }
 
+    for skill in agent.skills() {
+        crate::extension::publish(
+            crate::extension::topics::SKILL_LOADED,
+            serde_json::json!({
+                "session": session,
+                "skill": skill.metadata.name,
+            }),
+        );
+    }
+    crate::extension::publish(
+        crate::extension::topics::INSTRUCTION_BUILD,
+        serde_json::json!({
+            "session": session,
+            "preset": preset,
+            "tools": tool_count,
+            "skills": agent.skills().len(),
+            "schema_chars": tools_schema_chars,
+        }),
+    );
     BuiltAgent {
         agent: Arc::new(agent),
         plugins,

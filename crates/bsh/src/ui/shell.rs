@@ -2203,6 +2203,15 @@ impl Shell {
             cx.notify();
             return false;
         }
+        if attachment.mime.starts_with("audio/") {
+            crate::extension::publish(
+                crate::extension::topics::AUDIO_CAPTURED,
+                serde_json::json!({
+                    "name": attachment.name,
+                    "mime": attachment.mime,
+                }),
+            );
+        }
         self.state.attachments.push(attachment);
         true
     }
@@ -3813,6 +3822,13 @@ impl Shell {
                                 crate::extension::topics::AGENT_COMPLETED
                             },
                             serde_json::json!({ "session": session_id }),
+                        );
+                        crate::extension::publish(
+                            crate::extension::topics::TRAJECTORY_RECORDED,
+                            serde_json::json!({
+                                "session": session_id,
+                                "failed": failed,
+                            }),
                         );
                         shell.state.finish_plan(&session_id);
                         // A goal the model settled during the turn takes
