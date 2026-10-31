@@ -1150,6 +1150,74 @@ done
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn concurrent_calls_share_one_child_without_exhaustion() {
+        let scratch = Scratch::new("concurrent");
+        std::fs::write(
+            scratch.0.join("tools/echo.json"),
+            r#"{"description":"Echo","input_schema":{"type":"object"}}"#,
+        )
+        .expect("tool");
+        std::fs::write(
+            scratch.0.join("server.py"),
+            r#"import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": "1.0", "token": request.get("params", {}).get("token")}
+    elif method == "tools/call":
+        result = {"ok": True}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": request.get("id"), "result": result}), flush=True)
+"#,
+        )
+        .expect("server");
+        let manifest = Manifest::parse(
+            r#"
+schema_version = "1.0"
+[extension]
+id = "com.example.process"
+name = "Process"
+version = "1.0.0"
+description = "A process package"
+[compatibility]
+bsh = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+[runtime]
+kind = "process"
+entry = "python3"
+args = ["server.py"]
+[capabilities]
+required = ["process.execute"]
+[contributes]
+tools = ["echo"]
+[resources]
+max_execution_ms = 2000
+"#,
+            &scratch.0.join("extension.toml"),
+        )
+        .expect("manifest");
+        let runtime =
+            std::sync::Arc::new(ProcessRuntime::new(&manifest, &scratch.0).expect("runtime"));
+        let mut tasks = Vec::new();
+        for _ in 0..4 {
+            let runtime = std::sync::Arc::clone(&runtime);
+            let id = manifest.id().clone();
+            tasks.push(tokio::spawn(async move {
+                let context = CallContext::new(id, "concurrent", None, 3000);
+                runtime.call_tool("echo", json!({}), &context).await
+            }));
+        }
+        for task in tasks {
+            let result = task.await.expect("join").expect("call");
+            assert_eq!(result["ok"], true);
+        }
+        runtime.shutdown().await.expect("shutdown");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn a_missing_handshake_token_is_refused() {
         let scratch = Scratch::new("token");
         std::fs::write(
