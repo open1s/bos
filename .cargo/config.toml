@@ -23,6 +23,6 @@ PYO3_USE_ABI3 = "0"
 # `RUST_TEST_THREADS=<n> cargo test ...`.
 RUST_TEST_THREADS = "4"
 
-[http]
-proxy = "http://127.0.0.1:9981"
-timeout = 120
+# A proxy must not be committed: CI runners have no local proxy, and a
+# hard-coded 127.0.0.1 made every GitHub job fail before it could build. Set
+# CARGO_HTTP_PROXY in the shell when a local proxy is needed.
