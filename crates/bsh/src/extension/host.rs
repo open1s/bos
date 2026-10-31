@@ -242,6 +242,12 @@ pub(crate) struct HostMetrics {
     pub(crate) events_dropped: u64,
     /// Live event subscribers.
     pub(crate) subscribers: usize,
+    /// Extensions that failed to load.
+    pub(crate) failed: usize,
+    /// Runtimes currently carrying work (applied extensions).
+    pub(crate) active_tasks: usize,
+    /// Host open-to-ready duration in milliseconds.
+    pub(crate) startup_millis: u64,
 }
 
 /// One diagnostic line.
@@ -321,12 +327,14 @@ pub(crate) struct ExtensionHost {
     last_stamp: Option<SystemTime>,
     pump_generation: Arc<AtomicU64>,
     calls: Mutex<CallMetrics>,
+    startup_millis: u64,
 }
 
 impl ExtensionHost {
     /// Open a host: create the store, load policy, register built-ins and
     /// perform the first scan.
     pub(crate) fn open(config: HostConfig) -> Result<Self, ExtensionError> {
+        let started = std::time::Instant::now();
         let store = ExtensionStore::open(&config.root)?;
         let policy = Arc::new(PolicyEngine::open(
             store.grants_path(),
@@ -348,9 +356,11 @@ impl ExtensionHost {
             last_stamp: None,
             pump_generation: Arc::new(AtomicU64::new(0)),
             calls: Mutex::new(CallMetrics::default()),
+            startup_millis: 0,
         };
         host.register_builtins();
         host.rebuild()?;
+        host.startup_millis = started.elapsed().as_millis() as u64;
         Ok(host)
     }
 
@@ -1061,6 +1071,13 @@ impl ExtensionHost {
             events_delivered: bus.delivered,
             events_dropped: bus.dropped,
             subscribers: self.events.subscriber_count(),
+            failed: self
+                .loaded
+                .values()
+                .filter(|entry| entry.error.is_some())
+                .count(),
+            active_tasks: self.loaded.values().filter(|entry| entry.applied).count(),
+            startup_millis: self.startup_millis,
         }
     }
 

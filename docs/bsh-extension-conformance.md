@@ -52,7 +52,7 @@ Status legend:
 | Command/event/stream distinction | done | RPC, events and live process/MCP/WASM progress through run_streaming |
 | Versioned contracts | done | manifest 1.0, API 1.0, UI 1.0, WIT package 1.0 |
 | Fault containment | done | timeout/lazy runtime/cancel token + bounded process/MCP startup retry |
-| Observable by default | partial | status/audit/doctor + host call/event metrics; memory/fuel/task gauges partial |
+| Observable by default | partial | status/audit/doctor + calls/events/startup/failed/active; memory/fuel gauges partial |
 | Reproducible installation | done | lockfile, sources, upgrade/rollback, reproduce from remote or recorded local path |
 | Data survives code upgrades | done | data root separated; migrations executed on version change |
 
@@ -157,7 +157,7 @@ Status legend:
 | No host file descriptors | done |
 | Explicit request/response schemas | partial | tool/UI schemas; command/event payloads JSON-checked only |
 | Correlation ids and cancellation | done | correlation + cancel token + runtime stop |
-| Bounded payload and stream rate | partial | event/tool caps; chunked stream no rate limiter |
+| Bounded payload and stream rate | done | event/tool caps + a 200-per-second progress window |
 | Version every transported/persisted schema | done for manifest, UI, events, lock, state; grants/registry format 1 |
 | Host implementation types private | done |
 | Runtime transport mapped to domain semantics | done | process, wasm, mcp, declarative |
@@ -307,7 +307,7 @@ is deliberate and does not remove a feature.
 | Requirement | Status |
 |---|---|
 | Installed version/source, runtime kind, lifecycle, capabilities, errors, dependencies | done |
-| Startup duration, request count/latency, memory/fuel, active tasks/subscriptions, crash history | partial | call latency/bytes/events/subscribers; memory/fuel/tasks gauges partial |
+| Startup duration, request count/latency, memory/fuel, active tasks/subscriptions, crash history | partial | startup/calls/events/subscribers/failed/active; memory/fuel and crash history partial |
 | CLI new/validate/build/test/package/install/list/info/enable/disable/update/uninstall/logs/doctor | done | plus versions/rollback/quarantine/keygen/sign/trust/config/registry/metrics |
 | Templates, WIT bindings/examples, local dev, mock host, integration harness, logs/traces, compatibility checker, package builder, security diagnostics | partial | examples/builder/doctor; mock host missing |
 

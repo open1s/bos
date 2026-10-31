@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::Stream;
@@ -71,6 +71,43 @@ pub(crate) struct ExtensionTool {
     timeout_ms: u64,
     qualified: String,
     cancelled: Arc<AtomicBool>,
+}
+
+/// The progress events one tool may emit in a one-second window.
+const PROGRESS_PER_WINDOW: u32 = 200;
+const PROGRESS_WINDOW: Duration = Duration::from_secs(1);
+
+/// A fixed-window limiter for progress chunks, so a chatty guest cannot turn a
+/// tool call into an unbounded stream of model-visible messages.
+struct ProgressWindow {
+    started: Instant,
+    count: u32,
+}
+
+impl ProgressWindow {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            count: 0,
+        }
+    }
+
+    fn allow(&mut self) -> bool {
+        self.allow_at(Instant::now())
+    }
+
+    fn allow_at(&mut self, now: Instant) -> bool {
+        if now.duration_since(self.started) >= PROGRESS_WINDOW {
+            self.started = now;
+            self.count = 0;
+        }
+        if self.count < PROGRESS_PER_WINDOW {
+            self.count += 1;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl ExtensionTool {
@@ -187,7 +224,11 @@ impl react::tool::registry::AsyncTool for ExtensionTool {
         tokio::spawn(async move {
             let progress_stream = stream_tx.clone();
             let forward = tokio::spawn(async move {
+                let mut window = ProgressWindow::new();
                 while let Some(value) = progress_rx.recv().await {
+                    if !window.allow() {
+                        continue;
+                    }
                     let _ = progress_stream.send(Ok(value.to_string()));
                 }
             });
@@ -461,6 +502,17 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn progress_is_bounded_to_a_fixed_window() {
+        let mut window = ProgressWindow::new();
+        let start = Instant::now();
+        for _ in 0..PROGRESS_PER_WINDOW {
+            assert!(window.allow_at(start));
+        }
+        assert!(!window.allow_at(start));
+        assert!(window.allow_at(start + PROGRESS_WINDOW + Duration::from_millis(1)));
+    }
 
     struct Scratch(PathBuf);
 
