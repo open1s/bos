@@ -43,6 +43,11 @@ jobs:
             libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libfontconfig1-dev libfreetype6-dev libssl-dev libasound2-dev libxdo-dev
 
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
       - name: Format
         run: cargo fmt --all -- --check
 
@@ -84,6 +89,11 @@ jobs:
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
             libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libfontconfig1-dev libfreetype6-dev libssl-dev libasound2-dev libxdo-dev
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
 
       # Keep the workspace rust-version honest: if a dependency or the code
       # starts needing a newer compiler, this job fails instead of the docs
