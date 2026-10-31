@@ -549,6 +549,8 @@
 "settings.extensions": "Extension panels"
 "settings.extensionsHint": "Panels contributed by installed extensions, rendered by the host from their declarative UI"
 "settings.themeKit": "Kit theme"
+"settings.approveProcess": "Approve"
+"settings.processApprovals": "Process execution needs approval"
 "settings.extensionsRefresh": "Refresh"
 "settings.builtinPluginsHint": "Inspect the extensions this deployment ships."
 "settings.pluginsPageTitle": "Plugins"

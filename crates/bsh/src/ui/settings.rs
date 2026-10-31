@@ -6531,6 +6531,87 @@ impl Shell {
         }
         let view = self.extension_panels.clone().expect("panel view");
 
+        let statuses = self.extension_statuses.clone().unwrap_or_default();
+        let approvals: Vec<(String, String, String)> = statuses
+            .iter()
+            .filter_map(|status| {
+                let program = status.program.clone()?;
+                let denied = status
+                    .capabilities
+                    .iter()
+                    .find(|capability| capability.capability == "process.execute")
+                    .is_some_and(|capability| !capability.allowed);
+                denied.then(|| (status.id.clone(), program, status.name.clone()))
+            })
+            .collect();
+        let approval_settings = self.state.settings.clone();
+        let approval_workspace = workspace.clone();
+        let approval_view = cx.entity();
+        let mut approval_rows = div().flex().flex_col().gap(px(6.0));
+        for (id, program, name) in &approvals {
+            let id = id.clone();
+            let program = program.clone();
+            let label = format!(
+                "{} {program}",
+                tr(self.state.lang, "settings.approveProcess")
+            );
+            let settings = approval_settings.clone();
+            let workspace = approval_workspace.clone();
+            let view = approval_view.clone();
+            approval_rows = approval_rows.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(txt(name.clone(), 12.0, theme::text()))
+                    .child(
+                        Button::new(format!("approve-process-{id}"))
+                            .debug_selector({
+                                let id = id.clone();
+                                move || format!("approve-process-{id}")
+                            })
+                            .h(px(26.0))
+                            .px(px(10.0))
+                            .rounded(px(7.0))
+                            .bg(rgb(theme::new_session_fill()))
+                            .child(txt(label, 12.0, theme::text()))
+                            .on_click(cx.listener({
+                                move |_this, _event, _window, cx| {
+                                    if crate::extension::approve_process(
+                                        &settings,
+                                        workspace.as_deref(),
+                                        &id,
+                                        &program,
+                                    )
+                                    .is_ok()
+                                    {
+                                        let statuses = crate::extension::statuses(
+                                            &settings,
+                                            workspace.as_deref(),
+                                        );
+                                        view.update(cx, |this, cx| {
+                                            this.extension_statuses = Some(statuses);
+                                            cx.notify();
+                                        });
+                                    }
+                                }
+                            })),
+                    ),
+            );
+        }
+        let approval_section = (!approvals.is_empty()).then(|| {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .child(txt(
+                    tr(self.state.lang, "settings.processApprovals"),
+                    11.0,
+                    theme::muted(),
+                ))
+                .child(approval_rows)
+        });
         let theme_surfaces = self.extension_themes.clone().unwrap_or_default();
         let selected_theme = self.state.draft().global.general.extension_theme.clone();
         let selected_label = selected_theme
@@ -6629,14 +6710,22 @@ impl Shell {
                     &refresh_settings,
                     refresh_workspace.as_deref(),
                 ));
+                this.extension_statuses = Some(crate::extension::statuses(
+                    &refresh_settings,
+                    refresh_workspace.as_deref(),
+                ));
                 refresh_view.update(cx, |view, cx| {
                     view.set_panels(panels);
                     cx.notify();
                 });
             }));
-        let rows = vec![
-            div().mb(px(10.0)).child(theme_menu).into_any_element(),
-            div().mb(px(10.0)).child(refresh).into_any_element(),
+        let mut rows = Vec::new();
+        if let Some(section) = approval_section {
+            rows.push(div().mb(px(10.0)).child(section).into_any_element());
+        }
+        rows.push(div().mb(px(10.0)).child(theme_menu).into_any_element());
+        rows.push(div().mb(px(10.0)).child(refresh).into_any_element());
+        rows.push(
             div()
                 .debug_selector(|| "extension-panels".to_string())
                 .flex()
@@ -6645,7 +6734,7 @@ impl Shell {
                 .min_h(px(0.0))
                 .child(view)
                 .into_any_element(),
-        ];
+        );
         ("settings.extensions", "settings.extensionsHint", rows)
     }
 

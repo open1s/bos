@@ -136,6 +136,8 @@ pub(crate) struct ExtensionStatus {
     pub(crate) version: String,
     /// Runtime kind.
     pub(crate) runtime: String,
+    /// Declared process executable, when the runtime is a process.
+    pub(crate) program: Option<String>,
     /// Trust level.
     pub(crate) trust: String,
     /// Source label.
@@ -885,6 +887,21 @@ impl ExtensionHost {
             .collect()
     }
 
+    /// Grant one process executable and reload the package set.
+    pub(crate) fn approve_process(
+        &mut self,
+        id: &str,
+        program: &str,
+    ) -> Result<(), ExtensionError> {
+        self.policy.grant(
+            id,
+            crate::extension::capability::Capability::ProcessExecute,
+            crate::extension::capability::GrantScope::Program(program.to_string()),
+            Some("approved from the extensions pane".to_string()),
+        )?;
+        self.rebuild()
+    }
+
     /// Every panel an applied extension offers, ready for the host UI.
     pub(crate) fn panel_surfaces(&self) -> Vec<PanelSurface> {
         let mut surfaces = Vec::new();
@@ -1175,6 +1192,9 @@ impl ExtensionHost {
             name: entry.package.manifest.extension.name.clone(),
             version: entry.package.manifest.extension.version.to_string(),
             runtime: entry.package.manifest.runtime.kind.as_str().to_string(),
+            program: (entry.package.manifest.runtime.kind == RuntimeKind::Process)
+                .then(|| entry.package.manifest.runtime.entry.clone())
+                .flatten(),
             trust: entry.package.trust.as_str().to_string(),
             source: entry.package.source.label(),
             root: entry.package.root.display().to_string(),
@@ -1549,6 +1569,57 @@ pub(crate) fn themes(
         .as_ref()
         .map(ExtensionHost::theme_surfaces)
         .unwrap_or_default()
+}
+
+/// The status rows the current configuration offers, for the settings pane.
+pub(crate) fn statuses(
+    settings: &crate::settings::Settings,
+    workspace: Option<&Path>,
+) -> Vec<ExtensionStatus> {
+    with_host(settings, workspace, |host| host.statuses()).unwrap_or_default()
+}
+
+/// Approve one process executable from the settings pane.
+pub(crate) fn approve_process(
+    settings: &crate::settings::Settings,
+    workspace: Option<&Path>,
+    id: &str,
+    program: &str,
+) -> Result<(), ExtensionError> {
+    with_host(settings, workspace, |host| {
+        host.approve_process(id, program)
+    })
+    .unwrap_or_else(|| {
+        Err(ExtensionError::NotFound {
+            id: "extension host".to_string(),
+        })
+    })
+}
+
+/// Run a closure against the cached host, opening or refreshing it first.
+fn with_host<R>(
+    settings: &crate::settings::Settings,
+    workspace: Option<&Path>,
+    f: impl FnOnce(&mut ExtensionHost) -> R,
+) -> Option<R> {
+    let config = HostConfig::from_settings(settings, workspace.map(Path::to_path_buf), None);
+    let slot = HOST.get_or_init(|| Mutex::new(None));
+    let mut guard = slot.lock().ok()?;
+    let reopen = guard.as_ref().is_none_or(|host| host.config != config);
+    if reopen {
+        match ExtensionHost::open(config) {
+            Ok(host) => *guard = Some(host),
+            Err(error) => {
+                log::warn!("extension host could not open: {error}");
+                return None;
+            }
+        }
+    } else if let Some(host) = guard.as_mut() {
+        if let Err(error) = host.ensure_fresh() {
+            log::warn!("extension host could not refresh: {error}");
+        }
+    }
+    guard.as_mut().map(f)
 }
 
 /// Open a host for the CLI or a test, without touching the process global.

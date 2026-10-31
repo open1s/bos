@@ -544,6 +544,8 @@
 "settings.extensions": "扩展面板"
 "settings.extensionsHint": "已安装扩展提供的面板，由宿主按其声明式 UI 渲染"
 "settings.themeKit": "跟随 Kit 主题"
+"settings.approveProcess": "批准"
+"settings.processApprovals": "以下进程需要执行批准"
 "settings.extensionsRefresh": "刷新"
 "settings.builtinPluginsHint": "查看内置部署的扩展列表"
 "settings.pluginsPageTitle": "插件"

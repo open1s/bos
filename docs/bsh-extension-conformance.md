@@ -186,7 +186,7 @@ Status legend:
 | Built-in statically linked, internal interface, lifecycle conventions | done |
 | WASM load/validate, host binding, memory/fuel/time limits, authorized host functions, cancellation, error normalization, metrics | done |
 | Process JSON-RPC stdio, handshake, structured stderr | done |
-| Process executable allowlist/user approval | partial: allowlist + explicit grant; no per-command approval UI |
+| Process executable allowlist/user approval | done | allowlist + explicit grant; Settings > Extensions approves the declared process executable |
 | Environment filtering, cwd restriction, timeout, output limits | done |
 | OS-level sandbox | partial | macOS profile tested; Linux bwrap namespace plan implemented but not executed here; process network bridge absent |
 | Native dynamic libraries | non-goal |

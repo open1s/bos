@@ -857,6 +857,8 @@ pub(crate) struct Shell {
     /// the host on every frame.
     pub(crate) extension_themes:
         Option<std::collections::BTreeMap<String, crate::extension::ui::ThemePalette>>,
+    /// Extension status rows, resolved with the panels.
+    pub(crate) extension_statuses: Option<Vec<crate::extension::host::ExtensionStatus>>,
     /// The settings dialog's text fields.
     pub(crate) settings_inputs: SettingsInputs,
     /// The Vault pane's text fields.
@@ -1097,6 +1099,11 @@ impl Shell {
                 None => crate::theme::clear_extension_tokens(),
             }
             themes
+        };
+        let extension_statuses = {
+            let root = state.settings.active_workspace_root();
+            let workspace = (!root.is_empty()).then(|| std::path::PathBuf::from(root));
+            crate::extension::statuses(&state.settings, workspace.as_deref())
         };
         // A workspace file written before the model became session-scoped
         // still names one. It is handed to the session that is now open, once,
@@ -1685,6 +1692,7 @@ impl Shell {
             extension_commands: crate::extension::cached_commands(),
             extension_panels: None,
             extension_themes: Some(extension_themes),
+            extension_statuses: Some(extension_statuses),
             settings_inputs,
             vault_inputs,
             vault_revealed: None,
