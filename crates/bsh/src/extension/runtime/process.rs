@@ -192,6 +192,43 @@ impl ProcessSession {
     }
 }
 
+/// A macOS profile that allows reads everywhere and writes only inside the
+/// package, the open workspace, temp and device nodes.
+///
+/// This is a filesystem profile, not a network sandbox: the process protocol
+/// has no host network bridge, so network policy for a process package remains
+/// the capability decision that authorized spawning it.
+fn sandbox_profile(root: &Path, workspace: Option<&Path>, data_root: Option<&Path>) -> String {
+    let mut profile = "(version 1)(allow default)(deny file-write*)(allow file-write*".to_string();
+    let mut paths: Vec<PathBuf> = vec![
+        root.canonicalize().unwrap_or_else(|_| root.to_path_buf()),
+        PathBuf::from("/tmp"),
+        PathBuf::from("/private/tmp"),
+        PathBuf::from("/dev"),
+        PathBuf::from("/private/dev"),
+    ];
+    if let Some(workspace) = workspace {
+        paths.push(
+            workspace
+                .canonicalize()
+                .unwrap_or_else(|_| workspace.to_path_buf()),
+        );
+    }
+    if let Some(data_root) = data_root {
+        paths.push(
+            data_root
+                .canonicalize()
+                .unwrap_or_else(|_| data_root.to_path_buf()),
+        );
+    }
+    for path in paths {
+        let escaped = path.display().to_string().replace('"', "\\\"");
+        profile.push_str(&format!(" (subpath \"{escaped}\")"));
+    }
+    profile.push(')');
+    profile
+}
+
 /// Apply the manifest's resource ceilings in the child, before exec.
 ///
 /// RLIMIT_AS bounds the address space, RLIMIT_CPU is the wall-independent CPU
@@ -318,6 +355,9 @@ pub(crate) struct ProcessRuntime {
     memory_bytes: u64,
     cpu_seconds: u64,
     config: String,
+    workspace: Option<PathBuf>,
+    data_root: Option<PathBuf>,
+    sandbox: bool,
     session: Mutex<Option<ProcessSession>>,
     subscriptions: std::sync::Mutex<Vec<Subscription>>,
 }
@@ -359,6 +399,9 @@ impl ProcessRuntime {
             memory_bytes: manifest.resources.memory_mb().saturating_mul(1024 * 1024),
             cpu_seconds: (manifest.resources.execution_ms() / 1000).max(1) + 2,
             config: "{}".to_string(),
+            workspace: None,
+            data_root: None,
+            sandbox: cfg!(target_os = "macos"),
             session: Mutex::new(None),
             subscriptions: std::sync::Mutex::new(Vec::new()),
         })
@@ -372,6 +415,24 @@ impl ProcessRuntime {
     /// Attach the effective configuration sent in the initialize handshake.
     pub(crate) fn with_config(mut self, config: String) -> Self {
         self.config = config;
+        self
+    }
+
+    /// Attach the workspace a sandboxed child may write inside.
+    pub(crate) fn with_workspace(mut self, workspace: Option<PathBuf>) -> Self {
+        self.workspace = workspace;
+        self
+    }
+
+    /// Attach the package data namespace a sandboxed child may write inside.
+    pub(crate) fn with_data_root(mut self, data_root: Option<PathBuf>) -> Self {
+        self.data_root = data_root;
+        self
+    }
+
+    /// Disable or enable the macOS filesystem profile (tests may opt out).
+    pub(crate) fn with_sandbox(mut self, sandbox: bool) -> Self {
+        self.sandbox = sandbox;
         self
     }
 
@@ -491,7 +552,20 @@ impl ProcessRuntime {
             }
             canonical
         };
-        let mut command = Command::new(&program);
+        let mut command = if self.sandbox && cfg!(target_os = "macos") {
+            let mut command = Command::new("/usr/bin/sandbox-exec");
+            command
+                .arg("-p")
+                .arg(sandbox_profile(
+                    &self.root,
+                    self.workspace.as_deref(),
+                    self.data_root.as_deref(),
+                ))
+                .arg(&program);
+            command
+        } else {
+            Command::new(&program)
+        };
         configure_process_limits(&mut command, self.memory_bytes, self.cpu_seconds);
         command
             .args(&self.args)
@@ -826,6 +900,51 @@ events = ["workspace.changed"]
         tokio::time::sleep(Duration::from_millis(100)).await;
         let logged = std::fs::read_to_string(scratch.0.join("events.log")).expect("events log");
         assert!(logged.contains("workspace.changed"), "{logged}");
+        runtime.shutdown().await.expect("shutdown");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn the_macos_sandbox_denies_a_write_outside_the_package() {
+        let scratch = Scratch::new("sandbox");
+        std::fs::write(
+            scratch.0.join("tools/echo.json"),
+            r#"{"description":"Echo","input_schema":{"type":"object"}}"#,
+        )
+        .expect("tool");
+        let probe = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default()
+            .join(format!("bsh-ext-sandbox-probe-{}", std::process::id()));
+        let _ = std::fs::remove_file(&probe);
+        std::fs::write(
+            scratch.0.join("server.sh"),
+            r#"while IFS= read -r line; do
+  case "$line" in
+    *'"initialize"'*) echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"1.0"}}' ;;
+    *'"tools/call"'*)
+      if echo x > "$HOME/bsh-ext-sandbox-probe-PID" 2>/dev/null; then
+        echo '{"jsonrpc":"2.0","id":2,"result":{"blocked":false}}'
+      else
+        echo '{"jsonrpc":"2.0","id":2,"result":{"blocked":true}}'
+      fi
+      ;;
+  esac
+done
+"#
+            .replace("PID", &std::process::id().to_string()),
+        )
+        .expect("server");
+        let runtime = ProcessRuntime::new(&manifest(), &scratch.0)
+            .expect("runtime")
+            .with_sandbox(true);
+        let context = CallContext::new(manifest().id().clone(), "sandbox", None, 2000);
+        let result = runtime
+            .call_tool("echo", json!({}), &context)
+            .await
+            .expect("call");
+        assert_eq!(result["blocked"], true);
+        assert!(!probe.exists());
         runtime.shutdown().await.expect("shutdown");
     }
     #[cfg(unix)]

@@ -1281,10 +1281,19 @@ fn command_reproduce(args: &[String], root: Option<PathBuf>) -> Result<i32, Stri
             .map_err(|error| error.to_string())?,
             ExtensionSource::Builtin => continue,
             ExtensionSource::Installed | ExtensionSource::Development => {
-                return Err(format!(
-                    "{} {} is not installed and its lock has no remote source",
-                    locked.id, locked.version
-                ));
+                let Some(path) = &locked.source_path else {
+                    return Err(format!(
+                        "{} {} is not installed and its lock has no source path",
+                        locked.id, locked.version
+                    ));
+                };
+                if !std::path::Path::new(path).exists() {
+                    return Err(format!(
+                        "{} {} source path {path} no longer exists",
+                        locked.id, locked.version
+                    ));
+                }
+                sources::resolve(path, &store.cache_root()).map_err(|error| error.to_string())?
             }
         };
         let package =
@@ -1313,6 +1322,66 @@ fn command_reproduce(args: &[String], root: Option<PathBuf>) -> Result<i32, Stri
 mod tests {
     use super::command_package;
 
+    #[test]
+    fn an_installed_only_lock_reproduces_from_its_source_path() {
+        let root = std::env::temp_dir().join(format!("bsh-cli-reproduce-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let source = root.join("source");
+        std::fs::create_dir_all(source.join("tools")).expect("tools");
+        std::fs::write(
+            source.join("extension.toml"),
+            r#"
+schema_version = "1.0"
+
+[extension]
+id = "com.example.reproduced"
+name = "Reproduced"
+version = "1.0.0"
+description = "A reproduced test package"
+
+[compatibility]
+bsh = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+
+[runtime]
+kind = "declarative"
+
+[contributes]
+tools = ["echo"]
+"#,
+        )
+        .expect("manifest");
+        std::fs::write(
+            source.join("tools/echo.json"),
+            r#"{"description":"Echo","implementation":{"kind":"echo_arguments"}}"#,
+        )
+        .expect("tool");
+        let hash = super::package_hash(&source).expect("hash");
+        let lock = format!(
+            r#"
+format = 1
+host = "3.0.2"
+extension_api = "1.0"
+
+[[packages]]
+id = "com.example.reproduced"
+version = "1.0.0"
+hash = "{hash}"
+source = "installed"
+source_path = "{}"
+"#,
+            source.display()
+        );
+        let lock_path = root.join("lock.toml");
+        std::fs::write(&lock_path, lock).expect("lock");
+        let target = root.join("target");
+        super::command_reproduce(&[lock_path.display().to_string()], Some(target.clone()))
+            .expect("reproduce");
+        assert!(target
+            .join("installed/com.example.reproduced/1.0.0/extension.toml")
+            .is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
     #[test]
     fn a_package_builds_a_readable_tarball() {
         let root = std::env::temp_dir().join(format!("bsh-cli-package-{}", std::process::id()));

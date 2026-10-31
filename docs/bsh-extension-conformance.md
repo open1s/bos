@@ -64,7 +64,7 @@ Status legend:
 |---|---|---|
 | UI extension (panel) | partial | registration and validation; renderer missing |
 | Tool extension | done | |
-| Agent extension | partial | provider descriptor discovery; no executable agent-role adapter |
+| Agent extension | done | agent descriptor maps to a selectable Preset (plugins, permission, level) |
 | Model extension | done | descriptors merge into settings.plugin_providers and are selectable |
 | MCP extension | done | runtime/mcp.rs + mcp-echo fixture |
 | Workflow extension | done | runtime/workflow.rs sequential executor with capability union |
@@ -188,7 +188,7 @@ Status legend:
 | Process JSON-RPC stdio, handshake, structured stderr | done |
 | Process executable allowlist/user approval | partial: allowlist + explicit grant; no per-command approval UI |
 | Environment filtering, cwd restriction, timeout, output limits | done |
-| OS-level sandbox | partial | RLIMIT_AS/CPU/NOFILE + process group; no filesystem profile |
+| OS-level sandbox | partial | macOS sandbox profile for writes + RLIMIT ceilings; Linux namespaces and process network bridge absent |
 | Native dynamic libraries | non-goal |
 
 ## 9. UI
@@ -214,11 +214,11 @@ Status legend:
 | Context provider | partial: static Markdown |
 | Prompt provider | done |
 | Model provider | done | descriptor -> settings.plugin_providers |
-| Agent provider | partial | descriptor discovery; no executable role adapter |
+| Agent provider | done | descriptor -> settings.plugin_presets |
 | Preset provider | done | descriptor -> settings.plugin_presets |
 | Workflow provider | done | declarative executor |
 | Tool content: text, images, structured, file refs | done | ToolContent + MCP mapping |
-| Streaming output, progress, cancellation | partial | process $/progress is live; WASM/MCP final result only; cancel token |
+| Streaming output, progress, cancellation | partial | process $/progress and MCP notifications/progress are live; WASM final result only; cancel token |
 | Timeouts, error categories, correlation ids | done |
 | MCP tool/resource/prompt mapping | done | mcp-echo test |
 | MCP lifecycle/reconnect/timeout/cancel | partial | start/timeout/close; reconnect on next call only |
@@ -274,7 +274,7 @@ Status legend:
 | Upgrade must not overwrite data | done by versioned dirs |
 | Lockfile id/version/hash/source/revision/deps/api/signature/installation metadata | partial | signature/revision/metadata recorded in registry; lockfile fields partial |
 | Upgrade and rollback | done | versions/set_active/rollback CLI |
-| Reproduce from lockfile | partial | bsh ext reproduce reinstalls Git/registry locks and checks hashes; an Installed-only lock has no remote |
+| Reproduce from lockfile | done | bsh ext reproduce reinstalls Git/registry locks or the recorded local source path, then checks hashes |
 | Package integrity verification on load | done | doctor + install signature/hash |
 
 ## 14. Rust workspace proposal
@@ -328,7 +328,7 @@ is deliberate and does not remove a feature.
 | Phase 2 WASM + Extism | done |
 | Phase 3 agent, event, MCP, process | partial | MCP/events/process/tools done; live streaming/progress partial |
 | Phase 4 GPUI UI | partial | renderer/panels/actions done; themes and keyboard focus partial |
-| Phase 5 ecosystem | partial | registry/upgrade/rollback/signatures/builder/Extism done; Installed-only lock reproduction missing |
+| Phase 5 ecosystem | done | registry/upgrade/rollback/signatures/builder/Extism/lock reproduction |
 
 ## 19. User stories
 
@@ -336,25 +336,23 @@ The implementation covers the type/manifest/store/policy/lifecycle/process/CLI
 stories. Resolved: Wasmtime/host functions, Extism, WASM limits, WASM/process
 subscriptions, MCP, UI renderer/actions, installer sources, upgrade/rollback,
 CLI build/test/package/update, signatures, quarantine, process progress,
-model/preset providers and remote lock reproduction. Still open: executable
-agent-role adapters, app-wide theme application, Installed-only lock
-reproduction, OS filesystem sandbox, cross-platform coverage and retry backoff.
+model/preset providers and local/remote lock reproduction. Still open: WASM
+incremental progress, app-wide theme application, Linux filesystem sandboxing,
+cross-platform coverage and retry backoff.
 
 ## 20. Remaining gaps
 
 The first-release feature set is implemented except for these explicit gaps.
 Each is a behaviour, not a missing type.
 
-1. Live streaming/progress is real for process tools (`$/progress` through
-   run_streaming); WASM and MCP guests still deliver only their final result.
-2. Agent provider descriptors are discoverable but no executable agent-role adapter
-   is registered; model providers and presets are selectable.
+1. Live streaming/progress is real for process tools (`$/progress`) and MCP
+   (`notifications/progress`); WASM guests still deliver only their final result.
+2. Agent provider descriptors are selectable presets; there is no separate
+   code-level agent adapter API beyond that descriptor contract.
 3. Theme contributions apply to an extension's own panels, not the whole shell.
-4. Lockfile reproduction only covers lock entries that name a Git or registry
-   remote; an Installed-only lock cannot be reproduced from the file alone.
-5. OS filesystem sandbox: process children get RLIMIT ceilings and a process
-   group, not a macOS sandbox profile or Linux namespace.
-6. Guest/runtime cancellation: the tool future stops waiting, but a WASM guest
+4. Filesystem sandbox is macOS-only: a sandbox profile confines writes to the
+   package, workspace, data and temp paths; Linux namespaces are not implemented.
+5. Guest/runtime cancellation: the tool future stops waiting, but a WASM guest
    or process is not always terminated at the same instant.
-7. Cross-platform matrix: the suite is green on macOS (this environment);
+6. Cross-platform matrix: the suite is green on macOS (this environment);
    Windows/Linux process limits and path handling are not exercised here.

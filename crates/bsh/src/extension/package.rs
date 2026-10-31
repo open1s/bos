@@ -55,6 +55,8 @@ pub(crate) struct Package {
     pub(crate) signature: Option<PackageSignature>,
     /// The trust store's verdict on that signature.
     pub(crate) verification: SignatureVerification,
+    /// The directory or archive this install was copied from, when known.
+    pub(crate) source_path: Option<PathBuf>,
 }
 
 impl Package {
@@ -78,6 +80,8 @@ impl Package {
             .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|duration| duration.as_secs())
             .unwrap_or_default();
+        let source_path =
+            matches!(&source, ExtensionSource::Development).then(|| root.to_path_buf());
         Ok(Self {
             root: root.to_path_buf(),
             manifest,
@@ -88,6 +92,7 @@ impl Package {
             installed_at,
             signature,
             verification: SignatureVerification::Missing,
+            source_path,
         })
     }
 
@@ -106,6 +111,7 @@ impl Package {
             installed_at: 0,
             signature: None,
             verification: SignatureVerification::Missing,
+            source_path: None,
         })
     }
 
@@ -442,6 +448,9 @@ pub(crate) struct InstalledRecord {
     /// Publisher name from the signature, when one was present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) publisher: Option<String>,
+    /// The directory or archive this install was copied from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) source_path: Option<String>,
 }
 
 fn default_trust() -> TrustLevel {
@@ -860,6 +869,7 @@ impl ExtensionStore {
                             package.verification = record
                                 .verification
                                 .unwrap_or(SignatureVerification::Missing);
+                            package.source_path = record.source_path.map(PathBuf::from);
                         }
                         packages.push(package);
                     }
@@ -958,6 +968,8 @@ impl ExtensionStore {
         package.installed_at = unix_now();
         package.verification = verification.clone();
         package.signature = staged.signature.clone();
+        package.source_path = Some(source.to_path_buf());
+        package.source_path = Some(source.to_path_buf());
         let mut registry = self.read_registry()?;
         registry.insert(
             id.as_str(),
@@ -976,6 +988,7 @@ impl ExtensionStore {
                     .collect(),
                 verification: Some(verification),
                 publisher,
+                source_path: Some(source.display().to_string()),
             },
         );
         self.write_registry(&registry)?;

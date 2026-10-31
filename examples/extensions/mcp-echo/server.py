@@ -40,6 +40,11 @@ def main():
             }]})
         elif method == "tools/call":
             arguments = request.get("params", {}).get("arguments", {})
+            print(json.dumps({
+                "jsonrpc": "2.0",
+                "method": "notifications/progress",
+                "params": {"progress": 1, "total": 2},
+            }), flush=True)
             response = result(request_id, {
                 "content": [{"type": "text", "text": json.dumps(arguments)}],
                 "isError": False,

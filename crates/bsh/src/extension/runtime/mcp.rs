@@ -51,6 +51,16 @@ impl Session {
         params: Value,
         timeout_ms: u64,
     ) -> Result<Value, ExtensionError> {
+        self.request_with_progress(method, params, timeout_ms, None)
+    }
+
+    fn request_with_progress(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout_ms: u64,
+        progress: Option<&tokio::sync::mpsc::UnboundedSender<Value>>,
+    ) -> Result<Value, ExtensionError> {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
         let request = json!({
@@ -104,6 +114,14 @@ impl Session {
                     message: format!("response is not JSON: {error}"),
                 })?;
             if value.get("id").and_then(Value::as_u64) != Some(id) {
+                if let Some(sender) = progress {
+                    if value.get("method").and_then(Value::as_str) == Some("notifications/progress")
+                    {
+                        if let Some(params) = value.get("params") {
+                            let _ = sender.send(params.clone());
+                        }
+                    }
+                }
                 continue;
             }
             if let Some(error) = value.get("error") {
@@ -511,6 +529,67 @@ impl McpRuntime {
             prompts,
         })
     }
+    fn call_tool_with_progress(
+        &self,
+        name: &str,
+        arguments: Value,
+        progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+    ) -> Result<Value, ExtensionError> {
+        let mut guard = self.session.lock().map_err(|_| ExtensionError::Corrupt {
+            path: self.root.clone(),
+            message: "MCP session lock is poisoned".to_string(),
+        })?;
+        if guard.is_none() {
+            *guard = Some(self.start()?);
+        }
+        let session = guard.as_mut().expect("session");
+        let result = session.request_with_progress(
+            "tools/call",
+            json!({ "name": name, "arguments": arguments }),
+            self.max_execution_ms,
+            progress.as_ref(),
+        );
+        match result {
+            Ok(value) => {
+                let bytes = serde_json::to_vec(&value)
+                    .map(|bytes| bytes.len())
+                    .unwrap_or(0);
+                if bytes as u64 > self.max_output_bytes {
+                    *guard = None;
+                    return Err(ExtensionError::Limit {
+                        extension: self.extension.to_string(),
+                        message: format!(
+                            "MCP result is {bytes} bytes; the ceiling is {}",
+                            self.max_output_bytes
+                        ),
+                    });
+                }
+                let is_error = value
+                    .get("isError")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if is_error {
+                    let message = value
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .and_then(|content| content.first())
+                        .and_then(|content| content.get("text"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("MCP tool failed")
+                        .to_string();
+                    return Err(ExtensionError::Runtime {
+                        extension: self.extension.to_string(),
+                        message,
+                    });
+                }
+                Ok(value)
+            }
+            Err(error) => {
+                *guard = None;
+                Err(error)
+            }
+        }
+    }
 }
 
 fn sanitize_id(raw: &str) -> String {
@@ -643,6 +722,17 @@ impl Runtime for McpRuntime {
             .await
             .map(ToolResult::from_value)
     }
+
+    async fn call_tool_progress(
+        &self,
+        name: &str,
+        arguments: Value,
+        _context: &CallContext,
+        progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+    ) -> Result<ToolResult, ExtensionError> {
+        self.call_tool_with_progress(name, arguments, progress)
+            .map(ToolResult::from_value)
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -678,11 +768,14 @@ mod tests {
             None,
             5000,
         );
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let result = runtime
-            .call_tool("echo", serde_json::json!({"x": 1}), &context)
+            .call_tool_progress("echo", serde_json::json!({"x": 1}), &context, Some(sender))
             .await
             .expect("call");
-        assert_eq!(result, serde_json::json!("{\"x\": 1}"));
+        assert_eq!(result.to_value(), serde_json::json!("{\"x\": 1}"));
+        let progress = receiver.recv().await.expect("one progress notification");
+        assert_eq!(progress["progress"], 1);
         runtime.shutdown().await.expect("shutdown");
     }
 }

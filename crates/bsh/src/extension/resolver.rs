@@ -39,6 +39,9 @@ pub(crate) struct LockedPackage {
     pub(crate) hash: String,
     /// Where the package came from.
     pub(crate) source: ExtensionSource,
+    /// Local directory or archive this package was installed from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) source_path: Option<String>,
     /// Resolved dependency versions, id -> exact version.
     #[serde(default)]
     pub(crate) dependencies: BTreeMap<String, String>,
@@ -84,6 +87,10 @@ impl LockFile {
                 version: package.manifest.extension.version.to_string(),
                 hash: package.hash.clone(),
                 source: package.source.clone(),
+                source_path: package
+                    .source_path
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
                 dependencies: package
                     .manifest
                     .dependencies
@@ -351,6 +358,7 @@ tools = ["echo"]
             installed_at: 0,
             signature: None,
             verification: crate::extension::signing::SignatureVerification::Missing,
+            source_path: None,
         }
     }
 

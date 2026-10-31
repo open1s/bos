@@ -415,6 +415,7 @@ impl ExtensionHost {
                     installed_at: 0,
                     signature: None,
                     verification: crate::extension::signing::SignatureVerification::Missing,
+                    source_path: None,
                 };
                 let tools = runtime.descriptors();
                 self.builtins.push(BuiltinLoaded {
@@ -698,6 +699,8 @@ impl ExtensionHost {
             RuntimeKind::Process => {
                 let runtime = ProcessRuntime::new(&package.manifest, &package.root)?
                     .with_config(config.to_json())
+                    .with_workspace(self.config.workspace.clone())
+                    .with_data_root(Some(data_root.clone()))
                     .with_events(
                         Arc::clone(&self.events),
                         &package.manifest.contributes.events,

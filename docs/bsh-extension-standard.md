@@ -697,8 +697,8 @@ not kept:
 3. Theme tokens apply to the extension's own panels, not to the whole shell.
 4. Lockfile reproduction covers Git/registry remotes; an Installed-only lock has
    no remote and cannot be rebuilt from the file alone.
-5. Process children get RLIMIT ceilings and a process group, not a filesystem
-   sandbox profile or Linux namespace.
+5. Process children get RLIMIT ceilings and a process group, a macOS write
+   sandbox profile; Linux namespaces are not implemented.
 6. Cancellation stops the waiting call and asks the runtime to stop, but a WASM
    guest or child process may take a moment to disappear.
 7. Windows/Linux process limits are compiled but not exercised in this macOS
