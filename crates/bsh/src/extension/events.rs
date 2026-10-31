@@ -138,6 +138,12 @@ impl ExtensionEvent {
                 ),
             });
         }
+        if !json_depth_ok(&self.payload, 0) {
+            return Err(ExtensionError::Protocol {
+                extension: self.source.clone(),
+                message: "event payload nests deeper than 32 levels".to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -463,6 +469,18 @@ impl Drop for Subscription {
 }
 
 /// Build an extension lifecycle event.
+/// Reject a JSON value nested more than 32 levels deep.
+fn json_depth_ok(value: &Value, depth: usize) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    match value {
+        Value::Array(items) => items.iter().all(|item| json_depth_ok(item, depth + 1)),
+        Value::Object(map) => map.values().all(|item| json_depth_ok(item, depth + 1)),
+        _ => true,
+    }
+}
+
 pub(crate) fn lifecycle_event(
     extension: &ExtensionId,
     topic: &str,
@@ -536,6 +554,16 @@ mod tests {
         let error = last.expect("a publish").expect_err("over the rate");
         assert_eq!(error.category(), "limit");
         assert!(bus.metrics().rejected >= 1);
+    }
+
+    #[test]
+    fn a_deeply_nested_event_is_refused() {
+        let mut payload = serde_json::json!(0);
+        for _ in 0..40 {
+            payload = serde_json::json!([payload]);
+        }
+        let error = ExtensionEvent::new("bsh", "app.started", payload).expect_err("depth");
+        assert_eq!(error.category(), "runtime");
     }
 
     #[test]
