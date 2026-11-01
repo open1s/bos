@@ -71,10 +71,14 @@ interface types {
     }
 }
 
-/// Services the host exposes to an extension. Every function is authorized
-/// against the manifest's capabilities and the reader's grants before the host
-/// performs it. Paths are package-relative or workspace-relative; the host
-/// applies containment and refuses an escape.
+/// Services the host exposes to an extension. Operations that access protected
+/// resources (file access, HTTP fetch, storage, secrets, event publication and
+/// subscription) are checked against the corresponding manifest capability and
+/// reader grant. Logging, configuration, time, progress and releasing an existing
+/// subscription are host services, not independent capability grants.
+///
+/// read-file and write-file paths are workspace-relative. The host requires an
+/// open workspace, applies containment checks and refuses paths that escape it.
 interface host {
     use types.{event, host-error, log-level};
 
