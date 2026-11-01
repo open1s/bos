@@ -386,6 +386,428 @@ public Rust trait ABI. Built-in Rust is first-party only, linked into the binary
 
 ---
 
+### 3.4 The activation pipeline, step by step
+
+A package becomes a live capability through one deterministic pipeline. Knowing
+these steps is what lets an author predict *when* a contribution appears and
+*why* it does not.
+
+```text
+1 discovery        ExtensionStore::scan_installed
+2 selection        select_active_versions (one version per id)
+3 validation       Package::manifest + contribution files
+4 runtime build    build_runtime -> declarative/process/WASM/Extism/MCP/builtin
+5 workflow wrap    WorkflowRuntime::new, if workflows are declared
+6 dependency       resolver::resolve -> lock.toml
+7 capability       policy.authorize_required at activation
+8 activation       manager: Loading -> Starting -> Active
+9 event wiring     start_event_pump for active subscribers
+10 cache/status    status_cache, languages, integrations
+11 agent build     extension::install -> tools/commands/prompts/skills/panels
+12 UI build        Shell::new -> provider refresh, themes, panels, commands
+13 first call      LazyRuntime::ensure -> runtime.activate -> call
+14 shutdown        host.shutdown -> pump stops, runtimes close
+```
+
+| Step | Implementation | Output |
+|---|---|---|
+| discovery | `ExtensionHost::rebuild` → `store.scan_installed` | package roots + errors |
+| selection | `select_active_versions` | one active version per id |
+| validation | `Package` / `Manifest::validate` | accepted bytes or failure |
+| runtime build | `ExtensionHost::build_runtime` | `Runtime` + tool descriptors + contributions |
+| dependency | `resolver::resolve` | ordered set + `lock.toml` |
+| capability | `PolicyEngine::authorize_required` | allowed or denial reason |
+| activation | `LifecycleManager` | `Loading`/`Starting`/`Active` |
+| wiring | `start_event_pump`, `languages`, `integrations` | live subscriptions/descriptors |
+| agent | `ExtensionHost::apply` | agent tools, plugin commands/panels, prompt text, skills |
+| UI | `Shell::new`, `Settings` | views, tabs, theme, inventory |
+| call | `LazyRuntime::ensure` → runtime | result/progress/error |
+
+Two rules fall out of this order:
+
+- **Installation is not activation.** A package is installed, listed and
+  inspectable before it is applied. “resolved” means resolved, not running.
+- **Descriptor load is not process spawn.** A process runtime is constructed at
+  step 4 but its child starts at step 13 (or at warm-start for `on-startup`).
+  This is why a package can be “applied” while its first tool call still fails
+  on a missing launcher.
+
+### 3.5 The extension-point inventory
+
+There are seven families of extension point (agent, UI, model, logic, data,
+events and host). A package usually uses one contribution family plus one runtime
+family; it can mix contribution families.
+
+| Family | Point | Host surface | Consumer | Effect |
+|---|---|---|---|---|
+| Agent | Tool | `tools/<id>.json` + runtime | `Agent::try_add_async_tool` | model can call it |
+| Agent | Prompt | `prompts/<id>.md` | `Agent::append_system_prompt` | instruction text |
+| Agent | Context | `contexts/<id>.md` | prompt append with glob gate | scoped instruction |
+| Agent | Skill | `skills/<id>/SKILL.md` | `Agent::register_skills_from_dir` | skill index/loader |
+| Agent | Command | `commands/<id>.md` | `CommandSurface` + plugin registry | composer template |
+| UI | Panel | `panels/<id>.json` | `PanelSurface` → `ExtensionPanelView` | mounted UI |
+| UI | Theme | `themes/<id>.json` | `ThemePalette` | panel/shell palette |
+| Model | Provider | `providers/models/<id>.json` | `model_provider_surfaces` | selectable endpoint |
+| Model | Agent role | `providers/agents/<id>.json` | `preset_surfaces` | selectable preset |
+| Model | Preset | `presets/<id>.json` | `preset_surfaces` | selectable preset |
+| Logic | Workflow | `workflows/<id>.json` | `WorkflowRuntime` | tool composed of tools |
+| Data | Language | `languages/<id>.json` | `LanguageEntry` + `language_check` | diagnostics service |
+| Data | Integration | `integrations/<id>.json` | `IntegrationEntry` + `run_integration` | tool/command dispatch |
+| Events | Hook | `contributes.events` | `EventBus` + pump | event delivery |
+| Events | Publisher | `contributes.publishes` | `EventBus` | outbound notification |
+| Host | MCP | `runtime.kind=mcp` | `runtime/mcp.rs` | tools/resources/prompts |
+| Host | Storage | `extension.storage` | host functions | contained data |
+| Host | HTTP | `network.http` | `fetch` host function | outbound request |
+
+#### 3.5.1 The contribution-registry map
+
+```text
+package bytes
+  -> runtime loader (declarative / process / wasm / extism / mcp / builtin)
+  -> LoadedExtension { tools, contributions, runtime, trust }
+       |
+       +--> entry.tools --------> ExtensionHost::apply ----> Agent tool registry
+       +--> commands -----------> command_surfaces -------> Shell.extension_commands
+       +--> prompts/contexts ---> apply -------------------> Agent system prompt
+       +--> skills_dir ---------> apply -------------------> Agent skill loader
+       +--> panels -------------> panel_surfaces ---------> Shell panel views
+       +--> themes -------------> theme_surfaces ---------> Settings picker + Shell
+       +--> model_providers ----> model_provider_surfaces -> settings plugin providers
+       +--> presets/agents -----> preset_surfaces --------> settings plugin presets
+       +--> languages ----------> languages() -------------> language_check / CLI
+       +--> integrations -------> integrations() ----------> run_integration / CLI
+       +--> workflows ----------> WorkflowRuntime --------> tool registry
+       +--> events -------------> event pump -------------> guest event entry
+```
+
+The left side is bytes; the right side is the only code allowed to consume them.
+A contribution that is not listed in this map has no consumer, which is a bug or
+an explicitly documented gap.
+
+#### 3.5.2 Where the reader sees each extension point
+
+| Surface | Extension point | Management view |
+|---|---|---|
+| Settings → Extensions → Installed | packages, capabilities, tools, approvals | Enable/Disable, status |
+| Settings → Extensions → MCP | MCP inventory (host) | MCP tab |
+| Settings → Extensions → Skills | skills (host) | Skills tab |
+| Settings → Extensions → Theme | contributed palettes | Theme tab |
+| Settings → Extensions → Market | Git market entries | Install/Refresh |
+| Composer `/` and `+` | commands | command palette |
+| Composer model chip | model providers | model picker |
+| Agent preset picker | presets/agent roles | preset menu |
+| Left sidebar | `left` panels | mounted panel |
+| Right panel | `right` panels | Extensions tab |
+| Bottom dock | `bottom` panels | composer dock |
+| Center column | `center` panels | Extensions tab |
+| Agent prompt | prompts/contexts/skills | system prompt (not directly visible) |
+| Tool registry | tools/workflows | model tool schema |
+| Event bus | hooks | not a visible control |
+| CLI | every point | `bsh ext …` diagnostics |
+
+This table is the quick answer to “where does my extension show up?” If a
+contribution has no row here, it is consumed headlessly (language/integration)
+or it is not wired. Check §3.6 before designing around it.
+
+Not every point is a UI point. In particular:
+
+- **No arbitrary UI callback.** The only UI contract is a panel document; there
+  is no “draw this GPUI view” extension point.
+- **No session/trajectory mutator.** Extensions observe session/trajectory
+  events; they cannot rewrite transcript rows.
+- **No audio capture hook.** `audio.captured` is a notification; the producer is
+  the attachment capture path, not an extension API.
+- **No tool middleware.** A package contributes tools; it cannot wrap every
+  host tool. Use an event subscription for observation.
+- **No instruction override.** Prompt/context contributions append text; they do
+  not replace the host system prompt.
+- **No generic HTTP proxy.** `network.http` is a capability for a runtime’s
+  `fetch`; it is not an extension endpoint that arbitrary host HTTP calls route
+  through.
+
+### 3.6 How each kind becomes effective
+
+#### 3.6.1 Tool: descriptor → agent registry → model call
+
+1. The runtime loader reads `tools/<id>.json` and validates the descriptor.
+2. `ExtensionHost::rebuild` stores `entry.tools` and (for workflows) replaces the
+   descriptor set with the workflow wrapper’s descriptors.
+3. At agent build, `caps::build_agent_for_session_inner` calls
+   `crate::extension::install` after built-in bundles and before MCP.
+4. `ExtensionHost::apply` constructs `ExtensionTool` and registers it with
+   `agent.try_add_async_tool` under `<last-id-segment>__<tool-id>`.
+5. The model sees the qualified name in the tool schema. A call enters
+   `ExtensionTool::call`, which checks per-tool capabilities, builds a
+   `CallContext`, applies the timeout, calls the runtime, emits
+   `tool.invoked/completed/failed`, and returns a normalized result.
+6. `LazyRuntime` starts the process/WASM guest on the first call if it is not
+   warm.
+
+**When it appears:** after the next agent build. Installing a package mid-session
+updates the host inventory immediately, but the current agent’s tool list is
+fixed at build time; start a new turn/session or rebuild the agent.
+
+**Choose it when:** the model must decide to perform an action or retrieve data.
+
+#### 3.6.2 Command: Markdown → composer palette
+
+1. `commands/<id>.md` is parsed into a `CommandContribution` with description and
+   template.
+2. `ExtensionHost::command_surfaces` qualifies the id and returns
+   `CommandSurface { name, description, template }`.
+3. `Shell::new` stores `cached_commands()` in `extension_commands`.
+4. `command_menu` lists them after built-in rows; choosing one consumes the `/`
+   token and inserts the template into the draft.
+5. The agent plugin registry also receives a `PluginCommand` at build time for
+   the legacy plugin surface.
+
+**When it appears:** after the shell rebuild/refresh. Composer commands do not
+execute code; they insert prompt templates. A command can also be an
+integration/panel action, where a runtime with `commands/execute` executes it;
+a command that needs arbitrary work should still be a tool.
+
+**Choose it when:** the reader needs a reusable prompt/instruction shortcut.
+
+#### 3.6.3 Prompt and context: text → system prompt
+
+1. Markdown frontmatter supplies description; the body is prompt material.
+2. For every applied package, `ExtensionHost::apply` calls `append_prompt` with
+   the prompt/context capability.
+3. Prompts append unconditionally; contexts are gated by `context_matches`
+   against the open workspace’s `paths:` globs.
+4. Both are bounded by per-section and total prompt budgets; an empty body is
+   skipped; a denied capability silently omits the section (the policy is the
+   authority).
+
+**When it appears:** at agent build, per session. Changing workspace changes
+which scoped contexts match.
+
+**Choose it when:** the model needs background rules, workspace facts or style
+constraints. Use `prompts` for global, `contexts` for path-scoped.
+
+#### 3.6.4 Skill: directory → agent skill loader
+
+1. `skills/<id>/SKILL.md` is validated at package load.
+2. `ExtensionHost::apply` passes the package’s `skills/` directory to
+   `Agent::register_skills_from_dir`.
+3. The agent indexes the skill; when it loads, the host publishes
+   `skill.loaded` with the skill name and bytes.
+
+**When it appears:** at agent build. A declared skill with no file fails
+validation, not silently disappears.
+
+**Choose it when:** the capability is a procedure/knowledge pack the agent should
+load on demand, not a deterministic function. Use a tool when the model must get
+a computed result.
+
+#### 3.6.5 Panel: JSON document → mounted view → action
+
+1. `panels/<id>.json` is validated into a `PanelContribution` with location,
+   visibility, theme and `UiDocument`.
+2. `ExtensionHost::panel_surfaces` returns `PanelSurface` with runtime, owner,
+   panel id, title, theme and initial document.
+3. `Shell::new` calls `crate::extension::panels` once per location and creates
+   an `ExtensionPanelView` for left/right/bottom/center. The center tab is only
+   present when a center panel exists.
+4. The view validates the document and renders it with host widgets. A panel
+   action calls `runtime.call_tool(action, payload)`, then falls back to
+   `runtime.command(action, payload)` on `NotFound`.
+5. The result must be a `UiDocument`; its revision must be newer than the
+   rendered revision. The view applies it and rerenders; a stale action is
+   refused.
+
+**When it appears:** after the shell builds the panel view. A package installed
+mid-session needs a shell refresh/new window for a new panel to mount. The
+Settings pane no longer duplicates panels; it lists packages and themes.
+
+**Choose it when:** the reader needs persistent, interactive UI. Keep the
+document bounded and let the host own the chrome.
+
+#### 3.6.6 Theme: palette → tokens
+
+1. `themes/<id>.json` parses into `ThemePalette`; unknown tokens are ignored,
+   known missing tokens fall back.
+2. `panel_surfaces` attaches the first theme to that package’s panels, so a
+   panel gets its palette without a global selection.
+3. `theme_surfaces` exposes every theme as `ext.<package>.<theme>`; the Settings
+   picker writes `global.general.extension_theme` and applies the tokens
+   immediately.
+4. At shell startup, the stored id is resolved against the host themes and
+   `theme::set_extension_tokens` overlays the named fields; a missing theme
+   clears the overlay rather than failing the launch.
+
+**When it appears:** panel theme immediately; global theme on selection and at
+next launch.
+
+**Choose it when:** you need visual identity. Do not use a theme to hide
+functional state; tokens may fall back.
+
+#### 3.6.7 Language: descriptor → diagnostics call
+
+1. `languages/<id>.json` declares display name, extensions, required tool and
+   optional syntax.
+2. The host validates that the tool is declared, then collects `LanguageEntry`
+   for applied packages.
+3. `ExtensionHost::language_check(owner, language, path)` reads at most 1 MiB,
+   calls the tool with `{path,text,language}` and returns the runtime result.
+4. The CLI exposes it as `bsh ext language-check`; the agent can call the same
+   tool directly.
+
+**Current consumer:** host API and CLI. The editor gutter is not wired; the
+`syntax` field is metadata, not a renderer. Do not promise gutter diagnostics in
+a package README.
+
+**Choose it when:** you have a real parser/diagnostic engine for a language and
+want a declared, discoverable service.
+
+#### 3.6.8 Integration: descriptor → action dispatch
+
+1. `integrations/<id>.json` declares name, kind and a required tool/command
+   action.
+2. Applied packages populate `IntegrationEntry`.
+3. `ExtensionHost::run_integration(owner, integration, arguments)` looks up the
+   descriptor and dispatches the action through the runtime (tool first; command
+   for command actions).
+4. The CLI exposes `bsh ext integrate`; there is no generic outbound HTTP proxy.
+
+**Choose it when:** an external system has a named, reusable action that should
+be discoverable (GitHub, browser, terminal, custom). If you just need a tool, a
+plain tool is simpler.
+
+#### 3.6.9 Model provider: JSON → settings tree → picker
+
+1. `providers/models/<id>.json` parses as a settings `Provider`.
+2. `ExtensionHost::model_provider_surfaces` keys it `ext.<package>.<id>`.
+3. `caps::refresh_plugin_providers` runs at shell assembly, opens/refreshes the
+   host, merges contributed providers only when the reader has not defined the
+   same id, and calls `settings.global.set_plugin_providers` with the
+   `requires_key` bit.
+4. The model picker reads the plugin providers from settings. A provider with
+   `requires_key=false` is selectable without a credential; absent/true is
+   key-bearing and needs the vault.
+
+**When it appears:** on the next shell refresh/relaunch; the refresh function is
+called during `Shell::new`, so a clean restart is the reliable path.
+
+**Choose it when:** you add an OpenAI-compatible endpoint or a local model. Do
+not put API keys in the descriptor.
+
+#### 3.6.10 Agent role / preset: JSON → plugin presets
+
+1. `presets/<id>.json` and `providers/agents/<id>.json` parse as settings
+   `Preset` documents.
+2. `preset_surfaces` keys them `ext.<package>.<id>` and
+   `ext.<package>.agent.<id>`.
+3. `caps::refresh_plugin_providers` calls `settings.global.set_plugin_presets`.
+4. The preset picker and agent build read the merged preset tree.
+
+**Choose it when:** you need a reusable agent role, module bundle or permission
+preset. A preset changes choices; it does not execute code.
+
+#### 3.6.11 Workflow: JSON → tool wrapper
+
+1. `workflows/<id>.json` validates step names and same-package tool references.
+2. `ExtensionHost::rebuild` wraps the base runtime in `WorkflowRuntime` when any
+   workflow is declared, and advertises one tool per workflow.
+3. A workflow tool call runs its steps sequentially through the inner runtime;
+   `{{input.x}}` and `{{steps.name.x}}` are substituted.
+4. The descriptor’s capability union is checked like any tool.
+
+**Choose it when:** the logic is a deterministic sequence of tools in one
+package. Do not use it to call another package’s tools.
+
+#### 3.6.12 Event hook: subscription → pump → guest
+
+1. `contributes.events` is validated at package load; a trailing `.*` is allowed
+   for subscriptions.
+2. `start_event_pump` subscribes each active runtime’s topics to the host bus.
+3. The app calls `crate::extension::publish(topic, payload)` at the real seam
+   (session created, tool completed, model completed, UI/session lifecycle, etc.).
+4. The pump calls the guest’s event entry (`events/event` for process,
+   `on-event` for WASM, `bsh_event` for Extism) with the envelope.
+5. A full queue drops; publication never blocks. Shutdown removes subscriptions.
+
+**Choose it when:** you need observation/telemetry/reaction, not a synchronous
+answer. Use a tool for request/response.
+
+#### 3.6.13 MCP: server → mapped tools/resources/prompts
+
+1. `runtime.kind=mcp` starts the stdio server and performs initialize.
+2. The MCP runtime maps `tools/list` to BSH tool descriptors,
+   `resources/list|read` to contexts, `prompts/list|get` to prompts.
+3. Those contributions flow through the same `apply` path; there is no separate
+   MCP agent registry.
+4. Progress notifications become BSH tool progress; no panel UI is mapped.
+
+**Choose it when:** an MCP server already exists. Do not write a BSH runtime to
+re-implement an available MCP server.
+
+#### 3.6.14 UI/session/trajectory/audio/HTTP hooks
+
+These are event or host-function seams, not new contribution types:
+
+| Need | Seam | What is actually possible |
+|---|---|---|
+| Session log/trajectory | `session.created/updated/deleted`, `trajectory.recorded` | observe and react; no transcript rewrite |
+| UI lifecycle | panel actions, `ui.panels`/`ui.commands`/`ui.theme` | host-rendered UI only |
+| Audio | `audio.captured` | notification; no capture API |
+| HTTP | `network.http` + `fetch` host function | runtime’s outbound call, policy-checked |
+| Model | provider descriptors + `model.*` events | endpoint selection, not a middleware chain |
+| Instruction | prompts/contexts/skills + `instruction.build` | append text; no override |
+| Tool | tool descriptors + `tool.*` events | contribute/call; no global middleware |
+| MCP | MCP runtime + `mcp.connected` | map an existing server |
+
+### 3.7 Choosing an extension point
+
+Start from the reader-visible outcome, not from the API you want to write.
+
+| Requirement | Best point(s) | Usually not |
+|---|---|---|
+| “The agent can compute/fetch X.” | tool | a command or prompt |
+| “A reusable instruction.” | prompt/command | a tool that returns text |
+| “Facts only in this repo.” | scoped context | a global prompt |
+| “A procedure the agent loads.” | skill | a tool with a huge description |
+| “A reusable panel.” | declarative panel | arbitrary UI callback |
+| “A visual identity.” | theme | CSS/HTML |
+| “A new model endpoint.” | model provider | a tool wrapper |
+| “A role/preset.” | preset/agent provider | prompt only |
+| “A fixed sequence of tools.” | workflow | a process that reimplements tools |
+| “A language diagnostic.” | language + tool | descriptor-only stub |
+| “A third-party system action.” | integration + tool/command | raw HTTP from a panel |
+| “React when X happens.” | event subscription | polling in a tool |
+| “Expose an existing MCP server.” | MCP runtime | reimplementation |
+| “Add a first-party core feature.” | built-in Rust | a local package claiming builtin |
+
+Runtime choice follows the point: declarative for data/templates; process for
+real runtimes; WASM/Extism for portable untrusted code; MCP for existing servers;
+builtin for linked first-party code.
+
+### 3.8 The implementation workflow
+
+1. **Name the outcome.** “The model can call GitHub search” → tool; “the reader
+   sees a Git panel” → panel; “the agent knows repo conventions” → context.
+2. **Pick the smallest point.** One tool beats a panel that shells out; a
+   command beats a tool that only returns a prompt.
+3. **Pick the runtime.** Pure transformation → declarative; Python/Node/CLI →
+   process; existing WASM/Extism/MCP → that runtime; first-party → builtin.
+4. **Write the manifest and files.** Declare every id; add the file; validate.
+5. **Declare only necessary capabilities.** Start with the low-risk set; add
+   high-risk only with a scoped grant.
+6. **Test the bytes.** `validate`, `mock`, `install`, `info`, `doctor`.
+7. **Test the seam.** Call the tool through the agent/CLI; click the panel;
+   publish an event; check the model picker; run language/integration check.
+8. **Test denial and failure.** Missing grant, wrong scope, crashed runtime,
+   stale action, oversized output.
+9. **Package and sign.** Hash, sign, trust, publish to the market/registry.
+10. **Document the effect path.** Say which agent build/shell refresh exposes it,
+    what the reader must do, and what is intentionally not wired.
+
+A package that changes a contribution but not its runtime can usually keep the
+same manifest and test recipe. A package that changes runtime must re-test
+handshake, limits, cancellation and shutdown; those are runtime-specific, not
+contribution-specific.
+
+
 # Part II — The contract
 
 ## 4. Package anatomy and the manifest
