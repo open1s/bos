@@ -152,7 +152,7 @@ model = "anthropic/claude-3-haiku"
 |---|---|---|
 | **一份行为，三种语言** | 一套 Rust 内核，上面是 `nbos` 与 `@open1s/jsbos`；两边接口一旦漂移，CI 直接失败 | 一个 Python 框架，加一个半途而废的 SDK |
 | **智能体之间能对话** | `bus`：发布/订阅、查询/响应、caller/callable RPC，rkyv 线格式 | 进程之间拼 HTTP |
-| **工具真的能跑** | 唯一一套沙箱实现（macOS SBPL、Linux Landlock + Seccomp、Windows AppContainer），同时守住工具与终端两条缝 | “模型都这么说了，应该没事” |
+| **工具真的能跑** | `heel` 为宿主管理的命令提供原生 OS 隔离；BSH 扩展子进程另有隔离边界（macOS profile、Linux Bubblewrap）。Windows Process/MCP 目前没有 AppContainer 隔离（[#43](https://github.com/open1s/bos/issues/43)），Job Object 资源限制也尚未实现（[#39](https://github.com/open1s/bos/issues/39)）。 | “模型都这么说了，应该没事” |
 | **领域知识** | 目录式技能：带 frontmatter 的 `SKILL.md`，由模型按需加载 | 一段越写越长的系统提示词 |
 | **外部工具服务** | MCP 客户端，stdio 与 HTTP 都支持，工具/资源/提示词一并映射 | 每个服务器手写一个适配器 |
 | **上下文记得住** | 内存与文件两种记忆后端，支持元数据过滤，`{{memory}}` 直接进提示词 | 每个项目重搭一遍 RAG |

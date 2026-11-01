@@ -275,8 +275,11 @@ host applies max_execution_ms and max_output_bytes to every runtime. max_memory_
 bounds component and Extism runtimes (StoreLimits / Extism memory pages) and is
 translated to RLIMIT_AS for ProcessRuntime and McpRuntime children on Unix.
 Unix child launches also receive RLIMIT_CPU and RLIMIT_NOFILE ceilings and a
-separate process group. Windows currently has no equivalent Job Object limits;
-call deadlines and output caps are not substitutes for OS-level resource limits.
+separate process group. On Windows, ProcessRuntime and McpRuntime currently
+launch without an AppContainer boundary; `process.execute` authorization is not
+OS isolation ([Issue #43](https://github.com/open1s/bos/issues/43)). Windows also
+lacks equivalent Job Object resource limits ([Issue #39](https://github.com/open1s/bos/issues/39));
+call deadlines and output caps are not substitutes for OS-level enforcement.
 max_concurrent_calls is a declared allowance: process and MCP transports
 serialize calls through one child, so their effective concurrency is one.
 
@@ -788,8 +791,9 @@ not kept:
    operating system may take a moment to reap a child after the request.
 7. Unix ProcessRuntime and McpRuntime children receive RLIMIT_AS, RLIMIT_CPU
    and RLIMIT_NOFILE; Linux CI verifies MCP filesystem and resource boundaries.
-   Windows process resource limits remain unavailable until Job Object support
-   lands ([Issue #39](https://github.com/open1s/bos/issues/39)).
+   Windows ProcessRuntime and McpRuntime currently have neither AppContainer
+   isolation ([Issue #43](https://github.com/open1s/bos/issues/43)) nor Job Object
+   resource limits ([Issue #39](https://github.com/open1s/bos/issues/39)).
 8. The built-in runtime is for first-party code linked into bsh; an installed
    package cannot claim it.
 9. The extension root is ~/.bos/bsh/extensions (BSH's existing home) rather than
