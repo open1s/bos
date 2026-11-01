@@ -126,7 +126,7 @@ def add(a: int, b: int) -> int:
     return a + b
 
 async with BrainOS() as brain:
-    agent = brain.agent("assistant").with_tools(add)
+    agent = brain.agent("assistant").register(add)
     print(await agent.ask("What is 2 + 2?"))
 ```
 
@@ -145,7 +145,6 @@ const add = new ToolDef(
   "add",
   "Add two numbers",
   (args) => args.a + args.b,
-  { type: "object", properties: { result: { type: "number" } }, required: ["result"] },
   { type: "object", properties: { a: { type: "number" }, b: { type: "number" } }, required: ["a", "b"] },
 );
 
@@ -153,6 +152,7 @@ const brain = new BrainOS();
 await brain.start();
 const agent = await brain.agent("assistant").register(add).start();
 console.log(await agent.runSimple("What is 2 + 2?"));
+await brain.stop();
 ```
 
 指南：[JavaScript 使用指南](docs/javascript-user-guide.md)
@@ -165,14 +165,16 @@ console.log(await agent.runSimple("What is 2 + 2?"));
 use agent::{Agent, AgentConfig};
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = AgentConfig::default()
         .name("assistant")
-        .model("openai/gpt-4o")
-        .api_key(std::env::var("OPENAI_API_KEY").unwrap_or_default());
+        .model("gpt-4o")
+        .base_url("https://api.openai.com/v1")
+        .api_key(std::env::var("OPENAI_API_KEY")?);
 
     let agent = Agent::from_config(config);
-    println!("{}", agent.run_simple("Hello").await.expect("agent run"));
+    println!("{}", agent.run_simple("Hello").await?);
+    Ok(())
 }
 ```
 
