@@ -384,7 +384,7 @@ fn sandbox_profile(root: &Path, workspace: Option<&Path>, data_root: Option<&Pat
 /// backstop behind the host's own wall-clock timeout, and RLIMIT_NOFILE keeps a
 /// package from exhausting the process's descriptor table. Failures are
 /// ignored: a platform that refuses a limit still gets the host-side timeout.
-fn configure_process_limits(command: &mut Command, memory: u64, cpu: u64) {
+pub(super) fn configure_process_limits(command: &mut Command, memory: u64, cpu: u64) {
     #[cfg(unix)]
     {
         // SAFETY: pre_exec runs in the forked child before exec. The closure

@@ -199,6 +199,8 @@ struct McpCore {
     config: String,
     max_execution_ms: u64,
     max_output_bytes: u64,
+    memory_bytes: u64,
+    cpu_seconds: u64,
     /// The process.execute grant this runtime spawns under.
     policy: Option<(Arc<PolicyEngine>, TrustLevel)>,
     events: Option<Arc<EventBus>>,
@@ -310,6 +312,8 @@ impl McpCore {
             config,
             max_execution_ms: manifest.resources.execution_ms(),
             max_output_bytes: manifest.resources.output_bytes(),
+            memory_bytes: manifest.resources.memory_mb().saturating_mul(1024 * 1024),
+            cpu_seconds: (manifest.resources.execution_ms() / 1000).max(1) + 2,
             policy: Some((policy, trust)),
             events: Some(events),
             subscription: Mutex::new(subscription),
@@ -447,6 +451,14 @@ impl McpCore {
             command.args(&self.args);
             command
         };
+        // Apply the same Unix RLIMIT and process-group ceilings as
+        // ProcessRuntime. Windows remains a documented limitation until
+        // Job Object enforcement is implemented.
+        super::process::configure_process_limits(
+            &mut command,
+            self.memory_bytes,
+            self.cpu_seconds,
+        );
         command
             .current_dir(&self.root)
             .env_clear()
@@ -1012,7 +1024,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_file(&probe);
         std::fs::create_dir_all(&root).expect("package root");
-        let server = r#"import json, os, sys
+        let server = r#"import json, os, sys, resource
 probe = os.path.join(os.environ["HOME"], "bsh-mcp-sandbox-probe-PID")
 for line in sys.stdin:
     request = json.loads(line)
@@ -1031,6 +1043,10 @@ for line in sys.stdin:
             text = "wrote"
         except OSError:
             text = "blocked"
+        memory = resource.getrlimit(resource.RLIMIT_AS)[0]
+        cpu = resource.getrlimit(resource.RLIMIT_CPU)[0]
+        nofile = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+        text = f"{text}|{memory}|{cpu}|{nofile}"
         result = {"content": [{"type": "text", "text": text}], "isError": False}
     else:
         print(json.dumps({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "unsupported"}}), flush=True)
@@ -1091,7 +1107,26 @@ required = ["process.execute"]
             .call_tool("probe", json!({}), &context)
             .await
             .expect("sandboxed MCP call");
-        assert_eq!(result["content"][0]["text"], "blocked");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("MCP probe returns text");
+        let values: Vec<&str> = text.split('|').collect();
+        assert_eq!(values.first(), Some(&"blocked"));
+        assert_eq!(
+            values.get(1).and_then(|value| value.parse::<u64>().ok()),
+            Some(256 * 1024 * 1024),
+            "MCP child must inherit RLIMIT_AS"
+        );
+        assert_eq!(
+            values.get(2).and_then(|value| value.parse::<u64>().ok()),
+            Some(32),
+            "MCP child must inherit RLIMIT_CPU"
+        );
+        assert_eq!(
+            values.get(3).and_then(|value| value.parse::<u64>().ok()),
+            Some(256),
+            "MCP child must inherit RLIMIT_NOFILE"
+        );
         assert!(!probe.exists(), "MCP must not write into the host HOME");
         runtime.shutdown().await.expect("shutdown");
         let _ = std::fs::remove_dir_all(&root);
