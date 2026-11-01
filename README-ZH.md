@@ -163,9 +163,56 @@ base_url = "https://integrate.api.nvidia.com/v1"
 model = "nvidia/your-model"
 ```
 
-也支持 `OPENAI_API_KEY`、`LLM_BASE_URL` 和 `LLM_MODEL` 等环境变量。
-BSH 可在 **Settings → Models** 中配置 Provider；敏感信息存放于加密 Vault，
-而不是明文设置文件。
+也可以用环境变量：`OPENAI_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL`。
+
+**BSH** 把同样的供应商做成了可编辑的行：**设置 → 模型**。它的设置存放在
+`~/.bos/bsh/settings.toml`；不该以明文落盘的凭据，放进它旁边的加密保险库。
+
+---
+
+## 为什么不用另一个智能体框架
+
+| 你需要的 | 这里有什么 | 常见的替代 |
+|---|---|---|
+| **一份行为，三种语言** | 一套 Rust 内核，上面是 `nbos` 与 `@open1s/jsbos`；两边接口一旦漂移，CI 直接失败 | 一个 Python 框架，加一个半途而废的 SDK |
+| **智能体之间能对话** | `bus`：发布/订阅、查询/响应、caller/callable RPC，rkyv 线格式 | 进程之间拼 HTTP |
+| **工具真的能跑** | `heel` 为宿主管理的命令提供原生 OS 隔离；BSH 扩展子进程另有隔离边界（macOS profile、Linux Bubblewrap）。Windows Process/MCP 目前没有 AppContainer 隔离（[#43](https://github.com/open1s/bos/issues/43)），Job Object 资源限制也尚未实现（[#39](https://github.com/open1s/bos/issues/39)）。 | “模型都这么说了，应该没事” |
+| **领域知识** | 目录式技能：带 frontmatter 的 `SKILL.md`，由模型按需加载 | 一段越写越长的系统提示词 |
+| **外部工具服务** | MCP 客户端，stdio 与 HTTP 都支持，工具/资源/提示词一并映射 | 每个服务器手写一个适配器 |
+| **上下文记得住** | 内存与文件两种记忆后端，支持元数据过滤，`{{memory}}` 直接进提示词 | 每个项目重搭一遍 RAG |
+| **生产行为** | 重试分类、限流器、熔断器，以及按次运行的 token/工具/耗时指标 | 先祈祷，再复盘 |
+| **一张脸** | GPU 渲染的原生窗口（GPUI），不是 Electron 壳 | 给 CLI 套个网页 |
+
+---
+
+## 运行时内部（BOS）
+
+- **智能体循环**——`crates/react` 跑 ReAct：流式输出、调用工具、观察、继续。各条缝上都有
+  hook（`before_tool_call`、`after_llm_call`、`on_complete`、`on_error` ……），宿主可以观察
+  或拦截某一步，而不必 fork 引擎。
+- **供应商**——任何 OpenAI 兼容端点、Anthropic 协议、NVIDIA NIM、Google AI 与 OpenRouter，
+  按配置或按模型前缀选择。
+- **工具**——用 `FunctionTool`/`AsyncFunctionTool` 包一个闭包，或直接实现 `Tool`/`AsyncTool`
+  再注册；智能体通过 `react` 的缝调用它们，永远不经过总线。
+- **技能**——指向一个装满 `SKILL.md` 的目录，模型会在系统提示词里拿到目录，再调用
+  `load_skill` 取完整指令。
+- **记忆**——`InMemoryMemory` 按关键词重叠与新旧排序；`FileMemory` 把同样的排序写进
+  JSON lines，重启后仍在。过滤器限定召回范围，`{{memory}}` 把它放进提示词。
+- **MCP**——接入你已有的服务器（stdio 或 HTTP），把它们的工具、资源与提示词当成原生能力用。
+- **总线**——`Publisher`/`Subscriber` 做事件，`Queryable` 做请求/响应，`Callable`/`Caller` 做
+  RPC；一个 session 把它们挂到同一条传输上。
+- **沙箱**——`heel` 是唯一的沙箱实现：工作区是唯一可写处，可执行字节无处落盘，读取在基线
+  之上需显式开启，网络走策略。
+- **可观测性**——`crates/logging` 的 tracing，加上调用指标（token、工具调用、墙钟时间、
+  限流等待），两种绑定都能读到。
+
+### MCP，不需要再写一层封装
+
+```python
+from nbos import McpClient
+
+client = await McpClient.spawn("npx", ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"])
+await client.initialize()
 
 ## Runtime 核心能力
 

@@ -173,7 +173,63 @@ Environment variables are also supported: `OPENAI_API_KEY`, `LLM_BASE_URL`, and
 `LLM_MODEL`. In BSH, configure providers under **Settings → Models**. Sensitive values
 are stored in its encrypted vault rather than plain-text settings.
 
-## Runtime capabilities
+**BSH** has the same providers as rows you can edit: **Settings → Models**. Its settings live
+in `~/.bos/bsh/settings.toml`, and the values that must not sit there in plain text go into the
+encrypted vault beside it.
+
+---
+
+## Why this instead of another agent framework
+
+| What you need | What is here | What people usually settle for |
+|---|---|---|
+| **One behavior, three languages** | A Rust core with `nbos` and `@open1s/jsbos` over it; a CI guard fails the build when the two binding surfaces drift | A Python framework and a half-ported SDK |
+| **Agents that talk to each other** | `bus`: publish/subscribe, query/response and caller/callable RPC, with an rkyv wire format | Ad-hoc HTTP between processes |
+| **Tools you can actually run** | Native OS isolation through `heel` for host-managed commands; BSH extension children have a separate boundary (macOS profile, Linux Bubblewrap). Windows Process/MCP AppContainer isolation remains open ([#43](https://github.com/open1s/bos/issues/43)); Job Object limits remain open ([#39](https://github.com/open1s/bos/issues/39)). | "The model asked nicely, so it is fine" |
+| **Domain knowledge** | Directory skills — a `SKILL.md` with frontmatter, loaded on demand by the model | One system prompt that keeps growing |
+| **External tool servers** | An MCP client over stdio and HTTP, with tools, resources and prompts mapped in | A bespoke adapter per server |
+| **Context that survives** | In-memory and file-backed memory, metadata filters, `{{memory}}` in the prompt | RAG glue rebuilt per project |
+| **Production behavior** | Retry classification, rate limiter, circuit breaker, per-run token/tool/time metrics | Hope, then a postmortem |
+| **A face** | A GPU-rendered native window (GPUI), not an Electron shell | A web UI bolted onto a CLI |
+
+---
+
+## Inside the runtime (BOS)
+
+- **Agent loop** — `crates/react` runs the ReAct cycle: stream, call tools, observe, continue.
+  Hooks fire at the seams (`before_tool_call`, `after_llm_call`, `on_complete`, `on_error`, …)
+  so a host can observe or gate a step without forking the engine.
+- **Providers** — any OpenAI-compatible endpoint, the Anthropic protocol, NVIDIA NIM, Google
+  AI and OpenRouter, selected by config or by the model's vendor prefix.
+- **Tools** — wrap a closure with `FunctionTool`/`AsyncFunctionTool`, or implement
+  `Tool`/`AsyncTool` and register it; the agent reaches them through the `react` seam, never
+  through the bus.
+- **Skills** — point the agent at a directory of `SKILL.md` folders and the model gets the
+  catalogue in its system prompt, then calls `load_skill` for the full instructions.
+- **Memory** — `InMemoryMemory` ranks by keyword overlap and recency; `FileMemory` persists the
+  same ranking to JSON lines so it survives a restart. Filters scope recall; `{{memory}}` places
+  it in the prompt.
+- **MCP** — connect to servers you already have, over stdio or HTTP, and use their tools,
+  resources and prompts as if they were native.
+- **The bus** — `Publisher`/`Subscriber` for events, `Queryable` for request/response, and
+  `Callable`/`Caller` for RPC. A session attaches all of them to one transport.
+- **Sandbox** — `heel` is the one sandbox implementation: the workspace is the only writable place,
+  executable bytes are written nowhere, reads are opt-in above a baseline, and network goes
+  through a policy.
+- **Observability** — tracing through `crates/logging`, plus call metrics (tokens, tool calls,
+  wall time, rate-limit waits) that both bindings expose.
+
+### MCP, without a wrapper library
+
+```python
+from nbos import McpClient
+
+client = await McpClient.spawn("npx", ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"])
+await client.initialize()
+
+tools = await client.list_tools()
+print(await client.call_tool("echo", '{"text": "hello"}'))
+```
 
 | Capability | What you get |
 |---|---|
