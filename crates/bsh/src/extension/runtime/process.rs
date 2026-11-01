@@ -24,7 +24,9 @@ use super::{load_tool_descriptors, CallContext, Runtime, ToolDescriptor, ToolRes
 use crate::extension::capability::{CallScope, Capability, PolicyEngine};
 use crate::extension::events::{EventBus, EventFilter, ExtensionEvent, Subscription};
 use crate::extension::manifest::{is_allowlisted_command, validate_relative_path, Manifest};
-use crate::extension::types::{ExtensionError, ExtensionId, RuntimeKind, TrustLevel, HOST_VERSION};
+use crate::extension::types::{
+    ContributionId, ExtensionError, ExtensionId, RuntimeKind, TrustLevel, HOST_VERSION,
+};
 
 /// The protocol generation a process must speak.
 pub(crate) const PROTOCOL_VERSION: &str = "1.0";
@@ -472,6 +474,7 @@ pub(crate) struct ProcessRuntime {
     args: Vec<String>,
     env: BTreeMap<String, String>,
     tools: Vec<ToolDescriptor>,
+    commands: Vec<ContributionId>,
     max_execution_ms: u64,
     max_output_bytes: u64,
     memory_bytes: u64,
@@ -518,6 +521,7 @@ impl ProcessRuntime {
             args: manifest.runtime.args.clone(),
             env: manifest.runtime.env.clone(),
             tools,
+            commands: manifest.contributes.commands.clone(),
             max_execution_ms: manifest.resources.execution_ms(),
             max_output_bytes: manifest.resources.output_bytes(),
             memory_bytes: manifest.resources.memory_mb().saturating_mul(1024 * 1024),
@@ -917,6 +921,37 @@ impl Runtime for ProcessRuntime {
         self.call_tool_inner(name, arguments, context, None)
             .await
             .map(ToolResult::from_value)
+    }
+
+    async fn command(&self, id: &str, arguments: Value) -> Result<Value, ExtensionError> {
+        if !self.commands.iter().any(|command| command.as_str() == id) {
+            return Err(ExtensionError::NotFound {
+                id: format!("{}::{id}", self.extension),
+            });
+        }
+        let wait = Duration::from_millis(self.max_execution_ms.max(1));
+        let mut guard = tokio::time::timeout(wait, self.session.lock())
+            .await
+            .map_err(|_| ExtensionError::Timeout {
+                extension: self.extension.to_string(),
+                operation: format!("{id} (waiting for the process)"),
+                millis: self.max_execution_ms,
+            })?;
+        if guard.is_none() {
+            *guard = Some(self.start_with_retry().await?);
+        }
+        let session = guard.as_mut().expect("session was just started");
+        session
+            .request(
+                "commands/execute",
+                json!({
+                    "name": id,
+                    "arguments": arguments,
+                }),
+                self.max_execution_ms,
+                &self.extension,
+            )
+            .await
     }
 
     async fn call_tool_progress(

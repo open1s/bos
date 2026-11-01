@@ -1,0 +1,5 @@
+{
+  "name": "GitHub",
+  "kind": "github",
+  "action": "github-search"
+}

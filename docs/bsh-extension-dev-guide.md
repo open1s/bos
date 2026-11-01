@@ -312,6 +312,13 @@ A package selects `runtime.kind = "mcp"`. The host starts the server, performs
 
 `examples/extensions/mcp-echo` is a newline-delimited JSON-RPC Python server.
 
+`examples/extensions/language-python` is the language and integration
+starter: a real Python AST diagnostic behind a language descriptor and a
+GitHub action behind an integration descriptor.
+
+`examples/extensions/builtin-template` is the Rust built-in trait template.
+
+
 `examples/extensions/hook-demo` is a process package that subscribes to every
 host hook topic, records what arrives, and exposes the log through `hook-log`.
 It also carries a command, prompt, scoped context, panel, theme, preset, model

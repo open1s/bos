@@ -1,0 +1,11 @@
+{
+  "description": "Parse Python source and return diagnostics",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "path": {"type": "string"},
+      "text": {"type": "string"}
+    },
+    "required": ["text"]
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "name": "Hook Command",
+  "kind": "custom",
+  "action": "events"
+}

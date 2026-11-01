@@ -41,6 +41,12 @@ def main() -> None:
                 }
             else:
                 result = {"error": f"unknown tool {name}"}
+        elif method == "commands/execute":
+            result = {
+                "id": params.get("name"),
+                "arguments": params.get("arguments", {}),
+                "inserted": "hook demo command",
+            }
         elif method == "events/event":
             event = params.get("event", {})
             EVENTS.append({
