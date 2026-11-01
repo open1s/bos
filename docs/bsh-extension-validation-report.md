@@ -2,11 +2,18 @@
 
 **Reviewed:** 2026-11-01  
 **Repository:** `open1s/bos`, default branch `main`  
+**Source baseline:** `2f1805c7ce8498a5fb504dd8ba8b925087686c16`  
 **Scope:** `docs/BOS-BSH-Textbook.md`, Extension Standard, conformance matrix, peer-review report, extension manifest/runtime/policy/store code, example manifests and GitHub Actions workflow.
 
 ## Executive summary
 
-The review's Linux sandbox-default and MCP call-path fixes were merged in [PR #35](https://github.com/open1s/bos/pull/35). MCP Unix resource limits and startup cancellation fixes were subsequently merged in [PR #40](https://github.com/open1s/bos/pull/40) and [PR #42](https://github.com/open1s/bos/pull/42). A follow-up compile failure exposed the distinction between `std::process::Command` and `tokio::process::Command`; the shared RLIMIT hook and separate adapters are now on `main` in commit `d5a8314`. Two Windows security gaps remain explicit: extension Process/MCP children have no AppContainer isolation ([Issue #43](https://github.com/open1s/bos/issues/43)) and no Job Object resource limits ([Issue #39](https://github.com/open1s/bos/issues/39)). The latest main Rust workspace workflow is queued, so Linux integration and all-example acceptance are not yet verified.
+The review's Linux sandbox-default and MCP call-path fixes were merged in [PR #35](https://github.com/open1s/bos/pull/35). MCP Unix resource limits and startup cancellation fixes were subsequently merged in [PR #40](https://github.com/open1s/bos/pull/40) and [PR #42](https://github.com/open1s/bos/pull/42). A follow-up compile failure exposed the distinction between `std::process::Command` and `tokio::process::Command`; the shared RLIMIT hook and separate adapters are now on `main` in commit `d5a8314`. Two Windows security gaps remain explicit: extension Process/MCP children have no AppContainer isolation ([Issue #43](https://github.com/open1s/bos/issues/43)) and no Job Object resource limits ([Issue #39](https://github.com/open1s/bos/issues/39)).
+
+Current baseline note (2026-11-01): the source-level re-audit uses `main` commit
+`2f1805c7ce8498a5fb504dd8ba8b925087686c16`. The commit-status and workflow-runs
+lookups returned no entries for this SHA, so no green CI result is asserted for
+this baseline. This report remains a source/repository review; runtime claims
+require the executable tests described below.
 
 This review is source-level and repository-level. It did **not** execute the BSH binary or build/run the example packages: the connected GitHub interface exposes repository files and Actions state, not a local checkout/terminal. No example is marked runtime-verified based only on reading its files.
 
@@ -42,7 +49,7 @@ This automation is committed but its latest-commit CI result is still pending. R
 
 ### CI observation
 
-The Rust workflow includes Linux workspace tests, Windows extension tests, and an MSRV check. At review time, the workflow run associated with the textbook PR was still in progress. The workflow does not visibly contain a matrix that invokes `bsh ext validate` and `bsh ext test` over all ten textbook examples. This is a coverage improvement, not a claim that the examples are currently broken.
+The Rust workflow definition includes Linux workspace tests, Windows extension tests, and an MSRV check. The workflow does not visibly contain a matrix that invokes `bsh ext validate` and `bsh ext test` over all ten textbook examples. For the source baseline recorded above, no associated workflow run was returned by the GitHub Actions lookup. This is a coverage and evidence gap, not a claim that the examples are currently broken.
 
 ## 2. API conformance
 
@@ -111,7 +118,7 @@ Actions run #149 failed with E0433 because `McpCore::kill_child()` unconditional
 - **Installed integrity:** current scan code compares the computed package hash to the registry record and re-verifies signatures; test quarantine/refusal and publisher-key removal.
 - **WASM host calls:** subscriptions are checked against declared topics and `events.subscribe`; host filesystem operations authorize before writes. Preserve tests that assert denied operations have no side effects.
 - **Resource limits:** ProcessRuntime and McpRuntime now have separate adapters over a shared Unix RLIMIT hook for RLIMIT_AS, RLIMIT_CPU and RLIMIT_NOFILE. The Linux MCP integration test checks the effective limits and filesystem boundary, but the current main-branch run has not yet completed. Windows Job Object memory/CPU/process-tree limits remain unavailable ([Issue #39](https://github.com/open1s/bos/issues/39)). Pure-compute WASM cancellation remains bounded by epoch/fuel rather than immediate instruction interruption.
-- **Cross-platform:** Windows extension tests passed on the PR #35 merge commit; the latest main-branch Windows and Linux jobs are still running/queued. Windows Process/MCP children currently execute without AppContainer isolation ([Issue #43](https://github.com/open1s/bos/issues/43)); Job Object limits are also absent ([Issue #39](https://github.com/open1s/bos/issues/39)). Linux sandbox/resource integration and the ten-example automation still require the main-branch Rust workspace job to complete successfully.
+- **Cross-platform:** Windows extension tests passed on the PR #35 merge commit. No CI status or workflow run was returned for the current source baseline, so current Linux/Windows CI status is unverified here. Windows Process/MCP children currently execute without AppContainer isolation ([Issue #43](https://github.com/open1s/bos/issues/43)); Job Object limits are also absent ([Issue #39](https://github.com/open1s/bos/issues/39)). Linux sandbox/resource integration and the ten-example automation still require commit-linked successful runs.
 
 ## 4. Acceptance criteria
 
@@ -128,5 +135,5 @@ Actions run #149 failed with E0433 because `McpCore::kill_child()` unconditional
 ## 5. Review limitations
 
 - No local checkout or shell execution was available in this review session.
-- PR #35 was merged at `77a55ec`; PR #40 and PR #42 are also merged. The post-merge workflow for `6d7053c` failed: Linux/MSRV and Windows builds found the `std::process::Command` versus `tokio::process::Command` mismatch in the shared RLIMIT helper, while the core test job also reported rustfmt differences. Commit `d5a8314` added separate standard-library and Tokio command adapters and applied rustfmt. The latest `main` run for `4f56cb4` has Binding Parity green, NBOS in progress, and Rust Workspace, JSBOS and the main summary queued. Keep Issues #31, #36 and #38 open until Linux integration, all-example validation and MCP resource tests pass. Issue #41 is closed after the cancellation fix. This is not a formal penetration test, dynamic fuzzing campaign, or independent cryptographic audit.
+- PR #35 was merged at `77a55ec`; PR #40 and PR #42 are also merged. The post-merge workflow for `6d7053c` failed: Linux/MSRV and Windows builds found the `std::process::Command` versus `tokio::process::Command` mismatch in the shared RLIMIT helper, while the core test job also reported rustfmt differences. Commit `d5a8314` added separate standard-library and Tokio command adapters and applied rustfmt. The prior `4f56cb4` workflow snapshot is historical only and is not evidence for the current baseline `2f1805c7ce8498a5fb504dd8ba8b925087686c16`. Keep Issues #31, #36 and #38 open until Linux integration, all-example validation and MCP resource tests pass. Issue #41 is closed after the cancellation fix. This is not a formal penetration test, dynamic fuzzing campaign, or independent cryptographic audit.
 - This is not a formal penetration test, dynamic fuzzing campaign, or independent cryptographic audit.
