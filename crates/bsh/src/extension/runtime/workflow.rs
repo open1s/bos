@@ -1,9 +1,10 @@
 //! Declarative workflow contributions.
 //!
 //! A workflow is a bounded sequence of calls to the SAME extension's tools. The
-//! wrapper advertises one tool per workflow; its descriptor carries the union of
-//! the steps' capabilities, so the host authorizes everything the workflow can
-//! reach before the first step runs. The wrapper never reaches another package.
+//! wrapper advertises one tool per workflow. Each step is authorized against
+//! its own resolved arguments immediately before dispatch, so scoped grants are
+//! evaluated against the resource the step will actually access. The wrapper
+//! never reaches another package.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -85,7 +86,10 @@ impl WorkflowRuntime {
             for step in &workflow.steps {
                 if !inner_tools.contains_key(&step.tool) {
                     return Err(ExtensionError::NotFound {
-                        id: format!("workflow {} references missing tool {}", contribution.id, step.tool),
+                        id: format!(
+                            "workflow {} references missing tool {}",
+                            contribution.id, step.tool
+                        ),
                     });
                 }
             }
@@ -361,6 +365,94 @@ mod tests {
             expand("hello {{input.name}} {{steps.first.value}}", &input, &steps),
             "hello bos 7"
         );
+    }
+
+    #[tokio::test]
+    async fn a_workflow_authorizes_each_step_against_resolved_arguments() {
+        let scratch = std::env::temp_dir().join(format!(
+            "bsh-workflow-policy-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&scratch).expect("scratch");
+        let path = scratch.join("fetch.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string(&json!({
+                "description": "fetch",
+                "input_schema": {"type":"object"},
+                "steps": [{
+                    "name":"fetch",
+                    "tool":"echo",
+                    "arguments":{"url":"{{input.url}}"}
+                }]
+            }))
+            .expect("json"),
+        )
+        .expect("workflow");
+
+        let extension = "com.example.workflow";
+        let inner = Arc::new(Counting {
+            calls: AtomicUsize::new(0),
+            capabilities: vec![Capability::NetworkHttp],
+        });
+        let tools = inner.tools().await.expect("tools");
+        let policy = Arc::new(
+            PolicyEngine::open(
+                scratch.join("grants.toml"),
+                scratch.join("audit.jsonl"),
+                crate::extension::capability::PolicyMode::Enforce,
+            )
+            .expect("policy"),
+        );
+        policy
+            .grant(
+                extension,
+                Capability::NetworkHttp,
+                crate::extension::capability::GrantScope::Domain(
+                    "allowed.example".to_string(),
+                ),
+                None,
+            )
+            .expect("scoped network grant");
+        let runtime = WorkflowRuntime::new(
+            inner.clone(),
+            &[RawContribution {
+                id: ContributionId::parse("fetch").expect("id"),
+                path,
+            }],
+            &tools,
+            policy,
+            TrustLevel::Community,
+        )
+        .expect("runtime");
+        let context = CallContext::new(
+            crate::extension::types::ExtensionId::parse(extension).expect("id"),
+            "test",
+            None,
+            5000,
+        );
+
+        let denied = runtime
+            .call_tool("fetch", json!({"url":"https://evil.example/data"}), &context)
+            .await;
+        assert!(denied.is_err(), "the resolved step target must be denied");
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 0);
+
+        let allowed = runtime
+            .call_tool(
+                "fetch",
+                json!({"url":"https://allowed.example/data"}),
+                &context,
+            )
+            .await
+            .expect("the granted domain is allowed");
+        assert_eq!(
+            allowed["steps"]["fetch"]["url"],
+            "https://allowed.example/data"
+        );
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     #[tokio::test]
