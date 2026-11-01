@@ -283,12 +283,23 @@ pub(super) fn linux_bwrap_plan(
         "--tmpfs".to_string(),
         "/tmp".to_string(),
     ];
-    let mut writable = vec![root.to_path_buf()];
+    // Bubblewrap mount and chdir arguments must be absolute. Package roots
+    // commonly arrive as relative paths from `bsh ext mock` and development CLI.
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut writable = vec![root.clone()];
     if let Some(workspace) = workspace {
-        writable.push(workspace.to_path_buf());
+        writable.push(
+            workspace
+                .canonicalize()
+                .unwrap_or_else(|_| workspace.to_path_buf()),
+        );
     }
     if let Some(data_root) = data_root {
-        writable.push(data_root.to_path_buf());
+        writable.push(
+            data_root
+                .canonicalize()
+                .unwrap_or_else(|_| data_root.to_path_buf()),
+        );
     }
     // Mount parent directories before children so nested writable mounts do
     // not hide one another (for example, a package inside the workspace).
