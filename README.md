@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/bos-logo.png" alt="BOS — Rust-Native AI Agent Platform" width="440">
+  <img src="docs/assets/bos-logo.png" alt="BOS — Rust-Native AI Agent Platform" width="400">
 </p>
 
 <h1 align="center">BOS — The Rust-Native AI Agent Platform</h1>
@@ -13,11 +13,8 @@
 </p>
 
 <p align="center">
-  BOS (BrainOS) is a Rust-native platform for building, embedding, and operating AI agents.
-  One shared <strong>BOS Runtime</strong> provides the execution foundation. Developers access it
-  through multiple interfaces: native Rust, the NBOS Python SDK, and the JSBOS JavaScript SDK.
-  <strong>BSH (BOS Harness)</strong> brings the same runtime into an extensible native desktop
-  workspace for agent-driven development.
+  Build with Rust, Python, and JavaScript. Develop and operate agents in BSH,
+  the native desktop workspace built on BOS Runtime.
 </p>
 
 <p align="center">
@@ -26,14 +23,13 @@
   <a href="https://github.com/open1s/bos/actions/workflows/rust.yml"><img src="https://github.com/open1s/bos/actions/workflows/rust.yml/badge.svg" alt="Rust CI"></a>
   <a href="https://github.com/open1s/bos/actions/workflows/binding-parity.yml"><img src="https://github.com/open1s/bos/actions/workflows/binding-parity.yml/badge.svg" alt="Binding parity"></a>
   <a href="https://img.shields.io/github/license/open1s/bos"><img src="https://img.shields.io/github/license/open1s/bos" alt="License"></a>
-  <a href="docs/BOS-BSH-Textbook.md"><img src="https://img.shields.io/badge/docs-34%20chapter%20textbook-blue" alt="Documentation"></a>
 </p>
 
 <p align="center">
   <a href="#quick-start">Quick start</a> ·
-  <a href="#why-bos">Why BOS</a> ·
-  <a href="#bsh-native-agent-workspace">BSH desktop app</a> ·
-  <a href="#extension-platform">Extension platform</a> ·
+  <a href="#architecture">Architecture</a> ·
+  <a href="#bsh-agent-workspace">BSH workspace</a> ·
+  <a href="#extension-platform">Extensions</a> ·
   <a href="#documentation">Documentation</a>
 </p>
 
@@ -41,45 +37,85 @@
 
 ## What is BOS?
 
-**BOS is one shared Rust runtime, exposed through multiple developer interfaces and brought to life in one extensible agent workspace.**
+**BOS is a Rust-native AI Agent Platform built around one shared execution core.**
+Use the runtime directly from Rust, access it through the NBOS Python and JSBOS
+JavaScript interfaces, or work with agents in BSH—the native GPUI desktop workspace.
 
-The runtime is the foundation—not a language-specific SDK or a desktop application. Use it
-natively from Rust, or access the same execution core through NBOS for Python and JSBOS for
-JavaScript. BSH is the native GPUI workspace built on that runtime, bringing agent execution,
-developer tools, and an extension platform into one environment.
-
-| Product | What it does | Best for |
+| Part | Role | When to use it |
 |---|---|---|
-| **BOS Runtime** | Rust agent engine, tools, skills, memory, MCP client, multi-agent bus, policies and observability | Developers embedding agents into applications and services |
-| **NBOS** | Python bindings for the shared BOS engine | Python applications, automation and prototypes |
-| **JSBOS** | Node.js / JavaScript bindings for the shared BOS engine | Node.js services, developer tools and JavaScript automation |
-| **BSH** | Native desktop AI agent workspace with chat, terminal, browser, editor and extensions | People who want an integrated environment to build and operate agents |
+| **BOS Runtime** | Shared Rust agent execution core | Embed agent capabilities in applications and services |
+| **Rust** | Native interface to the runtime | Build Rust applications and infrastructure |
+| **NBOS** | Python interface to the same runtime | Python applications, automation and prototyping |
+| **JSBOS** | JavaScript / Node.js interface to the same runtime | Node.js services and JavaScript tooling |
+| **BSH** | Native GPUI agent workspace | Develop, use and operate agents in an integrated desktop environment |
+| **Extension Platform** | Extensibility layer within BSH | Adapt the workspace with tools, commands, panels and other contributions |
+
+## Architecture
+
+The product is organised into three layers: a shared runtime, developer
+interfaces, and the BSH workspace. The Extension Platform extends BSH; it is
+not a separate runtime or a replacement for the BOS Runtime.
+
+```mermaid
+flowchart TB
+    BOS["BOS · Rust-Native AI Agent Platform"]
+
+    subgraph Interfaces["Developer interfaces"]
+        RUST["Native Rust"]
+        PY["NBOS · Python"]
+        JS["JSBOS · JavaScript / Node.js"]
+    end
+
+    subgraph Workspace["Agent workspace"]
+        BSH["BSH · Native GPUI desktop workspace"]
+        EXT["BSH Extension Platform"]
+        EXT --> BSH
+    end
+
+    CORE["BOS Runtime · Shared Rust execution core"]
+
+    BOS --> Interfaces
+    BOS --> Workspace
+    RUST --> CORE
+    PY --> CORE
+    JS --> CORE
+    BSH --> CORE
+
+    classDef platform fill:#172554,stroke:#60a5fa,color:#fff
+    classDef runtime fill:#064e3b,stroke:#34d399,color:#fff
+    classDef interface fill:#1f2937,stroke:#9ca3af,color:#fff
+    classDef extension fill:#4a1d64,stroke:#c084fc,color:#fff
+    class BOS platform
+    class CORE runtime
+    class RUST,PY,JS,BSH interface
+    class EXT extension
+```
+
+NBOS and JSBOS expose the shared native implementation through language
+bindings. BSH is a native application that consumes BOS crates directly.
 
 ## Why BOS?
 
-BOS is built around a simple architectural principle: **the agent runtime should not be
-locked to a language, application, or interface.** One Rust implementation powers the native
-runtime, the Python and JavaScript SDKs, and the BSH desktop application. Teams get one
-execution model to embed in products, automate from scripts, and operate through a desktop
-workspace.
-
-- **Multiple interfaces, one execution model.** Use the Rust runtime directly, or build
-  through the NBOS Python and JSBOS JavaScript SDKs. The language bindings share the same
-  underlying implementation and are checked for API parity in CI.
-- **Agent orchestration, not only chat.** Run the ReAct loop, stream model output, invoke tools,
-  process observations, and continue execution with lifecycle hooks.
-- **MCP built in.** Connect to Model Context Protocol servers over stdio or HTTP; discover and
-  call tools and access resources and prompts.
-- **Multi-agent communication.** Use publish/subscribe, query/response, and caller/callable RPC
-  through a dedicated message bus.
-- **Skills and memory.** Load directory-based `SKILL.md` knowledge on demand and retain useful
-  context with in-memory or file-backed memory.
-- **Operational controls.** Configure retries, rate limiting, circuit breaking, execution
-  deadlines, token/tool metrics, and capability-based authorization.
-- **Extensible by design.** Embed BOS in your application, or extend BSH with declarative,
-  process, WASM Component, Extism, MCP, and built-in packages.
+- **One execution model.** Rust, Python and JavaScript interfaces share the
+  same Rust implementation rather than maintaining independent agent engines.
+- **Agent orchestration.** ReAct execution coordinates model responses, tool
+  calls, observations and lifecycle hooks.
+- **Model interoperability.** Provider adapters support OpenAI-compatible
+  endpoints, Anthropic, NVIDIA NIM, Google AI and OpenRouter.
+- **MCP integration.** Connect to MCP servers over stdio or HTTP and work with
+  their tools, resources and prompts.
+- **Multi-agent communication.** A message bus provides publish/subscribe,
+  query/response and RPC patterns.
+- **Reusable context.** Load directory-based `SKILL.md` skills and use
+  in-memory or file-backed memory.
+- **Operational controls.** Configure retries, rate limiting, circuit
+  breaking, execution deadlines, metrics and capability authorization.
+- **An extensible workspace.** Extend BSH with declarative, process,
+  WASM Component, Extism, MCP and built-in packages.
 
 ## Quick start
+
+Choose the interface that fits your application.
 
 ### Python
 
@@ -98,6 +134,8 @@ async with BrainOS() as brain:
     agent = brain.agent("assistant").with_tools(add)
     print(await agent.ask("What is 2 + 2?"))
 ```
+
+Guide: [Python user guide](docs/python-user-guide.md)
 
 ### JavaScript / Node.js
 
@@ -122,9 +160,11 @@ const agent = await brain.agent("assistant").register(add).start();
 console.log(await agent.runSimple("What is 2 + 2?"));
 ```
 
+Guide: [JavaScript user guide](docs/javascript-user-guide.md)
+
 ### Rust
 
-Add the crate you need from this workspace and use the same runtime directly:
+Use the runtime crates directly from the workspace:
 
 ```rust
 use agent::{Agent, AgentConfig};
@@ -141,6 +181,8 @@ async fn main() {
 }
 ```
 
+Guide: [Rust user guide](docs/rust-user-guide.md)
+
 ### Run BSH
 
 ```bash
@@ -150,14 +192,69 @@ cargo build --release -p bsh
 ./target/release/bsh
 ```
 
-BSH needs Rust 1.97+ and Zig 0.16 (the terminal pane builds Ghostty). On macOS, you can
-also package a development build with `./crates/bsh/make-dev-app.sh`. For Linux build
-dependencies, see the install list in [the Rust workflow](.github/workflows/rust.yml).
+BSH requires Rust 1.97+ and Zig 0.16 to build its Ghostty terminal integration.
+On macOS, a development app can also be packaged with
+`./crates/bsh/make-dev-app.sh`. See the
+[Rust workflow](.github/workflows/rust.yml) for Linux build dependencies.
 
-## Model and provider configuration
+## BSH agent workspace
 
-BOS supports OpenAI-compatible endpoints, Anthropic, NVIDIA NIM, Google AI, and OpenRouter.
-Configure a default model in `~/.bos/conf/config.toml`:
+**BSH brings agent execution and everyday development tools into one native
+desktop workspace.** It is built with GPUI and the BOS Runtime.
+
+- **Workspaces and sessions** — organise projects and persistent conversations.
+- **Agent-first interaction** — streaming responses, task plans, queued
+  messages and visible subagent activity.
+- **Integrated terminal** — Ghostty terminal surface with command-policy checks.
+- **Browser pane** — embedded WebView for browsing alongside an agent.
+- **Code editor** — file tree, tabs, diffs and tree-sitter language grammars.
+- **Settings and credentials** — provider configuration and an encrypted vault.
+- **Bilingual interface** — English and Chinese.
+- **Extensions** — add tools, commands, panels, prompts, contexts, skills,
+  themes, language services, agent roles, workflows, storage and hooks.
+
+## Extension Platform
+
+The Extension Platform is BSH's workspace extensibility layer. Packages are
+described by `extension.toml`; BSH validates package contents, resolves
+dependencies, manages lifecycle and evaluates capability permissions when an
+extension requests host functionality.
+
+| Runtime | Intended use |
+|---|---|
+| **Declarative** | JSON-defined tools, panels, prompts and themes |
+| **Process** | Existing programs and services communicating through JSON-RPC |
+| **WASM Component** | Portable components using the WebAssembly Component Model and WIT |
+| **Extism** | Existing Extism plugins |
+| **MCP** | Reuse an MCP server |
+| **Built-in** | First-party Rust functionality linked into BSH |
+
+Create and validate a package:
+
+```bash
+bsh ext new com.acme.hello --dir hello
+bsh ext validate hello
+bsh ext mock hello echo '{"text":"hi"}'
+bsh ext install hello
+bsh ext list
+bsh ext doctor
+```
+
+Start here:
+- [Extension developer guide](docs/bsh-extension-dev-guide.md)
+- [Extension standard](docs/bsh-extension-standard.md)
+- [WIT interface](crates/bsh/wit/extension.wit)
+- [Extension examples](examples/extensions/)
+
+**Security note:** extension capability authorization and operating-system
+isolation are separate controls. Enforcement differs by operating system and
+runtime. Consult the [extension standard](docs/bsh-extension-standard.md) and
+[security policy](SECURITY.md) for the current contract and limitations.
+
+## Model configuration
+
+BOS supports OpenAI-compatible endpoints, Anthropic, NVIDIA NIM, Google AI
+and OpenRouter. Configure a default model in `~/.bos/conf/config.toml`:
 
 ```toml
 [global_model]
@@ -171,211 +268,24 @@ base_url = "https://integrate.api.nvidia.com/v1"
 model = "nvidia/your-model"
 ```
 
-If neither the call nor the config file supplies a key, both bindings read `OPENAI_API_KEY`.
-There is no `LLM_BASE_URL` / `LLM_MODEL` override — the base URL and the model come from the
-call or from the sections above.
-
-BSH manages providers in **Settings → Models**. Sensitive credentials are stored in its
-encrypted vault rather than written as plain text in the settings file.
-
----
-
-## The BOS approach
-
-| Design principle | How BOS implements it |
-|---|---|
-| **One shared runtime** | A Rust core powers native Rust applications, NBOS, JSBOS, and BSH. |
-| **Agents as workflows, not just chat** | A ReAct loop coordinates model output, tool calls, observations, and lifecycle hooks. |
-| **Interoperability** | MCP connects existing tool servers over stdio and HTTP; provider adapters connect supported model APIs. |
-| **Multi-agent collaboration** | A dedicated bus supports publish/subscribe, query/response, and RPC communication. |
-| **Reusable knowledge and context** | Directory-based `SKILL.md` skills and in-memory or file-backed memory provide reusable context. |
-| **Operational control** | Retry policies, rate limiting, circuit breaking, deadlines, metrics, and capability authorization support controlled execution. |
-| **An extensible runtime** | BSH supports declarative, process, WASM Component, Extism, MCP, and built-in extensions. |
-
-BOS treats security boundaries as engineering guarantees that must be implemented and verified,
-not as blanket marketing claims. Enforcement varies by operating system and execution path.
-Windows AppContainer isolation for BSH Process/MCP extensions and Job Object resource limits
-remain tracked work ([#43](https://github.com/open1s/bos/issues/43), [#39](https://github.com/open1s/bos/issues/39)).
-
----
-
-## Inside the BOS runtime
-
-- **Agent loop** — `crates/react` runs the ReAct cycle: stream, call tools, observe, continue.
-  Hooks fire at the seams (`before_tool_call`, `after_llm_call`, `on_complete`, `on_error`, …)
-  so a host can observe or gate a step without forking the engine.
-- **Providers** — any OpenAI-compatible endpoint, the Anthropic protocol, NVIDIA NIM, Google
-  AI and OpenRouter, selected by config or by the model's vendor prefix.
-- **Tools** — wrap a closure with `FunctionTool`/`AsyncFunctionTool`, or implement
-  `Tool`/`AsyncTool` and register it; the agent reaches them through the `react` seam, never
-  through the bus.
-- **Skills** — point the agent at a directory of `SKILL.md` folders and the model gets the
-  catalogue in its system prompt, then calls `load_skill` for the full instructions.
-- **Memory** — `InMemoryMemory` ranks by keyword overlap and recency; `FileMemory` persists the
-  same ranking to JSON lines so it survives a restart. Filters scope recall; `{{memory}}` places
-  it in the prompt.
-- **MCP** — connect to servers you already have, over stdio or HTTP, and use their tools,
-  resources and prompts as if they were native.
-- **The bus** — `Publisher`/`Subscriber` for events, `Queryable` for request/response, and
-  `Callable`/`Caller` for RPC. A session attaches all of them to one transport.
-- **Sandbox** — `heel` is the one sandbox implementation: the workspace is the only writable place,
-  executable bytes are written nowhere, reads are opt-in above a baseline, and network goes
-  through a policy.
-- **Observability** — tracing through `crates/logging`, plus call metrics (tokens, tool calls,
-  wall time, rate-limit waits) that both bindings expose.
-
-### MCP, without a wrapper library
-
-```python
-from nbos import McpClient
-
-client = await McpClient.spawn("npx", ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"])
-await client.initialize()
-
-tools = await client.list_tools()
-print(await client.call_tool("echo", '{"text": "hello"}'))
-```
-
-| Capability | What you get |
-|---|---|
-| **Agent loop** | ReAct execution, streaming, tool calls, observations, lifecycle hooks |
-| **LLM providers** | OpenAI-compatible APIs, Anthropic protocol, NVIDIA NIM, Google AI, OpenRouter |
-| **Tools** | Sync and async tools, custom tool traits, JSON-schema-based definitions |
-| **MCP** | stdio and HTTP clients; tools, resources and prompts |
-| **Multi-agent bus** | Pub/sub, query/response, and RPC |
-| **Skills** | On-demand loading from `SKILL.md` directories |
-| **Memory** | In-memory and file-backed memory, metadata filters, prompt injection |
-| **Resilience** | Retry classification, rate limiting, circuit breaker and deadlines |
-| **Observability** | Tracing plus per-run token, tool-call, timing and rate-limit metrics |
-
-### One runtime, consistent SDKs
-
-NBOS and JSBOS are language interfaces over the same native engine, not independent
-reimplementations. CI checks the public API surfaces, native wrapper mappings, and API
-documentation for drift.
-
-| | Python | JavaScript |
-|---|---|---|
-| Import | `from nbos import BrainOS, tool` | `import { BrainOS, ToolDef } from "@open1s/jsbos"` |
-| Runtime | `async with BrainOS() as brain:` | `const brain = new BrainOS(); await brain.start()` |
-| Create agent | `brain.agent("assistant")` | `brain.agent("assistant")` |
-| Register tools | `.with_tools(add)` | `.register(toolDef)` |
-| Run | `await agent.ask("…")` | `await agent.runSimple("…")` |
-
-## One extensible agent workspace: BSH
-
-**BSH is the native GPUI workspace built on the BOS Runtime.** It brings agent sessions,
-projects, terminal, browser, code editor, and extensions into one environment. Agent execution
-lives alongside the tools developers use to do real work, while the extension platform lets
-teams adapt the workspace to their own workflows.
-
-- **Workspaces and sessions** — organize projects and persistent conversations; search,
-  pin, archive, fork and restore sessions.
-- **Agent-first chat** — streaming responses, turn navigation, task plans, queued messages,
-  visible subagent runs and scheduled tasks.
-- **Integrated terminal** — Ghostty terminal surface with command-policy checks.
-- **Browser pane** — embedded WebView for browsing alongside an agent.
-- **Code editor** — file tree, tabs, diffs and tree-sitter language grammars.
-- **Encrypted settings** — model/provider configuration and an encrypted vault using
-  Argon2id and XChaCha20-Poly1305.
-- **Bilingual interface** — English and Chinese.
-- **Extension platform** — add tools, commands, panels, prompts, contexts, skills, themes,
-  language services, agent roles, workflows, storage and hooks.
-
-## Extension platform
-
-The extension platform is the extensibility layer of the BSH workspace. BOS Runtime is
-embedded by applications; BSH is extended around developer workflows. Each extension is
-described by `extension.toml`. BSH validates the manifest and package contents, resolves
-dependencies, manages lifecycle, and applies capability policies when an extension requests
-host functionality.
-
-<p align="center">
-  <img src="docs/assets/charts/architecture.png" alt="BSH extension architecture: validate, hash, install, resolve, authorize, dispatch and run" width="820">
-</p>
-
-### Six extension runtimes
-
-| Runtime | Use it for | Extension implementation |
-|---|---|---|
-| **Declarative** | JSON-defined tools, panels, prompts and themes | Configuration; no guest code |
-| **Process** | Existing programs and command-line tools | Child process using line-delimited JSON-RPC |
-| **WASM Component** | Portable components with a typed interface | WebAssembly Component Model and WIT |
-| **Extism** | Existing Extism plugins | Extism plugin with the `bsh_host` import surface |
-| **MCP** | Reusing an MCP server | MCP server over stdio |
-| **Built-in** | First-party functionality | Rust code linked into the host |
-
-<p align="center">
-  <img src="docs/assets/charts/call-path.png" alt="Extension call path: capability authorization, policy decision, audit and dispatch" width="700">
-</p>
-
-### Build and test an extension
-
-```bash
-export BSH=./target/release/bsh
-
-$BSH ext new com.acme.hello --dir hello
-$BSH ext validate hello
-$BSH ext mock hello echo '{"text":"hi"}'
-$BSH ext install hello
-$BSH ext list
-$BSH ext doctor
-$BSH ext grant com.acme.hello workspace.write --scope workspace
-$BSH ext logs com.acme.hello
-```
-
-Explore the examples in [`examples/extensions/`](examples/extensions/):
-[`hello`](examples/extensions/hello),
-[`process-echo`](examples/extensions/process-echo),
-[`wasm-echo`](examples/extensions/wasm-echo),
-[`extism-echo`](examples/extensions/extism-echo),
-[`mcp-echo`](examples/extensions/mcp-echo), and
-[`extism-hook`](examples/extensions/extism-hook).
-
-The extension contract and developer resources:
-
-- [Extension standard](docs/bsh-extension-standard.md) — normative manifest, capability and runtime contract.
-- [Extension developer guide](docs/bsh-extension-dev-guide.md) — build your first package.
-- [WIT interface](crates/bsh/wit/extension.wit) — typed WASM component contract.
-- [Hook system](docs/bsh-hook-system.md) — lifecycle and observation hooks.
-- [Validation script](scripts/ci/verify-bsh-examples.sh) — example validation used by CI.
-
-**Security note:** extension authorization and OS-level isolation are separate layers.
-Available sandbox enforcement differs by operating system and runtime; Windows isolation
-for Process and MCP extension children is tracked separately. See
-[the extension security standard](docs/bsh-extension-standard.md) and
-[open security issues](https://github.com/open1s/bos/issues).
-
-## Repository structure
-
-```
-crates/
-├── agent/        agent runtime, tools, skills, memory, MCP, policies
-├── react/        ReAct engine and LLM client
-├── bus/          pub/sub, query/response and RPC
-├── config/       configuration loading and discovery
-├── logging/      tracing and instrumentation
-├── qserde/       rkyv-based serialization for the bus
-├── resource/     resource subsystem and rex CLI
-├── bsh/          native desktop harness and extension platform
-├── nbos/         Python bindings (pip install nbos)
-└── jsbos/        JavaScript bindings (npm install @open1s/jsbos)
-```
-
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the component and dependency model.
+If the call and configuration file do not provide a key, the bindings read
+`OPENAI_API_KEY`. BSH manages providers in **Settings → Models** and stores
+sensitive credentials in its encrypted vault.
 
 ## Documentation
 
 | Resource | Description |
 |---|---|
-| [BOS / BSH textbook](docs/BOS-BSH-Textbook.md) | 34-chapter practical guide to the runtime, desktop app and extension platform |
+| [BOS / BSH textbook](docs/BOS-BSH-Textbook.md) | In-depth guide to the runtime, desktop workspace and extensions |
+| [Architecture](ARCHITECTURE.md) | Component responsibilities and architecture |
+| [Rust user guide](docs/rust-user-guide.md) | Embed and use BOS from Rust |
 | [Python user guide](docs/python-user-guide.md) | Use BOS from Python |
 | [JavaScript user guide](docs/javascript-user-guide.md) | Use BOS from Node.js and JavaScript |
-| [Rust user guide](docs/rust-user-guide.md) | Embed and extend the Rust runtime |
-| [Extension standard](docs/bsh-extension-standard.md) · [Developer guide](docs/bsh-extension-dev-guide.md) | Package contract and extension development |
-| [Architecture](ARCHITECTURE.md) · [Onboarding](ONBOARDING.md) | System design and contributor setup |
-| [Settings](docs/bsh-settings-spec.md) · [Terminal policy](docs/bsh-terminal-policy.md) · [Hooks](docs/bsh-hook-system.md) | Detailed subsystem specifications |
-| [REX guide](docs/rex-user-guide.md) · [Diagnostics](docs/diagnostics.md) | Resource CLI and troubleshooting |
+| [Extension developer guide](docs/bsh-extension-dev-guide.md) | Build and test BSH extensions |
+| [Extension standard](docs/bsh-extension-standard.md) | Manifest, runtime and capability contract |
+| [Contributor onboarding](ONBOARDING.md) | Set up a development environment |
+| [Settings](docs/bsh-settings-spec.md) · [Terminal policy](docs/bsh-terminal-policy.md) · [Hooks](docs/bsh-hook-system.md) | Subsystem specifications |
+| [REX guide](docs/rex-user-guide.md) · [Diagnostics](docs/diagnostics.md) | Resource tooling and troubleshooting |
 | [Wiki](https://github.com/open1s/bos/wiki) · [Changelog](CHANGELOG.md) | Guides and release history |
 
 ## Build, test and contribute
@@ -388,7 +298,7 @@ cargo fmt --all
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 ```
 
-Python and JavaScript bindings have their own test suites:
+Python and JavaScript binding tests:
 
 ```bash
 cd crates/nbos  && maturin develop && pytest -m "not llm"
@@ -400,9 +310,9 @@ cd crates/jsbos && npm install && npx ava
 - [GitHub issues](https://github.com/open1s/bos/issues)
 - [Good first issues](https://github.com/open1s/bos/labels/good%20first%20issue)
 
-If BOS is useful to you, consider **starring the repository** and sharing what you build with it.
-Stars, issues, discussions and real-world examples help other developers discover the project
-and help us prioritize what to improve.
+If BOS is useful to you, consider starring the repository and sharing what you
+build with it. Feedback and real-world examples help others discover BOS and
+help guide its development.
 
 ## License
 
