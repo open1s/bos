@@ -44,7 +44,7 @@ jobs:
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
             libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libfontconfig1-dev libfreetype6-dev libssl-dev libasound2-dev libxdo-dev \
-            libc++-dev libc++abi-dev libxml2-dev xvfb
+            libc++-dev libc++abi-dev libxml2-dev xvfb bubblewrap
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
