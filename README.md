@@ -215,6 +215,20 @@ desktop workspace.** It is built with GPUI and the BOS Runtime.
 - **Extensions** — add tools, commands, panels, prompts, contexts, skills,
   themes, language services, agent roles, workflows, storage and hooks.
 
+### BSH interface preview
+
+> **Screenshot placeholders — not real application captures.** Replace these assets with screenshots from a running BSH build before using them as product evidence.
+
+| Main workspace | Agent session |
+|---|---|
+| ![BSH workspace placeholder](docs/assets/bsh-showcase/workspace.svg) | ![BSH agent session placeholder](docs/assets/bsh-showcase/agent-session.svg) |
+
+| Extension manager | Model and settings |
+|---|---|
+| ![BSH extension manager placeholder](docs/assets/bsh-showcase/extensions.svg) | ![BSH settings placeholder](docs/assets/bsh-showcase/settings.svg) |
+
+Replacement instructions: [BSH screenshot guide](docs/assets/bsh-showcase/README.md).
+
 ## Extension Platform
 
 The Extension Platform is BSH's workspace extensibility layer. Packages are
