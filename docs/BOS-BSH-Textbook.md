@@ -329,6 +329,106 @@ flowchart LR
 
 ## 3. Architecture and boundaries
 
+
+### 3.0 The design view and the implemented view
+
+The original design is a four-layer stack. It is the right mental model: a
+package contract, one runtime abstraction, several execution technologies, and
+the BSH services those technologies may reach.
+
+```text
+┌──────────────────────────────────────────────────────────────┐
+│                    BSH Extension API                         │
+│      Manifest · Lifecycle · Capability · Contribution        │
+└───────────────────────────┬──────────────────────────────────┘
+                            ↓
+┌──────────────────────────────────────────────────────────────┐
+│              Runtime Abstraction Layer                       │
+│   unified lifecycle, call, error, cancellation, diagnostics  │
+└───────────────────────────┬──────────────────────────────────┘
+                            ↓
+┌────────────────┬────────────────┬────────────────────────────┐
+│ Native         │ Extism         │ Wasmtime                   │
+│ Builtin Rust   │ Function       │ WIT Components             │
+│                │ Plugins        │                            │
+└────────────────┴────────────────┴────────────────────────────┘
+                            ↓
+┌──────────────────────────────────────────────────────────────┐
+│                     BSH Services                             │
+│      Agent · GPUI · Event Bus · Storage · Computer Use       │
+└──────────────────────────────────────────────────────────────┘
+```
+
+The implemented architecture keeps those layers and adds the runtimes and
+services that the first diagram simplified away. Nothing below is a second
+design; it is the same design with the real names.
+
+```mermaid
+flowchart TB
+  API["BSH Extension API<br/>Manifest · Lifecycle · Capability · Contribution"]
+  RA["Runtime Abstraction Layer<br/>activate · call · command · panel · pump · limits · diagnostics"]
+  B["Builtin Rust<br/>statically linked only"]
+  E["Extism<br/>PDK plugin"]
+  W["Wasmtime<br/>WIT component"]
+  P["Process<br/>newline JSON-RPC"]
+  M["MCP<br/>stdio server"]
+  D["Declarative<br/>data only, no code"]
+  S["BSH services<br/>Agent · GPUI · Event Bus · Storage<br/>Policy · Lifecycle · Store · Market"]
+  CU["Computer Use<br/>capability reserved"]
+  API --> RA
+  RA --> B
+  RA --> E
+  RA --> W
+  RA --> P
+  RA --> M
+  RA --> D
+  B --> S
+  E --> S
+  W --> S
+  P --> S
+  M --> S
+  D --> S
+  S -.-> CU
+  S --> API
+```
+
+#### 3.0.1 Gap register against the original design
+
+| Design element | Implemented reality | Verdict |
+|---|---|---|
+| Extension API: Manifest | `extension.toml` + strict validation | matches |
+| Extension API: Lifecycle | `LifecycleManager`, persisted state, retry/quarantine | matches |
+| Extension API: Capability | `PolicyEngine` + grants + audit + per-call scope | matches |
+| Extension API: Contribution | tools, commands, prompts, contexts, skills, panels, themes, providers, presets, workflows, languages, integrations, events | matches and broader |
+| Runtime Abstraction | `Runtime` trait: activate/deactivate/tool/command/panel/pump | matches; cancellation/limits are per runtime, not one global switch |
+| **Native / Builtin Rust** | `runtime.kind=builtin`, statically linked, first-party only | matches; “Native” must not be read as a dynamic-library ABI |
+| **Extism** | `runtime.kind=extism`, PDK exports + `bsh_host`, WASI disabled | matches |
+| **Wasmtime / WIT Components** | `runtime.kind=wasm-component`, WIT contract, fuel/memory/epoch limits | matches |
+| *(missing from the design)* **Process** | `runtime.kind=process`, JSON-RPC over stdio, handshake token, OS limits | implemented; now shown |
+| *(missing from the design)* **MCP** | `runtime.kind=mcp`, tools/resources/prompts mapped | implemented; now shown |
+| *(missing from the design)* **Declarative** | pure file contributions, no executable code | implemented; now shown |
+| **Agent** | tools, prompts, contexts, skills, commands consumed at agent build | matches |
+| **GPUI** | panels, themes, commands mounted by the host | matches |
+| **Event Bus** | bounded pub/sub with wildcard subscriptions and pump | matches |
+| **Storage** | per-extension namespace, atomic writes, quotas | matches |
+| **Computer Use** | `computer.use` capability is declared and audited; **no screen/pointer/keyboard host API or tool exists** | **open gap** |
+| *(missing from the design)* Policy/Lifecycle/Store/Market | policy, lifecycle, hashed store, lock, market exist below the API | implemented; now shown as platform services |
+
+The one real functional gap is **Computer Use**. The design lists it beside
+Agent/GPUI/Event Bus/Storage, but the extension platform only carries its
+capability bit; there is no `computer.use` host function, no screen/input tool,
+and therefore no extension that can use it. Do not advertise it as a working
+service. Implementing it needs a separate, security-critical host subsystem
+(screen capture, coordinate mapping, pointer/keyboard injection, per-call
+consent, and a platform matrix); until then it remains a reserved capability.
+
+Two nomenclature fixes matter for readers:
+
+- say **Builtin Rust**, not “Native”, because native dynamic libraries are an
+explicit non-goal;
+- say **GPUI** (the UI toolkit), not “GPU”.
+
+
 ### 3.1 The modules in `crates/bsh/src/extension`
 
 | Module | Responsibility |
@@ -2437,6 +2537,8 @@ Serve an index with `format`, `packages` (id, version, url, sha256). Clients use
 
 - Audio has no capture producer; `audio.captured` fires only for an audio
   attachment.
+- Computer Use is a reserved capability (`computer.use`); no screen/pointer/
+  keyboard host API or tool exists, so an extension cannot currently use it.
 - Language diagnostics dispatch through the host/CLI/agent but are not yet an
   editor gutter.
 - Integration actions are declared tool/command dispatch, not a generic outbound
