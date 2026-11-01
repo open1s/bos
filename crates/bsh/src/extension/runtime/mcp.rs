@@ -174,6 +174,16 @@ impl Drop for Session {
     }
 }
 
+/// Terminate one child through the standard-library process handle.
+///
+/// Keeping this operation behind a small helper makes the cancellation path
+/// independent of Unix-only pid signalling and directly testable on Windows.
+fn terminate_child_handle(child: &Arc<Mutex<Child>>) {
+    if let Ok(mut child) = child.lock() {
+        let _ = child.kill();
+    }
+}
+
 /// The state one MCP server package owns.
 ///
 /// Split out behind an `Arc` so a call can run on the blocking pool: the server
@@ -688,9 +698,7 @@ impl McpCore {
     fn kill_child(&self) {
         let child = self.child.lock().ok().and_then(|slot| slot.as_ref().cloned());
         if let Some(child) = child {
-            if let Ok(mut child) = child.lock() {
-                let _ = child.kill();
-            }
+            terminate_child_handle(&child);
         }
     }
 
@@ -945,6 +953,31 @@ impl McpRuntime {
 mod tests {
     use super::*;
     use crate::extension::manifest::Manifest;
+
+    #[test]
+    fn child_handle_termination_is_portable() {
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("powershell.exe");
+            command.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"]);
+            command
+        };
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = Command::new("sleep");
+            command.arg("30");
+            command
+        };
+        let child = command.spawn().expect("long-running child");
+        let child = Arc::new(Mutex::new(child));
+        terminate_child_handle(&child);
+        let status = child
+            .lock()
+            .expect("child lock")
+            .wait()
+            .expect("wait for terminated child");
+        assert!(!status.success(), "the child must be terminated, not finish normally");
+    }
 
     #[tokio::test]
     async fn a_server_maps_tools_resources_and_prompts() {
