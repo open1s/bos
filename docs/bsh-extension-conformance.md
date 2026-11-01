@@ -11,11 +11,12 @@ against the implementation in crates/bsh/src/extension. It is deliberately
 exhaustive: a requirement is not "done" because a type exists; it is done when
 the host performs the behaviour and a test proves it.
 
-Verification: the `rust workspace` GitHub run `41227090917` is green -
-format, clippy, docs, tests and the 1.97 MSRV build on Ubuntu. The browser
-engine cases are skipped on Linux because a shared Xvfb runner makes them
-load-flaky; they run on macOS. Four inherited frame-clock cases are ignored with
-their reason recorded in the test source, not silently deleted.
+Verification: the `rust workspace` GitHub run `41267469680` is green -
+format, clippy, docs, tests and the 1.97 MSRV build on Ubuntu, plus the
+`Windows extension tests` job on `windows-latest`. The browser engine cases are
+skipped on Linux because a shared Xvfb runner makes them load-flaky; they run on
+macOS. Four inherited frame-clock cases are ignored with their reason recorded
+in the test source, not silently deleted.
 
 Status legend:
 
