@@ -154,7 +154,7 @@ encrypted vault beside it.
 |---|---|---|
 | **One behavior, three languages** | A Rust core with `nbos` and `@open1s/jsbos` over it; a CI guard fails the build when the two binding surfaces drift | A Python framework and a half-ported SDK |
 | **Agents that talk to each other** | `bus`: publish/subscribe, query/response and caller/callable RPC, with an rkyv wire format | Ad-hoc HTTP between processes |
-| **Tools you can actually run** | One sandbox implementation (macOS SBPL, Linux Landlock + Seccomp, Windows AppContainer) behind the tool *and* terminal seams | "The model asked nicely, so it is fine" |
+| **Tools you can actually run** | Native OS isolation through `heel` for host-managed commands; BSH extension children have a separate boundary (macOS profile, Linux Bubblewrap). Windows Process/MCP AppContainer isolation remains open ([#43](https://github.com/open1s/bos/issues/43)); Job Object limits remain open ([#39](https://github.com/open1s/bos/issues/39)). | "The model asked nicely, so it is fine" |
 | **Domain knowledge** | Directory skills — a `SKILL.md` with frontmatter, loaded on demand by the model | One system prompt that keeps growing |
 | **External tool servers** | An MCP client over stdio and HTTP, with tools, resources and prompts mapped in | A bespoke adapter per server |
 | **Context that survives** | In-memory and file-backed memory, metadata filters, `{{memory}}` in the prompt | RAG glue rebuilt per project |
