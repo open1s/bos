@@ -29,23 +29,16 @@ The textbook's Appendix F lists ten runnable examples. The repository's `example
 | `language-python` | Listed in textbook inventory | Not run |
 | `computer-use` | Manifest and README commands referenced by code search | Not run |
 
-### Execution commands to run in a real checkout
+### Automated verification added in PR #35
 
-Run from the repository root after building BSH:
+The PR adds `scripts/ci/verify-bsh-examples.sh` and wires it into the Linux Rust workflow. It:
 
-```bash
-cargo build -p bsh
-export BSH=./target/debug/bsh
+- runs `ext validate` and `ext test` for all ten runnable examples;
+- runs `ext mock` for all 25 declared tools across those examples;
+- asserts the All-in-One `fail` tool returns its expected non-zero result;
+- asserts all nine macOS-only Computer Use tools return the documented Linux platform refusal before any input/screen operation.
 
-for example in hello allinone process-echo wasm-echo extism-echo extism-hook mcp-echo hook-demo language-python computer-use; do
-  echo "===== $example: validate ====="
-  "$BSH" ext validate "examples/extensions/$example" || exit 1
-  echo "===== $example: test ====="
-  "$BSH" ext test "examples/extensions/$example" || exit 1
-done
-```
-
-Then run `ext mock` for every declared tool with representative inputs. Runtime-specific end-to-end tests must separately exercise process, MCP, WASM and Extism; a successful `validate` or `mock` is not proof of sandbox enforcement.
+This automation is committed but its latest-commit CI result is still pending. Runtime mocks verify the host/runtime call path; they do not replace the dedicated Linux filesystem-boundary tests or a macOS Computer Use smoke test.
 
 ### CI observation
 
@@ -74,7 +67,7 @@ The original `main` branch had stale security statements and an inactive Linux P
 ### Finding SEC-01 — Linux ProcessRuntime sandbox disabled by default
 
 **Severity:** High  
-**Status:** Remediation proposed in [PR #35](https://github.com/open1s/bos/pull/35); CI pending — [Issue #31](https://github.com/open1s/bos/issues/31)
+**Status:** Code merged in [PR #35](https://github.com/open1s/bos/pull/35); Linux runtime verification pending — [Issue #31](https://github.com/open1s/bos/issues/31)
 
 Evidence on the reviewed `main` revision:
 
@@ -86,7 +79,7 @@ The PR enables the sandbox by default on Linux, fails closed when bubblewrap can
 ### Finding SEC-04 — Linux MCP runtime bypassed the process sandbox
 
 **Severity:** High  
-**Status:** Remediation proposed in [PR #35](https://github.com/open1s/bos/pull/35); CI pending — [Issue #36](https://github.com/open1s/bos/issues/36)
+**Status:** Code merged in [PR #35](https://github.com/open1s/bos/pull/35); Linux runtime verification pending — [Issue #36](https://github.com/open1s/bos/issues/36)
 
 Evidence on the reviewed `main` revision:
 
@@ -107,7 +100,7 @@ This may be an intentional consequence of granting arbitrary process execution, 
 ### Finding SEC-03 — Windows MCP cancellation did not compile
 
 **Severity:** High for Windows CI / platform coverage  
-**Status:** Remediation proposed in [PR #35](https://github.com/open1s/bos/pull/35); Windows CI pending — [Issue #33](https://github.com/open1s/bos/issues/33)
+**Status:** Code merged in [PR #35](https://github.com/open1s/bos/pull/35); latest Windows CI verification pending — [Issue #33](https://github.com/open1s/bos/issues/33)
 
 Actions run #149 failed with E0433 because `McpCore::kill_child()` unconditionally called `libc::kill` while `libc` was declared only under `cfg(unix)`. The PR replaces pid signalling with a separately lockable `std::process::Child` handle and adds a cross-platform termination test.
 
@@ -124,7 +117,7 @@ Actions run #149 failed with E0433 because `McpCore::kill_child()` unconditional
 
 - [ ] All ten runnable examples pass `ext validate`.
 - [ ] All ten pass `ext test`.
-- [ ] Every tool in every example has at least one representative `ext mock` test where the runtime supports mock.
+- [ ] All 25 declared tools are covered by `ext mock` or an explicitly expected platform/negative result.
 - [ ] Process, MCP, WASM and Extism have end-to-end tests against the actual example package.
 - [ ] Linux ProcessRuntime and McpRuntime children are sandboxed by default or refused; no silent unsandboxed fallback.
 - [ ] Linux integration tests verify filesystem boundaries for both runtimes and process teardown.
@@ -135,5 +128,5 @@ Actions run #149 failed with E0433 because `McpCore::kill_child()` unconditional
 ## 5. Review limitations
 
 - No local checkout or shell execution was available in this review session.
-- PR #35 adds the Linux bubblewrap integration tests and all-example verification script. Its current Actions results must be checked before any P0 issue is closed; this report does not claim those tests have passed.
+- PR #35 was merged at `77a55ec`. Its first post-merge Rust workflow reached `cargo fmt --check` and failed on formatting differences before compilation/tests ran. The Windows extension job was still running when inspected. Follow-up PR #37 carries the rustfmt corrections and canonical mount-path handling. Keep Issues #31, #33 and #36 open until the latest main-branch Linux integration, all-example, and Windows extension jobs pass.
 - This is not a formal penetration test, dynamic fuzzing campaign, or independent cryptographic audit.
