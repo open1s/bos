@@ -383,7 +383,7 @@ mod tests {
                 "steps": [{
                     "name":"fetch",
                     "tool":"echo",
-                    "arguments":{"url":"{{input.url}}"}
+                    "arguments":{"url":"{{input.step_url}}"}
                 }]
             }))
             .expect("json"),
@@ -444,7 +444,14 @@ mod tests {
         );
 
         let denied = runtime
-            .call_tool("fetch", json!({"url":"https://evil.example/data"}), &context)
+            .call_tool(
+                "fetch",
+                json!({
+                    "url":"https://allowed.example/data",
+                    "step_url":"https://evil.example/data"
+                }),
+                &context,
+            )
             .await;
         assert!(denied.is_err(), "the resolved step target must be denied");
         assert_eq!(inner.calls.load(Ordering::SeqCst), 0);
@@ -452,7 +459,10 @@ mod tests {
         let allowed = runtime
             .call_tool(
                 "fetch",
-                json!({"url":"https://allowed.example/data"}),
+                json!({
+                    "url":"https://allowed.example/data",
+                    "step_url":"https://allowed.example/data"
+                }),
                 &context,
             )
             .await
