@@ -124,8 +124,9 @@ panels/status.json carries a validated declarative view:
 
 The action is a contribution id owned by the package. The current host registers
 the panel id and title; the declarative renderer is the next consumer. Invalid
-actions, over-deep trees, an oversized text leaf and a non-https image are
-refused at load time.
+actions, over-deep trees, oversized text leaves and image sources that are not
+package-relative `asset/...` paths are refused at load time. Remote `http:` and
+`https:` images are not fetched by this host.
 
 ## 5. A process extension
 
@@ -172,7 +173,12 @@ for line in sys.stdin:
     request = json.loads(line)
     method = request.get("method")
     if method == "initialize":
-        result = {"protocolVersion": "1.0"}
+        # Echo the per-session nonce supplied by the host.
+        params = request.get("params", {})
+        result = {
+            "protocolVersion": "1.0",
+            "token": params.get("token", ""),
+        }
     elif method == "tools/call":
         result = request["params"]["arguments"]
     elif method == "shutdown":
@@ -320,8 +326,11 @@ GitHub action behind an integration descriptor.
 `examples/extensions/builtin-template` is the Rust built-in trait template.
 
 
-`examples/extensions/hook-demo` is a process package that subscribes to every
-host hook topic, records what arrives, and exposes the log through `hook-log`.
+`examples/extensions/hook-demo` is a process package that subscribes to the
+host event topics listed in its `contributes.events` manifest entry, records
+events it receives, and exposes the log through `hook-log`. It demonstrates
+event subscriptions, not the separate `contributes.hooks` Observe Hook API
+(which requires `hooks.observe` and is delivered by the Extism runtime).
 It also carries a command, prompt, scoped context, panel, theme, preset, model
 provider, agent role, workflow and config schema, so it is the reference for
 "one package, every extension point". Run it with
@@ -409,7 +418,9 @@ A package may ship `themes/<id>.json`:
 The first declared theme applies to that extension's panels. Known tokens are
 page, text, muted, faint, border, border-soft, accent, error, success, warn,
 new-session-fill and hover; unknown tokens are ignored and missing tokens fall
-back to the host palette. A theme does not re-theme the whole shell.
+back to the host palette. The Settings > Extensions pane also offers a declared
+theme for selection as the app-wide shell palette override; merely declaring a
+theme does not change the shell palette.
 
 ## Extension commands in the composer
 
