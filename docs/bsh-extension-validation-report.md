@@ -117,8 +117,8 @@ Actions run #149 failed with E0433 because `McpCore::kill_child()` unconditional
 - **Path scopes:** source normalizes lexical paths before scope comparison. Continue to treat symlink and TOCTOU handling as separate filesystem-boundary concerns.
 - **Installed integrity:** current scan code compares the computed package hash to the registry record and re-verifies signatures; test quarantine/refusal and publisher-key removal.
 - **WASM host calls:** subscriptions are checked against declared topics and `events.subscribe`; host filesystem operations authorize before writes. Preserve tests that assert denied operations have no side effects.
-- **Resource limits:** keep per-runtime tests for output bytes, memory, fuel and wall-clock deadlines. Pure-compute WASM cancellation remains bounded by epoch/fuel rather than immediate instruction interruption, as the peer-review report states.
-- **Cross-platform:** Linux sandbox execution and Windows process-limit behaviour require actual platform CI, not just platform-independent argument-plan unit tests. The current Windows extension job is failing at compile time on the Unix-only `libc` call tracked by Issue #33.
+- **Resource limits:** ProcessRuntime and McpRuntime now share Unix RLIMIT_AS, RLIMIT_CPU and RLIMIT_NOFILE setup; Linux MCP integration coverage verifies the effective limits and filesystem boundary. Windows OS-level memory/CPU/process-tree limits remain unavailable and are tracked in [Issue #39](https://github.com/open1s/bos/issues/39). Pure-compute WASM cancellation remains bounded by epoch/fuel rather than immediate instruction interruption.
+- **Cross-platform:** Windows MCP extension CI passed on the PR #35 merge commit. Linux sandbox/resource integration and the ten-example automation still require the main-branch Rust workspace job to complete successfully.
 
 ## 4. Acceptance criteria
 
