@@ -158,19 +158,17 @@ impl Session {
     }
 
     fn close(&mut self) {
-        if let Ok(mut child) = self.child.lock() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        let mut child = self.child.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        if let Ok(mut child) = self.child.lock() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        let mut child = self.child.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
@@ -179,9 +177,8 @@ impl Drop for Session {
 /// Keeping this operation behind a small helper makes the cancellation path
 /// independent of Unix-only pid signalling and directly testable on Windows.
 fn terminate_child_handle(child: &Arc<Mutex<Child>>) {
-    if let Ok(mut child) = child.lock() {
-        let _ = child.kill();
-    }
+    let mut child = child.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _ = child.kill();
 }
 
 /// The state one MCP server package owns.
@@ -696,7 +693,12 @@ impl McpCore {
     /// held during blocking stdio exchanges. Child::kill uses the native
     /// process-termination API on both Unix and Windows.
     fn kill_child(&self) {
-        let child = self.child.lock().ok().and_then(|slot| slot.as_ref().cloned());
+        let child = self
+            .child
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .cloned();
         if let Some(child) = child {
             terminate_child_handle(&child);
         }
@@ -850,9 +852,7 @@ impl Runtime for McpRuntime {
         if let Some(mut session) = slot.take() {
             session.close();
         }
-        if let Ok(mut child) = self.core.child.lock() {
-            *child = None;
-        }
+        *self.core.child.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         Ok(())
     }
 
