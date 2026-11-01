@@ -6626,31 +6626,51 @@ impl Shell {
             let _ = tx.send_blocking(result);
         });
         cx.spawn(async move |this, cx| {
-            let result = rx.recv().await;
-            let _ = this.update(cx, |this, cx| {
-                this.extension_market_fetching = false;
-                match result {
-                    Ok(Ok(entries)) => {
-                        this.extension_market = Some(entries);
-                        this.extension_market_error = None;
-                    }
-                    Ok(Err(error)) => this.extension_market_error = Some(error.to_string()),
-                    Err(_) => {
-                        this.extension_market_error = Some("market channel closed".to_string())
-                    }
+            let receive = rx.recv();
+            futures::pin_mut!(receive);
+            let timer = cx
+                .background_executor()
+                .timer(std::time::Duration::from_secs(45));
+            futures::pin_mut!(timer);
+            match futures::future::select(receive, timer).await {
+                futures::future::Either::Left((result, _)) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.extension_market_fetching = false;
+                        match result {
+                            Ok(Ok(entries)) => {
+                                this.extension_market = Some(entries);
+                                this.extension_market_error = None;
+                            }
+                            Ok(Err(error)) => this.extension_market_error = Some(error.to_string()),
+                            Err(_) => {
+                                this.extension_market_error =
+                                    Some("market channel closed".to_string())
+                            }
+                        }
+                        cx.notify();
+                    });
                 }
-                cx.notify();
-            });
+                futures::future::Either::Right((_, _)) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.extension_market_fetching = false;
+                        this.extension_market_error =
+                            Some(tr(this.state.lang, "settings.marketTimeout").to_string());
+                        cx.notify();
+                    });
+                }
+            }
         })
         .detach();
     }
 
     /// Install one market entry off the UI thread.
     fn install_extension_market(&mut self, id: String, cx: &mut Context<Self>) {
-        if self.extension_market_fetching {
+        if self.extension_market_installing.is_some() {
             return;
         }
-        self.extension_market_fetching = true;
+        self.extension_market_installing = Some(id.clone());
+        self.extension_market_error = None;
+        cx.notify();
         let root = crate::extension::store_root(&self.state.settings);
         let settings = self.state.settings.clone();
         let workspace = {
@@ -6679,10 +6699,12 @@ impl Shell {
         cx.spawn(async move |this, cx| {
             let result = rx.recv().await;
             let _ = this.update(cx, |this, cx| {
-                this.extension_market_fetching = false;
+                this.extension_market_installing = None;
                 match result {
                     Ok(Ok(_)) => {
                         this.extension_market_error = None;
+                        this.state
+                            .notice(tr(this.state.lang, "settings.extensionInstalled").to_string());
                         let statuses = crate::extension::statuses(&settings, workspace.as_deref());
                         this.extension_statuses = Some(statuses);
                     }
@@ -6720,12 +6742,7 @@ impl Shell {
                 .flex()
                 .flex_row()
                 .items_center()
-                .justify_between()
-                .child(txt(
-                    tr(lang, "settings.marketGitHint"),
-                    12.0,
-                    theme::muted(),
-                ))
+                .justify_end()
                 .child(refresh)
                 .into_any_element(),
         );
@@ -6752,6 +6769,7 @@ impl Shell {
         for entry in entries {
             let installed = statuses.iter().find(|status| status.id == entry.id);
             let enabled = installed.is_some_and(|status| status.configured);
+            let installing = self.extension_market_installing.as_deref() == Some(entry.id.as_str());
             let action = if installed.is_some() {
                 let id = entry.id.clone();
                 let label = if enabled {
@@ -6797,7 +6815,11 @@ impl Shell {
                     .bg(rgb(theme::accent()))
                     .cursor_pointer()
                     .child(txt(
-                        tr(lang, "settings.extensionInstall"),
+                        if installing {
+                            tr(lang, "settings.marketInstalling")
+                        } else {
+                            tr(lang, "settings.extensionInstall")
+                        },
                         11.0,
                         theme::page(),
                     ))

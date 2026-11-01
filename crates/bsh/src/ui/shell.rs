@@ -875,8 +875,10 @@ pub(crate) struct Shell {
     pub(crate) extension_market: Option<Vec<crate::extension::market::MarketEntry>>,
     /// Why the market could not be read or refreshed.
     pub(crate) extension_market_error: Option<String>,
-    /// Whether a market refresh or install is in flight.
+    /// Whether a market refresh is in flight.
     pub(crate) extension_market_fetching: bool,
+    /// The market entry currently being installed, if any.
+    pub(crate) extension_market_installing: Option<String>,
     /// The settings dialog's text fields.
     pub(crate) settings_inputs: SettingsInputs,
     /// The Vault pane's text fields.
@@ -1762,6 +1764,7 @@ impl Shell {
             extension_market: None,
             extension_market_error: None,
             extension_market_fetching: false,
+            extension_market_installing: None,
             settings_inputs,
             vault_inputs,
             vault_revealed: None,
