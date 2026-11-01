@@ -1055,7 +1055,15 @@ mod tests {
     impl Scratch {
         fn new(label: &str) -> Self {
             let index = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
+            // Linux replaces /tmp with a private tmpfs in the process sandbox.
+            // Keep the package root elsewhere so the explicit writable bind remains visible.
+            #[cfg(target_os = "linux")]
+            let base = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            #[cfg(not(target_os = "linux"))]
+            let base = std::env::temp_dir();
+            let path = base.join(format!(
                 "bsh-ext-process-{label}-{}-{index}",
                 std::process::id()
             ));
