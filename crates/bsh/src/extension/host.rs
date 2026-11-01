@@ -2188,22 +2188,25 @@ tools = ["echo"]
             serde_json::json!({"session": "e2e"}),
         )
         .expect("event");
-        host.events().publish(&event).expect("publish");
         let mut log = serde_json::Value::Null;
         for _ in 0..40 {
+            // The builtin inspector subscribes before the process runtime does;
+            // republishing until the process log names the event proves the
+            // process's own subscription rather than any subscriber at all.
+            host.events().publish(&event).expect("publish");
             log = host
                 .run_integration("com.example.hook-demo", "github", serde_json::json!({}))
                 .await
                 .expect("integration dispatch");
-            if log["count"].as_u64().unwrap_or(0) >= 1 {
+            if log["events"].as_array().is_some_and(|events| {
+                events
+                    .iter()
+                    .any(|event| event["topic"] == "session.created")
+            }) {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        assert!(
-            log["count"].as_u64().unwrap_or(0) >= 1,
-            "the process did not receive the event: {log}"
-        );
         assert!(
             log["events"].as_array().is_some_and(|events| events
                 .iter()
