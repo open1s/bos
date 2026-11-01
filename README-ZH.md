@@ -208,6 +208,20 @@ Linux 构建依赖见 [Rust workflow](.github/workflows/rust.yml)。
 - **扩展能力** —— 增加工具、命令、面板、提示词、上下文、技能、主题、
   语言服务、Agent 角色、工作流、存储和 Hooks。
 
+### BSH 界面预览
+
+> **以下均为界面占位图，并非真实应用截图。** 在将其作为产品界面证据使用前，请替换为实际运行的 BSH 截图。
+
+| 主工作空间 | Agent 会话 |
+|---|---|
+| ![BSH 工作空间占位图](docs/assets/bsh-showcase/workspace.svg) | ![BSH Agent 会话占位图](docs/assets/bsh-showcase/agent-session.svg) |
+
+| 扩展管理器 | 模型与设置 |
+|---|---|
+| ![BSH 扩展管理器占位图](docs/assets/bsh-showcase/extensions.svg) | ![BSH 设置占位图](docs/assets/bsh-showcase/settings.svg) |
+
+替换要求：[BSH 截图替换指南](docs/assets/bsh-showcase/README.md)。
+
 ## 扩展平台
 
 Extension Platform 是 BSH 的工作空间扩展层。扩展包通过
