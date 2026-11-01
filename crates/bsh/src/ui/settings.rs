@@ -6872,13 +6872,6 @@ impl Shell {
             let root = self.state.settings.active_workspace_root();
             (!root.is_empty()).then(|| std::path::PathBuf::from(root))
         };
-        if self.extension_panels.is_none() {
-            let panels = crate::extension::panels(&self.state.settings, workspace.as_deref(), None);
-            self.extension_panels =
-                Some(cx.new(|_| crate::ui::extension_panel::ExtensionPanelView::new(panels)));
-        }
-        let view = self.extension_panels.clone().expect("panel view");
-
         let statuses = self.extension_statuses.clone().unwrap_or_default();
         let approvals: Vec<(String, String, String)> = statuses
             .iter()
@@ -7026,7 +7019,6 @@ impl Shell {
             });
         let refresh_settings = self.state.settings.clone();
         let refresh_workspace = workspace;
-        let refresh_view = view.clone();
         let refresh = div()
             .id("extension-panels-refresh")
             .debug_selector(|| "extension-panels-refresh".to_string())
@@ -7047,8 +7039,6 @@ impl Shell {
                 theme::text(),
             ))
             .on_click(cx.listener(move |this, _event, _window, cx| {
-                let panels =
-                    crate::extension::panels(&refresh_settings, refresh_workspace.as_deref(), None);
                 this.extension_themes = Some(crate::extension::themes(
                     &refresh_settings,
                     refresh_workspace.as_deref(),
@@ -7057,10 +7047,7 @@ impl Shell {
                     &refresh_settings,
                     refresh_workspace.as_deref(),
                 ));
-                refresh_view.update(cx, |view, cx| {
-                    view.set_panels(panels);
-                    cx.notify();
-                });
+                cx.notify();
             }));
         let mut inventory = div().flex().flex_col().gap(px(6.0));
         if statuses.is_empty() {
@@ -7221,16 +7208,6 @@ impl Shell {
         }
         rows.push(div().mb(px(10.0)).child(theme_menu).into_any_element());
         rows.push(div().mb(px(10.0)).child(refresh).into_any_element());
-        rows.push(
-            div()
-                .debug_selector(|| "extension-panels".to_string())
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_h(px(0.0))
-                .child(view)
-                .into_any_element(),
-        );
         ("settings.extensions", "settings.extensionsHint", rows)
     }
 

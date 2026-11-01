@@ -134,36 +134,6 @@ impl ExtensionPanelView {
         view
     }
 
-    /// Replace the panel list, keeping a selection when the id still exists.
-    pub(crate) fn set_panels(&mut self, panels: Vec<PanelSurface>) {
-        let selected_id = self
-            .panels
-            .get(self.selected)
-            .map(|panel| panel.panel_id.clone());
-        self.panels = panels;
-        self.selected = selected_id
-            .and_then(|id| self.panels.iter().position(|panel| panel.panel_id == id))
-            .unwrap_or(0);
-        self.session = None;
-        self.document = None;
-        self.error = None;
-        self.message = None;
-        self.loading = false;
-        let theme = self
-            .panels
-            .get(self.selected)
-            .and_then(|panel| panel.theme.as_ref());
-        self.palette = Palette::new(theme);
-        if let Some(panel) = self.panels.get(self.selected) {
-            if let Some(document) = &panel.initial {
-                if let Ok(session) = UiSession::open(panel.owner.clone(), document.clone()) {
-                    self.document = Some(session.document().clone());
-                    self.session = Some(session);
-                }
-            }
-        }
-    }
-
     fn select(&mut self, index: usize, cx: &mut Context<Self>) {
         if index >= self.panels.len() || index == self.selected {
             return;

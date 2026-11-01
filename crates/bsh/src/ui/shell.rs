@@ -851,8 +851,6 @@ pub(crate) struct Shell {
     pub(crate) plugins: Vec<crate::plugins::PluginInfo>,
     /// Extension commands the composer palette can insert.
     pub(crate) extension_commands: Vec<crate::extension::CommandSurface>,
-    /// The declarative extension panel host, created when the pane opens.
-    pub(crate) extension_panels: Option<Entity<crate::ui::extension_panel::ExtensionPanelView>>,
     /// Panels declared for the left sidebar.
     pub(crate) left_extension_panels:
         Option<Entity<crate::ui::extension_panel::ExtensionPanelView>>,
@@ -1124,13 +1122,6 @@ impl Shell {
             let root = state.settings.active_workspace_root();
             let workspace = (!root.is_empty()).then(|| std::path::PathBuf::from(root));
             crate::extension::statuses(&state.settings, workspace.as_deref())
-        };
-        let extension_panels = {
-            let root = state.settings.active_workspace_root();
-            let workspace = (!root.is_empty()).then(|| std::path::PathBuf::from(root));
-            let panels = crate::extension::panels(&state.settings, workspace.as_deref(), None);
-            (!panels.is_empty())
-                .then(|| cx.new(|_| crate::ui::extension_panel::ExtensionPanelView::new(panels)))
         };
         let center_extension_panels = {
             let root = state.settings.active_workspace_root();
@@ -1761,7 +1752,6 @@ impl Shell {
             caps_generation: 0,
             plugins: Vec::new(),
             extension_commands: crate::extension::cached_commands(),
-            extension_panels,
             center_extension_panels,
             left_extension_panels,
             right_extension_panels,

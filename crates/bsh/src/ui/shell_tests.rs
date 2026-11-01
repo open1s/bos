@@ -29892,9 +29892,9 @@ fn enter_in_the_address_bar_starts_a_navigation(cx: &mut TestAppContext) {
     );
 }
 
-/// The extensions pane mounts the declarative panel host without a package.
+/// The Extensions pane lists the platform inventory without a package.
 #[gpui::test]
-fn the_extensions_pane_renders_its_panel_host(cx: &mut TestAppContext) {
+fn the_extensions_pane_renders_its_inventory(cx: &mut TestAppContext) {
     init_test_app(cx);
     let (_harness, cx) = cx.add_window_view(move |window, cx| {
         let state = AppState::with_store(scratch_store("extension-panels"));
@@ -29904,8 +29904,8 @@ fn the_extensions_pane_renders_its_panel_host(cx: &mut TestAppContext) {
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(
-        cx.debug_bounds("extension-panels").is_some(),
-        "the extensions pane draws the panel host"
+        cx.debug_bounds("extension-inventory").is_some(),
+        "the extensions pane draws the installed inventory"
     );
     assert!(
         cx.debug_bounds("extension-panels-refresh").is_some(),
@@ -29928,10 +29928,6 @@ fn the_extensions_rail_opens_the_extension_inventory(cx: &mut TestAppContext) {
     assert!(
         cx.debug_bounds("extension-inventory").is_some(),
         "the Extensions rail opens the installed-extension inventory"
-    );
-    assert!(
-        cx.debug_bounds("extension-panels").is_some(),
-        "the same pane hosts contributed panels"
     );
     assert!(
         cx.debug_bounds("extension-status-toggle-com.bos.bsh.extensions")
@@ -30005,8 +30001,8 @@ fn the_plugins_header_opens_the_extension_panels(cx: &mut TestAppContext) {
     cx.simulate_click(button.center(), Modifiers::default());
     cx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(
-        cx.debug_bounds("extension-panels").is_some(),
-        "the header control opens the panel host"
+        cx.debug_bounds("extension-inventory").is_some(),
+        "the header control opens the Extensions inventory"
     );
 }
 
