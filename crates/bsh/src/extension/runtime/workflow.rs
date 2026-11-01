@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 
 use super::declarative::RawContribution;
 use super::{CallContext, Runtime, ToolDescriptor, ToolResult};
-use crate::extension::capability::{authorize_each, call_scope, Capability, PolicyEngine};
+use crate::extension::capability::{authorize_each, call_scope, PolicyEngine};
 use crate::extension::types::{ExtensionError, RuntimeKind, TrustLevel};
 
 /// One step in a workflow.
@@ -324,6 +324,7 @@ impl Runtime for WorkflowRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extension::capability::{Capability, GrantScope};
     use crate::extension::types::ContributionId;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -408,9 +409,7 @@ mod tests {
             .grant(
                 extension,
                 Capability::NetworkHttp,
-                crate::extension::capability::GrantScope::Domain(
-                    "allowed.example".to_string(),
-                ),
+                GrantScope::Domain("allowed.example".to_string()),
                 None,
             )
             .expect("scoped network grant");
