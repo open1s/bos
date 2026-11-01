@@ -1,0 +1,33 @@
+{
+  "description": "Inspect the all-in-one demo: identity, configuration and the last events",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "limit": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 20
+      }
+    },
+    "additionalProperties": false
+  },
+  "steps": [
+    {
+      "name": "about",
+      "tool": "describe",
+      "arguments": {}
+    },
+    {
+      "name": "settings",
+      "tool": "config",
+      "arguments": {}
+    },
+    {
+      "name": "log",
+      "tool": "events",
+      "arguments": {
+        "limit": "{{input.limit}}"
+      }
+    }
+  ]
+}

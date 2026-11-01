@@ -1,0 +1,88 @@
+schema_version = "1.0"
+
+[extension]
+id = "com.example.allinone"
+name = "All-in-One Exam Demo"
+version = "1.0.0"
+description = "One package that exercises every BSH extension contribution: tools, commands, panels, prompts, contexts, skills, languages, integrations, themes, presets, providers, workflows, events, configuration and the process protocol"
+authors = ["BSH Example"]
+license = "MIT"
+repository = "https://github.com/open1s/bos"
+homepage = "https://github.com/open1s/bos/tree/main/examples/extensions/allinone"
+
+[compatibility]
+bsh = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+
+[runtime]
+kind = "process"
+entry = "python3"
+args = ["-B", "server.py"]
+protocol = "jsonrpc-2.0"
+startup = "on-demand"
+
+[runtime.env]
+PYTHONDONTWRITEBYTECODE = "1"
+DEMO_GREETING = "hello from the all-in-one demo"
+
+[capabilities]
+required = ["process.execute", "agent.tools.register"]
+optional = [
+  "agent.prompts.provide",
+  "agent.context.provide",
+  "agent.skills.provide",
+  "agent.models.provide",
+  "agent.agents.provide",
+  "agent.workflows.provide",
+  "ui.panels",
+  "ui.commands",
+  "ui.theme",
+  "events.subscribe",
+]
+
+[contributes]
+tools = ["describe", "echo", "sum", "progress", "fail", "events", "config"]
+commands = ["hello", "refresh"]
+panels = ["dashboard"]
+prompts = ["guide"]
+contexts = ["workspace"]
+skills = ["allinone"]
+languages = ["demo"]
+integrations = ["github", "command"]
+themes = ["aurora"]
+presets = ["safe"]
+model_providers = ["demo"]
+agent_providers = ["helper"]
+workflows = ["inspect"]
+events = [
+  "app.started",
+  "app.shutdown",
+  "workspace.opened",
+  "workspace.changed",
+  "session.created",
+  "session.updated",
+  "trajectory.recorded",
+  "agent.started",
+  "agent.completed",
+  "agent.failed",
+  "skill.loaded",
+  "instruction.build",
+  "model.requested",
+  "model.completed",
+  "tool.invoked",
+  "tool.completed",
+  "tool.failed",
+  "extension.loaded",
+]
+
+[configuration]
+schema = "schemas/config.schema.json"
+
+[configuration.defaults]
+greeting = "hello from the all-in-one demo"
+verbose = true
+
+[resources]
+max_memory_mb = 128
+max_execution_ms = 5000
+max_output_bytes = 1048576

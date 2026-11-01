@@ -1,0 +1,8 @@
+{
+  "name": "All-in-One Demo Language",
+  "extensions": [
+    "allinone"
+  ],
+  "tool": "describe",
+  "syntax": "rust"
+}
