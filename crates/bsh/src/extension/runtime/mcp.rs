@@ -158,17 +158,19 @@ impl Session {
     }
 
     fn close(&mut self) {
-        let mut child = self.child.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _ = child.kill();
-        let _ = child.wait();
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        let mut child = self.child.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _ = child.kill();
-        let _ = child.wait();
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -710,14 +712,11 @@ impl McpCore {
     /// held during blocking stdio exchanges. Child::kill uses the native
     /// process-termination API on both Unix and Windows.
     fn kill_child(&self) {
-        let child = self
-            .child
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
-            .cloned();
+        let child = self.child.lock().ok().and_then(|slot| slot.as_ref().cloned());
         if let Some(child) = child {
-            terminate_child_handle(&child);
+            if let Ok(mut child) = child.lock() {
+                let _ = child.kill();
+            }
         }
     }
 
@@ -869,7 +868,9 @@ impl Runtime for McpRuntime {
         if let Some(mut session) = slot.take() {
             session.close();
         }
-        *self.core.child.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        if let Ok(mut child) = self.core.child.lock() {
+            *child = None;
+        }
         Ok(())
     }
 

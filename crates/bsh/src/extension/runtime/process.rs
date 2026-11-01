@@ -1230,10 +1230,7 @@ events = ["workspace.changed"]
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .expect("CI runner HOME is set");
-        let probe = home.join(format!(
-            "bsh-ext-linux-sandbox-probe-{}",
-            std::process::id()
-        ));
+        let probe = home.join(format!("bsh-ext-linux-sandbox-probe-{}", std::process::id()));
         let _ = std::fs::remove_file(&probe);
         std::fs::write(
             scratch.0.join("server.sh"),
@@ -1254,23 +1251,14 @@ done
         )
         .expect("server");
         let runtime = ProcessRuntime::new(&manifest(), &scratch.0).expect("runtime");
-        assert!(
-            runtime.sandbox,
-            "Linux process sandbox must be enabled by default"
-        );
+        assert!(runtime.sandbox, "Linux process sandbox must be enabled by default");
         let context = CallContext::new(manifest().id().clone(), "linux-sandbox", None, 2000);
         let result = runtime
             .call_tool("echo", json!({}), &context)
             .await
             .expect("sandboxed call");
-        assert_eq!(
-            result["blocked"], true,
-            "HOME is outside writable sandbox mounts"
-        );
-        assert!(
-            !probe.exists(),
-            "the extension must not write into the host HOME"
-        );
+        assert_eq!(result["blocked"], true, "HOME is outside writable sandbox mounts");
+        assert!(!probe.exists(), "the extension must not write into the host HOME");
         runtime.shutdown().await.expect("shutdown");
     }
 
