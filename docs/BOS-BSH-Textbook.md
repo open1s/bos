@@ -609,6 +609,12 @@ This table is the quick answer to “where does my extension show up?” If a
 contribution has no row here, it is consumed headlessly (language/integration)
 or it is not wired. Check §3.6 before designing around it.
 
+An Installed row shows a **Grant** button when a required capability is denied.
+It grants every missing required capability with the narrowest default scope
+(workspace for path capabilities, the declared program for process, any for the
+rest), rewrites the host, and refreshes the row; the same decision is available
+headlessly through `bsh ext grant` and is audited either way.
+
 Not every point is a UI point. In particular:
 
 - **No arbitrary UI callback.** The only UI contract is a panel document; there

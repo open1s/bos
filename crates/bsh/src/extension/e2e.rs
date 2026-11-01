@@ -205,6 +205,37 @@ async fn the_computer_use_example_exposes_every_declared_surface() {
     host.shutdown().await;
 }
 
+#[tokio::test]
+async fn the_grant_button_path_activates_a_denied_community_package() {
+    let root = scratch("grant-required");
+    std::fs::create_dir_all(root.join("workspace")).expect("workspace");
+    let store = ExtensionStore::open(&root).expect("store");
+    store
+        .install(&examples().join("computer-use"))
+        .expect("install");
+    let mut host = ExtensionHost::open(config(&root)).expect("host");
+    let id = "com.example.computer-use";
+    let before = host
+        .statuses()
+        .into_iter()
+        .find(|status| status.id == id)
+        .expect("status");
+    assert!(!before.applied, "critical capabilities start denied");
+    let granted = host.grant_required(id).expect("grant required");
+    assert!(granted >= 2, "granted {granted} capabilities");
+    let after = host
+        .statuses()
+        .into_iter()
+        .find(|status| status.id == id)
+        .expect("status");
+    assert!(
+        after.applied,
+        "granted package activates: {:?}",
+        after.error
+    );
+    host.shutdown().await;
+}
+
 fn copy_dir(source: &Path, target: &Path) {
     std::fs::create_dir_all(target).expect("target");
     for entry in std::fs::read_dir(source).expect("source") {

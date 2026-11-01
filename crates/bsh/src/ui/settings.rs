@@ -7241,6 +7241,64 @@ impl Shell {
                             ))
                             .child({
                                 let id = status.id.clone();
+                                let missing = status
+                                    .capabilities
+                                    .iter()
+                                    .any(|item| item.required && !item.allowed);
+                                let settings = self.state.settings.clone();
+                                let workspace = {
+                                    let root = settings.active_workspace_root();
+                                    (!root.is_empty()).then(|| std::path::PathBuf::from(root))
+                                };
+                                if missing {
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "extension-grant-{}",
+                                            status.id
+                                        )))
+                                        .debug_selector({
+                                            let id = status.id.clone();
+                                            move || format!("extension-grant-{id}")
+                                        })
+                                        .h(px(24.0))
+                                        .px(px(9.0))
+                                        .rounded(px(7.0))
+                                        .bg(rgb(theme::accent()))
+                                        .cursor_pointer()
+                                        .child(txt(
+                                            tr(self.state.lang, "settings.extensionGrant"),
+                                            11.0,
+                                            theme::page(),
+                                        ))
+                                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                                            match crate::extension::grant_required(
+                                                &settings,
+                                                workspace.as_deref(),
+                                                &id,
+                                            ) {
+                                                Ok(count) => this.state.notice(format!(
+                                                    "{} {count}",
+                                                    tr(
+                                                        this.state.lang,
+                                                        "settings.extensionGranted"
+                                                    )
+                                                )),
+                                                Err(error) => this.state.notice(error.to_string()),
+                                            }
+                                            this.extension_statuses =
+                                                Some(crate::extension::statuses(
+                                                    &settings,
+                                                    workspace.as_deref(),
+                                                ));
+                                            cx.notify();
+                                        }))
+                                        .into_any_element()
+                                } else {
+                                    div().into_any_element()
+                                }
+                            })
+                            .child({
+                                let id = status.id.clone();
                                 let enabled = status.configured;
                                 div()
                                     .id(SharedString::from(format!(

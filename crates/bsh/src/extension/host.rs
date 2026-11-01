@@ -16,7 +16,7 @@ use std::time::SystemTime;
 use serde::Serialize;
 
 use super::agent as contribution;
-use super::capability::{CallScope, Decision, PolicyEngine, PolicyMode};
+use super::capability::{CallScope, Capability, Decision, GrantScope, PolicyEngine, PolicyMode};
 use super::events::{lifecycle_event, topics, EventBus, ExtensionEvent};
 use super::lifecycle::{Health, LifecycleManager};
 use super::package::{write_atomic, ExtensionStore, Package};
@@ -124,6 +124,8 @@ pub(crate) struct CapabilityStatus {
     pub(crate) reason: Option<String>,
     /// The risk bucket.
     pub(crate) risk: String,
+    /// Whether this capability is required for activation.
+    pub(crate) required: bool,
 }
 
 /// One extension as a status row.
@@ -1161,6 +1163,52 @@ impl ExtensionHost {
         self.rebuild()
     }
 
+    /// Grant every required capability a currently denied package asks for.
+    ///
+    /// This is the explicit UI decision behind the Installed row's Grant
+    /// button. The button is only shown when a required capability is denied;
+    /// each grant is written with the narrowest default scope available here
+    /// (workspace for path capabilities, declared program for process, any for
+    /// the rest) and is audited with the pane as its note.
+    pub(crate) fn grant_required(&mut self, id: &str) -> Result<usize, ExtensionError> {
+        let status = self
+            .statuses()
+            .into_iter()
+            .find(|status| status.id == id)
+            .ok_or_else(|| ExtensionError::NotFound { id: id.to_string() })?;
+        let program = status.program.clone();
+        let mut granted = 0usize;
+        for capability in status
+            .capabilities
+            .iter()
+            .filter(|item| item.required && !item.allowed)
+        {
+            let parsed: Capability = capability.capability.parse()?;
+            let scope = match parsed {
+                Capability::WorkspaceRead | Capability::WorkspaceWrite => GrantScope::Workspace,
+                Capability::ProcessExecute => {
+                    GrantScope::Program(program.clone().ok_or_else(|| ExtensionError::Denied {
+                        extension: id.to_string(),
+                        capability: capability.capability.clone(),
+                        reason: "process extension has no declared executable".to_string(),
+                    })?)
+                }
+                _ => GrantScope::Any,
+            };
+            self.policy.grant(
+                id,
+                parsed,
+                scope,
+                Some("granted from the extensions pane".to_string()),
+            )?;
+            granted += 1;
+        }
+        if granted > 0 {
+            self.rebuild()?;
+        }
+        Ok(granted)
+    }
+
     /// Every panel an applied extension offers, ready for the host UI.
     pub(crate) fn panel_surfaces(&self) -> Vec<PanelSurface> {
         let mut surfaces = Vec::new();
@@ -1453,6 +1501,12 @@ impl ExtensionHost {
                 scope: granted_scope,
                 reason,
                 risk: capability.risk().as_str().to_string(),
+                required: entry
+                    .package
+                    .manifest
+                    .capabilities
+                    .required
+                    .contains(capability),
             });
         }
         ExtensionStatus {
@@ -1896,6 +1950,19 @@ pub(crate) fn approve_process(
         host.approve_process(id, program)
     })
     .unwrap_or_else(|| {
+        Err(ExtensionError::NotFound {
+            id: "extension host".to_string(),
+        })
+    })
+}
+
+/// Grant every required capability a package currently lacks.
+pub(crate) fn grant_required(
+    settings: &crate::settings::Settings,
+    workspace: Option<&Path>,
+    id: &str,
+) -> Result<usize, ExtensionError> {
+    with_host(settings, workspace, |host| host.grant_required(id)).unwrap_or_else(|| {
         Err(ExtensionError::NotFound {
             id: "extension host".to_string(),
         })

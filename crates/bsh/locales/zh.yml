@@ -617,6 +617,8 @@
 "settings.marketTimeout": "市场刷新超时，请检查网络后重试"
 "settings.extensionEnable": "启用"
 "settings.extensionDisable": "禁用"
+"settings.extensionGrant": "授权"
+"settings.extensionGranted": "已授权"
 "settings.extensionEnabled": "已启用"
 "settings.extensionDisabled": "已禁用"
 "settings.extensionAvailable": "可安装"

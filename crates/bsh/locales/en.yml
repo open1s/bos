@@ -622,6 +622,8 @@
 "settings.marketTimeout": "Market refresh timed out; check your network and try again"
 "settings.extensionEnable": "Enable"
 "settings.extensionDisable": "Disable"
+"settings.extensionGrant": "Grant"
+"settings.extensionGranted": "Granted"
 "settings.extensionEnabled": "Enabled"
 "settings.extensionDisabled": "Disabled"
 "settings.extensionAvailable": "Available"
