@@ -55,6 +55,8 @@ Commands:
   providers                           list model and agent provider descriptors
   languages                           list declared language services
   integrations                        list declared external integrations
+  language-check <id> <lang> <path>   run a language service's diagnostics tool
+  integrate <id> <integration> [json] run an integration's tool or command
   market [query]                      list the Git extension market
   market install <id>                 install the newest market version
   doctor                              check the store, hashes, dependencies and policy
@@ -136,6 +138,8 @@ pub(crate) fn run(args: &[String]) -> i32 {
         "providers" => command_providers(root.clone()),
         "languages" => command_languages(root.clone()),
         "integrations" => command_integrations(root.clone()),
+        "language-check" => command_language_check(&rest[1..], root.clone()),
+        "integrate" => command_integrate(&rest[1..], root.clone()),
         "market" => command_market(&rest[1..], root.clone()),
         "keygen" => command_keygen(&rest[1..]),
         "sign" => command_sign(&rest[1..]),
@@ -1431,12 +1435,7 @@ fn command_languages(root: Option<PathBuf>) -> Result<i32, String> {
     })
     .map_err(|error| error.to_string())?;
     for entry in host.languages() {
-        let tool = entry
-            .contribution
-            .tool
-            .as_ref()
-            .map(|tool| tool.as_str())
-            .unwrap_or("-");
+        let tool = entry.contribution.tool.as_str();
         println!(
             "{}\t{}\t{}\t{}\t{}",
             entry.owner,
@@ -1459,12 +1458,7 @@ fn command_integrations(root: Option<PathBuf>) -> Result<i32, String> {
     })
     .map_err(|error| error.to_string())?;
     for entry in host.integrations() {
-        let action = entry
-            .contribution
-            .action
-            .as_ref()
-            .map(|action| action.as_str())
-            .unwrap_or("-");
+        let action = entry.contribution.action.as_str();
         println!(
             "{}\t{}\t{}\t{}\t{}",
             entry.owner,
@@ -1477,6 +1471,69 @@ fn command_integrations(root: Option<PathBuf>) -> Result<i32, String> {
     Ok(0)
 }
 
+fn command_language_check(args: &[String], root: Option<PathBuf>) -> Result<i32, String> {
+    let owner = args
+        .first()
+        .ok_or_else(|| "usage: bsh ext language-check <id> <language> <path>".to_string())?;
+    let language = args
+        .get(1)
+        .ok_or_else(|| "usage: bsh ext language-check <id> <language> <path>".to_string())?;
+    let path = args
+        .get(2)
+        .ok_or_else(|| "usage: bsh ext language-check <id> <language> <path>".to_string())?;
+    let store = ExtensionStore::open(config(root).root).map_err(|error| error.to_string())?;
+    let host = ExtensionHost::open(HostConfig {
+        root: store.root().to_path_buf(),
+        workspace: Some(std::env::current_dir().unwrap_or_default()),
+        disabled: BTreeSet::new(),
+        preset_allowed: None,
+    })
+    .map_err(|error| error.to_string())?;
+    let value = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?
+        .block_on(host.language_check(owner, language, std::path::Path::new(path)))
+        .map_err(|error| error.to_string())?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?
+    );
+    Ok(0)
+}
+
+fn command_integrate(args: &[String], root: Option<PathBuf>) -> Result<i32, String> {
+    let owner = args
+        .first()
+        .ok_or_else(|| "usage: bsh ext integrate <id> <integration> [json]".to_string())?;
+    let integration = args
+        .get(1)
+        .ok_or_else(|| "usage: bsh ext integrate <id> <integration> [json]".to_string())?;
+    let arguments = match args.get(2) {
+        Some(text) => serde_json::from_str(text)
+            .map_err(|error| format!("integration arguments are not JSON: {error}"))?,
+        None => serde_json::json!({}),
+    };
+    let store = ExtensionStore::open(config(root).root).map_err(|error| error.to_string())?;
+    let host = ExtensionHost::open(HostConfig {
+        root: store.root().to_path_buf(),
+        workspace: Some(std::env::current_dir().unwrap_or_default()),
+        disabled: BTreeSet::new(),
+        preset_allowed: None,
+    })
+    .map_err(|error| error.to_string())?;
+    let value = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?
+        .block_on(host.run_integration(owner, integration, arguments))
+        .map_err(|error| error.to_string())?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?
+    );
+    Ok(0)
+}
 fn command_market(args: &[String], root: Option<PathBuf>) -> Result<i32, String> {
     let store = ExtensionStore::open(config(root).root).map_err(|error| error.to_string())?;
     let url = std::env::var("BSH_EXTENSION_MARKET")

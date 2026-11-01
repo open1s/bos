@@ -95,7 +95,7 @@ pub(crate) struct LanguageContribution {
     /// File extensions without the leading dot.
     pub(crate) extensions: Vec<String>,
     /// Tool that answers diagnostics for a document.
-    pub(crate) tool: Option<ContributionId>,
+    pub(crate) tool: ContributionId,
     /// Optional tree-sitter grammar id.
     pub(crate) syntax: Option<String>,
 }
@@ -110,7 +110,7 @@ pub(crate) struct IntegrationContribution {
     /// github, browser, terminal or custom.
     pub(crate) kind: String,
     /// Tool or command the host dispatches to.
-    pub(crate) action: Option<ContributionId>,
+    pub(crate) action: ContributionId,
 }
 
 /// Everything a declarative package contributes beyond its tools.
@@ -428,13 +428,11 @@ pub(crate) fn load_contributions(
                 });
             }
         }
-        if let Some(tool) = &file.tool {
-            if !manifest.contributes.tools.contains(tool) {
-                return Err(ExtensionError::Manifest {
-                    path,
-                    message: format!("language tool {tool} is not a declared tool"),
-                });
-            }
+        if !manifest.contributes.tools.contains(&file.tool) {
+            return Err(ExtensionError::Manifest {
+                path,
+                message: format!("language tool {} is not a declared tool", file.tool),
+            });
         }
         contributions.languages.push(LanguageContribution {
             id: id.clone(),
@@ -467,17 +465,16 @@ pub(crate) fn load_contributions(
                 message: "integration kind must be github, browser, terminal or custom".to_string(),
             });
         }
-        if let Some(action) = &file.action {
-            if !manifest.contributes.tools.contains(action)
-                && !manifest.contributes.commands.contains(action)
-            {
-                return Err(ExtensionError::Manifest {
-                    path,
-                    message: format!(
-                        "integration action {action} is not a declared tool or command"
-                    ),
-                });
-            }
+        if !manifest.contributes.tools.contains(&file.action)
+            && !manifest.contributes.commands.contains(&file.action)
+        {
+            return Err(ExtensionError::Manifest {
+                path,
+                message: format!(
+                    "integration action {} is not a declared tool or command",
+                    file.action
+                ),
+            });
         }
         contributions.integrations.push(IntegrationContribution {
             id: id.clone(),
@@ -615,8 +612,7 @@ struct LanguageFile {
     name: String,
     #[serde(default)]
     extensions: Vec<String>,
-    #[serde(default)]
-    tool: Option<ContributionId>,
+    tool: ContributionId,
     #[serde(default)]
     syntax: Option<String>,
 }
@@ -626,8 +622,7 @@ struct LanguageFile {
 struct IntegrationFile {
     name: String,
     kind: String,
-    #[serde(default)]
-    action: Option<ContributionId>,
+    action: ContributionId,
 }
 
 #[cfg(test)]

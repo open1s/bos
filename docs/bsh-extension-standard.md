@@ -230,19 +230,23 @@ events are subscription topics; a trailing .* is allowed. publishes are topics
 the package may emit; a wildcard is not allowed there. Topic segments are
 lowercase letters, digits, hyphen and underscore, separated by dots.
 
-Language descriptors name a language, its bare file extensions, and an optional tool that answers diagnostics for a document:
+Language descriptors name a language, its bare file extensions, and the tool that answers diagnostics for a document. The tool is required and must be declared by the same package:
 
 ~~~json
 {"name":"Rust","extensions":["rs"],"tool":"diagnostics","syntax":"rust"}
 ~~~
 
-Integration descriptors name an external system and the tool or command that drives it:
+Integration descriptors name an external system and the tool or command that drives it. The action is required and must be declared by the same package:
 
 ~~~json
 {"name":"GitHub","kind":"github","action":"issues"}
 ~~~
 
-The kind is github, browser, terminal or custom. The referenced tool or command must be declared by the same package. Both descriptors are validated at load and listed by `bsh ext languages` and `bsh ext integrations`.
+The kind is github, browser, terminal or custom. The referenced tool or command must be declared by the same package. Both descriptors are validated at load and listed by `bsh ext languages` and `bsh ext integrations`. Run them with `bsh ext language-check <id> <language> <path>` and `bsh ext integrate <id> <integration> [json]`.
+
+Model provider descriptors at providers/models/<id>.json are settings Provider documents: name, base_url, api_mode and one flattened table per model keyed by nickname. Each model carries model (the id the API is called with), name, max_tokens, api_mode, reasoning_effort and input_types.
+
+requires_key = false declares an open or anonymous lane. Absent or true reads as key-bearing, the safe default: the build demands a credential instead of sending an unauthenticated request. A keyless descriptor makes the build send no credential rather than inventing a missing-key refusal for an endpoint that was never going to receive one. requires_key is a provider field, not a model entry; it is read before the flattened model table.
 
 ### 4.6 Resources
 

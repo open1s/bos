@@ -46,5 +46,5 @@ The same package carries a command, prompt, scoped context, panel, theme,
 preset, model provider, agent role, workflow, language service, integration
 descriptor and config schema, so it exercises the provider and UI surfaces
 alongside the event hooks. The workflow's single step calls this package's own
-`hook-log` tool; the language descriptor points its diagnostics at the same
-tool, and the GitHub integration points at the `events` command.
+`hook-log` tool; the language and GitHub integration descriptors both point
+their action at the same tool.

@@ -28,12 +28,13 @@ use super::runtime::mcp::McpRuntime;
 use super::runtime::process::ProcessRuntime;
 use super::runtime::wasm::WasmRuntime;
 use super::runtime::workflow::WorkflowRuntime;
-use super::runtime::{empty_schema, LazyRuntime, Runtime, ToolDescriptor};
+use super::runtime::{empty_schema, CallContext, LazyRuntime, Runtime, ToolDescriptor};
 use super::types::{
     ContributionId, ExtensionError, ExtensionId, ExtensionSource, LifecycleState, RuntimeKind,
     StartupPolicy, TrustLevel, ValidationReport, EXTENSION_API_VERSION, HOST_VERSION,
 };
 use super::ui::{PanelLocation, PanelVisibility, ThemePalette, UiDocument};
+use serde_json::Value;
 
 /// The configuration that decides which store and which packages a host owns.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -953,6 +954,129 @@ impl ExtensionHost {
         &self.integrations
     }
 
+    /// Run one language service's declared diagnostics tool over a document.
+    pub(crate) async fn language_check(
+        &self,
+        owner: &str,
+        language: &str,
+        path: &Path,
+    ) -> Result<Value, ExtensionError> {
+        let entry = self
+            .languages
+            .iter()
+            .find(|entry| {
+                entry.owner.as_str() == owner
+                    && (entry.contribution.id.as_str() == language
+                        || entry.contribution.name == language)
+            })
+            .ok_or_else(|| ExtensionError::Denied {
+                extension: owner.to_string(),
+                capability: "language.check".to_string(),
+                reason: format!("{language} is not a declared language"),
+            })?;
+        let text = std::fs::read_to_string(path).map_err(|source| ExtensionError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if text.len() > 1024 * 1024 {
+            return Err(ExtensionError::Denied {
+                extension: owner.to_string(),
+                capability: "language.check".to_string(),
+                reason: "document is larger than 1 MiB".to_string(),
+            });
+        }
+        let loaded = self
+            .loaded
+            .get(owner)
+            .ok_or_else(|| ExtensionError::Denied {
+                extension: owner.to_string(),
+                capability: "language.check".to_string(),
+                reason: "extension is not loaded".to_string(),
+            })?;
+        let runtime = loaded
+            .runtime
+            .clone()
+            .ok_or_else(|| ExtensionError::Denied {
+                extension: owner.to_string(),
+                capability: "language.check".to_string(),
+                reason: "extension has no runtime".to_string(),
+            })?;
+        let context = CallContext::new(
+            entry.owner.clone(),
+            "language-check",
+            self.config.workspace.clone(),
+            30_000,
+        );
+        runtime
+            .call_tool(
+                entry.contribution.tool.as_str(),
+                serde_json::json!({
+                    "path": path.display().to_string(),
+                    "text": text,
+                    "language": entry.contribution.id.as_str(),
+                }),
+                &context,
+            )
+            .await
+    }
+
+    /// Dispatch one integration's declared tool or command.
+    pub(crate) async fn run_integration(
+        &self,
+        owner: &str,
+        integration: &str,
+        arguments: Value,
+    ) -> Result<Value, ExtensionError> {
+        let entry = self
+            .integrations
+            .iter()
+            .find(|entry| {
+                entry.owner.as_str() == owner
+                    && (entry.contribution.id.as_str() == integration
+                        || entry.contribution.name == integration)
+            })
+            .ok_or_else(|| ExtensionError::Denied {
+                extension: owner.to_string(),
+                capability: "integration.run".to_string(),
+                reason: format!("{integration} is not a declared integration"),
+            })?;
+        let loaded = self
+            .loaded
+            .get(owner)
+            .ok_or_else(|| ExtensionError::Denied {
+                extension: owner.to_string(),
+                capability: "integration.run".to_string(),
+                reason: "extension is not loaded".to_string(),
+            })?;
+        let runtime = loaded
+            .runtime
+            .clone()
+            .ok_or_else(|| ExtensionError::Denied {
+                extension: owner.to_string(),
+                capability: "integration.run".to_string(),
+                reason: "extension has no runtime".to_string(),
+            })?;
+        let action = entry.contribution.action.as_str();
+        if loaded
+            .package
+            .manifest
+            .contributes
+            .tools
+            .iter()
+            .any(|tool| tool.as_str() == action)
+        {
+            let context = CallContext::new(
+                entry.owner.clone(),
+                "integration-run",
+                self.config.workspace.clone(),
+                60_000,
+            );
+            runtime.call_tool(action, arguments, &context).await
+        } else {
+            runtime.command(action, arguments).await
+        }
+    }
+
     /// Clear a persisted failure and reload the package set.
     pub(crate) fn retry(&mut self, id: &str) -> Result<(), ExtensionError> {
         let id = crate::extension::types::ExtensionId::parse(id.to_string())?;
@@ -1829,6 +1953,55 @@ tools = ["echo"]
         .expect("tool");
     }
 
+    fn write_language_package(root: &Path) {
+        for directory in ["tools", "languages", "integrations"] {
+            std::fs::create_dir_all(root.join(directory)).expect(directory);
+        }
+        std::fs::write(
+            root.join("extension.toml"),
+            r#"
+schema_version = "1.0"
+
+[extension]
+id = "com.example.language"
+name = "Language"
+version = "1.0.0"
+description = "A language and integration fixture"
+
+[compatibility]
+bsh = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+
+[runtime]
+kind = "declarative"
+
+[capabilities]
+required = ["agent.tools.register"]
+
+[contributes]
+tools = ["check"]
+languages = ["rust"]
+integrations = ["github"]
+"#,
+        )
+        .expect("manifest");
+        std::fs::write(
+            root.join("tools/check.json"),
+            r#"{"description":"Check","implementation":{"kind":"echo_arguments"}}"#,
+        )
+        .expect("tool");
+        std::fs::write(
+            root.join("languages/rust.json"),
+            r#"{"name":"Rust","extensions":["rs"],"tool":"check"}"#,
+        )
+        .expect("language");
+        std::fs::write(
+            root.join("integrations/github.json"),
+            r#"{"name":"GitHub","kind":"github","action":"check"}"#,
+        )
+        .expect("integration");
+    }
+
     fn write_dependent(root: &Path, id: &str, dependency: &str) {
         std::fs::create_dir_all(root.join("tools")).expect("tools");
         let manifest = format!(
@@ -1864,6 +2037,42 @@ tools = ["echo"]
             r#"{"description":"Echo","implementation":{"kind":"echo_arguments"}}"#,
         )
         .expect("tool");
+    }
+
+    #[tokio::test]
+    async fn language_and_integration_descriptors_dispatch() {
+        let root = scratch("language-integration");
+        let source = root.join("source");
+        write_language_package(&source);
+        let store = ExtensionStore::open(&root).expect("store");
+        let package = store.install(&source).expect("install");
+        let policy =
+            PolicyEngine::open(store.grants_path(), store.audit_path(), PolicyMode::Enforce)
+                .expect("policy");
+        for capability in &package.manifest.capabilities.required {
+            policy
+                .grant(package.id().as_str(), *capability, GrantScope::Any, None)
+                .expect("grant");
+        }
+        drop(policy);
+        let host = ExtensionHost::open(config(&root)).expect("host");
+        let document = root.join("main.rs");
+        std::fs::write(&document, "fn main() {}").expect("document");
+        let checked = host
+            .language_check("com.example.language", "rust", &document)
+            .await
+            .expect("language dispatch");
+        assert_eq!(checked["language"], "rust");
+        assert_eq!(checked["text"], "fn main() {}");
+        let integrated = host
+            .run_integration(
+                "com.example.language",
+                "github",
+                serde_json::json!({"q": 1}),
+            )
+            .await
+            .expect("integration dispatch");
+        assert_eq!(integrated["q"], 1);
     }
 
     #[cfg(unix)]
