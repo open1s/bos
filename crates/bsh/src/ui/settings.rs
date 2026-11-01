@@ -6894,7 +6894,6 @@ impl Shell {
             .collect();
         let approval_settings = self.state.settings.clone();
         let approval_workspace = workspace.clone();
-        let approval_view = cx.entity();
         let mut approval_rows = div().flex().flex_col().gap(px(6.0));
         for (id, program, name) in &approvals {
             let id = id.clone();
@@ -6905,7 +6904,6 @@ impl Shell {
             );
             let settings = approval_settings.clone();
             let workspace = approval_workspace.clone();
-            let view = approval_view.clone();
             approval_rows = approval_rows.child(
                 div()
                     .flex()
@@ -6925,7 +6923,7 @@ impl Shell {
                             .bg(rgb(theme::new_session_fill()))
                             .child(txt(label, 12.0, theme::text()))
                             .on_click(cx.listener({
-                                move |_this, _event, _window, cx| {
+                                move |this, _event, _window, cx| {
                                     if crate::extension::approve_process(
                                         &settings,
                                         workspace.as_deref(),
@@ -6934,14 +6932,11 @@ impl Shell {
                                     )
                                     .is_ok()
                                     {
-                                        let statuses = crate::extension::statuses(
+                                        this.extension_statuses = Some(crate::extension::statuses(
                                             &settings,
                                             workspace.as_deref(),
-                                        );
-                                        view.update(cx, |this, cx| {
-                                            this.extension_statuses = Some(statuses);
-                                            cx.notify();
-                                        });
+                                        ));
+                                        cx.notify();
                                     }
                                 }
                             })),
