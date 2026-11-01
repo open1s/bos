@@ -12,6 +12,8 @@ use gpui_kit::component::button::Button;
 use gpui_kit::*;
 
 use crate::extension::host::PanelSurface;
+use crate::extension::runtime::CallContext;
+use crate::extension::types::ExtensionError;
 use crate::extension::ui::{
     ButtonStyle, NotificationLevel, PanelLocation, ThemePalette, UiActionRequest, UiDocument,
     UiNode, UiSession,
@@ -250,8 +252,25 @@ impl ExtensionPanelView {
         self.message = Some("Running…".to_string());
         cx.spawn(async move |this, cx| {
             let action_for_call = action.clone();
+            let context = CallContext::new(
+                panel.owner.clone(),
+                format!("panel:{}", panel.panel_id),
+                None,
+                30_000,
+            );
             let outcome = crate::extension::run_on_tokio(async move {
-                runtime.command(&action_for_call, payload).await
+                // An action names either a tool or a runtime command. Tools are
+                // the common case (the hello panel's Echo is a tool); fall back
+                // to the command seam only when no tool owns the id.
+                match runtime
+                    .call_tool(&action_for_call, payload.clone(), &context)
+                    .await
+                {
+                    Err(ExtensionError::NotFound { .. }) => {
+                        runtime.command(&action_for_call, payload).await
+                    }
+                    other => other,
+                }
             })
             .await;
             let _ = this.update(cx, |this, cx| {
