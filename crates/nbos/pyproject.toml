@@ -5,10 +5,10 @@ build-backend = "maturin"
 [project]
 name = "nbos"
 version = "3.0.2"
-description = "Multi-language AI agent framework. Agents, tools, event bus, MCP, skills, memory — in Python."
+description = "BOS (BrainOS) for Python — AI agents with tools, skills, memory, MCP and a multi-agent event bus, on a Rust core."
 requires-python = ">=3.9"
 authors = [{name = "BrainOS Team", email = "oss@open1s.com"}]
-keywords = ["ai", "agent", "llm", "multi-agent", "mcp", "brainos", "react", "agent-framework", "rust", "tools"]
+keywords = ["ai", "agent", "llm", "multi-agent", "mcp", "mcp-client", "brainos", "bos", "react", "agent-framework", "agent-runtime", "tool-calling", "function-calling", "rust", "tools"]
 classifiers = [
   "Programming Language :: Python",
   "Programming Language :: Rust",

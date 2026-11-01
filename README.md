@@ -1,44 +1,56 @@
-English | [中文版本](./README-ZH.md)
+<p align="right">
+  <b>English</b> · <a href="README-ZH.md">中文</a>
+</p>
 
-<p align="center"> BrainOS — Multi-language AI agent runtime. One framework — Rust core, Python & JS bindings.
+<p align="center">
+  <img src="docs/assets/bos-logo.png" alt="BOS — BrainOS" width="440">
+</p>
+
+<p align="center">
+  <strong>An agent runtime in Rust — and the desktop app that runs on it.</strong>
+</p>
+
+<p align="center">
+  <b>BOS</b> (BrainOS) is the runtime: agents, tools, skills, memory, MCP, and a multi-agent bus,<br>
+  with first-class Python and JavaScript bindings over one Rust core.<br>
+  <b>BSH</b> (BOS Harness) is the native desktop app built on that same runtime: workspaces, chat,<br>
+  terminal, browser, editor — and an extension platform that reaches every one of them.
 </p>
 
 <p align="center">
   <a href="https://pypi.org/project/nbos"><img src="https://img.shields.io/pypi/v/nbos?label=python&logo=pypi&color=3776AB" alt="PyPI"></a>
   <a href="https://www.npmjs.com/package/@open1s/jsbos"><img src="https://img.shields.io/npm/v/@open1s/jsbos?label=javascript&logo=npm&color=CB3837" alt="npm"></a>
-  <a href="https://github.com/open1s/bos/actions/workflows/jsbos.yml"><img src="https://github.com/open1s/bos/actions/workflows/jsbos.yml/badge.svg" alt="CI"></a>
-  <a href="https://github.com/open1s/bos/wiki"><img src="https://img.shields.io/badge/docs-wiki-blue?logo=github" alt="Wiki"></a>
+  <a href="https://github.com/open1s/bos/actions/workflows/rust.yml"><img src="https://github.com/open1s/bos/actions/workflows/rust.yml/badge.svg" alt="Rust CI"></a>
+  <a href="https://github.com/open1s/bos/actions/workflows/binding-parity.yml"><img src="https://github.com/open1s/bos/actions/workflows/binding-parity.yml/badge.svg" alt="Binding parity"></a>
   <a href="https://github.com/open1s/bos/blob/main/LICENSE"><img src="https://img.shields.io/github/license/open1s/bos?color=blue" alt="License"></a>
+  <a href="docs/BOS-BSH-Textbook.md"><img src="https://img.shields.io/badge/docs-34%20chapters%20%C2%B7%20second%20edition-blue" alt="Textbook"></a>
 </p>
 
 ---
 
-**You have an LLM. You want it to use tools, talk to other agents, remember conversations, and connect to MCP servers — in Python, JavaScript, or Rust.**
+## Two things, one repository
 
-BOS is the runtime that makes this work out of the box. One `pip install nbos` or `npm install @open1s/jsbos` gets you agents with tools, a pub/sub event bus for multi-agent coordination, MCP client for external tools, skill loading for domain-specific capabilities, and cross-session memory — all backed by a performant Rust core.
+| | What it is | Start with |
+|---|---|---|
+| **BOS**<br>the runtime | A Rust core (`agent`, `react`, `bus`, `config`, `logging`) plus Python (`nbos`) and JavaScript (`@open1s/jsbos`) bindings. It is what you embed when you want an agent in *your* program. | `pip install nbos`<br>`npm install @open1s/jsbos`<br>`agent = { path = "crates/agent" }` |
+| **BSH**<br>the harness | The native desktop application. It is what you open when you want to *use* an agent: sessions, workspaces, a terminal, a browser, an editor, subagents, scheduled tasks, and extensions. | `cargo build -p bsh` |
 
-<p align="center">
-  <img src="https://github.com/open1s/bos/blob/main/docs/assets/bos-hero.png" alt="BrainOS demo" width="700">
-</p>
+BSH is not a second product with its own stack. It is the first consumer of BOS: the same
+agent loop, the same tools, the same sandbox, the same MCP client. When BSH gets a
+capability, the crates get it too — and the bindings follow.
+
+---
+
+## The 30-second taste
+
+**Python — an agent with a tool:**
 
 ```bash
-# 30-second win — copy, paste, run
-pip install nbos && python -c "
-from nbos import BrainOS
-import asyncio
-print(asyncio.run(BrainOS().agent('assistant').ask('say hi')))
-"
+pip install nbos
 ```
-
----
-
-## Quick Start
-
-### Python (nbos)
 
 ```python
 from nbos import BrainOS, tool
-from nbos.content import Content, ContentPart
 
 @tool("Add two numbers")
 def add(a: int, b: int) -> int:
@@ -46,418 +58,330 @@ def add(a: int, b: int) -> int:
 
 async with BrainOS() as brain:
     agent = brain.agent("assistant").with_tools(add)
-    result = await agent.ask("What is 2+2?")
-
-    # Multimodal: text + image
-    content = Content.parts([
-        ContentPart.text("What is in this image?"),
-        ContentPart.image("https://example.com/photo.jpg"),
-    ])
-    result = await agent.ask(content)
-
-    # Multimodal: text + audio
-    audio_content = Content.parts([
-        ContentPart.text("Transcribe this audio"),
-        ContentPart.audio("/path/to/audio.wav", "wav"),
-    ])
-    result = await agent.ask(audio_content)
+    print(await agent.ask("What is 2+2?"))
 ```
 
-### JavaScript (@open1s/jsbos)
+**JavaScript — the same agent, the same vocabulary:**
+
+```bash
+npm install @open1s/jsbos
+```
 
 ```javascript
-import { BrainOS, ToolDef, Content, ContentPart } from '@open1s/jsbos';
+import { BrainOS, ToolDef } from '@open1s/jsbos';
 
-// Create tool using ToolDef
-const addTool = new ToolDef(
-  'add',
-  'Add two numbers',
+const add = new ToolDef(
+  'add', 'Add two numbers',
   (args) => (args.a || 0) + (args.b || 0),
   { type: 'object', properties: { result: { type: 'number' } }, required: ['result'] },
-  { type: 'object', properties: { a: { type: 'number' }, b: { type: 'number' } }, required: ['a', 'b'] }
+  { type: 'object', properties: { a: { type: 'number' }, b: { type: 'number' } }, required: ['a', 'b'] },
 );
 
 const brain = new BrainOS();
 await brain.start();
-const agent = await brain.agent('assistant')
-  .register(addTool)
-  .start();
-const result = await agent.runSimple('What is 2+2?');
-
-// Multimodal: text + image
-const content = Content.parts([
-    ContentPart.text('What is in this image?'),
-    ContentPart.image('https://example.com/photo.jpg'),
-]);
-const result2 = await agent.ask(content);
-
-// Multimodal: text + audio
-const audioContent = Content.parts([
-    ContentPart.text('Transcribe this audio'),
-    ContentPart.audio('/path/to/audio.wav', 'wav'),
-]);
-const result3 = await agent.ask(audioContent);
+const agent = await brain.agent('assistant').register(add).start();
+console.log(await agent.runSimple('What is 2+2?'));
 ```
 
-### Rust (agent crate)
+**Rust — the engine underneath both:**
 
 ```rust
 use agent::{Agent, AgentConfig};
 
-let config = AgentConfig::default()
-    .name("assistant")
-    .model("openai/gpt-4o")            // vendor inferred from the model prefix
-    .api_key(std::env::var("OPENAI_API_KEY")?);
-let agent = Agent::from_config(config);
-let result = agent.run_simple("Hello").await?;
+#[tokio::main]
+async fn main() {
+    let config = AgentConfig::default()
+        .name("assistant")
+        .model("openai/gpt-4o")          // the vendor is inferred from the prefix
+        .api_key(std::env::var("OPENAI_API_KEY").unwrap_or_default());
+    let agent = Agent::from_config(config);
+    println!("{}", agent.run_simple("Hello").await.expect("agent run"));
+}
 ```
 
----
-
-## Why BOS?
-
-BOS is not another LangChain wrapper or Python-only framework. It's a **multi-language runtime** built from the ground up for production AI agents.
-
-| Need | BOS | Typical alternative |
-|------|-----|-------------------|
-| **Language choice** | Rust core + Python `nbos` + JavaScript `@open1s/jsbos` | Python-only |
-| **Multi-agent** | Built-in event bus (pub/sub, query/RPC, caller/callable) | Ad-hoc or single-process |
-| **External tools** | Native MCP client (stdio + HTTP) | Roll your own |
-| **Agent capabilities** | Directory-based skills system — load domain expertise on demand | Hardcoded prompts |
-| **Memory** | Cross-session persistence built in | Plugin or DIY |
-| **Production** | Circuit breaker, rate limiter, configurable resilience | Often absent |
-| **Performance** | Rust zero-cost abstractions, async Tokio runtime | GIL-bound Python |
-
-**If you want an agent that speaks more than one language, talks to other agents, and works in production — not just a notebook — BOS is the runtime.**
-
----
-
-
-## Skills System
-
-Agents can load capabilities from directory-based skill definitions:
-
-```python
-# Create skills directory with skill folders
-skills_dir = "/path/to/skills"
-agent.register_skills_from_dir(skills_dir)
-```
-
-### Skill Format
-
-Each skill is a directory containing a `SKILL.md` file with YAML frontmatter:
-
-```
-skills/
-├── python-coding/
-│   └── SKILL.md
-├── api-design/
-│   └── SKILL.md
-└── database-ops/
-    └── SKILL.md
-```
-
-**SKILL.md format:**
-```markdown
----
-name: python-coding
-description: Python coding conventions for this project
-category: coding
-version: 1.0.0
----
-
-# Python Coding Conventions
-
-Your skill instructions here...
-```
-
-The agent's LLM receives available skills in the system prompt and can call `load_skill` to retrieve full instructions.
-
----
-
-## Project Structure
-
-```
-bos/
-├── crates/
-│   ├── agent/          # AI agent framework with LLM, skills, tools, MCP
-│   ├── bus/            # Pub/sub, queryable, caller/callable
-│   ├── config/         # TOML/YAML config loading
-│   ├── logging/        # Tracing and instrumentation
-│   ├── react/          # ReAct reasoning engine
-│   ├── qserde/         # rkyv-backed wire format (+ qserde_derive)
-│   ├── resource/       # Resource subsystem + `rex` CLI
-│   ├── nbos/           # Python bindings (nbos package)
-│   └── jsbos/          # Node.js bindings (@open1s/jsbos)
-├── docs/               # User guides
-│   ├── python-user-guide.md
-│   ├── javascript-user-guide.md
-│   └── rust-user-guide.md
-└── Cargo.toml          # Workspace
-```
-
----
-
-## Crates
-
-| Crate | Description | Install |
-|-------|-------------|---------|
-| `agent` | Core agent with LLM integration, tools, skills, MCP | `cargo add agent` |
-| `bus` | Pub/sub, query/response, RPC messaging | `cargo add bus` |
-| `config` | Config loading from TOML, YAML, env vars | `cargo add config` |
-| `logging` | Tracing and observability | `cargo add logging` |
-| `react` | ReAct reasoning + acting engine | `cargo add react` |
-| `qserde` | rkyv-backed archive + wire format for bus payloads | `cargo add qserde` |
-| `resource` | Resource subsystem with `rex` CLI | `cargo add resource` |
-| `nbos` | Python bindings | `pip install nbos` |
-| `jsbos` | Node.js bindings | `npm install @open1s/jsbos` |
-
----
-
-## Commands
+**The app — a window instead of a REPL:**
 
 ```bash
-# Build all
-cargo build --all
-
-# Test all
-cargo test --all
-
-# Lint
-cargo clippy --all
-cargo fmt --all
-
-# Python bindings (nbos)
-cd crates/nbos && maturin develop
-
-# Node.js bindings (jsbos)
-cd crates/jsbos && npm install && npm run build
+git clone https://github.com/open1s/bos && cd bos
+cargo build --release -p bsh
+./target/release/bsh                  # pick a model in Settings → Models
+./crates/bsh/make-dev-app.sh          # macOS: the same binary, wrapped in BSH.app
 ```
 
----
+BSH needs Rust 1.97+ and **Zig 0.16** (the terminal pane compiles Ghostty). On Linux, the
+CI install list in [`.github/workflows/rust.yml`](.github/workflows/rust.yml) is the exact
+set of GTK, WebKitGTK, Wayland and X11 headers the build wants. `make-dev-app.sh` builds a
+debug binary and wraps it in `target/debug/BSH.app`.
 
-## User Guides
+### Point it at a model
 
-- **Python**: [docs/python-user-guide.md](docs/python-user-guide.md)
-- **JavaScript**: [docs/javascript-user-guide.md](docs/javascript-user-guide.md)
-- **Rust**: [docs/rust-user-guide.md](docs/rust-user-guide.md)
-- **BSH by Example** (extension textbook): [docs/BOS-BSH-Textbook.md](docs/BOS-BSH-Textbook.md)
-- **中文**: [README-ZH.md](README-ZH.md)
-
----
-
-## Unified API
-
-The `nbos` package (Python) and `@open1s/jsbos` (JavaScript) provide consistent high-level APIs:
-
-| Feature | Python | JavaScript |
-|---------|--------|------------|
-| Import | `from nbos import BrainOS, tool` | `import { BrainOS, ToolDef } from '@open1s/jsbos'` |
-| Create brain | `async with BrainOS() as brain:` | `const brain = new BrainOS(); await brain.start()` |
-| Create agent | `brain.agent("name")` | `brain.agent("name")` |
-| Fluent config | `.with_model("gpt-4")` | `.model("gpt-4")` |
-| Register tools | `.with_tools(tool)` | `.register(toolDef)` |
-| Run | `await agent.ask("...")` | `await agent.runSimple("...")` |
-| Text content | `Content.text("...")` | `Content.text("...")` |
-| Image content | `ContentPart.image(url)` | `ContentPart.image(url)` |
-| Audio content | `ContentPart.audio(data, format)` | `ContentPart.audio(data, format)` |
-| Bus factory | `BusManager()` | `BusManager.create()` |
-
-### Low-level Bindings
-
-For direct access to Rust bindings:
-
-| Language | Package | Import |
-|----------|---------|--------|
-| Python | `nbos` | `from nbos import Agent, Bus, McpClient, ...` |
-| JavaScript | `@open1s/jsbos` | `import { Agent, Bus, McpClient } from '@open1s/jsbos'` |
-
----
-
-## MCP Client
-
-Connect to MCP servers via stdio or HTTP transport:
-
-### Python
-
-```python
-from nbos import McpClient
-
-# Process-based server
-client = await McpClient.spawn("npx", ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"])
-await client.initialize()
-
-# HTTP server
-client = McpClient.connect_http("http://127.0.0.1:8000/mcp")
-await client.initialize()
-
-# Use tools
-tools = await client.list_tools()
-result = await client.call_tool("echo", '{"text": "hello"}')
-```
-
-### JavaScript
-
-```javascript
-import { McpClient } from '@open1s/jsbos';
-
-// Process-based server
-const client = await McpClient.spawn("npx", ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]);
-await client.initialize();
-
-// HTTP server
-const client = McpClient.connectHttp("http://127.0.0.1:8000/mcp");
-await client.initialize();
-
-// Use tools
-const tools = await client.listTools();
-const result = await client.callTool("echo", '{"text": "hello"}');
-```
-
-### HTTP Server Example
-
-```bash
-# Start an MCP HTTP server
-python3 crates/examples/mcp_http_server.py
-# Server runs on http://127.0.0.1:8000/mcp
-```
-
----
-
-## Configuration
-
-Create `~/.bos/conf/config.toml`:
+**BOS** reads `~/.bos/conf/config.toml`:
 
 ```toml
-# OpenAI-compatible endpoint
 [global_model]
 api_key = "your-api-key"
 base_url = "https://api.openai.com/v1"
 model = "gpt-4"
 
-# NVIDIA NIM
+# ...or name the vendors you use and let the model prefix pick one
 [llm.nvidia]
 api_key = "nv-..."
 base_url = "https://integrate.api.nvidia.com/v1"
 model = "nvidia/llama-3.1-nemotron-70b-instruct"
 
-# Google AI (Gemini, etc.)
 [llm.google]
 api_key = "google-api-key"
 base_url = "https://generativelanguage.googleapis.com/v1"
 model = "gemini-pro"
 
-# OpenRouter
 [llm.openrouter]
 api_key = "or-..."
 base_url = "https://openrouter.ai/api/v1"
 model = "anthropic/claude-3-haiku"
-
-[bus]
-mode = "peer"
-listen = ["127.0.0.1:7890"]
 ```
 
-Or use environment variables: `OPENAI_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL`
+Environment variables work too: `OPENAI_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL`.
+
+**BSH** has the same providers as rows you can edit: **Settings → Models**. Its settings live
+in `~/.bos/bsh/settings.toml`, and the values that must not sit there in plain text go into the
+encrypted vault beside it.
+
+---
+
+## Why this instead of another agent framework
+
+| What you need | What is here | What people usually settle for |
+|---|---|---|
+| **One behavior, three languages** | A Rust core with `nbos` and `@open1s/jsbos` over it; a CI guard fails the build when the two binding surfaces drift | A Python framework and a half-ported SDK |
+| **Agents that talk to each other** | `bus`: publish/subscribe, query/response and caller/callable RPC, with an rkyv wire format | Ad-hoc HTTP between processes |
+| **Tools you can actually run** | One sandbox implementation (macOS SBPL, Linux Landlock + Seccomp, Windows AppContainer) behind the tool *and* terminal seams | "The model asked nicely, so it is fine" |
+| **Domain knowledge** | Directory skills — a `SKILL.md` with frontmatter, loaded on demand by the model | One system prompt that keeps growing |
+| **External tool servers** | An MCP client over stdio and HTTP, with tools, resources and prompts mapped in | A bespoke adapter per server |
+| **Context that survives** | In-memory and file-backed memory, metadata filters, `{{memory}}` in the prompt | RAG glue rebuilt per project |
+| **Production behavior** | Retry classification, rate limiter, circuit breaker, per-run token/tool/time metrics | Hope, then a postmortem |
+| **A face** | A GPU-rendered native window (GPUI), not an Electron shell | A web UI bolted onto a CLI |
+
+---
+
+## Inside the runtime (BOS)
+
+- **Agent loop** — `crates/react` runs the ReAct cycle: stream, call tools, observe, continue.
+  Hooks fire at the seams (`before_tool_call`, `after_llm_call`, `on_complete`, `on_error`, …)
+  so a host can observe or gate a step without forking the engine.
+- **Providers** — any OpenAI-compatible endpoint, the Anthropic protocol, NVIDIA NIM, Google
+  AI and OpenRouter, selected by config or by the model's vendor prefix.
+- **Tools** — wrap a closure with `FunctionTool`/`AsyncFunctionTool`, or implement
+  `Tool`/`AsyncTool` and register it; the agent reaches them through the `react` seam, never
+  through the bus.
+- **Skills** — point the agent at a directory of `SKILL.md` folders and the model gets the
+  catalogue in its system prompt, then calls `load_skill` for the full instructions.
+- **Memory** — `InMemoryMemory` ranks by keyword overlap and recency; `FileMemory` persists the
+  same ranking to JSON lines so it survives a restart. Filters scope recall; `{{memory}}` places
+  it in the prompt.
+- **MCP** — connect to servers you already have, over stdio or HTTP, and use their tools,
+  resources and prompts as if they were native.
+- **The bus** — `Publisher`/`Subscriber` for events, `Queryable` for request/response, and
+  `Callable`/`Caller` for RPC. A session attaches all of them to one transport.
+- **Sandbox** — `heel` is the one sandbox implementation: the workspace is the only writable place,
+  executable bytes are written nowhere, reads are opt-in above a baseline, and network goes
+  through a policy.
+- **Observability** — tracing through `crates/logging`, plus call metrics (tokens, tool calls,
+  wall time, rate-limit waits) that both bindings expose.
+
+### MCP, without a wrapper library
+
+```python
+from nbos import McpClient
+
+client = await McpClient.spawn("npx", ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"])
+await client.initialize()
+
+tools = await client.list_tools()
+print(await client.call_tool("echo", '{"text": "hello"}'))
+```
+
+The JavaScript client has the same calls in camelCase (`listTools`, `callTool`,
+`connectHttp`), and `agent` exposes the same client to the Rust host.
+
+### The bindings stay in step
+
+`nbos` and `@open1s/jsbos` are not translations of each other — they are two surfaces over the
+same engine, held to one vocabulary (`ask`, `call`, `publish_text`, `recv`, `handle`, …) by
+three static guards that run on every pull request: [`parity.test.js`](crates/jsbos/test/parity.test.js)
+compares the Python and JavaScript classes, [`native-bindings.test.js`](crates/jsbos/test/native-bindings.test.js)
+proves every wrapper call resolves to a real native member, and
+[`api-docs.test.js`](crates/jsbos/test/api-docs.test.js) proves every public member is documented.
+
+| | Python | JavaScript |
+|---|---|---|
+| Import | `from nbos import BrainOS, tool` | `import { BrainOS, ToolDef } from '@open1s/jsbos'` |
+| Create the runtime | `async with BrainOS() as brain:` | `const brain = new BrainOS(); await brain.start()` |
+| Create an agent | `brain.agent("name")` | `brain.agent("name")` |
+| Choose a model | `.with_model("gpt-4")` | `.model("gpt-4")` |
+| Register tools | `.with_tools(add)` | `.register(toolDef)` |
+| Run | `await agent.ask("…")` | `await agent.runSimple("…")` |
+| Multimodal | `Content.parts([...])` | `Content.parts([...])` |
+| Low level | `from nbos import Agent, Bus, McpClient` | `import { Agent, Bus, McpClient } from '@open1s/jsbos'` |
+
+---
+
+## Inside the harness (BSH)
+
+`bsh` is one native binary. Everything below is in it, backed by the crates in this repo —
+none of it is a mock surface:
+
+- **Workspaces and sessions** — each workspace is a directory and a boundary; sessions are
+  stored, searched, pinned, archived, forked and restored on launch.
+- **The conversation** — streaming turns, a turn rail for jumping back, a to-do panel fed by
+  the agent's own plan store, a queue for messages typed mid-turn, subagent runs listed while
+  they stream, and scheduled tasks that fire into a session on a cadence.
+- **A real terminal** — Ghostty's Metal surface inside the window, with each submitted line
+  checked by the terminal policy before the shell sees it.
+- **A browser pane** — a WebView (WKWebView on macOS, WebKitGTK on Linux) for pages, and
+  `bsh --browser=URL` to land on one directly.
+- **An editor** — file tree, tabs, diffs, and tree-sitter grammars for the languages people
+  actually open.
+- **Settings that mean something** — account, vault, general, models, plugins and agent
+  presets; a `settings.toml` that is read once per launch, and an encrypted vault
+  (Argon2id + XChaCha20-Poly1305) for the values that must not sit in it in plain text.
+- **Two languages** — English and Chinese, translated pane by pane rather than in the menu only.
+- **Extensions** — see below. The app is designed so a package can add a tool, a command, a
+  panel, a prompt, a context, a skill, a theme, an icon, a language service, an agent role, a
+  workflow, storage, events, or an observation hook.
+
+---
+
+## Extensions: one manifest, six runtimes
+
+A package is a directory with an `extension.toml` and the contributions it declares. The host
+validates it, hashes it, installs it into a content-addressed store, resolves its dependencies,
+runs its lifecycle, and then dispatches each call through a capability policy that decides —
+per call, with scopes — whether the package may do the thing it asked for.
+
+<p align="center">
+  <img src="docs/assets/charts/architecture.png" alt="From package to contribution: validate, hash, install, resolve, gate, dispatch, run" width="820">
+</p>
+
+| Runtime | Use it when | The guest is |
+|---|---|---|
+| **declarative** | The work is JSON: tools, panels, prompts, themes | No code |
+| **process** | The work is an existing program or CLI | A child process speaking line-delimited JSON-RPC |
+| **wasm-component** | It is new third-party code that needs a hard sandbox | A WASM component against the WIT contract |
+| **extism** | You already have an Extism plugin | A plugin, with a `bsh_host` import surface |
+| **mcp** | You already have an MCP server | That server, stdio |
+| **built-in** | You are first-party and linked in | Rust in this repository |
+
+<p align="center">
+  <img src="docs/assets/charts/call-path.png" alt="Every tool call: authorize each declared capability, deny with a reason and an audit row, or call with a deadline" width="700">
+</p>
+
+```bash
+# Build the app first, then use its developer CLI.
+export BSH=./target/release/bsh
+
+$BSH ext new com.acme.hello --dir hello   # scaffold a package
+$BSH ext validate hello                   # schema, ids, files, compatibility
+$BSH ext mock hello echo '{"text":"hi"}'  # run a tool against a permissive host
+$BSH ext install hello                    # stage, hash, authorize, activate
+$BSH ext list                             # what the host believes is installed
+$BSH ext doctor                           # hash drift, dependency and policy gaps
+$BSH ext grant com.acme.hello workspace.write --scope workspace
+$BSH ext logs com.acme.hello              # the audit trail, decision by decision
+```
+
+Start from a working package: [`examples/extensions/hello`](examples/extensions/hello) is
+declarative, [`process-echo`](examples/extensions/process-echo) speaks JSON-RPC,
+[`wasm-echo`](examples/extensions/wasm-echo) and [`extism-echo`](examples/extensions/extism-echo)
+are sandboxed, [`mcp-echo`](examples/extensions/mcp-echo) reuses a server you already have, and
+[`extism-hook`](examples/extensions/extism-hook) observes the model and HTTP traffic. CI verifies
+every one of them on every push ([`scripts/ci/verify-bsh-examples.sh`](scripts/ci/verify-bsh-examples.sh)).
+
+- **Normative contract:** [`docs/bsh-extension-standard.md`](docs/bsh-extension-standard.md) · **walkthrough:**
+  [`docs/bsh-extension-dev-guide.md`](docs/bsh-extension-dev-guide.md) · **WIT:**
+  [`crates/bsh/wit/extension.wit`](crates/bsh/wit/extension.wit)
+- **Twenty capabilities**, from `workspace.write` and `network.http` to `secrets.read`,
+  `process.execute` and `hooks.observe`, each grantable with a scope and each decision written to
+  an audit log.
+- **Hooks are not events:** an event is after the fact and has many subscribers; a hook is a
+  declared seam call with one receiver class. [`docs/bsh-hook-system.md`](docs/bsh-hook-system.md)
+- **Signing and trust:** `bsh ext keygen`/`sign`/`trust`/`verify`, a dependency lockfile, and a
+  market that can point at any Git repository.
+
+---
+
+## Repository map
+
+```
+crates/
+├── agent/        agents, tools, skills, memory, MCP, sessions, sandbox, policies
+├── react/        the ReAct engine and LLM client seam
+├── bus/          pub/sub, query, caller/callable
+├── config/       TOML/YAML/env loading, discovery
+├── logging/      tracing and instrumentation
+├── qserde/       rkyv-backed wire format used by the bus
+├── resource/     standalone resource subsystem and the `rex` CLI
+├── bsh/          the BSH desktop harness (binary + extension platform)
+├── nbos/         Python bindings -> pip install nbos
+└── jsbos/        Node.js bindings -> npm install @open1s/jsbos
+```
+
+Layers flow one way: `nbos`/`jsbos` → `agent` → `react` → `bus` → `logging` → `config`.
+`resource` stands alone. The [ARCHITECTURE.md](ARCHITECTURE.md) has the long version.
 
 ---
 
 ## Examples
 
-See the examples directories:
+| | |
+|---|---|
+| **Python** | [`crates/examples/`](crates/examples) — agents, the bus, MCP (stdio and HTTP), hooks, plugins; [`crates/nbos/examples/`](crates/nbos/examples) for multimodal content and audio |
+| **JavaScript** | [`crates/jsbos/examples/`](crates/jsbos/examples) — the same set, plus an MCP-over-HTTP agent |
+| **Rust** | [`crates/agent/examples/`](crates/agent/examples) — quickstart, hooks and plugins, resilience; [`crates/react/examples/`](crates/react/examples) for a bare LLM call |
+| **Extensions** | [`examples/extensions/`](examples/extensions) — one package per runtime, all verified in CI |
 
-- Python: `crates/nbos/examples/`
-- JavaScript: `crates/jsbos/examples/`
-- Rust: `crates/examples/` (includes `agent_skill_demo.rs`)
+---
 
-### Multimodal Demos
+## Documentation
+
+| Start here | |
+|---|---|
+| [**BSH by Example**](docs/BOS-BSH-Textbook.md) | A 34-chapter working book on the app and its extension framework — second edition |
+| [Python guide](docs/python-user-guide.md) · [JavaScript guide](docs/javascript-user-guide.md) · [Rust guide](docs/rust-user-guide.md) | The three surfaces, with complete examples |
+| [Extension standard](docs/bsh-extension-standard.md) · [dev guide](docs/bsh-extension-dev-guide.md) | The normative contract, and the shortest path to a package |
+| [Architecture](ARCHITECTURE.md) · [Onboarding](ONBOARDING.md) | How the layers fit, and how to get productive in this repo |
+| [Settings spec](docs/bsh-settings-spec.md) · [Terminal policy](docs/bsh-terminal-policy.md) · [Hooks](docs/bsh-hook-system.md) · [Observability capture](docs/bsh-observability-capture.md) | The behaviour behind specific panes |
+| [`rex` CLI](docs/rex-user-guide.md) · [Diagnostics](docs/diagnostics.md) | The standalone resource tool, and what to do when something misbehaves |
+| [Wiki](https://github.com/open1s/bos/wiki) · [Changelog](CHANGELOG.md) | Guides and release notes |
+
+---
+
+## Build, test, contribute
 
 ```bash
-# Python multimodal (text, image, audio)
-python crates/nbos/examples/demo_multimodal.py
+cargo build --workspace                  # everything
+cargo test --workspace                   # the core workspace (bindings have their own suites)
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 
-# JavaScript multimodal (text, image, audio)
-node crates/jsbos/examples/demo_multimodal.js
-
-# JavaScript audio demo
-node crates/jsbos/examples/demo_audio.js
+# bindings
+cd crates/nbos  && maturin develop && pytest -m "not llm"
+cd crates/jsbos && npm install && npx ava
 ```
 
-### MCP Demos
+- **CI** runs the workspace tests, clippy, rustdoc, the extension-example verifier, and the two
+  binding pipelines: [`.github/workflows/`](.github/workflows/)
+- **Contribute:** [CONTRIBUTING.md](CONTRIBUTING.md) · **security:** [SECURITY.md](SECURITY.md) ·
+  **versioning:** this repo uses [jj](https://github.com/jj-vcs/jj) — every change is a stack you
+  are expected to curate before pushing.
+- **Good first contributions:** write an extension for a tool you already use, add a grammar or a
+  language service, or pick up an issue labelled `good first issue`.
 
-```bash
-# JavaScript MCP HTTP demo
-node crates/jsbos/examples/mcp_http_agent_demo.js
-
-# Python MCP HTTP demo (run server first, then use)
-python3 crates/examples/mcp_http_server.py
-```
+If BSH or BOS saves you a day, **star the repository** — it is the signal that keeps this work
+funded, and it is how the next person finds it.
 
 ---
 
 ## License
 
-MIT OR Apache-2.0
-
----
-
-## Changelog
-
-### v3.0.2 (2026-10-07)
-
-- **Fixed**: rate-limit/retry waits and per-run token, tool-call and tool-time metrics now recorded on the live LLM path
-- **Fixed**: npm publish pipeline hardened — serialized publishes, dist-tag repair, stray-tag guard, idempotent re-runs
-- **Docs**: READMEs refreshed for the 3.0.2 baseline release
-
-### v3.0.1 (2026-10-07)
-
-- **Added**: Memory store (in-memory/file-backed) with metadata filters, `{{memory}}` prompt placeholder, and a `Memory` class in Python/JS
-- **Added**: `react::template` prompt templates; `AsyncFunctionTool::from_fn`
-- **Added**: Retry classification by error type; rate limiter honours `retry_backoff`/`auto_wait`
-- **Added**: Per-call min/max LLM wall time in metrics, surfaced by both bindings
-
-### v2.3.6 (2026-07-01)
-
-- **Added**: `skill_dir` to `load_skill` tool result — LLM receives the parent path of `SKILL.md` for accessing bundled resources
-
-### v2.3.5
-
-- **Added**: Skills system: directory-based skill loading with `SKILL.md` files
-- **Added**: `load_skill` tool — LLM can load skill instructions on demand
-- **Added**: Skill caching with TTL in ReAct engine
-- **Fixed**: Skill load performance — avoid redundant filesystem reads
-
-### v2.3.0 (2026-06-09)
-
-- **Added**: Audio support — `Content.audio()`, `ContentPart.audio()` for multimodal LLM calls
-- **Added**: LLM vendor configuration — `[llm.google]`, `[llm.nvidia]`, `[llm.openrouter]` in config
-- **Added**: `demo_audio.js` and `demo_multimodal.js` examples
-- **Added**: `demo_multimodal.py` Python example
-- **Improved**: Content API — unified `Content`/`ContentPart`/`Binary` classes for text, images, audio
-- **Fixed**: Content serialization for multimodal messages
-
-### v2.2.0 (2026-05-18)
-
-- **Added**: `agent.stop()` — stop a running agent/react/stream via ESC key
-- **Added**: `agent.is_running()` — check if agent is currently running
-- **Added**: Stop flag and running state in NAPI Agent layer
-- **Added**: `StreamToken::Stopped` variant for stream cancellation
-- **Added**: Concurrent call prevention with error "Agent is already running"
-- **Added**: Stream returns `{status: "stopped"|"completed"}` JSON string
-- **Breaking**: `stream()` now returns `String` (JSON status object) instead of `()`
-
-### v2.1.4 (2026-05-15)
-
-- **Fixed**: `getPerfMetrics()` now correctly updates after `stream()` calls
-- **Added**: Token usage tracking — `totalInputTokens` and `totalOutputTokens` are now recorded from LLM responses for `react()`, `runSimple()`, and `stream()`
-- **Added**: Tool invocation tracking — `toolInvocationCount` records actual tool calls made by the agent
-- **Renamed**: Metrics fields for clarity: `callCount` → `llmCallCount`, `toolCallCount` → `toolInvocationCount`
-- **Added**: `agent_metrics_demo.js` example to verify metrics recording
-
-### v2.1.3 (2026-05-13)
-
-- Previous release
-
----
-
-**Version**: 3.0.2 | **Last Updated**: 2026-10-07
+MIT OR Apache-2.0 · **Version** 3.0.2 · [Releases](https://github.com/open1s/bos/releases)
