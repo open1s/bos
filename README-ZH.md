@@ -3,21 +3,20 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/bos-logo.png" alt="BOS — BrainOS AI 智能体框架" width="440">
+  <img src="docs/assets/bos-logo.png" alt="BOS — Rust 原生 AI Agent 平台" width="440">
 </p>
 
 <h1 align="center">BOS — Rust 原生 AI Agent 平台</h1>
 
 <p align="center">
-  <strong>一个 Rust 内核，三种开发接口，一个原生 Agent 工作空间。</strong>
+  <strong>One Runtime. Multiple Interfaces. One Extensible Agent Workspace.</strong>
 </p>
 
 <p align="center">
-  BOS（BrainOS）是一套面向 AI Agent 构建、集成与运行的可组合平台。
-  Rust Runtime 将 Agent 编排、工具调用、MCP、Skills、Memory 和多智能体通信
-  统一在同一执行内核之上。开发者可以直接使用 Rust，也可以通过 NBOS（Python）
-  和 JSBOS（JavaScript）调用同一套运行时。<strong>BSH（BOS Harness）</strong>
-  则把这套 Runtime 带入原生桌面工作空间，服务于 Agent 驱动的开发流程。
+  BOS（BrainOS）是一个 Rust 原生 AI Agent 平台：以统一的 <strong>BOS Runtime</strong> 为执行核心，
+  通过多种开发接口向不同语言和应用开放同一套运行能力，并以 <strong>BSH（BOS Harness）</strong>
+  提供可扩展的原生桌面 Agent 工作空间。开发者可以直接使用 Rust，也可以通过 NBOS（Python）
+  和 JSBOS（JavaScript）接入同一运行时。
 </p>
 
 <p align="center">
@@ -41,11 +40,11 @@
 
 ## BOS 是什么？
 
-**BOS 为 AI Agent 提供统一的运行时基础，而不是绑定某一种语言或交互界面。**
+**BOS 的核心是一套共享的 Rust Runtime，通过多种开发接口开放能力，并最终汇聚到一个可扩展的 Agent 工作空间。**
 
-Rust Runtime 承担核心执行能力；NBOS 和 JSBOS 将同一套引擎开放给 Python 与
-JavaScript；BSH 则以原生桌面应用的形式提供完整工作环境。开发者既可以把 Agent
-能力嵌入自己的产品，也可以通过 BSH 构建、调试和运行 Agent。
+Runtime 是统一执行基础，不依附于某一种语言 SDK 或桌面应用。开发者可以直接使用 Rust，
+也可以通过 NBOS（Python）和 JSBOS（JavaScript）调用同一套执行内核。BSH 则是建立在
+该 Runtime 之上的原生 GPUI 工作空间，将 Agent 执行、开发工具与扩展平台整合在一起。
 
 | 产品组成 | 核心能力 | 适用场景 |
 |---|---|---|
@@ -60,8 +59,8 @@ BOS 的核心设计原则是：**Agent Runtime 不应被某一种语言、某一
 同一套 Rust 实现同时服务于原生 Rust 应用、Python 与 JavaScript SDK，以及 BSH 桌面端。
 团队因此可以使用一致的执行模型，将 Agent 嵌入业务产品、通过脚本自动化，或在桌面工作空间中运行。
 
-- **一个内核，三种语言。** 直接使用 Rust，或通过 Python、JavaScript SDK 开发。
-  两种语言绑定共享底层实现，并通过 CI 检查 API 一致性。
+- **多种接口，一套执行模型。** 可以直接使用 Rust Runtime，也可以通过 NBOS Python
+  和 JSBOS JavaScript SDK 开发。语言绑定共享底层实现，并通过 CI 检查 API 一致性。
 - **完整 Agent 执行循环。** 基于 ReAct 完成模型流式输出、工具调用、结果观察和后续推理，
   并提供生命周期 Hooks。
 - **内置 MCP。** 通过 stdio 或 HTTP 连接 Model Context Protocol 服务端，发现并调用工具，
@@ -219,6 +218,7 @@ from nbos import McpClient
 
 client = await McpClient.spawn("npx", ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"])
 await client.initialize()
+```
 
 ## Runtime 核心能力
 
@@ -247,11 +247,11 @@ CI 会检查公开 API、Native Wrapper 映射和 API 文档，避免绑定接�
 | 注册工具 | `.with_tools(add)` | `.register(toolDef)` |
 | 执行 | `await agent.ask("…")` | `await agent.runSimple("…")` |
 
-## BSH：原生 AI Agent 工作空间
+## 一个可扩展的 Agent 工作空间：BSH
 
-**BSH 是建立在 BOS Runtime 之上的原生桌面产品。**
-它基于 GPUI 构建，将 Agent 会话、项目、终端、浏览器、代码编辑器和扩展整合到同一工作空间。
-Agent 不再是开发环境之外的独立聊天窗口，而是可以参与实际开发流程的执行能力。
+**BSH 是建立在 BOS Runtime 之上的原生 GPUI 工作空间。** 它将 Agent 会话、项目、终端、
+浏览器、代码编辑器和扩展整合到同一环境。Agent 执行能力与开发者日常使用的工具并置，
+扩展平台则允许团队围绕自己的工作流程定制工作空间。
 
 - **工作区与会话** —— 按项目组织工作空间和持久会话，支持搜索、置顶、归档、分叉与恢复。
 - **Agent 对话** —— 流式响应、轮次导航、任务计划、消息队列、子 Agent 运行状态和定时任务。
@@ -265,9 +265,9 @@ Agent 不再是开发环境之外的独立聊天窗口，而是可以参与实�
 
 ## 扩展平台
 
-BOS Runtime 面向应用集成，BSH 面向可扩展的桌面工作流。扩展通过 `extension.toml`
-描述和打包；BSH 负责校验 Manifest 与包内容、解析依赖、管理生命周期，并在扩展请求
-宿主能力时执行相应的能力授权策略。
+扩展平台是 BSH 工作空间的可扩展层。BOS Runtime 面向应用集成，BSH 则围绕开发者
+工作流程进行扩展。每个扩展通过 `extension.toml` 描述和打包；BSH 负责校验 Manifest 与
+包内容、解析依赖、管理生命周期，并在扩展请求宿主能力时执行相应的能力授权策略。
 
 <p align="center">
   <img src="docs/assets/charts/architecture.png" alt="BSH 扩展架构：校验、哈希、安装、依赖解析、授权、分发与执行" width="820">
