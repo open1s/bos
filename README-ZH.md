@@ -163,7 +163,8 @@ base_url = "https://integrate.api.nvidia.com/v1"
 model = "nvidia/your-model"
 ```
 
-也可以用环境变量：`OPENAI_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL`。
+如果调用参数与配置文件都没有提供 key，两种绑定都会读取 `OPENAI_API_KEY`；
+没有 `LLM_BASE_URL`、`LLM_MODEL` 这类覆盖——base URL 与模型来自调用参数或上面的配置段。
 
 **BSH** 把同样的供应商做成了可编辑的行：**设置 → 模型**。它的设置存放在
 `~/.bos/bsh/settings.toml`；不该以明文落盘的凭据，放进它旁边的加密保险库。

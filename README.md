@@ -169,12 +169,12 @@ base_url = "https://integrate.api.nvidia.com/v1"
 model = "nvidia/your-model"
 ```
 
-Environment variables are also supported: `OPENAI_API_KEY`, `LLM_BASE_URL`, and
-`LLM_MODEL`. In BSH, configure providers under **Settings → Models**. Sensitive values
-are stored in its encrypted vault rather than plain-text settings.
+If neither the call nor the config file supplies a key, both bindings read `OPENAI_API_KEY`.
+There is no `LLM_BASE_URL` / `LLM_MODEL` override — the base URL and the model come from the
+call or from the sections above.
 
-**BSH** has the same providers as rows you can edit: **Settings → Models**. Its settings live
-in `~/.bos/bsh/settings.toml`, and the values that must not sit there in plain text go into the
+In BSH the same providers are rows you can edit under **Settings → Models**. Its settings live
+in `~/.bos/bsh/settings.toml`, and values that must not sit there in plain text go into the
 encrypted vault beside it.
 
 ---
