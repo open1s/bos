@@ -164,7 +164,8 @@ base_url = "https://integrate.api.nvidia.com/v1"
 model = "nvidia/your-model"
 ```
 
-也可以用环境变量：`OPENAI_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL`。
+如果调用参数与配置文件都没有提供 key，两种绑定都会读取 `OPENAI_API_KEY`；
+没有 `LLM_BASE_URL`、`LLM_MODEL` 这类覆盖——base URL 与模型来自调用参数或上面的配置段。
 
 BSH 可在 **设置 → 模型** 中管理 Provider。敏感凭据存放在加密 Vault 中，
 不会以明文形式写入普通设置文件。
