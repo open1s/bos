@@ -6,7 +6,7 @@
 
 ## Executive summary
 
-The textbook is broadly aligned with a substantial implementation, but it must not imply that every documented security boundary is active on every platform. The most important newly reproduced-by-static-inspection gap is that the Linux process sandbox is not enabled by the production default. This is tracked as [Issue #31](https://github.com/open1s/bos/issues/31).
+The textbook is broadly aligned with the implementation, but the review found two P0 platform gaps: Linux ProcessRuntime did not enable bubblewrap by default, and Windows MCP cancellation used Unix-only `libc`. A further call-path review found that Linux McpRuntime bypassed the ProcessRuntime sandbox entirely. Remediation for all three is proposed in [PR #35](https://github.com/open1s/bos/pull/35); Linux integration and Windows CI results are pending.
 
 This review is source-level and repository-level. It did **not** execute the BSH binary or build/run the example packages: the connected GitHub interface exposes repository files and Actions state, not a local checkout/terminal. No example is marked runtime-verified based only on reading its files.
 
@@ -67,33 +67,33 @@ The existing `docs/bsh-extension-peer-review.md` records the earlier C1/H1–H9 
 
 ### Contract drift requiring attention
 
-1. `docs/bsh-extension-standard.md` §15 currently says Linux runs the bubblewrap plan.
-2. `docs/bsh-extension-conformance.md` §12/§20 explicitly lists Linux filesystem sandboxing as a remaining gap.
-3. The process runtime source initializes `sandbox` with `cfg!(target_os = "macos")`, while the Linux spawn branch requires `self.sandbox && cfg!(target_os = "linux")`. The Linux branch therefore is not selected by the production default.
-
-The textbook has been amended in this review branch to state the effective behaviour and link Issue #31.
+The original `main` branch had stale security statements and an inactive Linux ProcessRuntime sandbox default. PR #35 updates the textbook, normative standard and conformance matrix to match the remediation branch. A separate MCP call-path review also found and addressed the direct-spawn bypass tracked by [Issue #36](https://github.com/open1s/bos/issues/36).
 
 ## 3. Security review
 
-### Finding SEC-01 — Linux process sandbox disabled by default
+### Finding SEC-01 — Linux ProcessRuntime sandbox disabled by default
 
 **Severity:** High  
-**Status:** Open — [Issue #31](https://github.com/open1s/bos/issues/31)
+**Status:** Remediation proposed in [PR #35](https://github.com/open1s/bos/pull/35); CI pending — [Issue #31](https://github.com/open1s/bos/issues/31)
 
-Evidence:
+Evidence on the reviewed `main` revision:
 
-- `ProcessRuntime::new()` sets `sandbox: cfg!(target_os = "macos")`.
-- The Linux process-spawn path invokes `bwrap` only when `self.sandbox && cfg!(target_os = "linux")`.
-- The extension runtime's `with_sandbox(true)` call found in this review is in a macOS-only test, not the production construction path.
+- `ProcessRuntime::new()` set `sandbox: cfg!(target_os = "macos")`.
+- The Linux spawn branch invoked `bwrap` only when `self.sandbox && cfg!(target_os = "linux")`.
 
-Impact: Linux process extensions are spawned without the documented bubblewrap namespace and mount restrictions. They run with the BSH user's filesystem permissions, subject to other process limits and environment filtering.
+The PR enables the sandbox by default on Linux, fails closed when bubblewrap cannot run, and adds a Linux integration test that attempts a write to host HOME outside the package bind.
 
-Required remediation:
+### Finding SEC-04 — Linux MCP runtime bypassed the process sandbox
 
-- Enable sandboxing by default on supported Linux systems.
-- Fail closed for untrusted extensions if bubblewrap or required kernel features are unavailable; do not silently launch unsandboxed.
-- Add a Linux integration test proving writes outside the allowed package/workspace/data/temp mounts fail.
-- Make any development opt-out explicit and conspicuous.
+**Severity:** High  
+**Status:** Remediation proposed in [PR #35](https://github.com/open1s/bos/pull/35); CI pending — [Issue #36](https://github.com/open1s/bos/issues/36)
+
+Evidence on the reviewed `main` revision:
+
+- `McpCore::start()` used `Command::new(&program)` directly and did not invoke bubblewrap.
+- MCP still launches package-controlled code under `process.execute`, so the capability grant alone did not provide filesystem isolation.
+
+The PR reuses the shared Linux bubblewrap launch plan for MCP and adds an integration test that verifies an MCP child cannot write outside its package root. Missing bubblewrap or namespace failure aborts the spawn; no unsandboxed fallback is provided.
 
 ### Finding SEC-02 — Process child networking is not mediated by network.http
 
@@ -104,12 +104,12 @@ The macOS profile is a filesystem-write profile and starts with network access a
 
 This may be an intentional consequence of granting arbitrary process execution, but the capability model must say so clearly. Do not describe `network.http` as controlling network access by process children. Stronger enforcement would require a network namespace/firewall/proxy design, not just a filesystem sandbox.
 
-### Finding SEC-03 — Windows MCP cancellation does not compile
+### Finding SEC-03 — Windows MCP cancellation did not compile
 
 **Severity:** High for Windows CI / platform coverage  
-**Status:** Open — [Issue #33](https://github.com/open1s/bos/issues/33)
+**Status:** Remediation proposed in [PR #35](https://github.com/open1s/bos/pull/35); Windows CI pending — [Issue #33](https://github.com/open1s/bos/issues/33)
 
-The Windows extension test job in Actions run #149 failed to compile `crates/bsh/src/extension/runtime/mcp.rs:683`: `McpCore::kill_child()` unconditionally calls `libc::kill`, while `libc` is declared only under `cfg(unix)` in `crates/bsh/Cargo.toml`. This is a concrete CI failure (E0433), not a speculative static concern. Use a platform abstraction or cfg-specific child termination and retain a Windows regression test.
+Actions run #149 failed with E0433 because `McpCore::kill_child()` unconditionally called `libc::kill` while `libc` was declared only under `cfg(unix)`. The PR replaces pid signalling with a separately lockable `std::process::Child` handle and adds a cross-platform termination test.
 
 ### Additional security checks
 
@@ -126,8 +126,8 @@ The Windows extension test job in Actions run #149 failed to compile `crates/bsh
 - [ ] All ten pass `ext test`.
 - [ ] Every tool in every example has at least one representative `ext mock` test where the runtime supports mock.
 - [ ] Process, MCP, WASM and Extism have end-to-end tests against the actual example package.
-- [ ] Linux process extensions are sandboxed by default or refused; no silent unsandboxed fallback.
-- [ ] Linux integration test verifies filesystem boundaries and process teardown.
+- [ ] Linux ProcessRuntime and McpRuntime children are sandboxed by default or refused; no silent unsandboxed fallback.
+- [ ] Linux integration tests verify filesystem boundaries for both runtimes and process teardown.
 - [ ] Capability denial tests cover agent, panel, language, integration and workflow dispatch.
 - [ ] Network capability documentation explicitly distinguishes host-mediated HTTP from child-process sockets.
 - [ ] Textbook, normative standard and conformance matrix agree on each platform's effective guarantees.
@@ -135,5 +135,5 @@ The Windows extension test job in Actions run #149 failed to compile `crates/bsh
 ## 5. Review limitations
 
 - No local checkout or shell execution was available in this review session.
-- GitHub Actions run #149 was inspected: the Windows extension-test job failed with E0433 at `mcp.rs:683`; Linux/MSRV and other jobs were still running at the time of inspection. This run is associated with PR #30's commit, not a successful validation of the documentation changes in this PR.
+- PR #35 adds the Linux bubblewrap integration tests and all-example verification script. Its current Actions results must be checked before any P0 issue is closed; this report does not claim those tests have passed.
 - This is not a formal penetration test, dynamic fuzzing campaign, or independent cryptographic audit.

@@ -262,7 +262,7 @@ fn process_rss_bytes(pid: u32) -> Option<u64> {
 ///
 /// Kept platform-independent so the argument plan is testable on macOS even
 /// though it is only executed on Linux.
-fn linux_bwrap_plan(
+pub(super) fn linux_bwrap_plan(
     root: &Path,
     workspace: Option<&Path>,
     data_root: Option<&Path>,
@@ -283,17 +283,43 @@ fn linux_bwrap_plan(
         "--tmpfs".to_string(),
         "/tmp".to_string(),
     ];
-    let mut writable: Vec<&Path> = vec![root];
+    let mut writable = vec![root.to_path_buf()];
     if let Some(workspace) = workspace {
-        writable.push(workspace);
+        writable.push(workspace.to_path_buf());
     }
     if let Some(data_root) = data_root {
-        writable.push(data_root);
+        writable.push(data_root.to_path_buf());
     }
+    // Mount parent directories before children so nested writable mounts do
+    // not hide one another (for example, a package inside the workspace).
+    writable.sort_by_key(|path| path.components().count());
+    writable.dedup();
+
+    let mut bound = Vec::<PathBuf>::new();
+    let mut created_tmp_dirs = Vec::<PathBuf>::new();
     for path in writable {
+        if path != Path::new("/tmp") && !bound.iter().any(|parent| path.starts_with(parent)) {
+            // /tmp is a fresh tmpfs in the sandbox. Recreate destination
+            // directories before binding a package/workspace/data root that
+            // was originally located under the host's /tmp.
+            if let Ok(relative) = path.strip_prefix("/tmp") {
+                let mut destination = PathBuf::from("/tmp");
+                for component in relative.components() {
+                    if let std::path::Component::Normal(name) = component {
+                        destination.push(name);
+                        if !created_tmp_dirs.contains(&destination) {
+                            plan.push("--dir".to_string());
+                            plan.push(destination.display().to_string());
+                            created_tmp_dirs.push(destination.clone());
+                        }
+                    }
+                }
+            }
+        }
         plan.push("--bind".to_string());
         plan.push(path.display().to_string());
         plan.push(path.display().to_string());
+        bound.push(path);
     }
     plan.push("--chdir".to_string());
     plan.push(root.display().to_string());
@@ -1033,6 +1059,24 @@ mod tests {
     static TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
+    fn the_linux_plan_creates_tmpfs_targets_before_binding_temp_roots() {
+        let plan = linux_bwrap_plan(
+            Path::new("/tmp/bsh-package"),
+            Some(Path::new("/tmp/bsh-package/workspace")),
+            None,
+            Path::new("/tmp/bsh-package/server"),
+            &[],
+        );
+        let dir = plan.iter().position(|item| item == "--dir").expect("tmpfs target dir");
+        let bind = plan.iter().position(|item| item == "--bind").expect("package bind");
+        assert!(dir < bind, "the package destination must exist before bind");
+        assert_eq!(
+            plan.iter().filter(|item| item.as_str() == "--bind").count(),
+            2
+        );
+    }
+
+    #[test]
     fn the_linux_plan_binds_only_writable_roots_and_appends_the_command() {
         let plan = linux_bwrap_plan(
             Path::new("/pkg"),
@@ -1055,7 +1099,15 @@ mod tests {
     impl Scratch {
         fn new(label: &str) -> Self {
             let index = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
+            // Linux replaces /tmp with a private tmpfs in the process sandbox.
+            // Keep the package root elsewhere so the explicit writable bind remains visible.
+            #[cfg(target_os = "linux")]
+            let base = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            #[cfg(not(target_os = "linux"))]
+            let base = std::env::temp_dir();
+            let path = base.join(format!(
                 "bsh-ext-process-{label}-{}-{index}",
                 std::process::id()
             ));

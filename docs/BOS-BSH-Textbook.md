@@ -1581,9 +1581,10 @@ caps and concurrent calls sharing one child.
 - `process.execute` grant required, optionally scoped to program/args;
 - process group and RLIMIT ceilings;
 - macOS filesystem write sandbox profile (not a network sandbox);
-- Linux bubblewrap is not enabled by the current production default; see
-  [Issue #31](https://github.com/open1s/bos/issues/31). Even when enabled, its
-  `--share-net` setting does not isolate process-child networking;
+- Linux Process and MCP runtimes enable bubblewrap by default; missing
+  bubblewrap or namespace setup failure aborts the spawn (fail closed; no
+  unsandboxed fallback). The current plan uses `--share-net`, so child
+  networking remains shared;
 - stdout/stderr captured and bounded.
 
 ## 10.7 Process checklist
@@ -3410,7 +3411,7 @@ Controls:
 - [ ] `doctor` passes on a clean install;
 - [ ] no secret is logged, including in hook payloads.
 
-**Process-runtime warning:** `process.execute` authorizes arbitrary child code. The macOS profile restricts filesystem writes, not network access. The Linux bubblewrap plan is currently not enabled by the production default (`ProcessRuntime::new` sets `sandbox` only on macOS); see [Issue #31](https://github.com/open1s/bos/issues/31). Until fixed and verified on Linux, do not treat Linux process extensions as OS-sandboxed. The Linux plan also uses `--share-net`, so it does not isolate child networking. `network.http` governs host-mediated HTTP calls, not arbitrary sockets opened by a process child.
+**Process/MCP runtime warning:** `process.execute` authorizes arbitrary child code. macOS applies a filesystem-write profile to ProcessRuntime, not a network sandbox. Linux enables bubblewrap by default for ProcessRuntime and McpRuntime; if bubblewrap or namespace setup is unavailable, spawning fails closed rather than launching unsandboxed. The current Linux plan uses `--share-net`, so it does not isolate child networking. `network.http` governs host-mediated HTTP calls, not arbitrary sockets opened by a child process.
 
 ## 34.3 Deliberate limits
 
@@ -3421,9 +3422,10 @@ Controls:
    shell palette.
 4. Lock reproduction covers Git/registry and the recorded local source path.
 5. Process children get RLIMIT ceilings and a process group. macOS applies a
-   filesystem write sandbox (not a network sandbox). Linux currently does not
-   enable its bubblewrap plan by default; see [Issue #31](https://github.com/open1s/bos/issues/31).
-   The plan itself uses `--share-net`, so child network access is not isolated.
+   filesystem write sandbox to ProcessRuntime (not a network sandbox). Linux
+   enables bubblewrap by default for ProcessRuntime and McpRuntime and fails
+   closed if it cannot start; `--share-net` means child network access remains
+   shared with the host.
 6. Cancellation stops a process/MCP child immediately, traps WASM at its next
    host call, and lets a pure-compute guest run to its fuel deadline.
 7. Windows/Linux process limits are compiled but not exercised here.

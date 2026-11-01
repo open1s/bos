@@ -174,6 +174,15 @@ impl Drop for Session {
     }
 }
 
+/// Terminate one child through the standard-library process handle.
+///
+/// Keeping this operation behind a small helper makes the cancellation path
+/// independent of Unix-only pid signalling and directly testable on Windows.
+fn terminate_child_handle(child: &Arc<Mutex<Child>>) {
+    let mut child = child.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _ = child.kill();
+}
+
 /// The state one MCP server package owns.
 ///
 /// Split out behind an `Arc` so a call can run on the blocking pool: the server
@@ -421,9 +430,26 @@ impl McpCore {
                 },
             )?;
         }
-        let mut command = Command::new(&program);
+        // MCP is also an arbitrary package-controlled child process. Reuse
+        // the same Linux bubblewrap boundary as the process runtime; a missing
+        // bwrap binary or failed namespace setup must never fall back to direct
+        // execution.
+        let mut command = if cfg!(target_os = "linux") {
+            let mut command = Command::new("bwrap");
+            command.args(super::process::linux_bwrap_plan(
+                &self.root,
+                None,
+                None,
+                &program,
+                &self.args,
+            ));
+            command
+        } else {
+            let mut command = Command::new(&program);
+            command.args(&self.args);
+            command
+        };
         command
-            .args(&self.args)
             .current_dir(&self.root)
             .env_clear()
             .stdin(Stdio::piped())
@@ -945,6 +971,127 @@ impl McpRuntime {
 mod tests {
     use super::*;
     use crate::extension::manifest::Manifest;
+
+    #[test]
+    fn child_handle_termination_is_portable() {
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("powershell.exe");
+            command.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"]);
+            command
+        };
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = Command::new("sleep");
+            command.arg("30");
+            command
+        };
+        let child = command.spawn().expect("long-running child");
+        let child = Arc::new(Mutex::new(child));
+        terminate_child_handle(&child);
+        let status = child
+            .lock()
+            .expect("child lock")
+            .wait()
+            .expect("wait for terminated child");
+        assert!(!status.success(), "the child must be terminated, not finish normally");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_linux_mcp_child_cannot_write_outside_its_package_root() {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .expect("CI runner HOME is set");
+        let root = home.join(format!("bsh-mcp-sandbox-package-{}", std::process::id()));
+        let probe = home.join(format!("bsh-mcp-sandbox-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&probe);
+        std::fs::create_dir_all(&root).expect("package root");
+        let server = r#"import json, os, sys
+probe = os.path.join(os.environ["HOME"], "bsh-mcp-sandbox-probe-PID")
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    rid = request.get("id")
+    if method == "initialize":
+        result = {"protocolVersion": "2024-11-05", "capabilities": {}, "serverInfo": {"name": "sandbox-test", "version": "1"}}
+    elif method == "notifications/initialized":
+        continue
+    elif method == "tools/list":
+        result = {"tools": [{"name": "probe", "description": "Probe filesystem isolation", "inputSchema": {"type": "object", "properties": {}}}]}
+    elif method == "tools/call":
+        try:
+            with open(probe, "w", encoding="utf-8") as handle:
+                handle.write("escaped")
+            text = "wrote"
+        except OSError:
+            text = "blocked"
+        result = {"content": [{"type": "text", "text": text}], "isError": False}
+    else:
+        print(json.dumps({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "unsupported"}}), flush=True)
+        continue
+    print(json.dumps({"jsonrpc": "2.0", "id": rid, "result": result}), flush=True)
+"#.replace("PID", &std::process::id().to_string());
+        std::fs::write(root.join("server.py"), server).expect("server");
+        let manifest = Manifest::parse(
+            r#"
+schema_version = "1.0"
+[extension]
+id = "com.example.mcp-sandbox"
+name = "MCP Sandbox"
+version = "1.0.0"
+description = "Linux MCP sandbox integration test"
+[compatibility]
+bsh = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+[runtime]
+kind = "mcp"
+entry = "python3"
+args = ["server.py"]
+[capabilities]
+required = ["process.execute"]
+"#,
+            &root.join("extension.toml"),
+        )
+        .expect("manifest");
+        let policy = Arc::new(
+            PolicyEngine::open(
+                root.join("grants.toml"),
+                root.join("audit.jsonl"),
+                crate::extension::capability::PolicyMode::Enforce,
+            )
+            .expect("policy"),
+        );
+        policy
+            .grant(
+                manifest.id().as_str(),
+                Capability::ProcessExecute,
+                crate::extension::capability::GrantScope::Program("python3".to_string()),
+                None,
+            )
+            .expect("grant");
+        let runtime = McpRuntime::new(
+            &manifest,
+            &root,
+            "{}".to_string(),
+            policy,
+            TrustLevel::Local,
+            EventBus::new(),
+        )
+        .expect("runtime");
+        let tools = runtime.descriptors().expect("MCP inventory");
+        assert!(tools.iter().any(|tool| tool.id.as_str() == "probe"));
+        let context = CallContext::new(manifest.id().clone(), "sandbox", None, 5000);
+        let result = runtime
+            .call_tool("probe", json!({}), &context)
+            .await
+            .expect("sandboxed MCP call");
+        assert_eq!(result["content"][0]["text"], "blocked");
+        assert!(!probe.exists(), "MCP must not write into the host HOME");
+        runtime.shutdown().await.expect("shutdown");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[tokio::test]
     async fn a_server_maps_tools_resources_and_prompts() {

@@ -69,6 +69,11 @@ jobs:
           xvfb-run -a cargo test --workspace --exclude jsbos --exclude nbos
           -- --skip browser::engine::tests
 
+      - name: Verify all BSH extension examples
+        run: |
+          cargo build -p bsh --bin bsh
+          BSH_BIN=./target/debug/bsh bash scripts/ci/verify-bsh-examples.sh
+
   windows:
     name: Windows extension tests
     runs-on: windows-latest
