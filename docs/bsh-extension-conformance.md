@@ -148,7 +148,7 @@ Status legend:
 | core/cancellation | done | AsyncTool token -> Runtime::cancel |
 | capabilities/filesystem | done | WASM read_file/write_file host functions with policy |
 | capabilities/network | done | WASM fetch host function with policy |
-| capabilities/process | partial | policy + spawn + rlimits + RSS watchdog + macOS profile + Linux bwrap default for process/MCP (integration CI pending); Windows limits absent |
+| capabilities/process | partial | policy + spawn + Unix RLIMIT_AS/CPU/NOFILE for process/MCP + RSS watchdog + macOS profile + Linux bwrap default (integration CI pending); Windows Job Object limits absent ([Issue #39](https://github.com/open1s/bos/issues/39)) |
 | capabilities/storage | done | WASM storage_get/set/list |
 | capabilities/secrets | done | WASM read_secret |
 | agent/tool, prompt, context_provider | tool/prompt done, context static |
@@ -255,8 +255,8 @@ Status legend:
 | Capability categories including terminal.execute | done | process.execute plus the terminal.execute alias |
 | Network domain/method policy | done | domain scope and optional method-restricted domain scope |
 | Process executable/argument policy | done | allowlist, explicit grant, program and program+args scopes checked per spawn |
-| CPU/fuel and wall clock | done | wall clock + wasm fuel + process RLIMIT_CPU |
-| Memory/concurrency | done | WASM/Extism memory limits, process RLIMIT_AS, serialized per-runtime calls |
+| CPU/fuel and wall clock | partial | wall clock + wasm fuel + Unix Process/MCP RLIMIT_CPU; Windows OS CPU limits absent |
+| Memory/concurrency | partial | WASM/Extism memory limits; Unix Process/MCP RLIMIT_AS and RLIMIT_NOFILE; serialized calls; Windows Job Object limits absent ([Issue #39](https://github.com/open1s/bos/issues/39)) |
 | Host-call authorization | done | WASM host functions call PolicyEngine |
 | IPC authentication and message validation | done | private stdio, per-session handshake token echo, line/JSON/depth validation |
 | Secret redaction | done | read_secret + audit without values |
