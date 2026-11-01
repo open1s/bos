@@ -6755,6 +6755,31 @@ impl Shell {
                 .child(txt(status.name.clone(), 13.0, theme::text()))
                 .child(txt(meta, 11.0, theme::muted()))
                 .child(txt(summary, 11.0, theme::faint()));
+            let mut contributions = Vec::new();
+            if !status.skills.is_empty() {
+                contributions.push(format!(
+                    "{}: {}",
+                    tr(self.state.lang, "settings.extensionSkills"),
+                    status.skills.join(", ")
+                ));
+            }
+            if !status.languages.is_empty() {
+                contributions.push(format!(
+                    "{}: {}",
+                    tr(self.state.lang, "settings.extensionLanguages"),
+                    status.languages.join(", ")
+                ));
+            }
+            if !status.integrations.is_empty() {
+                contributions.push(format!(
+                    "{}: {}",
+                    tr(self.state.lang, "settings.extensionIntegrations"),
+                    status.integrations.join(", ")
+                ));
+            }
+            if !contributions.is_empty() {
+                detail = detail.child(txt(contributions.join(" · "), 11.0, theme::muted()));
+            }
             if let Some(error) = &status.error {
                 detail = detail.child(txt(error.clone(), 11.0, theme::error()));
             }
