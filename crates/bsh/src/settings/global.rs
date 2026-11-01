@@ -709,6 +709,15 @@ pub(crate) struct Provider {
     /// family choice survives without a leaf to hold it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) api_mode: Option<String>,
+    /// Whether the endpoint needs a credential.
+    ///
+    /// Absent reads as key-bearing, which is the safe default for a provider a
+    /// reader declared by hand. A package that serves an open or anonymous
+    /// lane declares `requires_key: false` in its provider descriptor, and the
+    /// build then sends no credential instead of inventing a missing-key
+    /// refusal for an endpoint that was never going to receive one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) requires_key: Option<bool>,
     /// The models this provider offers, keyed by nickname.
     ///
     /// Flattened: a model sits directly under its provider, so the file reads
@@ -2194,6 +2203,27 @@ root = "/tmp/bsh"
         assert_eq!(
             entry.input_types, None,
             "undeclared reads as permissive; an empty list would read as text-only"
+        );
+    }
+
+    #[test]
+    fn a_provider_descriptor_may_declare_an_anonymous_lane() {
+        let provider: Provider = serde_json::from_str(
+            r#"{"name":"Open","base_url":"http://127.0.0.1:1/v1","requires_key":false,"one":{"model":"one"}}"#,
+        )
+        .expect("the descriptor parses");
+        assert_eq!(
+            provider.requires_key,
+            Some(false),
+            "a package's keyless lane survives the descriptor parse"
+        );
+        assert_eq!(provider.models.len(), 1, "requires_key is not a model");
+        let key_bearing: Provider =
+            serde_json::from_str(r#"{"base_url":"http://x","one":{"model":"one"}}"#)
+                .expect("the descriptor parses");
+        assert_eq!(
+            key_bearing.requires_key, None,
+            "absent stays key-bearing, the safe default"
         );
     }
 

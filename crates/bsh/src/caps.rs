@@ -110,6 +110,9 @@ pub(crate) fn plugin_provider_node(
         // as one; the package is the owner.
         declared: false,
         api_mode: provider.api_mode.clone(),
+        // The package declared whether its lane is anonymous; the build reads
+        // this to choose between a credential lookup and an empty key.
+        requires_key: Some(provider.requires_key),
         models,
     }
 }
@@ -131,6 +134,18 @@ pub(crate) fn refresh_plugin_providers(settings: &mut Settings) {
     let mut providers: BTreeMap<String, crate::settings::global::Provider> = BTreeMap::new();
     let mut keys: BTreeMap<String, bool> = BTreeMap::new();
     let mut owners: BTreeMap<String, String> = BTreeMap::new();
+
+    // Open (or refresh) the extension host before reading the contributed
+    // provider cache. At launch nothing has opened it yet - the shell's own
+    // theme and status queries run after this refresh - and
+    // `cached_model_providers` answers from the open host, so refreshing first
+    // cached an empty set for the whole session. That is what kept every
+    // model provider an installed BSH package declares out of the picker.
+    {
+        let root = settings.active_workspace_root();
+        let workspace = (!root.is_empty()).then(|| std::path::PathBuf::from(root));
+        let _ = crate::extension::statuses(settings, workspace.as_deref());
+    }
 
     // The inventory is read from the persisted global document, not from a
     // draft: a build describes what is installed, and the pane's unsaved edits
@@ -173,8 +188,12 @@ pub(crate) fn refresh_plugin_providers(settings: &mut Settings) {
         if settings.global.providers.contains_key(&id) || providers.contains_key(&id) {
             continue;
         }
+        // A descriptor that declares an open or anonymous lane is honoured;
+        // absent stays key-bearing, the safe default for a provider nobody
+        // classified.
+        let requires_key = provider.requires_key.unwrap_or(true);
         providers.insert(id.clone(), provider);
-        keys.insert(id.clone(), true);
+        keys.insert(id.clone(), requires_key);
         owners.insert(id, "extension".to_string());
     }
     settings
@@ -8626,6 +8645,70 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
     /// none of them: the composer palette is a fixed list, nothing renders a
     /// registry panel, and a prompt has no consumer. Listing them would put a
     /// chip on a control that does not exist.
+    /// A launch refresh must open the extension host before it reads the
+    /// contributed provider cache: this is the seam that makes an installed
+    /// BSH package's provider appear in the picker at all.
+    #[test]
+    fn a_launch_refresh_surfaces_a_bsh_package_provider() {
+        let scratch =
+            std::env::temp_dir().join(format!("bsh-launch-provider-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let root = scratch.join("extensions");
+        let package = scratch.join("pkg");
+        std::fs::create_dir_all(package.join("providers").join("models")).expect("descriptor dir");
+        std::fs::write(
+            package.join("extension.toml"),
+            r#"
+schema_version = "1.0"
+[extension]
+id = "com.example.keyless"
+name = "Keyless"
+version = "1.0.0"
+description = "keyless provider fixture"
+[compatibility]
+bsh = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+[runtime]
+kind = "declarative"
+[capabilities]
+required = ["agent.tools.register"]
+[contributes]
+model_providers = ["zen"]
+"#,
+        )
+        .expect("manifest");
+        std::fs::write(
+            package.join("providers").join("models").join("zen.json"),
+            r#"{"name":"Open","base_url":"http://127.0.0.1:9/v1","api_mode":"chat","requires_key":false,"one":{"model":"one"}}"#,
+        )
+        .expect("descriptor");
+
+        let arguments: Vec<String> = vec![
+            "--root".into(),
+            root.display().to_string(),
+            "install".into(),
+            package.display().to_string(),
+        ];
+        assert_eq!(crate::extension::cli(&arguments), 0, "the fixture installs");
+        let mut settings = crate::settings::Settings::default();
+        settings.save_root = Some(scratch.clone());
+        refresh_plugin_providers(&mut settings);
+        assert!(
+            settings
+                .global
+                .is_plugin_provider("ext.com.example.keyless.zen"),
+            "the host provider is cached: {:?}",
+            settings.global.provider_ids()
+        );
+        assert!(
+            !settings
+                .global
+                .provider_requires_key("ext.com.example.keyless.zen"),
+            "the descriptor's keyless lane survives the refresh"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
     #[test]
     fn only_the_capabilities_this_shell_draws_are_surfaced() {
         use agent::extensions::Capability;

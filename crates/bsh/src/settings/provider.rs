@@ -391,6 +391,7 @@ impl GlobalSettings {
                 legacy_api_key: None,
                 declared: false,
                 api_mode: Some(family_protocol(id).to_string()),
+                requires_key: None,
                 models: BTreeMap::new(),
             },
         );
@@ -420,6 +421,7 @@ impl GlobalSettings {
                 legacy_api_key: None,
                 declared: true,
                 api_mode: None,
+                requires_key: None,
                 models: BTreeMap::new(),
             },
         );
