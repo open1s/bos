@@ -2211,6 +2211,23 @@ pub(crate) fn close_live(handle: &BrowserHandle) {
     handle.stop_engine();
 }
 
+/// Kill engine children a previous crash left behind, before this launch.
+///
+/// The engine also reaps at its own launch; doing it here covers the case
+/// where the next session never opens the browser pane. The reaper only kills
+/// a pid it can prove is an orphan whose argv carries this build's marker.
+pub(crate) fn reap_orphans() {
+    let state_dir = engine::cdp::client::default_state_dir();
+    let report = engine::reap::reap_orphans(&state_dir, &engine::reap::SystemProcesses);
+    if report.reaped_any() {
+        log::info!(
+            "browser: reaped {} orphaned engine process(es): {:?}",
+            report.reaped.len(),
+            report.reaped
+        );
+    }
+}
+
 /// Run a blocking fetch on a runtime thread that may block.
 async fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,

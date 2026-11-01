@@ -610,9 +610,25 @@ fn the_browser_model_is_fed_by_the_live_engine() {
         format!("{stale:?}").contains("call browser_snapshot for fresh refs"),
         "{stale:?}"
     );
-    // Closing stops the process this handle started.
+    // Closing stops the process this handle started, and its CDP port must
+    // close too - a dead EngineState with a live Chromium is the leak.
+    let port = handle
+        .engine()
+        .expect("the engine was live")
+        .client()
+        .port();
     crate::browser::close_live(&handle);
     assert!(!handle.engine_ready());
+    let mut closed = false;
+    for _ in 0..50 {
+        let address = format!("127.0.0.1:{port}").parse().expect("an address");
+        if TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_err() {
+            closed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(closed, "browser_close left the engine port {port} open");
 }
 
 /// A pre-warm separates the two costs a first open used to pay together:

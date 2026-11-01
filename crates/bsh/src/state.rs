@@ -1937,6 +1937,9 @@ impl AppState {
         for id in ids {
             self.save_session(&id);
         }
+        // A browser engine is a real child process. Closing the window must
+        // reap it here, not leave it for the next launch's orphan scan.
+        self.browser.stop_engine();
         log::info!("harness shutting down: {saved} sessions saved");
     }
 

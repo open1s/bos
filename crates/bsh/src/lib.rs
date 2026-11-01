@@ -65,6 +65,9 @@ pub fn run() {
         .join("log");
     std::fs::create_dir_all(&dir).ok();
     logging::auto_init_tracing_in(dir, "bsh");
+    // A previous SIGKILL can leave Chromium behind; clean it before the next
+    // window, not only when the browser pane is first opened.
+    browser::reap_orphans();
     ui::run(ui::Startup::from_args());
     // The window closed, so no plugin process may outlive it. A bridged plugin is
     // a child this app started; leaving it running would be a leaked process the
