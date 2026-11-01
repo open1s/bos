@@ -13540,21 +13540,19 @@ fn the_settings_rail_is_the_measured_cells_plus_the_vault() {
             "vault",
             "general",
             "models",
-            "plugins",
+            "extensions",
             "agent-presets",
         ],
         "the measured settings.section registrations, with the Vault after Account"
     );
-    // The cell is BSH's own word for what it holds - the reference's section id
-    // is still `plugins`, but the label a reader sees says what the pane
-    // actually lists, which is extensions rather than only built-in plugins.
+    // BSH replaces the reference's plugin page with the extension platform.
     assert_eq!(
-        crate::i18n::tr(crate::i18n::Lang::En, "settings.plugins"),
+        crate::i18n::tr(crate::i18n::Lang::En, "settings.extensions"),
         "Extensions",
         "the rail cell is labelled Extensions"
     );
     assert_eq!(
-        crate::i18n::tr(crate::i18n::Lang::Zh, "settings.plugins"),
+        crate::i18n::tr(crate::i18n::Lang::Zh, "settings.extensions"),
         "扩展",
         "and its Chinese label is 扩展"
     );
