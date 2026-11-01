@@ -875,8 +875,13 @@ impl Runtime for ProcessRuntime {
     }
 
     async fn activate(&self) -> Result<(), ExtensionError> {
-        // The descriptors are the contract; the process starts on the first
-        // call so an enabled package costs no memory until it is used.
+        // On-demand packages still start on their first call, because nothing
+        // calls activate for them. An on-startup package is warmed by the host
+        // right after load, and this is the one place the child is spawned.
+        let mut guard = self.session.lock().await;
+        if guard.is_none() {
+            *guard = Some(self.start_with_retry().await?);
+        }
         Ok(())
     }
 

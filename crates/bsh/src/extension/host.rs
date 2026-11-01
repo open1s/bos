@@ -2172,6 +2172,16 @@ tools = ["echo"]
         host.language_check("com.example.hook-demo", "hookdemo", &document)
             .await
             .expect("language check starts the process");
+        for _ in 0..40 {
+            if host.events().subscriber_count() > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            host.events().subscriber_count() > 0,
+            "the process subscribed before the event"
+        );
         let event = ExtensionEvent::new(
             "bsh",
             topics::SESSION_CREATED,
@@ -2179,11 +2189,17 @@ tools = ["echo"]
         )
         .expect("event");
         host.events().publish(&event).expect("publish");
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        let log = host
-            .run_integration("com.example.hook-demo", "github", serde_json::json!({}))
-            .await
-            .expect("integration dispatch");
+        let mut log = serde_json::Value::Null;
+        for _ in 0..40 {
+            log = host
+                .run_integration("com.example.hook-demo", "github", serde_json::json!({}))
+                .await
+                .expect("integration dispatch");
+            if log["count"].as_u64().unwrap_or(0) >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
         assert!(
             log["count"].as_u64().unwrap_or(0) >= 1,
             "the process did not receive the event: {log}"
