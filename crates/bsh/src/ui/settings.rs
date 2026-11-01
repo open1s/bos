@@ -1225,7 +1225,13 @@ impl Shell {
 
         // The Extensions tab strip belongs to the pane, not to the scrolling
         // options box: pinned here, it stays reachable at any scroll offset.
-        let tab_strip = (section == 13).then(|| self.plugin_tabs(cx));
+        let tab_strip = if section == 13 {
+            Some(self.plugin_tabs(cx))
+        } else if section == 17 {
+            Some(self.extensions_tabs(cx))
+        } else {
+            None
+        };
         let mut pane = div().flex_1().min_w_0().flex().flex_col().child(header);
         if let Some(tabs) = tab_strip {
             pane = pane.child(div().flex_none().px(px(24.0)).child(tabs));
@@ -6532,13 +6538,15 @@ impl Shell {
             (0usize, tr(lang, "settings.extensionsTabInstalled")),
             (1, tr(lang, "settings.extensionsTabMcp")),
             (2, tr(lang, "settings.extensionsTabSkills")),
-            (3, tr(lang, "settings.extensionsTabMarket")),
+            (3, tr(lang, "settings.extensionsTabTheme")),
+            (4, tr(lang, "settings.extensionsTabMarket")),
         ] {
             let selected = self.extensions_tab == index;
             let id = match index {
                 1 => "mcp",
                 2 => "skills",
-                3 => "market",
+                3 => "theme",
+                4 => "market",
                 _ => "installed",
             };
             strip = strip.child(
@@ -6850,23 +6858,22 @@ impl Shell {
         &mut self,
         cx: &mut Context<Self>,
     ) -> (&'static str, &'static str, Vec<AnyElement>) {
-        let tabs = self.extensions_tabs(cx);
         if self.extensions_tab == 1 {
             self.plugins_tab = 1;
-            let (_, _, mut rows) = self.section_builtin_plugins(cx);
-            rows.insert(0, tabs);
+            let (_, _, rows) = self.section_builtin_plugins(cx);
             return ("settings.extensions", "settings.mcpIntro", rows);
         }
         if self.extensions_tab == 2 {
             self.plugins_tab = 2;
-            let (_, _, mut rows) = self.section_builtin_plugins(cx);
-            rows.insert(0, tabs);
+            let (_, _, rows) = self.section_builtin_plugins(cx);
             return ("settings.extensions", "settings.skillsIntro", rows);
         }
-        if self.extensions_tab == 3 {
-            let mut rows = self.extension_market_rows(cx);
-            rows.insert(0, tabs);
-            return ("settings.extensions", "settings.marketGitHint", rows);
+        if self.extensions_tab == 4 {
+            return (
+                "settings.extensions",
+                "settings.marketGitHint",
+                self.extension_market_rows(cx),
+            );
         }
         let workspace = {
             let root = self.state.settings.active_workspace_root();
@@ -7017,6 +7024,13 @@ impl Shell {
                 }
                 menu
             });
+        if self.extensions_tab == 3 {
+            return (
+                "settings.extensions",
+                "settings.extensionsThemeHint",
+                vec![div().child(theme_menu).into_any_element()],
+            );
+        }
         let refresh_settings = self.state.settings.clone();
         let refresh_workspace = workspace;
         let refresh = div()
@@ -7201,12 +7215,10 @@ impl Shell {
             .child(inventory);
 
         let mut rows = Vec::new();
-        rows.push(tabs);
         rows.push(div().mb(px(14.0)).child(inventory).into_any_element());
         if let Some(section) = approval_section {
             rows.push(div().mb(px(10.0)).child(section).into_any_element());
         }
-        rows.push(div().mb(px(10.0)).child(theme_menu).into_any_element());
         rows.push(div().mb(px(10.0)).child(refresh).into_any_element());
         ("settings.extensions", "settings.extensionsHint", rows)
     }

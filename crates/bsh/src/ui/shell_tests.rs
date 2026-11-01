@@ -29965,6 +29965,13 @@ fn the_extensions_pane_keeps_mcp_and_skills(cx: &mut TestAppContext) {
         2,
         "the Skills tab opens the skills settings"
     );
+    let theme = cx.debug_bounds("extensions-tab-theme").expect("Theme tab");
+    cx.simulate_click(theme.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("extension-global-theme").is_some(),
+        "the Theme tab holds the extension theme picker"
+    );
     let market = cx
         .debug_bounds("extensions-tab-market")
         .expect("Market tab");
