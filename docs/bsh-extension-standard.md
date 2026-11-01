@@ -773,13 +773,12 @@ not kept:
    Settings also overlays its named tokens on the shell palette.
 4. Lockfile reproduction covers Git/registry remotes and the recorded local
    source path of a directory install.
-5. Process children get RLIMIT ceilings and a process group. macOS applies
-   a filesystem write sandbox profile. Linux enables bubblewrap by default:
-   the root filesystem is read-only, with package/workspace/data mounts writable
-   and a private PID/IPC/UTS namespace. If bubblewrap or namespace setup fails,
-   the spawn fails closed; it never falls back to an unsandboxed child. The
-   current plan uses `--share-net`, so process-child networking is not isolated
-   or mediated by the host's `network.http` capability.
+5. Process and MCP children are package-controlled code. Linux enables the
+   shared bubblewrap plan by default for both runtimes: the root filesystem is
+   read-only, the package root is writable, and PID/IPC/UTS namespaces are
+   private. If bubblewrap or namespace setup fails, spawning fails closed; it
+   never falls back to an unsandboxed child. The current plan uses `--share-net`,
+   so child networking is not isolated or mediated by `network.http`.
 6. Cancellation stops a process/MCP child immediately, traps a WASM guest at its next
    host call, and lets a pure-compute guest run to its epoch/fuel deadline (the host
    cannot set a Wasmtime epoch while the guest holds the synchronous store). The
