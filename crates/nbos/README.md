@@ -1,8 +1,15 @@
 # nbos — v3.0.2
 
-> Python bindings for BrainOS — AI agent framework with ReAct engine
+[![PyPI](https://img.shields.io/pypi/v/nbos?label=pypi&logo=pypi&color=3776AB)](https://pypi.org/project/nbos)
+[![License](https://img.shields.io/github/license/open1s/bos?color=blue)](https://github.com/open1s/bos/blob/main/LICENSE)
 
-High-performance Python bindings for [BrainOS](https://github.com/open1s/bos), a Rust-based AI agent framework implementing the ReAct (Reason + Act) paradigm. Built with [PyO3](https://pyo3.rs/) for native performance.
+> The Python surface of BOS — AI agents with tools, skills, memory, MCP and a multi-agent bus.
+
+`nbos` is the Python binding for [BOS (BrainOS)](https://github.com/open1s/bos), a Rust-based
+agent runtime implementing the ReAct (Reason + Act) paradigm. It is the same engine the
+[BSH desktop harness](https://github.com/open1s/bos#inside-the-harness-bsh) runs on, exposed to
+Python through [PyO3](https://pyo3.rs/) — so a tool you write here behaves the same in Rust,
+JavaScript and the app.
 
 ## Features
 
@@ -17,7 +24,7 @@ High-performance Python bindings for [BrainOS](https://github.com/open1s/bos), a
 
 ## Installation
 
-### From PyPI (when published)
+### From PyPI
 
 ```bash
 pip install nbos

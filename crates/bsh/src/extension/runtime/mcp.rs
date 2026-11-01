@@ -179,7 +179,9 @@ impl Drop for Session {
 /// Keeping this operation behind a small helper makes the cancellation path
 /// independent of Unix-only pid signalling and directly testable on Windows.
 fn terminate_child_handle(child: &Arc<Mutex<Child>>) {
-    let mut child = child.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut child = child
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _ = child.kill();
 }
 
@@ -197,6 +199,8 @@ struct McpCore {
     config: String,
     max_execution_ms: u64,
     max_output_bytes: u64,
+    memory_bytes: u64,
+    cpu_seconds: u64,
     /// The process.execute grant this runtime spawns under.
     policy: Option<(Arc<PolicyEngine>, TrustLevel)>,
     events: Option<Arc<EventBus>>,
@@ -308,6 +312,8 @@ impl McpCore {
             config,
             max_execution_ms: manifest.resources.execution_ms(),
             max_output_bytes: manifest.resources.output_bytes(),
+            memory_bytes: manifest.resources.memory_mb().saturating_mul(1024 * 1024),
+            cpu_seconds: (manifest.resources.execution_ms() / 1000).max(1) + 2,
             policy: Some((policy, trust)),
             events: Some(events),
             subscription: Mutex::new(subscription),
@@ -373,6 +379,9 @@ impl McpCore {
     fn start_with_retry(&self) -> Result<Session, ExtensionError> {
         let mut last = None;
         for delay in [0_u64, 100, 250] {
+            if self.cancelled.load(Ordering::SeqCst) {
+                return Err(self.cancellation_error());
+            }
             if delay > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(delay));
             }
@@ -437,11 +446,7 @@ impl McpCore {
         let mut command = if cfg!(target_os = "linux") {
             let mut command = Command::new("bwrap");
             command.args(super::process::linux_bwrap_plan(
-                &self.root,
-                None,
-                None,
-                &program,
-                &self.args,
+                &self.root, None, None, &program, &self.args,
             ));
             command
         } else {
@@ -449,6 +454,14 @@ impl McpCore {
             command.args(&self.args);
             command
         };
+        // Apply the same Unix RLIMIT and process-group ceilings as
+        // ProcessRuntime. Windows remains a documented limitation until
+        // Job Object enforcement is implemented.
+        super::process::configure_std_process_limits(
+            &mut command,
+            self.memory_bytes,
+            self.cpu_seconds,
+        );
         command
             .current_dir(&self.root)
             .env_clear()
@@ -479,10 +492,7 @@ impl McpCore {
                 message: "MCP stdout was not piped".to_string(),
             })?;
         let stderr = child.stderr.take();
-        let child = Arc::new(Mutex::new(child));
-        if let Ok(mut slot) = self.child.lock() {
-            *slot = Some(Arc::clone(&child));
-        }
+        let child = self.register_child(child)?;
         if let Some(stderr) = stderr {
             let extension = self.extension.to_string();
             std::thread::spawn(move || {
@@ -712,12 +722,54 @@ impl McpCore {
     /// held during blocking stdio exchanges. Child::kill uses the native
     /// process-termination API on both Unix and Windows.
     fn kill_child(&self) {
-        let child = self.child.lock().ok().and_then(|slot| slot.as_ref().cloned());
+        let child = self
+            .child
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .cloned();
         if let Some(child) = child {
-            if let Ok(mut child) = child.lock() {
-                let _ = child.kill();
-            }
+            terminate_child_handle(&child);
         }
+    }
+
+    fn cancellation_error(&self) -> ExtensionError {
+        ExtensionError::Runtime {
+            extension: self.extension.to_string(),
+            message: "MCP call cancelled".to_string(),
+        }
+    }
+
+    /// Register a spawned child and close the spawn/cancel race. If cancellation
+    /// arrived before the child handle became visible, terminate and reap it
+    /// before allowing the caller to proceed.
+    fn register_child(&self, child: Child) -> Result<Arc<Mutex<Child>>, ExtensionError> {
+        let child = Arc::new(Mutex::new(child));
+        {
+            let mut slot = self
+                .child
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *slot = Some(Arc::clone(&child));
+        }
+        if self.cancelled.load(Ordering::SeqCst) {
+            terminate_child_handle(&child);
+            if let Ok(mut process) = child.lock() {
+                let _ = process.wait();
+            }
+            let mut slot = self
+                .child
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if slot
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &child))
+            {
+                *slot = None;
+            }
+            return Err(self.cancellation_error());
+        }
+        Ok(child)
     }
 
     /// One tool call over the session, blocking this thread.
@@ -728,12 +780,17 @@ impl McpCore {
         progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
         timeout_ms: u64,
     ) -> Result<Value, ExtensionError> {
-        self.cancelled.store(false, Ordering::SeqCst);
+        if self.cancelled.load(Ordering::SeqCst) {
+            return Err(self.cancellation_error());
+        }
         let wire = self.wire_name(name);
         let mut guard = self.session.lock().map_err(|_| ExtensionError::Corrupt {
             path: self.root.clone(),
             message: "MCP session lock is poisoned".to_string(),
         })?;
+        if self.cancelled.load(Ordering::SeqCst) {
+            return Err(self.cancellation_error());
+        }
         if guard.is_none() {
             *guard = Some(self.start_with_retry()?);
         }
@@ -943,6 +1000,9 @@ impl McpRuntime {
         progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
     ) -> Result<Value, ExtensionError> {
         let deadline = context.timeout_ms.max(1).min(self.core.max_execution_ms);
+        // Reset synchronously before the worker is queued. A Stop arriving
+        // after this point must remain visible to the worker and spawn path.
+        self.core.cancelled.store(false, Ordering::SeqCst);
         let core = Arc::clone(&self.core);
         let name = name.to_string();
         let handle = tokio::task::spawn_blocking(move || {
@@ -994,7 +1054,10 @@ mod tests {
             .expect("child lock")
             .wait()
             .expect("wait for terminated child");
-        assert!(!status.success(), "the child must be terminated, not finish normally");
+        assert!(
+            !status.success(),
+            "the child must be terminated, not finish normally"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -1008,7 +1071,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_file(&probe);
         std::fs::create_dir_all(&root).expect("package root");
-        let server = r#"import json, os, sys
+        let server = r#"import json, os, sys, resource
 probe = os.path.join(os.environ["HOME"], "bsh-mcp-sandbox-probe-PID")
 for line in sys.stdin:
     request = json.loads(line)
@@ -1027,6 +1090,10 @@ for line in sys.stdin:
             text = "wrote"
         except OSError:
             text = "blocked"
+        memory = resource.getrlimit(resource.RLIMIT_AS)[0]
+        cpu = resource.getrlimit(resource.RLIMIT_CPU)[0]
+        nofile = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+        text = f"{text}|{memory}|{cpu}|{nofile}"
         result = {"content": [{"type": "text", "text": text}], "isError": False}
     else:
         print(json.dumps({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "unsupported"}}), flush=True)
@@ -1071,6 +1138,65 @@ required = ["process.execute"]
                 None,
             )
             .expect("grant");
+        // A Stop received after scheduling but before the blocking worker
+        // begins must not be cleared by the worker.
+        let cancelled_runtime = McpRuntime::new(
+            &manifest,
+            &root,
+            "{}".to_string(),
+            Arc::clone(&policy),
+            TrustLevel::Local,
+            EventBus::new(),
+        )
+        .expect("cancel test runtime");
+        cancelled_runtime
+            .core
+            .cancelled
+            .store(true, Ordering::SeqCst);
+        let cancelled =
+            cancelled_runtime
+                .core
+                .call_tool_blocking("echo", json!({"x": 1}), None, 5000);
+        assert!(matches!(
+            cancelled,
+            Err(ExtensionError::Runtime { message, .. }) if message.contains("cancelled")
+        ));
+        assert!(
+            cancelled_runtime
+                .core
+                .child
+                .lock()
+                .expect("child slot")
+                .is_none(),
+            "a pre-cancelled call must not spawn a child"
+        );
+
+        // Cancellation that races with Child registration must kill and reap
+        // the just-spawned process before start() can continue.
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = Command::new("sleep");
+            command.arg("30");
+            command
+        };
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("powershell.exe");
+            command.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"]);
+            command
+        };
+        let child = command.spawn().expect("long-running child");
+        assert!(cancelled_runtime.core.register_child(child).is_err());
+        assert!(
+            cancelled_runtime
+                .core
+                .child
+                .lock()
+                .expect("child slot")
+                .is_none(),
+            "a child registered after cancellation must be reaped and cleared"
+        );
+
         let runtime = McpRuntime::new(
             &manifest,
             &root,
@@ -1087,7 +1213,26 @@ required = ["process.execute"]
             .call_tool("probe", json!({}), &context)
             .await
             .expect("sandboxed MCP call");
-        assert_eq!(result["content"][0]["text"], "blocked");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("MCP probe returns text");
+        let values: Vec<&str> = text.split('|').collect();
+        assert_eq!(values.first(), Some(&"blocked"));
+        assert_eq!(
+            values.get(1).and_then(|value| value.parse::<u64>().ok()),
+            Some(256 * 1024 * 1024),
+            "MCP child must inherit RLIMIT_AS"
+        );
+        assert_eq!(
+            values.get(2).and_then(|value| value.parse::<u64>().ok()),
+            Some(32),
+            "MCP child must inherit RLIMIT_CPU"
+        );
+        assert_eq!(
+            values.get(3).and_then(|value| value.parse::<u64>().ok()),
+            Some(256),
+            "MCP child must inherit RLIMIT_NOFILE"
+        );
         assert!(!probe.exists(), "MCP must not write into the host HOME");
         runtime.shutdown().await.expect("shutdown");
         let _ = std::fs::remove_dir_all(&root);

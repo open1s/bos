@@ -1,260 +1,156 @@
-中文 | [English](./README.md)
-# BrainOS (BOS)
+<p align="right">
+  <a href="README.md">English</a> · <b>中文</b>
+</p>
 
-一个模块化的 AI 运行时框架，用于构建智能 AI 应用，支持多代理协调、事件流和可扩展工具系统。
+<p align="center">
+  <img src="docs/assets/bos-logo.png" alt="BOS — BrainOS AI 智能体框架" width="440">
+</p>
 
-## 核心特性
+<h1 align="center">BOS — Rust 原生 AI Agent 平台</h1>
 
-- **🤖 代理框架**: 集成 LLM 的多代理协调，支持技能管理
-- **🚌 事件总线**: 高性能发布/订阅消息，支持查询/响应、RPC 模式
-- **⚙️ 配置管理**: 支持 TOML、YAML、环境变量的灵活配置加载
-- **🧠 ReAct 引擎**: 推理 + 行动循环脚手架，用于 AI 代理工作流
-- **🐍 Python 绑定**: `pip install brainos` - 统一高级 Python API
-- **📦 Node.js 绑定**: `npm install @open1s/jsbos` - 统一高级 JavaScript API
-- **🔄 内存持久化**: 跨会话内存支持
-- **🔌 MCP 客户端**: 连接 Model Context Protocol 服务器（stdio 和 HTTP）
-- **📚 技能系统**: 从目录定义加载代理能力
+<p align="center">
+  <strong>一个 Rust 内核，三种开发接口，一个原生 Agent 工作空间。</strong>
+</p>
+
+<p align="center">
+  BOS（BrainOS）是一套面向 AI Agent 构建、集成与运行的可组合平台。
+  Rust Runtime 将 Agent 编排、工具调用、MCP、Skills、Memory 和多智能体通信
+  统一在同一执行内核之上。开发者可以直接使用 Rust，也可以通过 NBOS（Python）
+  和 JSBOS（JavaScript）调用同一套运行时。<strong>BSH（BOS Harness）</strong>
+  则把这套 Runtime 带入原生桌面工作空间，服务于 Agent 驱动的开发流程。
+</p>
+
+<p align="center">
+  <a href="https://pypi.org/project/nbos"><img src="https://img.shields.io/pypi/v/nbos?label=Python%20SDK&logo=pypi&color=3776AB" alt="Python SDK"></a>
+  <a href="https://www.npmjs.com/package/@open1s/jsbos"><img src="https://img.shields.io/npm/v/@open1s/jsbos?label=JavaScript%20SDK&logo=npm&color=CB3837" alt="JavaScript SDK"></a>
+  <a href="https://github.com/open1s/bos/actions/workflows/rust.yml"><img src="https://github.com/open1s/bos/actions/workflows/rust.yml/badge.svg" alt="Rust CI"></a>
+  <a href="https://github.com/open1s/bos/actions/workflows/binding-parity.yml"><img src="https://github.com/open1s/bos/actions/workflows/binding-parity.yml/badge.svg" alt="Binding parity"></a>
+  <a href="https://img.shields.io/github/license/open1s/bos"><img src="https://img.shields.io/github/license/open1s/bos" alt="License"></a>
+  <a href="docs/BOS-BSH-Textbook.md"><img src="https://img.shields.io/badge/docs-34%20章实战手册-blue" alt="文档"></a>
+</p>
+
+<p align="center">
+  <a href="#快速开始">快速开始</a> ·
+  <a href="#为什么选择-bos">产品特点</a> ·
+  <a href="#bsh原生-ai-agent-工作空间">BSH 桌面端</a> ·
+  <a href="#扩展平台">扩展平台</a> ·
+  <a href="#文档">文档</a>
+</p>
 
 ---
 
+## BOS 是什么？
+
+**BOS 为 AI Agent 提供统一的运行时基础，而不是绑定某一种语言或交互界面。**
+
+Rust Runtime 承担核心执行能力；NBOS 和 JSBOS 将同一套引擎开放给 Python 与
+JavaScript；BSH 则以原生桌面应用的形式提供完整工作环境。开发者既可以把 Agent
+能力嵌入自己的产品，也可以通过 BSH 构建、调试和运行 Agent。
+
+| 产品组成 | 核心能力 | 适用场景 |
+|---|---|---|
+| **BOS Runtime** | Rust Agent 引擎、工具、Skills、Memory、MCP Client、多智能体总线、策略与可观测性 | 将 Agent 能力嵌入自己的应用和服务 |
+| **NBOS** | BOS 内核的 Python 绑定 | Python 应用、自动化和快速原型 |
+| **JSBOS** | BOS 内核的 Node.js / JavaScript 绑定 | Node.js 服务、开发者工具和 JavaScript 自动化 |
+| **BSH** | 原生桌面 AI Agent 工作空间，集成对话、终端、浏览器、编辑器和扩展 | 希望在统一环境中构建、使用和管理智能体的开发者 |
+
+## 为什么选择 BOS？
+
+BOS 的核心设计原则是：**Agent Runtime 不应被某一种语言、某一个应用或某一种界面锁定。**
+同一套 Rust 实现同时服务于原生 Rust 应用、Python 与 JavaScript SDK，以及 BSH 桌面端。
+团队因此可以使用一致的执行模型，将 Agent 嵌入业务产品、通过脚本自动化，或在桌面工作空间中运行。
+
+- **一个内核，三种语言。** 直接使用 Rust，或通过 Python、JavaScript SDK 开发。
+  两种语言绑定共享底层实现，并通过 CI 检查 API 一致性。
+- **完整 Agent 执行循环。** 基于 ReAct 完成模型流式输出、工具调用、结果观察和后续推理，
+  并提供生命周期 Hooks。
+- **内置 MCP。** 通过 stdio 或 HTTP 连接 Model Context Protocol 服务端，发现并调用工具，
+  访问资源与提示模板。
+- **多智能体通信。** 提供发布/订阅、请求/响应以及 RPC，不必为 Agent 间协作另造一套通信层。
+- **Skills 与 Memory。** 按需加载目录化 `SKILL.md` 知识，并使用内存或文件型记忆保留上下文。
+- **运行治理能力。** 支持重试分类、限流、熔断、执行期限、Token/工具调用指标和能力授权。
+- **面向扩展设计。** 可将 BOS 嵌入自己的应用，也可以通过声明式、Process、WASM Component、
+  Extism、MCP 和 Built-in 等方式扩展 BSH。
+
 ## 快速开始
 
-### Python (brainos)
+### Python
+
+```bash
+pip install nbos
+```
 
 ```python
 from nbos import BrainOS, tool
 
-@tool("两数相加")
+@tool("Add two numbers")
 def add(a: int, b: int) -> int:
     return a + b
 
 async with BrainOS() as brain:
     agent = brain.agent("assistant").with_tools(add)
-    result = await agent.ask("2+2 等于多少?")
+    print(await agent.ask("What is 2 + 2?"))
 ```
 
-### JavaScript (@open1s/jsbos / brainos-js)
+### JavaScript / Node.js
+
+```bash
+npm install @open1s/jsbos
+```
 
 ```javascript
-import { BrainOS, ToolDef } from '@open1s/jsbos';
+import { BrainOS, ToolDef } from "@open1s/jsbos";
 
-// 创建工具使用 ToolDef
-const addTool = new ToolDef(
-  'add',
-  '两数相加',
-  (args) => (args.a || 0) + (args.b || 0),
-  { type: 'object', properties: { result: { type: 'number' } }, required: ['result'] },
-  { type: 'object', properties: { a: { type: 'number' }, b: { type: 'number' } }, required: ['a', 'b'] }
+const add = new ToolDef(
+  "add",
+  "Add two numbers",
+  (args) => args.a + args.b,
+  { type: "object", properties: { result: { type: "number" } }, required: ["result"] },
+  { type: "object", properties: { a: { type: "number" }, b: { type: "number" } }, required: ["a", "b"] },
 );
 
 const brain = new BrainOS();
 await brain.start();
-const agent = await brain.agent('assistant')
-  .register(addTool)
-  .start();
-const result = await agent.runSimple('2+2 等于多少?');
+const agent = await brain.agent("assistant").register(add).start();
+console.log(await agent.runSimple("What is 2 + 2?"));
 ```
 
-### Rust (agent crate)
+### Rust
+
+从 workspace 中引入需要的 crate，直接使用 Rust 运行时：
 
 ```rust
 use agent::{Agent, AgentConfig};
 
-let config = AgentConfig::default().name("assistant");
-let agent = Agent::builder().config(config).build()?;
-let result = agent.run_simple("Hello").await?;
+#[tokio::main]
+async fn main() {
+    let config = AgentConfig::default()
+        .name("assistant")
+        .model("openai/gpt-4o")
+        .api_key(std::env::var("OPENAI_API_KEY").unwrap_or_default());
+
+    let agent = Agent::from_config(config);
+    println!("{}", agent.run_simple("Hello").await.expect("agent run"));
+}
 ```
 
----
-
-## 技能系统
-
-代理可以从目录定义加载能力：
-
-```python
-# 创建技能目录并注册
-skills_dir = "/path/to/skills"
-agent.register_skills_from_dir(skills_dir)
-```
-
-### 技能格式
-
-每个技能是一个目录，包含 `SKILL.md` 文件和 YAML frontmatter：
-
-```
-skills/
-├── python-coding/
-│   └── SKILL.md
-├── api-design/
-│   └── SKILL.md
-└── database-ops/
-    └── SKILL.md
-```
-
-**SKILL.md 格式：**
-```markdown
----
-name: python-coding
-description: 项目 Python 编码规范
-category: coding
-version: 1.0.0
----
-
-# Python 编码规范
-
-你的技能说明内容...
-```
-
-LLM 会在系统提示词中收到可用技能列表，并可调用 `load_skill` 获取完整指令。
-
----
-
-## 项目结构
-
-```
-bos/
-├── crates/
-│   ├── agent/          # AI 代理框架，集成 LLM、技能、工具、MCP
-│   ├── bus/            # 发布/订阅、查询/响应、RPC 消息
-│   ├── config/         # TOML/YAML 配置加载
-│   ├── logging/        # 追踪和可观测性
-│   ├── react/          # ReAct 推理引擎
-│   ├── pybos/          # Python 绑定 (brainos 包)
-│   │   └── brainos/    # 高级 Python 包装器
-│   └── jsbos/          # Node.js 绑定 (@open1s/jsbos)
-├── docs/               # 用户指南
-│   ├── python-user-guide.md
-│   ├── javascript-user-guide.md
-│   └── rust-user-guide.md
-└── Cargo.toml          # 工作空间
-```
-
----
-
-## 核心 Crate
-
-| Crate | 描述 | 安装 |
-|-------|------|------|
-| `agent` | 核心代理，集成 LLM、工具、技能、MCP | `cargo add agent` |
-| `bus` | 发布/订阅、查询/响应、RPC 消息 | `cargo add bus` |
-| `config` | 从 TOML、YAML、环境变量加载配置 | `cargo add config` |
-| `logging` | 追踪和可观测性 | `cargo add logging` |
-| `react` | ReAct 推理 + 行动引擎 | `cargo add react` |
-| `pybos` | Python 绑定 | `pip install brainos` |
-| `jsbos` | Node.js 绑定 | `npm install @open1s/jsbos` |
-
----
-
-## 常用命令
+### 运行 BSH 桌面应用
 
 ```bash
-# 构建所有
-cargo build --all
-
-# 测试所有
-cargo test --all
-
-# 代码检查
-cargo clippy --all
-cargo fmt --all
-
-# Python 绑定（底层 nbos）
-cd crates/nbos && maturin develop
-
-# Node.js 绑定（底层 jsbos）
-cd crates/jsbos && npm install && npm run build
+git clone https://github.com/open1s/bos
+cd bos
+cargo build --release -p bsh
+./target/release/bsh
 ```
 
----
+BSH 需要 Rust 1.97+ 和 Zig 0.16（终端面板需要构建 Ghostty）。
+macOS 可通过 `./crates/bsh/make-dev-app.sh` 打包开发版；
+Linux 构建依赖请参考 [Rust CI workflow](.github/workflows/rust.yml)。
 
-## 用户指南
+## 模型与 Provider 配置
 
-- **Python**: [docs/python-user-guide.md](docs/python-user-guide.md)
-- **JavaScript**: [docs/javascript-user-guide.md](docs/javascript-user-guide.md)
-- **Rust**: [docs/rust-user-guide.md](docs/rust-user-guide.md)
-- **BOS/BSH 扩展教材**: [docs/BOS-BSH-Textbook.md](docs/BOS-BSH-Textbook.md)
-- **English**: [README.md](../README.md)
-
----
-
-## 统一 API
-
-`brainos` 包（Python）和 `@open1s/jsbos`（JavaScript）提供一致的高级 API：
-
-| 功能 | Python | JavaScript |
-|------|--------|------------|
-| 导入 | `from nbos import BrainOS, tool` | `import { BrainOS, ToolDef } from '@open1s/jsbos'` |
-| 创建 brain | `async with BrainOS() as brain:` | `const brain = new BrainOS(); await brain.start()` |
-| 创建代理 | `brain.agent("name")` | `brain.agent("name")` |
-| 链式配置 | `.with_model("gpt-4")` | `.model("gpt-4")` |
-| 注册工具 | `.register(tool)` | `.register(toolDef)` |
-| 运行 | `await agent.ask("...")` | `await agent.runSimple("...")` |
-| 总线工厂 | `BusManager()` | `BusManager.create()` |
-
-### 底层绑定
-
-直接访问 Rust 绑定：
-
-| 语言 | 包 | 导入 |
-|------|-----|------|
-| Python | `nbos` | `from nbos import Agent, Bus, McpClient, ...` |
-| JavaScript | `@open1s/jsbos` | `import { Agent, Bus, McpClient } from '@open1s/jsbos'` |
-
----
-
-## MCP 客户端
-
-通过 stdio 或 HTTP 连接到 MCP 服务器：
-
-### Python
-
-```python
-from nbos import McpClient
-
-# 基于进程的服务器
-client = await McpClient.spawn("npx", ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"])
-await client.initialize()
-
-# HTTP 服务器
-client = McpClient.connect_http("http://127.0.0.1:8000/mcp")
-await client.initialize()
-
-# 使用工具
-tools = await client.list_tools()
-result = await client.call_tool("echo", '{"text": "hello"}')
-```
-
-### JavaScript
-
-```javascript
-import { McpClient } from '@open1s/jsbos';
-
-// 基于进程的服务器
-const client = await McpClient.spawn("npx", ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]);
-await client.initialize();
-
-// HTTP 服务器
-const client = McpClient.connectHttp("http://127.0.0.1:8000/mcp");
-await client.initialize();
-
-// 使用工具
-const tools = await client.listTools();
-const result = await client.callTool("echo", '{"text": "hello"}');
-```
-
-### HTTP 服务器示例
-
-```bash
-# 启动 MCP HTTP 服务器
-python3 crates/examples/mcp_http_server.py
-# 服务器运行在 http://127.0.0.1:8000/mcp
-```
-
----
-
-## 配置
-
-创建 `~/.bos/conf/config.toml`:
+BOS 支持 OpenAI 兼容接口、Anthropic 协议、NVIDIA NIM、Google AI 和 OpenRouter。
+在 `~/.bos/conf/config.toml` 中配置默认模型：
 
 ```toml
 [global_model]
@@ -262,104 +158,229 @@ api_key = "your-api-key"
 base_url = "https://api.openai.com/v1"
 model = "gpt-4"
 
-# 或使用 NVIDIA NIM
-[global_model]
+[llm.nvidia]
 api_key = "nv-..."
-base_url = "https://api.nvidia.com/v"
-model = "nvidia/llama-3.1-nemotron-70b-instruct"
-
-[bus]
-mode = "peer"
-listen = ["127.0.0.1:7890"]
+base_url = "https://integrate.api.nvidia.com/v1"
+model = "nvidia/your-model"
 ```
 
-或使用环境变量：`OPENAI_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL`
+也可以用环境变量：`OPENAI_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL`。
+
+BSH 可在 **设置 → 模型** 中管理 Provider。敏感凭据存放在加密 Vault 中，
+不会以明文形式写入普通设置文件。
 
 ---
 
-## 示例
+## BOS 的设计方式
 
-查看示例目录：
+| 设计原则 | BOS 的实现 |
+|---|---|
+| **统一执行内核** | 一套 Rust Runtime 同时服务于原生 Rust 应用、NBOS、JSBOS 和 BSH。 |
+| **Agent 是执行流程，不只是对话** | ReAct 循环负责协调模型输出、工具调用、结果观察与生命周期 Hooks。 |
+| **默认支持互操作** | 通过 stdio 和 HTTP 接入 MCP Server，并通过 Provider 适配器连接模型 API。 |
+| **多 Agent 协作** | 专用消息总线提供发布/订阅、请求/响应和 RPC。 |
+| **知识与上下文可复用** | 目录化 `SKILL.md` 技能，以及内存或文件型 Memory。 |
+| **执行过程可治理** | 重试策略、限流、熔断、执行期限、指标和能力授权。 |
+| **运行时可持续扩展** | BSH 支持 Declarative、Process、WASM Component、Extism、MCP 和 Built-in 扩展。 |
 
-- Python: `crates/nbos/examples/`
-- JavaScript: `crates/jsbos/examples/`
-- Rust: `crates/examples/` (包含 `agent_skill_demo.rs`)
+BOS 将安全边界视为需要明确实现和验证的工程能力，而不是营销承诺。
+沙箱能力取决于操作系统与执行路径；BSH Process/MCP 扩展在 Windows 上的
+AppContainer 隔离和 Job Object 资源限制仍在跟踪实施中
+（[#43](https://github.com/open1s/bos/issues/43)、[#39](https://github.com/open1s/bos/issues/39)）。
 
-### MCP 演示
+---
+
+## 深入 BOS Runtime
+
+- **智能体循环**——`crates/react` 跑 ReAct：流式输出、调用工具、观察、继续。各条缝上都有
+  hook（`before_tool_call`、`after_llm_call`、`on_complete`、`on_error` ……），宿主可以观察
+  或拦截某一步，而不必 fork 引擎。
+- **供应商**——任何 OpenAI 兼容端点、Anthropic 协议、NVIDIA NIM、Google AI 与 OpenRouter，
+  按配置或按模型前缀选择。
+- **工具**——用 `FunctionTool`/`AsyncFunctionTool` 包一个闭包，或直接实现 `Tool`/`AsyncTool`
+  再注册；智能体通过 `react` 的缝调用它们，永远不经过总线。
+- **技能**——指向一个装满 `SKILL.md` 的目录，模型会在系统提示词里拿到目录，再调用
+  `load_skill` 取完整指令。
+- **记忆**——`InMemoryMemory` 按关键词重叠与新旧排序；`FileMemory` 把同样的排序写进
+  JSON lines，重启后仍在。过滤器限定召回范围，`{{memory}}` 把它放进提示词。
+- **MCP**——接入你已有的服务器（stdio 或 HTTP），把它们的工具、资源与提示词当成原生能力用。
+- **总线**——`Publisher`/`Subscriber` 做事件，`Queryable` 做请求/响应，`Callable`/`Caller` 做
+  RPC；一个 session 把它们挂到同一条传输上。
+- **沙箱**——`heel` 是唯一的沙箱实现：工作区是唯一可写处，可执行字节无处落盘，读取在基线
+  之上需显式开启，网络走策略。
+- **可观测性**——`crates/logging` 的 tracing，加上调用指标（token、工具调用、墙钟时间、
+  限流等待），两种绑定都能读到。
+
+### MCP，不需要再写一层封装
+
+```python
+from nbos import McpClient
+
+client = await McpClient.spawn("npx", ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"])
+await client.initialize()
+
+## Runtime 核心能力
+
+| 能力 | 说明 |
+|---|---|
+| **Agent Loop** | ReAct 执行、流式输出、工具调用、结果观察和生命周期 Hooks |
+| **LLM Providers** | OpenAI 兼容 API、Anthropic、NVIDIA NIM、Google AI、OpenRouter |
+| **Tools** | 同步/异步工具、自定义 Tool Trait、JSON Schema 定义 |
+| **MCP** | stdio 与 HTTP Client；支持 tools、resources、prompts |
+| **Multi-Agent Bus** | 发布/订阅、请求/响应和 RPC |
+| **Skills** | 从 `SKILL.md` 目录按需加载专业知识 |
+| **Memory** | 内存与文件型记忆、元数据过滤、Prompt 注入 |
+| **Resilience** | 重试分类、限流、熔断和执行期限 |
+| **Observability** | Tracing，以及每次运行的 Token、工具调用、耗时和限流指标 |
+
+### 一套 Runtime，两种一致的 SDK
+
+NBOS 和 JSBOS 是同一原生引擎的语言接口，而不是两套独立重写的实现。
+CI 会检查公开 API、Native Wrapper 映射和 API 文档，避免绑定接口逐渐分叉。
+
+| | Python | JavaScript |
+|---|---|---|
+| 导入 | `from nbos import BrainOS, tool` | `import { BrainOS, ToolDef } from "@open1s/jsbos"` |
+| Runtime | `async with BrainOS() as brain:` | `const brain = new BrainOS(); await brain.start()` |
+| 创建 Agent | `brain.agent("assistant")` | `brain.agent("assistant")` |
+| 注册工具 | `.with_tools(add)` | `.register(toolDef)` |
+| 执行 | `await agent.ask("…")` | `await agent.runSimple("…")` |
+
+## BSH：原生 AI Agent 工作空间
+
+**BSH 是建立在 BOS Runtime 之上的原生桌面产品。**
+它基于 GPUI 构建，将 Agent 会话、项目、终端、浏览器、代码编辑器和扩展整合到同一工作空间。
+Agent 不再是开发环境之外的独立聊天窗口，而是可以参与实际开发流程的执行能力。
+
+- **工作区与会话** —— 按项目组织工作空间和持久会话，支持搜索、置顶、归档、分叉与恢复。
+- **Agent 对话** —— 流式响应、轮次导航、任务计划、消息队列、子 Agent 运行状态和定时任务。
+- **集成终端** —— 内嵌 Ghostty 终端，并在命令执行前应用终端策略检查。
+- **浏览器面板** —— 在 Agent 工作空间中使用嵌入式 WebView。
+- **代码编辑器** —— 文件树、标签页、Diff 和 tree-sitter 语言语法。
+- **加密设置** —— Provider 配置与加密 Vault，使用 Argon2id 和 XChaCha20-Poly1305。
+- **双语界面** —— 支持中文与英文。
+- **扩展平台** —— 增加工具、命令、面板、提示词、上下文、技能、主题、语言服务、Agent 角色、
+  工作流、存储和 Hooks。
+
+## 扩展平台
+
+BOS Runtime 面向应用集成，BSH 面向可扩展的桌面工作流。扩展通过 `extension.toml`
+描述和打包；BSH 负责校验 Manifest 与包内容、解析依赖、管理生命周期，并在扩展请求
+宿主能力时执行相应的能力授权策略。
+
+<p align="center">
+  <img src="docs/assets/charts/architecture.png" alt="BSH 扩展架构：校验、哈希、安装、依赖解析、授权、分发与执行" width="820">
+</p>
+
+### 六种扩展运行时
+
+| Runtime | 适用场景 | 扩展实现 |
+|---|---|---|
+| **Declarative** | JSON 定义工具、面板、提示词和主题 | 声明配置，不执行 Guest 代码 |
+| **Process** | 复用已有程序和 CLI | 通过行分隔 JSON-RPC 通信的子进程 |
+| **WASM Component** | 具有类型化接口的可移植组件 | WebAssembly Component Model 与 WIT |
+| **Extism** | 接入现有 Extism 插件 | 使用 `bsh_host` 导入接口的 Extism 插件 |
+| **MCP** | 复用已有 MCP Server | stdio MCP Server |
+| **Built-in** | 第一方内置能力 | 链接进宿主的 Rust 代码 |
+
+<p align="center">
+  <img src="docs/assets/charts/call-path.png" alt="扩展调用链：能力授权、策略决策、审计与分发执行" width="700">
+</p>
+
+### 创建和验证扩展
 
 ```bash
-# JavaScript MCP HTTP 演示
-node crates/jsbos/examples/mcp_http_agent_demo.js
+export BSH=./target/release/bsh
 
-# Python MCP HTTP 演示（先启动服务器，然后使用）
-python3 crates/examples/mcp_http_server.py
+$BSH ext new com.acme.hello --dir hello
+$BSH ext validate hello
+$BSH ext mock hello echo '{"text":"hi"}'
+$BSH ext install hello
+$BSH ext list
+$BSH ext doctor
+$BSH ext grant com.acme.hello workspace.write --scope workspace
+$BSH ext logs com.acme.hello
 ```
 
----
+查看 [`examples/extensions/`](examples/extensions/) 中的示例：
+[`hello`](examples/extensions/hello)、
+[`process-echo`](examples/extensions/process-echo)、
+[`wasm-echo`](examples/extensions/wasm-echo)、
+[`extism-echo`](examples/extensions/extism-echo)、
+[`mcp-echo`](examples/extensions/mcp-echo) 和
+[`extism-hook`](examples/extensions/extism-hook)。
 
-## 许可证
+扩展开发资料：
 
-MIT OR Apache-2.0
+- [扩展标准](docs/bsh-extension-standard.md) —— Manifest、能力与运行时的规范契约。
+- [扩展开发指南](docs/bsh-extension-dev-guide.md) —— 从零创建第一个扩展。
+- [WIT 接口](crates/bsh/wit/extension.wit) —— WASM Component 类型化接口。
+- [Hook 系统](docs/bsh-hook-system.md) —— 生命周期与观测 Hook。
+- [CI 验证脚本](scripts/ci/verify-bsh-examples.sh) —— 扩展示例验证入口。
 
----
+**安全说明：**扩展能力授权与操作系统级隔离是两个不同层次。
+不同操作系统和运行时可提供的沙箱能力并不完全相同；Windows 上 Process 和 MCP
+扩展子进程的隔离工作仍在单独跟踪。详见
+[扩展安全规范](docs/bsh-extension-standard.md) 和
+[未关闭的安全问题](https://github.com/open1s/bos/issues)。
 
-## 更新日志
+## 仓库结构
 
-### v3.0.2 (2026-10-07)
+```
+crates/
+├── agent/        Agent Runtime、工具、Skills、Memory、MCP、策略
+├── react/        ReAct 引擎与 LLM Client
+├── bus/          发布/订阅、请求/响应与 RPC
+├── config/       配置加载与发现
+├── logging/      Tracing 与埋点
+├── qserde/       总线使用的 rkyv 序列化
+├── resource/     资源子系统与 rex CLI
+├── bsh/          原生桌面 Harness 与扩展平台
+├── nbos/         Python 绑定（pip install nbos）
+└── jsbos/        JavaScript 绑定（npm install @open1s/jsbos）
+```
 
-- **修复**: 限流/重试等待与按运行统计的 token、工具调用与工具耗时指标现在在真实 LLM 调用路径上正确记录
-- **修复**: npm 发布流水线加固 — 并发发布串行化、dist-tag 修复、错配标签防护、可重入的幂等发布
-- **文档**: README 更新至 3.0.2 基线发布
+组件关系与依赖方向见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
-### v3.0.1 (2026-10-07)
+## 文档
 
-- **新增**: 记忆存储（内存/文件，元数据过滤）、`{{memory}}` 提示词占位符、Python/JS `Memory` 类
-- **新增**: `react::template` 提示词模板；`AsyncFunctionTool::from_fn`
-- **新增**: 按错误类型分类重试；限流器支持 `retry_backoff`/`auto_wait`
-- **新增**: 指标中记录每次 LLM 调用的最小/最大耗时，两种绑定均可访问
+| 资料 | 内容 |
+|---|---|
+| [BOS / BSH 实战手册](docs/BOS-BSH-Textbook.md) | 34 章文档，覆盖 Runtime、桌面应用和扩展平台 |
+| [Python 使用指南](docs/python-user-guide.md) | 在 Python 中使用 BOS |
+| [JavaScript 使用指南](docs/javascript-user-guide.md) | 在 Node.js / JavaScript 中使用 BOS |
+| [Rust 使用指南](docs/rust-user-guide.md) | 嵌入和扩展 Rust Runtime |
+| [扩展标准](docs/bsh-extension-standard.md) · [开发指南](docs/bsh-extension-dev-guide.md) | 扩展规范与开发流程 |
+| [架构](ARCHITECTURE.md) · [项目上手](ONBOARDING.md) | 系统设计与贡献者环境 |
+| [设置](docs/bsh-settings-spec.md) · [终端策略](docs/bsh-terminal-policy.md) · [Hooks](docs/bsh-hook-system.md) | 子系统设计说明 |
+| [REX 指南](docs/rex-user-guide.md) · [诊断](docs/diagnostics.md) | 资源 CLI 与故障排查 |
+| [Wiki](https://github.com/open1s/bos/wiki) · [更新日志](CHANGELOG.md) | 使用指南与版本记录 |
 
-### v2.3.6 (2026-07-01)
+## 构建、测试与贡献
 
-- **新增**: `load_skill` 工具返回 `skill_dir` 字段 — LLM 可获取 `SKILL.md` 父目录路径以访问打包资源
+```bash
+cargo build --workspace
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+```
 
-### v2.3.5
+Python 和 JavaScript 绑定有独立测试套件：
 
-- **新增**: 技能系统：基于目录的技能加载，使用 `SKILL.md` 文件
-- **新增**: `load_skill` 工具 — LLM 可按需加载技能指令
-- **新增**: ReAct 引擎中的技能缓存（TTL）
-- **修复**: 技能加载性能 — 避免重复文件系统读取
+```bash
+cd crates/nbos  && maturin develop && pytest -m "not llm"
+cd crates/jsbos && npm install && npx ava
+```
 
-### v2.3.0 (2026-06-09)
+- [贡献指南](CONTRIBUTING.md)
+- [安全策略](SECURITY.md)
+- [GitHub Issues](https://github.com/open1s/bos/issues)
+- [适合新贡献者的 Issues](https://github.com/open1s/bos/labels/good%20first%20issue)
 
-- **新增**: 音频支持 — `Content.audio()`、`ContentPart.audio()` 多模态 LLM 调用
-- **新增**: LLM 供应商配置 — `[llm.google]`、`[llm.nvidia]`、`[llm.openrouter]` 配置项
-- **新增**: `demo_audio.js` 和 `demo_multimodal.js` 示例
-- **新增**: `demo_multimodal.py` Python 示例
-- **改进**: Content API — 统一的 `Content`/`ContentPart`/`Binary` 类，支持文本、图片、音频
-- **修复**: 多模态消息的 Content 序列化
+如果 BOS 对你有帮助，欢迎给仓库点一个 **Star**，也欢迎分享你基于 BOS 构建的项目。
+Star、Issue、Discussion 和真实使用案例，都能帮助更多开发者发现 BOS，也能帮助我们确定后续优先级。
 
-### v2.2.0 (2026-05-18)
+## License
 
-- **新增**: `agent.stop()` — 通过 ESC 键停止运行中的 agent/react/stream
-- **新增**: `agent.is_running()` — 检查 agent 是否正在运行
-- **新增**: NAPI Agent 层的停止标志和运行状态
-- **新增**: `StreamToken::Stopped` 变体用于流取消
-- **新增**: 并发调用阻止，错误提示 "Agent is already running"
-- **新增**: Stream 返回 `{status: "stopped"|"completed"}` JSON 字符串
-- **Breaking**: `stream()` 现在返回 `String`（JSON 状态对象）而非 `()`
-
-### v2.1.4 (2026-05-15)
-
-- **修复**: `getPerfMetrics()` 现在在 `stream()` 调用后正确更新
-- **新增**: Token 用量追踪 — `react()`、`runSimple()` 和 `stream()` 的 `totalInputTokens` 和 `totalOutputTokens` 现在会从 LLM 响应中记录
-- **新增**: 工具调用追踪 — `toolInvocationCount` 记录代理实际调用的工具次数
-- **重命名**: 指标字段更清晰：`callCount` → `llmCallCount`，`toolCallCount` → `toolInvocationCount`
-- **新增**: `agent_metrics_demo.js` 示例，用于验证指标记录
-
-### v2.1.3 (2026-05-13)
-
-- 上一个版本
-
----
-
-**版本**: 3.0.2 | **更新日期**: 2026-10-07
+MIT OR Apache-2.0 · Version 3.0.2 · [Releases](https://github.com/open1s/bos/releases)

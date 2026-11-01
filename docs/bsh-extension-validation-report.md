@@ -6,7 +6,7 @@
 
 ## Executive summary
 
-The textbook is broadly aligned with the implementation, but the review found two P0 platform gaps: Linux ProcessRuntime did not enable bubblewrap by default, and Windows MCP cancellation used Unix-only `libc`. A further call-path review found that Linux McpRuntime bypassed the ProcessRuntime sandbox entirely. Remediation for all three is proposed in [PR #35](https://github.com/open1s/bos/pull/35); Linux integration and Windows CI results are pending.
+The review's Linux sandbox-default and MCP call-path fixes were merged in [PR #35](https://github.com/open1s/bos/pull/35). MCP Unix resource limits and startup cancellation fixes were subsequently merged in [PR #40](https://github.com/open1s/bos/pull/40) and [PR #42](https://github.com/open1s/bos/pull/42). A follow-up compile failure exposed the distinction between `std::process::Command` and `tokio::process::Command`; the shared RLIMIT hook and separate adapters are now on `main` in commit `d5a8314`. Two Windows security gaps remain explicit: extension Process/MCP children have no AppContainer isolation ([Issue #43](https://github.com/open1s/bos/issues/43)) and no Job Object resource limits ([Issue #39](https://github.com/open1s/bos/issues/39)). The latest main Rust workspace workflow is queued, so Linux integration and all-example acceptance are not yet verified.
 
 This review is source-level and repository-level. It did **not** execute the BSH binary or build/run the example packages: the connected GitHub interface exposes repository files and Actions state, not a local checkout/terminal. No example is marked runtime-verified based only on reading its files.
 
@@ -67,7 +67,7 @@ The original `main` branch had stale security statements and an inactive Linux P
 ### Finding SEC-01 — Linux ProcessRuntime sandbox disabled by default
 
 **Severity:** High  
-**Status:** Remediation proposed in [PR #35](https://github.com/open1s/bos/pull/35); CI pending — [Issue #31](https://github.com/open1s/bos/issues/31)
+**Status:** Code merged in [PR #35](https://github.com/open1s/bos/pull/35); Linux runtime verification pending — [Issue #31](https://github.com/open1s/bos/issues/31)
 
 Evidence on the reviewed `main` revision:
 
@@ -79,7 +79,7 @@ The PR enables the sandbox by default on Linux, fails closed when bubblewrap can
 ### Finding SEC-04 — Linux MCP runtime bypassed the process sandbox
 
 **Severity:** High  
-**Status:** Remediation proposed in [PR #35](https://github.com/open1s/bos/pull/35); CI pending — [Issue #36](https://github.com/open1s/bos/issues/36)
+**Status:** Code merged in [PR #35](https://github.com/open1s/bos/pull/35); Linux runtime verification pending — [Issue #36](https://github.com/open1s/bos/issues/36)
 
 Evidence on the reviewed `main` revision:
 
@@ -100,7 +100,7 @@ This may be an intentional consequence of granting arbitrary process execution, 
 ### Finding SEC-03 — Windows MCP cancellation did not compile
 
 **Severity:** High for Windows CI / platform coverage  
-**Status:** Remediation proposed in [PR #35](https://github.com/open1s/bos/pull/35); Windows CI pending — [Issue #33](https://github.com/open1s/bos/issues/33)
+**Status:** Code merged in [PR #35](https://github.com/open1s/bos/pull/35); latest Windows CI verification pending — [Issue #33](https://github.com/open1s/bos/issues/33)
 
 Actions run #149 failed with E0433 because `McpCore::kill_child()` unconditionally called `libc::kill` while `libc` was declared only under `cfg(unix)`. The PR replaces pid signalling with a separately lockable `std::process::Child` handle and adds a cross-platform termination test.
 
@@ -110,8 +110,8 @@ Actions run #149 failed with E0433 because `McpCore::kill_child()` unconditional
 - **Path scopes:** source normalizes lexical paths before scope comparison. Continue to treat symlink and TOCTOU handling as separate filesystem-boundary concerns.
 - **Installed integrity:** current scan code compares the computed package hash to the registry record and re-verifies signatures; test quarantine/refusal and publisher-key removal.
 - **WASM host calls:** subscriptions are checked against declared topics and `events.subscribe`; host filesystem operations authorize before writes. Preserve tests that assert denied operations have no side effects.
-- **Resource limits:** keep per-runtime tests for output bytes, memory, fuel and wall-clock deadlines. Pure-compute WASM cancellation remains bounded by epoch/fuel rather than immediate instruction interruption, as the peer-review report states.
-- **Cross-platform:** Linux sandbox execution and Windows process-limit behaviour require actual platform CI, not just platform-independent argument-plan unit tests. The current Windows extension job is failing at compile time on the Unix-only `libc` call tracked by Issue #33.
+- **Resource limits:** ProcessRuntime and McpRuntime now have separate adapters over a shared Unix RLIMIT hook for RLIMIT_AS, RLIMIT_CPU and RLIMIT_NOFILE. The Linux MCP integration test checks the effective limits and filesystem boundary, but the current main-branch run has not yet completed. Windows Job Object memory/CPU/process-tree limits remain unavailable ([Issue #39](https://github.com/open1s/bos/issues/39)). Pure-compute WASM cancellation remains bounded by epoch/fuel rather than immediate instruction interruption.
+- **Cross-platform:** Windows extension tests passed on the PR #35 merge commit; the latest main-branch Windows and Linux jobs are still running/queued. Windows Process/MCP children currently execute without AppContainer isolation ([Issue #43](https://github.com/open1s/bos/issues/43)); Job Object limits are also absent ([Issue #39](https://github.com/open1s/bos/issues/39)). Linux sandbox/resource integration and the ten-example automation still require the main-branch Rust workspace job to complete successfully.
 
 ## 4. Acceptance criteria
 
@@ -128,5 +128,5 @@ Actions run #149 failed with E0433 because `McpCore::kill_child()` unconditional
 ## 5. Review limitations
 
 - No local checkout or shell execution was available in this review session.
-- PR #35 adds the Linux bubblewrap integration tests and all-example verification script. Its current Actions results must be checked before any P0 issue is closed; this report does not claim those tests have passed.
+- PR #35 was merged at `77a55ec`; PR #40 and PR #42 are also merged. The post-merge workflow for `6d7053c` failed: Linux/MSRV and Windows builds found the `std::process::Command` versus `tokio::process::Command` mismatch in the shared RLIMIT helper, while the core test job also reported rustfmt differences. Commit `d5a8314` added separate standard-library and Tokio command adapters and applied rustfmt. The latest `main` run for `4f56cb4` has Binding Parity green, NBOS in progress, and Rust Workspace, JSBOS and the main summary queued. Keep Issues #31, #36 and #38 open until Linux integration, all-example validation and MCP resource tests pass. Issue #41 is closed after the cancellation fix. This is not a formal penetration test, dynamic fuzzing campaign, or independent cryptographic audit.
 - This is not a formal penetration test, dynamic fuzzing campaign, or independent cryptographic audit.

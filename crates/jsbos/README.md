@@ -1,8 +1,15 @@
 # @open1s/jsbos — v3.0.2
 
-> BrainOS JavaScript/Node.js bindings — AI agent framework with ReAct engine
+[![npm](https://img.shields.io/npm/v/@open1s/jsbos?label=npm&logo=npm&color=CB3837)](https://www.npmjs.com/package/@open1s/jsbos)
+[![License](https://img.shields.io/github/license/open1s/bos?color=blue)](https://github.com/open1s/bos/blob/main/LICENSE)
 
-High-performance JavaScript bindings for [BrainOS](https://github.com/open1s/bos), a Rust-based AI agent framework implementing the ReAct (Reason + Act) paradigm. Built with [NAPI-RS](https://napi.rs/) for native performance.
+> The Node.js surface of BOS — AI agents with tools, skills, memory, MCP and a multi-agent bus.
+
+`@open1s/jsbos` is the JavaScript binding for [BOS (BrainOS)](https://github.com/open1s/bos), a
+Rust-based agent runtime implementing the ReAct (Reason + Act) paradigm. It is the same engine the
+[BSH desktop harness](https://github.com/open1s/bos#inside-the-harness-bsh) runs on, exposed to
+Node.js through [NAPI-RS](https://napi.rs/) — so a tool you write here behaves the same in Rust,
+Python and the app.
 
 ## Features
 

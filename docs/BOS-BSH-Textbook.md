@@ -637,7 +637,7 @@ a model or role that the settings layer can select.
 
 | Field | Range | Default | Enforced today |
 |---|---|---|---|
-| `max_memory_mb` | 1–4096 | 256 | wasm/Extism memory; process RLIMIT_AS |
+| `max_memory_mb` | 1–4096 | 256 | wasm/Extism memory; Unix Process/MCP RLIMIT_AS |
 | `max_execution_ms` | 1–600000 | 30000 | per call |
 | `max_concurrent_calls` | 1–64 | 4 | declared; process serializes through one child |
 | `max_output_bytes` | 1–16777216 | 1048576 | tool result |
@@ -3411,7 +3411,7 @@ Controls:
 - [ ] `doctor` passes on a clean install;
 - [ ] no secret is logged, including in hook payloads.
 
-**Process/MCP runtime warning:** `process.execute` authorizes arbitrary child code. macOS applies a filesystem-write profile to ProcessRuntime, not a network sandbox. Linux enables bubblewrap by default for ProcessRuntime and McpRuntime; if bubblewrap or namespace setup is unavailable, spawning fails closed rather than launching unsandboxed. The current Linux plan uses `--share-net`, so it does not isolate child networking. `network.http` governs host-mediated HTTP calls, not arbitrary sockets opened by a child process.
+**Process/MCP runtime warning:** `process.execute` authorizes arbitrary child code; it is not itself an OS sandbox. macOS applies a filesystem-write profile to ProcessRuntime, not a network sandbox. Linux enables bubblewrap by default for ProcessRuntime and McpRuntime; if bubblewrap or namespace setup is unavailable, spawning fails closed rather than launching unsandboxed. The current Linux plan uses `--share-net`, so it does not isolate child networking. `network.http` governs host-mediated HTTP calls, not arbitrary sockets opened by a child process. On Windows, ProcessRuntime and McpRuntime currently launch without an AppContainer boundary ([Issue #43](https://github.com/open1s/bos/issues/43)) or Job Object resource limits ([Issue #39](https://github.com/open1s/bos/issues/39)); do not treat capability authorization, deadlines or output caps as substitutes.
 
 ## 34.3 Deliberate limits
 
@@ -3421,14 +3421,18 @@ Controls:
 3. Themes apply to the package's panels; the Settings selection can overlay the
    shell palette.
 4. Lock reproduction covers Git/registry and the recorded local source path.
-5. Process children get RLIMIT ceilings and a process group. macOS applies a
-   filesystem write sandbox to ProcessRuntime (not a network sandbox). Linux
-   enables bubblewrap by default for ProcessRuntime and McpRuntime and fails
-   closed if it cannot start; `--share-net` means child network access remains
-   shared with the host.
+5. Process and MCP children get Unix RLIMIT_AS, RLIMIT_CPU and RLIMIT_NOFILE
+   ceilings and a process group. macOS applies a filesystem write sandbox to
+   ProcessRuntime (not a network sandbox). Linux enables bubblewrap by default
+   for ProcessRuntime and McpRuntime and fails closed if it cannot start;
+   `--share-net` means child network access remains shared with the host.
+   Windows Process/MCP children currently lack AppContainer isolation ([Issue #43](https://github.com/open1s/bos/issues/43)) and OS-level resource limits ([Issue #39](https://github.com/open1s/bos/issues/39)).
 6. Cancellation stops a process/MCP child immediately, traps WASM at its next
    host call, and lets a pure-compute guest run to its fuel deadline.
-7. Windows/Linux process limits are compiled but not exercised here.
+7. Linux CI exercises Process/MCP sandbox and resource boundaries. Windows
+   Process/MCP isolation and resource enforcement remain unavailable pending
+   AppContainer ([Issue #43](https://github.com/open1s/bos/issues/43)) and Job Object
+   ([Issue #39](https://github.com/open1s/bos/issues/39)) support.
 8. The built-in runtime is first-party code; disk packages cannot claim it.
 9. The extension root is `~/.bos/bsh/extensions`, not `~/.bsh`.
 10. Images are local package assets; remote image URLs are refused.
