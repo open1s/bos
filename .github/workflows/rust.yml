@@ -69,6 +69,36 @@ jobs:
           xvfb-run -a cargo test --workspace --exclude jsbos --exclude nbos
           -- --skip browser::engine::tests
 
+  windows:
+    name: Windows extension tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Rust 1.98.1
+        uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Test extension runtime and policy
+        run: >-
+          cargo test -p bsh --lib extension::
+          -- --skip ui::shell_tests
+
   msrv:
     name: Build at the declared MSRV
     runs-on: ubuntu-latest
