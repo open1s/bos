@@ -179,7 +179,9 @@ impl Drop for Session {
 /// Keeping this operation behind a small helper makes the cancellation path
 /// independent of Unix-only pid signalling and directly testable on Windows.
 fn terminate_child_handle(child: &Arc<Mutex<Child>>) {
-    let mut child = child.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut child = child
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _ = child.kill();
 }
 
@@ -437,11 +439,7 @@ impl McpCore {
         let mut command = if cfg!(target_os = "linux") {
             let mut command = Command::new("bwrap");
             command.args(super::process::linux_bwrap_plan(
-                &self.root,
-                None,
-                None,
-                &program,
-                &self.args,
+                &self.root, None, None, &program, &self.args,
             ));
             command
         } else {
@@ -712,11 +710,14 @@ impl McpCore {
     /// held during blocking stdio exchanges. Child::kill uses the native
     /// process-termination API on both Unix and Windows.
     fn kill_child(&self) {
-        let child = self.child.lock().ok().and_then(|slot| slot.as_ref().cloned());
+        let child = self
+            .child
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .cloned();
         if let Some(child) = child {
-            if let Ok(mut child) = child.lock() {
-                let _ = child.kill();
-            }
+            terminate_child_handle(&child);
         }
     }
 
@@ -994,7 +995,10 @@ mod tests {
             .expect("child lock")
             .wait()
             .expect("wait for terminated child");
-        assert!(!status.success(), "the child must be terminated, not finish normally");
+        assert!(
+            !status.success(),
+            "the child must be terminated, not finish normally"
+        );
     }
 
     #[cfg(target_os = "linux")]
