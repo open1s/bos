@@ -6,17 +6,18 @@
   <img src="docs/assets/bos-logo.png" alt="BOS — BrainOS AI 智能体框架" width="440">
 </p>
 
-<h1 align="center">BOS — Rust 原生 AI Agent 运行时</h1>
+<h1 align="center">BOS — Rust 原生 AI Agent 平台</h1>
 
 <p align="center">
-  <strong>一套智能体引擎，贯通 Rust、Python、JavaScript，以及原生桌面工作空间。</strong>
+  <strong>一个 Rust 内核，三种开发接口，一个原生 Agent 工作空间。</strong>
 </p>
 
 <p align="center">
-  BOS（BrainOS）是一套以 Rust 为核心、面向多语言开发的 AI Agent 框架与运行时，
-  将 Agent 编排、工具调用、MCP、Skills、Memory 和多智能体通信整合在统一内核中。
-  <strong>BSH（BOS Harness）</strong>则是基于同一运行时构建的原生桌面环境，
-  把智能体、代码、终端、浏览器和扩展放进一个工作空间。
+  BOS（BrainOS）是一套面向 AI Agent 构建、集成与运行的可组合平台。
+  Rust Runtime 将 Agent 编排、工具调用、MCP、Skills、Memory 和多智能体通信
+  统一在同一执行内核之上。开发者可以直接使用 Rust，也可以通过 NBOS（Python）
+  和 JSBOS（JavaScript）调用同一套运行时。<strong>BSH（BOS Harness）</strong>
+  则把这套 Runtime 带入原生桌面工作空间，服务于 Agent 驱动的开发流程。
 </p>
 
 <p align="center">
@@ -40,11 +41,11 @@
 
 ## BOS 是什么？
 
-**BOS 不只是 Prompt 封装，而是一套可嵌入、可扩展、可跨语言复用的 AI Agent Runtime。**
+**BOS 为 AI Agent 提供统一的运行时基础，而不是绑定某一种语言或交互界面。**
 
-它为应用提供统一的智能体基础设施：Rust 执行内核、Python 与 JavaScript SDK、
-一致的工具和 MCP 接口、可持续使用的上下文，以及多智能体通信原语。
-你可以把 BOS 作为库嵌入自己的产品，也可以直接使用 BSH，在原生桌面应用中构建和运行智能体。
+Rust Runtime 承担核心执行能力；NBOS 和 JSBOS 将同一套引擎开放给 Python 与
+JavaScript；BSH 则以原生桌面应用的形式提供完整工作环境。开发者既可以把 Agent
+能力嵌入自己的产品，也可以通过 BSH 构建、调试和运行 Agent。
 
 | 产品组成 | 核心能力 | 适用场景 |
 |---|---|---|
@@ -55,9 +56,9 @@
 
 ## 为什么选择 BOS？
 
-很多 Agent 框架绑定单一语言，或者把模型、工具、MCP 和记忆拼成松散的集成；
-桌面 Agent 工具又往往无法与业务应用共享同一套运行时。
-BOS 选择另一条路线：**一个 Rust 内核、多语言 SDK，以及基于同一引擎构建的桌面 Harness。**
+BOS 的核心设计原则是：**Agent Runtime 不应被某一种语言、某一个应用或某一种界面锁定。**
+同一套 Rust 实现同时服务于原生 Rust 应用、Python 与 JavaScript SDK，以及 BSH 桌面端。
+团队因此可以使用一致的执行模型，将 Agent 嵌入业务产品、通过脚本自动化，或在桌面工作空间中运行。
 
 - **一个内核，三种语言。** 直接使用 Rust，或通过 Python、JavaScript SDK 开发。
   两种语言绑定共享底层实现，并通过 CI 检查 API 一致性。
@@ -166,27 +167,31 @@ model = "nvidia/your-model"
 如果调用参数与配置文件都没有提供 key，两种绑定都会读取 `OPENAI_API_KEY`；
 没有 `LLM_BASE_URL`、`LLM_MODEL` 这类覆盖——base URL 与模型来自调用参数或上面的配置段。
 
-**BSH** 把同样的供应商做成了可编辑的行：**设置 → 模型**。它的设置存放在
-`~/.bos/bsh/settings.toml`；不该以明文落盘的凭据，放进它旁边的加密保险库。
+BSH 可在 **设置 → 模型** 中管理 Provider。敏感凭据存放在加密 Vault 中，
+不会以明文形式写入普通设置文件。
 
 ---
 
-## 为什么不用另一个智能体框架
+## BOS 的设计方式
 
-| 你需要的 | 这里有什么 | 常见的替代 |
-|---|---|---|
-| **一份行为，三种语言** | 一套 Rust 内核，上面是 `nbos` 与 `@open1s/jsbos`；两边接口一旦漂移，CI 直接失败 | 一个 Python 框架，加一个半途而废的 SDK |
-| **智能体之间能对话** | `bus`：发布/订阅、查询/响应、caller/callable RPC，rkyv 线格式 | 进程之间拼 HTTP |
-| **工具真的能跑** | `heel` 为宿主管理的命令提供原生 OS 隔离；BSH 扩展子进程另有隔离边界（macOS profile、Linux Bubblewrap）。Windows Process/MCP 目前没有 AppContainer 隔离（[#43](https://github.com/open1s/bos/issues/43)），Job Object 资源限制也尚未实现（[#39](https://github.com/open1s/bos/issues/39)）。 | “模型都这么说了，应该没事” |
-| **领域知识** | 目录式技能：带 frontmatter 的 `SKILL.md`，由模型按需加载 | 一段越写越长的系统提示词 |
-| **外部工具服务** | MCP 客户端，stdio 与 HTTP 都支持，工具/资源/提示词一并映射 | 每个服务器手写一个适配器 |
-| **上下文记得住** | 内存与文件两种记忆后端，支持元数据过滤，`{{memory}}` 直接进提示词 | 每个项目重搭一遍 RAG |
-| **生产行为** | 重试分类、限流器、熔断器，以及按次运行的 token/工具/耗时指标 | 先祈祷，再复盘 |
-| **一张脸** | GPU 渲染的原生窗口（GPUI），不是 Electron 壳 | 给 CLI 套个网页 |
+| 设计原则 | BOS 的实现 |
+|---|---|
+| **统一执行内核** | 一套 Rust Runtime 同时服务于原生 Rust 应用、NBOS、JSBOS 和 BSH。 |
+| **Agent 是执行流程，不只是对话** | ReAct 循环负责协调模型输出、工具调用、结果观察与生命周期 Hooks。 |
+| **默认支持互操作** | 通过 stdio 和 HTTP 接入 MCP Server，并通过 Provider 适配器连接模型 API。 |
+| **多 Agent 协作** | 专用消息总线提供发布/订阅、请求/响应和 RPC。 |
+| **知识与上下文可复用** | 目录化 `SKILL.md` 技能，以及内存或文件型 Memory。 |
+| **执行过程可治理** | 重试策略、限流、熔断、执行期限、指标和能力授权。 |
+| **运行时可持续扩展** | BSH 支持 Declarative、Process、WASM Component、Extism、MCP 和 Built-in 扩展。 |
+
+BOS 将安全边界视为需要明确实现和验证的工程能力，而不是营销承诺。
+沙箱能力取决于操作系统与执行路径；BSH Process/MCP 扩展在 Windows 上的
+AppContainer 隔离和 Job Object 资源限制仍在跟踪实施中
+（[#43](https://github.com/open1s/bos/issues/43)、[#39](https://github.com/open1s/bos/issues/39)）。
 
 ---
 
-## 运行时内部（BOS）
+## 深入 BOS Runtime
 
 - **智能体循环**——`crates/react` 跑 ReAct：流式输出、调用工具、观察、继续。各条缝上都有
   hook（`before_tool_call`、`after_llm_call`、`on_complete`、`on_error` ……），宿主可以观察
@@ -244,8 +249,9 @@ CI 会检查公开 API、Native Wrapper 映射和 API 文档，避免绑定接�
 
 ## BSH：原生 AI Agent 工作空间
 
-**BSH 是构建、使用和扩展 BOS 智能体的桌面应用。**
-它基于 GPUI 构建，不是 Electron 套壳；把 Agent 执行过程与开发者日常使用的工具放进同一个工作空间。
+**BSH 是建立在 BOS Runtime 之上的原生桌面产品。**
+它基于 GPUI 构建，将 Agent 会话、项目、终端、浏览器、代码编辑器和扩展整合到同一工作空间。
+Agent 不再是开发环境之外的独立聊天窗口，而是可以参与实际开发流程的执行能力。
 
 - **工作区与会话** —— 按项目组织工作空间和持久会话，支持搜索、置顶、归档、分叉与恢复。
 - **Agent 对话** —— 流式响应、轮次导航、任务计划、消息队列、子 Agent 运行状态和定时任务。
@@ -259,8 +265,9 @@ CI 会检查公开 API、Native Wrapper 映射和 API 文档，避免绑定接�
 
 ## 扩展平台
 
-BOS 面向嵌入式集成，BSH 面向可扩展桌面工作流。BSH 扩展以 `extension.toml` 描述。
-宿主负责校验 Manifest、验证包内容、解析依赖、管理生命周期，并在扩展请求宿主能力时执行授权策略。
+BOS Runtime 面向应用集成，BSH 面向可扩展的桌面工作流。扩展通过 `extension.toml`
+描述和打包；BSH 负责校验 Manifest 与包内容、解析依赖、管理生命周期，并在扩展请求
+宿主能力时执行相应的能力授权策略。
 
 <p align="center">
   <img src="docs/assets/charts/architecture.png" alt="BSH 扩展架构：校验、哈希、安装、依赖解析、授权、分发与执行" width="820">

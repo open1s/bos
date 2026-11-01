@@ -6,17 +6,18 @@
   <img src="docs/assets/bos-logo.png" alt="BOS — BrainOS AI Agent Framework" width="440">
 </p>
 
-<h1 align="center">BOS — The Rust-Native AI Agent Runtime</h1>
+<h1 align="center">BOS — The Rust-Native AI Agent Platform</h1>
 
 <p align="center">
-  <strong>Build AI agents once. Run them in Rust, Python, JavaScript — or inside a native desktop workspace.</strong>
+  <strong>One Rust core. Three developer interfaces. One native agent workspace.</strong>
 </p>
 
 <p align="center">
-  BOS (BrainOS) is an extensible, multi-language AI agent framework built around one Rust core.
-  It brings together agent orchestration, tool calling, MCP, skills, memory, and multi-agent
-  communication. <strong>BSH (BOS Harness)</strong> is its native desktop environment for working
-  with agents, code, terminals, browsers, and extensions.
+  BOS (BrainOS) is a composable platform for building, embedding, and operating AI agents.
+  Its Rust runtime brings orchestration, tools, MCP, skills, memory, and multi-agent
+  communication together behind one execution core. Use it directly from Rust, or through
+  the NBOS Python and JSBOS JavaScript SDKs. <strong>BSH (BOS Harness)</strong> brings that
+  same runtime into a native desktop workspace for agent-driven development.
 </p>
 
 <p align="center">
@@ -40,12 +41,13 @@
 
 ## What is BOS?
 
-**BOS is an AI agent runtime and developer framework — not just another prompt wrapper.**
+**BOS provides the shared runtime foundation for building and operating AI agents.**
 
-It gives applications a reusable agent foundation: a Rust execution core, consistent Python
-and JavaScript SDKs, a common tool and MCP model, persistent context, and primitives for
-agents to communicate. Use the libraries to embed agents in your own product, or use BSH
-to work with those agents in a native desktop application.
+Instead of tying agent behavior to one language or one interface, BOS separates the
+execution engine from the way developers use it. The Rust runtime provides the core
+capabilities; NBOS and JSBOS expose the same engine to Python and JavaScript; and BSH
+delivers a native desktop environment powered by that runtime. Embed agents in your own
+software, or use the integrated workspace to develop and operate them.
 
 | Product | What it does | Best for |
 |---|---|---|
@@ -56,10 +58,11 @@ to work with those agents in a native desktop application.
 
 ## Why BOS?
 
-Most agent frameworks make you choose between a language-specific SDK, a collection of loosely
-connected integrations, or a desktop tool that cannot share its runtime with your application.
-BOS takes a different route: **one Rust core, multiple language interfaces, and a desktop
-harness built on the same engine.**
+BOS is built around a simple architectural principle: **the agent runtime should not be
+locked to a language, application, or interface.** One Rust implementation powers the native
+runtime, the Python and JavaScript SDKs, and the BSH desktop application. Teams get one
+execution model to embed in products, automate from scripts, and operate through a desktop
+workspace.
 
 - **One engine, three languages.** Build on the Rust core or use the Python and JavaScript
   bindings. The bindings share the same underlying implementation and are checked for API
@@ -173,28 +176,31 @@ If neither the call nor the config file supplies a key, both bindings read `OPEN
 There is no `LLM_BASE_URL` / `LLM_MODEL` override — the base URL and the model come from the
 call or from the sections above.
 
-In BSH the same providers are rows you can edit under **Settings → Models**. Its settings live
-in `~/.bos/bsh/settings.toml`, and values that must not sit there in plain text go into the
-encrypted vault beside it.
+BSH manages providers in **Settings → Models**. Sensitive credentials are stored in its
+encrypted vault rather than written as plain text in the settings file.
 
 ---
 
-## Why this instead of another agent framework
+## The BOS approach
 
-| What you need | What is here | What people usually settle for |
-|---|---|---|
-| **One behavior, three languages** | A Rust core with `nbos` and `@open1s/jsbos` over it; a CI guard fails the build when the two binding surfaces drift | A Python framework and a half-ported SDK |
-| **Agents that talk to each other** | `bus`: publish/subscribe, query/response and caller/callable RPC, with an rkyv wire format | Ad-hoc HTTP between processes |
-| **Tools you can actually run** | Native OS isolation through `heel` for host-managed commands; BSH extension children have a separate boundary (macOS profile, Linux Bubblewrap). Windows Process/MCP AppContainer isolation remains open ([#43](https://github.com/open1s/bos/issues/43)); Job Object limits remain open ([#39](https://github.com/open1s/bos/issues/39)). | "The model asked nicely, so it is fine" |
-| **Domain knowledge** | Directory skills — a `SKILL.md` with frontmatter, loaded on demand by the model | One system prompt that keeps growing |
-| **External tool servers** | An MCP client over stdio and HTTP, with tools, resources and prompts mapped in | A bespoke adapter per server |
-| **Context that survives** | In-memory and file-backed memory, metadata filters, `{{memory}}` in the prompt | RAG glue rebuilt per project |
-| **Production behavior** | Retry classification, rate limiter, circuit breaker, per-run token/tool/time metrics | Hope, then a postmortem |
-| **A face** | A GPU-rendered native window (GPUI), not an Electron shell | A web UI bolted onto a CLI |
+| Design principle | How BOS implements it |
+|---|---|
+| **One shared runtime** | A Rust core powers native Rust applications, NBOS, JSBOS, and BSH. |
+| **Agents as workflows, not just chat** | A ReAct loop coordinates model output, tool calls, observations, and lifecycle hooks. |
+| **Interoperability** | MCP connects existing tool servers over stdio and HTTP; provider adapters connect supported model APIs. |
+| **Multi-agent collaboration** | A dedicated bus supports publish/subscribe, query/response, and RPC communication. |
+| **Reusable knowledge and context** | Directory-based `SKILL.md` skills and in-memory or file-backed memory provide reusable context. |
+| **Operational control** | Retry policies, rate limiting, circuit breaking, deadlines, metrics, and capability authorization support controlled execution. |
+| **An extensible runtime** | BSH supports declarative, process, WASM Component, Extism, MCP, and built-in extensions. |
+
+BOS treats security boundaries as engineering guarantees that must be implemented and verified,
+not as blanket marketing claims. Enforcement varies by operating system and execution path.
+Windows AppContainer isolation for BSH Process/MCP extensions and Job Object resource limits
+remain tracked work ([#43](https://github.com/open1s/bos/issues/43), [#39](https://github.com/open1s/bos/issues/39)).
 
 ---
 
-## Inside the runtime (BOS)
+## Inside the BOS runtime
 
 - **Agent loop** — `crates/react` runs the ReAct cycle: stream, call tools, observe, continue.
   Hooks fire at the seams (`before_tool_call`, `after_llm_call`, `on_complete`, `on_error`, …)
@@ -259,9 +265,10 @@ documentation for drift.
 
 ## BSH: native AI agent workspace
 
-**BSH is the desktop application for building, using, and extending BOS-powered agents.**
-It is a native GPUI application rather than an Electron wrapper, and brings the agent loop
-into the same workspace as the tools developers use.
+**BSH is the native desktop product built on the BOS runtime.**
+It brings agent sessions, projects, terminal, browser, code editor, and extensions into one
+GPUI workspace. Rather than keeping the agent in a separate chat window, BSH places agent
+execution alongside the tools developers use to do real work.
 
 - **Workspaces and sessions** — organize projects and persistent conversations; search,
   pin, archive, fork and restore sessions.
@@ -278,10 +285,10 @@ into the same workspace as the tools developers use.
 
 ## Extension platform
 
-BOS is designed to be embedded; BSH is designed to be extended. A BSH extension is a
-package described by `extension.toml`. The host validates the manifest, verifies package
-content, resolves dependencies, manages lifecycle, and applies capability policy when
-extensions request host operations.
+The BOS runtime is designed to be embedded in applications; BSH is designed to be extended
+around developer workflows. Each extension is described by `extension.toml`. BSH validates
+the manifest and package contents, resolves dependencies, manages lifecycle, and applies
+capability policies when an extension requests host functionality.
 
 <p align="center">
   <img src="docs/assets/charts/architecture.png" alt="BSH extension architecture: validate, hash, install, resolve, authorize, dispatch and run" width="820">
