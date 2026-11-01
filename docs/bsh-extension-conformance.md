@@ -148,7 +148,7 @@ Status legend:
 | core/cancellation | done | AsyncTool token -> Runtime::cancel |
 | capabilities/filesystem | done | WASM read_file/write_file host functions with policy |
 | capabilities/network | done | WASM fetch host function with policy |
-| capabilities/process | partial | policy + spawn + rlimits + RSS watchdog + macOS profile + Linux bwrap default enforcement (integration CI pending); Windows limits absent |
+| capabilities/process | partial | policy + spawn + rlimits + RSS watchdog + macOS profile + Linux bwrap default for process/MCP (integration CI pending); Windows limits absent |
 | capabilities/storage | done | WASM storage_get/set/list |
 | capabilities/secrets | done | WASM read_secret |
 | agent/tool, prompt, context_provider | tool/prompt done, context static |
@@ -197,7 +197,7 @@ Status legend:
 | Process JSON-RPC stdio, handshake, structured stderr | done |
 | Process executable allowlist/user approval | done | allowlist + explicit grant; Settings > Extensions approves the declared process executable |
 | Environment filtering, cwd restriction, timeout, output limits | done |
-| OS-level sandbox | partial | macOS filesystem profile; Linux bwrap enabled by default with a write-boundary integration test (CI pending); Windows OS sandbox absent; process network remains shared |
+| OS-level sandbox | partial | macOS process profile; Linux bwrap enabled by default for process and MCP with write-boundary integration tests (CI pending); Windows OS sandbox absent; child network remains shared |
 | Native dynamic libraries | non-goal |
 
 ## 9. UI
@@ -357,9 +357,10 @@ Each is a behaviour, not a missing type.
 
 1. Agent provider descriptors are selectable presets; there is no separate
    code-level agent adapter API beyond that descriptor contract.
-2. Filesystem sandbox: macOS profile is tested; Linux bubblewrap is enabled by
-   default and has a host-HOME write-denial integration test in Linux CI. The
-   CI result must remain green before this guarantee is marked verified.
+2. Filesystem sandbox: macOS process profile is tested; Linux bubblewrap is
+   enabled by default for both process and MCP children, with host-HOME
+   write-denial integration tests in Linux CI. CI must remain green before
+   this guarantee is marked verified.
 3. Cross-platform matrix: Linux and Windows extension CI provide compile/runtime
    coverage; Windows OS-level process sandboxing and process resource ceilings
    remain unavailable and must be documented as platform limitations.
