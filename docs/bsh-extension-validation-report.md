@@ -29,23 +29,16 @@ The textbook's Appendix F lists ten runnable examples. The repository's `example
 | `language-python` | Listed in textbook inventory | Not run |
 | `computer-use` | Manifest and README commands referenced by code search | Not run |
 
-### Execution commands to run in a real checkout
+### Automated verification added in PR #35
 
-Run from the repository root after building BSH:
+The PR adds `scripts/ci/verify-bsh-examples.sh` and wires it into the Linux Rust workflow. It:
 
-```bash
-cargo build -p bsh
-export BSH=./target/debug/bsh
+- runs `ext validate` and `ext test` for all ten runnable examples;
+- runs `ext mock` for all 25 declared tools across those examples;
+- asserts the All-in-One `fail` tool returns its expected non-zero result;
+- asserts all nine macOS-only Computer Use tools return the documented Linux platform refusal before any input/screen operation.
 
-for example in hello allinone process-echo wasm-echo extism-echo extism-hook mcp-echo hook-demo language-python computer-use; do
-  echo "===== $example: validate ====="
-  "$BSH" ext validate "examples/extensions/$example" || exit 1
-  echo "===== $example: test ====="
-  "$BSH" ext test "examples/extensions/$example" || exit 1
-done
-```
-
-Then run `ext mock` for every declared tool with representative inputs. Runtime-specific end-to-end tests must separately exercise process, MCP, WASM and Extism; a successful `validate` or `mock` is not proof of sandbox enforcement.
+This automation is committed but its latest-commit CI result is still pending. Runtime mocks verify the host/runtime call path; they do not replace the dedicated Linux filesystem-boundary tests or a macOS Computer Use smoke test.
 
 ### CI observation
 
@@ -124,7 +117,7 @@ Actions run #149 failed with E0433 because `McpCore::kill_child()` unconditional
 
 - [ ] All ten runnable examples pass `ext validate`.
 - [ ] All ten pass `ext test`.
-- [ ] Every tool in every example has at least one representative `ext mock` test where the runtime supports mock.
+- [ ] All 25 declared tools are covered by `ext mock` or an explicitly expected platform/negative result.
 - [ ] Process, MCP, WASM and Extism have end-to-end tests against the actual example package.
 - [ ] Linux ProcessRuntime and McpRuntime children are sandboxed by default or refused; no silent unsandboxed fallback.
 - [ ] Linux integration tests verify filesystem boundaries for both runtimes and process teardown.
