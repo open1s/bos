@@ -457,7 +457,7 @@ impl McpCore {
         // Apply the same Unix RLIMIT and process-group ceilings as
         // ProcessRuntime. Windows remains a documented limitation until
         // Job Object enforcement is implemented.
-        super::process::configure_process_limits(
+        super::process::configure_std_process_limits(
             &mut command,
             self.memory_bytes,
             self.cpu_seconds,
@@ -761,7 +761,10 @@ impl McpCore {
                 .child
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if slot.as_ref().is_some_and(|current| Arc::ptr_eq(current, &child)) {
+            if slot
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &child))
+            {
                 *slot = None;
             }
             return Err(self.cancellation_error());
@@ -1150,9 +1153,10 @@ required = ["process.execute"]
             .core
             .cancelled
             .store(true, Ordering::SeqCst);
-        let cancelled = cancelled_runtime
-            .core
-            .call_tool_blocking("echo", json!({"x": 1}), None, 5000);
+        let cancelled =
+            cancelled_runtime
+                .core
+                .call_tool_blocking("echo", json!({"x": 1}), None, 5000);
         assert!(matches!(
             cancelled,
             Err(ExtensionError::Runtime { message, .. }) if message.contains("cancelled")

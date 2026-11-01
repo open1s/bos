@@ -8,6 +8,8 @@
 //! handshake and a tools/call request whose result is the tool's JSON value.
 
 use std::collections::BTreeMap;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -309,9 +311,7 @@ pub(super) fn linux_bwrap_plan(
     let mut bound = Vec::<PathBuf>::new();
     let mut created_tmp_dirs = Vec::<PathBuf>::new();
     for path in writable {
-        if path != Path::new("/tmp")
-            && !bound.iter().any(|parent| path.starts_with(parent))
-        {
+        if path != Path::new("/tmp") && !bound.iter().any(|parent| path.starts_with(parent)) {
             // /tmp is a fresh tmpfs in the sandbox. Recreate destination
             // directories before binding a package/workspace/data root that
             // was originally located under the host's /tmp.
@@ -378,39 +378,77 @@ fn sandbox_profile(root: &Path, workspace: Option<&Path>, data_root: Option<&Pat
     profile
 }
 
-/// Apply the manifest's resource ceilings in the child, before exec.
+/// The child-side hook that installs the manifest's resource ceilings.
 ///
 /// RLIMIT_AS bounds the address space, RLIMIT_CPU is the wall-independent CPU
 /// backstop behind the host's own wall-clock timeout, and RLIMIT_NOFILE keeps a
 /// package from exhausting the process's descriptor table. Failures are
 /// ignored: a platform that refuses a limit still gets the host-side timeout.
-pub(super) fn configure_process_limits(command: &mut Command, memory: u64, cpu: u64) {
-    #[cfg(unix)]
-    {
+///
+/// The host builds two kinds of command - tokio's for the process runtime and
+/// the standard library's for the MCP client - and `pre_exec` is spelled the
+/// same on both but they are unrelated types. The closures therefore live here
+/// once, and each caller registers one on its own command.
+#[cfg(unix)]
+fn rlimit_hook(
+    memory: u64,
+    cpu: u64,
+) -> impl FnMut() -> std::io::Result<()> + Send + Sync + 'static {
+    move || {
         // SAFETY: pre_exec runs in the forked child before exec. The closure
         // only calls async-signal-safe setrlimit/setpgid and captures integers.
         unsafe {
-            command.pre_exec(move || {
-                let memory = memory.max(16 * 1024 * 1024) as libc::rlim_t;
-                let address = libc::rlimit {
-                    rlim_cur: memory,
-                    rlim_max: memory,
-                };
-                let _ = libc::setrlimit(libc::RLIMIT_AS, &address);
-                let cpu = cpu.max(1) as libc::rlim_t;
-                let cpu_limit = libc::rlimit {
-                    rlim_cur: cpu,
-                    rlim_max: cpu,
-                };
-                let _ = libc::setrlimit(libc::RLIMIT_CPU, &cpu_limit);
-                let descriptors = libc::rlimit {
-                    rlim_cur: 256,
-                    rlim_max: 256,
-                };
-                let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &descriptors);
-                let _ = libc::setpgid(0, 0);
-                Ok(())
-            });
+            let memory = memory.max(16 * 1024 * 1024) as libc::rlim_t;
+            let address = libc::rlimit {
+                rlim_cur: memory,
+                rlim_max: memory,
+            };
+            let _ = libc::setrlimit(libc::RLIMIT_AS, &address);
+            let cpu = cpu.max(1) as libc::rlim_t;
+            let cpu_limit = libc::rlimit {
+                rlim_cur: cpu,
+                rlim_max: cpu,
+            };
+            let _ = libc::setrlimit(libc::RLIMIT_CPU, &cpu_limit);
+            let descriptors = libc::rlimit {
+                rlim_cur: 256,
+                rlim_max: 256,
+            };
+            let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &descriptors);
+            let _ = libc::setpgid(0, 0);
+        }
+        Ok(())
+    }
+}
+
+/// Apply the manifest's resource ceilings to a tokio command.
+pub(super) fn configure_process_limits(command: &mut Command, memory: u64, cpu: u64) {
+    #[cfg(unix)]
+    {
+        // SAFETY: `rlimit_hook` runs in the forked child before exec and only
+        // calls async-signal-safe functions.
+        unsafe {
+            command.pre_exec(rlimit_hook(memory, cpu));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (command, memory, cpu);
+    }
+}
+
+/// Apply the same ceilings to the MCP client's synchronous command.
+pub(super) fn configure_std_process_limits(
+    command: &mut std::process::Command,
+    memory: u64,
+    cpu: u64,
+) {
+    #[cfg(unix)]
+    {
+        // SAFETY: `rlimit_hook` runs in the forked child before exec and only
+        // calls async-signal-safe functions.
+        unsafe {
+            command.pre_exec(rlimit_hook(memory, cpu));
         }
     }
     #[cfg(not(unix))]
@@ -1088,10 +1126,7 @@ mod tests {
             .iter()
             .position(|item| item == "--bind")
             .expect("package bind");
-        assert!(
-            dir < bind,
-            "the package destination must exist before bind"
-        );
+        assert!(dir < bind, "the package destination must exist before bind");
         assert_eq!(
             plan.iter().filter(|item| item.as_str() == "--bind").count(),
             2
@@ -1296,7 +1331,10 @@ events = ["workspace.changed"]
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .expect("CI runner HOME is set");
-        let probe = home.join(format!("bsh-ext-linux-sandbox-probe-{}", std::process::id()));
+        let probe = home.join(format!(
+            "bsh-ext-linux-sandbox-probe-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&probe);
         std::fs::write(
             scratch.0.join("server.sh"),
@@ -1317,14 +1355,23 @@ done
         )
         .expect("server");
         let runtime = ProcessRuntime::new(&manifest(), &scratch.0).expect("runtime");
-        assert!(runtime.sandbox, "Linux process sandbox must be enabled by default");
+        assert!(
+            runtime.sandbox,
+            "Linux process sandbox must be enabled by default"
+        );
         let context = CallContext::new(manifest().id().clone(), "linux-sandbox", None, 2000);
         let result = runtime
             .call_tool("echo", json!({}), &context)
             .await
             .expect("sandboxed call");
-        assert_eq!(result["blocked"], true, "HOME is outside writable sandbox mounts");
-        assert!(!probe.exists(), "the extension must not write into the host HOME");
+        assert_eq!(
+            result["blocked"], true,
+            "HOME is outside writable sandbox mounts"
+        );
+        assert!(
+            !probe.exists(),
+            "the extension must not write into the host HOME"
+        );
         runtime.shutdown().await.expect("shutdown");
     }
 
