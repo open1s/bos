@@ -11,12 +11,13 @@ against the implementation in crates/bsh/src/extension. It is deliberately
 exhaustive: a requirement is not "done" because a type exists; it is done when
 the host performs the behaviour and a test proves it.
 
-Verification: the `rust workspace` GitHub run `41267469680` is green -
-format, clippy, docs, tests and the 1.97 MSRV build on Ubuntu, plus the
-`Windows extension tests` job on `windows-latest`. The browser engine cases are
-skipped on Linux because a shared Xvfb runner makes them load-flaky; they run on
-macOS. Four inherited frame-clock cases are ignored with their reason recorded
-in the test source, not silently deleted.
+Verification snapshot (2026-11-01): source-level review is based on
+`main` commit `2f1805c7ce8498a5fb504dd8ba8b925087686c16`. The GitHub commit-status
+endpoint returned no status entries and the workflow-runs lookup returned no
+runs for this commit. Therefore this document does not claim that the current
+baseline has green CI. Historical run `41267469680` is not used as evidence for
+this commit. Platform-specific coverage and the cross-platform matrix must be
+reported against the exact commit and workflow run that produced them.
 
 Status legend:
 
@@ -328,7 +329,7 @@ is deliberate and does not remove a feature.
 | Unit: manifest, ids, resolver, lifecycle, capability, events, UI, paths, lock determinism | done |
 | Integration: built-in registration, WASM load/invoke, process start/stop, tools, cancellation, UI action routing, patches, denial, crash isolation, upgrade/rollback, data preservation | partial | cancellation and scan/load crash isolation covered; cross-platform execution remains partial |
 | Security tests: traversal, unauthorized fs/network, process denial, oversized messages, nested UI, event flood, resource exhaustion, malformed payloads, stale actions, revoked capability, package tampering/signatures | partial | signature/UI/traversal/process concurrency/time quota/memory cap/network flood covered; Windows execution remains |
-| Cross-platform matrix | not run in this environment |
+| Cross-platform matrix | not verified for baseline commit `2f1805c7ce8498a5fb504dd8ba8b925087686c16`; see current verification snapshot above |
 
 ## 18. Roadmap
 
