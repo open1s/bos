@@ -206,12 +206,83 @@ impl Bridge {
                     .timeout(Duration::from_millis(15_000))
                     .build()
                     .map_err(|error| error.to_string())?;
+                let requested_bytes = request
+                    .get("body")
+                    .and_then(Value::as_str)
+                    .map(|body| body.len() as u64)
+                    .unwrap_or(0);
+                let method_text = method.as_str().to_string();
+                let started = Instant::now();
                 let mut outgoing = client.request(method, parsed);
                 if let Some(body) = request.get("body").and_then(Value::as_str) {
                     outgoing = outgoing.body(body.to_string());
                 }
-                let response = outgoing.send().map_err(|error| error.to_string())?;
-                let bytes = response.bytes().map_err(|error| error.to_string())?;
+                let response = match outgoing.send() {
+                    Ok(response) => response,
+                    Err(error) => {
+                        let message = error.to_string();
+                        crate::extension::hooks::observe(
+                            "http.exchange",
+                            crate::extension::hooks::http_exchange(
+                                self.extension.as_str(),
+                                &method_text,
+                                raw,
+                                None,
+                                requested_bytes,
+                                0,
+                                None,
+                                0,
+                                started.elapsed().as_millis() as u64,
+                                Some(&message),
+                            ),
+                        );
+                        return Err(message);
+                    }
+                };
+                let ttfb_ms = started.elapsed().as_millis() as u64;
+                let status = response.status().as_u16();
+                let content_type = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                let bytes = match response.bytes() {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        let message = error.to_string();
+                        crate::extension::hooks::observe(
+                            "http.exchange",
+                            crate::extension::hooks::http_exchange(
+                                self.extension.as_str(),
+                                &method_text,
+                                raw,
+                                Some(status),
+                                requested_bytes,
+                                0,
+                                content_type.as_deref(),
+                                ttfb_ms,
+                                started.elapsed().as_millis() as u64,
+                                Some(&message),
+                            ),
+                        );
+                        return Err(message);
+                    }
+                };
+                crate::extension::hooks::observe(
+                    "http.exchange",
+                    crate::extension::hooks::http_exchange(
+                        self.extension.as_str(),
+                        &method_text,
+                        raw,
+                        Some(status),
+                        requested_bytes,
+                        bytes.len() as u64,
+                        content_type.as_deref(),
+                        ttfb_ms,
+                        started.elapsed().as_millis() as u64,
+                        None,
+                    ),
+                );
                 if bytes.len() > MAX_BRIDGE_BODY {
                     return Err("response is too large".to_string());
                 }
@@ -622,6 +693,15 @@ impl Runtime for ExtismRuntime {
         self.descriptors()
     }
 
+    async fn hook(&self, point: &str, payload: Value) -> Result<(), ExtensionError> {
+        // Observe batches arrive already shaped as {point, batch}; the guest
+        // export is only required for packages that declared a hook point,
+        // which manifest validation enforces.
+        let _ = point;
+        let _ = self.call::<_, Value>("bsh_hook", &payload)?;
+        Ok(())
+    }
+
     async fn call_tool(
         &self,
         name: &str,
@@ -777,6 +857,78 @@ mod tests {
         runtime.shutdown().await.expect("shutdown");
         let _ = std::fs::remove_dir_all(&scratch);
     }
+    #[tokio::test]
+    async fn observe_hooks_reach_an_extism_plugin() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/extensions/extism-hook")
+            .canonicalize()
+            .expect("the hook example exists");
+        let manifest = Manifest::load(&root).expect("manifest");
+        let scratch = std::env::temp_dir().join(format!("bsh-extism-hook-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(scratch.join("data")).expect("data");
+        let policy = Arc::new(
+            PolicyEngine::open(
+                scratch.join("grants.toml"),
+                scratch.join("audit.jsonl"),
+                crate::extension::capability::PolicyMode::Enforce,
+            )
+            .expect("policy"),
+        );
+        for capability in [
+            Capability::HooksObserve,
+            Capability::ExtensionStorage,
+            Capability::AgentToolsRegister,
+            Capability::UiPanels,
+        ] {
+            policy
+                .grant(
+                    "com.example.extism-hook",
+                    capability,
+                    crate::extension::capability::GrantScope::Any,
+                    None,
+                )
+                .expect("grant");
+        }
+        let runtime = ExtismRuntime::new(
+            &manifest,
+            &root,
+            &scratch.join("data"),
+            policy,
+            EventBus::new(),
+            None,
+            "{}".to_string(),
+            TrustLevel::Local,
+        )
+        .expect("runtime");
+        runtime
+            .hook(
+                "model.request",
+                json!({"point": "model.request", "batch": [{}, {}]}),
+            )
+            .await
+            .expect("model hook");
+        runtime
+            .hook(
+                "http.exchange",
+                json!({"point": "http.exchange", "batch": [{}]}),
+            )
+            .await
+            .expect("http hook");
+        let panel = runtime.panel("inspector").await.expect("panel");
+        let rendered = panel.to_string();
+        assert!(
+            rendered.contains("model.request: 2"),
+            "the guest counted the model batch: {rendered}"
+        );
+        assert!(
+            rendered.contains("http.exchange: 1"),
+            "the guest counted the http batch: {rendered}"
+        );
+        runtime.shutdown().await.expect("shutdown");
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
     #[test]
     fn bridge_rejects_unknown_operations() {
         let root = std::env::temp_dir().join(format!("bsh-ext-extism-{}", std::process::id()));

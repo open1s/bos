@@ -76,11 +76,13 @@ pub(crate) enum Capability {
     UiCommands,
     /// Contribute visual theme resources.
     UiTheme,
+    /// Receive observe-hook batches from host seams.
+    HooksObserve,
 }
 
 impl Capability {
     /// Every capability, in declaration order.
-    pub(crate) const ALL: [Capability; 19] = [
+    pub(crate) const ALL: [Capability; 20] = [
         Self::WorkspaceRead,
         Self::WorkspaceWrite,
         Self::NetworkHttp,
@@ -100,6 +102,7 @@ impl Capability {
         Self::UiPanels,
         Self::UiCommands,
         Self::UiTheme,
+        Self::HooksObserve,
     ];
 
     /// The stable manifest string.
@@ -124,6 +127,7 @@ impl Capability {
             Self::UiPanels => "ui.panels",
             Self::UiCommands => "ui.commands",
             Self::UiTheme => "ui.theme",
+            Self::HooksObserve => "hooks.observe",
         }
     }
 
@@ -149,6 +153,7 @@ impl Capability {
             Self::UiPanels => "contribute host-managed panels",
             Self::UiCommands => "contribute host commands and keybindings",
             Self::UiTheme => "contribute visual theme resources",
+            Self::HooksObserve => "receive observe-hook batches from host seams",
         }
     }
 
@@ -169,7 +174,7 @@ impl Capability {
             | Self::AgentAgentsProvide
             | Self::AgentWorkflowsProvide
             | Self::AgentSkillsProvide => Risk::Medium,
-            Self::WorkspaceWrite | Self::NetworkHttp => Risk::High,
+            Self::WorkspaceWrite | Self::NetworkHttp | Self::HooksObserve => Risk::High,
             Self::ProcessExecute | Self::ComputerUse | Self::SecretsRead => Risk::Critical,
         }
     }

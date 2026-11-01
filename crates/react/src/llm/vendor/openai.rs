@@ -415,11 +415,12 @@ impl OpenAiVendor {
     /// [LlmError::Http] rather than an empty list, so a caller never paints an
     /// empty catalog over a refusal.
     pub async fn fetch_model_ids(&self) -> Result<Vec<String>, LlmError> {
-        let response = self
+        let url = self.models_url();
+        let builder = self
             .client
-            .get(self.models_url())
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .send()
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key));
+        let response = super::tap::traced_send("llm.models", "GET", &url, None, 0, builder.send())
             .await
             .map_err(|e| LlmError::Http(e.to_string()))?;
         if !response.status().is_success() {
@@ -512,18 +513,28 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
         log_request(&openai_req);
 
         let t1 = std::time::Instant::now();
-        let response = client
+        let request_bytes = serde_json::to_vec(&openai_req)
+            .map(|body| body.len() as u64)
+            .unwrap_or(0);
+        let builder = client
             .post(&url)
             .header("Authorization", format!("Bearer {}", api_key))
             .header("Content-Type", "application/json")
-            .json(&openai_req)
-            .send()
-            .await
-            .map_err(|e| {
-                let err = LlmError::Http(e.to_string());
-                context.notify_error(&err);
-                err
-            })?;
+            .json(&openai_req);
+        let response = super::tap::traced_send(
+            "llm",
+            "POST",
+            &url,
+            request.request_id.as_deref(),
+            request_bytes,
+            builder.send(),
+        )
+        .await
+        .map_err(|e| {
+            let err = LlmError::Http(e.to_string());
+            context.notify_error(&err);
+            err
+        })?;
         info!("[TIMING] HTTP send+wait: {:?}", t1.elapsed());
 
         if !response.status().is_success() {
@@ -620,19 +631,29 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
 
         log_request(&openai_req);
 
-        let mut response = client
+        let request_bytes = serde_json::to_vec(&openai_req)
+            .map(|body| body.len() as u64)
+            .unwrap_or(0);
+        let builder = client
             .post(&url)
             .header("Authorization", format!("Bearer {}", api_key))
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")
-            .json(&openai_req)
-            .send()
-            .await
-            .map_err(|e| {
-                let err = LlmError::Other(format!("Request failed: {}", e));
-                context.notify_error(&err);
-                err
-            })?;
+            .json(&openai_req);
+        let mut response = super::tap::traced_send(
+            "llm",
+            "POST",
+            &url,
+            request.request_id.as_deref(),
+            request_bytes,
+            builder.send(),
+        )
+        .await
+        .map_err(|e| {
+            let err = LlmError::Other(format!("Request failed: {}", e));
+            context.notify_error(&err);
+            err
+        })?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -645,19 +666,29 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                 && openai_req.stream_options.take().is_some()
             {
                 log::warn!("provider rejected stream_options; retrying without usage reporting");
-                response = client
+                let request_bytes = serde_json::to_vec(&openai_req)
+                    .map(|body| body.len() as u64)
+                    .unwrap_or(0);
+                let builder = client
                     .post(&url)
                     .header("Authorization", format!("Bearer {}", api_key))
                     .header("Content-Type", "application/json")
                     .header("Accept", "text/event-stream")
-                    .json(&openai_req)
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        let err = LlmError::Other(format!("Request failed: {}", e));
-                        context.notify_error(&err);
-                        err
-                    })?;
+                    .json(&openai_req);
+                response = super::tap::traced_send(
+                    "llm",
+                    "POST",
+                    &url,
+                    request.request_id.as_deref(),
+                    request_bytes,
+                    builder.send(),
+                )
+                .await
+                .map_err(|e| {
+                    let err = LlmError::Other(format!("Request failed: {}", e));
+                    context.notify_error(&err);
+                    err
+                })?;
                 if !response.status().is_success() {
                     let status = response.status();
                     let body = response.text().await.unwrap_or_default();
@@ -1091,6 +1122,7 @@ mod tests {
             top_k: None,
             reasoning_effort: None,
             api_mode: crate::llm::ApiMode::Chat,
+            request_id: None,
         };
         let outcome = vendor
             .complete(

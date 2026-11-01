@@ -343,6 +343,17 @@ pub(crate) trait Runtime: Send + Sync {
     async fn pump(&self) -> Result<(), ExtensionError> {
         Ok(())
     }
+
+    /// Deliver one observe hook batch to this runtime.
+    ///
+    /// The payload is `{"point": "...", "batch": [...]}`; a runtime that does
+    /// not implement hooks refuses, and the host logs that refusal rather than
+    /// pretending the package was attached.
+    async fn hook(&self, point: &str, _payload: Value) -> Result<(), ExtensionError> {
+        Err(ExtensionError::UnsupportedRuntime {
+            kind: format!("{} hook {point}", self.kind()),
+        })
+    }
 }
 
 /// The on-disk tool descriptor every declarative and process package ships for

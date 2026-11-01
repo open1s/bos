@@ -350,6 +350,7 @@ fn test_react_with_request() {
         max_tokens: None,
         reasoning_effort: None,
         api_mode: react::llm::ApiMode::Chat,
+        request_id: None,
     };
 
     let rt = tokio::runtime::Runtime::new().unwrap();

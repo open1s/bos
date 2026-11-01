@@ -470,21 +470,31 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
             }
         }
 
-        let response = self
+        let request_bytes = serde_json::to_vec(&body)
+            .map(|body| body.len() as u64)
+            .unwrap_or(0);
+        let builder = self
             .client
             .post(&url)
             .header("x-api-key", self.api_key.as_str())
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
             .header("accept", "text/event-stream")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                let err = LlmError::Other(format!("Request failed: {}", e));
-                context.notify_error(&err);
-                err
-            })?;
+            .json(&body);
+        let response = super::tap::traced_send(
+            "llm",
+            "POST",
+            &url,
+            request.request_id.as_deref(),
+            request_bytes,
+            builder.send(),
+        )
+        .await
+        .map_err(|e| {
+            let err = LlmError::Other(format!("Request failed: {}", e));
+            context.notify_error(&err);
+            err
+        })?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -728,6 +738,7 @@ mod tests {
             max_tokens,
             reasoning_effort: None,
             api_mode: ApiMode::Anthropic,
+            request_id: None,
         }
     }
 

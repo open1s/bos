@@ -63,6 +63,7 @@ fn make_simple_request(model: &str) -> LlmRequest {
         top_k: None,
         reasoning_effort: None,
         api_mode: react::llm::ApiMode::Chat,
+        request_id: None,
     }
 }
 
@@ -353,6 +354,7 @@ async fn test_nvidia_response_parsing() {
         top_k: None,
         reasoning_effort: None,
         api_mode: react::llm::ApiMode::Chat,
+        request_id: None,
     };
     let result = match vendor
         .complete(
@@ -510,6 +512,7 @@ async fn test_nvidia_tool_calls_stream_with_config() {
         top_k: None,
         reasoning_effort: None,
         api_mode: react::llm::ApiMode::Chat,
+        request_id: None,
     };
 
     let stream_result = vendor
@@ -658,6 +661,7 @@ async fn test_responses_api_complete() {
         top_k: None,
         reasoning_effort: None,
         api_mode: react::llm::ApiMode::Responses,
+        request_id: None,
     };
     if request.model.is_empty() {
         request.model = "gpt-4".to_string();
@@ -735,6 +739,7 @@ async fn test_responses_api_stream() {
         top_k: None,
         reasoning_effort: None,
         api_mode: react::llm::ApiMode::Responses,
+        request_id: None,
     };
     if request.model.is_empty() {
         request.model = "gpt-4".to_string();

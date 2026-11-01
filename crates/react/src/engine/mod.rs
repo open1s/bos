@@ -322,7 +322,12 @@ impl<A: ReActApp> ReActEngine<A> {
             };
 
             self.react_app
-                .after_llm_response(&mut llm_response, session, context)
+                .after_llm_response(
+                    &mut llm_response,
+                    request.request_id.as_deref(),
+                    session,
+                    context,
+                )
                 .await;
 
             match llm_response {
@@ -1063,7 +1068,13 @@ skill_dir: {}
                 }
 
                 self.react_app
-                    .after_llm_response_step(&full_response, saw_tool_call, session, context)
+                    .after_llm_response_step(
+                        &full_response,
+                        saw_tool_call,
+                        request.request_id.as_deref(),
+                        session,
+                        context,
+                    )
                     .await;
 
                 if !full_response.is_empty() {

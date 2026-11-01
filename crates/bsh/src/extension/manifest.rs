@@ -14,6 +14,7 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 
 use super::capability::Capability;
+use super::hooks::HOOK_POINTS;
 use super::types::{
     extension_api_version, host_version, ContributionId, ContributionKind, ExtensionError,
     ExtensionId, Requirement, RuntimeKind, StartupPolicy, TrustLevel, ValidationReport,
@@ -159,6 +160,9 @@ pub(crate) struct ContributesSpec {
     /// Event topics the package publishes.
     #[serde(default)]
     pub(crate) publishes: Vec<String>,
+    /// Observe hook points this package attaches to.
+    #[serde(default)]
+    pub(crate) hooks: Vec<String>,
 }
 
 /// The configuration block.
@@ -560,10 +564,47 @@ impl Manifest {
         if self.contributes.skills.len() > 256 {
             report.error("contributes.skills", "must contain at most 256 entries");
         }
+        if self.contributes.hooks.len() > 32 {
+            report.error("contributes.hooks", "must contain at most 32 points");
+        }
+        let mut seen_hooks = std::collections::BTreeSet::new();
+        for point in &self.contributes.hooks {
+            if !HOOK_POINTS.contains(&point.as_str()) {
+                report.error(
+                    format!("contributes.hooks.{point}"),
+                    "is not a hook point this host dispatches",
+                );
+            }
+            if !seen_hooks.insert(point) {
+                report.error(
+                    format!("contributes.hooks.{point}"),
+                    "is declared more than once",
+                );
+            }
+        }
+        if !self.contributes.hooks.is_empty() {
+            if self.runtime.kind != RuntimeKind::Extism {
+                report.error(
+                    "contributes.hooks",
+                    "observe hooks are delivered by the extism runtime in this build",
+                );
+            }
+            if !self
+                .capabilities
+                .required
+                .contains(&Capability::HooksObserve)
+            {
+                report.error(
+                    "contributes.hooks",
+                    "requires capabilities.required = [\"hooks.observe\"]",
+                );
+            }
+        }
         if self.all_contributions().is_empty()
             && self.contributes.skills.is_empty()
             && self.contributes.events.is_empty()
             && self.contributes.publishes.is_empty()
+            && self.contributes.hooks.is_empty()
         {
             report.warn(
                 "contributes",
@@ -963,6 +1004,39 @@ max_concurrent_calls = 4
             .errors
             .iter()
             .any(|issue| issue.field == "contributes"));
+    }
+
+    #[test]
+    fn hooks_require_extism_and_the_observe_capability() {
+        let text = sample().replace(
+            "[contributes]",
+            "[contributes]\nhooks = [\"model.request\"]",
+        );
+        let report = parse(&text).validate();
+        assert!(!report.is_valid(), "{report:?}");
+        let hook_errors: Vec<_> = report
+            .errors
+            .iter()
+            .filter(|issue| issue.field.starts_with("contributes.hooks"))
+            .collect();
+        assert_eq!(
+            hook_errors.len(),
+            2,
+            "runtime and capability are both refused: {report:?}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_hook_point_is_refused() {
+        let text = sample().replace(
+            "[contributes]",
+            "[contributes]\nhooks = [\"model.telepathy\"]",
+        );
+        let report = parse(&text).validate();
+        assert!(report
+            .errors
+            .iter()
+            .any(|issue| issue.field == "contributes.hooks.model.telepathy"));
     }
 
     #[test]

@@ -942,6 +942,10 @@ fn build_agent_for_session_inner(
         root.as_deref(),
         eff.preset_extensions.as_deref(),
     ));
+    // Hooks are installed after the extension platform has applied its
+    // packages: the decision is "is a hook-attached package live for THIS
+    // build", and a package installed in this build is live now.
+    crate::extension::hooks::install_agent_hooks(&mut agent);
 
     // The MCP HTTP path is the tool boundary's network egress. The pool shares
     // one slot with every live transport, so installing this turn's gate here
@@ -1751,6 +1755,7 @@ impl SubagentContext {
             config.system_prompt
         );
         let mut child = Agent::from_config(config).with_context_budget(self.context_budget);
+        crate::extension::hooks::install_agent_hooks(&mut child);
         // The same skills the parent turn carries: a delegated prompt can name
         // one (the `/name` gesture), and the child's own catalogue and
         // `load_skill` tool then answer from it.

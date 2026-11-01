@@ -889,19 +889,29 @@ impl ResponsesTransport {
             }
         }
 
-        let response = self
+        let request_bytes = serde_json::to_vec(&responses_req)
+            .map(|body| body.len() as u64)
+            .unwrap_or(0);
+        let builder = self
             .client
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
-            .json(&responses_req)
-            .send()
-            .await
-            .map_err(|e| {
-                let err = LlmError::Http(e.to_string());
-                context.notify_error(&err);
-                err
-            })?;
+            .json(&responses_req);
+        let response = super::tap::traced_send(
+            "llm",
+            "POST",
+            &url,
+            request.request_id.as_deref(),
+            request_bytes,
+            builder.send(),
+        )
+        .await
+        .map_err(|e| {
+            let err = LlmError::Http(e.to_string());
+            context.notify_error(&err);
+            err
+        })?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -940,20 +950,30 @@ impl ResponsesTransport {
 
         let url = format!("{}/responses", self.endpoint);
 
-        let response = self
+        let request_bytes = serde_json::to_vec(&responses_req)
+            .map(|body| body.len() as u64)
+            .unwrap_or(0);
+        let builder = self
             .client
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")
-            .json(&responses_req)
-            .send()
-            .await
-            .map_err(|e| {
-                let err = LlmError::Other(format!("Request failed: {}", e));
-                context.notify_error(&err);
-                err
-            })?;
+            .json(&responses_req);
+        let response = super::tap::traced_send(
+            "llm",
+            "POST",
+            &url,
+            request.request_id.as_deref(),
+            request_bytes,
+            builder.send(),
+        )
+        .await
+        .map_err(|e| {
+            let err = LlmError::Other(format!("Request failed: {}", e));
+            context.notify_error(&err);
+            err
+        })?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -1176,6 +1196,7 @@ mod tests {
             max_tokens: Some(100),
             reasoning_effort: Some(crate::llm::ReasoningEffort::High),
             api_mode: crate::llm::ApiMode::Responses,
+            request_id: None,
         };
 
         let built = build_request(None, &req, &session, &context, false);

@@ -1549,6 +1549,11 @@ rate               one source may publish 200 events in a second
 
 The bus counters (published, delivered, dropped, rejected) are in `bsh ext metrics`.
 
+**Hooks are not events.** A hook is a call at a seam (`model.request`,
+`model.response`, `tool.before`, `tool.after`) delivered only to a package that
+declared it; it is bounded, batched and redacted. The hook layer and its current
+limits are in [bsh-hook-system.md](bsh-hook-system.md).
+
 **See also:** [Events §9](bsh-extension-standard.md#9-events),
 [appendix C](#appendix-c-event-reference).
 
@@ -2109,6 +2114,7 @@ agent.models.provide        medium (explicit grant for community)
 agent.agents.provide        medium (explicit grant for community)
 agent.workflows.provide     medium (explicit grant for community)
 events.publish/subscribe    low
+hooks.observe               high (explicit grant; observe batches only)
 ui.panels/ui.commands/ui.theme low
 ```
 
@@ -2217,6 +2223,7 @@ Global options: `--root <path>`, `--json`. Exit codes: 0 success, 1 failure,
 | [extism-echo](../examples/extensions/extism-echo) | Extism | PDK exports, host bridge |
 | [mcp-echo](../examples/extensions/mcp-echo) | MCP | tools, resources, prompts, progress |
 | [language-python](../examples/extensions/language-python) | process | real Python diagnostics, GitHub integration |
+| [extism-hook](../examples/extensions/extism-hook) | Extism | observe hooks: model/tool/http counters in a panel |
 | [computer-use](../examples/extensions/computer-use) | process | 9 tools, panel, command, prompt, skill, integrations, workflow |
 | [builtin-template](../examples/extensions/builtin-template) | built-in | Rust trait and manifest snippet |
 

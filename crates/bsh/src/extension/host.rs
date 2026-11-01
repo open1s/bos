@@ -360,6 +360,14 @@ type BuiltRuntime = (
     DeclarativeContributions,
 );
 
+/// One runtime attached to an observe hook point.
+pub(crate) struct HookTarget {
+    /// Extension id, for diagnostics.
+    pub(crate) id: String,
+    /// The runtime that receives the batch.
+    pub(crate) runtime: Arc<dyn Runtime>,
+}
+
 struct LoadedExtension {
     package: Package,
     runtime: Option<Arc<dyn Runtime>>,
@@ -422,6 +430,7 @@ impl ExtensionHost {
         if let Ok(mut slot) = bus_slot().write() {
             *slot = Some(Arc::clone(&events));
         }
+        super::hooks::install_http_tap();
         let status_cache = Arc::new(Mutex::new(Vec::new()));
         let mut host = Self {
             config,
@@ -460,6 +469,29 @@ impl ExtensionHost {
     /// The event bus.
     pub(crate) fn events(&self) -> &Arc<EventBus> {
         &self.events
+    }
+
+    /// Runtimes attached to one observe hook point.
+    pub(crate) fn hook_targets(&self, point: &str) -> Vec<HookTarget> {
+        self.loaded
+            .values()
+            .filter(|entry| entry.applied && entry.error.is_none())
+            .filter(|entry| {
+                entry
+                    .package
+                    .manifest
+                    .contributes
+                    .hooks
+                    .iter()
+                    .any(|declared| declared == point)
+            })
+            .filter_map(|entry| {
+                entry.runtime.as_ref().map(|runtime| HookTarget {
+                    id: entry.package.id().as_str().to_string(),
+                    runtime: Arc::clone(runtime),
+                })
+            })
+            .collect()
     }
 
     /// The store, for the CLI.
@@ -1929,6 +1961,31 @@ pub(crate) fn install(
     guard
         .as_ref()
         .map(|host| host.apply(agent, registry, allowed.as_ref()))
+        .unwrap_or_default()
+}
+
+/// Whether any applied package declares an observe hook point.
+pub(crate) fn hook_attached() -> bool {
+    let slot = HOST.get_or_init(|| Mutex::new(None));
+    let Ok(guard) = slot.lock() else {
+        return false;
+    };
+    guard.as_ref().is_some_and(|host| {
+        host.loaded
+            .values()
+            .any(|entry| entry.applied && !entry.package.manifest.contributes.hooks.is_empty())
+    })
+}
+
+/// Runtimes attached to one hook point on the process-global host.
+pub(crate) fn hook_targets(point: &str) -> Vec<HookTarget> {
+    let slot = HOST.get_or_init(|| Mutex::new(None));
+    let Ok(guard) = slot.lock() else {
+        return Vec::new();
+    };
+    guard
+        .as_ref()
+        .map(|host| host.hook_targets(point))
         .unwrap_or_default()
 }
 

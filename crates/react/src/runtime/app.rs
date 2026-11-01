@@ -43,6 +43,7 @@ pub trait ReActApp: Send + Sync {
     fn after_llm_response(
         &self,
         _response: &mut LlmResponse,
+        _request_id: Option<&str>,
         _session: &mut Self::Session,
         _context: &mut Self::Context,
     ) -> impl Future<Output = ()> + Send {
@@ -55,6 +56,7 @@ pub trait ReActApp: Send + Sync {
         &self,
         _response_text: &str,
         _had_tool_call: bool,
+        _request_id: Option<&str>,
         _session: &mut Self::Session,
         _context: &mut Self::Context,
     ) -> impl Future<Output = ()> + Send {
@@ -136,19 +138,21 @@ impl<T: ReActApp + ?Sized> ReActApp for Box<T> {
     fn after_llm_response(
         &self,
         response: &mut LlmResponse,
+        request_id: Option<&str>,
         session: &mut Self::Session,
         context: &mut Self::Context,
     ) -> impl Future<Output = ()> + Send {
-        (**self).after_llm_response(response, session, context)
+        (**self).after_llm_response(response, request_id, session, context)
     }
     fn after_llm_response_step(
         &self,
         response_text: &str,
         had_tool_call: bool,
+        request_id: Option<&str>,
         session: &mut Self::Session,
         context: &mut Self::Context,
     ) -> impl Future<Output = ()> + Send {
-        (**self).after_llm_response_step(response_text, had_tool_call, session, context)
+        (**self).after_llm_response_step(response_text, had_tool_call, request_id, session, context)
     }
     fn before_tool_call(
         &self,

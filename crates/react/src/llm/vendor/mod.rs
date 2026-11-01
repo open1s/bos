@@ -8,6 +8,7 @@ pub mod openaicompatible;
 pub mod openrouter;
 pub mod responses;
 pub mod router;
+mod tap;
 pub use anthropic::{AnthropicVendor, AnthropicVendorBuilder};
 pub use deepseek::{DeepSeekVendor, DeepSeekVendorBuilder};
 pub use nvidia::NvidiaVendor;
@@ -24,6 +25,7 @@ pub use responses::{
     ResponsesStreamEvent, ResponsesTransport, ResponsesUsage,
 };
 pub use router::LlmRouter;
+pub use tap::{set_http_tap, HttpExchange, HttpTap};
 
 use std::time::Duration;
 

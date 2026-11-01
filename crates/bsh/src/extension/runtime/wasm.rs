@@ -427,16 +427,79 @@ impl self::bsh::extension::host::Host for HostState {
             .timeout(Duration::from_millis(15_000))
             .build()
             .map_err(|error| self::bsh::extension::types::HostError::Runtime(error.to_string()))?;
+        let requested_bytes = body.as_ref().map(|body| body.len() as u64).unwrap_or(0);
+        let method_text = method.as_str().to_string();
+        let started = Instant::now();
         let mut request = client.request(method, parsed);
         if let Some(body) = body {
             request = request.body(body);
         }
-        let response = request
-            .send()
-            .map_err(|error| self::bsh::extension::types::HostError::Runtime(error.to_string()))?;
-        let bytes = response
-            .bytes()
-            .map_err(|error| self::bsh::extension::types::HostError::Runtime(error.to_string()))?;
+        let response = match request.send() {
+            Ok(response) => response,
+            Err(error) => {
+                let message = error.to_string();
+                crate::extension::hooks::observe(
+                    "http.exchange",
+                    crate::extension::hooks::http_exchange(
+                        self.extension.as_str(),
+                        &method_text,
+                        &url,
+                        None,
+                        requested_bytes,
+                        0,
+                        None,
+                        0,
+                        started.elapsed().as_millis() as u64,
+                        Some(&message),
+                    ),
+                );
+                return Err(self::bsh::extension::types::HostError::Runtime(message));
+            }
+        };
+        let ttfb_ms = started.elapsed().as_millis() as u64;
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let bytes = match response.bytes() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let message = error.to_string();
+                crate::extension::hooks::observe(
+                    "http.exchange",
+                    crate::extension::hooks::http_exchange(
+                        self.extension.as_str(),
+                        &method_text,
+                        &url,
+                        Some(status),
+                        requested_bytes,
+                        0,
+                        content_type.as_deref(),
+                        ttfb_ms,
+                        started.elapsed().as_millis() as u64,
+                        Some(&message),
+                    ),
+                );
+                return Err(self::bsh::extension::types::HostError::Runtime(message));
+            }
+        };
+        crate::extension::hooks::observe(
+            "http.exchange",
+            crate::extension::hooks::http_exchange(
+                self.extension.as_str(),
+                &method_text,
+                &url,
+                Some(status),
+                requested_bytes,
+                bytes.len() as u64,
+                content_type.as_deref(),
+                ttfb_ms,
+                started.elapsed().as_millis() as u64,
+                None,
+            ),
+        );
         if bytes.len() > MAX_HOST_BODY {
             return Err(self::bsh::extension::types::HostError::Limited(
                 "response is too large".to_string(),

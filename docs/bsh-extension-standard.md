@@ -225,11 +225,22 @@ workflows = ["git.release"]
 themes = ["git.dark"]
 events = ["workspace.opened", "tool.*"]
 publishes = ["git.changed"]
+hooks = ["model.request", "model.response"]
 ~~~
 
 events are subscription topics; a trailing .* is allowed. publishes are topics
 the package may emit; a wildcard is not allowed there. Topic segments are
 lowercase letters, digits, hyphen and underscore, separated by dots.
+
+hooks are observe hook points, not event topics. A package that declares one
+must also require `hooks.observe`, and this build delivers hooks only through the
+Extism runtime: an observe batch is passed to the guest's `bsh_hook` export.
+The points are `model.request`, `model.response`, `tool.before`,
+`tool.after` and `http.exchange`; the last is produced by the WASM/Extism
+`fetch` bridge and the built-in LLM vendors (status, sizes, timing; no headers
+or bodies). A model request and its vendor send carry the same `request_id`, so
+the two observations join. Intercept hooks (deny/replace) are not part of this
+build.
 
 Language descriptors name a language, its bare file extensions, and the tool that answers diagnostics for a document. The tool is required and must be declared by the same package:
 
@@ -329,6 +340,7 @@ renders as empty. Tool output is capped by max_output_bytes.
 | agent.skills.provide | medium | allow | allow | allow |
 | events.publish | low | allow | allow | allow |
 | events.subscribe | low | allow | allow | allow |
+| hooks.observe | high | allow | explicit grant | explicit grant |
 | ui.panels | low | allow | allow | allow |
 | ui.commands | low | allow | allow | allow |
 | ui.theme | low | allow | allow | allow |
@@ -780,6 +792,13 @@ not kept:
 11. An MCP package that declares contributes.events receives each event as a
     `bsh/events/event` JSON-RPC notification once its server is running; a host that has
     not started the server drops the queued event instead of spawning it.
+12. Hook delivery is observe-only and Extism-only in this build. Batches are bounded,
+    dropped-and-counted on overflow, redacted and capped at 8 KiB per field.
+    `http.exchange` is produced by the WASM/Extism `fetch` bridge and by the built-in
+    LLM vendors (status, sizes, TTFB; no headers or bodies). Process and MCP HTTP
+    calls are not captured yet.
+    Intercept hooks and the WASM/process hook transports are not implemented; a
+    manifest that declares hooks for another runtime is refused at validation.
 
 ## 16. Example
 

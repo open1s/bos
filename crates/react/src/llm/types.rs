@@ -785,6 +785,12 @@ pub struct LlmRequest {
     /// `/chat/completions`; `Responses` targets the newer `/v1/responses` API.
     #[serde(default)]
     pub api_mode: ApiMode,
+    /// Correlation id used by host hooks and the HTTP tap.
+    ///
+    /// It is never serialized to a provider: it exists so a `model.request`
+    /// observation and the `http.exchange` for the same send can be joined.
+    #[serde(skip)]
+    pub request_id: Option<String>,
 }
 
 /// Selects the protocol used for a single LLM request.
@@ -864,6 +870,7 @@ impl LlmRequest {
             top_k: None,
             reasoning_effort: None,
             api_mode: ApiMode::Chat,
+            request_id: None,
         }
     }
 

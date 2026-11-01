@@ -189,6 +189,7 @@ mod tests {
             top_k: None,
             reasoning_effort: None,
             api_mode: crate::llm::ApiMode::Chat,
+            request_id: None,
         };
         let outcome = vendor
             .complete(

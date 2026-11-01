@@ -1,0 +1,5 @@
+{
+  "description": "Read the observe-hook counters",
+  "input_schema": {"type": "object", "properties": {}},
+  "capabilities": []
+}

@@ -10,6 +10,7 @@ use react::llm::{
 };
 use react::runtime::app::ReActApp;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use serde_json::Value as JsonValue;
 use std::collections::VecDeque;
 use std::future::Future;
@@ -1213,6 +1214,86 @@ impl AgentReActApp {
     }
 }
 
+/// Generate the id that joins a model request to its HTTP exchange.
+fn next_request_id() -> String {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    format!(
+        "req-{millis}-{}",
+        SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
+/// Plain text of a message content value, with binaries named rather than
+/// embedded (a hook must not copy an image into an event).
+fn content_text(content: &Content) -> String {
+    match content {
+        Content::Text(text) => text.clone(),
+        Content::Parts(parts) => parts
+            .iter()
+            .map(|part| match part {
+                ContentPart::Text { text } => text.clone(),
+                ContentPart::Binary { .. } => "[binary]".to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+/// The bounded message summary a model hook receives.
+fn message_traces(session: &AgentSession) -> String {
+    let mut traces = Vec::new();
+    if let Some(history) = session.history() {
+        for message in history.iter().rev().take(48).rev() {
+            let (role, body) = match message {
+                Message::System { content } => ("system", content.clone()),
+                Message::User { content } => ("user", content_text(content)),
+                Message::Assistant { content } => ("assistant", content.clone()),
+                Message::AssistantToolCall { name, args, .. } => {
+                    ("tool_call", format!("{name} {args}"))
+                }
+                Message::ToolResult { content, .. } => ("tool_result", content.clone()),
+            };
+            traces.push(json!({
+                "role": role,
+                "bytes": body.len(),
+                "preview": body.chars().take(512).collect::<String>(),
+            }));
+        }
+    }
+    json!(traces).to_string()
+}
+
+fn request_context(req: &ReactLlmRequest, messages: &str) -> String {
+    let messages = serde_json::from_str::<JsonValue>(messages).unwrap_or_else(|_| json!([]));
+    json!({
+        "request_id": req.request_id,
+        "model": req.model,
+        "api_mode": req.api_mode.as_str(),
+        "temperature": req.temperature,
+        "max_tokens": req.max_tokens,
+        "prompt_bytes": content_text(&req.input).len(),
+        "messages": messages,
+    })
+    .to_string()
+}
+
+fn response_context(response: &ReactLlmResponse) -> String {
+    let usage = response.usage();
+    json!({
+        "response_type": "react",
+        "usage": usage.map(|usage| json!({
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "total_tokens": usage.total_tokens,
+        })),
+    })
+    .to_string()
+}
+
 impl ReActApp for AgentReActApp {
     type Session = AgentSession;
     type Context = AgentReactContext;
@@ -1257,6 +1338,9 @@ impl ReActApp for AgentReActApp {
         let agent_name = self.agent_name.clone();
         let hooks = self.hooks.clone();
         let plugins = self.plugins.clone();
+        let messages = message_traces(session);
+        let request_id = next_request_id();
+        req.request_id = Some(request_id.clone());
         async move {
             if plugins.has_plugins() {
                 let wrapper = crate::agent::plugin::LlmRequestWrapper::new(&*req);
@@ -1271,6 +1355,8 @@ impl ReActApp for AgentReActApp {
             }
             let mut ctx = crate::agent::hooks::HookContext::new(&agent_name);
             ctx.set("model", &req.model);
+            ctx.set("request_id", &request_id);
+            ctx.set("request", request_context(req, &messages));
             hooks
                 .trigger(crate::agent::hooks::HookEvent::BeforeLlmCall, ctx)
                 .await
@@ -1281,12 +1367,14 @@ impl ReActApp for AgentReActApp {
     fn after_llm_response(
         &self,
         response: &mut ReactLlmResponse,
+        request_id: Option<&str>,
         _session: &mut Self::Session,
         _context: &mut Self::Context,
     ) -> impl Future<Output = ()> + Send {
         let agent_name = self.agent_name.clone();
         let hooks = self.hooks.clone();
         let plugins = self.plugins.clone();
+        let request_id = request_id.map(str::to_string);
         async move {
             if plugins.has_plugins() {
                 let wrapper = crate::agent::plugin::LlmResponseWrapper::new(&*response);
@@ -1295,7 +1383,11 @@ impl ReActApp for AgentReActApp {
                 }
             }
             let mut ctx = crate::agent::hooks::HookContext::new(&agent_name);
+            if let Some(request_id) = request_id.as_deref() {
+                ctx.set("request_id", request_id);
+            }
             ctx.set("response_type", "react");
+            ctx.set("response", response_context(response));
             let _ = hooks
                 .trigger(crate::agent::hooks::HookEvent::AfterLlmCall, ctx)
                 .await;
@@ -1307,15 +1399,21 @@ impl ReActApp for AgentReActApp {
         &self,
         response_text: &str,
         had_tool_call: bool,
+        request_id: Option<&str>,
         _session: &mut Self::Session,
         _context: &mut Self::Context,
     ) -> impl Future<Output = ()> + Send {
         let agent_name = self.agent_name.clone();
         let hooks = self.hooks.clone();
+        let request_id = request_id.map(str::to_string);
         let response_text = response_text.to_string();
         async move {
             let mut ctx = crate::agent::hooks::HookContext::new(&agent_name);
+            if let Some(request_id) = request_id.as_deref() {
+                ctx.set("request_id", request_id);
+            }
             ctx.set("response_type", "stream");
+            ctx.set("response_bytes", response_text.len().to_string());
             ctx.set("response_text", &response_text);
             ctx.set("had_tool_call", had_tool_call.to_string());
             let _ = hooks

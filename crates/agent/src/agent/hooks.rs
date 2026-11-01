@@ -287,10 +287,14 @@ impl ReActApp for HookRegistry {
     async fn after_llm_response(
         &self,
         _response: &mut react::llm::LlmResponse,
+        request_id: Option<&str>,
         _session: &mut Self::Session,
         _context: &mut Self::Context,
     ) {
-        let ctx = HookContext::new("");
+        let mut ctx = HookContext::new("");
+        if let Some(request_id) = request_id {
+            ctx.set("request_id", request_id);
+        }
         let _ = self.trigger(HookEvent::AfterLlmCall, ctx).await;
     }
 
@@ -298,10 +302,14 @@ impl ReActApp for HookRegistry {
         &self,
         response_text: &str,
         had_tool_call: bool,
+        request_id: Option<&str>,
         _session: &mut Self::Session,
         _context: &mut Self::Context,
     ) {
         let mut ctx = HookContext::new("");
+        if let Some(request_id) = request_id {
+            ctx.set("request_id", request_id);
+        }
         ctx.set("response_type", "stream");
         ctx.set("response_text", response_text);
         ctx.set("had_tool_call", had_tool_call.to_string());
