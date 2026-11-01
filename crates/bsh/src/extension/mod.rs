@@ -28,6 +28,8 @@ mod agent;
 mod capability;
 mod cli;
 mod config;
+#[cfg(test)]
+mod e2e;
 mod events;
 pub(crate) mod host;
 pub(crate) use host::shutdown;
