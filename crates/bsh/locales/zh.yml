@@ -548,6 +548,8 @@
 "settings.themeKit": "跟随 Kit 主题"
 "settings.approveProcess": "批准"
 "settings.processApprovals": "以下进程需要执行批准"
+"settings.processApproved": "已批准；扩展已激活"
+"settings.processApproveFailed": "批准失败："
 "settings.extensionsTabInstalled": "已安装"
 "settings.extensionsTabMcp": "MCP"
 "settings.extensionsTabSkills": "技能"

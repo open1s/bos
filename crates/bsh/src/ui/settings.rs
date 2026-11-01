@@ -6924,20 +6924,29 @@ impl Shell {
                             .child(txt(label, 12.0, theme::text()))
                             .on_click(cx.listener({
                                 move |this, _event, _window, cx| {
-                                    if crate::extension::approve_process(
+                                    match crate::extension::approve_process(
                                         &settings,
                                         workspace.as_deref(),
                                         &id,
                                         &program,
-                                    )
-                                    .is_ok()
-                                    {
-                                        this.extension_statuses = Some(crate::extension::statuses(
-                                            &settings,
-                                            workspace.as_deref(),
-                                        ));
-                                        cx.notify();
+                                    ) {
+                                        Ok(()) => {
+                                            this.extension_statuses =
+                                                Some(crate::extension::statuses(
+                                                    &settings,
+                                                    workspace.as_deref(),
+                                                ));
+                                            this.state.notice(
+                                                tr(this.state.lang, "settings.processApproved")
+                                                    .to_string(),
+                                            );
+                                        }
+                                        Err(error) => this.state.notice(format!(
+                                            "{} {error}",
+                                            tr(this.state.lang, "settings.processApproveFailed")
+                                        )),
                                     }
+                                    cx.notify();
                                 }
                             })),
                     ),

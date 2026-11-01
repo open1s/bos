@@ -616,10 +616,16 @@ impl ExtensionHost {
                 }
             }
         }
-        let scope = self.host_scope();
         for (id, entry) in loaded.iter_mut() {
             if !ordered.contains(id) {
                 continue;
+            }
+            let mut scope = self.host_scope();
+            if entry.package.manifest.runtime.kind == RuntimeKind::Process {
+                // A process grant is scoped to the declared executable. The
+                // required-capability check must carry that same program, or a
+                // program:python3 grant can never cover it.
+                scope.program = entry.package.manifest.runtime.entry.clone();
             }
             let started = std::time::Instant::now();
             if let Err(error) = self.policy.authorize_required(
@@ -1417,7 +1423,10 @@ impl ExtensionHost {
             .error
             .clone()
             .or_else(|| record.and_then(|record| record.last_error.clone()));
-        let scope = self.host_scope();
+        let mut scope = self.host_scope();
+        if entry.package.manifest.runtime.kind == RuntimeKind::Process {
+            scope.program = entry.package.manifest.runtime.entry.clone();
+        }
         let mut capabilities = Vec::new();
         let mut seen = BTreeSet::new();
         for capability in entry
