@@ -45,7 +45,7 @@ Different readers use the book differently:
 - `validate` parses a package but never runs it. `test` parses and checks
   contribution files. `mock` runs a tool against a permissive mock host.
   `install` is the first command that writes managed state.
-- The book targets BSH 3.0.x and extension API 1.0.
+- The book is checked against the repository's BSH 3.0.2 baseline and extension API 1.0.0. Re-check the standard and implementation when either version changes.
 
 ## Table of contents
 
@@ -367,20 +367,21 @@ resolved relative to it.
 
 ```text
 hello/
-  extension.toml          required
-  tools/echo.json         one file per declared tool
-  commands/greet.md       one file per declared command
-  prompts/hello.md        one file per declared prompt
-  panels/status.json      one file per declared panel
-  README.md               optional, ignored by the host
+  extension.toml              required
+  tools/git.status.json       one file per declared tool
+  commands/greet.md           one file per declared command
+  prompts/hello.md            one file per declared prompt
+  panels/status.json          one file per declared panel
+  README.md                   optional, ignored by the host
 ```
 
-The manifest names contribution ids, not paths. The host derives the path from
-the contribution kind and the id:
+The manifest declares contribution ids, and the host derives each path from
+the contribution kind and the **full id**. Dotted ids remain dotted in file
+names; they are not reduced to their last segment.
 
 | Contribution | File |
 |---|---|
-| tool `echo` | `tools/echo.json` |
+| tool `git.status` | `tools/git.status.json` |
 | command `greet` | `commands/greet.md` |
 | prompt `hello` | `prompts/hello.md` |
 | context `guide` | `contexts/guide.md` |
@@ -392,7 +393,7 @@ the contribution kind and the id:
 | integration `github` | `integrations/github.json` |
 | model provider `demo` | `providers/models/demo.json` |
 | agent provider `helper` | `providers/agents/helper.json` |
-| preset `reader` | `providers/presets/reader.json` |
+| preset `reader` | `presets/reader.json` |
 
 A declared id without its file is a validation error, not an empty surface.
 That is deliberate: a package that says it contributes a panel and then does
@@ -556,18 +557,26 @@ max_output_bytes = 1048576
 
 ## 4.3 Identity rules
 
-**Extension id**: at least two dot-separated segments, each starting with a
-lowercase letter, then lowercase letters, digits or `-`; 3–128 characters.
-`com.example.hello` is valid; `Hello`, `com..hello` and `com.example.hello_world`
-are not.
+**Extension id**: 1–128 bytes, with at least two dot-separated segments.
+Each segment is 1–63 bytes, contains lowercase ASCII letters, digits, `-` or
+`_`, and starts and ends with a letter or digit. `com.example.hello` and
+`com.example.hello_world` are valid; `Hello`, `com..hello`,
+`com.example.-hello` and `com.example.hello_` are not.
 
-**Contribution id**: one or more segments separated by dots, each starting with
-a lowercase letter or digit; letters, digits, `-` and `_`; at most 64
-characters. `git.status`, `screen-size` and `v2.tool` are valid.
+**Contribution id**: 1–96 bytes, formed from one or more dot-separated
+segments. Each segment is 1–63 bytes, starts with a lowercase ASCII letter or
+digit, and contains only lowercase ASCII letters, digits, `-` or `_`.
+`git.status`, `screen-size` and `v2.tool` are valid. An id must be unique across
+all contribution kinds within one extension; a tool and a command cannot both
+be named `git.status`.
 
-**Model-facing tool name**: `<last-id-segment>__<tool-id>`, with dots in the
-package segment replaced by underscores. The `hello` package's `echo` tool is
-`hello__echo`; the full id is still what the audit and policy see.
+**Model-facing tool name**: the host uses the extension's last id segment as
+the namespace and flattens dots in the contribution id to underscores:
+`com.example.git-assistant` + `git.status` becomes
+`git-assistant__git_status`. Hyphens are preserved. Names longer than the
+provider limit (64 characters) are shortened with a stable digest suffix, so
+long ids do not collapse into the same tool name. Audit and policy continue to
+use the full extension and contribution ids.
 
 **Name, description, authors**: name 1–128 characters; description 1–4096
 bytes; at most 32 authors.
