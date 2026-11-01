@@ -532,7 +532,9 @@ impl ProcessRuntime {
             workspace: None,
             data_root: None,
             policy: None,
-            sandbox: cfg!(target_os = "macos"),
+            // Process extensions are untrusted code: require the platform OS sandbox by default.
+            // On Linux, a missing/unsupported bubblewrap must fail the spawn rather than fall back.
+            sandbox: cfg!(any(target_os = "linux", target_os = "macos")),
             child_pid: AtomicU32::new(0),
             session: Mutex::new(None),
             subscriptions: std::sync::Mutex::new(Vec::new()),
@@ -568,7 +570,7 @@ impl ProcessRuntime {
         self
     }
 
-    /// Disable or enable the macOS filesystem profile (tests may opt out).
+    /// Disable or enable the platform process sandbox (tests may opt out).
     pub(crate) fn with_sandbox(mut self, sandbox: bool) -> Self {
         self.sandbox = sandbox;
         self
@@ -1205,6 +1207,50 @@ events = ["workspace.changed"]
         tokio::time::sleep(Duration::from_millis(100)).await;
         let logged = std::fs::read_to_string(scratch.0.join("events.log")).expect("events log");
         assert!(logged.contains("workspace.changed"), "{logged}");
+        runtime.shutdown().await.expect("shutdown");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_linux_sandbox_denies_a_write_outside_the_package() {
+        let scratch = Scratch::new("linux-sandbox");
+        std::fs::write(
+            scratch.0.join("tools/echo.json"),
+            r#"{"description":"Echo","input_schema":{"type":"object"}}"#,
+        )
+        .expect("tool");
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .expect("CI runner HOME is set");
+        let probe = home.join(format!("bsh-ext-linux-sandbox-probe-{}", std::process::id()));
+        let _ = std::fs::remove_file(&probe);
+        std::fs::write(
+            scratch.0.join("server.sh"),
+            r#"while IFS= read -r line; do
+  case "$line" in
+    *'"initialize"'*) printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"1.0","token":"%s"}}\n' "$BSH_IPC_TOKEN" ;;
+    *'"tools/call"'*)
+      if echo x > "$HOME/bsh-ext-linux-sandbox-probe-PID" 2>/dev/null; then
+        echo '{"jsonrpc":"2.0","id":2,"result":{"blocked":false}}'
+      else
+        echo '{"jsonrpc":"2.0","id":2,"result":{"blocked":true}}'
+      fi
+      ;;
+  esac
+done
+"#
+            .replace("PID", &std::process::id().to_string()),
+        )
+        .expect("server");
+        let runtime = ProcessRuntime::new(&manifest(), &scratch.0).expect("runtime");
+        assert!(runtime.sandbox, "Linux process sandbox must be enabled by default");
+        let context = CallContext::new(manifest().id().clone(), "linux-sandbox", None, 2000);
+        let result = runtime
+            .call_tool("echo", json!({}), &context)
+            .await
+            .expect("sandboxed call");
+        assert_eq!(result["blocked"], true, "HOME is outside writable sandbox mounts");
+        assert!(!probe.exists(), "the extension must not write into the host HOME");
         runtime.shutdown().await.expect("shutdown");
     }
 
