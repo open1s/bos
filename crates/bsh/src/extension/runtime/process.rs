@@ -283,12 +283,23 @@ pub(super) fn linux_bwrap_plan(
         "--tmpfs".to_string(),
         "/tmp".to_string(),
     ];
-    let mut writable = vec![root.to_path_buf()];
+    // Bubblewrap mount and chdir arguments must be absolute. Package roots
+    // commonly arrive as relative paths from `bsh ext mock` and development CLI.
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut writable = vec![root.clone()];
     if let Some(workspace) = workspace {
-        writable.push(workspace.to_path_buf());
+        writable.push(
+            workspace
+                .canonicalize()
+                .unwrap_or_else(|_| workspace.to_path_buf()),
+        );
     }
     if let Some(data_root) = data_root {
-        writable.push(data_root.to_path_buf());
+        writable.push(
+            data_root
+                .canonicalize()
+                .unwrap_or_else(|_| data_root.to_path_buf()),
+        );
     }
     // Mount parent directories before children so nested writable mounts do
     // not hide one another (for example, a package inside the workspace).
@@ -298,7 +309,9 @@ pub(super) fn linux_bwrap_plan(
     let mut bound = Vec::<PathBuf>::new();
     let mut created_tmp_dirs = Vec::<PathBuf>::new();
     for path in writable {
-        if path != Path::new("/tmp") && !bound.iter().any(|parent| path.starts_with(parent)) {
+        if path != Path::new("/tmp")
+            && !bound.iter().any(|parent| path.starts_with(parent))
+        {
             // /tmp is a fresh tmpfs in the sandbox. Recreate destination
             // directories before binding a package/workspace/data root that
             // was originally located under the host's /tmp.
@@ -1067,9 +1080,18 @@ mod tests {
             Path::new("/tmp/bsh-package/server"),
             &[],
         );
-        let dir = plan.iter().position(|item| item == "--dir").expect("tmpfs target dir");
-        let bind = plan.iter().position(|item| item == "--bind").expect("package bind");
-        assert!(dir < bind, "the package destination must exist before bind");
+        let dir = plan
+            .iter()
+            .position(|item| item == "--dir")
+            .expect("tmpfs target dir");
+        let bind = plan
+            .iter()
+            .position(|item| item == "--bind")
+            .expect("package bind");
+        assert!(
+            dir < bind,
+            "the package destination must exist before bind"
+        );
         assert_eq!(
             plan.iter().filter(|item| item.as_str() == "--bind").count(),
             2
