@@ -688,7 +688,50 @@ impl ExtensionHost {
         }
         self.last_stamp = self.stamp();
         self.start_event_pump();
+        self.warm_startup_runtimes();
         Ok(())
+    }
+
+    /// Start the packages that declared `startup = "on-startup"`.
+    ///
+    /// Loading a package registers its descriptors; nothing has started it yet.
+    /// This is what gives the policy its meaning. The warm runs on a detached
+    /// thread with its own current-thread reactor, so a slow handshake never
+    /// blocks a build, and a failure is logged instead of failing the host. An
+    /// on-demand package is untouched: only an explicit call activates it.
+    fn warm_startup_runtimes(&self) {
+        let mut runtimes: Vec<(String, Arc<dyn Runtime>)> = Vec::new();
+        for entry in self.loaded.values() {
+            if !entry.applied || entry.package.manifest.runtime.startup != StartupPolicy::OnStartup
+            {
+                continue;
+            }
+            if let Some(runtime) = &entry.runtime {
+                runtimes.push((entry.package.id().as_str().to_string(), Arc::clone(runtime)));
+            }
+        }
+        if runtimes.is_empty() {
+            return;
+        }
+        std::thread::spawn(move || {
+            let Ok(reactor) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                log::warn!(target: "bsh::extension", "no reactor for on-startup activation");
+                return;
+            };
+            reactor.block_on(async {
+                for (id, runtime) in runtimes {
+                    if let Err(error) = runtime.activate().await {
+                        log::warn!(
+                            target: "bsh::extension",
+                            "{id} on-startup activation failed: {error}"
+                        );
+                    }
+                }
+            });
+        });
     }
 
     /// Bring an upgraded package's data document to its current schema.
@@ -2073,6 +2116,53 @@ tools = ["echo"]
             .await
             .expect("integration dispatch");
         assert_eq!(integrated["q"], 1);
+    }
+
+    #[tokio::test]
+    async fn the_hook_demo_receives_a_live_host_event() {
+        let root = scratch("hook-demo-e2e");
+        std::fs::create_dir_all(root.join("workspace")).expect("workspace");
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/extensions/hook-demo");
+        let store = ExtensionStore::open(&root).expect("store");
+        let package = store.install(&source).expect("install");
+        let policy =
+            PolicyEngine::open(store.grants_path(), store.audit_path(), PolicyMode::Enforce)
+                .expect("policy");
+        for capability in &package.manifest.capabilities.required {
+            policy
+                .grant(package.id().as_str(), *capability, GrantScope::Any, None)
+                .expect("grant");
+        }
+        drop(policy);
+        let host = ExtensionHost::open(config(&root)).expect("host");
+        let document = root.join("main.rs");
+        std::fs::write(&document, "fn main() {}").expect("document");
+        host.language_check("com.example.hook-demo", "hookdemo", &document)
+            .await
+            .expect("language check starts the process");
+        let event = ExtensionEvent::new(
+            "bsh",
+            topics::SESSION_CREATED,
+            serde_json::json!({"session": "e2e"}),
+        )
+        .expect("event");
+        host.events().publish(&event).expect("publish");
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let log = host
+            .run_integration("com.example.hook-demo", "github", serde_json::json!({}))
+            .await
+            .expect("integration dispatch");
+        assert!(
+            log["count"].as_u64().unwrap_or(0) >= 1,
+            "the process did not receive the event: {log}"
+        );
+        assert!(
+            log["events"].as_array().is_some_and(|events| events
+                .iter()
+                .any(|event| event["topic"] == "session.created")),
+            "session.created was not forwarded: {log}"
+        );
     }
 
     #[cfg(unix)]

@@ -415,10 +415,12 @@ requires an open workspace; manual is never applied automatically. A package can
 be enabled and still not applied (for example manual, disabled, missing a
 required grant, or failed dependency resolution), and the status row says which.
 
-Runtime activation is lazy. The build registers descriptors synchronously; a
-process is spawned on its first call and a wasm instance would compile on its
-first call. The lifecycle state Active means the host authorized and loaded the
-package, not that a process is necessarily running.
+Runtime activation is lazy for on-demand packages: the build registers
+descriptors synchronously, and a process is spawned on its first call. A package
+that declares startup = "on-startup" is warmed right after the host loads it, on
+a detached thread, so the handshake never blocks the build. A wasm instance
+compiles on activation. The lifecycle state Active means the host authorized and
+loaded the package.
 
 ## 8. Process protocol
 
