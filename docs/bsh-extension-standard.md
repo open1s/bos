@@ -271,11 +271,14 @@ max_output_bytes = 1048576   # 1..=16777216, default 1048576
 ~~~
 
 A manifest asking above a ceiling is invalid rather than silently clamped. The
-host applies max_execution_ms and max_output_bytes today. max_memory_mb bounds
-the component and Extism runtimes (StoreLimits / Extism memory pages) and is
-translated to RLIMIT_AS for process children. max_concurrent_calls is a declared
-allowance: the process runtime serializes calls through one child, so its
-effective concurrency is one until a pooled transport lands.
+host applies max_execution_ms and max_output_bytes to every runtime. max_memory_mb
+bounds component and Extism runtimes (StoreLimits / Extism memory pages) and is
+translated to RLIMIT_AS for ProcessRuntime and McpRuntime children on Unix.
+Unix child launches also receive RLIMIT_CPU and RLIMIT_NOFILE ceilings and a
+separate process group. Windows currently has no equivalent Job Object limits;
+call deadlines and output caps are not substitutes for OS-level resource limits.
+max_concurrent_calls is a declared allowance: process and MCP transports
+serialize calls through one child, so their effective concurrency is one.
 
 ### 4.7 Dependencies
 
@@ -783,8 +786,10 @@ not kept:
    host call, and lets a pure-compute guest run to its epoch/fuel deadline (the host
    cannot set a Wasmtime epoch while the guest holds the synchronous store). The
    operating system may take a moment to reap a child after the request.
-7. Windows/Linux process limits are compiled but not exercised in this macOS
-   environment.
+7. Unix ProcessRuntime and McpRuntime children receive RLIMIT_AS, RLIMIT_CPU
+   and RLIMIT_NOFILE; Linux CI verifies MCP filesystem and resource boundaries.
+   Windows process resource limits remain unavailable until Job Object support
+   lands ([Issue #39](https://github.com/open1s/bos/issues/39)).
 8. The built-in runtime is for first-party code linked into bsh; an installed
    package cannot claim it.
 9. The extension root is ~/.bos/bsh/extensions (BSH's existing home) rather than
