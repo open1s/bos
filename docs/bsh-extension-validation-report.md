@@ -104,6 +104,13 @@ The macOS profile is a filesystem-write profile and starts with network access a
 
 This may be an intentional consequence of granting arbitrary process execution, but the capability model must say so clearly. Do not describe `network.http` as controlling network access by process children. Stronger enforcement would require a network namespace/firewall/proxy design, not just a filesystem sandbox.
 
+### Finding SEC-03 — Windows MCP cancellation does not compile
+
+**Severity:** High for Windows CI / platform coverage  
+**Status:** Open — [Issue #33](https://github.com/open1s/bos/issues/33)
+
+The Windows extension test job in Actions run #149 failed to compile `crates/bsh/src/extension/runtime/mcp.rs:683`: `McpCore::kill_child()` unconditionally calls `libc::kill`, while `libc` is declared only under `cfg(unix)` in `crates/bsh/Cargo.toml`. This is a concrete CI failure (E0433), not a speculative static concern. Use a platform abstraction or cfg-specific child termination and retain a Windows regression test.
+
 ### Additional security checks
 
 - **Capability dispatch:** source shows a shared authorization seam used by agent tools, host-initiated language/integration calls, workflow steps and panel actions. Keep regression tests on each dispatch surface.
@@ -111,7 +118,7 @@ This may be an intentional consequence of granting arbitrary process execution, 
 - **Installed integrity:** current scan code compares the computed package hash to the registry record and re-verifies signatures; test quarantine/refusal and publisher-key removal.
 - **WASM host calls:** subscriptions are checked against declared topics and `events.subscribe`; host filesystem operations authorize before writes. Preserve tests that assert denied operations have no side effects.
 - **Resource limits:** keep per-runtime tests for output bytes, memory, fuel and wall-clock deadlines. Pure-compute WASM cancellation remains bounded by epoch/fuel rather than immediate instruction interruption, as the peer-review report states.
-- **Cross-platform:** Linux sandbox execution and Windows process-limit behaviour require actual platform CI, not just platform-independent argument-plan unit tests.
+- **Cross-platform:** Linux sandbox execution and Windows process-limit behaviour require actual platform CI, not just platform-independent argument-plan unit tests. The current Windows extension job is failing at compile time on the Unix-only `libc` call tracked by Issue #33.
 
 ## 4. Acceptance criteria
 
@@ -128,5 +135,5 @@ This may be an intentional consequence of granting arbitrary process execution, 
 ## 5. Review limitations
 
 - No local checkout or shell execution was available in this review session.
-- GitHub Actions run status was observed while jobs were still running; no final CI conclusion is asserted here.
+- GitHub Actions run #149 was inspected: the Windows extension-test job failed with E0433 at `mcp.rs:683`; Linux/MSRV and other jobs were still running at the time of inspection. This run is associated with PR #30's commit, not a successful validation of the documentation changes in this PR.
 - This is not a formal penetration test, dynamic fuzzing campaign, or independent cryptographic audit.
