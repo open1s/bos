@@ -379,6 +379,9 @@ impl McpCore {
     fn start_with_retry(&self) -> Result<Session, ExtensionError> {
         let mut last = None;
         for delay in [0_u64, 100, 250] {
+            if self.cancelled.load(Ordering::SeqCst) {
+                return Err(self.cancellation_error());
+            }
             if delay > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(delay));
             }
@@ -489,10 +492,7 @@ impl McpCore {
                 message: "MCP stdout was not piped".to_string(),
             })?;
         let stderr = child.stderr.take();
-        let child = Arc::new(Mutex::new(child));
-        if let Ok(mut slot) = self.child.lock() {
-            *slot = Some(Arc::clone(&child));
-        }
+        let child = self.register_child(child)?;
         if let Some(stderr) = stderr {
             let extension = self.extension.to_string();
             std::thread::spawn(move || {
@@ -733,6 +733,42 @@ impl McpCore {
         }
     }
 
+    fn cancellation_error(&self) -> ExtensionError {
+        ExtensionError::Runtime {
+            extension: self.extension.to_string(),
+            message: "MCP call cancelled".to_string(),
+        }
+    }
+
+    /// Register a spawned child and close the spawn/cancel race. If cancellation
+    /// arrived before the child handle became visible, terminate and reap it
+    /// before allowing the caller to proceed.
+    fn register_child(&self, child: Child) -> Result<Arc<Mutex<Child>>, ExtensionError> {
+        let child = Arc::new(Mutex::new(child));
+        {
+            let mut slot = self
+                .child
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *slot = Some(Arc::clone(&child));
+        }
+        if self.cancelled.load(Ordering::SeqCst) {
+            terminate_child_handle(&child);
+            if let Ok(mut process) = child.lock() {
+                let _ = process.wait();
+            }
+            let mut slot = self
+                .child
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if slot.as_ref().is_some_and(|current| Arc::ptr_eq(current, &child)) {
+                *slot = None;
+            }
+            return Err(self.cancellation_error());
+        }
+        Ok(child)
+    }
+
     /// One tool call over the session, blocking this thread.
     fn call_tool_blocking(
         &self,
@@ -741,12 +777,17 @@ impl McpCore {
         progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
         timeout_ms: u64,
     ) -> Result<Value, ExtensionError> {
-        self.cancelled.store(false, Ordering::SeqCst);
+        if self.cancelled.load(Ordering::SeqCst) {
+            return Err(self.cancellation_error());
+        }
         let wire = self.wire_name(name);
         let mut guard = self.session.lock().map_err(|_| ExtensionError::Corrupt {
             path: self.root.clone(),
             message: "MCP session lock is poisoned".to_string(),
         })?;
+        if self.cancelled.load(Ordering::SeqCst) {
+            return Err(self.cancellation_error());
+        }
         if guard.is_none() {
             *guard = Some(self.start_with_retry()?);
         }
@@ -956,6 +997,9 @@ impl McpRuntime {
         progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
     ) -> Result<Value, ExtensionError> {
         let deadline = context.timeout_ms.max(1).min(self.core.max_execution_ms);
+        // Reset synchronously before the worker is queued. A Stop arriving
+        // after this point must remain visible to the worker and spawn path.
+        self.core.cancelled.store(false, Ordering::SeqCst);
         let core = Arc::clone(&self.core);
         let name = name.to_string();
         let handle = tokio::task::spawn_blocking(move || {
@@ -1091,6 +1135,64 @@ required = ["process.execute"]
                 None,
             )
             .expect("grant");
+        // A Stop received after scheduling but before the blocking worker
+        // begins must not be cleared by the worker.
+        let cancelled_runtime = McpRuntime::new(
+            &manifest,
+            &root,
+            "{}".to_string(),
+            Arc::clone(&policy),
+            TrustLevel::Local,
+            EventBus::new(),
+        )
+        .expect("cancel test runtime");
+        cancelled_runtime
+            .core
+            .cancelled
+            .store(true, Ordering::SeqCst);
+        let cancelled = cancelled_runtime
+            .core
+            .call_tool_blocking("echo", json!({"x": 1}), None, 5000);
+        assert!(matches!(
+            cancelled,
+            Err(ExtensionError::Runtime { message, .. }) if message.contains("cancelled")
+        ));
+        assert!(
+            cancelled_runtime
+                .core
+                .child
+                .lock()
+                .expect("child slot")
+                .is_none(),
+            "a pre-cancelled call must not spawn a child"
+        );
+
+        // Cancellation that races with Child registration must kill and reap
+        // the just-spawned process before start() can continue.
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = Command::new("sleep");
+            command.arg("30");
+            command
+        };
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("powershell.exe");
+            command.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"]);
+            command
+        };
+        let child = command.spawn().expect("long-running child");
+        assert!(cancelled_runtime.core.register_child(child).is_err());
+        assert!(
+            cancelled_runtime
+                .core
+                .child
+                .lock()
+                .expect("child slot")
+                .is_none(),
+            "a child registered after cancellation must be reaped and cleared"
+        );
+
         let runtime = McpRuntime::new(
             &manifest,
             &root,
