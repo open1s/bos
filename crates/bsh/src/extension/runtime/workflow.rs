@@ -64,12 +64,12 @@ impl WorkflowRuntime {
         trust: TrustLevel,
     ) -> Result<Self, ExtensionError> {
         let mut workflows = BTreeMap::new();
-        let inner_tools: BTreeMap<String, ToolDescriptor> = inner_tools
+        let step_tools: BTreeMap<String, ToolDescriptor> = inner_tools
             .iter()
             .cloned()
             .map(|tool| (tool.id.as_str().to_string(), tool))
             .collect();
-        let mut tools: Vec<ToolDescriptor> = inner_tools.values().cloned().collect();
+        let mut tools = inner_tools.to_vec();
         for contribution in contributions {
             let text = std::fs::read_to_string(&contribution.path).map_err(|source| {
                 ExtensionError::Io {
@@ -84,7 +84,7 @@ impl WorkflowRuntime {
                 })?;
             // Validate step references while the package is being loaded.
             for step in &workflow.steps {
-                if !inner_tools.contains_key(&step.tool) {
+                if !step_tools.contains_key(&step.tool) {
                     return Err(ExtensionError::NotFound {
                         id: format!(
                             "workflow {} references missing tool {}",
@@ -114,7 +114,7 @@ impl WorkflowRuntime {
         Ok(Self {
             inner,
             workflows,
-            inner_tools,
+            inner_tools: step_tools,
             policy,
             trust,
             tools,
@@ -425,6 +425,17 @@ mod tests {
             TrustLevel::Community,
         )
         .expect("runtime");
+        let workflow_descriptor = runtime
+            .tools()
+            .await
+            .expect("workflow tools")
+            .into_iter()
+            .find(|tool| tool.id.as_str() == "fetch")
+            .expect("workflow descriptor");
+        assert!(
+            workflow_descriptor.capabilities.is_empty(),
+            "the workflow wrapper must not authorize an aggregate scope"
+        );
         let context = CallContext::new(
             crate::extension::types::ExtensionId::parse(extension).expect("id"),
             "test",
