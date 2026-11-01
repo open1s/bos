@@ -9,7 +9,8 @@
 <h1 align="center">BOS — Rust 原生 AI Agent 平台</h1>
 
 <p align="center">
-  <strong>One Runtime. Multiple Interfaces. One Extensible Agent Workspace.</strong>
+  <strong>One Runtime. Multiple Interfaces. One Extensible Agent Workspace.</strong><br>
+  一个运行时，多种开发接口，一个可扩展的 Agent 工作空间。
 </p>
 
 <p align="center">
