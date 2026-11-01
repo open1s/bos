@@ -186,8 +186,9 @@ LOG_LEVEL = "info"
   disabled so the bridge is the only filesystem/network path. bsh_host takes a
   JSON request and returns {"ok":true,"value":...} or {"ok":false,"error":...};
   ops are read_file, write_file, fetch, storage_get, storage_set, storage_list,
-  read_secret, emit, subscribe, config, now_millis and log. Every op is checked
-  against the same capability policy as the component runtime.
+  read_secret, emit, subscribe, config, now_millis and log. Operations that access protected resources are checked against the corresponding
+  capability and grant policy. Logging, configuration reads, time and progress
+  reporting are host services rather than independent capability grants.
 - mcp: entry is a stdio Model Context Protocol server; tools, resources and
   prompts are mapped to BSH tools, contexts and prompts.
 
@@ -358,6 +359,10 @@ renders as empty. Tool output is capped by max_output_bytes.
 | process.execute | critical | allow | explicit grant | explicit grant |
 | computer.use | critical | allow | explicit grant | explicit grant |
 | secrets.read | critical | allow | explicit grant | explicit grant |
+
+Compatibility alias: `terminal.execute` is accepted as an input alias for
+`process.execute`. It is not a separate capability; parsing normalizes it to
+`process.execute`, and serialization/audit output uses the canonical name.
 
 The default for a package read from disk is local. A publisher verification
 path does not exist yet, so "verified" is a recorded level, not a claim this
