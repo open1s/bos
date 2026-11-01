@@ -1119,6 +1119,64 @@ required = ["process.execute"]
                 None,
             )
             .expect("grant");
+        // A Stop received after scheduling but before the blocking worker
+        // begins must not be cleared by the worker.
+        let cancelled_runtime = McpRuntime::new(
+            &manifest,
+            &root,
+            "{}".to_string(),
+            Arc::clone(&policy),
+            TrustLevel::Local,
+            EventBus::new(),
+        )
+        .expect("cancel test runtime");
+        cancelled_runtime
+            .core
+            .cancelled
+            .store(true, Ordering::SeqCst);
+        let cancelled = cancelled_runtime
+            .core
+            .call_tool_blocking("echo", json!({"x": 1}), None, 5000);
+        assert!(matches!(
+            cancelled,
+            Err(ExtensionError::Runtime { message, .. }) if message.contains("cancelled")
+        ));
+        assert!(
+            cancelled_runtime
+                .core
+                .child
+                .lock()
+                .expect("child slot")
+                .is_none(),
+            "a pre-cancelled call must not spawn a child"
+        );
+
+        // Cancellation that races with Child registration must kill and reap
+        // the just-spawned process before start() can continue.
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = Command::new("sleep");
+            command.arg("30");
+            command
+        };
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("powershell.exe");
+            command.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"]);
+            command
+        };
+        let child = command.spawn().expect("long-running child");
+        assert!(cancelled_runtime.core.register_child(child).is_err());
+        assert!(
+            cancelled_runtime
+                .core
+                .child
+                .lock()
+                .expect("child slot")
+                .is_none(),
+            "a child registered after cancellation must be reaped and cleared"
+        );
+
         let runtime = McpRuntime::new(
             &manifest,
             &root,
