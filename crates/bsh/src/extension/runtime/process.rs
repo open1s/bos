@@ -262,7 +262,7 @@ fn process_rss_bytes(pid: u32) -> Option<u64> {
 ///
 /// Kept platform-independent so the argument plan is testable on macOS even
 /// though it is only executed on Linux.
-fn linux_bwrap_plan(
+pub(super) fn linux_bwrap_plan(
     root: &Path,
     workspace: Option<&Path>,
     data_root: Option<&Path>,
