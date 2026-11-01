@@ -428,9 +428,26 @@ impl McpCore {
                 },
             )?;
         }
-        let mut command = Command::new(&program);
+        // MCP is also an arbitrary package-controlled child process. Reuse
+        // the same Linux bubblewrap boundary as the process runtime; a missing
+        // bwrap binary or failed namespace setup must never fall back to direct
+        // execution.
+        let mut command = if cfg!(target_os = "linux") {
+            let mut command = Command::new("bwrap");
+            command.args(super::process::linux_bwrap_plan(
+                &self.root,
+                None,
+                None,
+                &program,
+                &self.args,
+            ));
+            command
+        } else {
+            let mut command = Command::new(&program);
+            command.args(&self.args);
+            command
+        };
         command
-            .args(&self.args)
             .current_dir(&self.root)
             .env_clear()
             .stdin(Stdio::piped())
