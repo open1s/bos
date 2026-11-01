@@ -2129,7 +2129,7 @@ tools = ["echo"]
                 .expect("grant");
         }
         drop(policy);
-        let mut host = ExtensionHost::open(config(&root)).expect("host");
+        let host = ExtensionHost::open(config(&root)).expect("host");
         let document = root.join("main.rs");
         std::fs::write(&document, "fn main() {}").expect("document");
         let checked = host
