@@ -157,6 +157,16 @@ impl GitMarket {
         &self.cache
     }
 
+    /// Read the index from the existing checkout without touching the network.
+    pub(crate) fn cached(&self) -> Result<MarketIndex, ExtensionError> {
+        let index = self.cache.join("index.json");
+        let text = std::fs::read_to_string(&index).map_err(|source| ExtensionError::Io {
+            path: index.clone(),
+            source,
+        })?;
+        MarketIndex::parse(&text, &index)
+    }
+
     /// Clone or refresh the checkout and read its index.
     pub(crate) fn sync(&mut self) -> Result<MarketIndex, ExtensionError> {
         if self.cache.join(".git").is_dir() {

@@ -89,7 +89,7 @@ impl HostConfig {
 /// that path. A test's save_root is its scratch store, so the platform root
 /// follows it. A test that has no save_root gets one process-wide scratch root
 /// instead of $HOME.
-fn extension_root(settings: &crate::settings::Settings) -> PathBuf {
+pub(crate) fn extension_root(settings: &crate::settings::Settings) -> PathBuf {
     if let Some(save_root) = &settings.save_root {
         return save_root.join("extensions");
     }
@@ -1724,6 +1724,20 @@ pub(crate) fn install(
 /// The host never invents a subscriber: a package that did not subscribe
 /// receives nothing, and a full queue is counted rather than blocking the
 /// publisher.
+pub(crate) fn publish(topic: &str, payload: serde_json::Value) {
+    let slot = HOST.get_or_init(|| Mutex::new(None));
+    let Ok(guard) = slot.lock() else {
+        return;
+    };
+    let Some(host) = guard.as_ref() else {
+        return;
+    };
+    if let Ok(event) = ExtensionEvent::new("bsh", topic, payload) {
+        if let Err(error) = host.events.publish(&event) {
+            log::debug!(target: "bsh::extension", "event publish failed: {error}");
+        }
+    }
+}
 
 /// Stop the process-global host and every runtime it owns.
 ///
@@ -1740,20 +1754,6 @@ pub(crate) fn shutdown() {
         .build()
     {
         runtime.block_on(host.shutdown());
-    }
-}
-pub(crate) fn publish(topic: &str, payload: serde_json::Value) {
-    let slot = HOST.get_or_init(|| Mutex::new(None));
-    let Ok(guard) = slot.lock() else {
-        return;
-    };
-    let Some(host) = guard.as_ref() else {
-        return;
-    };
-    if let Ok(event) = ExtensionEvent::new("bsh", topic, payload) {
-        if let Err(error) = host.events.publish(&event) {
-            log::debug!(target: "bsh::extension", "event publish failed: {error}");
-        }
     }
 }
 

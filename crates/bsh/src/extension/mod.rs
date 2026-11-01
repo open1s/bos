@@ -31,10 +31,15 @@ mod config;
 mod events;
 pub(crate) mod host;
 pub(crate) use host::shutdown;
+
+/// The managed extension root for a settings document.
+pub(crate) fn store_root(settings: &crate::settings::Settings) -> std::path::PathBuf {
+    host::extension_root(settings)
+}
 mod lifecycle;
 mod manifest;
-mod market;
-mod package;
+pub(crate) mod market;
+pub(crate) mod package;
 mod resolver;
 pub(crate) mod runtime;
 mod signing;

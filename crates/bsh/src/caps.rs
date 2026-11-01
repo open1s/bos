@@ -8690,8 +8690,10 @@ model_providers = ["zen"]
             package.display().to_string(),
         ];
         assert_eq!(crate::extension::cli(&arguments), 0, "the fixture installs");
-        let mut settings = crate::settings::Settings::default();
-        settings.save_root = Some(scratch.clone());
+        let mut settings = crate::settings::Settings {
+            save_root: Some(scratch.clone()),
+            ..Default::default()
+        };
         refresh_plugin_providers(&mut settings);
         assert!(
             settings

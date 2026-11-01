@@ -6532,11 +6532,13 @@ impl Shell {
             (0usize, tr(lang, "settings.extensionsTabInstalled")),
             (1, tr(lang, "settings.extensionsTabMcp")),
             (2, tr(lang, "settings.extensionsTabSkills")),
+            (3, tr(lang, "settings.extensionsTabMarket")),
         ] {
             let selected = self.extensions_tab == index;
             let id = match index {
                 1 => "mcp",
                 2 => "skills",
+                3 => "market",
                 _ => "installed",
             };
             strip = strip.child(
@@ -6577,6 +6579,273 @@ impl Shell {
         strip.into_any_element()
     }
 
+    /// Read the market index from the CLI's checkout, without network access.
+    fn load_extension_market(&mut self) {
+        if self.extension_market.is_some() || self.extension_market_fetching {
+            return;
+        }
+        let root = crate::extension::store_root(&self.state.settings);
+        let market = crate::extension::market::GitMarket::open(
+            &root,
+            crate::extension::market::DEFAULT_GIT_MARKET,
+        );
+        match market.cached() {
+            Ok(index) => {
+                self.extension_market = Some(index.extensions.clone());
+                self.extension_market_error = None;
+            }
+            Err(error) => {
+                self.extension_market = Some(Vec::new());
+                self.extension_market_error = Some(error.to_string());
+            }
+        }
+    }
+
+    /// Clone or refresh the Git market off the UI thread.
+    fn refresh_extension_market(&mut self, cx: &mut Context<Self>) {
+        if self.extension_market_fetching {
+            return;
+        }
+        self.extension_market_fetching = true;
+        let root = crate::extension::store_root(&self.state.settings);
+        let (tx, rx) = async_channel::bounded(1);
+        self.state.runner.rt().spawn_blocking(move || {
+            let mut market = crate::extension::market::GitMarket::open(
+                &root,
+                crate::extension::market::DEFAULT_GIT_MARKET,
+            );
+            let result = market.sync().map(|index| index.extensions.clone());
+            let _ = tx.send_blocking(result);
+        });
+        cx.spawn(async move |this, cx| {
+            let result = rx.recv().await;
+            let _ = this.update(cx, |this, cx| {
+                this.extension_market_fetching = false;
+                match result {
+                    Ok(Ok(entries)) => {
+                        this.extension_market = Some(entries);
+                        this.extension_market_error = None;
+                    }
+                    Ok(Err(error)) => this.extension_market_error = Some(error.to_string()),
+                    Err(_) => {
+                        this.extension_market_error = Some("market channel closed".to_string())
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Install one market entry off the UI thread.
+    fn install_extension_market(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.extension_market_fetching {
+            return;
+        }
+        self.extension_market_fetching = true;
+        let root = crate::extension::store_root(&self.state.settings);
+        let settings = self.state.settings.clone();
+        let workspace = {
+            let root = settings.active_workspace_root();
+            (!root.is_empty()).then(|| std::path::PathBuf::from(root))
+        };
+        let (tx, rx) = async_channel::bounded(1);
+        self.state.runner.rt().spawn_blocking(move || {
+            let store = crate::extension::package::ExtensionStore::open(&root);
+            let result = store.map_err(|error| error.to_string()).and_then(|store| {
+                let market = crate::extension::market::GitMarket::open(
+                    &root,
+                    crate::extension::market::DEFAULT_GIT_MARKET,
+                );
+                let index = market.cached().map_err(|error| error.to_string())?;
+                let entry = index
+                    .newest(&id)
+                    .ok_or_else(|| format!("{id} is not in the cached market"))?;
+                market
+                    .install(&store, entry)
+                    .map(|package| package.id().to_string())
+                    .map_err(|error| error.to_string())
+            });
+            let _ = tx.send_blocking(result);
+        });
+        cx.spawn(async move |this, cx| {
+            let result = rx.recv().await;
+            let _ = this.update(cx, |this, cx| {
+                this.extension_market_fetching = false;
+                match result {
+                    Ok(Ok(_)) => {
+                        this.extension_market_error = None;
+                        let statuses = crate::extension::statuses(&settings, workspace.as_deref());
+                        this.extension_statuses = Some(statuses);
+                    }
+                    Ok(Err(error)) => this.extension_market_error = Some(error),
+                    Err(_) => {
+                        this.extension_market_error = Some("market channel closed".to_string())
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn extension_market_rows(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        self.load_extension_market();
+        let lang = self.state.lang;
+        let statuses = self.extension_statuses.clone().unwrap_or_default();
+        let mut rows = Vec::new();
+        let refresh = div()
+            .id("extension-market-refresh")
+            .debug_selector(|| "extension-market-refresh".to_string())
+            .h(px(30.0))
+            .px(px(12.0))
+            .rounded(px(8.0))
+            .bg(rgb(theme::new_session_fill()))
+            .cursor_pointer()
+            .child(txt(tr(lang, "settings.marketRefresh"), 12.0, theme::text()))
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.refresh_extension_market(cx);
+            }));
+        rows.push(
+            div()
+                .mb(px(12.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .child(txt(
+                    tr(lang, "settings.marketGitHint"),
+                    12.0,
+                    theme::muted(),
+                ))
+                .child(refresh)
+                .into_any_element(),
+        );
+        if let Some(error) = &self.extension_market_error {
+            rows.push(
+                txt(error.clone(), 11.0, theme::error())
+                    .mb(px(8.0))
+                    .into_any_element(),
+            );
+        }
+        if self.extension_market_fetching {
+            rows.push(
+                txt(tr(lang, "settings.marketLoading"), 12.0, theme::muted())
+                    .mb(px(8.0))
+                    .into_any_element(),
+            );
+        }
+        let entries = self.extension_market.clone().unwrap_or_default();
+        if entries.is_empty() && !self.extension_market_fetching {
+            rows.push(
+                txt(tr(lang, "settings.marketGitEmpty"), 12.0, theme::muted()).into_any_element(),
+            );
+        }
+        for entry in entries {
+            let installed = statuses.iter().find(|status| status.id == entry.id);
+            let enabled = installed.is_some_and(|status| status.configured);
+            let action = if installed.is_some() {
+                let id = entry.id.clone();
+                let label = if enabled {
+                    tr(lang, "settings.extensionDisable")
+                } else {
+                    tr(lang, "settings.extensionEnable")
+                };
+                div()
+                    .id(SharedString::from(format!("extension-toggle-{}", entry.id)))
+                    .debug_selector({
+                        let id = entry.id.clone();
+                        move || format!("extension-toggle-{id}")
+                    })
+                    .h(px(28.0))
+                    .px(px(10.0))
+                    .rounded(px(7.0))
+                    .bg(rgb(theme::new_session_fill()))
+                    .cursor_pointer()
+                    .child(txt(label, 11.0, theme::text()))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.toggle_installed_extension(&id, cx);
+                        let settings = this.state.settings.clone();
+                        let root = settings.active_workspace_root();
+                        let workspace = (!root.is_empty()).then(|| std::path::PathBuf::from(root));
+                        this.extension_statuses =
+                            Some(crate::extension::statuses(&settings, workspace.as_deref()));
+                        cx.notify();
+                    }))
+            } else {
+                let id = entry.id.clone();
+                div()
+                    .id(SharedString::from(format!(
+                        "extension-install-{}",
+                        entry.id
+                    )))
+                    .debug_selector({
+                        let id = entry.id.clone();
+                        move || format!("extension-install-{id}")
+                    })
+                    .h(px(28.0))
+                    .px(px(10.0))
+                    .rounded(px(7.0))
+                    .bg(rgb(theme::accent()))
+                    .cursor_pointer()
+                    .child(txt(
+                        tr(lang, "settings.extensionInstall"),
+                        11.0,
+                        theme::page(),
+                    ))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.install_extension_market(id.clone(), cx);
+                    }))
+            };
+            let state_label = match installed {
+                Some(_) => {
+                    if enabled {
+                        tr(lang, "settings.extensionEnabled")
+                    } else {
+                        tr(lang, "settings.extensionDisabled")
+                    }
+                }
+                None => tr(lang, "settings.extensionAvailable"),
+            };
+            rows.push(
+                div()
+                    .id(SharedString::from(format!("extension-market-{}", entry.id)))
+                    .debug_selector({
+                        let id = entry.id.clone();
+                        move || format!("extension-market-{id}")
+                    })
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(10.0))
+                    .py(px(8.0))
+                    .border_b_1()
+                    .border_color(rgb(theme::border_soft()))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .flex_1()
+                            .min_w_0()
+                            .child(txt(entry.name.clone(), 13.0, theme::text()))
+                            .child(txt(
+                                format!(
+                                    "{} · v{} · {}",
+                                    entry.id, entry.version, entry.description
+                                ),
+                                11.0,
+                                theme::muted(),
+                            ))
+                            .child(txt(state_label, 11.0, theme::faint())),
+                    )
+                    .child(action)
+                    .into_any_element(),
+            );
+        }
+        rows
+    }
+
     fn section_extensions(
         &mut self,
         cx: &mut Context<Self>,
@@ -6593,6 +6862,11 @@ impl Shell {
             let (_, _, mut rows) = self.section_builtin_plugins(cx);
             rows.insert(0, tabs);
             return ("settings.extensions", "settings.skillsIntro", rows);
+        }
+        if self.extensions_tab == 3 {
+            let mut rows = self.extension_market_rows(cx);
+            rows.insert(0, tabs);
+            return ("settings.extensions", "settings.marketGitHint", rows);
         }
         let workspace = {
             let root = self.state.settings.active_workspace_root();

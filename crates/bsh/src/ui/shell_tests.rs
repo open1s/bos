@@ -29964,6 +29964,15 @@ fn the_extensions_pane_keeps_mcp_and_skills(cx: &mut TestAppContext) {
         2,
         "the Skills tab opens the skills settings"
     );
+    let market = cx
+        .debug_bounds("extensions-tab-market")
+        .expect("Market tab");
+    cx.simulate_click(market.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("extension-market-refresh").is_some(),
+        "the Market tab lists the Git provider"
+    );
     let installed = cx
         .debug_bounds("extensions-tab-installed")
         .expect("Installed tab");

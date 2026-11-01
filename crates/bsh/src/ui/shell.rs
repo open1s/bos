@@ -871,8 +871,14 @@ pub(crate) struct Shell {
         Option<std::collections::BTreeMap<String, crate::extension::ui::ThemePalette>>,
     /// Extension status rows, resolved with the panels.
     pub(crate) extension_statuses: Option<Vec<crate::extension::host::ExtensionStatus>>,
-    /// The Extensions pane's active sub-tab: installed, MCP, skills.
+    /// The Extensions pane's active sub-tab: installed, MCP, skills, market.
     pub(crate) extensions_tab: usize,
+    /// Cached Git market entries, loaded only when the Market tab opens.
+    pub(crate) extension_market: Option<Vec<crate::extension::market::MarketEntry>>,
+    /// Why the market could not be read or refreshed.
+    pub(crate) extension_market_error: Option<String>,
+    /// Whether a market refresh or install is in flight.
+    pub(crate) extension_market_fetching: bool,
     /// The settings dialog's text fields.
     pub(crate) settings_inputs: SettingsInputs,
     /// The Vault pane's text fields.
@@ -1763,6 +1769,9 @@ impl Shell {
             extension_themes: Some(extension_themes),
             extension_statuses: Some(extension_statuses),
             extensions_tab: 0,
+            extension_market: None,
+            extension_market_error: None,
+            extension_market_fetching: false,
             settings_inputs,
             vault_inputs,
             vault_revealed: None,
