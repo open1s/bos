@@ -29933,6 +29933,11 @@ fn the_extensions_rail_opens_the_extension_inventory(cx: &mut TestAppContext) {
         cx.debug_bounds("extension-panels").is_some(),
         "the same pane hosts contributed panels"
     );
+    assert!(
+        cx.debug_bounds("extension-status-toggle-com.bos.bsh.extensions")
+            .is_some(),
+        "an installed extension carries its enable/disable control"
+    );
 }
 
 /// The Extensions pane keeps the MCP and Skills settings as sub-tabs.

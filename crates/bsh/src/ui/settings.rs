@@ -6747,9 +6747,9 @@ impl Shell {
             let action = if installed.is_some() {
                 let id = entry.id.clone();
                 let label = if enabled {
-                    tr(lang, "settings.extensionDisable")
+                    tr(self.state.lang, "settings.extensionDisable")
                 } else {
-                    tr(lang, "settings.extensionEnable")
+                    tr(self.state.lang, "settings.extensionEnable")
                 };
                 div()
                     .id(SharedString::from(format!("extension-toggle-{}", entry.id)))
@@ -7163,7 +7163,46 @@ impl Shell {
                                 } else {
                                     theme::warn()
                                 },
-                            )),
+                            ))
+                            .child({
+                                let id = status.id.clone();
+                                let enabled = status.configured;
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "extension-status-toggle-{}",
+                                        status.id
+                                    )))
+                                    .debug_selector({
+                                        let id = status.id.clone();
+                                        move || format!("extension-status-toggle-{id}")
+                                    })
+                                    .h(px(24.0))
+                                    .px(px(9.0))
+                                    .rounded(px(7.0))
+                                    .bg(rgb(theme::new_session_fill()))
+                                    .cursor_pointer()
+                                    .child(txt(
+                                        if enabled {
+                                            tr(self.state.lang, "settings.extensionDisable")
+                                        } else {
+                                            tr(self.state.lang, "settings.extensionEnable")
+                                        },
+                                        11.0,
+                                        theme::text(),
+                                    ))
+                                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                                        this.toggle_installed_extension(&id, cx);
+                                        let settings = this.state.settings.clone();
+                                        let root = settings.active_workspace_root();
+                                        let workspace = (!root.is_empty())
+                                            .then(|| std::path::PathBuf::from(root));
+                                        this.extension_statuses = Some(crate::extension::statuses(
+                                            &settings,
+                                            workspace.as_deref(),
+                                        ));
+                                        cx.notify();
+                                    }))
+                            }),
                     ),
             );
         }
