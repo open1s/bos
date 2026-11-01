@@ -14,8 +14,8 @@ use serde_json::{json, Value};
 
 use super::declarative::RawContribution;
 use super::{CallContext, Runtime, ToolDescriptor, ToolResult};
-use crate::extension::capability::Capability;
-use crate::extension::types::{ExtensionError, RuntimeKind};
+use crate::extension::capability::{authorize_each, call_scope, Capability, PolicyEngine};
+use crate::extension::types::{ExtensionError, RuntimeKind, TrustLevel};
 
 /// One step in a workflow.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +47,9 @@ pub(crate) struct WorkflowFile {
 pub(crate) struct WorkflowRuntime {
     inner: Arc<dyn Runtime>,
     workflows: BTreeMap<String, WorkflowFile>,
+    inner_tools: BTreeMap<String, ToolDescriptor>,
+    policy: Arc<PolicyEngine>,
+    trust: TrustLevel,
     tools: Vec<ToolDescriptor>,
 }
 
@@ -56,9 +59,16 @@ impl WorkflowRuntime {
         inner: Arc<dyn Runtime>,
         contributions: &[RawContribution],
         inner_tools: &[ToolDescriptor],
+        policy: Arc<PolicyEngine>,
+        trust: TrustLevel,
     ) -> Result<Self, ExtensionError> {
         let mut workflows = BTreeMap::new();
-        let mut tools = inner_tools.to_vec();
+        let inner_tools: BTreeMap<String, ToolDescriptor> = inner_tools
+            .iter()
+            .cloned()
+            .map(|tool| (tool.id.as_str().to_string(), tool))
+            .collect();
+        let mut tools: Vec<ToolDescriptor> = inner_tools.values().cloned().collect();
         for contribution in contributions {
             let text = std::fs::read_to_string(&contribution.path).map_err(|source| {
                 ExtensionError::Io {
@@ -71,17 +81,12 @@ impl WorkflowRuntime {
                     path: contribution.path.clone(),
                     message: error.to_string(),
                 })?;
-            let mut capabilities: Vec<Capability> = Vec::new();
+            // Validate step references while the package is being loaded.
             for step in &workflow.steps {
-                if let Some(tool) = inner_tools
-                    .iter()
-                    .find(|tool| tool.id.as_str() == step.tool)
-                {
-                    for capability in &tool.capabilities {
-                        if !capabilities.contains(capability) {
-                            capabilities.push(*capability);
-                        }
-                    }
+                if !inner_tools.contains_key(&step.tool) {
+                    return Err(ExtensionError::NotFound {
+                        id: format!("workflow {} references missing tool {}", contribution.id, step.tool),
+                    });
                 }
             }
             tools.push(ToolDescriptor {
@@ -95,13 +100,19 @@ impl WorkflowRuntime {
                     .input_schema
                     .clone()
                     .unwrap_or_else(|| json!({"type":"object","properties":{}})),
-                capabilities,
+                // Workflow capabilities are authorized per step against the
+                // resolved arguments in execute(); an aggregate list checked
+                // against outer workflow input would authorize the wrong scope.
+                capabilities: Vec::new(),
             });
             workflows.insert(contribution.id.as_str().to_string(), workflow);
         }
         Ok(Self {
             inner,
             workflows,
+            inner_tools,
+            policy,
+            trust,
             tools,
         })
     }
@@ -121,6 +132,19 @@ impl WorkflowRuntime {
         let mut outputs = serde_json::Map::new();
         for step in &workflow.steps {
             let arguments = resolve(&step.arguments, &input, &outputs);
+            let descriptor = self.inner_tools.get(&step.tool).ok_or_else(|| {
+                ExtensionError::NotFound {
+                    id: format!("{}::{}", context.extension, step.tool),
+                }
+            })?;
+            let scope = call_scope(&arguments, context.workspace.as_deref());
+            authorize_each(
+                &self.policy,
+                context.extension.as_str(),
+                self.trust,
+                &descriptor.capabilities,
+                &scope,
+            )?;
             // Progress and cancellation belong to the step actually running,
             // not to the wrapper: threading the sender keeps a workflow's
             // child calls streamable like any other tool call.
@@ -299,7 +323,10 @@ mod tests {
     use crate::extension::types::ContributionId;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    struct Counting(AtomicUsize);
+    struct Counting {
+        calls: AtomicUsize,
+        capabilities: Vec<Capability>,
+    }
 
     #[async_trait]
     impl Runtime for Counting {
@@ -311,7 +338,7 @@ mod tests {
                 id: ContributionId::parse("echo").expect("id"),
                 description: "echo".to_string(),
                 input_schema: json!({"type":"object"}),
-                capabilities: Vec::new(),
+                capabilities: self.capabilities.clone(),
             }])
         }
         async fn call_tool(
@@ -320,7 +347,7 @@ mod tests {
             arguments: Value,
             _context: &CallContext,
         ) -> Result<Value, ExtensionError> {
-            self.0.fetch_add(1, Ordering::SeqCst);
+            self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(arguments)
         }
     }
@@ -352,8 +379,19 @@ mod tests {
             .expect("json"),
         )
         .expect("workflow");
-        let inner = Arc::new(Counting(AtomicUsize::new(0)));
+        let inner = Arc::new(Counting {
+            calls: AtomicUsize::new(0),
+            capabilities: Vec::new(),
+        });
         let tools = inner.tools().await.expect("tools");
+        let policy = Arc::new(
+            PolicyEngine::open(
+                scratch.join("grants.toml"),
+                scratch.join("audit.jsonl"),
+                crate::extension::capability::PolicyMode::Enforce,
+            )
+            .expect("policy"),
+        );
         let runtime = WorkflowRuntime::new(
             inner.clone(),
             &[RawContribution {
@@ -361,6 +399,8 @@ mod tests {
                 path,
             }],
             &tools,
+            policy,
+            TrustLevel::Local,
         )
         .expect("runtime");
         let context = CallContext::new(
@@ -374,7 +414,7 @@ mod tests {
             .await
             .expect("workflow");
         assert_eq!(result["steps"]["echo"]["who"], "bos");
-        assert_eq!(inner.0.load(Ordering::SeqCst), 1);
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
         let _ = std::fs::remove_dir_all(&scratch);
     }
 }
