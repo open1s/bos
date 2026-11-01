@@ -42,8 +42,8 @@ Status legend:
 | Unified tool/context/prompt contracts | done | agent.rs |
 | Capability authorization, quotas, audit | done | authorization, audit, memory/time/output/event/progress limits and a 20/s network window |
 | Directory package | done | package.rs |
-| Archive distribution | missing | tar.gz reader not yet wired to install |
-| Local/Git/official/private registries | missing | local directory only |
+| Archive distribution | done | tar.gz extraction wired through sources::resolve and install |
+| Local/Git/official/private registries | done | local dir, tar/HTTP archive, Git source, HTTP registry and Git market |
 | Native dynamic libraries | non-goal | design section 8.4 |
 
 ## 2. Design principles
@@ -182,7 +182,7 @@ Status legend:
 | Graceful deactivate/shutdown | done | runtime trait delegated through LazyRuntime |
 | Cancellation of outstanding work | done | Runtime::cancel stops process/MCP children and traps a WASM guest |
 | Health monitoring and crash handling | done | health/status, persisted last error, bounded startup retry and `bsh ext retry` |
-| Retry with bounded backoff | missing |
+| Retry with bounded backoff | done | LazyRuntime retries at 50/100/200/400 ms after a failed activation |
 | State persistence independent of package | done |
 | Explicit uninstall and retention | done |
 | Startup policies on-startup/on-demand/on-workspace-open/manual | done |

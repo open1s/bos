@@ -14,7 +14,9 @@ pub(crate) mod wasm;
 pub(crate) mod workflow;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -508,6 +510,7 @@ pub(crate) fn load_tool_descriptors(
 pub(crate) struct LazyRuntime {
     inner: Arc<dyn Runtime>,
     activated: tokio::sync::OnceCell<()>,
+    failures: AtomicU32,
 }
 
 impl LazyRuntime {
@@ -516,14 +519,35 @@ impl LazyRuntime {
         Self {
             inner,
             activated: tokio::sync::OnceCell::new(),
+            failures: AtomicU32::new(0),
         }
     }
 
+    /// Activate once, with a bounded exponential backoff between retries.
+    ///
+    /// The first attempt is immediate. After a failure the next attempt waits
+    /// 50 ms, then 100 ms, then 200 ms, capped at 400 ms, so a package whose
+    /// startup dependency is briefly unavailable recovers without a hot loop and
+    /// without unbounded delay.
     async fn ensure(&self) -> Result<(), ExtensionError> {
-        self.activated
+        let failures = self.failures.load(Ordering::Relaxed);
+        if failures > 0 {
+            let shift = failures.saturating_sub(1).min(3);
+            let delay = Duration::from_millis(50 * (1 << shift)).min(Duration::from_millis(400));
+            tokio::time::sleep(delay).await;
+        }
+        let result = self
+            .activated
             .get_or_try_init(|| async { self.inner.activate().await })
             .await
-            .map(|_| ())
+            .map(|_| ());
+        match &result {
+            Ok(()) => self.failures.store(0, Ordering::Relaxed),
+            Err(_) => {
+                self.failures.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        result
     }
 }
 
@@ -725,5 +749,52 @@ tools = ["echo", "greet"]
         assert!(implementation
             .run(&serde_json::json!({}), 16, &extension)
             .is_err());
+    }
+
+    struct FlakyRuntime {
+        attempts: AtomicU32,
+    }
+
+    #[async_trait]
+    impl Runtime for FlakyRuntime {
+        fn kind(&self) -> RuntimeKind {
+            RuntimeKind::Builtin
+        }
+
+        async fn activate(&self) -> Result<(), ExtensionError> {
+            if self.attempts.fetch_add(1, Ordering::Relaxed) < 2 {
+                return Err(ExtensionError::Denied {
+                    extension: "com.example.flaky".to_string(),
+                    capability: "startup".to_string(),
+                    reason: "not yet".to_string(),
+                });
+            }
+            Ok(())
+        }
+
+        async fn tools(&self) -> Result<Vec<ToolDescriptor>, ExtensionError> {
+            Ok(Vec::new())
+        }
+
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: Value,
+            _context: &CallContext,
+        ) -> Result<Value, ExtensionError> {
+            Ok(Value::Null)
+        }
+    }
+
+    #[tokio::test]
+    async fn lazy_activation_retries_then_succeeds() {
+        let inner = Arc::new(FlakyRuntime {
+            attempts: AtomicU32::new(0),
+        });
+        let runtime = LazyRuntime::new(inner.clone());
+        assert!(runtime.activate().await.is_err());
+        assert!(runtime.activate().await.is_err());
+        runtime.activate().await.expect("third attempt succeeds");
+        assert_eq!(inner.attempts.load(Ordering::Relaxed), 3);
     }
 }
