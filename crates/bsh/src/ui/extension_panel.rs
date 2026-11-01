@@ -246,9 +246,14 @@ impl ExtensionPanelView {
         };
         let revision = session.revision();
         let action = action.to_string();
+        let runtime = panel.runtime.clone();
         self.message = Some("Running…".to_string());
         cx.spawn(async move |this, cx| {
-            let outcome = panel.runtime.command(&action, payload).await;
+            let action_for_call = action.clone();
+            let outcome = crate::extension::run_on_tokio(async move {
+                runtime.command(&action_for_call, payload).await
+            })
+            .await;
             let _ = this.update(cx, |this, cx| {
                 this.message = None;
                 match outcome {

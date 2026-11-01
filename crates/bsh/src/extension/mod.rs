@@ -34,6 +34,32 @@ mod events;
 pub(crate) mod host;
 pub(crate) use host::shutdown;
 
+/// A process-wide Tokio runtime for extension work that starts outside a Tokio
+/// context, such as a GPUI click listener. Extension runtimes own Tokio process
+/// pipes and WASM async bindings, so spawning them from GPUI's executor alone
+/// panics with "there is no reactor running".
+///
+/// The runtime is created once, on first use, and lives for the app.
+pub(crate) async fn run_on_tokio<F, T>(future: F) -> T
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    let runtime = RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_name("bsh-extension-runtime")
+            .build()
+            .expect("extension Tokio runtime")
+    });
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    runtime.spawn(async move {
+        let _ = tx.send(future.await);
+    });
+    rx.await.expect("extension runtime task")
+}
+
 /// The managed extension root for a settings document.
 pub(crate) fn store_root(settings: &crate::settings::Settings) -> std::path::PathBuf {
     host::extension_root(settings)
@@ -59,4 +85,23 @@ pub(crate) use host::{
 /// Run the developer CLI and return the process exit code.
 pub(crate) fn cli(args: &[String]) -> i32 {
     cli::run(args)
+}
+
+#[cfg(test)]
+mod bridge_tests {
+    use super::run_on_tokio;
+
+    #[tokio::test]
+    async fn extension_work_runs_on_the_extension_runtime() {
+        let output = run_on_tokio(async {
+            tokio::process::Command::new("python3")
+                .args(["-c", "print('bridge')"])
+                .output()
+                .await
+        })
+        .await
+        .expect("process");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "bridge");
+    }
 }
