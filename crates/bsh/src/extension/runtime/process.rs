@@ -298,7 +298,9 @@ pub(super) fn linux_bwrap_plan(
     let mut bound = Vec::<PathBuf>::new();
     let mut created_tmp_dirs = Vec::<PathBuf>::new();
     for path in writable {
-        if path != Path::new("/tmp") && !bound.iter().any(|parent| path.starts_with(parent)) {
+        if path != Path::new("/tmp")
+            && !bound.iter().any(|parent| path.starts_with(parent))
+        {
             // /tmp is a fresh tmpfs in the sandbox. Recreate destination
             // directories before binding a package/workspace/data root that
             // was originally located under the host's /tmp.
@@ -1067,9 +1069,18 @@ mod tests {
             Path::new("/tmp/bsh-package/server"),
             &[],
         );
-        let dir = plan.iter().position(|item| item == "--dir").expect("tmpfs target dir");
-        let bind = plan.iter().position(|item| item == "--bind").expect("package bind");
-        assert!(dir < bind, "the package destination must exist before bind");
+        let dir = plan
+            .iter()
+            .position(|item| item == "--dir")
+            .expect("tmpfs target dir");
+        let bind = plan
+            .iter()
+            .position(|item| item == "--bind")
+            .expect("package bind");
+        assert!(
+            dir < bind,
+            "the package destination must exist before bind"
+        );
         assert_eq!(
             plan.iter().filter(|item| item.as_str() == "--bind").count(),
             2
