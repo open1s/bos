@@ -15,7 +15,7 @@ examples/extensions/allinone/
   prompts/guide.md            agent instruction
   contexts/workspace.md       path-scoped context
   skills/allinone/SKILL.md    agent skill
-  languages/demo.json         language descriptor
+  languages/demo-language.json         language descriptor
   integrations/*.json         GitHub and command integration descriptors
   themes/aurora.json          extension theme
   presets/safe.json           read-only agent preset
@@ -83,7 +83,7 @@ failure.
 | Prompt | `prompts/guide.md` | Injected into the built agent |
 | Context | `contexts/workspace.md` | Injected only when `crates/**/*.rs` or `src/**/*.rs` matches |
 | Skill | `skills/allinone/SKILL.md` | Skill inventory |
-| Language | `languages/demo.json` | `bsh ext languages` |
+| Language | `languages/demo-language.json` | `bsh ext languages` |
 | Integration | `integrations/*.json` | `bsh ext integrations` |
 | Theme | `themes/aurora.json` | Settings → Extensions theme selector |
 | Preset | `presets/safe.json` | Agent presets |

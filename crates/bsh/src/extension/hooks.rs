@@ -110,9 +110,12 @@ fn worker() {
             };
             runtime.block_on(async {
                 for target in targets {
-                    // A failed hook is logged by the runtime; one package must
-                    // not stop delivery to the others.
-                    let _ = target.runtime.hook(point, payload.clone()).await;
+                    // One package must not stop delivery to the others, but a
+                    // silent failure would make an unattached observer look
+                    // healthy: name the point and the package.
+                    if let Err(error) = target.runtime.hook(point, payload.clone()).await {
+                        log::warn!("extension {} hook {point} failed: {error}", target.id);
+                    }
                 }
             });
         }

@@ -58,7 +58,7 @@
             ],
             [
               "Language",
-              "languages/demo.json",
+              "languages/demo-language.json",
               "bsh ext languages"
             ],
             [

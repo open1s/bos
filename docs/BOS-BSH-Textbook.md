@@ -1,504 +1,696 @@
 # BSH by Example
 
-*A hands-on introduction to the BSH extension framework, in the spirit of
-[Rust by Example](https://doc.rust-lang.org/rust-by-example/): every idea
-arrives as a package you can validate, install, call and inspect.*
+**Second edition — the BSH 3.0 extension framework**
 
-BSH is the desktop shell built on the BOS framework. Its extension platform is a
-contract, not a plugin API: a package is a directory with an `extension.toml`,
-the host reads it, hashes it, authorizes it, and only then runs it. This book
-walks that contract one runnable example at a time.
+This is a working book, not a specification. Most chapters include commands you
+can run, output you should see, and the failure modes that waste the most time. The normative contract is [bsh-extension-standard.md](bsh-extension-standard.md);
+when this book and the standard disagree, the standard wins and the book has a
+bug.
 
-The normative text is [bsh-extension-standard.md](bsh-extension-standard.md).
-Where this book and the standard disagree, the standard wins. The design
-rationale is in [BSH_Extension_Framework_Design.md](BSH_Extension_Framework_Design.md),
-and the current implementation status is in
-[bsh-extension-conformance.md](bsh-extension-conformance.md).
+The second edition adds what the framework grew after the first one:
 
-## How to run the examples
+- the observe-hook layer and the five points it dispatches today;
+- `hooks.observe`, the twentieth capability;
+- request correlation between `model.request`, `model.response` and
+  `http.exchange`;
+- a runnable Extism observer (`examples/extensions/extism-hook`);
+- a sharper split between events (after the fact, many subscribers) and hooks
+  (declared seam calls, one receiver class).
 
-Every example is a directory under `examples/extensions`. From the BOS workspace:
+## Who this is for
 
-```text
-cargo build -p bsh                      # or use a release build
-alias bsh=./target/debug/bsh
+Different readers use the book differently:
 
-bsh ext validate examples/extensions/hello
-bsh ext install  examples/extensions/hello
-bsh ext info     com.example.hello
-bsh ext mock     examples/extensions/hello echo '{"text":"hi"}'
-```
+| You are | Start at | Then |
+|---|---|---|
+| Writing your first package | 1, 2, 3 | 4, 5, 7, 15 |
+| Choosing a runtime | 1, 2, 10 | 11, 12, 13 |
+| Instrumenting the agent | 2, 8, 22 | 23, 24, 25, 26 |
+| Operating a store | 3, 9, 30 | 28, 29, 31, 32 |
 
-Conventions used throughout:
+## Conventions
 
-- paths are relative to the workspace root unless stated otherwise;
-- `bsh ext …` is the developer CLI (chapter 23 is the task index);
-- a package id is reverse-domain (`com.example.hello`); a contribution id is
-  dotted and lowercase (`echo`, `git.status`);
-- a tool's model-facing name is the package's last id segment plus `__` plus the
-  tool id, with dots flattened: `com.example.git-assistant` + `git.status` →
-  `git-assistant__git_status`.
+- Commands assume the repository root and a debug build:
+
+  ```bash
+  cargo build -p bsh
+  export BSH=./target/debug/bsh
+  ```
+
+- `$BSH` means that binary. `--root <dir>` isolates a lab from your real
+  store; everything under `~/.bos/bsh/extensions` is otherwise live state.
+- JSON is shown as one object per line when it is a payload, and pretty-printed
+  when it is output. Field order is not significant.
+- "Exit 1" means a refused operation, not a crash. "Exit 2" is a usage error.
+- `validate` parses a package but never runs it. `test` parses and checks
+  contribution files. `mock` runs a tool against a permissive mock host.
+  `install` is the first command that writes managed state.
+- The book targets BSH 3.0.x and extension API 1.0.
 
 ## Table of contents
 
-- [Architecture and runtimes at a glance](#architecture-and-runtimes-at-a-glance)
-1. [Hello, extension](#1-hello-extension)
-2. [The package tree](#2-the-package-tree)
-3. [The manifest](#3-the-manifest)
-4. [Tools](#4-tools)
-5. [Commands](#5-commands)
-6. [Prompts and contexts](#6-prompts-and-contexts)
-7. [Capabilities and grants](#7-capabilities-and-grants)
-8. [The process runtime](#8-the-process-runtime)
-9. [The WASM component runtime](#9-the-wasm-component-runtime)
-10. [The Extism runtime](#10-the-extism-runtime)
-11. [The MCP runtime](#11-the-mcp-runtime)
-12. [Workflows](#12-workflows)
-13. [Panels](#13-panels)
-14. [Themes, icons and images](#14-themes-icons-and-images)
-15. [Skills](#15-skills)
-16. [Language services](#16-language-services)
-17. [Integrations](#17-integrations)
-18. [Model providers, agent roles and presets](#18-model-providers-agent-roles-and-presets)
-19. [Storage and configuration](#19-storage-and-configuration)
-20. [Events and hooks](#20-events-and-hooks)
-21. [Lifecycle](#21-lifecycle)
-22. [Store, integrity and signing](#22-store-integrity-and-signing)
-23. [The CLI by task](#23-the-cli-by-task)
-24. [Testing](#24-testing)
-25. [Debugging](#25-debugging)
-26. [Packaging and publishing](#26-packaging-and-publishing)
-27. [Built-in extensions](#27-built-in-extensions)
-28. [Limits and non-goals](#28-limits-and-non-goals)
-- [Appendix A. Manifest skeleton](#appendix-a-manifest-skeleton)
-- [Appendix B. Capability reference](#appendix-b-capability-reference)
-- [Appendix C. Event reference](#appendix-c-event-reference)
-- [Appendix D. UI nodes and limits](#appendix-d-ui-nodes-and-limits)
-- [Appendix E. CLI index](#appendix-e-cli-index)
-- [Appendix F. Example index](#appendix-f-example-index)
-- [Appendix G. Glossary](#appendix-g-glossary)
+**Part I — Orientation**
+
+1. [Quickstart in ten minutes](#1-quickstart-in-ten-minutes)
+2. [The mental model](#2-the-mental-model)
+3. [What is inside a package](#3-what-is-inside-a-package)
+
+**Part II — The declarative core**
+
+4. [The manifest, field by field](#4-the-manifest-field-by-field)
+5. [Tools](#5-tools)
+6. [Commands, prompts, contexts and skills](#6-commands-prompts-contexts-and-skills)
+7. [Capabilities, grants and audit](#7-capabilities-grants-and-audit)
+8. [Events](#8-events)
+9. [Lifecycle and status](#9-lifecycle-and-status)
+
+**Part III — Runtimes**
+
+10. [The process runtime](#10-the-process-runtime)
+11. [The WASM component runtime](#11-the-wasm-component-runtime)
+12. [The Extism runtime](#12-the-extism-runtime)
+13. [The MCP runtime](#13-the-mcp-runtime)
+14. [The declarative runtime](#14-the-declarative-runtime)
+
+**Part IV — Surfaces**
+
+15. [Panels and declarative UI](#15-panels-and-declarative-ui)
+16. [Themes, icons and images](#16-themes-icons-and-images)
+17. [Storage and configuration](#17-storage-and-configuration)
+18. [Instructions, skills and language services](#18-instructions-skills-and-language-services)
+19. [Integrations](#19-integrations)
+20. [Model providers, agent roles and presets](#20-model-providers-agent-roles-and-presets)
+21. [Workflows](#21-workflows)
+
+**Part V — Hooks and capture**
+
+22. [Hooks are not events](#22-hooks-are-not-events)
+23. [Declaring and authorizing hooks](#23-declaring-and-authorizing-hooks)
+24. [The guest contract](#24-the-guest-contract)
+25. [Build an observer end to end](#25-build-an-observer-end-to-end)
+26. [Capture cookbook](#26-capture-cookbook)
+27. [Debugging hooks](#27-debugging-hooks)
+
+**Part VI — Ship and operate**
+
+28. [Testing](#28-testing)
+29. [Debugging playbook](#29-debugging-playbook)
+30. [Store, integrity, signing and dependencies](#30-store-integrity-signing-and-dependencies)
+31. [The CLI by task](#31-the-cli-by-task)
+32. [Packaging, release and market](#32-packaging-release-and-market)
+33. [Built-in extensions](#33-built-in-extensions)
+34. [Security, limits and non-goals](#34-security-limits-and-non-goals)
+
+**Appendices**
+
+- [A. Manifest skeleton](#appendix-a-manifest-skeleton)
+- [B. Capability matrix](#appendix-b-capability-matrix)
+- [C. Hook payload reference](#appendix-c-hook-payload-reference)
+- [D. Error catalog](#appendix-d-error-catalog)
+- [E. Panel node reference](#appendix-e-panel-node-reference)
+- [F. Example index](#appendix-f-example-index)
+- [G. Author and reviewer checklists](#appendix-g-author-and-reviewer-checklists)
+- [H. Glossary](#appendix-h-glossary)
 
 ---
 
-# Architecture and runtimes at a glance
+# 1. Quickstart in ten minutes
 
-Everything in this book is one pipeline. A package is read from disk, proved to
-be what it claims, authorized, and only then handed to a runtime. The runtime is
-the only place code executes, and which runtime a package picks decides what
-"code" even means: a JSON document, a child process, a WASM component, an Extism
-plugin, an MCP server, or Rust linked into the host.
+The goal is not to understand every field yet. It is to install a package,
+inspect what the host thinks of it, run one tool without an agent, and then
+break it in a way the validator catches.
 
-## The whole system
+## 1.1 Build and validate
+
+```bash
+cargo build -p bsh
+export BSH=./target/debug/bsh
+
+$BSH ext validate examples/extensions/hello
+```
+
+Expected:
+
+```text
+id:      com.example.hello
+version: 1.0.0
+runtime: declarative
+hash:    6b108662c25eb98a4bacda8aa873fdcb1a6a1428be1c372932e5f816d4c32176
+valid
+```
+
+The hash is content-addressed. Change one byte of `tools/echo.json` and it
+changes; change a file inside `.git` and it does not. That is by design: the
+hash covers the package, not the checkout.
+
+## 1.2 Run a tool without an agent
+
+```bash
+$BSH ext mock examples/extensions/hello echo '{"text":"hi"}'
+```
+
+Expected:
+
+```json
+{
+  "text": "hi"
+}
+```
+
+`mock` builds a permissive in-memory host: capability checks pass, the network
+is absent, and no state is written. It answers one question — "does this tool
+descriptor and implementation produce a value?" — and nothing else. A tool that
+works under `mock` can still be denied at runtime; a tool that fails under
+`mock` will not be saved by a grant.
+
+## 1.3 Install into a laboratory store
+
+Do not experiment in your real store until you are comfortable with
+`--purge-data`.
+
+```bash
+$BSH --root /tmp/bsh-lab ext install examples/extensions/hello
+$BSH --root /tmp/bsh-lab ext list
+$BSH --root /tmp/bsh-lab ext info com.example.hello
+```
+
+`list` shows the columns that matter:
+
+```text
+ID                    VERSION  STATE   TRUST  APPLIED  TOOLS
+com.example.hello     1.0.0    active  local  yes      hello__echo
+```
+
+Two different words appear:
+
+- **state** is the lifecycle state (`discovered`, `active`, `failed`, …);
+- **applied** says whether the package's contributions are in the running
+  agent. A package can be `active` and not applied when it is manual, disabled,
+  missing a required grant, or failed dependency resolution.
+
+`info` explains both, plus the source, root, hash and capability decisions.
+If a row says `failed`, read `info` before touching the package; the reason is
+almost always one line long.
+
+## 1.4 Grant what the package asks for
+
+A local package defaults to trust level `local`. High and critical
+capabilities need an explicit grant.
+
+```bash
+$BSH --root /tmp/bsh-lab ext grant com.example.hello agent.tools.register --scope any
+$BSH --root /tmp/bsh-lab ext grant com.example.hello ui.panels --scope any
+$BSH --root /tmp/bsh-lab ext grant com.example.hello ui.commands --scope any
+```
+
+`agent.tools.register` is low risk and normally allowed by policy, but granting
+it explicitly makes the lab independent of policy defaults. The point of the
+exercise is the second command:
+
+```bash
+$BSH --root /tmp/bsh-lab ext revoke com.example.hello agent.tools.register
+$BSH --root /tmp/bsh-lab ext info com.example.hello
+```
+
+The required capability is now denied, so the package is not applied. This is
+the framework working: a tool the agent cannot be allowed to call is not
+registered just because the package is installed.
+
+Grant it again before continuing.
+
+## 1.5 Validate, test, mock, install: which one?
+
+| Command | Parses manifest | Reads contribution files | Runs code | Writes state |
+|---|---:|---:|---:|---:|
+| `validate` | yes | no | no | no |
+| `test` | yes | yes | no | no |
+| `mock` | yes | yes | one tool | no |
+| `install` | yes | yes | no | yes |
+| `doctor` | yes | walks the store | no | no |
+
+A package that only passes `validate` is not ready. Run `test` in CI and
+`mock` for every tool with a representative argument object.
+
+## 1.6 What could go wrong already
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `validate` exits 1 with a field path | manifest or contribution error | fix the field named in the path |
+| `hash` changes on every run | you edited a file while validating | stop editing; hashes are stable otherwise |
+| `install` exits 1 with "already installed" | same id and version exist | uninstall, or bump the version |
+| `list` shows `failed` and `APPLIED=no` | required capability denied | `ext info`, then grant or fix the manifest |
+| `mock` cannot find the tool | you used the model-facing name | use the declared tool id (`echo`, not `hello__echo`) |
+
+---
+
+# 2. The mental model
+
+BSH is a desktop shell. BOS is the agent stack inside it. The extension
+framework is the seam between them: a package declares surfaces, the host
+loads it, the agent sees the surfaces, and every reach across the seam is
+authorized and audited.
+
+## 2.1 Three planes
 
 ```mermaid
 flowchart LR
-    subgraph SOURCE["1 · Package (a directory)"]
-        direction TB
-        MANIFEST["extension.toml"]
-        FILES["tools/ · commands/ · panels/<br/>wasm/ · plugin.wasm · assets/"]
-    end
-
-    subgraph HOST["2 · Extension host (inside bsh)"]
-        direction TB
-        VALIDATE["validate: schema, ids,<br/>files, compatibility"]
-        STORE["hash → stage → install"]
-        RESOLVE["resolve dependencies<br/>+ lockfile"]
-        LIFE["lifecycle state machine"]
-        POLICY["capability policy + audit"]
-        DISPATCH["runtime dispatcher"]
-    end
-
-    subgraph RUN["3 · Runtime — where code executes"]
-        direction TB
-        DECL["declarative<br/>host interprets JSON"]
-        PROC["process<br/>child + JSON-RPC stdio"]
-        WASM["wasm-component<br/>Wasmtime + WIT"]
-        EXT["extism<br/>plugin + bsh_host"]
-        MCP["mcp<br/>stdio MCP server"]
-        BUILT["builtin<br/>linked Rust"]
-    end
-
-    SURFACES["4 · Contributions<br/>tools · commands · panels<br/>prompts · contexts · skills<br/>themes · events · storage"]
-
-    MANIFEST --> VALIDATE
-    FILES --> VALIDATE
-    VALIDATE --> STORE
-    STORE --> RESOLVE
-    RESOLVE --> LIFE
-    LIFE --> POLICY
-    POLICY --> DISPATCH
-
-    DISPATCH --> DECL
-    DISPATCH --> PROC
-    DISPATCH --> WASM
-    DISPATCH --> EXT
-    DISPATCH --> MCP
-    DISPATCH --> BUILT
-
-    DECL --> SURFACES
-    PROC --> SURFACES
-    WASM --> SURFACES
-    EXT --> SURFACES
-    MCP --> SURFACES
-    BUILT --> SURFACES
+  P["Package on disk"] -->|manifest + files| H["BSH extension host"]
+  H -->|tools, prompts, skills, providers| A["BOS agent"]
+  A -->|tool call| H
+  H -->|CallContext + scope| R["Runtime: declarative, process, wasm, extism, mcp"]
+  R -->|value / error| H
+  H -->|events| E["Event bus"]
+  H -->|observe hooks| K["Hook queue"]
+  K -->|bsh_hook batch| X["Extism observer"]
+  H -->|audit| L["audit.jsonl"]
 ```
 
-Read it in four steps:
+- **Package plane** — files, manifest, hash, signature, state.
+- **Agent plane** — the tools, prompts, contexts, skills, providers and
+  workflows that end up in a turn.
+- **Runtime plane** — where code executes, and therefore what the host can
+  enforce. A declarative tool cannot open a socket; a process can, so the host
+  restricts its environment and needs a grant.
 
-1. **Package** — the manifest declares identity, compatibility, capabilities and
-   contributions; every declaration must have its file.
-2. **Host** — validate, hash, install into an immutable store, resolve
-   dependencies, move the lifecycle state, authorize capabilities, and dispatch.
-3. **Runtime** — the single execution seam. Everything before this step is
-   static; everything after it is the package's code (or, for declarative, the
-   host interpreting the package's JSON).
-4. **Contributions** — the same runtime result feeds the agent's tool registry,
-   the composer, panels, prompts/contexts, skills, events and storage.
+## 2.2 What the host owns
 
-Only step 3 differs between runtimes. Steps 1, 2 and 4 are shared, which is why
-the rest of the contract can be uniform.
+The host is deliberately boring and central:
 
-Static renders of the three figures (for readers whose Markdown viewer does not
-draw Mermaid): [architecture](assets/charts/architecture.png),
-[runtime choice](assets/charts/runtime-choice.png),
-[call path](assets/charts/call-path.png).
+1. **Validation.** The manifest is parsed strictly before any code runs.
+2. **Resolution.** One version per id; dependencies before dependents.
+3. **Authorization.** Activation checks required capabilities; every call
+   checks per-call capabilities against a scope.
+4. **Execution.** One `Runtime` trait for every transport.
+5. **Isolation.** Timeouts, memory, output, queue and path bounds.
+6. **Observation.** Bus events and seam hooks, with different guarantees.
 
-## The six runtimes
+If a feature cannot be enforced at one of those six points, it is not a
+framework feature; it is a convention.
 
-| Runtime | Where the code lives | Contract | Choose it when | Avoid it when |
+## 2.3 The runtime matrix
+
+| Runtime | Code lives | Transport | Best at | Hook support today |
 |---|---|---|---|---|
-| **declarative** | nowhere: the host evaluates JSON descriptors | files in the package | the work is a prompt, a template, a panel, a theme or a fixed answer | you need I/O, state or computation |
-| **process** | a child process | newline JSON-RPC on stdin/stdout | the work already exists as a program or CLI | you want a per-call OS sandbox guarantee |
-| **wasm-component** | a Wasmtime component | WIT world `bsh-extension` | you ship new, untrusted code that needs a hard sandbox | you need native libraries or unrestricted networking |
-| **extism** | an Extism plugin | PDK exports + `bsh_host` | you already have an Extism plugin | you need WASI or full WASM components |
-| **mcp** | an external MCP server | MCP over stdio | you already have an MCP server | you need panel UI or command contributions |
-| **builtin** | Rust linked into bsh | the `BuiltinExtension` trait | the code is first-party | a third party needs to ship it |
+| builtin | linked into BSH | direct Rust | first-party surfaces | none |
+| declarative | JSON files | host functions | echo/constant/template tools | none |
+| process | any allowlisted child | NDJSON JSON-RPC over stdio | Python/Node tools, existing CLIs | none (events only) |
+| wasm-component | Wasm component | WIT imports | sandboxed, typed code | none (events only) |
+| extism | Extism plugin | `bsh_host` + exports | small plugins, many languages | **observe hooks** |
+| mcp | stdio MCP server | JSON-RPC MCP | reuse an MCP server | none (events only) |
 
-A package cannot mix runtimes: one `runtime.kind` per package.
+Only Extism can consume hooks in this build. That is a statement about the
+current bridge, not about the design: a WASM component or a process can still be
+the *source* of an `http.exchange` when it uses a host fetch (WASM) or when the
+host taps its own LLM client. The consumer restriction is enforced in manifest
+validation: a non-Extism package that declares `contributes.hooks` is refused.
 
-## What every runtime shares
-
-- the same manifest, hash, install, lifecycle and status row;
-- the same per-call capability check, with the scope derived from `path`, `url`
-  or `secret` — for agent calls, panel actions, language checks and integrations;
-- the same deadline and output ceiling;
-- the same audit line for every decision;
-- the same event envelope, queue bounds and rate limit.
-
-What differs is how a call travels and how it is stopped:
-
-| Runtime | Start | Call | Progress | Cancel | Event delivery |
-|---|---|---|---|---|---|
-| declarative | none | host evaluates the descriptor | — | immediate | not delivered |
-| process | `initialize` + nonce | `tools/call` | `$/progress` | child killed | `events/event` |
-| wasm-component | `initialize`, `activate` | WIT `call-tool` | `progress()` | traps at next host call; epoch/fuel bound | `on-event` |
-| extism | plugin load | `bsh_call_tool` | final result only | traps at next `bsh_host` call | `bsh_event` |
-| mcp | MCP `initialize` | `tools/call` | `notifications/progress` | child killed by pid | `bsh/events/event` |
-| builtin | trait `activate` | Rust call | — | trait `cancel` | — |
-
-## Picking a runtime
-
-```mermaid
-flowchart LR
-    START["New extension"] --> Q1{"Is the code first-party<br/>and linked into bsh?"}
-    Q1 -->|yes| BUILT["builtin"]
-    Q1 -->|no| Q2{"Do you already have<br/>an MCP server?"}
-    Q2 -->|yes| MCP["mcp"]
-    Q2 -->|no| Q3{"Do you already have<br/>an Extism plugin?"}
-    Q3 -->|yes| EXT["extism"]
-    Q3 -->|no| Q4{"Does the work already exist<br/>as a program or CLI?"}
-    Q4 -->|yes| PROC["process"]
-    Q4 -->|no| Q5{"Is it new third-party code<br/>that needs a hard sandbox?"}
-    Q5 -->|yes| WASM["wasm-component"]
-    Q5 -->|no| DECL["declarative"]
-```
-
-The order matters: an existing MCP server or Extism plugin is a better fit than
-rewriting it as a process, and a new untrusted extension should not become a
-process just because that is the easiest path.
-
-## One call, end to end
+## 2.4 One tool call, end to end
 
 ```mermaid
 sequenceDiagram
-    autonumber
-    participant C as Agent · panel · CLI
-    participant H as Extension host
-    participant P as Capability policy
-    participant R as Runtime
-    participant G as Guest or child
-
-    C->>H: call tool(id, arguments)
-    H->>P: authorize each descriptor capability (scope from path/url/secret)
-    alt denied
-        P-->>H: deny + reason
-        H-->>C: error, audited, no call
-    else allowed
-        P-->>H: allow, audited
-        H->>R: call_tool(deadline, correlation)
-        R->>G: WIT call · JSON-RPC · plugin call
-        G-->>R: result
-        R-->>H: result (time and output ceilings)
-        H-->>C: tool result + events
-    end
+  participant U as User
+  participant A as BOS agent
+  participant H as Extension host
+  participant P as Policy
+  participant R as Runtime
+  participant G as Guest
+  U->>A: "check the tree"
+  A->>H: tool call hello__echo
+  H->>P: authorize_each(capability, scope)
+  P-->>H: allow / deny (audited)
+  H->>R: call_tool(id, args, CallContext)
+  R->>G: transport-specific call
+  G-->>R: value or error
+  R-->>H: ToolResult
+  H-->>A: content blocks
+  H->>H: publish tool.completed
 ```
 
-Two consequences of that order:
+Three details are easy to miss:
 
-- a denied call never reaches the runtime, so a package cannot "fail open" by
-  returning a value while unauthorized;
-- the runtime never sees the caller's credentials or the policy engine, only the
-  call and its deadline — which is why all six runtimes can implement the same
-  seam.
+- The **model-facing name** is qualified (`hello__echo`); the package file is
+  `tools/echo.json` and the runtime sees `echo`.
+- The **scope** is derived from the arguments before authorization. A tool that
+  reads a file must name the argument `path`; a tool that fetches must name it
+  `url`. Otherwise a path- or domain-scoped grant cannot match, and the call is
+  denied even though the capability is granted.
+- The **audit entry** is written whether the call is allowed or denied. A
+  denial that does not appear in `audit.jsonl` is a host bug.
 
-**See also:** [Design boundaries](BSH_Extension_Framework_Design.md#41-architectural-boundaries),
-[capability model](bsh-extension-standard.md#6-capability-model),
-[lifecycle](bsh-extension-standard.md#7-lifecycle).
+## 2.5 Events versus hooks
+
+They look similar and are not:
+
+| Question | Event | Observe hook |
+|---|---|---|
+| Who receives it? | any subscriber to the topic | packages that declared that point |
+| When? | after the fact | at the seam, before the host forgets it |
+| Can it block? | never | never in this build |
+| Can it change the outcome? | no | no (intercept is not implemented) |
+| Delivery | one event at a time, bounded queue | batches of up to 64 |
+| Payload | event envelope + JSON payload | `{point, batch}` |
+| Failure | dropped and counted | one package's failure does not stop the next |
+| Typical use | cache invalidation, activity feed | capture, metrics, redaction review |
+
+If you want to *change* a model request, a hook is still the wrong tool in this
+build. Intercept hooks are designed but not implemented; use a plugin/provider
+adapter or patch the host.
 
 ---
 
-# 1. Hello, extension
+# 3. What is inside a package
 
-The smallest useful package declares one tool. Create it:
+A package is a directory. Its manifest is `extension.toml`; everything else is
+resolved relative to it.
 
-```text
-bsh ext new com.example.hello --dir hello
-bsh ext validate hello
-```
-
-`new` writes this tree:
+## 3.1 The minimum tree
 
 ```text
 hello/
-  extension.toml
-  README.md
-  tools/echo.json
-  commands/refresh.md
+  extension.toml          required
+  tools/echo.json         one file per declared tool
+  commands/greet.md       one file per declared command
+  prompts/hello.md        one file per declared prompt
+  panels/status.json      one file per declared panel
+  README.md               optional, ignored by the host
 ```
 
-The manifest:
+The manifest names contribution ids, not paths. The host derives the path from
+the contribution kind and the id:
+
+| Contribution | File |
+|---|---|
+| tool `echo` | `tools/echo.json` |
+| command `greet` | `commands/greet.md` |
+| prompt `hello` | `prompts/hello.md` |
+| context `guide` | `contexts/guide.md` |
+| panel `status` | `panels/status.json` |
+| workflow `inspect` | `workflows/inspect.json` |
+| skill `helper` | `skills/helper/SKILL.md` |
+| theme `midnight` | `themes/midnight.json` |
+| language `rust` | `languages/rust.json` |
+| integration `github` | `integrations/github.json` |
+| model provider `demo` | `providers/models/demo.json` |
+| agent provider `helper` | `providers/agents/helper.json` |
+| preset `reader` | `providers/presets/reader.json` |
+
+A declared id without its file is a validation error, not an empty surface.
+That is deliberate: a package that says it contributes a panel and then does
+not ship one should fail loudly at install time, not silently show nothing.
+
+## 3.2 What must not be there
+
+- Absolute paths and `..` components in any package-relative path.
+- Symlinks. The package must be self-contained; a symlink is refused at copy,
+  hash and load time.
+- `.git`, `.jj`, `target`, `node_modules` in the canonical hash and copy.
+  They are ignored, so a development checkout can be installed without dragging
+  build output along.
+- More than one manifest. Nested packages are separate packages, not one.
+
+## 3.3 The hash
+
+The package hash is SHA-256 over each file's **relative path, byte length and
+content digest**, in sorted path order. Directory metadata, timestamps and modes
+are excluded. `package.sig` is excluded from the hash it signs; otherwise a
+signature could never verify after signing.
+
+Practical consequences:
+
+- `chmod +x` on a script does not change the hash, but the executable bit is
+  still preserved by the copy. Do not rely on the hash to catch a mode change.
+- Reformatting JSON changes the hash. Build tools should normalize or accept it.
+- Installing the same content twice produces the same hash, so a release is
+  reproducible across machines.
+- `bsh ext doctor` recomputes the hash of every installed package and reports a
+  mismatch as post-install tampering.
+
+## 3.4 The managed store
+
+```text
+~/.bos/bsh/extensions/
+  installed/<id>/<version>/     immutable code and assets
+  staging/                      an install in progress
+  cache/                        downloaded archives
+  quarantine/                   disabled or failed packages under review
+  extension-data/<id>/          business data, survives upgrade
+  extension-state/
+    registry.toml               installed versions, hashes, sources
+    state.toml                  enabled flags, last state, last error
+    grants.toml                 capability grants
+    lock.toml                   resolved dependency set
+    trust.toml                  trusted publisher keys
+  logs/extensions/
+    audit.jsonl                 every capability decision
+    audit.jsonl.1               rotated at 1 MiB
+    <id>/                       package stdout/stderr
+```
+
+`BSH_EXTENSION_ROOT` or `--root` moves the whole tree. The data and state
+directories move with it, which is why a lab root is a safe place to learn.
+
+## 3.5 Immutability and versions
+
+An installed `<id>/<version>` is immutable. An upgrade creates a new version
+directory; a rollback switches the active version back. Uninstall removes the
+state record but keeps `extension-data/<id>` unless `--purge-data` is passed.
+
+This is the rule that makes rollback trustworthy: the code you roll back to is
+the exact bytes you installed, not a rebuild.
+
+## 3.6 Lab: see the hash and the store move
+
+```bash
+cp -R examples/extensions/hello /tmp/hello-lab
+$BSH ext hash /tmp/hello-lab
+printf '\n' >> /tmp/hello-lab/tools/echo.json
+$BSH ext hash /tmp/hello-lab
+```
+
+The two hashes differ. Revert the newline, and the original hash returns. If
+you make the file invalid JSON instead, `hash` still succeeds (it hashes bytes)
+but `validate` fails; that difference is why the CLI has both commands.
+
+---
+
+# 4. The manifest, field by field
+
+The parser rejects unknown fields. A misspelled optional field would otherwise
+disappear silently, and a package would ask for nothing and receive nothing.
+Optional additions use serde defaults; that is the forward-compatibility rule.
+
+## 4.1 A complete annotated manifest
 
 ```toml
 schema_version = "1.0"
 
 [extension]
-id = "com.example.hello"
-name = "Hello"                      # title-cased from the last id segment
-version = "0.1.0"
-description = "A BSH extension"
+id = "com.example.git-assistant"
+name = "Git Assistant"
+version = "1.0.0"
+description = "Git tools for the BSH agent"
+authors = ["Example Developer"]
+license = "MIT"
+repository = "https://example.com/git-assistant"
+homepage = "https://example.com"
 
 [compatibility]
 bsh = ">=3.0.0, <4.0.0"
 extension_api = "^1.0"
 
 [runtime]
-kind = "declarative"
+kind = "process"
+entry = "bin/server"
+args = ["--stdio"]
 startup = "on-demand"
-
-[capabilities]
-required = ["agent.tools.register"]
-optional = ["workspace.read"]
-
-[contributes]
-tools = ["echo"]
-commands = ["refresh"]
-
-[resources]
-max_execution_ms = 5000
-```
-
-The tool descriptor:
-
-```json
-{
-  "description": "Echo the arguments back to the model",
-  "input_schema": {
-    "type": "object",
-    "properties": {}
-  },
-  "implementation": { "kind": "echo_arguments" }
-}
-```
-
-Run it without installing anything:
-
-```text
-$ bsh ext mock hello echo '{"text":"hi"}'
-{
-  "text": "hi"
-}
-```
-
-Now install it and look at what the host recorded:
-
-```text
-$ bsh ext install hello
-$ bsh ext info com.example.hello
-id:          com.example.hello
-version:     0.1.0
-runtime:     declarative
-trust:       local
-state:       active
-applied:     true
-tools:       hello__echo
-commands:    hello__refresh
-# … source, root, hash, signature, health, configured
-```
-
-Three things happened that are worth naming:
-
-1. **Validation** parsed the manifest, checked compatibility, required every
-   declared contribution to have a file, and computed the package hash.
-2. **Install** copied the tree into a hashed, immutable store
-   (`~/.bos/bsh/extensions/installed/com.example.hello/0.1.0/`).
-3. **Activation** checked the required capabilities and registered
-   `hello__echo` with the agent. `agent.tools.register` is low risk, so a local
-   package is allowed by default.
-
-The model sees `hello__echo`, not `echo`: tool names are a flat namespace shared
-with every other provider.
-
-**See also:** [The extension standard §1](bsh-extension-standard.md#1-what-an-extension-is),
-[hello example](../examples/extensions/hello).
-
----
-
-# 2. The package tree
-
-A package is a directory whose file names are contribution ids. Nothing is
-discovered by convention beyond the manifest:
-
-```text
-my-extension/
-  extension.toml            required
-  README.md                 recommended
-  LICENSE                   recommended
-  plugin.wasm               Extism entry
-  wasm/<name>.wasm          component entry
-  tools/<id>.json           one per declared tool
-  commands/<id>.md          one per declared command
-  prompts/<id>.md           one per declared prompt
-  contexts/<id>.md          one per declared context
-  languages/<id>.json       one per declared language service
-  integrations/<id>.json    one per declared integration
-  skills/<id>/SKILL.md      one per declared skill
-  panels/<id>.json          one per declared panel
-  workflows/<id>.json       one per declared workflow
-  themes/<id>.json          one per declared theme
-  providers/models/<id>.json   model provider descriptors
-  providers/agents/<id>.json   agent role descriptors
-  presets/<id>.json            agent/module presets
-  migrations/<name>.toml       data migrations
-  schemas/                     configuration schemas
-  assets/                      icons and images (`asset/…`)
-```
-
-The file name is the **full** contribution id. A tool `git.status` lives at
-`tools/git.status.json`, never `tools/status.json`. That is what keeps two tools
-with the same leaf name from colliding on disk.
-
-Two rules the host enforces before any code runs:
-
-```text
-declared but missing    -> validate/install fails; the package contributes nothing
-extra file not declared -> ignored by the contract (it is still hashed)
-symlink anywhere        -> refused; packages must be self-contained
-```
-
-The hash excludes `.git`, `.jj`, `target` and `node_modules`, and excludes
-`package.sig` (the signature covers the tree, so it cannot cover itself).
-
-**See also:** [Package layout §3](bsh-extension-standard.md#3-package-layout).
-
----
-
-# 3. The manifest
-
-The manifest is deliberately strict: unknown fields are rejected, because a
-misspelled mandatory field that disappears silently is how a package asks for
-nothing and receives nothing.
-
-A fully annotated manifest:
-
-```toml
-schema_version = "1.0"              # exactly this
-
-[extension]
-id = "com.example.git-assistant"    # reverse-domain, lowercase
-name = "Git Assistant"              # 1..=128 characters
-version = "1.2.0"                   # SemVer 1.0
-description = "Git tools for BSH"   # 1..=4096 bytes
-authors = ["Example Developer"]     # at most 32
-license = "MIT"
-repository = "https://example.com/git-assistant"
-
-[compatibility]
-bsh = ">=3.0.0, <4.0.0"             # checked against the host crate
-extension_api = "^1.0"              # checked against EXTENSION_API_VERSION
-# ui_api = "^1.0"                   # optional; a mismatch is a warning
-
-[runtime]
-kind = "process"                    # builtin | declarative | process |
-                                    # wasm-component | extism | mcp
-entry = "bin/server"                # process/wasm/extism/mcp only
-args = ["--stdio"]                  # process only
-startup = "on-demand"               # on-startup | on-demand |
-                                    # on-workspace-open | manual
-protocol = "jsonrpc-2.0"            # process only
-
+protocol = "jsonrpc-2.0"
 [runtime.env]
-LOG_LEVEL = "info"                  # PATH/LD_*/DYLD_*/PYTHONPATH/NODE_OPTIONS
-                                    # are refused at validation
+LOG_LEVEL = "info"
 
 [capabilities]
-required = ["process.execute", "agent.tools.register"]
-optional = ["workspace.write", "network.http"]
+required = ["agent.tools.register", "workspace.read"]
+optional = ["workspace.write"]
 
 [contributes]
 tools = ["git.status", "git.diff"]
 commands = ["git.refresh"]
-prompts = ["git.guide"]
-contexts = ["git.workspace"]
+panels = ["git.panel"]
+prompts = ["git.prompt"]
+contexts = ["git.context"]
 languages = ["git.rust"]
 integrations = ["git.github"]
 skills = ["git.helper"]
-panels = ["git.panel"]
 workflows = ["git.release"]
 themes = ["git.dark"]
-presets = ["git.reader"]
-model_providers = ["git.example"]
-agent_providers = ["git.reviewer"]
-events = ["workspace.opened", "tool.*"]   # trailing wildcard allowed
-publishes = ["git.changed"]               # no wildcard here
+events = ["workspace.opened", "tool.*"]
+publishes = ["git.changed"]
+hooks = ["model.request", "model.response"]
 
 [configuration]
-schema = "schemas/config.json"
-defaults = { strict = true }
+schema = "config.schema.json"
+defaults = { "remote" = "origin" }
 
 [resources]
-max_memory_mb = 128                 # 1..=4096, default 256
-max_execution_ms = 5000             # 1..=600000, default 30000
-max_concurrent_calls = 4            # 1..=64, default 4
-max_output_bytes = 1048576          # 1..=16777216, default 1048576
+max_memory_mb = 128
+max_execution_ms = 5000
+max_concurrent_calls = 4
+max_output_bytes = 1048576
 
 [dependencies]
-"com.example.base" = "^1.0"         # at most 64
+"com.example.base" = "^1.0"
 ```
 
-A request above a ceiling is an **error**, not a silent clamp. That is the point:
-a package that asks for 8 GiB should be told no, not quietly given 256 MiB.
+## 4.2 Top-level fields
 
-**See also:** [Manifest reference §4](bsh-extension-standard.md#4-manifest-reference),
-[manifest skeleton](#appendix-a-manifest-skeleton).
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `schema_version` | string | yes | exactly `"1.0"` |
+| `extension` | table | yes | identity |
+| `compatibility` | table | yes | BSH and API ranges |
+| `runtime` | table | yes | execution mode |
+| `capabilities` | table | no | required and optional requests |
+| `contributes` | table | no | declared surfaces |
+| `configuration` | table | no | JSON Schema + defaults |
+| `resources` | table | no | requested ceilings |
+| `dependencies` | table | no | id → version range, maximum 64 |
+
+## 4.3 Identity rules
+
+**Extension id**: at least two dot-separated segments, each starting with a
+lowercase letter, then lowercase letters, digits or `-`; 3–128 characters.
+`com.example.hello` is valid; `Hello`, `com..hello` and `com.example.hello_world`
+are not.
+
+**Contribution id**: one or more segments separated by dots, each starting with
+a lowercase letter or digit; letters, digits, `-` and `_`; at most 64
+characters. `git.status`, `screen-size` and `v2.tool` are valid.
+
+**Model-facing tool name**: `<last-id-segment>__<tool-id>`, with dots in the
+package segment replaced by underscores. The `hello` package's `echo` tool is
+`hello__echo`; the full id is still what the audit and policy see.
+
+**Name, description, authors**: name 1–128 characters; description 1–4096
+bytes; at most 32 authors.
+
+## 4.4 Compatibility
+
+```toml
+[compatibility]
+bsh = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+```
+
+`bsh` is the host application version. `extension_api` is the package-facing
+generation. A host outside the range refuses the package with an
+`Incompatible` error naming both the requirement and the host version.
+
+Do not widen a range to "make it install". The API generation changes when a
+manifest field or runtime contract changes incompatibly; a package that ignores
+that will fail later, in a way that is harder to explain.
+
+## 4.5 Runtime fields
+
+| Field | Applies to | Rule |
+|---|---|---|
+| `kind` | all | `builtin`, `declarative`, `process`, `wasm-component`, `extism`, `mcp` |
+| `entry` | process, wasm, extism, mcp | package-relative, no absolute path, no `..` |
+| `args` | process | argv after the entry; no shell expansion |
+| `startup` | all | `on-startup`, `on-demand`, `on-workspace-open`, `manual` |
+| `protocol` | process | `jsonrpc-2.0` |
+| `env` | process | extra environment; dangerous names are refused |
+
+Process `entry` may also be one of the allowlisted launchers: `python3`,
+`python`, `node`, `bun`, `deno`, `sh`, `bash`. A package-relative executable
+does not need a launcher.
+
+The host clears the environment and forwards only `PATH`, `HOME`, `TMPDIR`,
+`LANG` and `LC_ALL`, plus the manifest's own variables. It refuses to set
+`PATH`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, any `DYLD_*`, `PYTHONPATH` or
+`NODE_OPTIONS`. If your tool needs a secret, use the vault capability, not an
+environment variable baked into the manifest.
+
+## 4.6 Contributions
+
+`events` are subscription topics; a trailing `.*` is allowed. `publishes` are
+topics the package may emit; a wildcard is not allowed there. Topic segments are
+lowercase letters, digits, hyphen and underscore, separated by dots.
+
+`hooks` are observe hook points, not event topics. A package that declares one
+must also require `hooks.observe`, and this build delivers hooks only through
+the Extism runtime. The five points are `model.request`, `model.response`,
+`tool.before`, `tool.after` and `http.exchange`.
+
+Language and integration descriptors are validated at load: the referenced tool
+or command must be declared by the same package. Provider descriptors must name
+a model or role that the settings layer can select.
+
+## 4.7 Resources
+
+| Field | Range | Default | Enforced today |
+|---|---|---|---|
+| `max_memory_mb` | 1–4096 | 256 | wasm/Extism memory; process RLIMIT_AS |
+| `max_execution_ms` | 1–600000 | 30000 | per call |
+| `max_concurrent_calls` | 1–64 | 4 | declared; process serializes through one child |
+| `max_output_bytes` | 1–16777216 | 1048576 | tool result |
+
+A manifest asking above a ceiling is invalid rather than silently clamped. If
+you need more than the ceiling, the host must change; editing a number is not a
+workaround.
+
+## 4.8 Dependencies
+
+```toml
+[dependencies]
+"com.example.base" = "^1.0"
+```
+
+There is exactly one selected version per id in a resolution. A later range
+that excludes the selected version is a conflict; the host does not install two
+versions of one id, because they would share a storage namespace and a tool
+namespace. Resolution is depth-first, dependencies before dependents, highest
+matching version. Cycles and missing ids are named in the error. A disabled
+package is not a candidate, even as a dependency; the dependent then fails to
+resolve rather than running code the reader switched off.
+
+## 4.9 Validation lab
+
+Try each of these against a copy of `hello`:
+
+1. Rename `tools/echo.json` to `tools/echo2.json` without changing the manifest.
+   `validate` fails on the missing contribution file.
+2. Add `unknown = true` at the top level. The parser refuses the unknown field.
+3. Set `entry = "../server"` in a process manifest. The path containment check
+   refuses it.
+4. Set `kind = "builtin"` in a disk manifest. A package read from disk may not
+   claim the built-in runtime.
+5. Add `hooks = ["model.request"]` to a declarative package. Validation refuses
+   hooks for a runtime that cannot receive them.
+
+The exact message names the field path; read that path before reading the rest
+of the sentence.
+
+## 4.10 Manifest checklist
+
+- [ ] `schema_version` is exactly `1.0`.
+- [ ] id and every contribution id pass the grammar.
+- [ ] `bsh` and `extension_api` ranges include the host you test on.
+- [ ] runtime kind and entry agree; no absolute paths, no `..`.
+- [ ] every required capability is actually needed; every optional one is
+      checked per call.
+- [ ] every declared contribution file exists and validates.
+- [ ] hooks declare `hooks.observe` and use the Extism runtime.
+- [ ] resources are realistic, not copied from another package.
+- [ ] dependencies are pinned to a range you tested.
 
 ---
 
-# 4. Tools
+# 5. Tools
 
-A tool is a descriptor plus a body. The descriptor is what the model sees; the
-body is where it runs.
+A tool is the one surface the model can call. Everything else is context or
+UI. The descriptor is the contract: name, description, schema, capabilities and
+(for declarative tools) an implementation.
 
-## 4.1 The descriptor
+## 5.1 The descriptor
 
 ```json
 {
@@ -513,147 +705,347 @@ body is where it runs.
 }
 ```
 
-- `description` defaults to the package name and id;
-- `input_schema` defaults to an object with no properties;
-- `capabilities` are checked **per call**, in addition to activation;
-- `implementation` is required for declarative tools and ignored by process
-  tools.
+| Field | Required | Rule |
+|---|---|---|
+| `description` | no | 1–4096 bytes; defaults to package name and id |
+| `input_schema` | no | JSON object; defaults to an empty object schema |
+| `capabilities` | no | checked per call, in addition to activation |
+| `implementation` | declarative only | one of three variants |
 
-The per-tool capability list is the least-privilege seam: a package may register
-ten tools and let only one of them ask for `workspace.write`. The same check runs
-when the tool is called by the agent, by a panel action, by
-`bsh ext language-check`, or by an integration.
+Process, WASM, Extism and MCP packages ignore `implementation`; their tool list
+comes from the runtime.
 
-## 4.2 The three declarative bodies
+## 5.2 The three declarative bodies
 
-Echo:
-
-```json
-{"description":"Echo","implementation":{"kind":"echo_arguments"}}
-```
-
-Constant:
+**Echo arguments** returns the call's arguments unchanged:
 
 ```json
-{"description":"Version","implementation":{"kind":"constant","value":{"version":"1.2.0"}}}
+{ "implementation": { "kind": "echo_arguments" } }
 ```
 
-Template:
+**Constant** returns a fixed value:
+
+```json
+{ "implementation": { "kind": "constant", "value": { "ok": true } } }
+```
+
+**Template** renders top-level placeholders:
 
 ```json
 {
-  "description": "Greet one person",
-  "input_schema": {
-    "type": "object",
-    "properties": {"name": {"type":"string"}}
-  },
   "implementation": {
     "kind": "template",
-    "text": "Hello {{name}}, from {{package}}"
+    "text": "path={{path}} depth={{depth}}"
   }
 }
 ```
 
-Placeholders read **top-level** argument names. A string renders as its text, any
-other JSON value renders as compact JSON, and a missing argument renders as
-empty. Output is capped by `max_output_bytes`.
+A string argument renders as text; any other JSON value renders as compact
+JSON; a missing argument renders as empty. Templates are not a programming
+language: no conditionals, no loops, no nested paths.
 
-## 4.3 Calling a tool
+## 5.3 Per-call capabilities
 
-From the CLI, through a permissive mock host:
+The descriptor's `capabilities` are the least-privilege seam. A package may
+register ten tools but only one of them may ask for `workspace.write`:
 
-```text
-bsh ext mock examples/extensions/hello echo '{"text":"hi"}'
+```json
+{
+  "description": "Write one file.",
+  "input_schema": {
+    "type": "object",
+    "properties": { "path": { "type": "string" }, "text": { "type": "string" } },
+    "required": ["path", "text"]
+  },
+  "capabilities": ["workspace.write"]
+}
 ```
 
-From the agent, through the model-facing name:
+At call time the host:
 
-```text
-hello__echo
+1. resolves the scope from the arguments (`path`, `url`, `secret`);
+2. asks policy for each capability in the descriptor;
+3. writes one audit record per decision;
+4. only then calls the runtime.
+
+A call that lacks the capability is denied before the runtime sees it. That is
+why a tool that "works in mock" can still fail with a denial: mock does not
+consult policy.
+
+## 5.4 Naming
+
+The runtime sees the declared id (`git.status`). The model sees
+`git-assistant__git.status` (dots in the package segment become underscores).
+The audit records the full extension id, the capability and the call scope, not
+the model-facing alias.
+
+If you rename a tool, you break prompts and saved trajectories that mention the
+old name. Treat the id as public API.
+
+## 5.5 Result shape
+
+A tool returns content blocks, an optional structured value and an error flag:
+
+```json
+{
+  "content": [{ "type": "text", "text": "clean" }],
+  "structuredContent": { "clean": true },
+  "isError": false
+}
 ```
 
-From a panel, with an action id equal to the tool id (chapter 13).
+Helpers normalize a bare JSON value into one text block. An application-level
+failure should set `isError: true` and explain what the caller can do; a
+transport failure (process exit, WASM trap, MCP EOF) is a host error and may
+close the session.
 
-## 4.4 Errors a tool can return
+## 5.6 Lab: build three tools
 
-```text
-not found            the id is not declared by this package
-permission denied    a declared capability is not granted (audited)
-timeout              the call exceeded min(caller, max_execution_ms)
-limit                the result exceeded max_output_bytes
-runtime/protocol     the guest or transport failed
+In a copy of `hello`, add:
+
+```json
+// tools/echo.json
+{
+  "description": "Echo the arguments",
+  "input_schema": {"type": "object"},
+  "implementation": {"kind": "echo_arguments"}
+}
 ```
 
-A denied call is a tool error the model can read, not a panic and not a silent
-no-op.
+```json
+// tools/version.json
+{
+  "description": "Return the package version",
+  "implementation": {"kind": "constant", "value": {"version": "1.0.0"}}
+}
+```
 
-**See also:** [Tool descriptors §5](bsh-extension-standard.md#5-tool-descriptors).
+```json
+// tools/read.json
+{
+  "description": "Read a path (declarative tools cannot actually read; this demonstrates the declaration)",
+  "input_schema": {
+    "type": "object",
+    "properties": {"path": {"type": "string"}},
+    "required": ["path"]
+  },
+  "capabilities": ["workspace.read"],
+  "implementation": {"kind": "template", "text": "would read {{path}}"}
+}
+```
+
+Declare them and run:
+
+```bash
+$BSH ext validate /tmp/hello-lab
+$BSH ext mock /tmp/hello-lab echo '{"text":"hi"}'
+$BSH ext mock /tmp/hello-lab version '{}'
+$BSH ext mock /tmp/hello-lab read '{"path":"src/main.rs"}'
+```
+
+The third tool demonstrates an important limit: the declarative runtime has no
+filesystem access. `workspace.read` is declared and authorized, but the
+implementation only renders the path. Declarative tools are for pure data, not
+for side effects.
+
+## 5.7 Schema advice
+
+- Name the argument `path` if it is a filesystem path, `url` if it is a URL,
+  `secret` if it is a secret name. Scope extraction is name-based.
+- Put `additionalProperties: false` on input schemas unless you deliberately
+  accept future fields.
+- Keep descriptions short and verb-first. The model sees them, not your README.
+- Do not put secrets in defaults; schema defaults are visible in the manifest
+  listing.
 
 ---
 
-# 5. Commands
+# 6. Commands, prompts, contexts and skills
 
-A command is a Markdown template the composer inserts. It runs as prompt text,
-not as code — unless the runtime implements `commands/execute` and the command is
-dispatched by the host (panel actions, integrations, the CLI).
+These are the "soft" surfaces: they shape what the model knows and what the
+reader can invoke, without adding a callable tool.
+
+## 6.1 Commands
+
+A command is a Markdown file with YAML frontmatter:
 
 ```markdown
 ---
-description: Greet the reader
+description: Greet the reader and name the extension
 ---
+
 Say hello from com.example.hello and name the open workspace.
 ```
 
-The file is `commands/greet.md` and the declaration is `commands = ["greet"]`.
-The composer shows the command as `hello__greet`, with the package name in the
-description.
+The host registers the command under the package's namespace. Running it
+inserts the body into the conversation; it does not execute code. A command is
+useful when the prompt is long, reusable, and should be discoverable by name.
 
-Command ids follow the same rules as tool ids, and registering the same id as a
-tool and a command is a validation error.
+Rules:
 
-**See also:** [Contributions §4.5](bsh-extension-standard.md#45-contributions).
+- `description` is required and is what the UI shows;
+- the body is inserted verbatim;
+- a command id is a contribution id (`greet`, `git.refresh`);
+- a command may be referenced by a panel action, but a panel action can also
+  call a command implemented by the runtime.
 
----
+## 6.2 Prompts
 
-# 6. Prompts and contexts
-
-Prompts are always appended to the system prompt. Contexts are appended only
-when their workspace globs match.
-
-## 6.1 A prompt
+A prompt is a Markdown fragment contributed to the agent's instruction set:
 
 ```markdown
 ---
-description: House style
+description: Hello prompt fragment
 ---
-Prefer short answers. Quote file paths as `path:line`.
+
+When the reader asks what this extension does, say that it is the BSH hello
+example: an echo tool, a greet command and a status panel.
 ```
 
-## 6.2 A scoped context
+Prompts are not user-invoked. The host appends the fragments whose package is
+applied, in a stable order. Keep them short and factual: every turn pays for
+them.
+
+## 6.3 Contexts
+
+A context is scoped text with optional path globs:
 
 ```markdown
 ---
-description: Rust workspace facts
-paths: src/**/*.rs, tests/**/*.rs
+description: All-in-one demo scoped workspace context
+paths: crates/**/*.rs, src/**/*.rs
 ---
-This workspace is a Rust project. Integration tests live under `tests/`.
+
+This workspace contains Rust crates. The all-in-one extension can answer
+questions about the extension framework: its `describe` tool reports the
+package identity and the `events` tool reports the host topics it observed.
 ```
 
-- an empty or absent `paths:` is unscoped and always matches;
-- a scoped context with no open workspace never matches;
-- each contribution adds at most 8 KiB, and all extensions together add at most
-  64 KiB to one build.
+The `paths` glob is a hint for when the context applies. A context without
+`paths` is scoped to the workspace as a whole. Contexts are selected by the
+host's context builder, not by the model.
 
-**See also:** [Context scope](bsh-extension-standard.md#45-contributions).
+## 6.4 Skills
+
+A skill is a directory with a `SKILL.md`:
+
+```text
+skills/
+  helper/
+    SKILL.md
+    references/
+      schema.md
+```
+
+The frontmatter is the catalogue entry; the body is loaded only when the model
+asks for the skill:
+
+```markdown
+---
+name: helper
+description: Walk the reader through the BSH extension framework
+version: 1.0.0
+---
+
+# Helper
+
+Use this skill when the reader wants a guided tour.
+
+1. Call `describe` to show the package identity.
+2. Call `events` to show which host topics have reached the process.
+```
+
+The catalogue (name and description) is always in the prompt; the body is
+loaded by `load_skill` on demand. That is the point of skills: many
+capabilities, little prompt cost.
+
+Rules:
+
+- `name` and `description` are required; the directory name must equal `name`;
+- a skill may include extra files, but they are inert until the model reads
+  them through the skill tool;
+- skills are agent-facing, not UI-facing.
+
+## 6.5 How the surfaces enter a turn
+
+```mermaid
+flowchart TD
+  M["Applied packages"] --> T["Tools: descriptors"]
+  M --> P["Prompts: fragments"]
+  M --> C["Contexts: scoped text"]
+  M --> S["Skills: catalogue"]
+  T --> A["Agent turn"]
+  P --> A
+  C --> A
+  S --> A
+  A -->|load_skill| SB["Skill body"]
+  SB --> A
+```
+
+Only applied packages contribute. A package can be installed, active, and still
+not applied because a required capability was denied. In that case none of its
+prompts, contexts or skills are in the turn — the host does not partially apply
+a package.
+
+## 6.6 Lab: a command and a skill
+
+1. Copy `hello` to `/tmp/hello-cmd`.
+2. Add `commands/explain.md` and declare `commands = ["greet", "explain"]`.
+3. Add `skills/tour/SKILL.md` and declare `skills = ["tour"]`.
+4. `bsh ext validate /tmp/hello-cmd`, then `bsh ext test /tmp/hello-cmd`.
+5. Install and grant. Ask the agent to "explain the hello extension"; the
+   command should be available, and the skill catalogue should name `tour`.
+
+If the command does not appear, check `bsh ext info` first: `APPLIED` is the
+only field that decides whether the turn can see it.
 
 ---
 
-# 7. Capabilities and grants
+# 7. Capabilities, grants and audit
 
-A capability in the manifest is a **request**. The host decides whether to grant
-it, and it records every decision.
+Capabilities are requests, never grants. The manifest asks; policy decides; the
+audit records. This chapter is the one to reread before shipping.
 
-## 7.1 Declaring
+## 7.1 The vocabulary
+
+There are twenty capabilities in this build:
+
+| Capability | Risk | What it allows |
+|---|---|---|
+| `workspace.read` | low | read inside the workspace |
+| `workspace.write` | high | create, write or remove inside the workspace |
+| `network.http` | high | outbound HTTP |
+| `process.execute` | critical | start a child process |
+| `computer.use` | critical | screen, keyboard, pointer |
+| `secrets.read` | critical | read a named vault secret |
+| `extension.storage` | low | the package's private storage |
+| `agent.tools.register` | low | register tools |
+| `agent.context.provide` | low | supply scoped context |
+| `agent.prompts.provide` | low | supply prompt fragments |
+| `agent.skills.provide` | medium | supply SKILL.md skills |
+| `agent.models.provide` | medium | register model providers |
+| `agent.agents.provide` | medium | register agent roles |
+| `agent.workflows.provide` | medium | register workflows |
+| `events.publish` | low | publish host events |
+| `events.subscribe` | low | subscribe to host events |
+| `hooks.observe` | high | receive observe-hook batches |
+| `ui.panels` | low | contribute panels |
+| `ui.commands` | low | contribute commands |
+| `ui.theme` | low | contribute themes |
+
+The risk bucket decides the default policy:
+
+| Trust | low | medium | high | critical |
+|---|---|---|---|---|
+| builtin | allow | allow | allow | allow |
+| verified | allow | allow | explicit grant | explicit grant |
+| community / local | allow | explicit grant | explicit grant | explicit grant |
+
+A package read from disk defaults to `local`. There is no publisher
+verification path in this build; "verified" is a recorded level, not something
+the host can prove.
+
+## 7.2 Required versus optional
 
 ```toml
 [capabilities]
@@ -661,115 +1053,372 @@ required = ["agent.tools.register", "workspace.read"]
 optional = ["workspace.write", "network.http"]
 ```
 
-Required capabilities are checked at activation; optional ones are checked when
-a call asks for them (that is what a tool descriptor's `capabilities` list is).
+- **Required** is checked at activation. If denied, the package is not applied
+  and its tools, prompts, contexts, skills, providers and hooks are absent.
+- **Optional** is not checked at activation. It is checked when a call asks for
+  it, using the tool descriptor's `capabilities`.
 
-## 7.2 Defaults by trust
-
-| Capability | Risk | Built-in | Verified | Community / local |
-|---|---|---|---|---|
-| workspace.read | low | allow | allow | allow, scoped to the workspace |
-| extension.storage | low | allow | allow | allow |
-| agent.tools.register | low | allow | allow | allow |
-| agent.context.provide | low | allow | allow | allow |
-| agent.prompts.provide | low | allow | allow | allow |
-| agent.skills.provide | medium | allow | allow | allow |
-| events.publish / subscribe | low | allow | allow | allow |
-| ui.panels / commands / theme | low | allow | allow | allow |
-| agent.models.provide | medium | allow | allow | explicit grant |
-| agent.agents.provide | medium | allow | allow | explicit grant |
-| agent.workflows.provide | medium | allow | allow | explicit grant |
-| workspace.write | high | allow | explicit grant | explicit grant |
-| network.http | high | allow | explicit grant | explicit grant |
-| process.execute | critical | allow | explicit grant | explicit grant |
-| computer.use | critical | allow | explicit grant | explicit grant |
-| secrets.read | critical | allow | explicit grant | explicit grant |
-
-A package read from disk starts at `local`. A valid publisher signature raises it
-to `verified`; a Git/market install starts at `community`.
+A capability in neither list is denied on any call. Declaring an optional
+capability the package never uses is harmless but misleading; declaring a
+required capability it never uses is a support burden.
 
 ## 7.3 Grants and scopes
 
-```text
-bsh ext grant <id> <capability> [--scope <scope>] [--note <text>]
+Grants live in `extension-state/grants.toml`:
+
+```toml
+[grants."com.example.git-assistant"."workspace.write"]
+scope = "workspace"
+granted_at = 1790000000
+note = "needed for the fix command"
 ```
+
+Scopes:
 
 | Scope | Covers |
 |---|---|
 | `any` | every call |
 | `workspace` | a call with an open workspace |
-| `path:/prefix` | a call whose path (or workspace) starts with the prefix |
+| `path:/prefix` | a path or workspace starting with the prefix |
 | `domain:example.com` | that host and its subdomains |
-| `domain:example.com:POST` | that host, only for the named HTTP method |
+| `domain:example.com:POST` | that host, only for the named method |
 | `program:python3` | that declared executable |
 | `program:python3:--version` | that executable with exactly those arguments |
 | `secret:NAME` | that one named secret |
 
-Examples:
+A grant scoped to one path does not cover another. A call that does not match
+its scope is denied with the scope in the reason, not silently widened.
 
-```text
-bsh ext grant com.example.tool workspace.write --scope workspace
-bsh ext grant com.example.tool network.http --scope domain:api.example.com
-bsh ext grant com.example.tool secrets.read --scope secret:GITHUB_TOKEN
-bsh ext grant com.example.process-echo process.execute --scope program:python3
-bsh ext grant com.example.process-echo process.execute --scope program:python3:--version
+Grant and revoke:
+
+```bash
+$BSH ext grant com.example.git-assistant workspace.write --scope path:/tmp/repo
+$BSH ext grant com.example.git-assistant network.http --scope domain:api.github.com:GET
+$BSH ext grant com.example.git-assistant secrets.read --scope secret:GITHUB_TOKEN
+$BSH ext revoke com.example.git-assistant workspace.write
 ```
-
-Scopes are matched after **normalizing** the path, so `../outside` cannot escape a
-`path:` grant. They are matched exactly on secret names, and on the dot boundary
-for domains, so `domain:example.com` does not match `evil-example.com`.
 
 ## 7.4 What a denial looks like
 
+At activation:
+
 ```text
-extension com.example.tool is not authorized for workspace.write:
-workspace.write requires an explicit grant for a local extension
-(run 'bsh ext grant com.example.tool workspace.write')
+extension com.example.git-assistant requires capability workspace.write,
+which policy denied: no grant and the default for trust local is deny
 ```
 
-Two different denials:
+At call time:
 
-- **no grant** — "requires an explicit grant"; run the command it prints;
-- **wrong scope** — "grant is scoped to …, which does not cover this call";
-  widen deliberately or name `path`/`url`/`secret` exactly.
+```text
+extension com.example.git-assistant is not authorized for workspace.write:
+grant scope path:/tmp/repo does not cover /tmp/other/file.rs
+```
 
-The Extensions pane has a **Grant** button for denied required capabilities. It
-writes the narrowest scope it can infer (workspace for path capabilities, the
-declared program for process) and it **refuses** to auto-grant `secrets.read` or
-`network.http`, because a scope-free grant would be wider than `secret:NAME` and
-`domain:host`. Those two keep their denial text with the exact command.
+Both are ordinary errors, not panics. The UI shows the denial with a **Grant**
+action for a denied required capability; the CLI path is `ext grant`.
 
-## 7.5 Audit
+## 7.5 Per-call scope extraction
 
-Every evaluation is one JSON line in `logs/extensions/audit.jsonl`:
+The host derives the scope from the arguments before authorization:
+
+- `path`: the argument named `path`, resolved against the workspace when
+  relative;
+- `domain`: the host of an argument named `url`;
+- `secret`: an argument named `secret`.
+
+This is why the argument names in chapter 5 matter. A tool that reads
+`file` instead of `path` will never match a path-scoped grant. Rename the
+argument; do not widen the grant.
+
+## 7.6 Audit
+
+Every decision is appended to `logs/extensions/audit.jsonl`, one JSON object
+per line:
 
 ```json
-{"timestamp":1790000000,"extension":"com.example.tool","capability":"workspace.write","allowed":false,"scope":null,"trust":"local","reason":"…"}
+{"timestamp":1790000000,"extension":"com.example.hello","capability":"agent.tools.register","allowed":true,"scope":"any","trust":"community","reason":""}
 ```
 
-The log rotates at 1 MiB to `audit.jsonl.1`. Secret values are never written.
+The log rotates at 1 MiB to `audit.jsonl.1`. Secret values are never logged.
+When a support report says "it worked yesterday", the audit is the first file to
+read: it shows which grant changed, not just which call failed.
 
-**See also:** [Capability model §6](bsh-extension-standard.md#6-capability-model).
+## 7.7 The hooks capability
+
+`hooks.observe` is high risk because a hook payload can contain prompts,
+tool arguments and results, and HTTP metadata. Two rules follow:
+
+1. A package that declares `contributes.hooks` must list `hooks.observe` in
+   `required`, so activation cannot silently proceed without the grant.
+2. The grant is still explicit for verified/community/local; a hook observer is
+   never installed "because it was in the manifest".
+
+The payload is redacted and bounded by the host (chapter 24), but redaction is
+not a substitute for a grant: a tool result can contain business data that no
+pattern will catch.
+
+## 7.8 Least-privilege recipe
+
+1. Give every tool the smallest capability set that makes it work.
+2. Prefer `optional` for capabilities used by one tool.
+3. Use the narrowest scope that still works: a path prefix, a domain + method,
+   a named secret.
+4. Do not ask for `process.execute` to run a script the host could run itself.
+5. Do not ask for `workspace.write` to write a cache; use storage.
+6. Re-run `bsh ext doctor` after changing grants; a denied required capability
+   makes the package unapplied, not unhealthy.
+
+## 7.9 Lab: observe a denial
+
+```bash
+cp -R examples/extensions/hello /tmp/hello-denied
+# add a tool that asks for workspace.write
+# tools/write.json
+# {"description":"write","capabilities":["workspace.write"],
+#  "input_schema":{"type":"object","properties":{"path":{"type":"string"},"text":{"type":"string"}}}}
+# declare tools = ["echo", "write"]
+$BSH --root /tmp/bsh-denied ext install /tmp/hello-denied
+$BSH --root /tmp/bsh-denied ext grant com.example.hello agent.tools.register --scope any
+$BSH --root /tmp/bsh-denied ext mock /tmp/hello-denied write '{"path":"a.txt","text":"x"}'
+```
+
+`mock` succeeds because the mock host is permissive. That is the lesson: mock
+tests the descriptor, not the policy. Install the package and call the tool
+through the agent (or a host test) to see the denial and the audit entry.
 
 ---
 
-# 8. The process runtime
+# 8. Events
 
-Use the process runtime when the work already exists as a program: Python, Node,
-a CLI, a service that speaks newline-delimited JSON-RPC.
+An event is a fact published after it happened. Anyone with the topic may
+subscribe; the publisher never blocks; a full queue drops and counts.
 
-## 8.1 The package
+## 8.1 The envelope
+
+```json
+{
+  "id": "uuid",
+  "source": "com.example.package",
+  "event_type": "tool.completed",
+  "schema_version": "1.0",
+  "timestamp": 1790000000000,
+  "correlation_id": "turn-1",
+  "payload": {}
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `id` | unique event id |
+| `source` | extension id, or a host source |
+| `event_type` | the topic |
+| `schema_version` | payload schema generation |
+| `timestamp` | Unix epoch milliseconds |
+| `correlation_id` | the turn or call this belongs to, when known |
+| `payload` | JSON object |
+
+## 8.2 Reserved topics
+
+`app.started`, `app.shutdown`, `workspace.opened`, `workspace.closed`,
+`workspace.changed`, `agent.started`, `agent.completed`, `agent.failed`,
+`model.requested`, `model.completed`, `config.changed`, `tool.invoked`,
+`tool.completed`, `tool.failed`, `extension.loaded`, `extension.unloaded`,
+`extension.failed`, `session.created`, `session.updated`, `session.deleted`,
+`trajectory.recorded`, `skill.loaded`, `instruction.build`,
+`network.request`, `mcp.connected`, `audio.captured`, `ui.action`.
+
+Topics are exact, or a trailing namespace wildcard in a subscription:
+`tool.*` matches `tool.completed` but not `tool`. A publisher cannot use a
+wildcard.
+
+## 8.3 Subscribe and publish
+
+A package declares:
+
+```toml
+[capabilities]
+required = ["events.subscribe", "events.publish"]
+
+[contributes]
+events = ["workspace.changed", "tool.*"]
+publishes = ["git.changed"]
+```
+
+Subscription mechanism differs by transport:
+
+- process: the host subscribes from `contributes.events` at activation; the
+  child receives notifications and does not send a subscribe request;
+- MCP: the host subscribes from `contributes.events` and delivers once the
+  server is running;
+- WASM: the guest calls the host `subscribe(topic)` function; the topic must be
+  declared in `contributes.events`;
+- Extism: the guest calls `bsh_host` op `subscribe`; the topic must be declared.
+
+Delivery:
+
+- process receives an `events/event` JSON-RPC notification;
+- WASM receives `on-event`;
+- Extism receives `bsh_event`;
+- MCP receives `bsh/events/event`.
+
+## 8.4 Quotas
+
+| Bound | Value |
+|---|---|
+| subscriber queue | default 64, max 4096 |
+| event size | 256 KiB |
+| publish rate | 200/s per source |
+| overflow | drop + counter, never block |
+
+A slow subscriber does not slow the publisher. If your package needs every
+event, it must drain its queue; if it cannot, it should subscribe to less.
+
+## 8.5 UI actions are events too
+
+When a panel button dispatches an action, the host routes it to the owning
+runtime and publishes `ui.action` with the extension, panel, action and the
+revision the view was rendered from. An action whose revision does not match
+the current panel revision is refused — a stale button cannot act on a new view.
+
+## 8.6 Events versus hooks
+
+Use an event when the fact is public and lossy is acceptable. Use a hook when
+the package needs the seam payload and has declared that point. Do not emulate
+hooks with events: by the time an event exists, an intercept decision is
+already too late (and intercept is not implemented anyway).
+
+## 8.7 Lab: watch a topic
+
+1. Copy `hook-demo` or `allinone`; it already subscribes to host topics.
+2. Install and grant it.
+3. Open a workspace, run one agent turn, then call its `hook-log`/`events` tool.
+4. Compare the topics it saw with `model.requested`/`model.completed` in the
+   shell log. They are after-the-fact facts, not the model hook payload.
+
+---
+
+# 9. Lifecycle and status
+
+## 9.1 State machine
+
+```text
+Discovered -> Validating -> Resolved -> Installing -> Installed
+Installed -> Loading -> Starting -> Active
+Active -> Suspending -> Suspended -> Starting
+Active -> Stopping -> Unloaded
+any non-Unloaded -> Failed
+Failed -> Loading (retry)
+Unloaded -> Loading (reinstall)
+```
+
+A transition the table does not define is an error, not a silent rewrite.
+Failure is always legal: the point is to stop a broken package.
+
+## 9.2 What each state means for you
+
+| State | Meaning | Typical action |
+|---|---|---|
+| `discovered` | seen on disk, not validated | run `validate` |
+| `validating` | manifest and contributions being checked | wait; read errors |
+| `resolved` | dependencies selected | check the lockfile if surprising |
+| `installing` | staged copy, hash, signature | wait; do not edit the source |
+| `installed` | package bytes in the store | enable/activate |
+| `loading` | runtime being built | watch logs if it hangs |
+| `starting` | handshake / guest start | startup timeout is 10s |
+| `active` | authorized and loaded | normal |
+| `suspended` | paused by the host | resume or leave it |
+| `failed` | last error recorded | `ext info`, fix, `ext retry` |
+| `unloaded` | stopped or disabled | reinstall/enable |
+
+## 9.3 Enabled, active, applied, configured
+
+Four words that are not synonyms:
+
+- **enabled** — the reader's switch in `state.toml`;
+- **active** — lifecycle reached `Active` (authorized and loaded);
+- **applied** — contributions are installed in the running agent for this build;
+- **configured** — the package's configuration schema validated and defaults
+  applied.
+
+A package is often `active` but `applied=no` because a required capability was
+denied, it is `manual`, or a dependency failed. `bsh ext info` prints all four
+so you do not have to guess.
+
+## 9.4 Startup policies
+
+| Policy | When it is applied |
+|---|---|
+| `on-startup` | warmed right after the host loads it, detached |
+| `on-demand` | descriptors registered; runtime starts on first call |
+| `on-workspace-open` | applied when a workspace opens |
+| `manual` | never automatically; the reader starts it |
+
+`on-startup` does not block the build: the warm-up runs on a detached thread.
+A process handshake has a 10-second deadline; a package that misses it fails
+with a startup error.
+
+## 9.5 Failure, retry, quarantine
+
+- A failure records the last error and state in `state.toml`.
+- `bsh ext retry <id>` clears the persisted failure and reloads.
+- `bsh ext quarantine <id> --reason ...` moves the code out of the installed
+  tree and disables it. Quarantine is for a package you do not trust enough to
+  run again; it is not "disable".
+- `bsh ext rollback <id>` activates the previous installed version, if any.
+
+## 9.6 Lab: read a failure correctly
+
+```bash
+$BSH --root /tmp/bsh-fail ext install examples/extensions/process-echo
+$BSH --root /tmp/bsh-fail ext revoke com.example.process-echo process.execute
+$BSH --root /tmp/bsh-fail ext info com.example.process-echo
+```
+
+The state is likely `failed` and `APPLIED=no`; the reason names
+`process.execute`. Grant it, then `ext retry` if the failure was persisted. The
+important habit: fix the cause, then retry; do not reinstall first.
+
+## 9.7 Lifecycle checklist
+
+- [ ] the package is enabled and its required grants are present;
+- [ ] `state` is `active` and `applied` is `yes`;
+- [ ] if `on-startup`, the handshake completes within 10s;
+- [ ] `configured` is true, or the configuration error is understood;
+- [ ] a failure has a readable `last_error`, not just "failed".
+
+---
+
+
+# 10. The process runtime
+
+Use a process when the tool already exists as a Python, Node, shell or compiled
+program, or when the logic is too large for a declarative implementation. The
+cost is a real child process: the host can bound it, but it can also do things
+the declarative runtime cannot.
+
+## 10.1 Package
+
+```text
+process-echo/
+  extension.toml
+  server.py
+  tools/echo.json
+```
 
 ```toml
 [extension]
 id = "com.example.process-echo"
 name = "Process Echo"
 version = "1.0.0"
-description = "An echo tool served by Python"
+description = "A minimal JSON-RPC process extension"
+
+[compatibility]
+bsh = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
 
 [runtime]
 kind = "process"
-entry = "python3"              # allowlisted launcher, or a package-relative file
+entry = "python3"
 args = ["server.py"]
 protocol = "jsonrpc-2.0"
 startup = "on-demand"
@@ -779,275 +1428,423 @@ required = ["process.execute", "agent.tools.register"]
 
 [contributes]
 tools = ["echo"]
-commands = ["refresh"]
-events = ["session.created", "tool.completed"]
 ```
 
-The launcher allowlist is exactly `python3`, `python`, `node`, `bun`, `deno`, `sh`,
-`bash`. Anything else must be a package-relative executable, and it may not be
-absolute or contain `..`.
+```json
+// tools/echo.json
+{
+  "description": "Echo the arguments through the child process",
+  "input_schema": {"type": "object"}
+}
+```
 
-## 8.2 The server
+The descriptor is still host-side: the process does not list its tools. The
+manifest and `tools/*.json` define the surface; the child only answers calls.
+That keeps the policy decision before any child code runs.
 
-One JSON object per line on stdin/stdout. This is a complete echo server:
+## 10.2 A complete server
 
 ```python
+#!/usr/bin/env python3
+"""A minimal BSH process extension.
+
+One JSON object per line on stdin, one per line on stdout. The host sends
+initialize, tools/call and shutdown; anything else may return an empty result.
+"""
 import json
-import os
 import sys
 
-TOKEN = os.environ.get("BSH_IPC_TOKEN", "")
 
-def send(message):
-    print(json.dumps(message), flush=True)
-
-def main():
+def main() -> None:
     for line in sys.stdin:
-        request = json.loads(line)
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            request = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
         method = request.get("method")
-        params = request.get("params") or {}
         request_id = request.get("id")
+        params = request.get("params") or {}
 
         if method == "initialize":
-            # Echo the nonce. A mismatch kills the child and refuses the package.
-            result = {"protocolVersion": "1.0", "token": params.get("token")}
+            # The token is the host's per-session nonce. Echo it or the host
+            # kills the child and refuses the package.
+            result = {
+                "protocolVersion": "1.0",
+                "token": params.get("token"),
+            }
         elif method == "tools/call":
-            # Optional live progress; the host forwards it to the agent.
-            send({"jsonrpc": "2.0", "method": "$/progress",
-                  "params": {"progress": 1, "total": 2}})
-            result = params.get("arguments", {})
-        elif method == "commands/execute":
-            result = {"id": params.get("name"), "arguments": params.get("arguments", {})}
-        elif method == "events/event":
-            continue                     # notification: no response
+            arguments = params.get("arguments") or {}
+            # Optional progress notification before the result.
+            print(json.dumps({
+                "jsonrpc": "2.0",
+                "method": "$/progress",
+                "params": {"message": "working", "progress": 1, "total": 2},
+            }), flush=True)
+            result = arguments
         elif method == "shutdown":
             result = {}
         else:
             result = {}
 
-        send({"jsonrpc": "2.0", "id": request_id, "result": result})
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": result,
+        }), flush=True)
+
 
 if __name__ == "__main__":
     main()
 ```
 
-The host sends:
+The handshake is mandatory:
+
+1. host sends `initialize` with `protocolVersion`, `extensionId`, `host` and
+   `token`;
+2. server answers with a `protocolVersion` starting `1.` and the same token;
+3. the host exports the token as `BSH_IPC_TOKEN` for launchers that cannot parse
+   stdin.
+
+A missing or mismatched token is a hard refusal. It prevents a child that
+inherited the pipe from answering a different host.
+
+## 10.3 Errors
+
+An application-level error uses the JSON-RPC error object:
 
 ```json
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1.0","extensionId":"com.example.process-echo","host":{"name":"bsh","version":"3.0.2"},"token":"<nonce>"}}
+{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"not a git repository"}}
 ```
 
-and expects the same nonce back. `protocolVersion` must start with `1.`.
+That becomes a tool error and leaves the session usable. A transport failure —
+stdout EOF, a timeout, an unparseable line — kills the session; the next call
+starts a fresh child rather than reading a stale response.
 
-## 8.3 Calls, errors and events
+Rules:
 
-```json
-{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"echo","arguments":{"x":1},"correlationId":"…"}}
+- responses with an unknown id are skipped as late answers;
+- a process that closes stdout before answering fails the call;
+- a timed-out call kills the child;
+- stderr is diagnostic only and is logged under the extension id.
+
+## 10.4 Limits
+
+| Bound | Value |
+|---|---|
+| one line | 4 MiB |
+| one result | `max_output_bytes` |
+| one call | min(caller deadline, `max_execution_ms`) |
+| handshake | 10s |
+| concurrency | one child, calls serialized |
+
+`max_concurrent_calls` is a declared allowance, not a promise that one child is
+parallel. A pooled transport is future work.
+
+## 10.5 Test it
+
+```bash
+$BSH ext validate examples/extensions/process-echo
+$BSH ext mock examples/extensions/process-echo echo '{"text":"hi"}'
 ```
 
-A normal result is the tool's JSON value. An error object is an
-application-level answer: the session stays alive. Only a transport failure
-(stdout closed, timeout, malformed line) kills the session, and the next call
-starts a fresh child.
+`mock` runs the real child with a permissive host. It proves the handshake and
+the call shape, not capability policy. For policy, install and call through the
+agent or a host test.
 
-Events arrive as notifications:
+The runtime test suite is the reference:
 
-```json
-{"jsonrpc":"2.0","method":"events/event","params":{"event_type":"session.created","payload":{}}}
+```bash
+cargo test -p bsh --lib -- extension::runtime::process
 ```
 
-## 8.4 What the host enforces
+It covers handshake refusal, a timed-out call, progress notifications, output
+caps and concurrent calls sharing one child.
 
-```text
-handshake        10 s, token must match
-one line         4 MiB
-one result       max_output_bytes
-one call         min(caller deadline, max_execution_ms)
-concurrency      one child; calls are serialized
-environment      cleared; only PATH, HOME, TMPDIR, LANG, LC_ALL + manifest vars
-working dir      the package root
-cancel           the child is killed; the next call respawns
-shutdown         a 1 s request, then kill
-stderr           logged with the extension id
-```
+## 10.6 What the host enforces
 
-On macOS the child runs under a filesystem profile that allows writes only in
-the package, the open workspace, the data namespace and temp; Linux uses the
-bubblewrap plan. The profile is a filesystem boundary, not a network one.
+- environment cleared, then only the allowlist and manifest vars;
+- working directory is the package root;
+- executable must be package-relative or an allowlisted launcher;
+- `process.execute` grant required, optionally scoped to program/args;
+- process group and RLIMIT ceilings;
+- macOS write sandbox profile; Linux bubblewrap plan (not exercised in the
+  macOS test environment);
+- stdout/stderr captured and bounded.
 
-## 8.5 Grants and a first call
+## 10.7 Process checklist
 
-```text
-bsh ext install examples/extensions/process-echo
-bsh ext grant com.example.process-echo process.execute --scope program:python3
-bsh ext grant com.example.process-echo agent.tools.register --scope any
-bsh ext info com.example.process-echo
-bsh ext mock examples/extensions/process-echo echo '{"x":1}'
-```
-
-A `program:` scope must match the manifest entry exactly. A narrower
-`program:python3:arg` grant is also supported and must match the declared
-argument vector.
-
-**See also:** [Process protocol §8](bsh-extension-standard.md#8-process-protocol),
-[process-echo example](../examples/extensions/process-echo).
+- [ ] initialize echoes the token and protocol version;
+- [ ] every response has the request id, one line, valid JSON;
+- [ ] shutdown answers within 1s;
+- [ ] progress notifications are optional and non-blocking;
+- [ ] stderr is diagnostics, never protocol;
+- [ ] the tool descriptor's schema matches what the server expects.
 
 ---
 
-# 9. The WASM component runtime
+# 11. The WASM component runtime
 
-WASM is the preferred third-party code boundary: the guest gets memory, fuel and
-an epoch deadline, and it reaches the host only through declared imports.
+A WASM component is the most sandboxed runtime: the guest has no ambient
+filesystem, network or clock. Every host call is a typed import that policy can
+deny. Use it when you want portability and a small trusted surface, and you can
+pay the build-toolchain cost.
 
-## 9.1 The contract
+## 11.1 The contract
+
+The WIT is in `crates/bsh/wit/extension.wit`. The host imports nothing; the
+component imports `host` and exports `extension`:
+
+```wit
+world bsh-extension {
+    import host;
+    export extension;
+}
+```
+
+Exports, called in this order: `initialize`, `activate`, then `tools`,
+`call-tool`, `command`, `panel`, `on-event`, then `deactivate` and
+`shutdown`.
+
+Host functions:
+
+| Function | Capability |
+|---|---|
+| `read-file` / `write-file` | workspace.read / workspace.write |
+| `fetch` | network.http |
+| `storage-get` / `storage-set` / `storage-list` | extension.storage |
+| `read-secret` | secrets.read |
+| `emit` / `subscribe` | events.publish / events.subscribe |
+| `configuration` | none; returns the validated config |
+| `now-millis` / `progress` / `log` | none |
+
+Every function returns `result<_, host-error>` where the error is one of
+`denied`, `not-found`, `limited`, `runtime`, `timeout`.
+
+## 11.2 Manifest
 
 ```toml
 [runtime]
 kind = "wasm-component"
 entry = "wasm/extension.wasm"
+startup = "on-demand"
+
+[capabilities]
+required = ["agent.tools.register", "extension.storage"]
 ```
 
-The published world is `crates/bsh/wit/extension.wit`:
+`entry` must be a package-relative `.wasm` component. The host compiles it on
+activation; a malformed component fails the package, not the host.
 
-```text
-world bsh-extension {
-    import host;        // every function is policy-checked
-    export extension;   // initialize, activate, tools, call-tool, …
+## 11.3 A minimal guest (Rust)
+
+```rust
+wit_bindgen::generate!({ path: "wit", world: "bsh-extension" });
+
+struct Echo;
+
+impl exports::bsh::extension::extension::Guest for Echo {
+    fn initialize(_host: String, _config: String) -> Result<(), HostError> { Ok(()) }
+    fn activate() -> Result<(), HostError> { Ok(()) }
+    fn deactivate() -> Result<(), HostError> { Ok(()) }
+    fn shutdown() -> Result<(), HostError> { Ok(()) }
+
+    fn tools() -> Vec<ToolDefinition> {
+        vec![ToolDefinition {
+            id: "echo".to_string(),
+            description: "Echo arguments through the component".to_string(),
+            input_schema: r#"{"type":"object"}"#.to_string(),
+        }]
+    }
+
+    fn call_tool(_id: String, arguments: String, _correlation: String)
+        -> Result<ToolResult, HostError>
+    {
+        host::progress(1, 2);
+        Ok(ToolResult { content: arguments, is_error: false })
+    }
+
+    fn command(_id: String, _args: String) -> Result<String, HostError> {
+        Ok(r#""command""#.to_string())
+    }
+
+    fn panel(_id: String) -> Result<String, HostError> {
+        Ok(r#"{"schema_version":"1.0","root":{"type":"text","text":"wasm panel"}}"#.to_string())
+    }
+
+    fn on_event(_event: Event) {}
+}
+
+export!(Echo);
+```
+
+Build (the example uses `wasm-tools` to turn the core module into a component):
+
+```bash
+rustup target add wasm32-unknown-unknown
+cd examples/extensions/wasm-echo/guest
+cargo build --target wasm32-unknown-unknown --release
+wasm-tools component new \
+  target/wasm32-unknown-unknown/release/bsh_wasm_echo.wasm \
+  -o ../wasm/extension.wasm
+```
+
+The committed `wasm/extension.wasm` is the source of truth for a host test.
+The snippet above is abridged; the full guest in `guest/src/lib.rs` imports the
+generated `bsh::extension` modules and is the file to copy.
+
+## 11.4 Test and limits
+
+```bash
+$BSH ext validate examples/extensions/wasm-echo
+$BSH ext mock examples/extensions/wasm-echo echo '{"text":"hi"}'
+cargo test -p bsh --lib -- extension::runtime::wasm
+```
+
+Limits: `max_memory_mb` via StoreLimits, `max_execution_ms` via fuel/epoch,
+`max_output_bytes` on the result. Cancellation traps the guest at its next host
+call; a pure-compute guest may run to its fuel deadline because the host cannot
+set an epoch while the synchronous store is held.
+
+A WASM package cannot receive observe hooks in this build. It can still *cause*
+`http.exchange` by calling `fetch`; an Extism observer can consume that.
+Declaring `contributes.hooks` on a WASM package is refused at validation.
+
+## 11.5 WASM checklist
+
+- [ ] the component exports the full `extension` interface;
+- [ ] every host call handles `denied` rather than assuming success;
+- [ ] memory and output stay under the manifest ceilings;
+- [ ] the guest does not busy-loop; cancellation depends on host calls;
+- [ ] `wasm/extension.wasm` is built from the committed source.
+
+---
+
+# 12. The Extism runtime
+
+Extism is the pragmatic plugin runtime: many languages, a small host bridge,
+and — uniquely in this build — the ability to receive observe hooks. The price
+is a JSON bridge with a specific envelope, and WASI disabled.
+
+## 12.1 Exports
+
+| Export | When |
+|---|---|
+| `bsh_tools` | host asks for descriptors |
+| `bsh_call_tool` | a tool call |
+| `bsh_command` | a command/action |
+| `bsh_panel` | a dynamic panel |
+| `bsh_event` | a subscribed event |
+| `bsh_hook` | an observe hook batch (only if declared) |
+
+A package that declares a hook point but does not export `bsh_hook` loads but
+fails delivery; the host logs the runtime error rather than pretending the
+observer is attached.
+
+## 12.2 The bridge envelope
+
+Every `bsh_host` call takes one JSON request and returns one JSON reply:
+
+```json
+{"ok":true,"value":...}
+```
+
+or
+
+```json
+{"ok":false,"error":"..."}
+```
+
+The guest must unwrap `value` on success and treat `ok:false` as an error. A
+guest that reads the reply as a bare value will see `null` or fail to parse.
+This is the most common Extism bug in the wild.
+
+## 12.3 Operations
+
+| Op | Capability | Notes |
+|---|---|---|
+| `read_file` / `write_file` | workspace.* | package or workspace relative, contained |
+| `fetch` | network.http | HTTP(S), body capped |
+| `storage_get` / `storage_set` / `storage_list` | extension.storage | own namespace only |
+| `read_secret` | secrets.read | named secret |
+| `emit` | events.publish | declared topic only |
+| `subscribe` | events.subscribe | declared topic only |
+| `config` | none | validated configuration |
+| `now_millis` | none | wall clock |
+| `log` | none | host log |
+
+The bridge is the only filesystem/network path: WASI is disabled.
+
+## 12.4 A guest that reads storage
+
+```rust
+use extism_pdk::*;
+use serde_json::{json, Value};
+
+#[host_fn]
+extern "ExtismHost" {
+    fn bsh_host(input: String) -> String;
+}
+
+fn host(request: Value) -> Option<Value> {
+    let raw = unsafe { bsh_host(request.to_string()) }.ok()?;
+    let reply: Value = serde_json::from_str(&raw).ok()?;
+    if reply.get("ok").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    Some(reply.get("value").cloned().unwrap_or(Value::Null))
 }
 ```
 
-The host interface:
+That helper is the template for every Extism package in this book, including
+the hook observer in chapter 25.
 
-```text
-log, emit, subscribe, unsubscribe
-read-file, write-file, fetch
-storage-get, storage-set, storage-list
-read-secret, configuration
-now-millis, progress
-```
+## 12.5 Build and test
 
-The extension interface:
-
-```text
-initialize(host-version, config)
-activate / deactivate / shutdown
-tools() -> list<tool-definition>
-call-tool(id, arguments, correlation-id) -> tool-result
-command(id, arguments) -> string
-panel(id) -> string
-on-event(event)
-```
-
-## 9.2 Build a guest
-
-```text
-rustup target add wasm32-unknown-unknown
-cargo build --target wasm32-unknown-unknown --release
-wasm-tools component new target/wasm32-unknown-unknown/release/guest.wasm \
-  -o wasm/extension.wasm
-```
-
-The smallest working guest is [wasm-echo](../examples/extensions/wasm-echo). Its
-export list is the contract; its imports are only the host functions it uses.
-
-## 9.3 Limits
-
-```text
-memory       resources.max_memory_mb -> StoreLimits
-time         max_execution_ms -> fuel + epoch deadline
-output       max_output_bytes -> checked before the result reaches the agent
-calls        the host clamps a host-initiated call to the manifest ceiling
-```
-
-Cancellation traps the guest at its next host call; a guest that performs pure
-computation with no host calls runs to its deadline. That is the honest limit of
-a synchronous Wasmtime store.
-
-## 9.4 Test
-
-```text
-bsh ext validate examples/extensions/wasm-echo
-bsh ext install  examples/extensions/wasm-echo
-bsh ext mock     examples/extensions/wasm-echo echo '{"text":"hi"}'
-```
-
-A component package may also ship the declarative files (prompts, contexts,
-commands, panels, themes) like any other runtime.
-
-**See also:** [WASM contract](../crates/bsh/wit/extension.wit),
-[wasm-echo](../examples/extensions/wasm-echo).
-
----
-
-# 10. The Extism runtime
-
-Extism is a WASM flavor with one host bridge and a PDK-friendly export set. Use it
-for an existing Extism plugin.
-
-## 10.1 The package
-
-```toml
-[runtime]
-kind = "extism"
-entry = "plugin.wasm"
-```
-
-WASI is disabled. The plugin reaches the host only through `bsh_host`.
-
-## 10.2 Exports and bridge
-
-```rust
-#[plugin_fn] pub fn bsh_tools(_: String) -> FnResult<String> { … }
-#[plugin_fn] pub fn bsh_call_tool(input: String) -> FnResult<String> { … }
-#[plugin_fn] pub fn bsh_command(input: String) -> FnResult<String> { … }
-#[plugin_fn] pub fn bsh_panel(_: String) -> FnResult<String> { … }
-#[plugin_fn] pub fn bsh_event(_: String) -> FnResult<String> { … }
-
-#[host_fn]
-extern "ExtismHost" { fn bsh_host(input: String) -> String; }
-```
-
-Bridge operations:
-
-```text
-read_file, write_file, fetch
-storage_get, storage_set, storage_list
-read_secret, emit, subscribe
-config, now_millis, log
-```
-
-The request is JSON: `{"op":"read_file","path":"notes.md"}`. The response is
-either `{"ok":true,"value":…}` or `{"ok":false,"error":…}`. Every operation is
-checked against the same policy as the component runtime, and `emit` is limited
-to the topics in `contributes.publishes`.
-
-## 10.3 Build
-
-```text
+```bash
 cd examples/extensions/extism-echo/guest
 cargo build --target wasm32-unknown-unknown --release
 cp target/wasm32-unknown-unknown/release/bsh_extism_echo.wasm ../plugin.wasm
+
+$BSH ext validate examples/extensions/extism-echo
+$BSH ext mock examples/extensions/extism-echo echo '{"text":"hi"}'
+cargo test -p bsh --lib -- extension::runtime::extism
 ```
 
-## 10.4 Test
+The runtime tests exercise the bridge envelope, storage, panels and the hook
+path. A guest that only works under `mock` may still fail the envelope test;
+run both.
 
-```text
-bsh ext validate examples/extensions/extism-echo
-bsh ext install  examples/extensions/extism-echo
-bsh ext mock     examples/extensions/extism-echo echo '{"text":"hi"}'
-```
+## 12.6 Limits and pitfalls
 
-**See also:** [Extism contract](bsh-extension-standard.md#43-runtime),
-[extism-echo](../examples/extensions/extism-echo).
+- one bridge body: 8 MiB;
+- result capped by `max_output_bytes`;
+- memory capped by `max_memory_mb`;
+- `fetch` returns text or base64, never status/headers (those go to
+  `http.exchange` instead);
+- a guest call holds the plugin lock; a hook delivered while a tool call is
+  running waits for that call (on the hook worker, not on the model path);
+- a failed hook call is logged and does not stop other packages.
+
+## 12.7 Extism checklist
+
+- [ ] all host replies go through the `{ok,value}` envelope;
+- [ ] `bsh_tools` returns an array with `id`, `description`, `input_schema`;
+- [ ] `bsh_hook` exists if any hook point is declared;
+- [ ] storage keys are relative and namespaced by the guest, not by path tricks;
+- [ ] `plugin.wasm` is rebuilt after source changes.
 
 ---
 
-# 11. The MCP runtime
+# 13. The MCP runtime
 
-MCP is an adapter: the host starts a stdio Model Context Protocol server and maps
-its inventory onto BSH surfaces.
+Use MCP when you already have a Model Context Protocol server and want its
+tools, resources and prompts in BSH without rewriting them.
 
-## 11.1 The package
+## 13.1 Manifest
 
 ```toml
 [runtime]
@@ -1055,186 +1852,220 @@ kind = "mcp"
 entry = "python3"
 args = ["server.py"]
 protocol = "mcp"
+startup = "on-demand"
+
+[capabilities]
+required = ["process.execute", "agent.tools.register",
+            "agent.context.provide", "agent.prompts.provide"]
+
+[contributes]
+contexts = ["guide"]
+prompts = ["greet"]
 ```
 
-The server must implement the MCP handshake and answer `tools/list`. The host
-performs `initialize` and `notifications/initialized`.
+MCP is a process transport with an MCP handshake. It still needs
+`process.execute`; the MCP runtime does not bypass the process policy.
 
-## 11.2 The mapping
+## 13.2 The handshake and mapping
 
-| MCP | BSH |
-|---|---|
-| `tools/list`, `tools/call` | tools |
-| `resources/list`, `resources/read` | contexts |
-| `prompts/list`, `prompts/get` | prompts |
-| `notifications/progress` | tool progress |
-| declared `contributes.events` | `bsh/events/event` notifications |
+The host:
 
-No panel UI is mapped: a panel needs the BSH declarative contract.
+1. starts the server;
+2. sends `initialize` with protocol version and client info;
+3. sends `notifications/initialized`;
+4. calls `tools/list`, `resources/list`, `prompts/list`;
+5. maps:
+   - MCP tools → BSH tools;
+   - MCP resources → BSH contexts (read with `resources/read`);
+   - MCP prompts → BSH prompt contributions (read with `prompts/get`).
 
-## 11.3 What the host enforces
+Calls go through `tools/call`. Progress notifications from the server are
+forwarded. Errors become tool errors; a transport EOF/timeout kills the
+session and the next call starts a fresh server.
 
-- spawning the server requires an explicit **process.execute** grant, scoped to
-  the declared program and arguments, exactly like the process runtime;
-- tool names are preserved: the server's `getUser` is called as `getUser` even
-  though the local contribution id is sanitized;
-- a call runs on the blocking pool under
-  `min(caller deadline, max_execution_ms)`; a timeout or cancel kills the child;
-- a decoded JSON-RPC error keeps the session; a transport failure does not;
-- a result above `max_output_bytes` is refused.
+## 13.3 Declared contributions
 
-## 11.4 Test
+A server may expose resources and prompts dynamically; the manifest's
+`contributes` lists the ids the package expects to provide. A declared
+contribution that the server does not return is a load error, not an empty
+surface.
 
-```text
-bsh ext install examples/extensions/mcp-echo
-bsh ext grant com.example.mcp-echo process.execute --scope program:python3
-bsh ext mock examples/extensions/mcp-echo echo '{"x":1}'
+Events: a package that declares `contributes.events` receives
+`bsh/events/event` notifications once its server is running. A host that has
+not started the server drops the queued event instead of spawning it.
+
+## 13.4 Test
+
+```bash
+$BSH ext validate examples/extensions/mcp-echo
+$BSH ext mock examples/extensions/mcp-echo echo '{"text":"hi"}'
+cargo test -p bsh --lib -- extension::runtime::mcp
 ```
 
-**See also:** [MCP runtime](bsh-extension-standard.md#43-runtime),
-[mcp-echo](../examples/extensions/mcp-echo).
+The test covers tool/resource/prompt mapping and a server that returns all
+three. If the server works with a generic MCP client but not here, compare the
+`initialize` result: the host requires a `protocolVersion` string.
+
+## 13.5 MCP limits
+
+- MCP HTTP requests made by the server are not captured by the host (chapter
+  26); use the server's own logging or a proxy.
+- One server process; calls serialized.
+- Timeouts and output caps follow the process runtime.
+- A server that writes diagnostics to stdout breaks the protocol; use stderr.
 
 ---
 
-# 12. Workflows
+# 14. The declarative runtime
 
-A workflow is a bounded sequence of calls to the **same** package's tools. The
-host advertises it as one tool.
+The declarative runtime is the zero-code path: the host executes one of three
+bodies from the tool descriptor.
 
-## 12.1 The file
+Use it when:
 
-```json
-{
-  "description": "Fetch, transform and report",
-  "input_schema": {
-    "type": "object",
-    "properties": {"path": {"type": "string"}}
-  },
-  "steps": [
-    {"name": "read", "tool": "echo", "arguments": {"path": "{{input.path}}"}},
-    {"name": "report", "tool": "echo", "arguments": {"from": "{{steps.read.path}}"}}
-  ]
-}
-```
+- the tool is an echo, a constant, or a simple string template;
+- you want a package that cannot fail at runtime;
+- you are scaffolding before choosing a real runtime.
 
-Placeholders are `{{input.name}}` and `{{steps.name.field}}`.
+Do not use it when:
 
-## 12.2 What the host does
+- you need filesystem, network, storage, secrets or time;
+- you need to call another tool;
+- you need progress, events or a dynamic panel.
 
-- computes the union of the step tools' capabilities and puts it on the workflow
-  tool, so everything the workflow can reach is authorized before step one;
-- runs the steps in order, forwarding progress and cancellation to the running
-  step;
-- never reaches another package: a step names a tool of the same extension.
+It has no hooks, no host calls and no code execution. That is the feature, not
+a gap: a declarative package is the easiest package to review.
 
-A workflow that names an undeclared tool fails at that step. Declare the tools.
-
-**See also:** [Workflows §4.5](bsh-extension-standard.md#45-contributions).
+Declarative tools still participate in capabilities and audit. A declared
+capability that the implementation never uses is a warning sign in review: it
+asks the reader for authority the code cannot exercise.
 
 ---
 
-# 13. Panels
 
-A panel is a bounded JSON document the host renders with its own widgets. No
-HTML, script, CSS, or GPUI object crosses the boundary.
+# 15. Panels and declarative UI
 
-## 13.1 The file
+A panel is JSON, not HTML. The host owns the widgets; the package owns the
+document. That is what makes a panel safe to render and cheap to review.
+
+## 15.1 The file
 
 ```json
 {
   "title": "Git Status",
   "icon": "asset/git.svg",
-  "location": "right",
-  "default_visibility": "visible",
   "view": {
     "schema_version": "1.0",
     "root": {
       "type": "column",
       "children": [
-        {"type": "heading", "text": "Git Status", "level": 2},
-        {"type": "text", "text": "Working tree clean"},
-        {"type": "button", "label": "Refresh", "action": "git.refresh", "style": "primary"}
+        { "type": "heading", "text": "Git Status", "level": 2 },
+        { "type": "text", "text": "Working tree clean" },
+        { "type": "button", "label": "Refresh", "action": "git.refresh", "style": "primary" }
       ]
     }
   }
 }
 ```
 
-`location` is `left`, `right`, `bottom` or `center`. `default_visibility` is
-`visible` or `hidden`.
+The renderer validates the document again at draw time. A file that passed
+install can still be rejected by the renderer if it was hand-edited in the
+store; that is why panels are validated twice.
 
-## 13.2 Nodes
+## 15.2 Node reference
 
-```text
-container, row, column, tabs        layout
-text, heading, markdown, code       text
-button, input, select, checkbox     controls
-list, table, tree                   collections
-progress, notification, divider,
-spacer, image                       status and decoration
-```
+| Type | Key fields | Notes |
+|---|---|---|
+| `container` | `children` | generic group |
+| `row` / `column` | `children` | layout |
+| `text` | `text` | one text leaf |
+| `heading` | `text`, `level` 1–6 | heading |
+| `markdown` | `text` | rendered Markdown, no HTML |
+| `button` | `label`, `action`, `style` | `primary`, `danger`, `ghost` |
+| `input` | `label`, `placeholder`, `value`, `action` | submitted with an action |
+| `select` | `label`, `options`, `value`, `action` | options are label/value pairs |
+| `checkbox` | `label`, `checked`, `action` | boolean |
+| `list` | `items` | up to 500 |
+| `table` | `columns`, `rows` | up to 500×32 |
+| `tree` | `nodes` | expandable |
+| `tabs` | `tabs` | up to 16 |
+| `progress` | `value` (0.0–1.0), `label` | determinate |
+| `code` | `value`, `language` | read-only |
+| `image` | `src`, `alt` | `asset/…` only |
+| `notification` | `level`, `text` | inline message |
+| `divider` | — | horizontal rule |
+| `spacer` | `size` | vertical space in pixels |
 
-Limits, enforced before rendering:
+Limits: depth 32, nodes 1000, one text leaf 16 KiB, all text 256 KiB, list 500
+items, table 500 rows × 32 columns, cell 2048 characters, tabs 16, serialized
+document 1 MiB. The renderer refuses beyond these; it does not truncate
+silently.
 
-```text
-depth 32, nodes 1000, one text 16 KiB, all text 256 KiB
-list 500 items, table 500x32, cell 2048 chars, tabs 16
-serialized document 1 MiB
-```
+## 15.3 Actions and revisions
 
-## 13.3 Actions
+An action is a contribution id owned by the package. When a button is pressed,
+the host routes the action to the owning runtime's command handler and
+publishes `ui.action` with:
 
-A button's `action` is a contribution id owned by the package. The host routes it
-to a tool first and to the runtime's command seam second.
+- extension id;
+- panel id;
+- action id;
+- the revision the view was rendered from;
+- the form values, when the panel has inputs.
 
-Two revisions are involved:
+The runtime answers with a new view (or an empty value for an in-place action).
+Every update carries a revision. A patch at or below the current revision is
+stale and refused. An action carrying a revision that no longer matches is
+refused too, so a button from an old view cannot act on a new one.
 
-1. the document revision the host rendered;
-2. the action request carries **that** revision.
+This is the concurrency rule that prevents the classic "clicked Refresh twice,
+the first answer overwrote the second" bug.
 
-A control painted from an old document is therefore refused when the view has
-moved on:
+## 15.4 Static and dynamic panels
 
-```text
-action at revision 3 but the view is at 4; the control was stale
-```
+- A panel file with a `view` is static: the host draws it as shipped.
+- A runtime may implement `panel(id)` (Extism: `bsh_panel`; WASM: `panel`)
+  and return a document. The file's `view` can be a placeholder; the runtime's
+  answer is used when the panel is opened or refreshed.
 
-An action may return a new document. The host applies it at `revision + 1`:
+A dynamic panel must still obey every node and size limit. It cannot return
+HTML, script or CSS.
 
-```json
-{
-  "schema_version": "1.0",
-  "root": {"type": "text", "text": "Refreshed"}
-}
-```
+## 15.5 Images and icons
 
-Any other JSON value becomes a one-line status message under the panel.
+A panel's `icon` and an image node's `src` are `asset/…` paths inside the
+package. The renderer loads the file. `data:`, `file:`, `javascript:`,
+`http:` and `https:` are refused; this build has no remote image loader. An
+icon that names a missing asset is a broken image, not a network fetch.
 
-## 13.4 Images and icons
+## 15.6 Failure modes
 
-`src` and `icon` accept an `asset/…` path inside the package:
-`{"type":"image","src":"asset/icons/logo.png","alt":"Logo"}`. Remote images
-(`https://`) are refused by validation: this host has no remote image loader, and
-a node the renderer cannot honour is worse than a validation error.
+| Symptom | Likely cause |
+|---|---|
+| panel never appears | package not applied, or `ui.panels` denied |
+| blank panel | view failed validation; look at host logs |
+| button does nothing | action id not declared by the same package, or stale revision |
+| image is a placeholder | missing `asset/` file, or a remote URL was refused |
+| update refused as stale | two updates raced; send the current revision |
+| text disappears | a limit was exceeded; the renderer refused, not truncated |
 
-## 13.5 Failure modes
+## 15.7 Lab: a counter panel
 
-```text
-invalid document      error printed in the panel, not a blank frame
-missing action        tool/command not found, shown inline
-stale action          refused by revision
-image outside package refused by validate
-```
+1. Copy `hello`; change `panels/status.json` to a column with a heading, a
+   text node and a button with `action: "bump"`.
+2. Add `commands/bump.md` and declare `commands = ["greet", "bump"]`.
+3. Install and open the panel. Press the button.
+4. The command runs; the panel does not update unless the runtime returns a new
+   view. For a static panel, the button is an action, not state.
 
-**See also:** [Declarative UI §10](bsh-extension-standard.md#10-declarative-ui),
-[appendix D](#appendix-d-ui-nodes-and-limits).
+To make the counter dynamic, implement `bsh_panel` in an Extism guest and read
+the count from storage (chapter 25 does exactly this).
 
 ---
 
-# 14. Themes, icons and images
+# 16. Themes, icons and images
 
-A theme is a token map. Missing tokens fall back to the host palette, so a
-partial theme is a refinement, not a broken frame.
+## 16.1 Themes
 
 ```json
 {
@@ -1250,796 +2081,1360 @@ partial theme is a refinement, not a broken frame.
 }
 ```
 
-Known tokens: `page`, `text`, `muted`, `faint`, `border`, `border-soft`, `accent`,
-`error`, `success`, `warn`, `new-session-fill`, `hover`.
+Known tokens: `page`, `text`, `muted`, `faint`, `border`, `border-soft`,
+`accent`, `error`, `success`, `warn`, `new-session-fill`, `hover`. A missing
+token falls back to the active host palette. The first declared theme applies
+to that extension's panels; Settings > Extensions can also select it globally,
+overlaying its named tokens on the shell palette.
 
-Two ways a theme is used:
+A theme is not CSS. It cannot add rules, fonts or animations; it maps tokens.
 
-- the first theme a package declares applies to **that extension's panels**;
-- Settings → Extensions also lists it as a **global** selection, which overlays
-  its named tokens on the shell palette.
+## 16.2 Icons and images
 
-A panel's `icon` and an `image` node are drawn from `asset/…` files in the
-package. Keep them small: they are loaded from disk when the panel paints.
+- panel `icon`: `asset/icon.svg`;
+- image node `src`: `asset/screenshot.png`;
+- both must exist inside the package;
+- SVG is drawn as an image, not executed as script;
+- remote URLs are refused in this build.
 
-**See also:** [Themes §10](bsh-extension-standard.md#10-declarative-ui).
+Package assets are copied into the immutable version directory and included in
+the hash. A missing asset is a validation error only if it is referenced by a
+panel; a package may ship unused assets.
 
 ---
 
-# 15. Skills
+# 17. Storage and configuration
 
-A skill is a `SKILL.md` directory the agent loads into its skill set.
+## 17.1 Storage
 
-```text
-skills/helper/SKILL.md
-```
+Each extension owns `extension-data/<id>/`. Keys are relative paths; absolute
+paths, `..`, `.` and backslashes are refused. The canonical parent must stay
+inside the namespace, which catches a symlinked directory planted inside it. A
+stored value cannot be a symlink.
 
-```markdown
----
-name: helper
-description: How to inspect this workspace
----
-When asked about the workspace, read `README.md` first and cite paths as
-`path:line`.
-```
+| Bound | Value |
+|---|---|
+| one value | 8 MiB |
+| files per namespace | 10,000 |
+| writes | atomic (temp file, fsync, rename) |
 
-Declare it:
+The namespace is created and purged by the host. WASM and Extism reach it
+through host calls; process and MCP packages cannot read it directly unless the
+host provides a surface, because their own filesystem access is outside the
+namespace.
+
+Storage is for business data, not for code or caches you can rebuild. It
+survives upgrades and is kept on uninstall unless `--purge-data` is passed.
+
+## 17.2 Configuration
+
+A package declares a schema and defaults:
 
 ```toml
-[contributes]
-skills = ["helper"]
+[configuration]
+schema = "config.schema.json"
+defaults = { "remote" = "origin" }
 ```
 
-The host validates that `skills/helper/SKILL.md` exists, registers the directory
-with the agent, and reports the skill on the status row. A package whose **only**
-contribution is a skill still applies; skills are not an afterthought to tools.
+The host validates the reader's configuration against the schema and passes the
+result to the runtime:
 
-```text
-bsh ext install examples/extensions/allinone
-bsh ext info com.example.allinone
+- process: `initialize.params.config`;
+- WASM: `configuration()`;
+- Extism: `bsh_host` op `config`;
+- MCP: `initialize.params.config` (an extra field; a server that does not know
+  it may ignore it, so do not rely on it for required settings).
+
+CLI:
+
+```bash
+$BSH ext config com.example.git-assistant
+$BSH ext config com.example.git-assistant schema
+$BSH ext config com.example.git-assistant set '{"remote":"upstream"}'
+$BSH ext config com.example.git-assistant set config.json
 ```
 
-**See also:** [Skills §4.5](bsh-extension-standard.md#45-contributions).
+A configuration error is a load error, not a silent default. The `configured`
+field in `ext info` tells you whether the schema passed.
+
+## 17.3 Storage versus workspace
+
+- **storage** is private, bounded, backed up with the extension, and available
+  without a workspace;
+- **workspace** is the user's files, requires a workspace and a grant, and is
+  visible to other tools.
+
+Do not store user documents in extension storage. Do not write caches into the
+workspace. The grant model makes this distinction visible in review.
 
 ---
 
-# 16. Language services
+# 18. Instructions, skills and language services
 
-A language service names a language, its bare file extensions, and the tool that
-answers diagnostics for a document.
+## 18.1 Instructions
 
-```json
-{"name":"Python","extensions":["py"],"tool":"diagnose","syntax":"python"}
-```
+Prompt fragments and contexts are composed into the instruction set. The host
+publishes `instruction.build` when it composes them; that event is useful when
+a prompt looks wrong: it shows which package contributed what, without exposing
+the full text in logs.
 
-The tool is required and must be declared by the same package. The host calls it
-with:
+Rules for prompt text:
 
-```json
-{"path":"/workspace/sample.py","text":"def ok():\n    return 1\n","language":"python"}
-```
+- state facts, not policy the host already enforces;
+- avoid repeating the tool description;
+- keep each fragment short; every turn pays for it;
+- do not include secrets or user data that the model does not need.
 
-and expects a diagnostics-shaped value. `examples/extensions/language-python`
-uses `ast.parse` for a real syntax check.
+## 18.2 Skills
 
-```text
-bsh ext install examples/extensions/language-python
-bsh ext grant com.example.language-python process.execute --scope program:python3
-printf 'def broken(:\n' > /tmp/bad.py
-bsh ext language-check com.example.language-python python /tmp/bad.py
-```
+A skill is a directory with `SKILL.md`. The frontmatter is the catalogue entry;
+the body is loaded on demand by `load_skill`.
 
-The same per-call capability check runs here as for an agent tool call: a
-diagnostics tool that declares `workspace.read` is checked, and a denial is an
-error, not a silent empty result.
+Validation rules:
 
-**See also:** [Languages §4.5](bsh-extension-standard.md#45-contributions),
-[language-python](../examples/extensions/language-python).
+- `name` and `description` required;
+- directory name equals `name`;
+- no absolute paths in the body;
+- the skill directory is copied and hashed with the package.
 
----
+A skill that is only a copy of the README adds prompt cost and no capability.
+A good skill names the tool calls, the order, and the failure handling.
 
-# 17. Integrations
-
-An integration descriptor names an external system and the tool or command that
-drives it.
+## 18.3 Language services
 
 ```json
-{"name":"GitHub","kind":"github","action":"github-search"}
-```
-
-The kind is `github`, `browser`, `terminal` or `custom`. The action is required
-and must be declared by the same package.
-
-```text
-tool action      dispatch through the runtime's tool call
-command action   dispatch through the runtime's command seam
-```
-
-A declarative package's commands are prompt templates, so a command action needs
-a runtime that implements `commands/execute` (process, Extism, WASM, workflow).
-When in doubt, make the action a tool.
-
-```text
-bsh ext integrate com.example.language-python github '{"query":"bsh"}'
-```
-
-**See also:** [Integrations §4.5](bsh-extension-standard.md#45-contributions).
-
----
-
-# 18. Model providers, agent roles and presets
-
-Three JSON descriptor kinds make a package selectable in Settings without a
-code-level adapter.
-
-## 18.1 A model provider
-
-```json
+// languages/rust.json
 {
-  "name": "Example",
-  "base_url": "https://api.example.com/v1",
+  "name": "Rust",
+  "extensions": ["rs"],
+  "tool": "diagnostics",
+  "syntax": "rust"
+}
+```
+
+The `tool` must be declared by the same package. The host uses the descriptor to
+answer "which language owns this file" and calls the tool for diagnostics.
+
+```bash
+$BSH ext languages
+$BSH ext language-check com.example.rust rust src/main.rs
+```
+
+## 18.4 Instructions and skills checklist
+
+- [ ] prompt fragment is short and non-duplicative;
+- [ ] skill body is loaded only when needed, and says what to do on failure;
+- [ ] language descriptor names a declared tool;
+- [ ] no secrets or workspace data in prompt text.
+
+---
+
+# 19. Integrations
+
+An integration names an external system and the action that drives it:
+
+```json
+// integrations/github.json
+{
+  "name": "GitHub",
+  "kind": "github",
+  "action": "issues"
+}
+```
+
+Kinds: `github`, `browser`, `terminal`, `custom`. The action must be a tool or
+command declared by the same package.
+
+```bash
+$BSH ext integrations
+$BSH ext integrate com.example.github github '{"repo":"open1s/bos"}'
+```
+
+The host validates the reference at load time. An integration whose action is
+missing fails the package; it does not appear as an empty menu entry.
+
+Integrations are a discovery surface, not a new transport. The action still goes
+through the same runtime, capability and audit path as a tool or command.
+
+---
+
+# 20. Model providers, agent roles and presets
+
+These descriptors let a package contribute settings entries, not arbitrary
+code. That limit is deliberate: a provider is a configuration document the host
+can validate, not a plugin that can rewrite the LLM client.
+
+## 20.1 A model provider
+
+```json
+// providers/models/demo.json
+{
+  "name": "All-in-One Example",
+  "base_url": "https://example.invalid/v1",
   "api_mode": "chat",
-  "requires_key": true,
-  "fast": {
-    "model": "example-small",
-    "name": "Example Fast",
-    "max_tokens": 8192
+  "requires_key": false,
+  "demo-model": {
+    "model": "demo-model",
+    "name": "Demo Model",
+    "max_tokens": 4096,
+    "input_types": ["text"]
   }
 }
 ```
 
-Each model is one flattened table keyed by nickname. `requires_key = false`
-declares an open or anonymous lane: the build sends no credential instead of
-refusing a missing key.
+The top-level fields describe the endpoint; each remaining key is a model
+nickname with its own descriptor. `requires_key = false` declares an open lane;
+absent or true reads as key-bearing, the safe default. A keyless descriptor
+makes the build send no credential rather than inventing a missing-key refusal.
 
-## 18.2 An agent role and a preset
+## 20.2 An agent role
 
 ```json
+// providers/agents/helper.json
 {
-  "level": 1,
+  "name": "All-in-One Helper",
+  "description": "A read-only agent role",
+  "plugins": ["files"],
   "permission": "read_only",
-  "plugins": ["files", "plan"],
-  "tools": ["read_file", "grep", "glob"],
-  "extensions": ["com.example.reader"]
+  "level": 1
 }
 ```
 
-An agent role descriptor maps onto a selectable preset: plugins, permission
-level, tool allowlist and extension allowlist.
+## 20.3 A preset
 
-## 18.3 How they are named
+A preset bundles provider/model/agent selections for the settings layer. The
+host applies it through the preset map; it is not a runtime object.
 
-The host namespaces every contributed descriptor:
+## 20.4 Naming and selection
 
-```text
-ext.<extension-id>.<contribution-id>
-ext.<extension-id>.agent.<contribution-id>     (agent roles)
+The settings layer lists contributions by package and descriptor name. A
+descriptor that is valid but not selected is inert. If two packages contribute
+the same nickname, the settings layer must disambiguate; do not rely on order.
+
+```bash
+$BSH ext providers
 ```
 
-The contributed maps are read when Settings loads and are selectable in the
-provider and preset pickers. Declaring `agent.models.provide`,
-`agent.agents.provide` or `agent.workflows.provide` is what the policy checks.
+## 20.5 Limits
 
-**See also:** [Providers §4.5](bsh-extension-standard.md#45-contributions).
+- no code-level adapter API beyond the descriptor contract;
+- no arbitrary base URL rewriting at call time;
+- no per-model capability grants; the package-level capability is the grant;
+- a model provider cannot receive observe hooks directly.
 
 ---
 
-# 19. Storage and configuration
+# 21. Workflows
 
-## 19.1 Storage
+A workflow is a named sequence of tool calls. It gives the model one tool
+instead of many, and gives the reader a repeatable recipe.
 
-Each extension owns `extension-data/<id>/`. A key is a relative path:
-
-```text
-notes/today.md          ok
-../other-extension/x    refused
-/absolute/path          refused
-a\b                     refused (backslash)
-```
-
-Rules:
-
-```text
-one value        8 MiB
-one namespace    10,000 files (enforced on write)
-writes           temp file, fsync, rename
-symlinks         refused, and the parent must stay inside the namespace
-```
-
-WASM components call `storage_get`/`storage_set`/`storage_list`; Extism calls
-the same operations through `bsh_host`. The process runtime has no storage bridge:
-a process package manages its own files, and the sandbox permits writes under its
-data namespace, but the host does not expose the storage API to it.
-
-## 19.2 Configuration
-
-A package can declare a JSON Schema and defaults:
-
-```toml
-[configuration]
-schema = "schemas/config.json"
-defaults = { strict = true }
-```
-
-```text
-bsh ext config <id>                 # read the effective document
-bsh ext config <id> schema          # print the schema
-bsh ext config <id> set '{"strict":false}'
-bsh ext config <id> set ./config.json
-```
-
-Values are validated against the schema and migrated on a version change.
-There is no configuration editor in Settings yet; the CLI is the supported
-surface (see [chapter 28](#28-limits-and-non-goals)).
-
-**See also:** [Storage §11](bsh-extension-standard.md#11-storage).
-
----
-
-# 20. Events and hooks
-
-An event is a notification. Delivery is bounded, never blocking, and only to
-subscribers that declared the topic.
-
-## 20.1 The envelope
+## 21.1 The file
 
 ```json
 {
-  "id": "uuid",
-  "source": "com.example.package",
-  "event_type": "tool.completed",
-  "schema_version": "1.0",
-  "timestamp": 1790000000000,
-  "correlation_id": "turn-1",
-  "payload": {}
+  "description": "Inspect the demo: identity, configuration and last events",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "limit": {"type": "integer", "minimum": 1, "maximum": 20}
+    },
+    "additionalProperties": false
+  },
+  "steps": [
+    {"name": "about", "tool": "describe", "arguments": {}},
+    {"name": "settings", "tool": "config", "arguments": {}},
+    {"name": "log", "tool": "events", "arguments": {"limit": "{{input.limit}}"}}
+  ]
 }
 ```
 
-## 20.2 Subscribe and publish
+## 21.2 Semantics
 
-```toml
-[contributes]
-events = ["session.created", "tool.*"]
-publishes = ["git.changed"]
+- steps run in order;
+- a step's arguments may reference `{{input.name}}` and
+  `{{steps.name.field}}` for an earlier step's output;
+- the first failing step fails the workflow; there is no optional step in this
+  build;
+- the workflow result contains each step's output keyed by `name`;
+- a workflow may only call tools declared by the same package.
+
+A workflow is not a general programming language: no loops, no conditionals, no
+arbitrary code. If you need those, write a process tool.
+
+## 21.3 Test
+
+```bash
+$BSH ext validate examples/extensions/allinone
+$BSH ext test examples/extensions/allinone
+# On a host that may spawn children, also run the workflow itself:
+$BSH ext mock examples/extensions/allinone inspect '{"limit":3}'
 ```
 
-A trailing `.*` selects a namespace. `publishes` may not use a wildcard.
+The `test` line is safe in any environment; the `mock` line spawns the Python
+child and fails in a nested sandbox that denies `sandbox-exec`.
 
-Where the event arrives depends on the runtime:
+## 21.4 Workflow checklist
 
-```text
-process     {"jsonrpc":"2.0","method":"events/event","params":{…}} notification
-WASM        on-event(event)
-Extism      bsh_event(<json envelope>)
-MCP         bsh/events/event notification (once the server is running)
-declarative no delivery; use a tool/panel action instead
-```
-
-A component publishes only topics in `publishes`; `tool.*` is always allowed for
-component tools.
-
-## 20.3 Topics the host publishes
-
-```text
-app.started, app.shutdown
-workspace.opened, workspace.closed, workspace.changed
-session.created, session.updated, session.deleted
-trajectory.recorded
-agent.started, agent.completed, agent.failed
-skill.loaded, instruction.build
-model.requested, model.completed
-mcp.connected
-tool.invoked, tool.completed, tool.failed
-network.request, audio.captured
-extension.loaded, extension.unloaded, extension.failed
-config.changed
-ui.action
-```
-
-`ui.action` carries the extension, panel, action and revision when a declarative
-panel routes a control.
-
-## 20.4 Bounds
-
-```text
-subscriber queue   default 64, maximum 4096; a full queue drops, never blocks
-event size         256 KiB before publication
-rate               one source may publish 200 events in a second
-```
-
-The bus counters (published, delivered, dropped, rejected) are in `bsh ext metrics`.
-
-**Hooks are not events.** A hook is a call at a seam (`model.request`,
-`model.response`, `tool.before`, `tool.after`) delivered only to a package that
-declared it; it is bounded, batched and redacted. The hook layer and its current
-limits are in [bsh-hook-system.md](bsh-hook-system.md).
-
-**See also:** [Events §9](bsh-extension-standard.md#9-events),
-[appendix C](#appendix-c-event-reference).
+- [ ] each step names a declared tool;
+- [ ] placeholders match the input schema;
+- [ ] failure behavior is what the caller expects;
+- [ ] the workflow is shorter than the equivalent prompt, or it is not worth it.
 
 ---
 
-# 21. Lifecycle
 
-A package moves through a state machine, not a set of conventions.
+# 22. Hooks are not events
 
-```text
-Discovered -> Validating -> Resolved -> Installing -> Installed
-Installed  -> Loading -> Starting -> Active
-Active     -> Suspending -> Suspended -> Starting
-Active     -> Stopping -> Unloaded
-any non-Unloaded -> Failed
-Failed     -> Loading            (retry)
-Unloaded   -> Loading            (reinstall)
+An event says "this happened". A hook says "you asked to be called at this seam".
+The difference is not cosmetic: hooks are declared per point, delivered in
+batches to a package that opted in, and are allowed to carry the seam payload
+that the public event deliberately omits.
+
+This build implements **observe** hooks only. An observe hook cannot deny,
+replace or delay the operation (beyond queueing); it watches. Intercept hooks —
+deny, replace, timeout budgets, priorities — are designed but not implemented,
+and no manifest field enables them.
+
+## 22.1 The five points
+
+| Point | Produced by | Payload is about | Typical use |
+|---|---|---|---|
+| `model.request` | BOS `BeforeLlmCall` | model, sampling, prompt bytes, message previews, request_id | capture, prompt-shape metrics |
+| `model.response` | BOS `AfterLlmCall` | usage, response type/text, request_id | cost, latency, answer shape |
+| `tool.before` | BOS `BeforeToolCall` | tool name, call id, arguments | audit, redaction review |
+| `tool.after` | BOS `AfterToolCall` | tool name, call id, result | audit, error analysis |
+| `http.exchange` | WASM/Extism `fetch`; built-in LLM vendor tap | status, sizes, TTFB, request_id | wire-level capture |
+
+## 22.2 What observe guarantees
+
+- **No blocking of the seam.** `observe` pushes to a bounded queue and returns.
+- **Batching.** Up to 64 events per guest call; events for one point per call.
+- **Bounded memory.** Queue 1024; overflow is dropped and counted, never grown.
+- **Redaction.** `sk-`, `ghp_` and `Bearer ` values are masked; each field is
+  capped at 8 KiB.
+- **Isolation.** One package's failure does not stop the next package; the
+  failure is logged, and the producer is unaffected.
+- **No host lock while the guest runs.** The worker copies targets, releases
+  the host lock, then calls the runtime.
+
+## 22.3 What observe does not guarantee
+
+- **Delivery.** A full queue drops; a slow guest causes later events to wait in
+  the queue, not in the model path.
+- **Ordering across points.** Batching groups by point; do not assume global
+  order between `model.request` and `http.exchange`.
+- **Exactly once.** A retry or fallback produces another observation with the
+  same `request_id`; that is correct, not a duplicate bug.
+- **Bodies.** Headers and bodies are absent; `hooks.bodies` is not implemented.
+- **Process/MCP HTTP.** Those children make their own requests; the host is not
+  in that path.
+
+## 22.4 Delivery path
+
+```mermaid
+sequenceDiagram
+  participant S as Seam (model/tool/fetch)
+  participant Q as Bounded queue
+  participant W as Hook worker
+  participant H as Host registry
+  participant E as Extism guest
+  S->>Q: observe(point, payload)  (returns immediately)
+  W->>Q: drain up to 64, grouped by point
+  W->>H: hook_targets(point)
+  H-->>W: attached runtimes (applied + declared)
+  W->>E: bsh_hook({"point":..., "batch":[...]})
+  E-->>W: {"action":"continue"} (ignored for observe)
 ```
 
-A transition the table does not define is an error, not a silent rewrite.
-Failure is legal from anywhere except `Unloaded`: the point is to stop a broken
+The worker is a dedicated thread with a current-thread Tokio runtime. It sleeps
+50 ms when the queue is empty; it does not busy-spin.
+
+## 22.5 Who can consume
+
+Only an applied Extism package that declares the point. "Applied" matters: a
+package installed but unapplied (missing grant, manual, failed dependency)
+receives nothing, because it has no runtime in the host's target list.
+
+A package may declare a point and still fail delivery if it does not export
+`bsh_hook`. The host logs the runtime error; it does not pretend the observer
+works.
+
+---
+
+# 23. Declaring and authorizing hooks
+
+## 23.1 Manifest
+
+```toml
+[runtime]
+kind = "extism"
+entry = "plugin.wasm"
+
+[capabilities]
+required = ["hooks.observe", "extension.storage", "ui.panels"]
+
+[contributes]
+panels = ["inspector"]
+tools = ["stats"]
+hooks = ["model.request", "model.response", "http.exchange"]
+```
+
+Rules enforced by validation:
+
+1. every point is one of the five;
+2. no duplicates;
+3. at most 32 points (the list is a declaration, not a subscription storm);
+4. `runtime.kind` is `extism` in this build;
+5. `hooks.observe` is in `required`, not merely `optional`.
+
+Each rule exists for a reason:
+
+- unknown points would silently never fire;
+- duplicates would deliver twice per batch;
+- non-Extism cannot receive in this build;
+- `hooks.observe` in `required` makes activation fail if the grant is missing,
+  instead of loading a package whose hooks can never be delivered.
+
+## 23.2 Grant
+
+`hooks.observe` is **high** risk. Defaults:
+
+| Trust | Default |
+|---|---|
+| builtin | allow |
+| verified | explicit grant |
+| community / local | explicit grant |
+
+```bash
+$BSH ext grant com.example.extism-hook hooks.observe --scope any
+```
+
+There is no finer scope for a hook today. If a future version adds per-point or
+per-body scopes, the manifest shape should not need to change.
+
+## 23.3 Lifecycle
+
+Hooks are installed with the agent build, after the extension platform has
+applied its packages:
+
+- if no applied package declares a hook point, no BOS agent hook is registered;
+- if a package is installed later, the next agent build sees it;
+- if the package is unapplied, its runtime is absent from the target list and
+  delivery stops.
+
+This avoids serializing hook context on every model/tool call for a host with
+no observers.
+
+## 23.4 Validation lab
+
+Try each failure:
+
+1. `hooks = ["model.telepathy"]` → unknown point.
+2. `hooks = ["model.request", "model.request"]` → duplicate.
+3. `kind = "process"` + hooks → "delivered by the extism runtime".
+4. valid hooks but no `hooks.observe` in `required` → capability error.
+5. `hooks.observe` in `optional` only → still an error; required is the rule.
+
+The error field starts with `contributes.hooks`. Read that first; the sentence
+explains which of the five rules failed.
+
+---
+
+# 24. The guest contract
+
+## 24.1 One call, one batch
+
+The host calls the guest export with:
+
+```json
+{
+  "point": "model.request",
+  "batch": [
+    { "agent": "assistant", "data": { "...": "..." } },
+    { "agent": "assistant", "data": { "...": "..." } }
+  ]
+}
+```
+
+The batch is at most 64 events, all for the same point. A guest should:
+
+1. parse the envelope;
+2. iterate `batch`;
+3. do bounded work per event (count, hash, append a small record);
+4. return `{"action":"continue"}` (the host ignores the action for observe, but
+   a valid JSON reply keeps the call healthy).
+
+A guest that returns an empty string or invalid JSON makes `call` fail to parse;
+the host logs it. Return an object.
+
+## 24.2 Model request payload
+
+The event is wrapped in `{agent, data}`; the `data` map carries the hook
+context. `data.request` is a JSON string produced by the agent:
+
+```json
+{
+  "agent": "assistant",
+  "data": {
+    "model": "gpt-4o",
+    "request_id": "req-1790000000000-1",
+    "request": "{\"request_id\":\"req-1790000000000-1\",\"model\":\"gpt-4o\",\"api_mode\":\"chat\",\"temperature\":0.7,\"max_tokens\":null,\"prompt_bytes\":1834,\"messages\":[{\"role\":\"system\",\"bytes\":1200,\"preview\":\"You are...\"}]}"
+  }
+}
+```
+
+The preview is 512 characters per message; at most the last 48 messages are
+included. The full prompt is not present. That is deliberate: a hook is a
+capture seam, not a prompt dump.
+
+## 24.3 Model response payload
+
+Complete:
+
+```json
+{
+  "agent": "assistant",
+  "data": {
+    "request_id": "req-...",
+    "response_type": "react",
+    "response": "{\"response_type\":\"react\",\"usage\":{\"prompt_tokens\":120,\"completion_tokens\":40,\"total_tokens\":160}}"
+  }
+}
+```
+
+Stream:
+
+```json
+{
+  "agent": "assistant",
+  "data": {
+    "request_id": "req-...",
+    "response_type": "stream",
+    "response_bytes": "320",
+    "response_text": "...",
+    "had_tool_call": "false"
+  }
+}
+```
+
+The stream path receives the accumulated text at the end of the step, not each
+token. A per-token hook would be a different point with different backpressure.
+
+## 24.4 Tool payloads
+
+Before:
+
+```json
+{"agent":"assistant","data":{"tool_name":"hello__echo","call_id":"call-1","tool_args":"{\"text\":\"hi\"}"}}
+```
+
+After:
+
+```json
+{"agent":"assistant","data":{"tool_name":"hello__echo","call_id":"call-1","tool_result":"{\"text\":\"hi\"}"}}
+```
+
+`tool_args` and `tool_result` are JSON strings; a result can be large, and is
+capped at 8 KiB by the host before delivery.
+
+## 24.5 HTTP exchange payload
+
+`http.exchange` is not wrapped in `data`; it is the event itself:
+
+```json
+{
+  "source": "llm",
+  "request_id": "req-...",
+  "method": "POST",
+  "host": "api.deepseek.com",
+  "path": "/chat/completions",
+  "status": 200,
+  "request_bytes": 1834,
+  "response_bytes": 0,
+  "content_type": "text/event-stream",
+  "ttfb_ms": 430,
+  "total_ms": 438,
+  "error": null
+}
+```
+
+- `source` is `llm` or `llm.models` for the vendor tap, or a package id for a
+  WASM/Extism `fetch`;
+- `request_id` joins the model observations; it is `null` for an extension
+  fetch that is not a model call;
+- `response_bytes` is `content-length` when present, often 0 for a stream;
+- no headers, no body; URL query is not copied into `path`.
+
+## 24.6 Limits and redaction
+
+| Bound | Value |
+|---|---|
+| queue | 1024 events |
+| batch | 64 |
+| field | 8 KiB |
+| worker poll | 50 ms |
+| retries | none; a failed call is logged |
+
+Redaction masks `sk-`, `ghp_` and `Bearer ` tokens. It does not mask arbitrary
+business data. A tool result that contains a customer name or a file path is
+delivered as-is (up to the cap). Treat the observer as a trusted reader: the
+grant is the privacy boundary, not the pattern.
+
+## 24.7 Guest checklist
+
+- [ ] export `bsh_hook` if any point is declared;
+- [ ] parse `{point, batch}`, not a single event;
+- [ ] handle an empty batch and an unknown point;
+- [ ] return valid JSON;
+- [ ] do bounded work; no unbounded append;
+- [ ] use storage for counters, not memory, if the panel must survive reopen.
+
+---
+
+# 25. Build an observer end to end
+
+This chapter follows `examples/extensions/extism-hook`, a small observer that
+counts model and HTTP events and exposes the counts through a tool and a panel.
+
+## 25.1 Manifest
+
+```toml
+schema_version = "1.0"
+
+[extension]
+id = "com.example.extism-hook"
+name = "Extism Hook Observer"
+version = "1.0.0"
+description = "Consumes BSH observe hooks and counts them per point"
+
+[compatibility]
+bsh = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+
+[runtime]
+kind = "extism"
+entry = "plugin.wasm"
+startup = "on-demand"
+
+[capabilities]
+required = ["hooks.observe", "extension.storage", "agent.tools.register", "ui.panels"]
+
+[contributes]
+tools = ["stats"]
+panels = ["inspector"]
+hooks = ["model.request", "model.response", "http.exchange"]
+```
+
+## 25.2 Guest
+
+The guest keeps a JSON object in storage, keyed by point. It uses the
+`bsh_host` envelope helper from chapter 12; the abbreviated part is:
+
+```rust
+fn read_counts() -> Value {
+    host(json!({"op": "storage_get", "key": "counts"}))
+        .and_then(|value| value.get("text").cloned())
+        .and_then(|text| text.as_str().and_then(|text| serde_json::from_str(text).ok()))
+        .unwrap_or_else(|| json!({}))
+}
+
+#[plugin_fn]
+pub fn bsh_hook(input: String) -> FnResult<String> {
+    let payload: Value = serde_json::from_str(&input).unwrap_or(Value::Null);
+    let point = payload["point"].as_str().unwrap_or("unknown");
+    let count = payload["batch"].as_array().map(|b| b.len() as u64).unwrap_or(1);
+
+    let mut counts = read_counts();
+    if let Some(object) = counts.as_object_mut() {
+        let current = object.get(point).and_then(Value::as_u64).unwrap_or(0);
+        object.insert(point.to_string(), json!(current + count));
+        let _ = host(json!({
+            "op": "storage_set",
+            "key": "counts",
+            "data": counts.to_string(),
+        }));
+    }
+    Ok(json!({"action": "continue"}).to_string())
+}
+```
+
+The panel reads the same counts and renders text lines; the `stats` tool returns
+the JSON. Neither surface is special: they are ordinary Extism exports.
+
+## 25.3 Build
+
+```bash
+cd examples/extensions/extism-hook/guest
+cargo build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/bsh_extism_hook.wasm ../plugin.wasm
+cd -
+```
+
+The committed `plugin.wasm` is built this way. Rebuild after editing the guest;
+the host hashes the new bytes.
+
+## 25.4 Install and grant
+
+```bash
+$BSH --root /tmp/bsh-hook ext install examples/extensions/extism-hook
+$BSH --root /tmp/bsh-hook ext grant com.example.extism-hook hooks.observe --scope any
+$BSH --root /tmp/bsh-hook ext grant com.example.extism-hook extension.storage --scope any
+$BSH --root /tmp/bsh-hook ext grant com.example.extism-hook agent.tools.register --scope any
+$BSH --root /tmp/bsh-hook ext grant com.example.extism-hook ui.panels --scope any
+$BSH --root /tmp/bsh-hook ext info com.example.extism-hook
+```
+
+`APPLIED` must be `yes`. If it is not, the missing grant is named.
+
+## 25.5 Run the agent
+
+Open a workspace and send one turn. The agent calls the model; the observer's
+worker receives `model.request` and `model.response` batches. Open the
+**Observe hooks** panel or call the `stats` tool:
+
+```json
+{"model.request":2,"model.response":2,"http.exchange":2}
+```
+
+Two model calls in one turn are normal: a tool step and a final answer. The
+counts are batches, not tokens.
+
+## 25.6 Test without an agent
+
+The host test constructs the runtime, calls `hook` twice and reads the panel:
+
+```bash
+cargo test -p bsh --lib -- extension::runtime::extism::tests::observe_hooks_reach_an_extism_plugin
+```
+
+It asserts `model.request: 2` and `http.exchange: 1` in the rendered panel. This
+is the fastest end-to-end check of a guest: no LLM, no UI, no grants UI.
+
+## 25.7 What this example deliberately does not do
+
+- no body capture;
+- no per-request timeline (only counts);
+- no redaction beyond the host's patterns;
+- no attempt to deny a call (observe cannot);
+- no cross-process HTTP capture (process/MCP children are not tapped).
+
+Extend it by storing per-`request_id` records (chapter 26), not by adding
+unbounded strings to the counter object.
+
+---
+
+# 26. Capture cookbook
+
+## 26.1 Join one model call
+
+Given `request_id`, collect:
+
+1. `model.request` with the same id — model, prompt bytes, message roles;
+2. `model.response` with the same id — usage, response type;
+3. `http.exchange` with the same id — status, sizes, TTFB.
+
+A retry or fallback produces multiple `http.exchange` records with one id; sort
+by `timestamp` (the batch does not add one, so record arrival time in the guest).
+
+## 26.2 A minimal timeline schema
+
+```json
+{
+  "request_id": "req-...",
+  "started_ms": 1790000000123,
+  "model": "deepseek-chat",
+  "prompt_bytes": 1834,
+  "http": [{"status": 200, "ttfb_ms": 430, "bytes": 0}],
+  "usage": {"prompt_tokens": 120, "completion_tokens": 40},
+  "response_type": "stream"
+}
+```
+
+Store one record per id in extension storage under
+`timeline/<request_id>.json`, and a bounded index of recent ids. Do not store
+the full prompt or answer; store sizes and hashes unless the reader explicitly
+enables bodies (not available yet).
+
+## 26.3 Tool audit
+
+`tool.before` + `tool.after` with the same `call_id` form a duration pair:
+
+- before carries the arguments;
+- after carries the result;
+- the host's `tool.completed` event carries the public counterpart.
+
+If you need latency, record arrival time in the guest; the payload has no
+timestamp. If you need the tool's own timing, use the event's timestamp, not the
+hook's.
+
+## 26.4 HTTP timeline
+
+- `source` tells you whether this was an LLM vendor call or a package fetch;
+- `host`/`path` are safe to store; the query is dropped;
+- `status` is absent on a transport error; `error` then carries the message;
+- `response_bytes` is 0 for a stream or a chunked response without
+  content-length; do not treat 0 as "no body".
+
+## 26.5 Redaction and privacy
+
+The host masks obvious credentials before delivery. That is not enough for a
+production observer:
+
+- decide what you need: counts, timings, sizes, hashes, or text;
+- if you store text, bound it and encrypt at rest if the data is sensitive;
+- never upload a hook payload by default; make it an explicit reader action;
+- log denials and dropped counts, not payloads;
+- remember that `tool_args` can contain a customer's data even when no
+  credential pattern matches.
+
+## 26.6 Quotas in the guest
+
+The host can deliver at most 64 events per call; a busy turn can produce many
+batches. A guest that writes storage per event will be slow and may hit the
+worker's queue. Batch inside the guest:
+
+1. merge counters in memory for the call;
+2. write once at the end;
+3. keep the stored record bounded (for example, last 200 request ids).
+
+## 26.7 Recipes
+
+| Want | Observe | Do not |
+|---|---|---|
+| Turn cost | `model.response` usage | parse prompts |
+| Latency | `http.exchange` ttfb/total | infer from model text |
+| Tool usage | `tool.before/after` | scrape logs |
+| Prompt size | `model.request` prompt_bytes | store full messages |
+| Wire failures | `http.exchange` status/error | retry inside the hook |
+| Per-call timeline | join by request_id | assume global order |
+
+---
+
+# 27. Debugging hooks
+
+| Symptom | Check |
+|---|---|
+| no hook calls at all | is any package applied with a declared point? `ext list` |
+| package applied, no calls | does the manifest declare the point and `hooks.observe`? |
+| calls fail | does the guest export `bsh_hook`? look at package logs |
+| counts never change | is the guest returning valid JSON? is storage granted? |
+| events dropped | queue 1024; a slow guest or a burst; drop count is internal and not yet in metrics |
+| duplicate observations | retries/fallbacks share request_id; dedupe by id + source |
+| no model events | the agent build did not install hooks; check applied packages before the turn |
+| no HTTP events from a process | process HTTP is not tapped; use the child's logs/proxy |
+| panel empty | panel document failed validation, or the runtime did not return one |
+
+Five habits:
+
+1. Run the runtime test first; it removes the agent and the UI.
+2. Read `audit.jsonl` for a denied `hooks.observe` at activation.
+3. Read the package log for a guest error; a failed hook is not a failed turn.
+4. Check `APPLIED` before debugging the payload.
+5. For a missing HTTP record, confirm the source: only the vendor tap and the
+   WASM/Extism `fetch` bridge produce `http.exchange`.
+
+---
+
+
+# 28. Testing
+
+The framework gives you four levels. Use all four; each catches a different
+class of mistake.
+
+## 28.1 The four levels
+
+| Level | Command | Catches | Does not catch |
+|---|---|---|---|
+| schema | `ext validate` | manifest, ids, paths, references | runtime behavior |
+| contributions | `ext test` | missing/invalid tool, panel, prompt files | runtime behavior |
+| tool | `ext mock` | descriptor + one tool's output | grants, agent, UI |
+| host | runtime tests / E2E | policy, lifecycle, transport, UI document | your production data |
+
+## 28.2 `ext test` versus `ext validate`
+
+`validate` parses the manifest and checks semantic rules. `test` additionally
+loads every declared contribution file and validates its schema. A panel with a
+node type the renderer does not know passes `validate` but fails `test`.
+
+```bash
+$BSH ext validate examples/extensions/allinone
+$BSH ext test examples/extensions/allinone
+```
+
+## 28.3 `ext mock`
+
+`mock` builds a permissive in-memory host and runs one tool. It is the fastest
+way to check the tool's return shape:
+
+```bash
+$BSH ext mock examples/extensions/hello echo '{"text":"hi"}'
+$BSH ext mock examples/extensions/process-echo echo '{"text":"hi"}'
+$BSH ext mock examples/extensions/wasm-echo echo '{"text":"hi"}'
+$BSH ext mock examples/extensions/extism-echo echo '{"text":"hi"}'
+$BSH ext mock examples/extensions/mcp-echo echo '{"text":"hi"}'
+```
+
+It does not enforce capabilities, does not write state and does not exercise the
+agent. A tool that works here can still be denied at runtime.
+
+## 28.4 Host tests
+
+The runtime test modules are the reference for transport behavior:
+
+```bash
+cargo test -p bsh --lib -- extension::runtime::process
+cargo test -p bsh --lib -- extension::runtime::wasm
+cargo test -p bsh --lib -- extension::runtime::extism
+cargo test -p bsh --lib -- extension::runtime::mcp
+cargo test -p bsh --lib -- extension::host
+cargo test -p bsh --lib -- extension::hooks
+```
+
+They cover handshake refusal, timeouts, output caps, progress, the bridge
+envelope, storage, panels, hook batching and the Extism observer end to end.
+
+## 28.5 A conformance matrix for your package
+
+Write this down before release:
+
+| Surface | Validated | Tested | Notes |
+|---|---|---|---|
+| manifest | `validate` | CI | |
+| each tool | `mock` | one happy + one error | |
+| panel | `test` | opened once | revision action |
+| command | `test` | invoked once | |
+| prompt/context | `test` | appears in turn | |
+| skill | `test` | `load_skill` | |
+| hooks | `validate` | observer test | only Extism |
+| grants | `doctor` | denied path | |
+
+## 28.6 CI recipe
+
+```bash
+cargo fmt --all -- --check
+cargo clippy -p bsh --all-targets --no-deps -- -D warnings
+cargo test -p bsh --lib -- extension::
+cargo build -p bsh
+./target/debug/bsh ext validate examples/extensions/hello
+./target/debug/bsh ext test examples/extensions/hello
+./target/debug/bsh ext mock examples/extensions/hello echo '{"text":"ci"}'
+```
+
+The process runtime tests spawn children. In a nested sandbox that denies
+`sandbox-exec`, those tests fail for environmental reasons; the other extension
+tests still pass. Record the known-environment failures instead of hiding them.
+
+## 28.7 Test data
+
+- use a temporary `--root` per test;
+- do not depend on the developer's `~/.bos`;
+- pin a package hash when testing the store;
+- clean `extension-data` between tests unless the test is about persistence;
+- for a hook observer, call `runtime.hook` directly instead of driving an LLM.
+
+---
+
+# 29. Debugging playbook
+
+## 29.1 The first five commands
+
+```bash
+$BSH ext list
+$BSH ext info <id>
+$BSH ext doctor
+$BSH ext logs <id>
+$BSH ext metrics
+```
+
+`list` tells you state + applied. `info` tells you why. `doctor` tells you
+whether the store, hashes, dependencies and policy agree. `logs` shows audit and
+runtime output. `metrics` shows calls, events and subscriptions.
+
+## 29.2 Symptom to cause
+
+| Symptom | First check | Usual cause |
+|---|---|---|
+| not in `list` | root and install path | installed elsewhere, or install failed |
+| `failed` | `info` last error | missing grant, bad manifest, handshake |
+| `active` but `APPLIED=no` | info's reason | required capability denied, manual, dependency |
+| tool missing from agent | applied, capability, descriptor | package unapplied or tool not declared |
+| tool call denied | audit + grant scope | argument name not `path`/`url`/`secret` |
+| tool times out | `max_execution_ms`, child logs | child blocked or handshake slow |
+| panel blank | logs + `ext test` | invalid view, missing asset, stale revision |
+| events not arriving | subscription, queue, topic | queue full, wildcard misuse, not applied |
+| hooks not arriving | applied + declared point + export | missing grant, missing `bsh_hook` |
+| hash mismatch in doctor | install mutation | edited installed files; reinstall |
+
+## 29.3 Read the audit
+
+```bash
+tail -n 20 ~/.bos/bsh/extensions/logs/extensions/audit.jsonl
+```
+
+Each line answers: which extension, which capability, allowed, scope, trust,
+reason. A denial without a line is a host bug; report it with the call's
+correlation id.
+
+## 29.4 Blank panel
+
+1. Is the package applied?
+2. Did `ext test` accept the panel file?
+3. Does the runtime's `panel` export return a document (dynamic panels)?
+4. Did the renderer reject a node or a limit? Look for a validation error in the
+   host log, not in the package log.
+5. Is the action revision stale?
+
+## 29.5 A failing handshake
+
+The process handshake has a 10s deadline. A server that prints a banner to
+stdout before its JSON breaks the protocol; a server that forgets the token is
+killed. Test the server by hand:
+
+```bash
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1.0","token":"t"}}' | python3 server.py
+```
+
+The first line must be a JSON response with the same token.
+
+## 29.6 Debugging hooks without an agent
+
+Call the runtime directly:
+
+```rust
+runtime.hook("model.request", json!({
+    "point": "model.request",
+    "batch": [{"agent": "test", "data": {"request_id": "req-1"}}]
+})).await?;
+let panel = runtime.panel("inspector").await?;
+```
+
+That is exactly what the observer test does. If it works here and not in a turn,
+the problem is installation/application, not the guest.
+
+---
+
+# 30. Store, integrity, signing and dependencies
+
+## 30.1 The store
+
+See chapter 3 for the tree. Two rules matter operationally:
+
+- installed code is immutable; an upgrade is a new version directory;
+- `extension-data` survives uninstall unless `--purge-data`.
+
+## 30.2 Hash and tampering
+
+The hash covers relative path, byte length and content digest, sorted, with
+`.git`, `.jj`, `target`, `node_modules` excluded and `package.sig` excluded
+from the hash it signs. `doctor` recomputes it and reports a mismatch.
+
+```bash
+$BSH ext hash examples/extensions/hello
+$BSH ext doctor
+```
+
+## 30.3 Sign and trust
+
+```bash
+$BSH ext keygen acme --out /tmp/acme.key
+$BSH ext sign /tmp/hello-release --publisher acme --key /tmp/acme.key
+$BSH ext trust acme <public-key>
+$BSH ext verify /tmp/hello-release
+```
+
+The signature is Ed25519 over `bsh-package-v1`, id, exact version and package
+hash. Install behavior:
+
+- valid signature by a trusted publisher → trust `verified`;
+- valid signature by an untrusted publisher → warning, trust remains local;
+- invalid signature → installation refused.
+
+A hash proves integrity. Only a verified signature proves who produced the
 package.
 
-Persistence lives in `extension-state/state.toml`: the enabled flag, last state,
-last error and last start time. Three consequences worth knowing:
+## 30.4 Dependencies and the lock
 
-- an **upgrade preserves** the enabled flag; installing v2 does not re-enable a
-  package the reader switched off;
-- a **corrupt** state document is treated as disabled, not as enabled: a broken
-  file must not switch code back on;
-- a package that was applied and then stops being applied publishes
-  `extension.unloaded`.
-
-## 21.1 Startup policies
-
-```text
-on-startup          warmed right after the host loads it (detached thread)
-on-demand           descriptors load now; the runtime starts on first call
-on-workspace-open   only with an open workspace
-manual              never applied automatically
+```bash
+$BSH ext reproduce extension-state/lock.toml
+$BSH ext versions <id>
+$BSH ext rollback <id>
 ```
 
-A package can be enabled and still not applied: manual, disabled, missing a
-required grant, failed dependency resolution. The status row says which.
+The lock records format, host, extension API, and per package the exact version,
+hash, source and resolved dependency versions. It is sorted and deterministic.
+Reproduction covers Git/registry remotes and the recorded local source path of a
+directory install.
 
-**See also:** [Lifecycle §7](bsh-extension-standard.md#7-lifecycle).
+## 30.5 Upgrade, rollback, quarantine
 
----
-
-# 22. Store, integrity and signing
-
-## 22.1 Where things live
-
-```text
-~/.bos/bsh/extensions/
-  installed/<id>/<version>/     immutable package code
-  staging/                      an install in progress
-  cache/                        downloaded packages
-  quarantine/                   disabled or failed packages
-  extension-data/<id>/          business data (survives uninstall unless purged)
-  extension-state/
-    registry.toml               installed versions, hashes, sources
-    state.toml                  enabled flags, last state, last error
-    grants.toml                 capability grants
-    lock.toml                   the resolved dependency set
-  logs/extensions/
-    audit.jsonl                 capability decisions
-    <id>/                       package logs
-```
-
-Set `BSH_EXTENSION_ROOT` to move the root.
-
-## 22.2 The hash
-
-SHA-256 over each file's relative path, byte length and content digest, in sorted
-path order. Directory metadata, timestamps and modes are excluded. `.git`,
-`.jj`, `target` and `node_modules` are excluded; so is `package.sig`, because a
-signature cannot cover itself.
-
-## 22.3 Install and verify
-
-```text
-source -> validate -> copy to staging -> hash -> rename into installed/
-```
-
-An existing id/version is refused; an upgrade is a new version directory.
-Verification does not stop at install: on every load the host recomputes the
-hash, compares it with `registry.toml`, and re-verifies a signature against
-`extension-state/trust.toml`. A mismatch refuses activation (and the doctor
-reports it); a removed publisher demotes the trust level.
-
-## 22.4 Signatures
-
-```text
-bsh ext keygen example --out keys
-bsh ext sign   ./my-extension --publisher example --key keys/example.key
-bsh ext verify ./my-extension
-bsh ext trust  example <public-key>        # add a publisher
-bsh ext untrust example                    # remove one
-bsh ext publishers
-```
-
-The signature is Ed25519 over `bsh-package-v1`, the id, the exact version and the
-hash, stored in `package.sig`. A valid signature by a trusted publisher installs
-as `verified`; an untrusted publisher is recorded as a warning; an invalid
-signature refuses installation.
-
-## 22.5 Dependencies and reproduction
-
-```toml
-[dependencies]
-"com.example.base" = "^1.0"
-```
-
-There is exactly one selected version per id. Resolution is depth-first,
-dependencies before dependents, highest matching version; cycles and missing ids
-are named. A disabled package is not a candidate, even as a dependency.
-
-The lockfile records format, host, extension API, and for each package its id,
-exact version, hash, source and resolved dependencies. `bsh ext reproduce <lock>`
-re-fetches exactly those bytes: an installed directory with the right name but
-the wrong hash is an error, not "present".
-
-**See also:** [Store and locking §12](bsh-extension-standard.md#12-store-integrity-and-locking).
-
----
-
-# 23. The CLI by task
-
-The CLI is the first consumer of the same host the desktop build uses. Global
-options, `--root <path>` and `--json`, are accepted before or after the command.
-
-## 23.1 Author
-
-```text
-bsh ext new <id> [--dir <path>] [--force]
-bsh ext validate <path>
-bsh ext hash <path>
-bsh ext build <path> [--out <dir>]      # alias: package
-bsh ext test <path>
-bsh ext mock <path> [tool] [json]
-```
-
-`validate` exits 1 on an invalid manifest **or** a missing/unparseable
-contribution file, for every runtime kind. `mock` runs one tool against a
-permissive host; it proves the runtime contract, not the policy.
-
-## 23.2 Install and inspect
-
-```text
-bsh ext install <path|archive|git+url> [--registry <name|url> <id>[@version]]
-bsh ext uninstall <id> [--purge-data]
-bsh ext list [--json]
-bsh ext info <id> [--json]
-bsh ext enable <id> | disable <id>
-bsh ext versions <id>
-bsh ext doctor [--json]
-```
-
-## 23.3 Grant and decide
-
-```text
-bsh ext grant <id> <capability> [--scope <scope>] [--note <text>]
-bsh ext revoke <id> <capability>
-bsh ext capabilities
-```
-
-## 23.4 Maintain
-
-```text
-bsh ext reproduce <lock>
-bsh ext update <path>
-bsh ext rollback <id>
-bsh ext retry <id>
-bsh ext quarantine <id> [--reason <text>]
-bsh ext config <id> [set <json|file>|schema]
-bsh ext logs <id>
-bsh ext metrics
-```
-
-## 23.5 Providers, languages and integrations
-
-```text
-bsh ext providers
-bsh ext languages
-bsh ext integrations
-bsh ext language-check <id> <language> <path>
-bsh ext integrate <id> <integration> [json]
-```
-
-## 23.6 Keys, registries, market
-
-```text
-bsh ext keygen/sign/verify/trust/untrust/publishers
-bsh ext registry add|list|remove/search
-bsh ext market [query]
-bsh ext market install <id>
-```
-
-Exit codes: 0 success, 1 failure, 2 usage. `doctor` returns 1 when an
-error-severity issue exists.
-
-**See also:** [CLI §13](bsh-extension-standard.md#13-diagnostics-and-cli),
-[appendix E](#appendix-e-cli-index).
-
----
-
-# 24. Testing
-
-Test in layers, because each layer proves a different thing.
-
-| Layer | Proves | Command |
+| Action | Command | Effect |
 |---|---|---|
-| Validation | bytes and declarations | `bsh ext validate` |
-| Mock | runtime contract, no policy | `bsh ext mock` |
-| Host | store, hash, lifecycle, grants | `install` + `info` |
-| Agent build | tools/commands/prompts/contexts/skills registered | agent tests |
-| UI | panel renders and routes an action | GPUI test |
-| Events | publish reaches a real runtime | host E2E test |
-| Market | index → install → community status | extension E2E |
-| Security | denial, scope, traversal, quotas | capability/process tests |
-| Shutdown | children, threads, subscriptions released | host shutdown test |
+| upgrade | `ext update <path>` | install new version and activate |
+| rollback | `ext rollback <id>` | activate previous version |
+| retry | `ext retry <id>` | clear failure and reload |
+| quarantine | `ext quarantine <id> --reason ...` | move code out, disable |
+| uninstall | `ext uninstall <id> [--purge-data]` | remove, keep data by default |
 
-The BSH-side E2E suite runs against the real store and host:
-
-```text
-cargo test -p bsh --lib extension::e2e
-```
-
-Write these tests for your own package:
-
-```text
-undeclared topic publish/subscribe
-path traversal and absolute path
-domain outside the grant
-process executable/args outside the grant
-oversized result/line/event
-malformed request/response
-stale panel action revision
-missing or revoked capability
-cancellation and timeout
-upgrade with data retained
-```
-
-CI runs the extension suite on Ubuntu and Windows; use
-`cargo clippy -p bsh --lib --tests -- -D warnings` before pushing.
-
-**See also:** [Testing strategy §17](BSH_Extension_Framework_Design.md#17-testing-strategy).
+Do not "fix" a bad install by editing files in `installed/`. The hash will
+disagree with the registry, and doctor will report tampering.
 
 ---
 
-# 25. Debugging
+# 31. The CLI by task
 
-## 25.1 A loop that finds almost everything
+Global options: `--root <path>` and `--json`. Exit codes: 0 success, 1 failure,
+2 usage.
 
-```text
-1. bsh ext validate <path>     manifest and contribution files
-2. bsh ext info <id>           state, error, grants, trust, applied
-3. bsh ext logs <id>           audit decisions and runtime logs
-4. bsh ext mock <path> <tool>  runtime only
-5. bsh ext doctor              store, hashes, dependencies, policy
-6. only then: the panel document and the action ids
+## 31.1 Author
+
+| Task | Command |
+|---|---|
+| scaffold | `ext new com.example.thing --dir ./thing` |
+| validate | `ext validate ./thing` |
+| test contributions | `ext test ./thing` |
+| run one tool | `ext mock ./thing tool '{"arg":1}'` |
+| hash | `ext hash ./thing` |
+| package | `ext build ./thing --out dist` |
+
+## 31.2 Inspect
+
+| Task | Command |
+|---|---|
+| list | `ext list` / `ext list --json` |
+| one package | `ext info <id>` / `--json` |
+| capabilities | `ext capabilities` |
+| providers | `ext providers` |
+| languages | `ext languages` |
+| integrations | `ext integrations` |
+| metrics | `ext metrics` |
+| health | `ext doctor` / `--json` |
+
+## 31.3 Install and decide
+
+| Task | Command |
+|---|---|
+| install directory | `ext install ./thing` |
+| install archive | `ext install dist/thing-1.0.0.tar.gz` |
+| install Git | `ext install git+https://...` |
+| grant | `ext grant <id> <cap> --scope <scope> [--note ...]` |
+| revoke | `ext revoke <id> <cap>` |
+| enable/disable | `ext enable <id>` / `ext disable <id>` |
+| retry | `ext retry <id>` |
+| quarantine | `ext quarantine <id> --reason ...` |
+
+## 31.4 Maintain
+
+| Task | Command |
+|---|---|
+| versions | `ext versions <id>` |
+| rollback | `ext rollback <id>` |
+| reproduce | `ext reproduce <lock>` |
+| logs | `ext logs <id>` |
+| config | `ext config <id> [set ...|schema]` |
+| uninstall | `ext uninstall <id> [--purge-data]` |
+
+## 31.5 Publish
+
+| Task | Command |
+|---|---|
+| keygen | `ext keygen <publisher> --out <path>` |
+| sign | `ext sign <path> --publisher <name> --key <file-or-base64>` |
+| verify | `ext verify <path>` |
+| trust | `ext trust <publisher> <public-key>` |
+| registry | `ext registry add|list|remove ...` |
+| search | `ext search [query] [--registry <name>]` |
+| market | `ext market [query]`, `ext market install <id>` |
+
+## 31.6 Scripting
+
+Use `--json` and exit codes:
+
+```bash
+if ! $BSH ext validate ./thing >/tmp/validate.txt 2>&1; then
+  cat /tmp/validate.txt
+  exit 1
+fi
+$BSH ext info com.example.thing --json | jq '.applied'
 ```
 
-## 25.2 Symptom to cause
-
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| status `resolved`, never `active` | required grant missing or scope mismatch | read the error; grant the exact scope |
-| "requires an explicit grant" | default policy refuses this trust/risk pair | run the grant command it prints |
-| "does not cover this call" | a grant exists with a narrower scope | name `path`/`url`/`secret`, or widen deliberately |
-| tool not found | model-facing name mismatch | use `<last-id>__<tool-id>` |
-| panel action "not found" | action is neither a declared tool nor a command | declare it, or route it as a tool |
-| stale action refused | the view moved on | return the new document; the host applies revision + 1 |
-| context never appears | `paths:` does not match the open workspace | use workspace-relative globs |
-| skill not listed | not declared, or `SKILL.md` missing | declare it and run `validate` |
-| provider absent | descriptor invalid, or capability denied | validate the JSON; check `agent.models.provide` |
-| language check "not declared" | wrong descriptor id | use the id, not the display name |
-| market empty | no cached index | run `bsh ext market` to refresh |
-| market install refused | path, hash, identity or signature | read the inline error; validate the package |
-| process exits during handshake | token not echoed, or a missing launcher | echo the nonce; check the entry |
-| "there is no reactor running" | tokio spawned from the GPUI thread | use `extension::run_on_tokio` |
-| "cannot update Shell while already updated" | nested `Entity::update` in a listener | mutate `this` directly |
-| image renders nothing | `https://` source | use `asset/…` inside the package |
-
-## 25.3 When the UI is blank
-
-- does the document validate? `bsh ext validate` reports panel errors;
-- is the package applied, not merely installed?
-- is the location right? a right panel does not appear in the center tab;
-- is the theme token the same as the background?
-- is the control from an older revision?
-
-**See also:** [Diagnostics §13](bsh-extension-standard.md#13-diagnostics-and-cli).
+`validate` returns 1 on an invalid manifest or a missing/unparseable
+contribution file. `doctor` returns 1 when an error-severity issue exists.
 
 ---
 
-# 26. Packaging and publishing
+# 32. Packaging, release and market
 
-## 26.1 Build
+## 32.1 Build
 
-```text
-bsh ext hash ./my-extension
-bsh ext package ./my-extension --out dist
+```bash
+$BSH ext build examples/extensions/hello --out /tmp/bsh-dist
 ```
 
-The archive contains the package root; VCS directories, build output,
-`node_modules` and symlinks are excluded.
-
-## 26.2 Sign
+Expected:
 
 ```text
-bsh ext keygen example --out keys
-bsh ext sign ./my-extension --publisher example --key keys/example.key
-bsh ext verify ./my-extension
+built /tmp/bsh-dist/com.example.hello-1.0.0.tar.gz
+hash:  6b108662c25eb98a4bacda8aa873fdcb1a6a1428be1c372932e5f816d4c32176
 ```
 
-Publish the public key through a channel your readers trust, then
-`bsh ext trust example <public-key>`.
+The archive contains the package directory, not the store metadata. The hash in
+the output is the package hash; record it in the release notes.
 
-## 26.3 A Git market
+## 32.2 Sign
 
-The provider is a repository with an `index.json` at its root and packages under
-it:
-
-```text
-provider/
-  index.json
-  packages/hello/extension.toml
-  packages/hello/tools/echo.json
+```bash
+# Sign the package directory before building: package.sig lives inside it.
+$BSH ext sign examples/extensions/hello --publisher acme --key /tmp/acme.key
+$BSH ext verify examples/extensions/hello
+$BSH ext build examples/extensions/hello --out /tmp/bsh-dist
 ```
+
+`package.sig` is excluded from the hash it signs, so signing does not change
+the hash. The signature covers id, exact version and package hash, not the
+archive bytes.
+
+## 32.3 A Git market
+
+The market provider is a Git repository with `index.json` at its root:
 
 ```json
 {
   "schema_version": 1,
   "extensions": [
-    {"id":"com.example.hello","name":"Hello","version":"1.0.0",
-     "description":"hello","path":"packages/hello"}
+    {
+      "id": "com.example.hello",
+      "name": "Hello",
+      "version": "1.0.0",
+      "description": "A minimal declarative extension",
+      "path": "packages/hello",
+      "hash": "6b1086..."
+    }
   ]
 }
 ```
 
-The host checks the entry's path is package-relative, installs the directory the
-entry names, and verifies that the installed id, version and (when declared)
-hash match the entry. A private provider uses the same layout; point
-`BSH_EXTENSION_MARKET` at it, or set the URL in Settings → Extensions.
+Installing an entry copies the directory named by `path` into the normal hashed
+store with community trust, so the same lifecycle, policy and audit apply. The
+market URL comes from `BSH_EXTENSION_MARKET`, the reader's setting, or the
+official provider, in that order.
 
-## 26.4 An HTTP registry
+## 32.4 An HTTP registry
 
-Serve an index with `format` and `packages` entries (id, version, url, sha256),
-then:
+A registry is an index the CLI can search and install from. Keep the same
+promise as the Git market: the registry entry is not trusted because it is
+listed; the package hash and signature are what make it trustworthy.
 
-```text
-bsh ext registry add official https://example/index.json
-bsh ext search --registry official
-bsh ext install --registry official com.example.x@1.0.0
-```
+## 32.5 Release checklist
 
-## 26.5 Release checklist
-
-```text
-[ ] id, version and compatibility are correct
-[ ] every declaration has its file
-[ ] validate and doctor pass
-[ ] every tool passes mock
-[ ] install + grant + info reaches active
-[ ] panel actions work, including a stale click
-[ ] language/integration dispatch works
-[ ] uninstall keeps data; reinstall sees it
-[ ] archive is signed and the key is published
-[ ] README states capabilities, data and network behaviour
-```
-
-**See also:** [Registry and market §13](bsh-extension-standard.md#13-diagnostics-and-cli).
+- [ ] version bumped (semver) and compatibility ranges still true;
+- [ ] `validate`, `test`, `mock` for every tool;
+- [ ] runtime tests pass (or environment failures documented);
+- [ ] hash recorded;
+- [ ] signed and verified;
+- [ ] README states required grants and runtime;
+- [ ] changelog names breaking changes;
+- [ ] archive does not contain `target`, `.git`, test data or secrets;
+- [ ] install from the archive into a clean root succeeds.
 
 ---
 
-# 27. Built-in extensions
+# 33. Built-in extensions
 
-A built-in is first-party Rust linked into the host. An installed package may not
-claim the `builtin` runtime.
+A built-in extension is first-party Rust linked into BSH. A manifest read from
+disk may not claim `kind = "builtin"`; the built-in registry owns those ids.
 
-```rust
-struct HelloBuiltin;
+The visible built-in is the **Extension Inspector**:
 
-#[async_trait]
-impl BuiltinExtension for HelloBuiltin {
-    fn manifest_toml(&self) -> &'static str {
-        r#"
-schema_version = "1.0"
-[extension]
-id = "com.example.hello-builtin"
-name = "Hello Builtin"
-version = "1.0.0"
-description = "A linked-in tool"
-[compatibility]
-bsh = ">=3.0.0, <4.0.0"
-extension_api = "^1.0"
-[runtime]
-kind = "builtin"
-entry = "hello"
-[capabilities]
-required = ["agent.tools.register"]
-[contributes]
-tools = ["hello"]
-"#
-    }
+| Field | Value |
+|---|---|
+| id | `com.bos.bsh.extensions` |
+| runtime | builtin |
+| tool | `extensions__list` |
+| capability | `agent.tools.register` |
 
-    fn tools(&self) -> Vec<ToolDescriptor> {
-        vec![ToolDescriptor {
-            id: ContributionId::parse("hello").unwrap(),
-            description: "Say hello".to_string(),
-            input_schema: json!({"type": "object", "properties": {}}),
-            capabilities: Vec::new(),
-        }]
-    }
+It reports the extensions installed on the machine and their host state. Its
+value is not the tool itself; it is the pattern: the agent can inspect the
+extension platform through the same policy and audit path as any package.
 
-    fn call_tool(&self, name: &str, _arguments: &Value) -> Result<Value, ExtensionError> {
-        match name {
-            "hello" => Ok(json!({"message": "hello"})),
-            other => Err(ExtensionError::NotFound { id: other.to_string() }),
-        }
-    }
-}
-
-let runtime = BuiltinRuntime::new(Arc::new(HelloBuiltin))?;
-```
-
-Rules: a reverse-domain id; every tool id declared in `contributes.tools`; the
-manifest validated exactly like an external package; capabilities checked; no
-filesystem, network or process access outside the capability API.
-`examples/extensions/builtin-template/README.md` is the template.
-
-**See also:** [Built-in runtime](bsh-extension-standard.md#43-runtime).
+Built-ins cannot be uninstalled. They can be disabled? No — the host owns them.
+Treat their status rows as host diagnostics, not as packages you can repair with
+`ext retry`.
 
 ---
 
-# 28. Limits and non-goals
+# 34. Security, limits and non-goals
 
-## 28.1 Decisions
+## 34.1 Threat model in one page
 
-- **No public Rust trait ABI.** The ABI is the manifest, JSON, WIT and the
-  process protocol. Built-in Rust is first-party only.
-- **GPUI objects stay in the host.** Declarative UI is the public UI contract.
-- **WASM Component is the primary third-party runtime; Extism is supported** for
-  existing PDK plugins. Process is first-class, not a fallback.
-- **MCP is an adapter**, not the core API.
-- **Capability declarations are not grants.** Every effect is authorized.
-- **The store is hashed and immutable.** Data is separate; uninstall is explicit.
-- **The market is Git.** The index is reviewable.
+Trust boundaries:
 
-## 28.2 Non-goals
+- package code is untrusted until a grant says otherwise;
+- the model is untrusted input to tools;
+- the workspace is user data, not a sandbox;
+- the extension store is host state, not a package's private directory;
+- hook payloads can contain business data and credentials.
 
-```text
-native dynamic libraries
-arbitrary guest GPUI embedding
-a public Rust extension ABI
-unrestricted host access
-a JavaScript or HTML UI runtime
-a hosted marketplace with accounts and payments
-```
+Controls:
 
-## 28.3 Honest limits
+- strict manifest validation before code;
+- path containment and symlink refusal;
+- capability checks at activation and per call;
+- environment filtering and executable allowlists;
+- timeouts, output, memory and queue bounds;
+- no HTML/script/CSS in UI;
+- atomic state writes and an audit line per decision;
+- hash verification and signature trust.
 
-- A WASM or Extism guest that performs pure computation cannot be interrupted
-  mid-instruction; it stops at its deadline (WASM) or returns normally (Extism).
-  Host-call-heavy guests stop at the next host call.
-- Images are local package assets only; an `https://` source is refused because
-  this host has no remote image loader.
-- Audio has no capture producer of its own; `audio.captured` fires for an audio
-  attachment.
-- `computer.use` is a critical capability and an activation/audit gate, not a
-  host-owned screen/pointer API. A package that implements screen control is a
-  normal process extension and must say so.
-- Language diagnostics dispatch through the host, CLI and agent, but are not yet
-  an editor gutter.
-- Integration actions are declared tool/command dispatch, not a generic outbound
-  proxy.
-- There is no configuration editor in Settings; use `bsh ext config`.
-- Windows process limits are compiled but not exercised in the macOS test
-  environment; the Linux bubblewrap plan is implemented but not executed there.
-- The store is shared by one process at a time; a concurrent CLI grant and a
-  desktop host do not live-reload each other.
+## 34.2 The security checklist
 
-**See also:** [Deliberate limits §15](bsh-extension-standard.md#15-deliberate-limits-of-this-implementation),
-[peer review](bsh-extension-peer-review.md).
+- [ ] every package-relative path is contained;
+- [ ] every storage key is contained and not a symlink;
+- [ ] required grants are explicit for high/critical capabilities;
+- [ ] tool argument names match scope extraction (`path`, `url`, `secret`);
+- [ ] process environment is filtered and the executable is allowlisted;
+- [ ] UI has no executable content and images are local assets;
+- [ ] hooks declare `hooks.observe` and are Extism-only;
+- [ ] audit has a line for every allow/deny;
+- [ ] `doctor` passes on a clean install;
+- [ ] no secret is logged, including in hook payloads.
+
+## 34.3 Deliberate limits
+
+1. Tool progress is live for process, MCP and WASM; a runtime that cannot stream
+   delivers its final result as chunks.
+2. Model/agent/preset providers are descriptors, not a code-level adapter API.
+3. Themes apply to the package's panels; the Settings selection can overlay the
+   shell palette.
+4. Lock reproduction covers Git/registry and the recorded local source path.
+5. Process children get RLIMIT, a process group and a macOS write sandbox; the
+   Linux bubblewrap plan is not exercised in the macOS test environment.
+6. Cancellation stops a process/MCP child immediately, traps WASM at its next
+   host call, and lets a pure-compute guest run to its fuel deadline.
+7. Windows/Linux process limits are compiled but not exercised here.
+8. The built-in runtime is first-party code; disk packages cannot claim it.
+9. The extension root is `~/.bos/bsh/extensions`, not `~/.bsh`.
+10. Images are local package assets; remote image URLs are refused.
+11. MCP events require a running server; a queued event does not spawn one.
+12. Hooks are observe-only and Extism-only; process/MCP HTTP is not captured;
+    bodies and intercept are not implemented.
+
+## 34.4 Non-goals
+
+- running arbitrary JavaScript in the UI;
+- a package that can grant itself a capability;
+- two versions of one id at once;
+- silent fallback when a contribution fails to load;
+- a hook that blocks the model path;
+- a body capture that is on by default.
+
+## 34.5 Where to go next
+
+- [BSH Extension Standard 1.0](bsh-extension-standard.md) — the normative contract.
+- [Hook layer design](bsh-hook-system.md) — observe/intercept reasoning, phases.
+- [Observability capture](bsh-observability-capture.md) — capture planes and schemas.
+- [Peer review](bsh-extension-peer-review.md) — what was fixed and what remains.
+- `examples/extensions/` — ten runnable packages, one per runtime and surface.
 
 ---
 
@@ -2051,206 +3446,283 @@ schema_version = "1.0"
 [extension]
 id = "com.example.package"
 name = "Package"
-version = "1.0.0"
-description = "What it does"
+version = "0.1.0"
+description = "What this package does"
 authors = ["You"]
 license = "MIT"
+repository = "https://example.com/package"
+homepage = "https://example.com"
 
 [compatibility]
 bsh = ">=3.0.0, <4.0.0"
 extension_api = "^1.0"
 
 [runtime]
-kind = "declarative"   # declarative | process | wasm-component | extism | mcp | builtin
-# entry = "…"
-# args = ["…"]
-# startup = "on-demand"
+kind = "declarative"        # builtin | declarative | process | wasm-component | extism | mcp
+# entry = "bin/server"      # process, wasm, extism, mcp
+# args = ["--stdio"]        # process only
+# protocol = "jsonrpc-2.0"  # process only
+startup = "on-demand"       # on-startup | on-demand | on-workspace-open | manual
+# [runtime.env]
+# LOG_LEVEL = "info"
 
 [capabilities]
 required = ["agent.tools.register"]
-optional = []
+# optional = ["workspace.read"]
 
 [contributes]
-# tools = []
-# commands = []
-# prompts = []
-# contexts = []
-# languages = []
-# integrations = []
-# skills = []
-# panels = []
-# themes = []
-# workflows = []
-# presets = []
-# model_providers = []
-# agent_providers = []
-# events = []
-# publishes = []
+tools = ["echo"]
+# commands = ["greet"]
+# prompts = ["hello"]
+# contexts = ["guide"]
+# languages = ["rust"]
+# integrations = ["github"]
+# skills = ["helper"]
+# panels = ["status"]
+# themes = ["midnight"]
+# workflows = ["inspect"]
+# events = ["workspace.changed", "tool.*"]
+# publishes = ["thing.changed"]
+# hooks = ["model.request", "model.response"]
+
+# [configuration]
+# schema = "config.schema.json"
+# defaults = { "key" = "value" }
 
 [resources]
-max_memory_mb = 128
-max_execution_ms = 5000
+max_memory_mb = 256
+max_execution_ms = 30000
 max_concurrent_calls = 4
 max_output_bytes = 1048576
+
+# [dependencies]
+# "com.example.base" = "^1.0"
 ```
 
 ---
 
-# Appendix B. Capability reference
+# Appendix B. Capability matrix
 
-```text
-workspace.read      low      scoped to the workspace
-workspace.write     high     explicit grant
-extension.storage   low      own namespace
-network.http        high     domain/method scoped
-process.execute     critical program/args scoped
-computer.use        critical activation/audit gate
-secrets.read        critical secret-name scoped
-agent.tools.register        low
-agent.context.provide       low
-agent.prompts.provide       low
-agent.skills.provide        medium (allowed at every trust level)
-agent.models.provide        medium (explicit grant for community)
-agent.agents.provide        medium (explicit grant for community)
-agent.workflows.provide     medium (explicit grant for community)
-events.publish/subscribe    low
-hooks.observe               high (explicit grant; observe batches only)
-ui.panels/ui.commands/ui.theme low
+| Capability | Risk | Built-in | Verified | Community/local |
+|---|---|---|---|---|
+| workspace.read | low | allow | allow | allow (workspace-scoped) |
+| extension.storage | low | allow | allow | allow |
+| agent.tools.register | low | allow | allow | allow |
+| agent.context.provide | low | allow | allow | allow |
+| agent.prompts.provide | low | allow | allow | allow |
+| agent.skills.provide | medium | allow | allow | allow |
+| events.publish | low | allow | allow | allow |
+| events.subscribe | low | allow | allow | allow |
+| hooks.observe | high | allow | explicit grant | explicit grant |
+| ui.panels | low | allow | allow | allow |
+| ui.commands | low | allow | allow | allow |
+| ui.theme | low | allow | allow | allow |
+| agent.models.provide | medium | allow | allow | explicit grant |
+| agent.agents.provide | medium | allow | allow | explicit grant |
+| agent.workflows.provide | medium | allow | allow | explicit grant |
+| workspace.write | high | allow | explicit grant | explicit grant |
+| network.http | high | allow | explicit grant | explicit grant |
+| process.execute | critical | allow | explicit grant | explicit grant |
+| computer.use | critical | allow | explicit grant | explicit grant |
+| secrets.read | critical | allow | explicit grant | explicit grant |
+
+---
+
+# Appendix C. Hook payload reference
+
+## C.1 Envelope
+
+```json
+{"point":"model.request","batch":[event, ...]}
+```
+
+## C.2 Model request event
+
+```json
+{"agent":"assistant","data":{
+  "model":"gpt-4o",
+  "request_id":"req-...",
+  "request":"{...json string...}"
+}}
+```
+
+Request JSON: `request_id`, `model`, `api_mode`, `temperature`, `max_tokens`,
+`prompt_bytes`, `messages` (role, bytes, preview).
+
+## C.3 Model response event
+
+Complete:
+
+```json
+{"agent":"assistant","data":{
+  "request_id":"req-...",
+  "response_type":"react",
+  "response":"{\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}"
+}}
+```
+
+Stream:
+
+```json
+{"agent":"assistant","data":{
+  "request_id":"req-...",
+  "response_type":"stream",
+  "response_bytes":"320",
+  "response_text":"...",
+  "had_tool_call":"false"
+}}
+```
+
+## C.4 Tool events
+
+```json
+{"agent":"assistant","data":{"tool_name":"pkg__tool","call_id":"call-1","tool_args":"{...}"}}
+{"agent":"assistant","data":{"tool_name":"pkg__tool","call_id":"call-1","tool_result":"{...}"}}
+```
+
+## C.5 HTTP exchange event
+
+```json
+{"source":"llm","request_id":"req-...","method":"POST","host":"api.example.com",
+ "path":"/v1/chat","status":200,"request_bytes":1834,"response_bytes":0,
+ "content_type":"text/event-stream","ttfb_ms":430,"total_ms":438,"error":null}
 ```
 
 ---
 
-# Appendix C. Event reference
+# Appendix D. Error catalog
 
-```text
-app.started, app.shutdown
-workspace.opened, workspace.closed, workspace.changed
-session.created, session.updated, session.deleted
-trajectory.recorded
-agent.started, agent.completed, agent.failed
-skill.loaded, instruction.build
-model.requested, model.completed
-mcp.connected
-tool.invoked, tool.completed, tool.failed
-network.request, audio.captured
-extension.loaded, extension.unloaded, extension.failed
-config.changed
-ui.action
-```
-
----
-
-# Appendix D. UI nodes and limits
-
-```text
-container, row, column, tabs, list, table, tree
-text, heading, markdown, button, input, select, checkbox,
-progress, code, image, notification, divider, spacer
-```
-
-```text
-depth 32
-nodes 1000
-one text leaf 16 KiB; all text 256 KiB
-list 500 items
-table 500 rows x 32 columns; cell 2048 characters
-tabs 16
-serialized document 1 MiB
-```
-
-A document has `schema_version` and `root`. A panel file adds `title`, optional
-`icon`, `location` and `default_visibility`.
+| Class | Example message | What to do |
+|---|---|---|
+| IO | `path: No such file` | check the path, package root and permissions |
+| TOML | `invalid TOML: expected ...` | fix syntax; the message names the line |
+| JSON | `invalid JSON: ...` | fix the contribution file |
+| Manifest | `path: field: problem` | read the field path, fix the manifest |
+| InvalidId | `invalid extension id` | id grammar |
+| InvalidContribution | `invalid contribution id` | contribution grammar |
+| InvalidVersion | `invalid version/range` | fix semver |
+| Incompatible | `requires bsh ..., host ...` | widen compatibility only if true |
+| Lifecycle | `cannot move from X to Y` | host bug or manual state edit |
+| UnsupportedRuntime | `runtime ... not implemented` | use a supported kind |
+| MissingCapability | `requires capability ...` | grant or remove the request |
+| Denied | `not authorized for ...` | grant the right scope |
+| Dependency | `dependency error ...` | fix range, missing id or cycle |
+| Cycle | `dependency cycle: ...` | break the cycle |
+| Runtime | `runtime error: ...` | read the package log |
+| Remote | `remote error ...` | application-level error from server |
+| Timeout | `timed out after ...` | raise the ceiling or fix the child |
+| Limit | `exceeds ...` | reduce output or raise a legal ceiling |
+| Corrupt | `plugin lock poisoned` / `component missing` | reinstall |
+| NotFound | `... not found` | check the declared id |
 
 ---
 
-# Appendix E. CLI index
+# Appendix E. Panel node reference
 
-```text
-new <id> [--dir <path>] [--force]
-validate <path>
-hash <path>
-build|package <path> [--out <dir>]
-test <path>
-mock <path> [tool] [json]
-install <path|archive|git+url> [--registry <name|url> <id>[@version]]
-uninstall <id> [--purge-data]
-list [--json]
-info <id> [--json]
-enable <id> | disable <id>
-versions <id>
-reproduce <lock>
-update <path>
-rollback <id>
-retry <id>
-quarantine <id> [--reason <text>]
-grant <id> <capability> [--scope <scope>] [--note <text>]
-revoke <id> <capability>
-capabilities
-config <id> [set <json|file>|schema]
-logs <id>
-metrics
-providers
-languages
-integrations
-language-check <id> <language> <path>
-integrate <id> <integration> [json]
-market [query]
-market install <id>
-doctor [--json]
-keygen <publisher> [--out <path>]
-sign <path> --publisher <name> --key <file-or-base64>
-verify <path>
-trust <publisher> <public-key>
-untrust <publisher>
-publishers
-registry add|list|remove|search
-```
+| Type | Fields |
+|---|---|
+| `container` | `children` |
+| `row` | `children` |
+| `column` | `children` |
+| `text` | `text` |
+| `heading` | `text`, `level` |
+| `markdown` | `text` |
+| `button` | `label`, `action`, `style` |
+| `input` | `label`, `placeholder`, `value`, `action` |
+| `select` | `label`, `options`, `value`, `action` |
+| `checkbox` | `label`, `checked`, `action` |
+| `list` | `items` |
+| `table` | `columns`, `rows` |
+| `tree` | `nodes` |
+| `tabs` | `tabs` |
+| `progress` | `value` (0.0–1.0), `label` |
+| `code` | `value`, `language` |
+| `image` | `src`, `alt` |
+| `notification` | `level`, `text` |
+| `divider` | — |
+| `spacer` | `size` |
 
-Global options: `--root <path>`, `--json`. Exit codes: 0 success, 1 failure,
-2 usage.
+Limits: depth 32, nodes 1000, text leaf 16 KiB, all text 256 KiB, list 500,
+table 500×32, cell 2048, tabs 16, document 1 MiB.
 
 ---
 
 # Appendix F. Example index
 
-| Example | Runtime | Shows |
+| Example | Runtime | Teaches |
 |---|---|---|
-| [hello](../examples/extensions/hello) | declarative | one tool, one command |
-| [allinone](../examples/extensions/allinone) | declarative | every contribution kind |
-| [hook-demo](../examples/extensions/hook-demo) | process | every hook topic, skills, languages, integrations |
-| [process-echo](../examples/extensions/process-echo) | process | handshake, token, tools, events, commands |
-| [wasm-echo](../examples/extensions/wasm-echo) | WASM component | WIT exports, progress |
-| [extism-echo](../examples/extensions/extism-echo) | Extism | PDK exports, host bridge |
-| [mcp-echo](../examples/extensions/mcp-echo) | MCP | tools, resources, prompts, progress |
-| [language-python](../examples/extensions/language-python) | process | real Python diagnostics, GitHub integration |
-| [extism-hook](../examples/extensions/extism-hook) | Extism | observe hooks: model/tool/http counters in a panel |
-| [computer-use](../examples/extensions/computer-use) | process | 9 tools, panel, command, prompt, skill, integrations, workflow |
-| [builtin-template](../examples/extensions/builtin-template) | built-in | Rust trait and manifest snippet |
+| `hello` | declarative | manifest, tool, command, prompt, panel |
+| `allinone` | process | full surface, workflow, providers, skills |
+| `process-echo` | process | handshake, JSON-RPC, progress |
+| `wasm-echo` | wasm-component | WIT, host calls, progress |
+| `extism-echo` | extism | exports, bridge envelope, panels |
+| `extism-hook` | extism | observe hooks, storage counters, request_id |
+| `mcp-echo` | mcp | tools, resources, prompts mapping |
+| `hook-demo` | process | event topics and hook points |
+| `language-python` | process | language service descriptor |
+| `computer-use` | process | nine tools, panel, workflow, integrations |
+
+Run `bsh ext validate examples/extensions/<name>` before using one as a
+template.
 
 ---
 
-# Appendix G. Glossary
+# Appendix G. Author and reviewer checklists
 
-- **Contribution** — one declared surface (tool, panel, prompt, …).
-- **Runtime** — where code executes (declarative, process, WASM, Extism, MCP,
-  built-in).
-- **Capability** — a permission vocabulary item.
-- **Grant** — a scoped allow stored in `grants.toml`.
-- **Trust** — built-in, verified, community or local.
-- **Store** — the hashed, immutable package tree.
-- **Lock** — the resolved dependency set and its sources.
-- **Hook** — a host event delivered to a subscribed runtime.
-- **Model-facing tool name** — `<last-id>__<tool-id>`.
-- **Declarative UI** — a bounded JSON tree rendered by the host.
-- **Action revision** — the document revision a panel action was rendered from.
-- **Lazy activation** — descriptors load now, the runtime starts on first call.
-- **Community trust** — an unsigned package from a market or registry.
+## G.1 Author
+
+- [ ] manifest fields valid; unknown fields absent;
+- [ ] every contribution file exists and passes `test`;
+- [ ] each tool has the smallest capability set;
+- [ ] scope argument names are `path`, `url`, `secret`;
+- [ ] runtime choice is justified (declarative → process → wasm/extism → mcp);
+- [ ] prompts are short and do not duplicate tool descriptions;
+- [ ] panel has a revision strategy and local assets;
+- [ ] hooks declare `hooks.observe` and export `bsh_hook`;
+- [ ] no secret is logged or stored in plain text;
+- [ ] `validate`, `test`, `mock` and at least one host test pass.
+
+## G.2 Reviewer
+
+- [ ] can a malicious tool call escape its path/domain/secret scope?
+- [ ] does a declared capability exceed what the code does?
+- [ ] is the process environment filtered and the executable allowlisted?
+- [ ] does the guest handle `ok:false` from the bridge?
+- [ ] are hook payloads bounded, redacted and stored minimally?
+- [ ] does the UI avoid remote images and executable content?
+- [ ] does the lifecycle handle a missing grant without silently applying?
+- [ ] is the audit line present for allow and deny?
+- [ ] is the package signed and reproducible?
+- [ ] are the limits realistic and within the standard?
 
 ---
 
-*End of book. The normative bytes are in
-[bsh-extension-standard.md](bsh-extension-standard.md); the current implementation
-status is in [bsh-extension-conformance.md](bsh-extension-conformance.md); known
-gaps and residuals are in [bsh-extension-peer-review.md](bsh-extension-peer-review.md).*
+# Appendix H. Glossary
 
+| Term | Meaning |
+|---|---|
+| **applied** | contributions are installed in the running agent |
+| **active** | lifecycle state: authorized and loaded |
+| **builtin** | first-party Rust linked into BSH |
+| **capability** | a named permission a package requests |
+| **contribution** | a tool, command, panel, prompt, context, skill, provider, workflow, theme, language or integration |
+| **declarative** | runtime that executes one of three host-defined tool bodies |
+| **event** | after-the-fact fact on the bus |
+| **grant** | a policy record allowing a capability, optionally scoped |
+| **hook** | a declared seam call delivered to an attached runtime |
+| **intercept** | a hook class that can deny/replace; not implemented |
+| **observe** | a hook class that only watches; implemented |
+| **package** | a directory with a manifest and its contributions |
+| **qualified name** | model-facing tool name `pkg__tool` |
+| **request_id** | correlation id shared by model and HTTP observations |
+| **scope** | path/domain/program/secret restriction on a grant |
+| **store** | the managed extension root |
+| **trust** | builtin, verified, community or local |
+| **runtime** | where code executes: declarative, process, wasm, extism, mcp, builtin |
+
+---
+
+*End of the second edition. If a command in this book does not behave as shown,
+run the corresponding test under `crates/bsh` and file the difference: the book
+is expected to track the code, not the other way around.*
 
