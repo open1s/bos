@@ -148,7 +148,7 @@ Status legend:
 | core/cancellation | done | AsyncTool token -> Runtime::cancel |
 | capabilities/filesystem | done | WASM read_file/write_file host functions with policy |
 | capabilities/network | done | WASM fetch host function with policy |
-| capabilities/process | partial | policy + spawn + Unix RLIMIT_AS/CPU/NOFILE for process/MCP + RSS watchdog + macOS profile + Linux bwrap default (integration CI pending); Windows Job Object limits absent ([Issue #39](https://github.com/open1s/bos/issues/39)) |
+| capabilities/process | partial | policy + spawn + Unix RLIMIT_AS/CPU/NOFILE for process/MCP + RSS watchdog + macOS profile + Linux bwrap default (integration CI pending); Windows AppContainer isolation absent ([Issue #43](https://github.com/open1s/bos/issues/43)) and Job Object limits absent ([Issue #39](https://github.com/open1s/bos/issues/39)) |
 | capabilities/storage | done | WASM storage_get/set/list |
 | capabilities/secrets | done | WASM read_secret |
 | agent/tool, prompt, context_provider | tool/prompt done, context static |
@@ -197,7 +197,7 @@ Status legend:
 | Process JSON-RPC stdio, handshake, structured stderr | done |
 | Process executable allowlist/user approval | done | allowlist + explicit grant; Settings > Extensions approves the declared process executable |
 | Environment filtering, cwd restriction, timeout, output limits | done |
-| OS-level sandbox | partial | macOS process profile; Linux bwrap enabled by default for process and MCP with write-boundary integration tests (CI pending); Windows OS sandbox absent; child network remains shared |
+| OS-level sandbox | partial | macOS process profile; Linux bwrap enabled by default for process and MCP with write-boundary integration tests (CI pending); Windows Process/MCP AppContainer boundary absent ([Issue #43](https://github.com/open1s/bos/issues/43)); child network remains shared |
 | Native dynamic libraries | non-goal |
 
 ## 9. UI
@@ -255,7 +255,7 @@ Status legend:
 | Capability categories including terminal.execute | done | process.execute plus the terminal.execute alias |
 | Network domain/method policy | done | domain scope and optional method-restricted domain scope |
 | Process executable/argument policy | done | allowlist, explicit grant, program and program+args scopes checked per spawn |
-| CPU/fuel and wall clock | partial | wall clock + wasm fuel + Unix Process/MCP RLIMIT_CPU; Windows OS CPU limits absent |
+| CPU/fuel and wall clock | partial | wall clock + wasm fuel + Unix Process/MCP RLIMIT_CPU; Windows OS CPU limits absent pending Job Objects ([Issue #39](https://github.com/open1s/bos/issues/39)) |
 | Memory/concurrency | partial | WASM/Extism memory limits; Unix Process/MCP RLIMIT_AS and RLIMIT_NOFILE; serialized calls; Windows Job Object limits absent ([Issue #39](https://github.com/open1s/bos/issues/39)) |
 | Host-call authorization | done | WASM host functions call PolicyEngine |
 | IPC authentication and message validation | done | private stdio, per-session handshake token echo, line/JSON/depth validation |
@@ -362,5 +362,6 @@ Each is a behaviour, not a missing type.
    write-denial integration tests in Linux CI. CI must remain green before
    this guarantee is marked verified.
 3. Cross-platform matrix: Linux and Windows extension CI provide compile/runtime
-   coverage; Windows OS-level process sandboxing and process resource ceilings
-   remain unavailable and must be documented as platform limitations.
+   coverage, not equivalent isolation guarantees. Windows Process/MCP children
+   currently lack AppContainer isolation ([Issue #43](https://github.com/open1s/bos/issues/43))
+   and Job Object resource limits ([Issue #39](https://github.com/open1s/bos/issues/39)).
