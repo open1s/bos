@@ -55,6 +55,8 @@ Commands:
   providers                           list model and agent provider descriptors
   languages                           list declared language services
   integrations                        list declared external integrations
+  market [query]                      list the Git extension market
+  market install <id>                 install the newest market version
   doctor                              check the store, hashes, dependencies and policy
   keygen <publisher> [--out <path>]   create an Ed25519 publisher key pair
   sign <path> --publisher <name> --key <file-or-base64>
@@ -134,6 +136,7 @@ pub(crate) fn run(args: &[String]) -> i32 {
         "providers" => command_providers(root.clone()),
         "languages" => command_languages(root.clone()),
         "integrations" => command_integrations(root.clone()),
+        "market" => command_market(&rest[1..], root.clone()),
         "keygen" => command_keygen(&rest[1..]),
         "sign" => command_sign(&rest[1..]),
         "verify" => command_verify(&rest[1..], root.clone()),
@@ -1469,6 +1472,42 @@ fn command_integrations(root: Option<PathBuf>) -> Result<i32, String> {
             entry.contribution.name,
             entry.contribution.kind,
             action
+        );
+    }
+    Ok(0)
+}
+
+fn command_market(args: &[String], root: Option<PathBuf>) -> Result<i32, String> {
+    let store = ExtensionStore::open(config(root).root).map_err(|error| error.to_string())?;
+    let url = std::env::var("BSH_EXTENSION_MARKET")
+        .unwrap_or_else(|_| crate::extension::market::DEFAULT_GIT_MARKET.to_string());
+    let mut market = crate::extension::market::GitMarket::open(store.root(), &url);
+    let index = market.sync().map_err(|error| error.to_string())?;
+    if args.first().map(String::as_str) == Some("install") {
+        let id = args
+            .get(1)
+            .ok_or_else(|| "usage: bsh ext market install <id>".to_string())?;
+        let entry = index
+            .newest(id)
+            .ok_or_else(|| format!("{id} is not in the market"))?;
+        let package = market
+            .install(&store, entry)
+            .map_err(|error| error.to_string())?;
+        println!(
+            "installed {} {} from {}",
+            package.id(),
+            package.version(),
+            market.url()
+        );
+        return Ok(0);
+    }
+    let query = args.join(" ");
+    let entries = index.matching(&query);
+    println!("ID\tVERSION\tNAME\tPATH");
+    for entry in entries {
+        println!(
+            "{}\t{}\t{}\t{}",
+            entry.id, entry.version, entry.name, entry.path
         );
     }
     Ok(0)

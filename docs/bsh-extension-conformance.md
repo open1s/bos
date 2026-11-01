@@ -271,6 +271,7 @@ Status legend:
 | Requirement | Status |
 |---|---|
 | Official registry | done | HTTP index source |
+| Git marketplace | done | `bsh ext market` clones the Git provider, validates `index.json`, and installs with community trust |
 | Git repository source | done | git+URL#revision |
 | Local directory | done |
 | Local package archive | done | tar.gz extractor |

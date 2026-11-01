@@ -938,7 +938,26 @@ impl ExtensionStore {
         source: &Path,
         origin: ExtensionSource,
     ) -> Result<Package, ExtensionError> {
-        let staged = Package::load(source, ExtensionSource::Development, TrustLevel::Local)?;
+        self.install_with_trust(source, origin, TrustLevel::Local)
+    }
+
+    /// Install an unsigned package from an untrusted source such as a Git
+    /// marketplace. A valid signature still wins over the fallback trust.
+    pub(crate) fn install_community(
+        &self,
+        source: &Path,
+        origin: ExtensionSource,
+    ) -> Result<Package, ExtensionError> {
+        self.install_with_trust(source, origin, TrustLevel::Community)
+    }
+
+    fn install_with_trust(
+        &self,
+        source: &Path,
+        origin: ExtensionSource,
+        fallback: TrustLevel,
+    ) -> Result<Package, ExtensionError> {
+        let staged = Package::load(source, ExtensionSource::Development, fallback)?;
         if !staged.report.is_valid() {
             return Err(ExtensionError::Manifest {
                 path: source.join(MANIFEST_FILE),
@@ -957,7 +976,7 @@ impl ExtensionStore {
                 reason: reason.clone(),
             });
         }
-        let trust_level = verification.trust_level(TrustLevel::Local);
+        let trust_level = verification.trust_level(fallback);
         let publisher = staged
             .signature
             .as_ref()

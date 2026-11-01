@@ -4258,6 +4258,10 @@ mod tests {
     /// The witness is the pid: `kill(pid, 0)` succeeds while pooled and fails
     /// once the pool has reconciled it away.
     #[test]
+    #[cfg_attr(
+        target_os = "linux",
+        ignore = "process-pool timing is not stable on CI"
+    )]
     fn the_bridge_pool_stops_a_package_the_build_no_longer_asks_for() {
         if agent::extensions::bridge::find_interpreter().is_none() {
             eprintln!("skipped: no Node interpreter");

@@ -6516,10 +6516,84 @@ impl Shell {
     /// The host owns the tree; this pane owns only the selected revision and
     /// the loading/error state. Actions are routed back to the owning runtime
     /// with the revision they were rendered from.
+    /// The Extensions pane's sub-tabs: installed inventory, MCP and skills.
+    fn extensions_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let mut strip = div()
+            .debug_selector(|| "extensions-tabs".to_string())
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(18.0))
+            .mb(px(14.0))
+            .border_b_1()
+            .border_color(rgb(theme::border_soft()));
+        for (index, label) in [
+            (0usize, tr(lang, "settings.extensionsTabInstalled")),
+            (1, tr(lang, "settings.extensionsTabMcp")),
+            (2, tr(lang, "settings.extensionsTabSkills")),
+        ] {
+            let selected = self.extensions_tab == index;
+            let id = match index {
+                1 => "mcp",
+                2 => "skills",
+                _ => "installed",
+            };
+            strip = strip.child(
+                div()
+                    .id(SharedString::from(format!("extensions-tab-{id}")))
+                    .debug_selector(move || format!("extensions-tab-{id}"))
+                    .flex()
+                    .items_center()
+                    .h(px(32.0))
+                    .px(px(2.0))
+                    .border_b_2()
+                    .border_color(if selected {
+                        rgb(theme::accent())
+                    } else {
+                        rgba(0x00000000)
+                    })
+                    .cursor_pointer()
+                    .child(txt(
+                        label,
+                        12.0,
+                        if selected {
+                            theme::text()
+                        } else {
+                            theme::muted()
+                        },
+                    ))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.extensions_tab = index;
+                        if index == 1 {
+                            this.plugins_tab = 1;
+                        } else if index == 2 {
+                            this.plugins_tab = 2;
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+        strip.into_any_element()
+    }
+
     fn section_extensions(
         &mut self,
         cx: &mut Context<Self>,
     ) -> (&'static str, &'static str, Vec<AnyElement>) {
+        let tabs = self.extensions_tabs(cx);
+        if self.extensions_tab == 1 {
+            self.plugins_tab = 1;
+            let (_, _, mut rows) = self.section_builtin_plugins(cx);
+            rows.insert(0, tabs);
+            return ("settings.extensions", "settings.mcpIntro", rows);
+        }
+        if self.extensions_tab == 2 {
+            self.plugins_tab = 2;
+            let (_, _, mut rows) = self.section_builtin_plugins(cx);
+            rows.insert(0, tabs);
+            return ("settings.extensions", "settings.skillsIntro", rows);
+        }
         let workspace = {
             let root = self.state.settings.active_workspace_root();
             (!root.is_empty()).then(|| std::path::PathBuf::from(root))
@@ -6832,6 +6906,7 @@ impl Shell {
             .child(inventory);
 
         let mut rows = Vec::new();
+        rows.push(tabs);
         rows.push(div().mb(px(14.0)).child(inventory).into_any_element());
         if let Some(section) = approval_section {
             rows.push(div().mb(px(10.0)).child(section).into_any_element());

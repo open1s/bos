@@ -29934,6 +29934,46 @@ fn the_extensions_rail_opens_the_extension_inventory(cx: &mut TestAppContext) {
         "the same pane hosts contributed panels"
     );
 }
+
+/// The Extensions pane keeps the MCP and Skills settings as sub-tabs.
+#[gpui::test]
+fn the_extensions_pane_keeps_mcp_and_skills(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = AppState::with_store(scratch_store("extension-tabs"));
+        let section = section_index("extensions").expect("the extensions index");
+        let shell = cx.new(|cx| Shell::build_for_test(window, Some(section), state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let mcp = cx.debug_bounds("extensions-tab-mcp").expect("MCP tab");
+    cx.simulate_click(mcp.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("mcp-add").is_some(),
+        "the MCP tab opens the MCP settings"
+    );
+    let skills = cx
+        .debug_bounds("extensions-tab-skills")
+        .expect("Skills tab");
+    cx.simulate_click(skills.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).extensions_tab),
+        2,
+        "the Skills tab opens the skills settings"
+    );
+    let installed = cx
+        .debug_bounds("extensions-tab-installed")
+        .expect("Installed tab");
+    cx.simulate_click(installed.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("extension-inventory").is_some(),
+        "the Installed tab returns to the extension inventory"
+    );
+}
 /// The plugins header opens the extension panel host.
 #[gpui::test]
 fn the_plugins_header_opens_the_extension_panels(cx: &mut TestAppContext) {

@@ -871,6 +871,8 @@ pub(crate) struct Shell {
         Option<std::collections::BTreeMap<String, crate::extension::ui::ThemePalette>>,
     /// Extension status rows, resolved with the panels.
     pub(crate) extension_statuses: Option<Vec<crate::extension::host::ExtensionStatus>>,
+    /// The Extensions pane's active sub-tab: installed, MCP, skills.
+    pub(crate) extensions_tab: usize,
     /// The settings dialog's text fields.
     pub(crate) settings_inputs: SettingsInputs,
     /// The Vault pane's text fields.
@@ -1760,6 +1762,7 @@ impl Shell {
             bottom_extension_panels,
             extension_themes: Some(extension_themes),
             extension_statuses: Some(extension_statuses),
+            extensions_tab: 0,
             settings_inputs,
             vault_inputs,
             vault_revealed: None,

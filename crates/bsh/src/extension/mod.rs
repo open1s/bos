@@ -32,6 +32,7 @@ mod events;
 pub(crate) mod host;
 mod lifecycle;
 mod manifest;
+mod market;
 mod package;
 mod resolver;
 pub(crate) mod runtime;
