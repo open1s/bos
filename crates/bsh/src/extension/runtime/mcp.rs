@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -41,7 +41,7 @@ const MAX_ITEMS: usize = 256;
 
 /// One live MCP server.
 struct Session {
-    child: Child,
+    child: Arc<Mutex<Child>>,
     stdin: ChildStdin,
     lines: Receiver<Vec<u8>>,
     next_id: u64,
@@ -158,15 +158,19 @@ impl Session {
     }
 
     fn close(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -192,8 +196,9 @@ struct McpCore {
     wire: Mutex<BTreeMap<String, String>>,
     catalog: Mutex<Option<Catalog>>,
     session: Mutex<Option<Session>>,
-    /// The live child's pid, for cancellation without the session lock.
-    child_pid: AtomicU32,
+    /// A separately lockable child handle, so cancellation never waits for the
+    /// synchronous session exchange mutex. Child::kill is portable across OSes.
+    child: Mutex<Option<Arc<Mutex<Child>>>>,
     cancelled: AtomicBool,
 }
 
@@ -300,7 +305,7 @@ impl McpCore {
             wire: Mutex::new(BTreeMap::new()),
             catalog: Mutex::new(None),
             session: Mutex::new(None),
-            child_pid: AtomicU32::new(0),
+            child: Mutex::new(None),
             cancelled: AtomicBool::new(false),
         })
     }
@@ -436,7 +441,6 @@ impl McpCore {
             path: program,
             source,
         })?;
-        self.child_pid.store(child.id(), Ordering::SeqCst);
         let stdin = child.stdin.take().ok_or_else(|| ExtensionError::Protocol {
             extension: self.extension.to_string(),
             message: "MCP stdin was not piped".to_string(),
@@ -448,7 +452,12 @@ impl McpCore {
                 extension: self.extension.to_string(),
                 message: "MCP stdout was not piped".to_string(),
             })?;
-        if let Some(stderr) = child.stderr.take() {
+        let stderr = child.stderr.take();
+        let child = Arc::new(Mutex::new(child));
+        if let Ok(mut slot) = self.child.lock() {
+            *slot = Some(Arc::clone(&child));
+        }
+        if let Some(stderr) = stderr {
             let extension = self.extension.to_string();
             std::thread::spawn(move || {
                 let reader = BufReader::new(stderr);
@@ -673,14 +682,14 @@ impl McpCore {
 
     /// Kill the live child without waiting for the session lock.
     ///
-    /// Cancellation must work while a call holds that lock (the call is a
-    /// blocking stdio exchange), so the pid is recorded outside it.
+    /// The child handle has its own mutex, independent of the session mutex
+    /// held during blocking stdio exchanges. Child::kill uses the native
+    /// process-termination API on both Unix and Windows.
     fn kill_child(&self) {
-        let pid = self.child_pid.swap(0, Ordering::SeqCst);
-        if pid != 0 {
-            // SAFETY: kill(2) only signals the process this runtime spawned.
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        let child = self.child.lock().ok().and_then(|slot| slot.as_ref().cloned());
+        if let Some(child) = child {
+            if let Ok(mut child) = child.lock() {
+                let _ = child.kill();
             }
         }
     }
@@ -716,7 +725,6 @@ impl McpCore {
                     .unwrap_or(0);
                 if bytes as u64 > self.max_output_bytes {
                     *guard = None;
-                    self.child_pid.store(0, Ordering::SeqCst);
                     return Err(ExtensionError::Limit {
                         extension: self.extension.to_string(),
                         message: format!(
@@ -750,7 +758,6 @@ impl McpCore {
             Err(error @ ExtensionError::Remote { .. }) => Err(error),
             Err(error) => {
                 *guard = None;
-                self.child_pid.store(0, Ordering::SeqCst);
                 Err(error)
             }
         }
@@ -835,7 +842,9 @@ impl Runtime for McpRuntime {
         if let Some(mut session) = slot.take() {
             session.close();
         }
-        self.core.child_pid.store(0, Ordering::SeqCst);
+        if let Ok(mut child) = self.core.child.lock() {
+            *child = None;
+        }
         Ok(())
     }
 
@@ -845,7 +854,7 @@ impl Runtime for McpRuntime {
 
     async fn cancel(&self) -> Result<(), ExtensionError> {
         // No session lock: a running call holds it for the whole stdio
-        // exchange, and the pid outside it is what makes Stop effective.
+        // exchange, and the separate child handle makes Stop effective.
         self.stop();
         Ok(())
     }
