@@ -171,6 +171,40 @@ async fn the_hook_demo_language_integration_and_hooks_are_live() {
     assert_eq!(host.events().subscriber_count(), 0);
 }
 
+#[tokio::test]
+async fn the_computer_use_example_exposes_every_declared_surface() {
+    let root = scratch("computer-use");
+    std::fs::create_dir_all(root.join("workspace")).expect("workspace");
+    let store = ExtensionStore::open(&root).expect("store");
+    let package = store
+        .install(&examples().join("computer-use"))
+        .expect("install");
+    grant_all(
+        &store,
+        package.id(),
+        &package.manifest.capabilities.required,
+    );
+    let mut host = ExtensionHost::open(config(&root)).expect("host");
+    let status = host
+        .statuses()
+        .into_iter()
+        .find(|status| status.id == "com.example.computer-use")
+        .expect("computer-use status");
+    assert!(status.applied, "computer-use applies: {:?}", status.error);
+    assert!(status
+        .tools
+        .iter()
+        .any(|tool| tool.ends_with("__screen_size")));
+    assert!(status.tools.iter().any(|tool| tool.ends_with("__inspect")));
+    assert!(status
+        .commands
+        .iter()
+        .any(|command| command.ends_with("__refresh")));
+    assert_eq!(status.panels, ["computer-use__desktop"]);
+    assert_eq!(host.integrations().len(), 2);
+    host.shutdown().await;
+}
+
 fn copy_dir(source: &Path, target: &Path) {
     std::fs::create_dir_all(target).expect("target");
     for entry in std::fs::read_dir(source).expect("source") {

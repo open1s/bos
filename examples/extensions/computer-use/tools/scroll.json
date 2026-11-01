@@ -1,0 +1,27 @@
+{
+  "description": "Scroll the pointer location by a pixel delta. Positive delta_y scrolls down.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "delta_y": {
+        "type": "integer"
+      },
+      "delta_x": {
+        "type": "integer"
+      },
+      "x": {
+        "type": "number"
+      },
+      "y": {
+        "type": "number"
+      }
+    },
+    "required": [
+      "delta_y"
+    ],
+    "additionalProperties": false
+  },
+  "capabilities": [
+    "computer.use"
+  ]
+}

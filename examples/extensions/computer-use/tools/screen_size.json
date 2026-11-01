@@ -1,0 +1,11 @@
+{
+  "description": "Return the main display size in points (the coordinate system used by mouse tools) and pixels.",
+  "input_schema": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  },
+  "capabilities": [
+    "computer.use"
+  ]
+}

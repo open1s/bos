@@ -1,0 +1,5 @@
+{
+  "name": "Desktop Refresh",
+  "kind": "custom",
+  "action": "refresh"
+}

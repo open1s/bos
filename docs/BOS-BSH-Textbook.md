@@ -2302,6 +2302,27 @@ reference for a package that contributes every kind:
 Use it as a map, not as a minimal template. Read its manifest and copy the
 surfaces you need.
 
+
+### 19.1 Computer Use: a process extension that verifies the framework
+
+`examples/extensions/computer-use` is the architecture test in package form. It
+uses the process runtime and real macOS CoreGraphics calls to contribute:
+
+- 9 tools: screen size, screenshot, cursor, move, click, drag, scroll, type and
+  key press;
+- a right panel whose Refresh action runs the `refresh` command;
+- a composer command, prompt, skill and workflow;
+- a tool-action integration and a command-action integration;
+- `session.created`/`tool.completed` subscriptions;
+- `computer.use` plus `process.execute` as declared capabilities.
+
+It proves that a third-party package can reach Agent, GPUI, Event Bus and
+Storage seams without a host change. It also exposes the honest limit: for a
+process runtime, `computer.use` is an activation/audit gate, not a per-call OS
+sandbox. A production computer-use service needs a host-owned screen/input API
+with per-call consent; this package is deliberately a normal process extension
+so the framework itself is what is under test.
+
 ---
 
 ## 20. A built-in Rust extension
@@ -2567,6 +2588,7 @@ Serve an index with `format`, `packages` (id, version, url, sha256). Clients use
 | MCP | `examples/extensions/mcp-echo` |
 | Language + integration | `examples/extensions/language-python` |
 | Hooks/events | `examples/extensions/allinone` |
+| Computer Use (macOS process) | `examples/extensions/computer-use` |
 | Built-in Rust | `examples/extensions/builtin-template` |
 
 ### 25.2 Author checklist

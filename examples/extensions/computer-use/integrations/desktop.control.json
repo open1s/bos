@@ -1,0 +1,5 @@
+{
+  "name": "Desktop",
+  "kind": "custom",
+  "action": "screen_size"
+}

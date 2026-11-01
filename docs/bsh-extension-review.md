@@ -109,6 +109,7 @@ inactive, with the grant command in its error.
 | MCP | `examples/extensions/mcp-echo` | tools, resources, prompts, progress |
 | Hooks/UI | `examples/extensions/hook-demo` | every hook topic, skills, languages, integrations, UI, theme, presets |
 | Language | `examples/extensions/language-python` | real Python diagnostics, GitHub integration |
+| Computer Use | `examples/extensions/computer-use` | process runtime, 9 tools, panel, command, prompt, skill, 2 integrations, workflow, hooks, macOS permissions |
 | Built-in | `examples/extensions/builtin-template` | Rust trait + manifest snippet |
 
 ## 5. Verdict

@@ -1,0 +1,11 @@
+{
+  "description": "Return the current pointer position in display points.",
+  "input_schema": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  },
+  "capabilities": [
+    "computer.use"
+  ]
+}

@@ -1,0 +1,59 @@
+schema_version = "1.0"
+
+[extension]
+id = "com.example.computer-use"
+name = "Computer Use"
+version = "1.0.0"
+description = "A real, opt-in screen, pointer and keyboard extension for macOS"
+authors = ["BSH Example"]
+license = "MIT"
+
+[compatibility]
+bsh = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+
+[runtime]
+kind = "process"
+entry = "python3"
+args = ["server.py"]
+protocol = "jsonrpc-2.0"
+startup = "on-demand"
+
+[capabilities]
+required = [
+  "process.execute",
+  "computer.use",
+  "agent.tools.register",
+  "agent.prompts.provide",
+  "agent.skills.provide",
+  "agent.workflows.provide",
+  "ui.panels",
+  "ui.commands",
+  "events.subscribe",
+]
+
+[contributes]
+tools = [
+  "screen_size",
+  "screenshot",
+  "cursor_position",
+  "mouse_move",
+  "mouse_click",
+  "mouse_drag",
+  "scroll",
+  "type_text",
+  "key_press",
+]
+commands = ["refresh"]
+prompts = ["system"]
+skills = ["computer-safety"]
+panels = ["desktop"]
+integrations = ["desktop.control", "desktop.refresh"]
+workflows = ["inspect"]
+events = ["session.created", "tool.completed"]
+
+[resources]
+max_memory_mb = 256
+max_execution_ms = 15000
+max_concurrent_calls = 1
+max_output_bytes = 1048576

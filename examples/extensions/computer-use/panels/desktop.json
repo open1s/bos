@@ -1,0 +1,20 @@
+{
+  "title": "Computer Use",
+  "icon": null,
+  "location": "right",
+  "default_visibility": "visible",
+  "view": {
+    "schema_version": "1.0",
+    "revision": 1,
+    "root": {
+      "type": "column",
+      "children": [
+        { "type": "heading", "text": "Computer Use", "level": 2 },
+        { "type": "text", "text": "Screen, pointer and keyboard control through the process runtime." },
+        { "type": "text", "text": "Grant Screen Recording and Accessibility to BSH before using this panel." },
+        { "type": "button", "label": "Refresh", "action": "refresh", "style": "primary" },
+        { "type": "button", "label": "Screenshot", "action": "screenshot" }
+      ]
+    }
+  }
+}

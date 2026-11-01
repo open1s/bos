@@ -1,0 +1,22 @@
+{
+  "description": "Move the pointer to a display point.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "x": {
+        "type": "number"
+      },
+      "y": {
+        "type": "number"
+      }
+    },
+    "required": [
+      "x",
+      "y"
+    ],
+    "additionalProperties": false
+  },
+  "capabilities": [
+    "computer.use"
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "description": "Click at a display point. Coordinates are points, not screenshot pixels.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "x": {
+        "type": "number"
+      },
+      "y": {
+        "type": "number"
+      },
+      "button": {
+        "type": "string",
+        "enum": [
+          "left",
+          "right",
+          "middle"
+        ]
+      },
+      "clicks": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 3
+      }
+    },
+    "required": [
+      "x",
+      "y"
+    ],
+    "additionalProperties": false
+  },
+  "capabilities": [
+    "computer.use"
+  ]
+}
