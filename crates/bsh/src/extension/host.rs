@@ -160,6 +160,12 @@ pub(crate) struct ExtensionStatus {
     pub(crate) commands: Vec<String>,
     /// Qualified panel names.
     pub(crate) panels: Vec<String>,
+    /// Declared skill names.
+    pub(crate) skills: Vec<String>,
+    /// Declared language names.
+    pub(crate) languages: Vec<String>,
+    /// Declared integration names.
+    pub(crate) integrations: Vec<String>,
     /// Capability decisions.
     pub(crate) capabilities: Vec<CapabilityStatus>,
     /// The last failure.
@@ -1292,6 +1298,26 @@ impl ExtensionHost {
                 .panels
                 .iter()
                 .map(|panel| id.qualify(&panel.id))
+                .collect(),
+            skills: entry
+                .package
+                .manifest
+                .contributes
+                .skills
+                .iter()
+                .map(|skill| skill.as_str().to_string())
+                .collect(),
+            languages: entry
+                .contributions
+                .languages
+                .iter()
+                .map(|language| language.name.clone())
+                .collect(),
+            integrations: entry
+                .contributions
+                .integrations
+                .iter()
+                .map(|integration| integration.name.clone())
                 .collect(),
             capabilities,
             error,

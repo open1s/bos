@@ -1599,6 +1599,10 @@ tools = ["echo"]
         )
         .expect("tool");
         let hash = super::package_hash(&source).expect("hash");
+        // TOML basic strings need Windows separators escaped; the real lock
+        // writer does this through serde, and this fixture writes the document
+        // by hand.
+        let source_path = source.display().to_string().replace('\\', "\\\\");
         let lock = format!(
             r#"
 format = 1
@@ -1610,9 +1614,8 @@ id = "com.example.reproduced"
 version = "1.0.0"
 hash = "{hash}"
 source = "installed"
-source_path = "{}"
-"#,
-            source.display()
+source_path = "{source_path}"
+"#
         );
         let lock_path = root.join("lock.toml");
         std::fs::write(&lock_path, lock).expect("lock");

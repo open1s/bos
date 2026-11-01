@@ -29915,6 +29915,27 @@ fn the_extensions_pane_renders_its_panel_host(cx: &mut TestAppContext) {
     );
 }
 
+/// The Extensions rail cell opens the extension platform inventory, not the
+/// legacy plugin list.
+#[gpui::test]
+fn the_extensions_rail_opens_the_extension_inventory(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (_harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = AppState::with_store(scratch_store("extension-inventory"));
+        let section = section_index("extensions").expect("the extensions index");
+        let shell = cx.new(|cx| Shell::build_for_test(window, Some(section), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("extension-inventory").is_some(),
+        "the Extensions rail opens the installed-extension inventory"
+    );
+    assert!(
+        cx.debug_bounds("extension-panels").is_some(),
+        "the same pane hosts contributed panels"
+    );
+}
 /// The plugins header opens the extension panel host.
 #[gpui::test]
 fn the_plugins_header_opens_the_extension_panels(cx: &mut TestAppContext) {

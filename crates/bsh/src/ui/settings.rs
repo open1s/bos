@@ -58,7 +58,7 @@ pub(crate) const NAV: [&str; 6] = [
     "vault",
     "general",
     "models",
-    "plugins",
+    "extensions",
     "agent-presets",
 ];
 
@@ -6719,7 +6719,95 @@ impl Shell {
                     cx.notify();
                 });
             }));
+        let mut inventory = div().flex().flex_col().gap(px(6.0));
+        if statuses.is_empty() {
+            inventory = inventory.child(txt(
+                tr(self.state.lang, "settings.extensionsEmpty"),
+                12.0,
+                theme::muted(),
+            ));
+        }
+        for status in &statuses {
+            let mut meta = format!(
+                "{} · v{} · {} · {}",
+                status.id, status.version, status.runtime, status.trust
+            );
+            if !status.skills.is_empty() {
+                meta.push_str(&format!(" · {} skills", status.skills.len()));
+            }
+            if !status.languages.is_empty() {
+                meta.push_str(&format!(" · {} languages", status.languages.len()));
+            }
+            if !status.integrations.is_empty() {
+                meta.push_str(&format!(" · {} integrations", status.integrations.len()));
+            }
+            let summary = if status.tools.is_empty() {
+                tr(self.state.lang, "settings.extensionNoTools").to_string()
+            } else {
+                status.tools.join(", ")
+            };
+            let mut detail = div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .flex_1()
+                .min_w_0()
+                .child(txt(status.name.clone(), 13.0, theme::text()))
+                .child(txt(meta, 11.0, theme::muted()))
+                .child(txt(summary, 11.0, theme::faint()));
+            if let Some(error) = &status.error {
+                detail = detail.child(txt(error.clone(), 11.0, theme::error()));
+            }
+            inventory = inventory.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "extension-status-{}",
+                        status.id
+                    )))
+                    .debug_selector({
+                        let id = status.id.clone();
+                        move || format!("extension-status-{id}")
+                    })
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .py(px(8.0))
+                    .border_b_1()
+                    .border_color(rgb(theme::border_soft()))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(8.0))
+                            .child(detail)
+                            .child(txt(
+                                status.state.as_str().to_string(),
+                                11.0,
+                                if status.applied {
+                                    theme::success()
+                                } else {
+                                    theme::warn()
+                                },
+                            )),
+                    ),
+            );
+        }
+        let inventory = div()
+            .debug_selector(|| "extension-inventory".to_string())
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(txt(
+                tr(self.state.lang, "settings.extensionsInstalled"),
+                11.0,
+                theme::muted(),
+            ))
+            .child(inventory);
+
         let mut rows = Vec::new();
+        rows.push(div().mb(px(14.0)).child(inventory).into_any_element());
         if let Some(section) = approval_section {
             rows.push(div().mb(px(10.0)).child(section).into_any_element());
         }
