@@ -1108,12 +1108,21 @@ required = ["process.execute"]
             .expect("MCP probe returns text");
         let values: Vec<&str> = text.split('|').collect();
         assert_eq!(values.first(), Some(&"blocked"));
-        assert_eq!(values.get(1).and_then(|value| value.parse::<u64>().ok()), Some(256 * 1024 * 1024),
-            "MCP child must inherit RLIMIT_AS");
-        assert_eq!(values.get(2).and_then(|value| value.parse::<u64>().ok()), Some(32),
-            "MCP child must inherit RLIMIT_CPU");
-        assert_eq!(values.get(3).and_then(|value| value.parse::<u64>().ok()), Some(256),
-            "MCP child must inherit RLIMIT_NOFILE");
+        assert_eq!(
+            values.get(1).and_then(|value| value.parse::<u64>().ok()),
+            Some(256 * 1024 * 1024),
+            "MCP child must inherit RLIMIT_AS"
+        );
+        assert_eq!(
+            values.get(2).and_then(|value| value.parse::<u64>().ok()),
+            Some(32),
+            "MCP child must inherit RLIMIT_CPU"
+        );
+        assert_eq!(
+            values.get(3).and_then(|value| value.parse::<u64>().ok()),
+            Some(256),
+            "MCP child must inherit RLIMIT_NOFILE"
+        );
         assert!(!probe.exists(), "MCP must not write into the host HOME");
         runtime.shutdown().await.expect("shutdown");
         let _ = std::fs::remove_dir_all(&root);
