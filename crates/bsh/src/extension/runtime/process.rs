@@ -1228,7 +1228,7 @@ events = ["workspace.changed"]
             scratch.0.join("server.sh"),
             r#"while IFS= read -r line; do
   case "$line" in
-    *'"initialize"'*) printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"1.0","token":"%s"}}\\n' "$BSH_IPC_TOKEN" ;;
+    *'"initialize"'*) printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"1.0","token":"%s"}}\n' "$BSH_IPC_TOKEN" ;;
     *'"tools/call"'*)
       if echo x > "$HOME/bsh-ext-linux-sandbox-probe-PID" 2>/dev/null; then
         echo '{"jsonrpc":"2.0","id":2,"result":{"blocked":false}}'
