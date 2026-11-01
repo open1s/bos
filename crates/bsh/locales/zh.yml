@@ -606,6 +606,8 @@
 "settings.marketIntro": "从本地包或远程插件市场索引安装 Codex 与 DeepSeek Harness 插件。"
 "settings.marketLocalOnly": "本地包始终列出。打开此页会加载远程目录；安装前不会下载。"
 "settings.marketApplyHint": "安装和启用会立即生效，并在重启后保留。"
+"settings.marketApply": "应用"
+"settings.marketSourceHint": "来自 Git 仓库的扩展"
 "settings.marketGitHint": "来自 github.com/open1s/bsh_extensions 的扩展"
 "settings.marketGitEmpty": "缓存市场中没有扩展。刷新以克隆提供方。"
 "settings.marketLoading": "正在刷新市场..."

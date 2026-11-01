@@ -1536,8 +1536,8 @@ fn command_integrate(args: &[String], root: Option<PathBuf>) -> Result<i32, Stri
 }
 fn command_market(args: &[String], root: Option<PathBuf>) -> Result<i32, String> {
     let store = ExtensionStore::open(config(root).root).map_err(|error| error.to_string())?;
-    let url = std::env::var("BSH_EXTENSION_MARKET")
-        .unwrap_or_else(|_| crate::extension::market::DEFAULT_GIT_MARKET.to_string());
+    let settings = crate::settings::Settings::load();
+    let url = crate::extension::market::configured_url(&settings);
     let mut market = crate::extension::market::GitMarket::open(store.root(), &url);
     let index = market.sync().map_err(|error| error.to_string())?;
     if args.first().map(String::as_str) == Some("install") {

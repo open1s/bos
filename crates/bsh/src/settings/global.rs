@@ -391,6 +391,9 @@ pub(crate) struct GlobalSettings {
     /// them unique the way a map key would.
     #[serde(default, alias = "extentions")]
     pub(crate) extensions: Vec<InstalledExtension>,
+    /// Git URL of the extension market. Empty means the official provider.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) extension_market_url: String,
     /// Remote plugin-market index URLs, in display order.
     ///
     /// The market fetches each URL on Refresh; nothing is written back into
@@ -429,6 +432,7 @@ impl Default for GlobalSettings {
             plugin_provider_owners: BTreeMap::new(),
             presets: BTreeMap::new(),
             extensions: Vec::new(),
+            extension_market_url: String::new(),
             market_indexes: Vec::new(),
             workspaces: Vec::new(),
             web_search: WebSearchSection::default(),

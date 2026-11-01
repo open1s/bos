@@ -29981,6 +29981,10 @@ fn the_extensions_pane_keeps_mcp_and_skills(cx: &mut TestAppContext) {
         cx.debug_bounds("extension-market-refresh").is_some(),
         "the Market tab lists the Git provider"
     );
+    assert!(
+        cx.debug_bounds("extension-market-apply").is_some(),
+        "the Market tab lets the reader apply a custom Git source"
+    );
     let installed = cx
         .debug_bounds("extensions-tab-installed")
         .expect("Installed tab");

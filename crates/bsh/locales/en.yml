@@ -611,6 +611,8 @@
 "settings.marketIntro": "Install Codex and DeepSeek Harness plugins from local packages or a remote market index."
 "settings.marketLocalOnly": "Local packages stay listed. Remote catalogs load when you open this tab; nothing downloads until Install."
 "settings.marketApplyHint": "Install and enable take effect immediately and survive a restart."
+"settings.marketApply": "Apply"
+"settings.marketSourceHint": "Extensions from a Git repository"
 "settings.marketGitHint": "Extensions from github.com/open1s/bsh_extensions"
 "settings.marketGitEmpty": "No extensions in the cached market. Refresh to clone the provider."
 "settings.marketLoading": "Refreshing the market..."

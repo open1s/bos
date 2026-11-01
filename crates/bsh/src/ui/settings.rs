@@ -6593,10 +6593,8 @@ impl Shell {
             return;
         }
         let root = crate::extension::store_root(&self.state.settings);
-        let market = crate::extension::market::GitMarket::open(
-            &root,
-            crate::extension::market::DEFAULT_GIT_MARKET,
-        );
+        let url = crate::extension::market::configured_url(&self.state.settings);
+        let market = crate::extension::market::GitMarket::open(&root, &url);
         match market.cached() {
             Ok(index) => {
                 self.extension_market = Some(index.extensions.clone());
@@ -6616,12 +6614,10 @@ impl Shell {
         }
         self.extension_market_fetching = true;
         let root = crate::extension::store_root(&self.state.settings);
+        let url = crate::extension::market::configured_url(&self.state.settings);
         let (tx, rx) = async_channel::bounded(1);
         self.state.runner.rt().spawn_blocking(move || {
-            let mut market = crate::extension::market::GitMarket::open(
-                &root,
-                crate::extension::market::DEFAULT_GIT_MARKET,
-            );
+            let mut market = crate::extension::market::GitMarket::open(&root, &url);
             let result = market.sync().map(|index| index.extensions.clone());
             let _ = tx.send_blocking(result);
         });
@@ -6663,6 +6659,32 @@ impl Shell {
         .detach();
     }
 
+    /// Persist the editable Git market URL and reload the market.
+    fn apply_extension_market_url(&mut self, cx: &mut Context<Self>) {
+        let typed = self
+            .extension_market_url_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let configured =
+            if typed.is_empty() || typed == crate::extension::market::DEFAULT_GIT_MARKET {
+                String::new()
+            } else {
+                typed
+            };
+        self.state.settings.global.extension_market_url = configured.clone();
+        self.state.draft_mut().global.extension_market_url = configured;
+        if let Err(error) = self.state.settings.save_global() {
+            self.extension_market_error = Some(format!("saving market source: {error}"));
+            cx.notify();
+            return;
+        }
+        self.extension_market = None;
+        self.extension_market_error = None;
+        self.refresh_extension_market(cx);
+    }
+
     /// Install one market entry off the UI thread.
     fn install_extension_market(&mut self, id: String, cx: &mut Context<Self>) {
         if self.extension_market_installing.is_some() {
@@ -6672,6 +6694,7 @@ impl Shell {
         self.extension_market_error = None;
         cx.notify();
         let root = crate::extension::store_root(&self.state.settings);
+        let url = crate::extension::market::configured_url(&self.state.settings);
         let settings = self.state.settings.clone();
         let workspace = {
             let root = settings.active_workspace_root();
@@ -6681,10 +6704,7 @@ impl Shell {
         self.state.runner.rt().spawn_blocking(move || {
             let store = crate::extension::package::ExtensionStore::open(&root);
             let result = store.map_err(|error| error.to_string()).and_then(|store| {
-                let market = crate::extension::market::GitMarket::open(
-                    &root,
-                    crate::extension::market::DEFAULT_GIT_MARKET,
-                );
+                let market = crate::extension::market::GitMarket::open(&root, &url);
                 let index = market.cached().map_err(|error| error.to_string())?;
                 let entry = index
                     .newest(&id)
@@ -6736,13 +6756,41 @@ impl Shell {
             .on_click(cx.listener(|this, _event, _window, cx| {
                 this.refresh_extension_market(cx);
             }));
+        let apply = div()
+            .id("extension-market-apply")
+            .debug_selector(|| "extension-market-apply".to_string())
+            .h(px(30.0))
+            .px(px(12.0))
+            .rounded(px(8.0))
+            .bg(rgb(theme::accent()))
+            .cursor_pointer()
+            .child(txt(tr(lang, "settings.marketApply"), 12.0, theme::page()))
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.apply_extension_market_url(cx);
+            }));
         rows.push(
             div()
                 .mb(px(12.0))
                 .flex()
                 .flex_row()
                 .items_center()
-                .justify_end()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h(px(30.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .px(px(10.0))
+                        .rounded(px(8.0))
+                        .bg(rgb(theme::new_session_fill()))
+                        .child(icon(IconName::Globe, 12.0, theme::faint()))
+                        .child(Input::new(&self.extension_market_url_input).appearance(false)),
+                )
+                .child(apply)
                 .child(refresh)
                 .into_any_element(),
         );
@@ -6893,7 +6941,7 @@ impl Shell {
         if self.extensions_tab == 4 {
             return (
                 "settings.extensions",
-                "settings.marketGitHint",
+                "settings.marketSourceHint",
                 self.extension_market_rows(cx),
             );
         }

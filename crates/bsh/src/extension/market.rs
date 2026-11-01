@@ -17,6 +17,24 @@ use super::types::{ExtensionError, ExtensionSource};
 /// The official provider repository.
 pub(crate) const DEFAULT_GIT_MARKET: &str = "https://github.com/open1s/bsh_extensions";
 
+/// The market URL for this launch: environment override, then the reader's
+/// setting, then the official provider. The environment wins so a developer
+/// can test a local provider without editing the settings file.
+pub(crate) fn configured_url(settings: &crate::settings::Settings) -> String {
+    if let Ok(url) = std::env::var("BSH_EXTENSION_MARKET") {
+        let url = url.trim();
+        if !url.is_empty() {
+            return url.to_string();
+        }
+    }
+    let configured = settings.global.extension_market_url.trim();
+    if configured.is_empty() {
+        DEFAULT_GIT_MARKET.to_string()
+    } else {
+        configured.to_string()
+    }
+}
+
 /// One package advertised by the provider.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct MarketEntry {

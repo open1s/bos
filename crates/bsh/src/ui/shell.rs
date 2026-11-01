@@ -879,6 +879,8 @@ pub(crate) struct Shell {
     pub(crate) extension_market_fetching: bool,
     /// The market entry currently being installed, if any.
     pub(crate) extension_market_installing: Option<String>,
+    /// Editable Git URL for the extension market.
+    pub(crate) extension_market_url_input: Entity<InputState>,
     /// The settings dialog's text fields.
     pub(crate) settings_inputs: SettingsInputs,
     /// The Vault pane's text fields.
@@ -1257,6 +1259,15 @@ impl Shell {
         let market_url = cx.new(|cx| {
             InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "settings.marketUrlHint"))
         });
+        let current_market_url = state.settings.global.extension_market_url.clone();
+        let extension_market_url_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(crate::extension::market::DEFAULT_GIT_MARKET)
+        });
+        if !current_market_url.is_empty() {
+            extension_market_url_input.update(cx, |input, cx| {
+                input.set_value(current_market_url, window, cx);
+            });
+        }
         let skill_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "settings.skillsSearch"))
         });
@@ -1765,6 +1776,7 @@ impl Shell {
             extension_market_error: None,
             extension_market_fetching: false,
             extension_market_installing: None,
+            extension_market_url_input,
             settings_inputs,
             vault_inputs,
             vault_revealed: None,
