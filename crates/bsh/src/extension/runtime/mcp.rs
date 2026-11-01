@@ -197,6 +197,8 @@ struct McpCore {
     config: String,
     max_execution_ms: u64,
     max_output_bytes: u64,
+    memory_bytes: u64,
+    cpu_seconds: u64,
     /// The process.execute grant this runtime spawns under.
     policy: Option<(Arc<PolicyEngine>, TrustLevel)>,
     events: Option<Arc<EventBus>>,
@@ -308,6 +310,8 @@ impl McpCore {
             config,
             max_execution_ms: manifest.resources.execution_ms(),
             max_output_bytes: manifest.resources.output_bytes(),
+            memory_bytes: manifest.resources.memory_mb().saturating_mul(1024 * 1024),
+            cpu_seconds: (manifest.resources.execution_ms() / 1000).max(1) + 2,
             policy: Some((policy, trust)),
             events: Some(events),
             subscription: Mutex::new(subscription),
@@ -449,6 +453,14 @@ impl McpCore {
             command.args(&self.args);
             command
         };
+        // Apply the same Unix RLIMIT and process-group ceilings as
+        // ProcessRuntime. Windows remains a documented limitation until
+        // Job Object enforcement is implemented.
+        super::process::configure_process_limits(
+            &mut command,
+            self.memory_bytes,
+            self.cpu_seconds,
+        );
         command
             .current_dir(&self.root)
             .env_clear()
