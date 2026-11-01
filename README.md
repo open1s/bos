@@ -3,21 +3,21 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/bos-logo.png" alt="BOS — BrainOS AI Agent Framework" width="440">
+  <img src="docs/assets/bos-logo.png" alt="BOS — Rust-Native AI Agent Platform" width="440">
 </p>
 
 <h1 align="center">BOS — The Rust-Native AI Agent Platform</h1>
 
 <p align="center">
-  <strong>One Rust core. Three developer interfaces. One native agent workspace.</strong>
+  <strong>One Runtime. Multiple Interfaces. One Extensible Agent Workspace.</strong>
 </p>
 
 <p align="center">
-  BOS (BrainOS) is a composable platform for building, embedding, and operating AI agents.
-  Its Rust runtime brings orchestration, tools, MCP, skills, memory, and multi-agent
-  communication together behind one execution core. Use it directly from Rust, or through
-  the NBOS Python and JSBOS JavaScript SDKs. <strong>BSH (BOS Harness)</strong> brings that
-  same runtime into a native desktop workspace for agent-driven development.
+  BOS (BrainOS) is a Rust-native platform for building, embedding, and operating AI agents.
+  One shared <strong>BOS Runtime</strong> provides the execution foundation. Developers access it
+  through multiple interfaces: native Rust, the NBOS Python SDK, and the JSBOS JavaScript SDK.
+  <strong>BSH (BOS Harness)</strong> brings the same runtime into an extensible native desktop
+  workspace for agent-driven development.
 </p>
 
 <p align="center">
@@ -41,13 +41,12 @@
 
 ## What is BOS?
 
-**BOS provides the shared runtime foundation for building and operating AI agents.**
+**BOS is one shared Rust runtime, exposed through multiple developer interfaces and brought to life in one extensible agent workspace.**
 
-Instead of tying agent behavior to one language or one interface, BOS separates the
-execution engine from the way developers use it. The Rust runtime provides the core
-capabilities; NBOS and JSBOS expose the same engine to Python and JavaScript; and BSH
-delivers a native desktop environment powered by that runtime. Embed agents in your own
-software, or use the integrated workspace to develop and operate them.
+The runtime is the foundation—not a language-specific SDK or a desktop application. Use it
+natively from Rust, or access the same execution core through NBOS for Python and JSBOS for
+JavaScript. BSH is the native GPUI workspace built on that runtime, bringing agent execution,
+developer tools, and an extension platform into one environment.
 
 | Product | What it does | Best for |
 |---|---|---|
@@ -64,9 +63,9 @@ runtime, the Python and JavaScript SDKs, and the BSH desktop application. Teams 
 execution model to embed in products, automate from scripts, and operate through a desktop
 workspace.
 
-- **One engine, three languages.** Build on the Rust core or use the Python and JavaScript
-  bindings. The bindings share the same underlying implementation and are checked for API
-  parity in CI.
+- **Multiple interfaces, one execution model.** Use the Rust runtime directly, or build
+  through the NBOS Python and JSBOS JavaScript SDKs. The language bindings share the same
+  underlying implementation and are checked for API parity in CI.
 - **Agent orchestration, not only chat.** Run the ReAct loop, stream model output, invoke tools,
   process observations, and continue execution with lifecycle hooks.
 - **MCP built in.** Connect to Model Context Protocol servers over stdio or HTTP; discover and
@@ -263,12 +262,12 @@ documentation for drift.
 | Register tools | `.with_tools(add)` | `.register(toolDef)` |
 | Run | `await agent.ask("…")` | `await agent.runSimple("…")` |
 
-## BSH: native AI agent workspace
+## One extensible agent workspace: BSH
 
-**BSH is the native desktop product built on the BOS runtime.**
-It brings agent sessions, projects, terminal, browser, code editor, and extensions into one
-GPUI workspace. Rather than keeping the agent in a separate chat window, BSH places agent
-execution alongside the tools developers use to do real work.
+**BSH is the native GPUI workspace built on the BOS Runtime.** It brings agent sessions,
+projects, terminal, browser, code editor, and extensions into one environment. Agent execution
+lives alongside the tools developers use to do real work, while the extension platform lets
+teams adapt the workspace to their own workflows.
 
 - **Workspaces and sessions** — organize projects and persistent conversations; search,
   pin, archive, fork and restore sessions.
@@ -285,10 +284,11 @@ execution alongside the tools developers use to do real work.
 
 ## Extension platform
 
-The BOS runtime is designed to be embedded in applications; BSH is designed to be extended
-around developer workflows. Each extension is described by `extension.toml`. BSH validates
-the manifest and package contents, resolves dependencies, manages lifecycle, and applies
-capability policies when an extension requests host functionality.
+The extension platform is the extensibility layer of the BSH workspace. BOS Runtime is
+embedded by applications; BSH is extended around developer workflows. Each extension is
+described by `extension.toml`. BSH validates the manifest and package contents, resolves
+dependencies, manages lifecycle, and applies capability policies when an extension requests
+host functionality.
 
 <p align="center">
   <img src="docs/assets/charts/architecture.png" alt="BSH extension architecture: validate, hash, install, resolve, authorize, dispatch and run" width="820">
