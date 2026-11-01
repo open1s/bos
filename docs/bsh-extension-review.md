@@ -37,9 +37,9 @@ problem_type: review
 | Language/integration were descriptor-only | Real diagnostics and action dispatch |
 | Process integrations could not run commands | `commands/execute` added to the process protocol |
 
-Remaining product gap: **audio capture** has no host producer; `audio.captured`
-fires only for an audio attachment. There is no voice-input subsystem to plug
-into.
+Remaining product gap: **audio capture** has no host producer of its own;
+`audio.captured` fires when an audio attachment is captured, and there is no
+voice-input subsystem to plug into.
 
 ## 2. Architecture review
 

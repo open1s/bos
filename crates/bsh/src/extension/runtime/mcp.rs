@@ -10,8 +10,9 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -19,9 +20,11 @@ use serde_json::{json, Value};
 
 use super::declarative::{DeclarativeContributions, TextContribution};
 use super::{CallContext, Runtime, ToolDescriptor, ToolResult};
+use crate::extension::capability::{CallScope, Capability, PolicyEngine};
+use crate::extension::events::{EventBus, EventFilter, Subscription};
 use crate::extension::manifest::{is_allowlisted_command, validate_relative_path, Manifest};
 use crate::extension::types::{
-    ContributionId, ExtensionError, ExtensionId, RuntimeKind, HOST_VERSION,
+    ContributionId, ExtensionError, ExtensionId, RuntimeKind, TrustLevel, HOST_VERSION,
 };
 
 /// The protocol version this adapter sends.
@@ -125,7 +128,7 @@ impl Session {
                 continue;
             }
             if let Some(error) = value.get("error") {
-                return Err(ExtensionError::Runtime {
+                return Err(ExtensionError::Remote {
                     extension: "mcp".to_string(),
                     message: error.to_string(),
                 });
@@ -167,8 +170,12 @@ impl Drop for Session {
     }
 }
 
-/// The MCP runtime for one server package.
-pub(crate) struct McpRuntime {
+/// The state one MCP server package owns.
+///
+/// Split out behind an `Arc` so a call can run on the blocking pool: the server
+/// speaks synchronous stdio, and awaiting it on an executor thread both blocks
+/// that thread and prevents the caller's deadline and cancel from firing.
+struct McpCore {
     extension: ExtensionId,
     root: PathBuf,
     entry: String,
@@ -177,8 +184,22 @@ pub(crate) struct McpRuntime {
     config: String,
     max_execution_ms: u64,
     max_output_bytes: u64,
+    /// The process.execute grant this runtime spawns under.
+    policy: Option<(Arc<PolicyEngine>, TrustLevel)>,
+    events: Option<Arc<EventBus>>,
+    subscription: Mutex<Option<Subscription>>,
+    /// contribution id -> the name the server itself uses.
+    wire: Mutex<BTreeMap<String, String>>,
     catalog: Mutex<Option<Catalog>>,
     session: Mutex<Option<Session>>,
+    /// The live child's pid, for cancellation without the session lock.
+    child_pid: AtomicU32,
+    cancelled: AtomicBool,
+}
+
+/// The MCP runtime for one server package.
+pub(crate) struct McpRuntime {
+    core: Arc<McpCore>,
 }
 
 struct Catalog {
@@ -193,6 +214,56 @@ impl McpRuntime {
         manifest: &Manifest,
         root: &Path,
         config: String,
+        policy: Arc<PolicyEngine>,
+        trust: TrustLevel,
+        events: Arc<EventBus>,
+    ) -> Result<Self, ExtensionError> {
+        let subscription = if manifest.contributes.events.is_empty() {
+            None
+        } else {
+            EventFilter::from_topics(&manifest.contributes.events)
+                .ok()
+                .map(|filter| events.subscribe(filter, 64))
+        };
+        Ok(Self {
+            core: Arc::new(McpCore::new(
+                manifest,
+                root,
+                config,
+                policy,
+                trust,
+                events,
+                subscription,
+            )?),
+        })
+    }
+
+    /// The tool descriptors the server advertised.
+    pub(crate) fn descriptors(&self) -> Result<Vec<ToolDescriptor>, ExtensionError> {
+        self.core.descriptors()
+    }
+
+    /// Context and prompt contributions discovered from resources/prompts.
+    pub(crate) fn contributions(&self) -> Result<DeclarativeContributions, ExtensionError> {
+        self.core.contributions()
+    }
+
+    /// Ask the server to stop; the session dies with the runtime.
+    pub(crate) fn stop(&self) {
+        self.core.cancelled.store(true, Ordering::SeqCst);
+        self.core.kill_child();
+    }
+}
+
+impl McpCore {
+    fn new(
+        manifest: &Manifest,
+        root: &Path,
+        config: String,
+        policy: Arc<PolicyEngine>,
+        trust: TrustLevel,
+        events: Arc<EventBus>,
+        subscription: Option<Subscription>,
     ) -> Result<Self, ExtensionError> {
         if manifest.runtime.kind != RuntimeKind::Mcp {
             return Err(ExtensionError::Manifest {
@@ -223,8 +294,14 @@ impl McpRuntime {
             config,
             max_execution_ms: manifest.resources.execution_ms(),
             max_output_bytes: manifest.resources.output_bytes(),
+            policy: Some((policy, trust)),
+            events: Some(events),
+            subscription: Mutex::new(subscription),
+            wire: Mutex::new(BTreeMap::new()),
             catalog: Mutex::new(None),
             session: Mutex::new(None),
+            child_pid: AtomicU32::new(0),
+            cancelled: AtomicBool::new(false),
         })
     }
 
@@ -322,6 +399,23 @@ impl McpRuntime {
             }
             canonical
         };
+        // The MCP runtime spawns a child exactly like the process runtime, so
+        // it must pass the same gate: an explicit process.execute grant, scoped
+        // to this exact program and argument vector. Without this a package
+        // that simply omitted the capability from its manifest ran arbitrary
+        // commands with the reader's privileges.
+        if let Some((policy, trust)) = &self.policy {
+            policy.authorize_call(
+                self.extension.as_str(),
+                *trust,
+                Capability::ProcessExecute,
+                &CallScope {
+                    program: Some(self.entry.clone()),
+                    args: Some(self.args.clone()),
+                    ..CallScope::default()
+                },
+            )?;
+        }
         let mut command = Command::new(&program);
         command
             .args(&self.args)
@@ -342,6 +436,7 @@ impl McpRuntime {
             path: program,
             source,
         })?;
+        self.child_pid.store(child.id(), Ordering::SeqCst);
         let stdin = child.stdin.take().ok_or_else(|| ExtensionError::Protocol {
             extension: self.extension.to_string(),
             message: "MCP stdin was not piped".to_string(),
@@ -419,6 +514,10 @@ impl McpRuntime {
         let timeout = self.max_execution_ms;
         let mut tools = Vec::new();
         let mut cursor = Value::Null;
+        let mut wire = self.wire.lock().map_err(|_| ExtensionError::Corrupt {
+            path: self.root.clone(),
+            message: "MCP wire-name lock is poisoned".to_string(),
+        })?;
         loop {
             let result = session.request(
                 "tools/list",
@@ -436,6 +535,22 @@ impl McpRuntime {
                         Ok(id) => id,
                         Err(_) => continue,
                     };
+                    if wire.contains_key(id.as_str()) {
+                        // Two server names can map onto one contribution id
+                        // once they are sanitized. Keep the first and say so;
+                        // silently replacing would route calls to the wrong
+                        // tool.
+                        log::warn!(
+                            target: "bsh::extension",
+                            "{}: MCP tools {:?} and {:?} share the id {:?}; the later one is ignored",
+                            self.extension,
+                            wire.get(id.as_str()).map(String::as_str).unwrap_or_default(),
+                            name,
+                            id
+                        );
+                        continue;
+                    }
+                    wire.insert(id.as_str().to_string(), name.to_string());
                     tools.push(ToolDescriptor {
                         id,
                         description: tool
@@ -547,12 +662,39 @@ impl McpRuntime {
             prompts,
         })
     }
-    fn call_tool_with_progress(
+    /// The name the server itself uses for a contribution id.
+    fn wire_name(&self, id: &str) -> String {
+        self.wire
+            .lock()
+            .ok()
+            .and_then(|wire| wire.get(id).cloned())
+            .unwrap_or_else(|| id.to_string())
+    }
+
+    /// Kill the live child without waiting for the session lock.
+    ///
+    /// Cancellation must work while a call holds that lock (the call is a
+    /// blocking stdio exchange), so the pid is recorded outside it.
+    fn kill_child(&self) {
+        let pid = self.child_pid.swap(0, Ordering::SeqCst);
+        if pid != 0 {
+            // SAFETY: kill(2) only signals the process this runtime spawned.
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
+
+    /// One tool call over the session, blocking this thread.
+    fn call_tool_blocking(
         &self,
         name: &str,
         arguments: Value,
         progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+        timeout_ms: u64,
     ) -> Result<Value, ExtensionError> {
+        self.cancelled.store(false, Ordering::SeqCst);
+        let wire = self.wire_name(name);
         let mut guard = self.session.lock().map_err(|_| ExtensionError::Corrupt {
             path: self.root.clone(),
             message: "MCP session lock is poisoned".to_string(),
@@ -563,8 +705,8 @@ impl McpRuntime {
         let session = guard.as_mut().expect("session");
         let result = session.request_with_progress(
             "tools/call",
-            json!({ "name": name, "arguments": arguments }),
-            self.max_execution_ms,
+            json!({ "name": wire, "arguments": arguments }),
+            timeout_ms,
             progress.as_ref(),
         );
         match result {
@@ -574,6 +716,7 @@ impl McpRuntime {
                     .unwrap_or(0);
                 if bytes as u64 > self.max_output_bytes {
                     *guard = None;
+                    self.child_pid.store(0, Ordering::SeqCst);
                     return Err(ExtensionError::Limit {
                         extension: self.extension.to_string(),
                         message: format!(
@@ -602,10 +745,45 @@ impl McpRuntime {
                 }
                 Ok(value)
             }
+            // A well-formed JSON-RPC error leaves the pipe in a known state, so
+            // the next call keeps the session and the server's in-process state.
+            Err(error @ ExtensionError::Remote { .. }) => Err(error),
             Err(error) => {
                 *guard = None;
+                self.child_pid.store(0, Ordering::SeqCst);
                 Err(error)
             }
+        }
+    }
+
+    /// Deliver queued host events as `bsh/events/event` notifications.
+    ///
+    /// The server is started on demand, so a package whose server is not
+    /// running yet simply drops the queued events instead of paying a spawn
+    /// just to deliver a notification.
+    fn pump(&self) {
+        let mut queued = Vec::new();
+        if let Ok(slot) = self.subscription.lock() {
+            if let Some(subscription) = slot.as_ref() {
+                while let Some(event) = subscription.try_recv() {
+                    queued.push(event);
+                }
+            }
+        }
+        if queued.is_empty() {
+            return;
+        }
+        let Ok(mut guard) = self.session.lock() else {
+            return;
+        };
+        let Some(session) = guard.as_mut() else {
+            return;
+        };
+        for event in queued {
+            let Ok(params) = serde_json::to_value(&event) else {
+                continue;
+            };
+            let _ = session.notify("bsh/events/event", params);
         }
     }
 }
@@ -646,16 +824,30 @@ impl Runtime for McpRuntime {
     }
 
     async fn deactivate(&self) -> Result<(), ExtensionError> {
-        if let Ok(mut slot) = self.session.lock() {
-            if let Some(mut session) = slot.take() {
-                session.close();
-            }
+        let mut slot = self
+            .core
+            .session
+            .lock()
+            .map_err(|_| ExtensionError::Corrupt {
+                path: self.core.root.clone(),
+                message: "MCP session lock is poisoned".to_string(),
+            })?;
+        if let Some(mut session) = slot.take() {
+            session.close();
         }
+        self.core.child_pid.store(0, Ordering::SeqCst);
         Ok(())
     }
 
     async fn shutdown(&self) -> Result<(), ExtensionError> {
         self.deactivate().await
+    }
+
+    async fn cancel(&self) -> Result<(), ExtensionError> {
+        // No session lock: a running call holds it for the whole stdio
+        // exchange, and the pid outside it is what makes Stop effective.
+        self.stop();
+        Ok(())
     }
 
     async fn tools(&self) -> Result<Vec<ToolDescriptor>, ExtensionError> {
@@ -666,68 +858,9 @@ impl Runtime for McpRuntime {
         &self,
         name: &str,
         arguments: Value,
-        _context: &CallContext,
+        context: &CallContext,
     ) -> Result<Value, ExtensionError> {
-        let mut guard = self.session.lock().map_err(|_| ExtensionError::Corrupt {
-            path: self.root.clone(),
-            message: "MCP session lock is poisoned".to_string(),
-        })?;
-        if guard.is_none() {
-            *guard = Some(self.start_with_retry()?);
-        }
-        let session = guard.as_mut().expect("session");
-        let result = session.request(
-            "tools/call",
-            json!({ "name": name, "arguments": arguments }),
-            self.max_execution_ms,
-        );
-        match result {
-            Ok(value) => {
-                let bytes = serde_json::to_vec(&value)
-                    .map(|bytes| bytes.len())
-                    .unwrap_or(0);
-                if bytes as u64 > self.max_output_bytes {
-                    *guard = None;
-                    return Err(ExtensionError::Limit {
-                        extension: self.extension.to_string(),
-                        message: format!(
-                            "MCP result is {bytes} bytes; the ceiling is {}",
-                            self.max_output_bytes
-                        ),
-                    });
-                }
-                let is_error = value
-                    .get("isError")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                if is_error {
-                    let message = value
-                        .get("content")
-                        .and_then(Value::as_array)
-                        .and_then(|content| content.first())
-                        .and_then(|content| content.get("text"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("MCP tool failed")
-                        .to_string();
-                    return Err(ExtensionError::Runtime {
-                        extension: self.extension.to_string(),
-                        message,
-                    });
-                }
-                if let Some(content) = value.get("content").and_then(Value::as_array) {
-                    if content.len() == 1 {
-                        if let Some(text) = content[0].get("text").and_then(Value::as_str) {
-                            return Ok(Value::String(text.to_string()));
-                        }
-                    }
-                }
-                Ok(value)
-            }
-            Err(error) => {
-                *guard = None;
-                Err(error)
-            }
-        }
+        self.call(name, arguments, context, None).await
     }
 
     async fn call_tool_result(
@@ -736,7 +869,7 @@ impl Runtime for McpRuntime {
         arguments: Value,
         context: &CallContext,
     ) -> Result<ToolResult, ExtensionError> {
-        self.call_tool(name, arguments, context)
+        self.call(name, arguments, context, None)
             .await
             .map(ToolResult::from_value)
     }
@@ -745,11 +878,58 @@ impl Runtime for McpRuntime {
         &self,
         name: &str,
         arguments: Value,
-        _context: &CallContext,
+        context: &CallContext,
         progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
     ) -> Result<ToolResult, ExtensionError> {
-        self.call_tool_with_progress(name, arguments, progress)
+        self.call(name, arguments, context, progress)
+            .await
             .map(ToolResult::from_value)
+    }
+
+    async fn pump(&self) -> Result<(), ExtensionError> {
+        self.core.pump();
+        Ok(())
+    }
+}
+
+impl McpRuntime {
+    /// Run one call on the blocking pool under the caller's deadline.
+    ///
+    /// The MCP transport is synchronous stdio: running it inline on an executor
+    /// thread starved the runtime and made the caller's timeout and cancel
+    /// unreachable. `spawn_blocking` keeps the exchange off the executor, and
+    /// on a deadline the child is killed so the blocked read returns now rather
+    /// than when the server chooses to answer.
+    async fn call(
+        &self,
+        name: &str,
+        arguments: Value,
+        context: &CallContext,
+        progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+    ) -> Result<Value, ExtensionError> {
+        let deadline = context.timeout_ms.max(1).min(self.core.max_execution_ms);
+        let core = Arc::clone(&self.core);
+        let name = name.to_string();
+        let handle = tokio::task::spawn_blocking(move || {
+            core.call_tool_blocking(&name, arguments, progress, deadline)
+        });
+        match tokio::time::timeout(Duration::from_millis(deadline.saturating_add(100)), handle)
+            .await
+        {
+            Err(_) => {
+                self.stop();
+                Err(ExtensionError::Timeout {
+                    extension: self.core.extension.to_string(),
+                    operation: "mcp tools/call".to_string(),
+                    millis: deadline,
+                })
+            }
+            Ok(Err(error)) => Err(ExtensionError::Runtime {
+                extension: self.core.extension.to_string(),
+                message: format!("MCP call task failed: {error}"),
+            }),
+            Ok(Ok(result)) => result,
+        }
     }
 }
 #[cfg(test)]
@@ -771,7 +951,33 @@ mod tests {
             .canonicalize()
             .expect("the MCP example exists");
         let manifest = Manifest::load(&root).expect("manifest");
-        let runtime = McpRuntime::new(&manifest, &root, "{}".to_string()).expect("runtime");
+        let scratch = std::env::temp_dir().join(format!("bsh-mcp-test-{}", std::process::id()));
+        std::fs::create_dir_all(&scratch).expect("scratch");
+        let policy = Arc::new(
+            PolicyEngine::open(
+                scratch.join("grants.toml"),
+                scratch.join("audit.jsonl"),
+                crate::extension::capability::PolicyMode::Enforce,
+            )
+            .expect("policy"),
+        );
+        policy
+            .grant(
+                "com.example.mcp-echo",
+                Capability::ProcessExecute,
+                crate::extension::capability::GrantScope::Program("python3".to_string()),
+                None,
+            )
+            .expect("grant");
+        let runtime = McpRuntime::new(
+            &manifest,
+            &root,
+            "{}".to_string(),
+            policy,
+            TrustLevel::Local,
+            EventBus::new(),
+        )
+        .expect("runtime");
         let tools = runtime.descriptors().expect("tools");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].id.as_str(), "echo");

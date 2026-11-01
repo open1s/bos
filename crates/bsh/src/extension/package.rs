@@ -67,7 +67,27 @@ impl Package {
         trust: TrustLevel,
     ) -> Result<Self, ExtensionError> {
         let manifest = Manifest::load(root)?;
-        let report = manifest.validate();
+        let mut report = manifest.validate();
+        if manifest.runtime.kind == crate::extension::types::RuntimeKind::Builtin
+            && source != ExtensionSource::Builtin
+        {
+            report.error(
+                "runtime.kind",
+                "a manifest read from disk may not claim the builtin runtime; the built-in registry owns those ids",
+            );
+        }
+        // §3: every declared contribution must have its file. Skills were the
+        // one kind no code path checked, so a declaration could list a skill
+        // the package never shipped.
+        for skill in &manifest.contributes.skills {
+            let path = root.join("skills").join(skill.as_str()).join("SKILL.md");
+            if !path.is_file() {
+                report.error(
+                    format!("contributes.skills.{}", skill.as_str()),
+                    format!("skills/{}/SKILL.md is missing", skill.as_str()),
+                );
+            }
+        }
         let signature = PackageSignature::load(root)?;
         let hash = if report.is_valid() {
             package_hash(root)?
@@ -710,11 +730,19 @@ impl ExtensionStore {
     }
 
     /// The state record for one extension, with the default of enabled.
+    ///
+    /// A *missing* record means "never configured", which is enabled. A state
+    /// document that cannot be read is different: falling back to the default
+    /// would silently re-enable every package the reader had disabled.
     pub(crate) fn state_of(&self, id: &ExtensionId) -> ExtensionState {
-        self.read_state()
-            .ok()
-            .and_then(|state| state.extensions.get(id.as_str()).cloned())
-            .unwrap_or_default()
+        match self.read_state() {
+            Ok(state) => state
+                .extensions
+                .get(id.as_str())
+                .cloned()
+                .unwrap_or_default(),
+            Err(_) => ExtensionState::default(),
+        }
     }
 
     /// Persist one extension's state record.
@@ -909,6 +937,47 @@ impl ExtensionStore {
                                 .verification
                                 .unwrap_or(SignatureVerification::Missing);
                             package.source_path = record.source_path.map(PathBuf::from);
+                            // Re-check integrity on every load, not only in
+                            // `doctor`: a file changed under installed/ must not
+                            // keep the trust level the install recorded.
+                            if !record.hash.is_empty()
+                                && !package.hash.is_empty()
+                                && record.hash != package.hash
+                            {
+                                package.report.error(
+                                    "hash",
+                                    "installed files no longer match the hash recorded at install time; reinstall the package",
+                                );
+                            } else if let Ok(trust_store) =
+                                super::signing::TrustStore::load(self.trust_path())
+                            {
+                                let verification = super::signing::verify_package(
+                                    &version_dir,
+                                    package.id().as_str(),
+                                    &package.version().to_string(),
+                                    &package.hash,
+                                    &trust_store,
+                                );
+                                if let SignatureVerification::Invalid { reason } = &verification {
+                                    package.report.error(
+                                        "signature",
+                                        format!("installed signature is invalid: {reason}"),
+                                    );
+                                }
+                                // A publisher removal or a key change must
+                                // demote an installed package, not be frozen at
+                                // the install-time verdict.
+                                let fallback = if matches!(
+                                    package.verification,
+                                    SignatureVerification::Verified { .. }
+                                ) {
+                                    TrustLevel::Community
+                                } else {
+                                    package.trust
+                                };
+                                package.trust = verification.trust_level(fallback);
+                                package.verification = verification;
+                            }
                         }
                         packages.push(package);
                     }
@@ -1004,6 +1073,17 @@ impl ExtensionStore {
         }
         copy_tree(source, &staging)?;
         let hash = package_hash(&staging)?;
+        // The signature above covers the hash of the source tree that was read.
+        // If the staging copy does not hash to the same value, the bytes being
+        // installed are not the bytes that were verified.
+        if !staged.hash.is_empty() && staged.hash != hash {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(ExtensionError::Denied {
+                extension: id.to_string(),
+                capability: "package.integrity".to_string(),
+                reason: "the copied package does not match the verified source hash".to_string(),
+            });
+        }
         if let Some(parent) = destination.parent() {
             std::fs::create_dir_all(parent).map_err(|error| ExtensionError::Io {
                 path: parent.to_path_buf(),
@@ -1026,7 +1106,6 @@ impl ExtensionStore {
         package.installed_at = unix_now();
         package.verification = verification.clone();
         package.signature = staged.signature.clone();
-        package.source_path = Some(source.to_path_buf());
         package.source_path = Some(source.to_path_buf());
         let mut registry = self.read_registry()?;
         registry.insert(
@@ -1051,7 +1130,9 @@ impl ExtensionStore {
         );
         self.write_registry(&registry)?;
         self.update_state(&id, |state| {
-            state.enabled = true;
+            // An upgrade must not switch a package the reader disabled back on:
+            // the enabled flag is the reader's decision and survives the install
+            // (§7). A fresh record already defaults to enabled.
             state.installed_at = package.installed_at;
             state.last_error = None;
             state.active_version = Some(version.clone());
@@ -1249,6 +1330,23 @@ max_execution_ms = 1000
         assert_eq!(again.id(), &id);
         store.uninstall(&id, true).expect("uninstall with data");
         assert!(!store.data_dir(&id).exists());
+    }
+
+    #[test]
+    fn an_upgrade_keeps_a_disabled_package_disabled() {
+        let scratch = Scratch::new("upgrade-enabled");
+        let source = scratch.0.join("source");
+        write_package(&source, &manifest());
+        let store = ExtensionStore::open(scratch.0.join("store")).expect("store");
+        let package = store.install(&source).expect("install");
+        store.set_enabled(package.id(), false).expect("disable");
+        let upgrade = scratch.0.join("upgrade");
+        write_package(&upgrade, &manifest().replace("1.2.3", "1.2.4"));
+        store.install(&upgrade).expect("upgrade");
+        assert!(
+            !store.state_of(package.id()).enabled,
+            "an install must not switch a disabled package back on"
+        );
     }
 
     #[test]

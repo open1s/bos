@@ -37,7 +37,7 @@ use super::ui::{PanelLocation, PanelVisibility, ThemePalette, UiDocument};
 use serde_json::Value;
 
 /// The configuration that decides which store and which packages a host owns.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct HostConfig {
     /// The managed extension root.
     pub(crate) root: PathBuf,
@@ -48,6 +48,22 @@ pub(crate) struct HostConfig {
     /// The preset's explicit allowlist, if it has one.
     pub(crate) preset_allowed: Option<BTreeSet<String>>,
 }
+
+impl PartialEq for HostConfig {
+    /// Two configurations share one host when they name the same store, the
+    /// same workspace and the same disabled set. The preset allowlist is
+    /// deliberately excluded: it filters what one build applies, not which
+    /// host owns the store. Including it made every status/theme read reopen
+    /// the host (and tear down live runtimes) whenever a preset declared an
+    /// allowlist.
+    fn eq(&self, other: &Self) -> bool {
+        self.root == other.root
+            && self.workspace == other.workspace
+            && self.disabled == other.disabled
+    }
+}
+
+impl Eq for HostConfig {}
 
 impl HostConfig {
     /// Build the configuration for one agent build.
@@ -72,10 +88,17 @@ impl HostConfig {
     }
 
     /// Whether a package is enabled by configuration alone.
+    ///
+    /// The preset allowlist is applied when a build *applies* contributions
+    /// (see `apply`), not when the host discovers packages: one host serves
+    /// every preset, and a status row describes the store rather than the
+    /// preset that happened to build last.
     pub(crate) fn allows(&self, id: &ExtensionId) -> bool {
-        if self.disabled.contains(id.as_str()) {
-            return false;
-        }
+        !self.disabled.contains(id.as_str())
+    }
+
+    /// Whether this preset admits the package.
+    fn preset_allows(&self, id: &ExtensionId) -> bool {
         self.preset_allowed
             .as_ref()
             .is_none_or(|allowed| allowed.contains(id.as_str()))
@@ -219,6 +242,19 @@ pub(crate) struct PanelSurface {
     pub(crate) theme: Option<ThemePalette>,
     /// A declarative view that is ready without a call, when one exists.
     pub(crate) initial: Option<UiDocument>,
+    /// Policy the panel's actions are authorized against.
+    pub(crate) policy: Arc<PolicyEngine>,
+    /// Trust level of the owning package.
+    pub(crate) trust: TrustLevel,
+    /// The owning package's tool descriptors, so a panel action gets the same
+    /// per-call capability check as an agent tool call.
+    pub(crate) tools: Arc<Vec<ToolDescriptor>>,
+    /// The workspace open for the build that created this surface, used to
+    /// resolve a panel action's `path` argument before authorization.
+    pub(crate) workspace: Option<PathBuf>,
+    /// The package root, so an `asset/…` image or icon can be resolved to a
+    /// file the renderer can actually load.
+    pub(crate) root: PathBuf,
 }
 
 /// Aggregate tool-call counters.
@@ -347,7 +383,6 @@ pub(crate) struct ExtensionHost {
     status_cache: Arc<Mutex<Vec<ExtensionStatus>>>,
     last_stamp: Option<SystemTime>,
     pump_generation: Arc<AtomicU64>,
-    calls: Mutex<CallMetrics>,
     startup_millis: u64,
     crash_history: Vec<String>,
     languages: Vec<LanguageEntry>,
@@ -384,6 +419,9 @@ impl ExtensionHost {
             PolicyMode::Enforce,
         )?);
         let events = EventBus::new();
+        if let Ok(mut slot) = bus_slot().write() {
+            *slot = Some(Arc::clone(&events));
+        }
         let status_cache = Arc::new(Mutex::new(Vec::new()));
         let mut host = Self {
             config,
@@ -397,7 +435,6 @@ impl ExtensionHost {
             status_cache,
             last_stamp: None,
             pump_generation: Arc::new(AtomicU64::new(0)),
-            calls: Mutex::new(CallMetrics::default()),
             startup_millis: 0,
             crash_history: Vec::new(),
             languages: Vec::new(),
@@ -492,6 +529,15 @@ impl ExtensionHost {
             let id = builtin.package.id().clone();
             let configured = self.store.state_of(&id).enabled && self.config.allows(&id);
             manager.register(id.as_str(), configured);
+            // The linked-in packages take the same discovery path as an
+            // installed one, so activation is a legal transition rather than
+            // the old unconditional rewrite to Active.
+            manager
+                .transition(id.as_str(), LifecycleState::Validating)
+                .ok();
+            manager
+                .transition(id.as_str(), LifecycleState::Resolved)
+                .ok();
             loaded.insert(
                 id.as_str().to_string(),
                 LoadedExtension {
@@ -623,11 +669,17 @@ impl ExtensionHost {
                 continue;
             }
             let mut scope = self.host_scope();
-            if entry.package.manifest.runtime.kind == RuntimeKind::Process {
-                // A process grant is scoped to the declared executable. The
-                // required-capability check must carry that same program, or a
-                // program:python3 grant can never cover it.
+            if matches!(
+                entry.package.manifest.runtime.kind,
+                RuntimeKind::Process | RuntimeKind::Mcp
+            ) {
+                // A process/MCP grant is scoped to the declared executable and
+                // its arguments. The required-capability check must carry the
+                // same pair, or a program:python3:--version grant can never
+                // cover the load-time check even though the per-spawn check
+                // would pass.
                 scope.program = entry.package.manifest.runtime.entry.clone();
+                scope.args = Some(entry.package.manifest.runtime.args.clone());
             }
             let started = std::time::Instant::now();
             if let Err(error) = self.policy.authorize_required(
@@ -648,9 +700,31 @@ impl ExtensionHost {
                 .ok();
         }
 
+        // Packages that were applied before this scan and are not applied now
+        // are unloaded; §9 promises subscribers an extension.unloaded event and
+        // nothing used to publish one.
+        let previous_applied: Vec<ExtensionId> = self
+            .loaded
+            .values()
+            .filter(|entry| entry.applied)
+            .map(|entry| entry.package.id().clone())
+            .collect();
         self.manager = manager;
         self.loaded = loaded;
         self.issues = issues;
+        for id in previous_applied {
+            let still_applied = self
+                .loaded
+                .get(id.as_str())
+                .is_some_and(|entry| entry.applied);
+            if !still_applied {
+                if let Ok(event) =
+                    lifecycle_event(&id, topics::EXTENSION_UNLOADED, "unloaded", None)
+                {
+                    let _ = self.events.publish(&event);
+                }
+            }
+        }
         let mut languages = Vec::new();
         let mut integrations = Vec::new();
         for entry in self.loaded.values().filter(|entry| entry.applied) {
@@ -865,7 +939,14 @@ impl ExtensionHost {
                 ))
             }
             RuntimeKind::Mcp => {
-                let runtime = McpRuntime::new(&package.manifest, &package.root, config.to_json())?;
+                let runtime = McpRuntime::new(
+                    &package.manifest,
+                    &package.root,
+                    config.to_json(),
+                    Arc::clone(&self.policy),
+                    package.trust,
+                    Arc::clone(&self.events),
+                )?;
                 let tools = runtime.descriptors()?;
                 let contributions = runtime.contributions()?;
                 Ok((
@@ -886,10 +967,16 @@ impl ExtensionHost {
                     package.trust,
                 )?;
                 let tools = runtime.descriptors()?;
+                // The component serves commands and panels through its own
+                // exports; prompts, contexts, languages and themes still come
+                // from the declared files. Loading them here is what keeps a
+                // declared contribution from silently disappearing.
+                let contributions =
+                    declarative::load_contributions(&package.root, &package.manifest)?;
                 Ok((
                     Arc::new(LazyRuntime::new(Arc::new(runtime))),
                     tools,
-                    DeclarativeContributions::default(),
+                    contributions,
                 ))
             }
             RuntimeKind::Builtin => Err(ExtensionError::Manifest {
@@ -940,10 +1027,17 @@ impl ExtensionHost {
         &self,
         agent: &mut ::agent::Agent,
         registry: &mut ::agent::plugins::PluginRegistry,
+        preset_allowed: Option<&BTreeSet<String>>,
     ) -> Vec<crate::plugins::PluginInfo> {
         let mut infos = Vec::new();
         for entry in self.loaded.values() {
             if !entry.applied || entry.error.is_some() {
+                continue;
+            }
+            // The preset is a property of this build, not of the cached host:
+            // the host is shared across presets, so the filter arrives here.
+            if preset_allowed.is_some_and(|allowed| !allowed.contains(entry.package.id().as_str()))
+            {
                 continue;
             }
             let Some(runtime) = &entry.runtime else {
@@ -954,7 +1048,10 @@ impl ExtensionHost {
                 || !contributions.commands.is_empty()
                 || !contributions.panels.is_empty()
                 || !contributions.prompts.is_empty()
-                || !contributions.contexts.is_empty();
+                || !contributions.contexts.is_empty()
+                // A package may contribute only skills; skipping it here
+                // silently dropped every skill it declared.
+                || !entry.package.manifest.contributes.skills.is_empty();
             if !has_agent_contribution {
                 continue;
             }
@@ -1058,17 +1155,28 @@ impl ExtensionHost {
             self.config.workspace.clone(),
             30_000,
         );
-        runtime
-            .call_tool(
-                entry.contribution.tool.as_str(),
-                serde_json::json!({
-                    "path": path.display().to_string(),
-                    "text": text,
-                    "language": entry.contribution.id.as_str(),
-                }),
-                &context,
-            )
-            .await
+        let arguments = serde_json::json!({
+            "path": path.display().to_string(),
+            "text": text,
+            "language": entry.contribution.id.as_str(),
+        });
+        let tool = entry.contribution.tool.as_str();
+        let descriptor = loaded
+            .tools
+            .iter()
+            .find(|descriptor| descriptor.id.as_str() == tool)
+            .ok_or_else(|| ExtensionError::NotFound {
+                id: format!("{owner}::{tool}"),
+            })?;
+        let scope = super::capability::call_scope(&arguments, self.config.workspace.as_deref());
+        super::capability::authorize_each(
+            &self.policy,
+            owner,
+            loaded.package.trust,
+            &descriptor.capabilities,
+            &scope,
+        )?;
+        runtime.call_tool(tool, arguments, &context).await
     }
 
     /// Dispatch one integration's declared tool or command.
@@ -1108,14 +1216,19 @@ impl ExtensionHost {
                 reason: "extension has no runtime".to_string(),
             })?;
         let action = entry.contribution.action.as_str();
-        if loaded
-            .package
-            .manifest
-            .contributes
+        if let Some(descriptor) = loaded
             .tools
             .iter()
-            .any(|tool| tool.as_str() == action)
+            .find(|descriptor| descriptor.id.as_str() == action)
         {
+            let scope = super::capability::call_scope(&arguments, self.config.workspace.as_deref());
+            super::capability::authorize_each(
+                &self.policy,
+                owner,
+                loaded.package.trust,
+                &descriptor.capabilities,
+                &scope,
+            )?;
             let context = CallContext::new(
                 entry.owner.clone(),
                 "integration-run",
@@ -1137,8 +1250,19 @@ impl ExtensionHost {
             .filter_map(|entry| entry.runtime.clone())
             .collect();
         self.loaded.clear();
-        for runtime in runtimes {
+        // Stop them together: sequential shutdown paid every process's
+        // one-second kill deadline in turn, so a machine with four process
+        // packages hung the closing window for four seconds.
+        let stops = runtimes.into_iter().map(|runtime| async move {
             let _ = runtime.shutdown().await;
+        });
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            futures::future::join_all(stops),
+        )
+        .await;
+        if let Ok(mut slot) = bus_slot().write() {
+            *slot = None;
         }
     }
     /// Clear a persisted failure and reload the package set.
@@ -1193,6 +1317,11 @@ impl ExtensionHost {
                         reason: "process extension has no declared executable".to_string(),
                     })?)
                 }
+                // A secret or a host cannot be named from this pane, and
+                // granting "any" would be wider than the standard's
+                // secret:NAME / domain: scope. Leave the denial; its reason
+                // already shows the exact grant command and scope to use.
+                Capability::SecretsRead | Capability::NetworkHttp => continue,
                 _ => GrantScope::Any,
             };
             self.policy.grant(
@@ -1234,6 +1363,11 @@ impl ExtensionHost {
                     owner: entry.package.id().clone(),
                     theme: theme.clone(),
                     initial: Some(panel.view.clone()),
+                    policy: Arc::clone(&self.policy),
+                    trust: entry.package.trust,
+                    tools: Arc::new(entry.tools.clone()),
+                    workspace: self.config.workspace.clone(),
+                    root: entry.package.root.clone(),
                 });
             }
             for id in &entry.package.manifest.contributes.panels {
@@ -1251,6 +1385,11 @@ impl ExtensionHost {
                     owner: entry.package.id().clone(),
                     theme: theme.clone(),
                     initial: None,
+                    policy: Arc::clone(&self.policy),
+                    trust: entry.package.trust,
+                    tools: Arc::new(entry.tools.clone()),
+                    workspace: self.config.workspace.clone(),
+                    root: entry.package.root.clone(),
                 });
             }
         }
@@ -1398,7 +1537,7 @@ impl ExtensionHost {
     /// Aggregate counters for the status view and diagnostics.
     pub(crate) fn metrics(&self) -> HostMetrics {
         let bus = self.events.metrics();
-        let calls = self.calls.lock().map(|calls| *calls).unwrap_or_default();
+        let calls = CALLS.lock().map(|calls| *calls).unwrap_or_default();
         HostMetrics {
             extensions: self.loaded.len(),
             applied: self.loaded.values().filter(|entry| entry.applied).count(),
@@ -1443,18 +1582,6 @@ impl ExtensionHost {
                 })
                 .collect(),
             crash_history: self.crash_history.clone(),
-        }
-    }
-
-    fn record_call(&self, millis: u64, bytes: u64, ok: bool) {
-        if let Ok(mut calls) = self.calls.lock() {
-            calls.tool_calls = calls.tool_calls.saturating_add(1);
-            if !ok {
-                calls.tool_failures = calls.tool_failures.saturating_add(1);
-            }
-            calls.total_call_ms = calls.total_call_ms.saturating_add(millis);
-            calls.max_call_ms = calls.max_call_ms.max(millis);
-            calls.output_bytes = calls.output_bytes.saturating_add(bytes);
         }
     }
 
@@ -1740,6 +1867,27 @@ fn startup_allows(package: &Package, config: &HostConfig) -> bool {
 /// a fresh host and drops the previous runtimes.
 static HOST: OnceLock<Mutex<Option<ExtensionHost>>> = OnceLock::new();
 
+/// The live event bus, published outside the host lock.
+///
+/// `publish` is called from UI and agent threads while a build may hold the host
+/// lock during `apply`; contending on that lock stalled the publisher behind
+/// skills-dir reads and context globs.
+static BUS: OnceLock<std::sync::RwLock<Option<Arc<EventBus>>>> = OnceLock::new();
+
+fn bus_slot() -> &'static std::sync::RwLock<Option<Arc<EventBus>>> {
+    BUS.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+/// Tool-call counters, also outside the host lock: `record_tool_call` runs on
+/// every tool completion and must not wait for a build.
+static CALLS: Mutex<CallMetrics> = Mutex::new(CallMetrics {
+    tool_calls: 0,
+    tool_failures: 0,
+    total_call_ms: 0,
+    max_call_ms: 0,
+    output_bytes: 0,
+});
+
 /// Install every enabled extension into one agent build.
 ///
 /// This is the only function the rest of BSH needs. It never panics and never
@@ -1776,9 +1924,11 @@ pub(crate) fn install(
             log::warn!("extension host could not refresh: {error}");
         }
     }
+    let allowed: Option<BTreeSet<String>> =
+        preset_allowed.map(|ids| ids.iter().cloned().collect::<BTreeSet<_>>());
     guard
         .as_ref()
-        .map(|host| host.apply(agent, registry))
+        .map(|host| host.apply(agent, registry, allowed.as_ref()))
         .unwrap_or_default()
 }
 
@@ -1788,15 +1938,12 @@ pub(crate) fn install(
 /// receives nothing, and a full queue is counted rather than blocking the
 /// publisher.
 pub(crate) fn publish(topic: &str, payload: serde_json::Value) {
-    let slot = HOST.get_or_init(|| Mutex::new(None));
-    let Ok(guard) = slot.lock() else {
-        return;
-    };
-    let Some(host) = guard.as_ref() else {
+    let bus = bus_slot().read().ok().and_then(|slot| slot.clone());
+    let Some(bus) = bus else {
         return;
     };
     if let Ok(event) = ExtensionEvent::new("bsh", topic, payload) {
-        if let Err(error) = host.events.publish(&event) {
+        if let Err(error) = bus.publish(&event) {
             log::debug!(target: "bsh::extension", "event publish failed: {error}");
         }
     }
@@ -1822,12 +1969,14 @@ pub(crate) fn shutdown() {
 
 /// Record one extension tool call on the process-global host.
 pub(crate) fn record_tool_call(millis: u64, bytes: u64, ok: bool) {
-    let slot = HOST.get_or_init(|| Mutex::new(None));
-    let Ok(guard) = slot.lock() else {
-        return;
-    };
-    if let Some(host) = guard.as_ref() {
-        host.record_call(millis, bytes, ok);
+    if let Ok(mut calls) = CALLS.lock() {
+        calls.tool_calls = calls.tool_calls.saturating_add(1);
+        if !ok {
+            calls.tool_failures = calls.tool_failures.saturating_add(1);
+        }
+        calls.total_call_ms = calls.total_call_ms.saturating_add(millis);
+        calls.max_call_ms = calls.max_call_ms.max(millis);
+        calls.output_bytes = calls.output_bytes.saturating_add(bytes);
     }
 }
 
@@ -2524,6 +2673,21 @@ tools = ["echo"]
             .join("1.0.0");
         std::fs::write(installed.join("extra.txt"), "changed").expect("tamper");
         let host = ExtensionHost::open(config(&root.join("extensions"))).expect("host");
+        // The mismatch is refused at load, not only reported by a command the
+        // reader has to remember to run.
+        let status = host
+            .statuses()
+            .into_iter()
+            .find(|status| status.id == "com.example.hosted")
+            .expect("the tampered package is still listed");
+        assert!(!status.applied, "{status:?}");
+        assert!(
+            status
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("hash")),
+            "{status:?}"
+        );
         let report = host.doctor();
         assert!(report
             .issues
@@ -2533,18 +2697,137 @@ tools = ["echo"]
     }
 
     #[test]
-    fn a_preset_allowlist_also_gates_a_builtin() {
+    fn a_preset_allowlist_filters_application_without_reopening_the_host() {
         let root = scratch("preset-builtin");
+        let id = ExtensionId::parse("com.bos.bsh.extensions").expect("id");
         let mut narrowed = config(&root);
         narrowed.preset_allowed = Some(BTreeSet::new());
-        let host = ExtensionHost::open(narrowed).expect("host");
+        // The store keeps the package enabled; the preset decides whether this
+        // build applies it.
+        assert!(narrowed.allows(&id));
+        assert!(!narrowed.preset_allows(&id));
+        // The cache key ignores the preset: otherwise every status read with a
+        // preset allowlist reopened the host and tore down live runtimes.
+        let mut plain = config(&root);
+        plain.preset_allowed = None;
+        assert_eq!(narrowed, plain);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn write_guarded_package(root: &Path) {
+        for directory in ["tools", "languages"] {
+            std::fs::create_dir_all(root.join(directory)).expect(directory);
+        }
+        std::fs::write(
+            root.join("extension.toml"),
+            r#"
+schema_version = "1.0"
+
+[extension]
+id = "com.example.guarded"
+name = "Guarded"
+version = "1.0.0"
+description = "A language tool that needs a secret"
+
+[compatibility]
+bsh = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+
+[runtime]
+kind = "declarative"
+
+[capabilities]
+required = ["agent.tools.register"]
+
+[contributes]
+tools = ["check"]
+languages = ["rust"]
+"#,
+        )
+        .expect("manifest");
+        std::fs::write(
+            root.join("tools/check.json"),
+            r#"{"description":"Check","capabilities":["secrets.read"],"implementation":{"kind":"echo_arguments"}}"#,
+        )
+        .expect("tool");
+        std::fs::write(
+            root.join("languages/rust.json"),
+            r#"{"name":"Rust","extensions":["rs"],"tool":"check"}"#,
+        )
+        .expect("language");
+    }
+
+    #[tokio::test]
+    async fn a_language_check_is_authorized_like_a_tool_call() {
+        let root = scratch("language-denied");
+        let source = root.join("source");
+        write_guarded_package(&source);
+        let store = ExtensionStore::open(&root).expect("store");
+        store.install(&source).expect("install");
+        let host = ExtensionHost::open(config(&root)).expect("host");
+        let document = root.join("main.rs");
+        std::fs::write(&document, "fn main() {}").expect("document");
+        let error = host
+            .language_check("com.example.guarded", "rust", &document)
+            .await
+            .expect_err("secrets.read is not granted");
+        assert!(
+            matches!(error, ExtensionError::Denied { .. }),
+            "the non-agent dispatch path must authorize: {error}"
+        );
+    }
+
+    #[test]
+    fn grant_required_never_widens_a_secret_or_host_scope() {
+        let root = scratch("grant-narrow");
+        let source = root.join("source");
+        std::fs::create_dir_all(source.join("tools")).expect("tools");
+        std::fs::write(
+            source.join("extension.toml"),
+            r#"
+schema_version = "1.0"
+
+[extension]
+id = "com.example.secretive"
+name = "Secretive"
+version = "1.0.0"
+description = "Needs a secret and a host"
+
+[compatibility]
+bsh = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+
+[runtime]
+kind = "declarative"
+
+[capabilities]
+required = ["secrets.read", "network.http"]
+
+[contributes]
+tools = ["echo"]
+"#,
+        )
+        .expect("manifest");
+        std::fs::write(
+            source.join("tools/echo.json"),
+            r#"{"description":"Echo","implementation":{"kind":"echo_arguments"}}"#,
+        )
+        .expect("tool");
+        let store = ExtensionStore::open(&root).expect("store");
+        store.install(&source).expect("install");
+        let mut host = ExtensionHost::open(config(&root)).expect("host");
+        let granted = host
+            .grant_required("com.example.secretive")
+            .expect("grant attempt");
+        assert_eq!(
+            granted, 0,
+            "a scope-free grant would be wider than secret:NAME / domain:host"
+        );
         let status = host
             .statuses()
             .into_iter()
-            .find(|status| status.id == "com.bos.bsh.extensions")
-            .expect("inspector");
-        assert!(!status.configured);
-        assert!(!status.applied);
-        let _ = std::fs::remove_dir_all(&root);
+            .find(|status| status.id == "com.example.secretive")
+            .expect("status");
+        assert!(!status.applied, "{status:?}");
     }
 }

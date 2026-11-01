@@ -25,7 +25,7 @@
 #![allow(dead_code)]
 
 mod agent;
-mod capability;
+pub(crate) mod capability;
 mod cli;
 mod config;
 #[cfg(test)]

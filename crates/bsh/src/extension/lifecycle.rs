@@ -185,6 +185,13 @@ impl LifecycleManager {
             .records
             .get_mut(id)
             .ok_or_else(|| ExtensionError::NotInstalled { id: id.to_string() })?;
+        if !allowed_transition(record.state, LifecycleState::Active) {
+            return Err(ExtensionError::Lifecycle {
+                extension: id.to_string(),
+                from: record.state,
+                to: LifecycleState::Active,
+            });
+        }
         record.state = LifecycleState::Active;
         record.last_error = None;
         record.updated_at = unix_now();
@@ -245,6 +252,8 @@ pub(crate) fn allowed_transition(from: LifecycleState, to: LifecycleState) -> bo
             | (Suspended, Stopping)
             | (Suspended, Unloaded)
             | (Stopping, Unloaded)
+            // §7 defines retry as Failed -> Loading.
+            | (Failed, Loading)
             | (Unloaded, Loading)
             | (Unloaded, Discovered)
     )
@@ -280,6 +289,22 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_extension_can_retry() {
+        let mut manager = LifecycleManager::new();
+        manager.register("com.example.a", true);
+        manager
+            .transition("com.example.a", LifecycleState::Validating)
+            .expect("validate");
+        manager
+            .transition("com.example.a", LifecycleState::Resolved)
+            .expect("resolve");
+        manager.fail("com.example.a", "boom");
+        manager
+            .transition("com.example.a", LifecycleState::Loading)
+            .expect("§7 defines Failed -> Loading as retry");
+    }
+
+    #[test]
     fn an_undefined_transition_is_refused() {
         let mut manager = LifecycleManager::new();
         manager.register("com.example.a", true);
@@ -311,9 +336,34 @@ mod tests {
     }
 
     #[test]
+    fn activation_from_discovered_is_refused() {
+        let mut manager = LifecycleManager::new();
+        manager.register("com.example.a", true);
+        manager
+            .activated("com.example.a", 0)
+            .expect_err("discovered cannot jump to active");
+        assert_eq!(
+            manager.get("com.example.a").expect("record").state,
+            LifecycleState::Discovered
+        );
+    }
+
+    #[test]
     fn call_failures_degrade_an_active_extension() {
         let mut manager = LifecycleManager::new();
         manager.register("com.example.a", true);
+        // Activation is a legal transition from Starting, not a state write
+        // from anywhere; walk the documented path first.
+        for state in [
+            LifecycleState::Validating,
+            LifecycleState::Resolved,
+            LifecycleState::Loading,
+            LifecycleState::Starting,
+        ] {
+            manager
+                .transition("com.example.a", state)
+                .unwrap_or_else(|error| panic!("{state}: {error}"));
+        }
         manager.activated("com.example.a", 12).expect("activate");
         manager.record_call("com.example.a");
         assert_eq!(

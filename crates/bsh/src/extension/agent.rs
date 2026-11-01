@@ -139,31 +139,7 @@ impl ExtensionTool {
     }
 
     fn scope(&self, arguments: &Value) -> CallScope {
-        let mut scope = CallScope {
-            workspace: self.workspace.clone(),
-            path: self.workspace.clone(),
-            ..CallScope::default()
-        };
-        if let Some(raw) = arguments.get("path").and_then(Value::as_str) {
-            let path = PathBuf::from(raw);
-            scope.path = Some(if path.is_absolute() {
-                path
-            } else if let Some(workspace) = &self.workspace {
-                workspace.join(path)
-            } else {
-                path
-            });
-        }
-        if let Some(raw) = arguments.get("url").and_then(Value::as_str) {
-            if let Ok(url) = reqwest::Url::parse(raw) {
-                scope.domain = url.host_str().map(str::to_string);
-            }
-        }
-        scope.secret = arguments
-            .get("secret")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        scope
+        super::capability::call_scope(arguments, self.workspace.as_deref())
     }
 
     fn emit(&self, topic: &str, payload: Value, correlation: &str) {
@@ -268,22 +244,22 @@ impl ExtensionTool {
         let started = std::time::Instant::now();
         let correlation = uuid::Uuid::new_v4().to_string();
         let scope = self.scope(arguments);
-        for capability in &self.descriptor.capabilities {
-            if let Err(error) =
-                self.policy
-                    .authorize_call(self.owner.as_str(), self.trust, *capability, &scope)
-            {
-                self.emit(
-                    topics::TOOL_FAILED,
-                    serde_json::json!({
-                        "tool": self.descriptor.id.as_str(),
-                        "capability": capability.as_str(),
-                        "error": error.to_string(),
-                    }),
-                    &correlation,
-                );
-                return Err(error.to_tool_error());
-            }
+        if let Err(error) = super::capability::authorize_each(
+            &self.policy,
+            self.owner.as_str(),
+            self.trust,
+            &self.descriptor.capabilities,
+            &scope,
+        ) {
+            self.emit(
+                topics::TOOL_FAILED,
+                serde_json::json!({
+                    "tool": self.descriptor.id.as_str(),
+                    "error": error.to_string(),
+                }),
+                &correlation,
+            );
+            return Err(error.to_tool_error());
         }
         self.emit(
             topics::TOOL_INVOKED,

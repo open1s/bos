@@ -57,27 +57,40 @@ impl ExtensionStorage {
             message: reason,
         })?;
         let path = self.root.join(&relative);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| ExtensionError::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-            let canonical_root = self
-                .root
-                .canonicalize()
-                .map_err(|source| ExtensionError::Io {
-                    path: self.root.clone(),
-                    source,
-                })?;
-            let canonical_parent = parent.canonicalize().map_err(|source| ExtensionError::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-            if !canonical_parent.starts_with(&canonical_root) {
-                return Err(ExtensionError::Corrupt {
-                    path: path.clone(),
-                    message: "key escapes the extension data namespace".to_string(),
-                });
+        // Walk the parent one component at a time from the namespace root:
+        // creating the whole parent first would follow a symlink planted inside
+        // the namespace before the containment check could refuse it.
+        let mut cursor = self.root.clone();
+        if let Some(parent) = relative.parent() {
+            for component in parent.components() {
+                cursor.push(component);
+                match std::fs::symlink_metadata(&cursor) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return Err(ExtensionError::Corrupt {
+                            path: cursor,
+                            message: "key escapes the extension data namespace".to_string(),
+                        });
+                    }
+                    Ok(metadata) if metadata.is_dir() => {}
+                    Ok(_) => {
+                        return Err(ExtensionError::Corrupt {
+                            path: cursor,
+                            message: "a parent component is not a directory".to_string(),
+                        });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        std::fs::create_dir(&cursor).map_err(|source| ExtensionError::Io {
+                            path: cursor.clone(),
+                            source,
+                        })?;
+                    }
+                    Err(source) => {
+                        return Err(ExtensionError::Io {
+                            path: cursor,
+                            source,
+                        });
+                    }
+                }
             }
         }
         if path
@@ -143,7 +156,34 @@ impl ExtensionStorage {
             });
         }
         let path = self.path(key)?;
+        // The namespace cap has to guard the write, not only the listing: a
+        // guest that never lists could otherwise grow the namespace without
+        // bound and only discover the limit when listing breaks.
+        if !path.exists() && self.at_file_limit() {
+            return Err(ExtensionError::Limit {
+                extension: self.id.to_string(),
+                message: format!("namespace holds more than {MAX_FILES} files"),
+            });
+        }
         super::package::write_atomic(&path, bytes)
+    }
+
+    /// Whether the namespace already holds the maximum number of files.
+    fn at_file_limit(&self) -> bool {
+        let mut count = 0usize;
+        for entry in walkdir::WalkDir::new(&self.root)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            if entry.file_type().is_file() {
+                count += 1;
+                if count >= MAX_FILES {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Write a JSON value.

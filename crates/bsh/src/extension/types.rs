@@ -78,10 +78,27 @@ impl ExtensionId {
         let local = sanitize_name(&contribution.as_str().replace('.', "_"));
         let mut qualified = format!("{namespace}__{local}");
         if qualified.len() > 64 {
-            qualified.truncate(64);
-            while qualified.ends_with('_') {
-                qualified.pop();
+            // Truncating blindly can reduce every tool in a package to the
+            // same bare namespace (a 63-byte id segment already fills the
+            // limit), silently dropping all but one. Keep as much of the name
+            // as fits and append a stable digest of the full id pair, so two
+            // distinct tools never collapse onto one model-facing name.
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(self.0.as_bytes());
+            hasher.update([0u8]);
+            hasher.update(contribution.as_str().as_bytes());
+            let digest = hasher.finalize();
+            let suffix = format!(
+                "_{:08x}",
+                u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]])
+            );
+            let keep = 64usize.saturating_sub(suffix.len());
+            let mut prefix: String = qualified.chars().take(keep).collect();
+            while prefix.ends_with('_') {
+                prefix.pop();
             }
+            qualified = format!("{prefix}{suffix}");
         }
         qualified
     }
@@ -457,6 +474,14 @@ pub(crate) enum ContributionKind {
     Language,
     /// An external-system integration descriptor.
     Integration,
+    /// A SKILL.md skill directory.
+    Skill,
+    /// A model provider descriptor.
+    ModelProvider,
+    /// An agent role descriptor.
+    AgentProvider,
+    /// An agent/module preset.
+    Preset,
 }
 
 impl ContributionKind {
@@ -472,6 +497,10 @@ impl ContributionKind {
             Self::Theme => "themes",
             Self::Language => "languages",
             Self::Integration => "integrations",
+            Self::Skill => "skills",
+            Self::ModelProvider => "model_providers",
+            Self::AgentProvider => "agent_providers",
+            Self::Preset => "presets",
         }
     }
 }
@@ -666,6 +695,18 @@ pub(crate) enum ExtensionError {
         /// Runtime message.
         message: String,
     },
+    /// The remote end answered with a well-formed error object.
+    ///
+    /// This is a normal application-level failure, not a broken transport: a
+    /// process or MCP session that returns one is still usable, so callers must
+    /// not tear the session down (unlike Protocol).
+    #[error("extension {extension} reported: {message}")]
+    Remote {
+        /// Extension id.
+        extension: String,
+        /// Remote message.
+        message: String,
+    },
     /// The runtime violated the wire protocol.
     #[error("extension {extension} protocol error: {message}")]
     Protocol {
@@ -752,7 +793,7 @@ impl ExtensionError {
             Self::UnsupportedRuntime { .. } => "unsupported",
             Self::MissingCapability { .. } | Self::Denied { .. } => "permission",
             Self::Dependency { .. } | Self::Cycle { .. } => "dependency",
-            Self::Runtime { .. } | Self::Protocol { .. } => "runtime",
+            Self::Runtime { .. } | Self::Remote { .. } | Self::Protocol { .. } => "runtime",
             Self::Timeout { .. } => "timeout",
             Self::Limit { .. } => "limit",
             Self::NotInstalled { .. }
@@ -890,6 +931,21 @@ mod tests {
             ExtensionId::parse("com.example.a-very-long-namespace-name-for-tools").expect("id");
         let contribution = ContributionId::parse("x".repeat(60)).expect("contribution");
         assert!(owner.qualify(&contribution).len() <= 64);
+    }
+
+    #[test]
+    fn long_qualified_names_stay_distinct() {
+        let owner = ExtensionId::parse(format!("com.example.{}", "a".repeat(60))).expect("id");
+        let left = ContributionId::parse("left").expect("left");
+        let right = ContributionId::parse("right").expect("right");
+        let left = owner.qualify(&left);
+        let right = owner.qualify(&right);
+        assert!(left.len() <= 64, "{left}");
+        assert!(right.len() <= 64, "{right}");
+        assert_ne!(
+            left, right,
+            "two tools must not collapse onto the same model-facing name"
+        );
     }
 
     #[test]

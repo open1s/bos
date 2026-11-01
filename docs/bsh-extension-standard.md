@@ -28,7 +28,7 @@ An extension is a directory with an extension.toml manifest. It may contribute:
 | Panel | Host plugin registry plus a declarative UI document | declarative, process, built-in |
 | Prompt | Agent system prompt section | declarative, process, built-in |
 | Context | Agent system prompt section | declarative, process, built-in |
-| Workflow | Recorded; no executor in this build | declarative |
+| Workflow | Sequential executor over the package's own tools | declarative |
 | Theme | Panel theme plus selectable app-wide palette override | declarative |
 
 Registering a contribution and being allowed to perform its operation are two
@@ -467,7 +467,10 @@ The result is the tool's JSON value:
 {"jsonrpc":"2.0","id":2,"result":{"branch":"main","clean":true}}
 ~~~
 
-An error uses the standard JSON-RPC error object and becomes a tool error:
+An error uses the standard JSON-RPC error object and becomes a tool error. A decoded error
+object is an application-level answer and leaves the session usable; only a transport
+failure (stdout EOF, a timeout, an unparseable line) kills the session and makes the next
+call start a fresh process.
 
 ~~~json
 {"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"not a git repository"}}
@@ -514,7 +517,7 @@ agent.failed, model.requested, model.completed, config.changed, tool.invoked,
 tool.completed, tool.failed, extension.loaded, extension.unloaded,
 extension.failed, session.created, session.updated, session.deleted,
 trajectory.recorded, skill.loaded, instruction.build, network.request,
-mcp.connected, audio.captured.
+mcp.connected, audio.captured, ui.action.
 
 Hook points are ordinary event subscriptions: declare a topic in
 contributes.events, declare a subscription in the runtime, and receive it
@@ -531,7 +534,7 @@ through the runtime's event delivery. The host publishes at these seams:
 | Tools | tool.invoked / tool.completed / tool.failed | an extension or built-in tool runs |
 | HTTP | network.request | a WASM/Extism host fetch is about to leave |
 | Audio | audio.captured | an audio attachment is captured |
-| UI | panel actions | a declarative UI action is routed |
+| UI | ui.action | a declarative UI action is routed, with extension, panel, action and revision |
 
 Controls:
 
@@ -560,7 +563,7 @@ Panels carry a schema_version and a root node:
 ~~~json
 {
   "title": "Git Status",
-  "icon": "assets/git.svg",
+  "icon": "asset/git.svg",
   "view": {
     "schema_version": "1.0",
     "root": {
@@ -587,8 +590,9 @@ Rules:
 
 - no HTML, script, CSS or executable content is accepted;
 - an action is a contribution id owned by the package;
-- an image is an https URL or an asset/ package-relative path; data:, file:,
-  javascript: and http: are refused;
+- an image is an asset/ package-relative path inside the package; data:, file:,
+  javascript:, http: and https: are refused in this build, which has no remote image
+  loader (the renderer draws the file);
 - every update carries a revision; a patch at or below the current revision is
   stale and refused;
 - an action carries the revision it was rendered from; a mismatched revision is
@@ -597,6 +601,10 @@ Rules:
 The host owns GPUI objects. The renderer validates the document again, draws
 the supported nodes, and routes each action to the owning runtime's command
 handler with the revision it was rendered from.
+
+A panel's `icon` and an image node's `src` are `asset/…` paths inside the
+package; the renderer loads that file. A remote image source is refused at
+validation because this host has no remote image loader.
 
 A package may also ship themes/<id>.json:
 
@@ -756,14 +764,22 @@ not kept:
 5. Process children get RLIMIT ceilings, a process group and a macOS write
    sandbox profile, and Linux runs the bubblewrap namespace plan. Linux execution
    is not exercised in the macOS test environment.
-6. Cancellation traps a WASM guest and stops a process/MCP child; the operating
-   system may take a moment to reap the child after the request.
+6. Cancellation stops a process/MCP child immediately, traps a WASM guest at its next
+   host call, and lets a pure-compute guest run to its epoch/fuel deadline (the host
+   cannot set a Wasmtime epoch while the guest holds the synchronous store). The
+   operating system may take a moment to reap a child after the request.
 7. Windows/Linux process limits are compiled but not exercised in this macOS
    environment.
 8. The built-in runtime is for first-party code linked into bsh; an installed
    package cannot claim it.
 9. The extension root is ~/.bos/bsh/extensions (BSH's existing home) rather than
    ~/.bsh as the design sketched; BSH_EXTENSION_ROOT overrides both paths.
+10. Images are local package assets only; an https image source is refused rather than
+    accepted and drawn as text. A panel icon is drawn the same way when it names an
+    existing asset/ file.
+11. An MCP package that declares contributes.events receives each event as a
+    `bsh/events/event` JSON-RPC notification once its server is running; a host that has
+    not started the server drops the queued event instead of spawning it.
 
 ## 16. Example
 

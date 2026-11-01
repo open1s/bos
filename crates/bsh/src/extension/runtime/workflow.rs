@@ -116,11 +116,22 @@ impl WorkflowRuntime {
         workflow: &WorkflowFile,
         input: Value,
         context: &CallContext,
+        progress: Option<&tokio::sync::mpsc::UnboundedSender<Value>>,
     ) -> Result<Value, ExtensionError> {
         let mut outputs = serde_json::Map::new();
         for step in &workflow.steps {
             let arguments = resolve(&step.arguments, &input, &outputs);
-            let value = self.inner.call_tool(&step.tool, arguments, context).await?;
+            // Progress and cancellation belong to the step actually running,
+            // not to the wrapper: threading the sender keeps a workflow's
+            // child calls streamable like any other tool call.
+            let value = match progress {
+                Some(sender) => self
+                    .inner
+                    .call_tool_progress(&step.tool, arguments, context, Some(sender.clone()))
+                    .await?
+                    .to_value(),
+                None => self.inner.call_tool(&step.tool, arguments, context).await?,
+            };
             outputs.insert(step.name.clone(), value);
         }
         Ok(json!({ "steps": outputs }))
@@ -215,7 +226,7 @@ impl Runtime for WorkflowRuntime {
         context: &CallContext,
     ) -> Result<Value, ExtensionError> {
         if let Some(workflow) = self.workflows.get(name) {
-            return self.execute(workflow, arguments, context).await;
+            return self.execute(workflow, arguments, context, None).await;
         }
         self.inner.call_tool(name, arguments, context).await
     }
@@ -228,11 +239,45 @@ impl Runtime for WorkflowRuntime {
     ) -> Result<ToolResult, ExtensionError> {
         if let Some(workflow) = self.workflows.get(name) {
             return self
-                .execute(workflow, arguments, context)
+                .execute(workflow, arguments, context, None)
                 .await
                 .map(ToolResult::from_value);
         }
         self.inner.call_tool_result(name, arguments, context).await
+    }
+
+    async fn call_tool_progress(
+        &self,
+        name: &str,
+        arguments: Value,
+        context: &CallContext,
+        progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+    ) -> Result<ToolResult, ExtensionError> {
+        if let Some(workflow) = self.workflows.get(name) {
+            return self
+                .execute(workflow, arguments, context, progress.as_ref())
+                .await
+                .map(ToolResult::from_value);
+        }
+        self.inner
+            .call_tool_progress(name, arguments, context, progress)
+            .await
+    }
+
+    async fn cancel(&self) -> Result<(), ExtensionError> {
+        self.inner.cancel().await
+    }
+
+    fn fuel_used(&self) -> Option<u64> {
+        self.inner.fuel_used()
+    }
+
+    fn memory_limit(&self) -> Option<u64> {
+        self.inner.memory_limit()
+    }
+
+    fn memory_used(&self) -> Option<u64> {
+        self.inner.memory_used()
     }
 
     async fn command(&self, id: &str, arguments: Value) -> Result<Value, ExtensionError> {

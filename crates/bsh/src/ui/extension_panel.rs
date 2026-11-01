@@ -90,6 +90,13 @@ pub(crate) struct ExtensionPanelView {
     palette: Palette,
     /// Selected index per tabs path, so switching a tab is host state.
     tabs: std::collections::BTreeMap<String, usize>,
+    /// The selected panel's package root, for `asset/…` images and icons.
+    panel_root: Option<std::path::PathBuf>,
+    /// The revision the controls currently on screen were rendered from.
+    ///
+    /// The action request carries this, not the live session revision: stamping
+    /// it at dispatch time made the staleness check unable to fail.
+    render_revision: u64,
 }
 
 impl ExtensionPanelView {
@@ -109,6 +116,7 @@ impl ExtensionPanelView {
             .and_then(|panel| panel.theme.as_ref())
             .map(|theme| Palette::new(Some(theme)))
             .unwrap_or_else(|| Palette::new(None));
+        let panel_root = panels.get(selected).map(|panel| panel.root.clone());
         let mut view = Self {
             panels,
             selected,
@@ -119,6 +127,8 @@ impl ExtensionPanelView {
             message: None,
             palette,
             tabs: std::collections::BTreeMap::new(),
+            panel_root,
+            render_revision: 0,
         };
         if let Some(panel) = view.panels.get(selected) {
             if let Some(document) = &panel.initial {
@@ -144,6 +154,7 @@ impl ExtensionPanelView {
         self.error = None;
         self.message = None;
         self.loading = false;
+        self.panel_root = Some(self.panels[index].root.clone());
         let theme = self.panels[index].theme.as_ref();
         self.palette = Palette::new(theme);
         if let Some(document) = self.panels[index].initial.clone() {
@@ -205,7 +216,7 @@ impl ExtensionPanelView {
         };
         let request = UiActionRequest {
             action: action.to_string(),
-            revision: session.revision(),
+            revision: self.render_revision,
             payload: payload.clone(),
         };
         if let Err(error) = session.accept_action(&request) {
@@ -216,7 +227,38 @@ impl ExtensionPanelView {
         let Some(panel) = self.panels.get(self.selected).cloned() else {
             return;
         };
-        let revision = session.revision();
+        // A panel action is a tool call on a surface that is not the agent, so
+        // it needs the same per-call capability decision and audit line.
+        if let Some(descriptor) = panel
+            .tools
+            .iter()
+            .find(|descriptor| descriptor.id.as_str() == action)
+        {
+            let scope =
+                crate::extension::capability::call_scope(&payload, panel.workspace.as_deref());
+            if let Err(error) = crate::extension::capability::authorize_each(
+                &panel.policy,
+                panel.owner.as_str(),
+                panel.trust,
+                &descriptor.capabilities,
+                &scope,
+            ) {
+                self.error = Some(error.to_string());
+                cx.notify();
+                return;
+            }
+        }
+        let revision = self.render_revision;
+        // §9's UI row: the host announces that a panel action was routed.
+        crate::extension::publish(
+            crate::extension::topics::UI_ACTION,
+            serde_json::json!({
+                "extension": panel.owner.as_str(),
+                "panel": panel.panel_id,
+                "action": action,
+                "revision": revision,
+            }),
+        );
         let action = action.to_string();
         let runtime = panel.runtime.clone();
         self.message = Some("Running…".to_string());
@@ -610,21 +652,31 @@ impl ExtensionPanelView {
                 code.child(txt(value.clone(), 12.0, self.palette.text))
                     .into_any_element()
             }
-            UiNode::Image { src, alt } => div()
-                .flex()
-                .flex_col()
-                .gap(px(2.0))
-                .child(txt(
-                    if alt.is_empty() {
-                        src.clone()
-                    } else {
-                        alt.clone()
-                    },
-                    12.0,
-                    self.palette.muted,
-                ))
-                .child(txt(src.clone(), 11.0, self.palette.faint))
-                .into_any_element(),
+            UiNode::Image { src, alt } => {
+                if let Some(asset) = src.strip_prefix("asset/") {
+                    if let Some(root) = &self.panel_root {
+                        let path = root.join(asset);
+                        if path.is_file() {
+                            return img(path).max_w(relative(1.0)).into_any_element();
+                        }
+                    }
+                }
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(txt(
+                        if alt.is_empty() {
+                            src.clone()
+                        } else {
+                            alt.clone()
+                        },
+                        12.0,
+                        self.palette.muted,
+                    ))
+                    .child(txt(src.clone(), 11.0, self.palette.faint))
+                    .into_any_element()
+            }
             UiNode::Notification { level, text } => {
                 let color = match level {
                     NotificationLevel::Info => self.palette.accent,
@@ -676,6 +728,9 @@ fn summarize(value: &Value) -> String {
 impl Render for ExtensionPanelView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_loaded(cx);
+        // Record what this frame draws from; a click later in the frame's life
+        // is an action on this revision, not on whatever replaced it since.
+        self.render_revision = self.session.as_ref().map(UiSession::revision).unwrap_or(0);
         let mut root = div()
             .debug_selector(|| "extension-panel-view".to_string())
             .flex()
@@ -709,6 +764,7 @@ impl Render for ExtensionPanelView {
                     .h(px(28.0))
                     .flex()
                     .items_center()
+                    .gap(px(6.0))
                     .rounded(px(7.0))
                     .bg(rgb(if selected {
                         self.palette.accent
@@ -716,6 +772,12 @@ impl Render for ExtensionPanelView {
                         self.palette.new_session_fill
                     }))
                     .cursor_pointer()
+                    .children(panel.icon.as_deref().and_then(|icon| {
+                        let relative = icon.strip_prefix("asset/")?;
+                        let path = panel.root.join(relative);
+                        path.is_file()
+                            .then(|| img(path).max_h(px(14.0)).max_w(px(14.0)).into_any_element())
+                    }))
                     .child(txt(
                         format!("{} · {location}", panel.title),
                         12.0,
@@ -801,6 +863,18 @@ mod tests {
             owner: ExtensionId::parse("com.example.ui").expect("id"),
             theme: None,
             initial: Some(document),
+            policy: Arc::new(
+                crate::extension::capability::PolicyEngine::open(
+                    std::env::temp_dir().join(format!("bsh-panel-grants-{}", std::process::id())),
+                    std::env::temp_dir().join(format!("bsh-panel-audit-{}", std::process::id())),
+                    crate::extension::capability::PolicyMode::Advisory,
+                )
+                .expect("policy"),
+            ),
+            trust: crate::extension::types::TrustLevel::Local,
+            tools: Arc::new(Vec::new()),
+            workspace: None,
+            root: std::path::PathBuf::from("/nonexistent-panel-root"),
         }
     }
 

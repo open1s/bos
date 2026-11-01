@@ -145,7 +145,9 @@ impl ProcessSession {
                     continue;
                 }
                 if let Some(error) = value.get("error") {
-                    return Err(ExtensionError::Runtime {
+                    // A decoded JSON-RPC error is an application-level answer,
+                    // not a broken pipe: the session stays usable.
+                    return Err(ExtensionError::Remote {
                         extension: extension.to_string(),
                         message: jsonrpc_error_message(error),
                     });
@@ -643,6 +645,10 @@ impl ProcessRuntime {
                 }
                 Ok(value)
             }
+            Err(error @ ExtensionError::Remote { .. }) => {
+                // The server answered; the transport is still in a known state.
+                Err(error)
+            }
             Err(error) => {
                 // A timed-out or broken exchange leaves the pipe in an unknown
                 // state, so the next call starts a fresh process instead of
@@ -941,7 +947,7 @@ impl Runtime for ProcessRuntime {
             *guard = Some(self.start_with_retry().await?);
         }
         let session = guard.as_mut().expect("session was just started");
-        session
+        let result = session
             .request(
                 "commands/execute",
                 json!({
@@ -951,7 +957,34 @@ impl Runtime for ProcessRuntime {
                 self.max_execution_ms,
                 &self.extension,
             )
-            .await
+            .await;
+        // A command obeys the same rules as a tool call: a ceiling on the
+        // result and a fresh process after a broken exchange. Returning the
+        // request directly left a timed-out response on the pipe for the next
+        // tools/call to skip.
+        match result {
+            Ok(value) => {
+                let bytes = serde_json::to_vec(&value)
+                    .map(|bytes| bytes.len())
+                    .unwrap_or(0);
+                if bytes as u64 > self.max_output_bytes {
+                    *guard = None;
+                    return Err(ExtensionError::Limit {
+                        extension: self.extension.to_string(),
+                        message: format!(
+                            "command result is {bytes} bytes; the ceiling is {}",
+                            self.max_output_bytes
+                        ),
+                    });
+                }
+                Ok(value)
+            }
+            Err(error @ ExtensionError::Remote { .. }) => Err(error),
+            Err(error) => {
+                *guard = None;
+                Err(error)
+            }
+        }
     }
 
     async fn call_tool_progress(

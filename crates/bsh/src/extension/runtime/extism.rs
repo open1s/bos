@@ -44,6 +44,8 @@ struct Bridge {
     config: String,
     subscriptions: Mutex<Vec<Subscription>>,
     events_out: Mutex<Vec<ExtensionEvent>>,
+    /// Set by cancel; host bridge calls refuse while it holds.
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Bridge {
@@ -53,6 +55,10 @@ impl Bridge {
             .map(|_| ())
     }
 
+    /// Resolve a guest path and prove it stays inside the workspace.
+    ///
+    /// Creation happens after authorization, against the deepest existing
+    /// ancestor, so a denied write cannot first create directories.
     fn path(&self, raw: &str) -> Result<PathBuf, String> {
         let Some(workspace) = &self.workspace else {
             return Err("no workspace is open".to_string());
@@ -62,16 +68,26 @@ impl Bridge {
         let canonical_workspace = workspace
             .canonicalize()
             .map_err(|error| error.to_string())?;
-        let parent = path.parent().unwrap_or(workspace);
-        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-        let canonical_parent = parent.canonicalize().map_err(|error| error.to_string())?;
-        if !canonical_parent.starts_with(&canonical_workspace) {
+        let mut ancestor = path.parent().unwrap_or(workspace).to_path_buf();
+        while !ancestor.exists() {
+            match ancestor.parent() {
+                Some(parent) if parent.starts_with(workspace) => ancestor = parent.to_path_buf(),
+                _ => break,
+            }
+        }
+        let canonical_ancestor = ancestor.canonicalize().map_err(|error| error.to_string())?;
+        if !canonical_ancestor.starts_with(&canonical_workspace) {
             return Err("path escapes the workspace".to_string());
         }
         Ok(path)
     }
 
     fn dispatch(&self, raw: &str) -> Value {
+        // A guest that keeps running after Stop has no other interruption
+        // point: the bridge is where a cancelled call is trapped.
+        if self.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            return json!({"ok": false, "error": "the call was cancelled"});
+        }
         let request: Value = match serde_json::from_str(raw) {
             Ok(request) => request,
             Err(error) => return json!({"ok": false, "error": error.to_string()}),
@@ -110,6 +126,7 @@ impl Bridge {
                 self.authorize(
                     Capability::WorkspaceRead,
                     CallScope {
+                        workspace: self.workspace.clone(),
                         path: Some(path.clone()),
                         ..CallScope::default()
                     },
@@ -137,6 +154,7 @@ impl Bridge {
                 self.authorize(
                     Capability::WorkspaceWrite,
                     CallScope {
+                        workspace: self.workspace.clone(),
                         path: Some(path.clone()),
                         ..CallScope::default()
                     },
@@ -144,6 +162,9 @@ impl Bridge {
                 .map_err(|error| error.to_string())?;
                 if data.len() > MAX_BRIDGE_BODY {
                     return Err("data is too large".to_string());
+                }
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
                 }
                 std::fs::write(&path, data).map_err(|error| error.to_string())?;
                 Ok(Value::Null)
@@ -337,8 +358,11 @@ pub(crate) struct ExtismRuntime {
     tools: Vec<ToolDescriptor>,
     execution_ms: u64,
     memory_mb: u64,
+    output_bytes: u64,
     fuel_used: AtomicU64,
     cancelled: Arc<std::sync::atomic::AtomicBool>,
+    /// Set by shutdown only; cancel is a per-call state the next call clears.
+    stopped: std::sync::atomic::AtomicBool,
     deadline: Mutex<Option<Instant>>,
 }
 
@@ -384,6 +408,7 @@ impl ExtismRuntime {
                 message: error.to_string(),
             }
         })?;
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let bridge = Arc::new(Bridge {
             extension: manifest.id().clone(),
             trust,
@@ -396,6 +421,7 @@ impl ExtismRuntime {
             config: config.clone(),
             subscriptions: Mutex::new(Vec::new()),
             events_out: Mutex::new(Vec::new()),
+            cancelled: Arc::clone(&cancelled),
         });
         let tools = load_tool_descriptors(root, manifest)?;
         Ok(Self {
@@ -407,8 +433,10 @@ impl ExtismRuntime {
             tools,
             execution_ms: manifest.resources.execution_ms(),
             memory_mb: manifest.resources.memory_mb(),
+            output_bytes: manifest.resources.output_bytes(),
             fuel_used: AtomicU64::new(0),
-            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cancelled,
+            stopped: std::sync::atomic::AtomicBool::new(false),
             deadline: Mutex::new(None),
         })
     }
@@ -581,7 +609,13 @@ impl Runtime for ExtismRuntime {
 
     async fn cancel(&self) -> Result<(), ExtensionError> {
         self.cancelled.store(true, Ordering::SeqCst);
-        self.deactivate().await
+        // Do not wait on a running call's plugin lock: the bridge traps the
+        // guest at its next host call, and dropping the plugin here would
+        // block the cancel task until that call returns.
+        if let Ok(mut plugin) = self.plugin.try_lock() {
+            *plugin = None;
+        }
+        Ok(())
     }
 
     async fn tools(&self) -> Result<Vec<ToolDescriptor>, ExtensionError> {
@@ -594,16 +628,45 @@ impl Runtime for ExtismRuntime {
         arguments: Value,
         context: &CallContext,
     ) -> Result<Value, ExtensionError> {
+        if self.stopped.load(Ordering::Relaxed) {
+            return Err(ExtensionError::Runtime {
+                extension: self.extension.to_string(),
+                message: "runtime is shut down".to_string(),
+            });
+        }
+        // Cancellation is per call: the bridge traps while it is set, and the
+        // next call starts clean instead of failing forever.
+        self.cancelled.store(false, Ordering::Relaxed);
         let input = json!({
             "name": name,
             "arguments": arguments,
             "correlationId": context.correlation_id,
             "config": self.config,
         });
-        self.call::<_, Value>("bsh_call_tool", &input)?
+        let value = self
+            .call::<_, Value>("bsh_call_tool", &input)?
             .ok_or_else(|| ExtensionError::NotFound {
                 id: format!("{}::{name}", self.extension),
-            })
+            })?;
+        let bytes = serde_json::to_vec(&value)
+            .map(|bytes| bytes.len())
+            .unwrap_or(0);
+        if bytes as u64 > self.output_bytes {
+            return Err(ExtensionError::Limit {
+                extension: self.extension.to_string(),
+                message: format!(
+                    "plugin result is {bytes} bytes; the ceiling is {}",
+                    self.output_bytes
+                ),
+            });
+        }
+        Ok(value)
+    }
+
+    async fn shutdown(&self) -> Result<(), ExtensionError> {
+        self.stopped.store(true, Ordering::SeqCst);
+        self.cancelled.store(true, Ordering::SeqCst);
+        self.deactivate().await
     }
 
     async fn call_tool_result(
@@ -741,6 +804,7 @@ mod tests {
             config: "{}".to_string(),
             subscriptions: Mutex::new(Vec::new()),
             events_out: Mutex::new(Vec::new()),
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let response = bridge.dispatch(r#"{"op":"nope"}"#);
         assert_eq!(response["ok"], false);

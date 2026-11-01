@@ -2480,6 +2480,68 @@ impl Shell {
         cx.notify();
     }
 
+    /// Re-read every extension surface a running build can change.
+    ///
+    /// Status rows were refreshed on install/enable/disable, but the composer
+    /// palette and the mounted panels were captured once in `Shell::new`, so a
+    /// package installed from the Market needed a relaunch to appear in them.
+    pub(crate) fn refresh_extension_surfaces(&mut self, cx: &mut Context<Self>) {
+        use crate::extension::ui::PanelLocation;
+        let root = self.state.settings.active_workspace_root();
+        let workspace = (!root.is_empty()).then(|| std::path::PathBuf::from(root));
+        self.extension_statuses = Some(crate::extension::statuses(
+            &self.state.settings,
+            workspace.as_deref(),
+        ));
+        self.extension_commands = crate::extension::cached_commands();
+        let themes = crate::extension::themes(&self.state.settings, workspace.as_deref());
+        // The selected extension theme is runtime state on the same list: a
+        // package that contributed the active theme must take effect now, not
+        // only on the next launch.
+        match self
+            .state
+            .settings
+            .global
+            .general
+            .extension_theme
+            .as_deref()
+            .and_then(|id| themes.get(id))
+        {
+            Some(theme) => crate::theme::set_extension_tokens(&theme.colors),
+            None => crate::theme::clear_extension_tokens(),
+        }
+        self.extension_themes = Some(themes);
+        let panels = crate::extension::panels(&self.state.settings, workspace.as_deref(), None);
+        let take = |location: PanelLocation| {
+            panels
+                .iter()
+                .filter(|panel| panel.location == location)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let center = take(PanelLocation::Center);
+        self.center_extension_panels = (!center.is_empty())
+            .then(|| cx.new(|_| crate::ui::extension_panel::ExtensionPanelView::new(center)));
+        let left = take(PanelLocation::Left);
+        self.left_extension_panels = (!left.is_empty())
+            .then(|| cx.new(|_| crate::ui::extension_panel::ExtensionPanelView::new(left)));
+        let right = take(PanelLocation::Right);
+        self.right_extension_panels = (!right.is_empty())
+            .then(|| cx.new(|_| crate::ui::extension_panel::ExtensionPanelView::new(right)));
+        let bottom = take(PanelLocation::Bottom);
+        self.bottom_extension_panels = (!bottom.is_empty())
+            .then(|| cx.new(|_| crate::ui::extension_panel::ExtensionPanelView::new(bottom)));
+        self.publish_config_changed();
+    }
+
+    /// Tell subscribers that the configuration document changed.
+    fn publish_config_changed(&self) {
+        crate::extension::publish(
+            crate::extension::topics::CONFIG_CHANGED,
+            serde_json::json!({}),
+        );
+    }
+
     /// Keep the dialog's settings, persist them, and rebuild the capability list.
     ///
     /// The dialog stays open: Save is a commit, not a close. The draft is taken
@@ -2508,6 +2570,9 @@ impl Shell {
                 self.developer_tools_failed = false;
                 // A full Save supersedes any earlier focused-write refusal.
                 self.skills_save_error = None;
+                // Extensions observe configuration changes through the bus; a
+                // saved document is exactly that event.
+                self.publish_config_changed();
                 // The confirmation is drawn in THIS panel's footer. The status
                 // line the older round wrote lives in the statusbar, which the
                 // dialog's own scrim and panel cover - so a save that worked

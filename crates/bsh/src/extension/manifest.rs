@@ -298,6 +298,10 @@ impl Manifest {
             ContributionKind::Theme => &self.contributes.themes,
             ContributionKind::Language => &self.contributes.languages,
             ContributionKind::Integration => &self.contributes.integrations,
+            ContributionKind::Skill => &self.contributes.skills,
+            ContributionKind::ModelProvider => &self.contributes.model_providers,
+            ContributionKind::AgentProvider => &self.contributes.agent_providers,
+            ContributionKind::Preset => &self.contributes.presets,
         }
     }
 
@@ -313,6 +317,10 @@ impl Manifest {
             ContributionKind::Theme,
             ContributionKind::Language,
             ContributionKind::Integration,
+            ContributionKind::Skill,
+            ContributionKind::ModelProvider,
+            ContributionKind::AgentProvider,
+            ContributionKind::Preset,
         ];
         let mut all = Vec::new();
         for kind in kinds {
@@ -546,15 +554,6 @@ impl Manifest {
                         previous.as_str(),
                         kind.as_str()
                     ),
-                );
-            }
-        }
-        let mut skills = std::collections::BTreeSet::new();
-        for id in &self.contributes.skills {
-            if !skills.insert(id) {
-                report.error(
-                    "contributes.skills",
-                    format!("skill id {id:?} is declared more than once"),
                 );
             }
         }
@@ -960,6 +959,20 @@ max_concurrent_calls = 4
         );
         let report = parse(&text).validate();
         assert!(!report.is_valid());
+        assert!(report
+            .errors
+            .iter()
+            .any(|issue| issue.field == "contributes"));
+    }
+
+    #[test]
+    fn a_skill_and_a_tool_may_not_share_an_id() {
+        let text = sample().replace(
+            "commands = [\"git.refresh\"]",
+            "commands = [\"git.refresh\"]\nskills = [\"git.status\"]",
+        );
+        let report = parse(&text).validate();
+        assert!(!report.is_valid(), "{report:?}");
         assert!(report
             .errors
             .iter()

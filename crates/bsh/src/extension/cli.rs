@@ -80,27 +80,30 @@ Exit codes: 0 success, 1 failure, 2 usage.";
 
 /// Run the CLI and return the process exit code.
 pub(crate) fn run(args: &[String]) -> i32 {
-    let mut rest = args.to_vec();
+    // §13 makes --json and --root global options. They are accepted before or
+    // after the subcommand: parsing only the prefix silently ignored the
+    // documented trailing form (and aimed `uninstall --root` at the real store).
+    let mut rest = Vec::new();
     let mut json = false;
     let mut root: Option<PathBuf> = None;
-    while let Some(first) = rest.first().cloned() {
-        if first == "--json" {
+    let mut index = 0;
+    while index < args.len() {
+        let current = args[index].clone();
+        if current == "--json" {
             json = true;
-            rest.remove(0);
-        } else if first == "--root" {
-            rest.remove(0);
-            let Some(value) = rest.first().cloned() else {
+        } else if current == "--root" {
+            index += 1;
+            let Some(value) = args.get(index) else {
                 eprintln!("--root needs a path");
                 return 2;
             };
             root = Some(PathBuf::from(value));
-            rest.remove(0);
-        } else if let Some(value) = first.strip_prefix("--root=") {
+        } else if let Some(value) = current.strip_prefix("--root=") {
             root = Some(PathBuf::from(value));
-            rest.remove(0);
         } else {
-            break;
+            rest.push(current);
         }
+        index += 1;
     }
     let Some(command) = rest.first().cloned() else {
         println!("{USAGE}");
@@ -334,6 +337,24 @@ fn command_validate(args: &[String]) -> Result<i32, String> {
     }
 }
 
+/// A throwaway advisory policy for validation paths.
+///
+/// Validation constructs runtimes but never spawns or calls them, so the engine
+/// only has to exist; advisory mode means a future call path cannot turn a
+/// validation into a denial.
+fn validation_policy() -> std::sync::Arc<crate::extension::capability::PolicyEngine> {
+    let dir = std::env::temp_dir().join(format!("bsh-ext-validate-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::sync::Arc::new(
+        crate::extension::capability::PolicyEngine::open(
+            dir.join("grants.toml"),
+            dir.join("audit.jsonl"),
+            crate::extension::capability::PolicyMode::Advisory,
+        )
+        .expect("a validation policy opens"),
+    )
+}
+
 /// Load the runtime's contribution files without activating anything.
 ///
 /// Manifest validation alone cannot see a missing tools/<id>.json or an
@@ -351,11 +372,49 @@ fn validate_runtime(package: &Package) -> Result<(), String> {
                 .map(|_| ())
                 .map_err(|error| error.to_string())
         }
-        RuntimeKind::Mcp => McpRuntime::new(&package.manifest, &package.root, "{}".to_string())
-            .map(|_| ())
-            .map_err(|error| error.to_string()),
-        RuntimeKind::Extism => Ok(()),
-        _ => Ok(()),
+        RuntimeKind::Mcp => McpRuntime::new(
+            &package.manifest,
+            &package.root,
+            "{}".to_string(),
+            validation_policy(),
+            TrustLevel::Local,
+            crate::extension::events::EventBus::new(),
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string()),
+        RuntimeKind::Extism => {
+            let entry = package
+                .manifest
+                .runtime
+                .entry
+                .as_deref()
+                .ok_or_else(|| "runtime.entry is missing".to_string())?;
+            if !package.root.join(entry).is_file() {
+                return Err(format!("runtime.entry {entry} is missing"));
+            }
+            crate::extension::runtime::load_tool_descriptors(&package.root, &package.manifest)
+                .map_err(|error| error.to_string())?;
+            load_contributions(&package.root, &package.manifest)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        }
+        RuntimeKind::WasmComponent => {
+            let entry = package
+                .manifest
+                .runtime
+                .entry
+                .as_deref()
+                .ok_or_else(|| "runtime.entry is missing".to_string())?;
+            if !package.root.join(entry).is_file() {
+                return Err(format!("runtime.entry {entry} is missing"));
+            }
+            load_contributions(&package.root, &package.manifest)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        }
+        RuntimeKind::Builtin => Err(
+            "the builtin runtime is linked into the host; a package may not claim it".to_string(),
+        ),
     }
 }
 
@@ -1238,8 +1297,15 @@ fn command_mock(args: &[String]) -> Result<i32, String> {
                     ),
             ),
             RuntimeKind::Mcp => std::sync::Arc::new(
-                McpRuntime::new(&package.manifest, &path, config.clone())
-                    .map_err(|error| error.to_string())?,
+                McpRuntime::new(
+                    &package.manifest,
+                    &path,
+                    config.clone(),
+                    std::sync::Arc::clone(&policy),
+                    TrustLevel::Local,
+                    std::sync::Arc::clone(&events),
+                )
+                .map_err(|error| error.to_string())?,
             ),
             RuntimeKind::WasmComponent => std::sync::Arc::new(
                 crate::extension::runtime::wasm::WasmRuntime::new(
@@ -1584,6 +1650,23 @@ fn command_reproduce(args: &[String], root: Option<PathBuf>) -> Result<i32, Stri
             .ok()
             .is_some_and(|versions| versions.iter().any(|version| version == &locked.version));
         if installed {
+            // "present" is only true if the bytes are the locked bytes: the
+            // lockfile's whole point is reproducibility, not a directory name.
+            let id = crate::extension::types::ExtensionId::parse(locked.id.clone())
+                .map_err(|error| error.to_string())?;
+            let installed_root = store.version_root(&id, &locked.version);
+            let package = Package::load(
+                &installed_root,
+                ExtensionSource::Installed,
+                TrustLevel::Local,
+            )
+            .map_err(|error| error.to_string())?;
+            if !locked.hash.is_empty() && package.hash != locked.hash {
+                return Err(format!(
+                    "installed {} {} does not match the locked hash; reinstall it",
+                    locked.id, locked.version
+                ));
+            }
             println!("present {} {}", locked.id, locked.version);
             continue;
         }

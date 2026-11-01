@@ -19,6 +19,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const MAX_NETWORK_CALLS_PER_SECOND: usize = 20;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value;
 
 use super::types::{ExtensionError, TrustLevel};
 
@@ -269,7 +270,21 @@ impl fmt::Display for GrantScope {
             Self::DomainMethod(domain, method) => write!(formatter, "domain:{domain}:{method}"),
             Self::Program(program) => write!(formatter, "program:{program}"),
             Self::ProgramArgs(program, args) => {
-                write!(formatter, "program:{program}:{}", args.join(","))
+                // A comma inside one argument would be re-split on reload and
+                // silently change what the grant allows; the JSON form is
+                // unambiguous and the parser still reads the legacy join.
+                if args
+                    .iter()
+                    .any(|argument| argument.contains(',') || argument.starts_with('['))
+                {
+                    write!(
+                        formatter,
+                        "program:{program}:{}",
+                        serde_json::to_string(args).unwrap_or_default()
+                    )
+                } else {
+                    write!(formatter, "program:{program}:{}", args.join(","))
+                }
             }
             Self::Secret(secret) => write!(formatter, "secret:{secret}"),
         }
@@ -290,7 +305,7 @@ impl FromStr for GrantScope {
             if path.trim().is_empty() {
                 return Err("path scope needs a path".to_string());
             }
-            return Ok(Self::Path(PathBuf::from(path)));
+            return Ok(Self::Path(normalize_scope_path(Path::new(path))));
         }
         if let Some(domain) = raw.strip_prefix("domain:") {
             if domain.trim().is_empty() {
@@ -315,11 +330,15 @@ impl FromStr for GrantScope {
                 if program.trim().is_empty() {
                     return Err("program scope needs an executable".to_string());
                 }
-                let args = args
-                    .split(',')
-                    .filter(|arg| !arg.is_empty())
-                    .map(str::to_string)
-                    .collect();
+                let args = if args.trim_start().starts_with('[') {
+                    serde_json::from_str::<Vec<String>>(args)
+                        .map_err(|error| format!("program argument JSON is invalid: {error}"))?
+                } else {
+                    args.split(',')
+                        .filter(|arg| !arg.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                };
                 return Ok(Self::ProgramArgs(program.to_string(), args));
             }
             return Ok(Self::Program(program.to_string()));
@@ -519,6 +538,85 @@ pub(crate) struct CallScope {
     pub(crate) secret: Option<String>,
 }
 
+/// Lexically normalize a path without touching the filesystem.
+///
+/// A scope is a lease on a prefix, so the comparison has to happen on a path
+/// that no `..` component can lengthen: `/ws/sub/../../etc` must not look like
+/// it still sits under `/ws/sub`. Canonicalization would also resolve symlinks,
+/// which a grant deliberately does not do (a lease names a location, not the
+/// inode behind it), so this walks components instead.
+pub(crate) fn normalize_scope_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                let rooted = normalized.has_root();
+                if !normalized.pop() && !rooted {
+                    normalized.push("..");
+                }
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+/// Derive the scope of one tool call from its arguments.
+///
+/// The standard fixes three argument names the policy reads: `path`, `url` and
+/// `secret`. A relative path resolves against the open workspace, and every
+/// path is normalized first, so a scoped grant cannot be escaped with `..`.
+pub(crate) fn call_scope(arguments: &Value, workspace: Option<&Path>) -> CallScope {
+    let mut scope = CallScope {
+        workspace: workspace.map(Path::to_path_buf),
+        path: workspace.map(Path::to_path_buf),
+        ..CallScope::default()
+    };
+    if let Some(raw) = arguments.get("path").and_then(Value::as_str) {
+        let path = PathBuf::from(raw);
+        let resolved = if path.is_absolute() {
+            path
+        } else if let Some(workspace) = workspace {
+            workspace.join(path)
+        } else {
+            path
+        };
+        scope.path = Some(normalize_scope_path(&resolved));
+    }
+    if let Some(raw) = arguments.get("url").and_then(Value::as_str) {
+        if let Ok(url) = reqwest::Url::parse(raw) {
+            scope.domain = url.host_str().map(str::to_string);
+        }
+    }
+    if let Some(raw) = arguments.get("method").and_then(Value::as_str) {
+        scope.method = Some(raw.to_ascii_uppercase());
+    }
+    scope.secret = arguments
+        .get("secret")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    scope
+}
+
+/// Authorize every capability a tool descriptor declares, in order.
+///
+/// One shared seam for the agent tool wrapper, host-initiated calls (language
+/// diagnostics, integrations) and panel actions, so a surface cannot dispatch a
+/// tool while skipping the per-call check the standard requires.
+pub(crate) fn authorize_each(
+    policy: &PolicyEngine,
+    extension: &str,
+    trust: TrustLevel,
+    capabilities: &[Capability],
+    scope: &CallScope,
+) -> Result<(), ExtensionError> {
+    for capability in capabilities {
+        policy.authorize_call(extension, trust, *capability, scope)?;
+    }
+    Ok(())
+}
+
 /// Whether a DNS host equals a domain or is one of its subdomains.
 fn host_matches(host: &str, domain: &str) -> bool {
     host.eq_ignore_ascii_case(domain)
@@ -533,11 +631,15 @@ impl GrantScope {
         match self {
             Self::Any => true,
             Self::Workspace => call.workspace.is_some(),
-            Self::Path(prefix) => call
-                .path
-                .as_ref()
-                .or(call.workspace.as_ref())
-                .is_some_and(|path| path.starts_with(prefix)),
+            // Compare normalized paths: a lexical prefix check on the raw
+            // argument would let `..` walk out of the granted prefix.
+            Self::Path(prefix) => {
+                let prefix = normalize_scope_path(prefix);
+                call.path
+                    .as_ref()
+                    .or(call.workspace.as_ref())
+                    .is_some_and(|path| normalize_scope_path(path).starts_with(&prefix))
+            }
             Self::Domain(domain) => call
                 .domain
                 .as_ref()
@@ -823,8 +925,12 @@ impl PolicyEngine {
             TrustLevel::Verified if capability.risk() <= Risk::Medium => Decision::Allow {
                 scope: default_scope(capability, scope),
             },
+            // The standard's table allows agent.skills.provide at every trust
+            // level even though it is a medium-risk capability; it is the one
+            // documented medium exception to the low-risk default.
             TrustLevel::Community | TrustLevel::Local | TrustLevel::Unknown
-                if capability.risk() == Risk::Low =>
+                if capability.risk() == Risk::Low
+                    || capability == Capability::AgentSkillsProvide =>
             {
                 Decision::Allow {
                     scope: default_scope(capability, scope),
@@ -1034,6 +1140,77 @@ mod tests {
         }));
         let program: GrantScope = "program:sh".parse().expect("scope");
         assert_eq!(program, GrantScope::Program("sh".to_string()));
+    }
+
+    #[test]
+    fn a_parent_directory_cannot_escape_a_path_grant() {
+        let grant: GrantScope = "path:/ws/sub".parse().expect("scope");
+        let inside = call_scope(
+            &serde_json::json!({"path": "notes/readme.md"}),
+            Some(Path::new("/ws/sub")),
+        );
+        assert!(grant.covers(&inside));
+        let outside = call_scope(
+            &serde_json::json!({"path": "../outside.txt"}),
+            Some(Path::new("/ws/sub")),
+        );
+        assert!(
+            !grant.covers(&outside),
+            "{}",
+            outside.path.expect("path").display()
+        );
+        let absolute = call_scope(
+            &serde_json::json!({"path": "/etc/passwd"}),
+            Some(Path::new("/ws/sub")),
+        );
+        assert!(!grant.covers(&absolute));
+    }
+
+    #[test]
+    fn a_program_argument_with_a_comma_round_trips() {
+        let scope =
+            GrantScope::ProgramArgs("python3".to_string(), vec!["--exclude=a,b".to_string()]);
+        let parsed: GrantScope = scope.to_string().parse().expect("scope");
+        assert_eq!(parsed, scope);
+    }
+
+    #[test]
+    fn community_packages_may_use_skills() {
+        let scratch = Scratch::new("skills");
+        let policy = engine(&scratch);
+        // §6's table allows agent.skills.provide at every trust level.
+        assert!(policy
+            .evaluate(
+                "com.example.skills",
+                TrustLevel::Community,
+                Capability::AgentSkillsProvide,
+                &CallScope::default(),
+            )
+            .is_allowed());
+        // The other medium capabilities still need a grant at community trust.
+        assert!(!policy
+            .evaluate(
+                "com.example.skills",
+                TrustLevel::Community,
+                Capability::AgentModelsProvide,
+                &CallScope::default(),
+            )
+            .is_allowed());
+    }
+
+    #[test]
+    fn every_declared_capability_is_checked() {
+        let scratch = Scratch::new("each");
+        let policy = engine(&scratch);
+        let error = authorize_each(
+            &policy,
+            "com.example.tool",
+            TrustLevel::Local,
+            &[Capability::WorkspaceRead, Capability::WorkspaceWrite],
+            &CallScope::default(),
+        )
+        .expect_err("the write is denied");
+        assert!(matches!(error, ExtensionError::Denied { .. }), "{error}");
     }
 
     #[test]

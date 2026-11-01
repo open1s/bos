@@ -6695,11 +6695,6 @@ impl Shell {
         cx.notify();
         let root = crate::extension::store_root(&self.state.settings);
         let url = crate::extension::market::configured_url(&self.state.settings);
-        let settings = self.state.settings.clone();
-        let workspace = {
-            let root = settings.active_workspace_root();
-            (!root.is_empty()).then(|| std::path::PathBuf::from(root))
-        };
         let (tx, rx) = async_channel::bounded(1);
         self.state.runner.rt().spawn_blocking(move || {
             let store = crate::extension::package::ExtensionStore::open(&root);
@@ -6725,8 +6720,7 @@ impl Shell {
                         this.extension_market_error = None;
                         this.state
                             .notice(tr(this.state.lang, "settings.extensionInstalled").to_string());
-                        let statuses = crate::extension::statuses(&settings, workspace.as_deref());
-                        this.extension_statuses = Some(statuses);
+                        this.refresh_extension_surfaces(cx);
                     }
                     Ok(Err(error)) => this.extension_market_error = Some(error),
                     Err(_) => {
@@ -6839,11 +6833,7 @@ impl Shell {
                     .child(txt(label, 11.0, theme::text()))
                     .on_click(cx.listener(move |this, _event, _window, cx| {
                         this.toggle_installed_extension(&id, cx);
-                        let settings = this.state.settings.clone();
-                        let root = settings.active_workspace_root();
-                        let workspace = (!root.is_empty()).then(|| std::path::PathBuf::from(root));
-                        this.extension_statuses =
-                            Some(crate::extension::statuses(&settings, workspace.as_deref()));
+                        this.refresh_extension_surfaces(cx);
                         cx.notify();
                     }))
             } else {
@@ -7001,11 +6991,7 @@ impl Shell {
                                         &program,
                                     ) {
                                         Ok(()) => {
-                                            this.extension_statuses =
-                                                Some(crate::extension::statuses(
-                                                    &settings,
-                                                    workspace.as_deref(),
-                                                ));
+                                            this.refresh_extension_surfaces(cx);
                                             this.state.notice(
                                                 tr(this.state.lang, "settings.processApproved")
                                                     .to_string(),
@@ -7110,8 +7096,6 @@ impl Shell {
                 vec![div().child(theme_menu).into_any_element()],
             );
         }
-        let refresh_settings = self.state.settings.clone();
-        let refresh_workspace = workspace;
         let refresh = div()
             .id("extension-panels-refresh")
             .debug_selector(|| "extension-panels-refresh".to_string())
@@ -7132,14 +7116,7 @@ impl Shell {
                 theme::text(),
             ))
             .on_click(cx.listener(move |this, _event, _window, cx| {
-                this.extension_themes = Some(crate::extension::themes(
-                    &refresh_settings,
-                    refresh_workspace.as_deref(),
-                ));
-                this.extension_statuses = Some(crate::extension::statuses(
-                    &refresh_settings,
-                    refresh_workspace.as_deref(),
-                ));
+                this.refresh_extension_surfaces(cx);
                 cx.notify();
             }));
         let mut inventory = div().flex().flex_col().gap(px(6.0));
@@ -7285,11 +7262,7 @@ impl Shell {
                                                 )),
                                                 Err(error) => this.state.notice(error.to_string()),
                                             }
-                                            this.extension_statuses =
-                                                Some(crate::extension::statuses(
-                                                    &settings,
-                                                    workspace.as_deref(),
-                                                ));
+                                            this.refresh_extension_surfaces(cx);
                                             cx.notify();
                                         }))
                                         .into_any_element()
@@ -7325,14 +7298,7 @@ impl Shell {
                                     ))
                                     .on_click(cx.listener(move |this, _event, _window, cx| {
                                         this.toggle_installed_extension(&id, cx);
-                                        let settings = this.state.settings.clone();
-                                        let root = settings.active_workspace_root();
-                                        let workspace = (!root.is_empty())
-                                            .then(|| std::path::PathBuf::from(root));
-                                        this.extension_statuses = Some(crate::extension::statuses(
-                                            &settings,
-                                            workspace.as_deref(),
-                                        ));
+                                        this.refresh_extension_surfaces(cx);
                                         cx.notify();
                                     }))
                             }),

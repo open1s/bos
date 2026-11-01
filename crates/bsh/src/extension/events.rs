@@ -60,6 +60,8 @@ pub(crate) mod topics {
     pub(crate) const EXTENSION_UNLOADED: &str = "extension.unloaded";
     /// An extension failed.
     pub(crate) const EXTENSION_FAILED: &str = "extension.failed";
+    /// A declarative UI action was routed to its owning runtime.
+    pub(crate) const UI_ACTION: &str = "ui.action";
     /// A model request is about to be sent.
     pub(crate) const MODEL_REQUESTED: &str = "model.requested";
     /// A model request finished.

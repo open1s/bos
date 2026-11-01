@@ -508,6 +508,17 @@ fn raw_contribution(
             ),
         });
     }
+    // A declared file must parse at load time: an unreadable theme or provider
+    // descriptor used to pass `validate`, install, and then vanish at the
+    // consumer, which §13/§14 forbid.
+    let text = std::fs::read_to_string(&path).map_err(|source| ExtensionError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    serde_json::from_str::<serde_json::Value>(&text).map_err(|error| ExtensionError::Json {
+        path: path.clone(),
+        message: error.to_string(),
+    })?;
     Ok(RawContribution {
         id: id.clone(),
         path,

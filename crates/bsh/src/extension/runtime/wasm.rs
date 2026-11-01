@@ -122,6 +122,7 @@ struct HostState {
     storage: ExtensionStorage,
     workspace: Option<PathBuf>,
     publishes: Vec<String>,
+    subscribes: Vec<String>,
     config: String,
     limits: TrackingLimiter,
     subscriptions: BTreeMap<u64, crate::extension::events::Subscription>,
@@ -184,6 +185,11 @@ impl HostState {
             .map_err(Self::host_error)
     }
 
+    /// Resolve a guest path and prove it stays inside the workspace.
+    ///
+    /// Nothing is created here: containment is checked against the deepest
+    /// existing ancestor, so a denied write does not first create directories
+    /// and a symlinked parent is caught before it is followed.
     fn workspace_path(&self, raw: &str) -> Result<PathBuf, self::bsh::extension::types::HostError> {
         let Some(workspace) = &self.workspace else {
             return Err(self::bsh::extension::types::HostError::Denied(
@@ -196,18 +202,32 @@ impl HostState {
         let canonical_workspace = workspace
             .canonicalize()
             .map_err(|error| self::bsh::extension::types::HostError::Runtime(error.to_string()))?;
-        let parent = path.parent().unwrap_or(workspace);
-        std::fs::create_dir_all(parent)
-            .map_err(|error| self::bsh::extension::types::HostError::Runtime(error.to_string()))?;
-        let canonical_parent = parent
+        let mut ancestor = path.parent().unwrap_or(workspace).to_path_buf();
+        while !ancestor.exists() {
+            match ancestor.parent() {
+                Some(parent) if parent.starts_with(workspace) => ancestor = parent.to_path_buf(),
+                _ => break,
+            }
+        }
+        let canonical_ancestor = ancestor
             .canonicalize()
             .map_err(|error| self::bsh::extension::types::HostError::Runtime(error.to_string()))?;
-        if !canonical_parent.starts_with(&canonical_workspace) {
+        if !canonical_ancestor.starts_with(&canonical_workspace) {
             return Err(self::bsh::extension::types::HostError::Denied(
                 "path escapes the workspace".to_string(),
             ));
         }
         Ok(path)
+    }
+
+    /// Refuse a host call once the runtime has been cancelled.
+    fn check_alive(&self) -> Result<(), self::bsh::extension::types::HostError> {
+        if self.cancelled.load(Ordering::Relaxed) {
+            return Err(self::bsh::extension::types::HostError::Denied(
+                "the call was cancelled".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     fn publish_allowed(&self, topic: &str) -> bool {
@@ -254,6 +274,8 @@ impl self::bsh::extension::host::Host for HostState {
         &mut self,
         event: self::bsh::extension::types::Event,
     ) -> Result<(), self::bsh::extension::types::HostError> {
+        self.check_alive()?;
+        self.authorize(Capability::EventsPublish, CallScope::default())?;
         if !self.publish_allowed(&event.event_type) {
             return Err(self::bsh::extension::types::HostError::Denied(format!(
                 "topic {} is not declared in contributes.publishes",
@@ -269,6 +291,20 @@ impl self::bsh::extension::host::Host for HostState {
     }
 
     fn subscribe(&mut self, topic: String) -> Result<u64, self::bsh::extension::types::HostError> {
+        self.check_alive()?;
+        // A subscription is a declared contribution, not an open tap: the
+        // topic must appear in contributes.events and pass the same
+        // events.subscribe decision the manifest requested.
+        if !self.subscribes.iter().any(|pattern| {
+            TopicPattern::parse(pattern, true)
+                .map(|pattern| pattern.matches(&topic))
+                .unwrap_or(false)
+        }) {
+            return Err(self::bsh::extension::types::HostError::Denied(format!(
+                "topic {topic} is not declared in contributes.events"
+            )));
+        }
+        self.authorize(Capability::EventsSubscribe, CallScope::default())?;
         let filter = EventFilter::from_topics(&[topic])
             .map_err(self::bsh::extension::types::HostError::Denied)?;
         let id = self.next_subscription;
@@ -286,6 +322,7 @@ impl self::bsh::extension::host::Host for HostState {
         &mut self,
         path: String,
     ) -> Result<Vec<u8>, self::bsh::extension::types::HostError> {
+        self.check_alive()?;
         let path = self.workspace_path(&path)?;
         self.authorize(
             Capability::WorkspaceRead,
@@ -318,6 +355,7 @@ impl self::bsh::extension::host::Host for HostState {
                 bytes.len()
             )));
         }
+        self.check_alive()?;
         let path = self.workspace_path(&path)?;
         self.authorize(
             Capability::WorkspaceWrite,
@@ -327,6 +365,11 @@ impl self::bsh::extension::host::Host for HostState {
                 ..CallScope::default()
             },
         )?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                self::bsh::extension::types::HostError::Runtime(error.to_string())
+            })?;
+        }
         write_atomic(&path, &bytes).map_err(Self::host_error)
     }
 
@@ -336,6 +379,7 @@ impl self::bsh::extension::host::Host for HostState {
         method: String,
         body: Option<Vec<u8>>,
     ) -> Result<Vec<u8>, self::bsh::extension::types::HostError> {
+        self.check_alive()?;
         let parsed = reqwest::Url::parse(&url)
             .map_err(|error| self::bsh::extension::types::HostError::Denied(error.to_string()))?;
         if parsed.scheme() != "https" && parsed.scheme() != "http" {
@@ -405,6 +449,7 @@ impl self::bsh::extension::host::Host for HostState {
         &mut self,
         key: String,
     ) -> Result<Option<Vec<u8>>, self::bsh::extension::types::HostError> {
+        self.check_alive()?;
         self.authorize(Capability::ExtensionStorage, CallScope::default())?;
         self.storage.read(&key).map_err(Self::host_error)
     }
@@ -414,6 +459,7 @@ impl self::bsh::extension::host::Host for HostState {
         key: String,
         value: Vec<u8>,
     ) -> Result<(), self::bsh::extension::types::HostError> {
+        self.check_alive()?;
         self.authorize(Capability::ExtensionStorage, CallScope::default())?;
         self.storage.write(&key, &value).map_err(Self::host_error)
     }
@@ -422,6 +468,7 @@ impl self::bsh::extension::host::Host for HostState {
         &mut self,
         prefix: String,
     ) -> Result<Vec<String>, self::bsh::extension::types::HostError> {
+        self.check_alive()?;
         self.authorize(Capability::ExtensionStorage, CallScope::default())?;
         self.storage
             .list()
@@ -437,6 +484,7 @@ impl self::bsh::extension::host::Host for HostState {
         &mut self,
         name: String,
     ) -> Result<String, self::bsh::extension::types::HostError> {
+        self.check_alive()?;
         self.authorize(
             Capability::SecretsRead,
             CallScope {
@@ -464,6 +512,9 @@ impl self::bsh::extension::host::Host for HostState {
     }
 
     fn progress(&mut self, value: u32, total: u32) {
+        if self.cancelled.load(Ordering::Relaxed) {
+            return;
+        }
         if let Some(sender) = &self.progress {
             let _ = sender.send(serde_json::json!({
                 "progress": value,
@@ -487,10 +538,14 @@ pub(crate) struct WasmRuntime {
     storage: ExtensionStorage,
     workspace: Option<PathBuf>,
     publishes: Vec<String>,
+    subscribes: Vec<String>,
     config: String,
     resources: ResourcesSpec,
     trust: TrustLevel,
     cancelled: Arc<AtomicBool>,
+    /// Set by shutdown only. Cancellation is a per-call state that the next
+    /// call clears, but a shut-down runtime must never be revived by one.
+    stopped: AtomicBool,
     instance: Mutex<Option<Instance>>,
     fuel_budget: AtomicU64,
     fuel_used: AtomicU64,
@@ -542,10 +597,12 @@ impl WasmRuntime {
             storage,
             workspace,
             publishes: manifest.contributes.publishes.clone(),
+            subscribes: manifest.contributes.events.clone(),
             config,
             resources: manifest.resources.clone(),
             trust,
             cancelled: Arc::new(AtomicBool::new(false)),
+            stopped: AtomicBool::new(false),
             fuel_budget: AtomicU64::new(0),
             fuel_used: AtomicU64::new(0),
             memory_used: Arc::new(AtomicU64::new(0)),
@@ -579,6 +636,7 @@ impl WasmRuntime {
             storage: self.storage.clone(),
             workspace: self.workspace.clone(),
             publishes: self.publishes.clone(),
+            subscribes: self.subscribes.clone(),
             config: self.config.clone(),
             limits: TrackingLimiter {
                 limits,
@@ -789,6 +847,7 @@ impl Runtime for WasmRuntime {
     }
 
     async fn shutdown(&self) -> Result<(), ExtensionError> {
+        self.stopped.store(true, Ordering::SeqCst);
         self.cancelled.store(true, Ordering::Relaxed);
         self.deactivate().await?;
         let mut guard = self.instance.lock().map_err(|_| ExtensionError::Corrupt {
@@ -807,7 +866,10 @@ impl Runtime for WasmRuntime {
 
     async fn cancel(&self) -> Result<(), ExtensionError> {
         self.cancelled.store(true, Ordering::SeqCst);
-        if let Ok(mut guard) = self.instance.lock() {
+        // Never block on the instance lock: a running guest holds it for the
+        // whole call. Host functions trap on the flag below, and the epoch /
+        // fuel cut is best-effort for a guest between calls.
+        if let Ok(mut guard) = self.instance.try_lock() {
             if let Some(instance) = guard.as_mut() {
                 instance.store.set_epoch_deadline(0);
                 let _ = instance.store.set_fuel(0);
@@ -826,19 +888,24 @@ impl Runtime for WasmRuntime {
         arguments: Value,
         context: &CallContext,
     ) -> Result<Value, ExtensionError> {
-        if self.cancelled.load(Ordering::Relaxed) {
+        if self.stopped.load(Ordering::Relaxed) {
             return Err(ExtensionError::Runtime {
                 extension: self.extension.to_string(),
-                message: "runtime was cancelled".to_string(),
+                message: "runtime is shut down".to_string(),
             });
         }
+        // A cancelled call must not poison the next one: the flag is per call.
+        self.cancelled.store(false, Ordering::Relaxed);
         self.ensure_instance()?;
         let mut guard = self.instance.lock().map_err(|_| ExtensionError::Corrupt {
             path: self.component.clone(),
             message: "wasm instance lock is poisoned".to_string(),
         })?;
         let instance = guard.as_mut().expect("instance");
-        self.prepare_call(instance, context.timeout_ms)?;
+        self.prepare_call(
+            instance,
+            context.timeout_ms.min(self.resources.execution_ms()),
+        )?;
         let arguments = serde_json::to_string(&arguments).unwrap_or_default();
         let result = instance
             .bindings
@@ -860,6 +927,18 @@ impl Runtime for WasmRuntime {
             return Err(ExtensionError::Runtime {
                 extension: self.extension.to_string(),
                 message: result.content,
+            });
+        }
+        // The manifest ceiling applies to every runtime; a component could
+        // otherwise return up to its memory limit.
+        if result.content.len() as u64 > self.resources.output_bytes() {
+            return Err(ExtensionError::Limit {
+                extension: self.extension.to_string(),
+                message: format!(
+                    "component result is {} bytes; the ceiling is {}",
+                    result.content.len(),
+                    self.resources.output_bytes()
+                ),
             });
         }
         serde_json::from_str(&result.content).map_err(|error| ExtensionError::Runtime {

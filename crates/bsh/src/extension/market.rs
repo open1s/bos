@@ -11,8 +11,8 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
-use super::package::ExtensionStore;
-use super::types::{ExtensionError, ExtensionSource};
+use super::package::{ExtensionStore, Package};
+use super::types::{ExtensionError, ExtensionSource, TrustLevel};
 
 /// The official provider repository.
 pub(crate) const DEFAULT_GIT_MARKET: &str = "https://github.com/open1s/bsh_extensions";
@@ -126,18 +126,18 @@ fn validate_entry(entry: &MarketEntry, path: &Path) -> Result<(), ExtensionError
         path: path.to_path_buf(),
         message: format!("market entry {} has invalid version: {error}", entry.id),
     })?;
-    if entry.path.is_empty()
-        || entry.path.starts_with('/')
-        || entry.path.split('/').any(|segment| segment == "..")
-    {
-        return Err(ExtensionError::Manifest {
+    // The same grammar every other package-relative path must satisfy: it
+    // rejects absolute paths, "." / ".." components and backslashes (which a
+    // split-on-'/' check let through on Windows).
+    super::manifest::validate_relative_path(&entry.path).map_err(|reason| {
+        ExtensionError::Manifest {
             path: path.to_path_buf(),
             message: format!(
-                "market entry {} has an unsafe path {:?}",
+                "market entry {} has an unsafe path {:?}: {reason}",
                 entry.id, entry.path
             ),
-        });
-    }
+        }
+    })?;
     Ok(())
 }
 
@@ -248,6 +248,31 @@ impl GitMarket {
                 path: source,
                 message: format!("market entry {} has no extension.toml", entry.id),
             });
+        }
+        // The index is not trusted to describe what the directory contains: the
+        // installed id and version must match the entry, and a declared hash
+        // must be the hash of the bytes that install.
+        let declared = Package::load(&source, ExtensionSource::Development, TrustLevel::Community)?;
+        if declared.id().as_str() != entry.id || declared.version() != entry.version {
+            return Err(ExtensionError::Manifest {
+                path: source,
+                message: format!(
+                    "market entry {} {} does not match the package it names ({} {})",
+                    entry.id,
+                    entry.version,
+                    declared.id(),
+                    declared.version()
+                ),
+            });
+        }
+        if let Some(hash) = entry.hash.as_deref().filter(|hash| !hash.is_empty()) {
+            if declared.hash != hash {
+                return Err(ExtensionError::Denied {
+                    extension: entry.id.clone(),
+                    capability: "package.integrity".to_string(),
+                    reason: "market package does not match the hash its index declares".to_string(),
+                });
+            }
         }
         store.install_community(
             &source,

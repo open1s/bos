@@ -317,8 +317,12 @@ pub(crate) enum UiNode {
         value: String,
     },
     /// An image.
+    ///
+    /// Only `asset/` package-relative paths are drawn in this build: the host
+    /// has no remote image loader, so accepting an https URL would render
+    /// nothing.
     Image {
-        /// An https URL or an `asset/` package-relative path.
+        /// An `asset/` package-relative path.
         src: String,
         /// Alternative text.
         #[serde(default)]
@@ -577,7 +581,7 @@ fn walk(node: &UiNode, depth: usize, state: &mut WalkState<'_>) {
             if !valid_image_source(src) {
                 state.report.error(
                     "ui.image.src",
-                    "must be an https:// URL or an asset/ package-relative path",
+                    "must be an asset/ package-relative path; this host does not fetch remote images",
                 );
             }
             text_leaf("ui.image.alt", alt, state);
@@ -650,12 +654,11 @@ fn action_id(field: &str, action: &str, state: &mut WalkState<'_>) {
 }
 
 fn valid_image_source(src: &str) -> bool {
-    if let Some(rest) = src.strip_prefix("https://") {
-        return !rest.is_empty() && !rest.contains(char::is_whitespace);
-    }
     if let Some(rest) = src.strip_prefix("asset/") {
         return validate_relative_path(rest).is_ok();
     }
+    // Remote images are refused rather than accepted and drawn as text: a
+    // component the renderer cannot honour is worse than a validation error.
     false
 }
 
@@ -850,11 +853,12 @@ mod tests {
     }
 
     #[test]
-    fn images_only_accept_https_or_package_assets() {
-        for src in ["https://example.com/a.png", "asset/icons/a.png"] {
+    fn images_only_accept_package_assets() {
+        for src in ["asset/icons/a.png", "asset/a.svg"] {
             assert!(valid_image_source(src), "{src}");
         }
         for src in [
+            "https://example.com/a.png",
             "javascript:alert(1)",
             "file:///etc/passwd",
             "data:image/png;base64,xxx",
