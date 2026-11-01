@@ -72,4 +72,5 @@ pub fn run() {
     // every agent build and reaped by their own `Drop`, so this is the belt to
     // that pair of braces rather than the only guarantee.
     caps::stop_bridge_pool();
+    crate::extension::shutdown();
 }

@@ -30,6 +30,7 @@ mod cli;
 mod config;
 mod events;
 pub(crate) mod host;
+pub(crate) use host::shutdown;
 mod lifecycle;
 mod manifest;
 mod market;

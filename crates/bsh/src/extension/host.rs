@@ -1120,6 +1120,19 @@ impl ExtensionHost {
         }
     }
 
+    /// Stop every loaded runtime and end the delivery thread.
+    pub(crate) async fn shutdown(&mut self) {
+        self.pump_generation.fetch_add(1, Ordering::SeqCst);
+        let runtimes: Vec<Arc<dyn Runtime>> = self
+            .loaded
+            .values()
+            .filter_map(|entry| entry.runtime.clone())
+            .collect();
+        self.loaded.clear();
+        for runtime in runtimes {
+            let _ = runtime.shutdown().await;
+        }
+    }
     /// Clear a persisted failure and reload the package set.
     pub(crate) fn retry(&mut self, id: &str) -> Result<(), ExtensionError> {
         let id = crate::extension::types::ExtensionId::parse(id.to_string())?;
@@ -1711,6 +1724,24 @@ pub(crate) fn install(
 /// The host never invents a subscriber: a package that did not subscribe
 /// receives nothing, and a full queue is counted rather than blocking the
 /// publisher.
+
+/// Stop the process-global host and every runtime it owns.
+///
+/// Called when the window closes: the extension host is a process-global cache,
+/// so dropping the shell is not enough to release process children or WASM
+/// stores. The delivery thread also stops because the generation moved.
+pub(crate) fn shutdown() {
+    let slot = HOST.get_or_init(|| Mutex::new(None));
+    let Some(mut host) = slot.lock().ok().and_then(|mut guard| guard.take()) else {
+        return;
+    };
+    if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        runtime.block_on(host.shutdown());
+    }
+}
 pub(crate) fn publish(topic: &str, payload: serde_json::Value) {
     let slot = HOST.get_or_init(|| Mutex::new(None));
     let Ok(guard) = slot.lock() else {
@@ -2098,7 +2129,7 @@ tools = ["echo"]
                 .expect("grant");
         }
         drop(policy);
-        let host = ExtensionHost::open(config(&root)).expect("host");
+        let mut host = ExtensionHost::open(config(&root)).expect("host");
         let document = root.join("main.rs");
         std::fs::write(&document, "fn main() {}").expect("document");
         let checked = host
@@ -2135,7 +2166,7 @@ tools = ["echo"]
                 .expect("grant");
         }
         drop(policy);
-        let host = ExtensionHost::open(config(&root)).expect("host");
+        let mut host = ExtensionHost::open(config(&root)).expect("host");
         let document = root.join("main.rs");
         std::fs::write(&document, "fn main() {}").expect("document");
         host.language_check("com.example.hook-demo", "hookdemo", &document)
@@ -2162,6 +2193,17 @@ tools = ["echo"]
                 .iter()
                 .any(|event| event["topic"] == "session.created")),
             "session.created was not forwarded: {log}"
+        );
+        assert!(
+            host.events().subscriber_count() > 0,
+            "the runtime subscribed before shutdown"
+        );
+        host.shutdown().await;
+        assert!(host.loaded.is_empty(), "shutdown releases every runtime");
+        assert_eq!(
+            host.events().subscriber_count(),
+            0,
+            "dropping the runtimes releases their subscriptions"
         );
     }
 
