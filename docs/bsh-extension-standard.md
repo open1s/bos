@@ -9,6 +9,7 @@ problem_type: reference
 **Status:** normative for BSH 3.x, extension API 1.0
 **Implemented by:** crates/bsh/src/extension
 **Design background:** docs/BSH_Extension_Framework_Design.md
+**Comprehensive textbook:** docs/BOS-BSH-Textbook.md
 
 This document is the contract a package and a host implement. Where the design
 document describes intent, this one describes the accepted bytes, the accepted

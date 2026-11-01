@@ -172,6 +172,7 @@ cd crates/jsbos && npm install && npm run build
 - **Python**: [docs/python-user-guide.md](docs/python-user-guide.md)
 - **JavaScript**: [docs/javascript-user-guide.md](docs/javascript-user-guide.md)
 - **Rust**: [docs/rust-user-guide.md](docs/rust-user-guide.md)
+- **BOS/BSH 扩展教材**: [docs/BOS-BSH-Textbook.md](docs/BOS-BSH-Textbook.md)
 - **English**: [README.md](../README.md)
 
 ---

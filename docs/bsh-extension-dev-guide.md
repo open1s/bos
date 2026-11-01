@@ -8,7 +8,8 @@ problem_type: guide
 
 This guide takes a package from an empty directory to an installed tool that the
 agent can call. The normative contract is docs/bsh-extension-standard.md; read
-it before shipping a package.
+it before shipping a package. The full narrative, architecture and all
+tutorials are in docs/BOS-BSH-Textbook.md.
 
 ## 1. Quick start
 
