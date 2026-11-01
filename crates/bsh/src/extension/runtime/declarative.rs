@@ -85,6 +85,34 @@ pub(crate) struct RawContribution {
     pub(crate) path: PathBuf,
 }
 
+/// One declared language service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LanguageContribution {
+    /// Contribution id.
+    pub(crate) id: ContributionId,
+    /// Human name.
+    pub(crate) name: String,
+    /// File extensions without the leading dot.
+    pub(crate) extensions: Vec<String>,
+    /// Tool that answers diagnostics for a document.
+    pub(crate) tool: Option<ContributionId>,
+    /// Optional tree-sitter grammar id.
+    pub(crate) syntax: Option<String>,
+}
+
+/// One declared external-system integration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IntegrationContribution {
+    /// Contribution id.
+    pub(crate) id: ContributionId,
+    /// Human name.
+    pub(crate) name: String,
+    /// github, browser, terminal or custom.
+    pub(crate) kind: String,
+    /// Tool or command the host dispatches to.
+    pub(crate) action: Option<ContributionId>,
+}
+
 /// Everything a declarative package contributes beyond its tools.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DeclarativeContributions {
@@ -106,6 +134,10 @@ pub(crate) struct DeclarativeContributions {
     pub(crate) model_providers: Vec<RawContribution>,
     /// Agent role descriptors.
     pub(crate) agent_providers: Vec<RawContribution>,
+    /// Language service descriptors.
+    pub(crate) languages: Vec<LanguageContribution>,
+    /// External-system integration descriptors.
+    pub(crate) integrations: Vec<IntegrationContribution>,
 }
 
 impl DeclarativeContributions {
@@ -120,6 +152,8 @@ impl DeclarativeContributions {
             && self.presets.is_empty()
             && self.model_providers.is_empty()
             && self.agent_providers.is_empty()
+            && self.languages.is_empty()
+            && self.integrations.is_empty()
     }
 }
 
@@ -359,6 +393,99 @@ pub(crate) fn load_contributions(
             .agent_providers
             .push(raw_contribution(root, "providers/agents", "json", id)?);
     }
+    for id in &manifest.contributes.languages {
+        let raw = raw_contribution(root, "languages", "json", id)?;
+        let path = raw.path.clone();
+        let file: LanguageFile =
+            serde_json::from_str(&read_text(&path)?).map_err(|error| ExtensionError::Json {
+                path: path.clone(),
+                message: error.to_string(),
+            })?;
+        if file.name.trim().is_empty() || file.name.chars().count() > 120 {
+            return Err(ExtensionError::Manifest {
+                path,
+                message: "language name must be 1..=120 characters".to_string(),
+            });
+        }
+        if file.extensions.is_empty() || file.extensions.len() > 64 {
+            return Err(ExtensionError::Manifest {
+                path,
+                message: "a language must declare 1..=64 file extensions".to_string(),
+            });
+        }
+        for extension in &file.extensions {
+            if extension.is_empty()
+                || extension.starts_with('.')
+                || !extension
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '+' | '.'))
+            {
+                return Err(ExtensionError::Manifest {
+                    path: path.clone(),
+                    message: format!(
+                        "language extension {extension:?} must be bare and alphanumeric"
+                    ),
+                });
+            }
+        }
+        if let Some(tool) = &file.tool {
+            if !manifest.contributes.tools.contains(tool) {
+                return Err(ExtensionError::Manifest {
+                    path,
+                    message: format!("language tool {tool} is not a declared tool"),
+                });
+            }
+        }
+        contributions.languages.push(LanguageContribution {
+            id: id.clone(),
+            name: file.name,
+            extensions: file.extensions,
+            tool: file.tool,
+            syntax: file.syntax,
+        });
+    }
+    for id in &manifest.contributes.integrations {
+        let raw = raw_contribution(root, "integrations", "json", id)?;
+        let path = raw.path.clone();
+        let file: IntegrationFile =
+            serde_json::from_str(&read_text(&path)?).map_err(|error| ExtensionError::Json {
+                path: path.clone(),
+                message: error.to_string(),
+            })?;
+        if file.name.trim().is_empty() || file.name.chars().count() > 120 {
+            return Err(ExtensionError::Manifest {
+                path,
+                message: "integration name must be 1..=120 characters".to_string(),
+            });
+        }
+        if !matches!(
+            file.kind.as_str(),
+            "github" | "browser" | "terminal" | "custom"
+        ) {
+            return Err(ExtensionError::Manifest {
+                path,
+                message: "integration kind must be github, browser, terminal or custom".to_string(),
+            });
+        }
+        if let Some(action) = &file.action {
+            if !manifest.contributes.tools.contains(action)
+                && !manifest.contributes.commands.contains(action)
+            {
+                return Err(ExtensionError::Manifest {
+                    path,
+                    message: format!(
+                        "integration action {action} is not a declared tool or command"
+                    ),
+                });
+            }
+        }
+        contributions.integrations.push(IntegrationContribution {
+            id: id.clone(),
+            name: file.name,
+            kind: file.kind,
+            action: file.action,
+        });
+    }
     Ok(contributions)
 }
 
@@ -482,6 +609,27 @@ struct PanelFile {
     view: UiDocument,
 }
 
+/// One language descriptor file.
+#[derive(Debug, Deserialize)]
+struct LanguageFile {
+    name: String,
+    #[serde(default)]
+    extensions: Vec<String>,
+    #[serde(default)]
+    tool: Option<ContributionId>,
+    #[serde(default)]
+    syntax: Option<String>,
+}
+
+/// One integration descriptor file.
+#[derive(Debug, Deserialize)]
+struct IntegrationFile {
+    name: String,
+    kind: String,
+    #[serde(default)]
+    action: Option<ContributionId>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,7 +648,15 @@ mod tests {
                 std::process::id()
             ));
             let _ = std::fs::remove_dir_all(&path);
-            for directory in ["tools", "commands", "prompts", "contexts", "panels"] {
+            for directory in [
+                "tools",
+                "commands",
+                "prompts",
+                "contexts",
+                "panels",
+                "languages",
+                "integrations",
+            ] {
                 std::fs::create_dir_all(path.join(directory)).expect("scratch");
             }
             Self(path)
@@ -537,6 +693,8 @@ commands = ["refresh"]
 prompts = ["system"]
 contexts = ["workspace"]
 panels = ["status"]
+languages = ["rust"]
+integrations = ["github"]
 
 [resources]
 max_output_bytes = 4096
@@ -576,6 +734,16 @@ max_output_bytes = 4096
             ),
         )
         .expect("panel");
+        std::fs::write(
+            scratch.0.join("languages/rust.json"),
+            r#"{"name":"Rust","extensions":["rs"],"tool":"echo","syntax":"rust"}"#,
+        )
+        .expect("language");
+        std::fs::write(
+            scratch.0.join("integrations/github.json"),
+            r#"{"name":"GitHub","kind":"github","action":"refresh"}"#,
+        )
+        .expect("integration");
     }
 
     #[test]
@@ -588,6 +756,11 @@ max_output_bytes = 4096
         assert_eq!(contributions.commands[0].description, "Refresh the tree");
         assert_eq!(contributions.prompts[0].description, "System");
         assert_eq!(contributions.contexts[0].text, "Workspace facts.");
+        assert_eq!(contributions.languages[0].name, "Rust");
+        assert_eq!(contributions.languages[0].extensions, vec!["rs"]);
+        assert_eq!(contributions.languages[0].syntax.as_deref(), Some("rust"));
+        assert_eq!(contributions.integrations[0].name, "GitHub");
+        assert_eq!(contributions.integrations[0].kind, "github");
         assert_eq!(contributions.panels[0].title, "Status");
         assert_eq!(
             contributions.panels[0].view.root,

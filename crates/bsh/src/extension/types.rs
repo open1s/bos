@@ -453,6 +453,10 @@ pub(crate) enum ContributionKind {
     Workflow,
     /// A theme.
     Theme,
+    /// A language service descriptor.
+    Language,
+    /// An external-system integration descriptor.
+    Integration,
 }
 
 impl ContributionKind {
@@ -466,6 +470,8 @@ impl ContributionKind {
             Self::Context => "contexts",
             Self::Workflow => "workflows",
             Self::Theme => "themes",
+            Self::Language => "languages",
+            Self::Integration => "integrations",
         }
     }
 }

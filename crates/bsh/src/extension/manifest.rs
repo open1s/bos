@@ -135,6 +135,12 @@ pub(crate) struct ContributesSpec {
     /// Reusable workflows.
     #[serde(default)]
     pub(crate) workflows: Vec<ContributionId>,
+    /// Language service descriptors (languages/<id>.json).
+    #[serde(default)]
+    pub(crate) languages: Vec<ContributionId>,
+    /// External-system integration descriptors (integrations/<id>.json).
+    #[serde(default)]
+    pub(crate) integrations: Vec<ContributionId>,
     /// Model provider descriptors (providers/models/<id>.json).
     #[serde(default)]
     pub(crate) model_providers: Vec<ContributionId>,
@@ -290,6 +296,8 @@ impl Manifest {
             ContributionKind::Context => &self.contributes.contexts,
             ContributionKind::Workflow => &self.contributes.workflows,
             ContributionKind::Theme => &self.contributes.themes,
+            ContributionKind::Language => &self.contributes.languages,
+            ContributionKind::Integration => &self.contributes.integrations,
         }
     }
 
@@ -303,6 +311,8 @@ impl Manifest {
             ContributionKind::Context,
             ContributionKind::Workflow,
             ContributionKind::Theme,
+            ContributionKind::Language,
+            ContributionKind::Integration,
         ];
         let mut all = Vec::new();
         for kind in kinds {

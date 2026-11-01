@@ -99,6 +99,8 @@ my-extension/
   commands/<id>.md        one per declared command
   prompts/<id>.md         one per declared prompt
   contexts/<id>.md        one per declared context
+  languages/<id>.json     one per declared language service
+  integrations/<id>.json  one per declared external integration
   skills/<id>/SKILL.md    one per declared skill
   panels/<id>.json        one per declared panel
   workflows/<id>.json     one per declared workflow (executed)
@@ -215,6 +217,8 @@ commands = ["git.refresh"]
 panels = ["git.panel"]
 prompts = ["git.prompt"]
 contexts = ["git.context"]
+languages = ["git.rust"]
+integrations = ["git.github"]
 skills = ["git.helper"]
 workflows = ["git.release"]
 themes = ["git.dark"]
@@ -225,6 +229,20 @@ publishes = ["git.changed"]
 events are subscription topics; a trailing .* is allowed. publishes are topics
 the package may emit; a wildcard is not allowed there. Topic segments are
 lowercase letters, digits, hyphen and underscore, separated by dots.
+
+Language descriptors name a language, its bare file extensions, and an optional tool that answers diagnostics for a document:
+
+~~~json
+{"name":"Rust","extensions":["rs"],"tool":"diagnostics","syntax":"rust"}
+~~~
+
+Integration descriptors name an external system and the tool or command that drives it:
+
+~~~json
+{"name":"GitHub","kind":"github","action":"issues"}
+~~~
+
+The kind is github, browser, terminal or custom. The referenced tool or command must be declared by the same package. Both descriptors are validated at load and listed by `bsh ext languages` and `bsh ext integrations`.
 
 ### 4.6 Resources
 

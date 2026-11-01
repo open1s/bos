@@ -1,0 +1,5 @@
+{
+  "name": "Hook Demo GitHub",
+  "kind": "github",
+  "action": "events"
+}

@@ -81,9 +81,9 @@ Status legend:
 | Command extension | done | registered and inserted from the composer slash palette |
 | Event extension | done | WASM/process subscriptions, workspace/model/agent/tool publishers |
 | Theme extension | done | panel theme plus an app-wide palette override selected in Settings |
-| Language extension | missing | no language contribution kind |
+| Language extension | done | languages/<id>.json descriptor + declared diagnostics tool; validated and listed by `bsh ext languages` |
 | Storage extension | done | namespace API + WASM/WIT and Extism bsh_host bindings |
-| Integration extension | missing | no GitHub/browser/terminal adapter contribution |
+| Integration extension | done | integrations/<id>.json descriptor (github/browser/terminal/custom) + declared tool or command; listed by `bsh ext integrations` |
 
 ### 3.2 Execution runtimes
 

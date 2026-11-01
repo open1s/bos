@@ -53,6 +53,8 @@ Commands:
                                       read or write an extension's configuration
   metrics                             print call, event and subscriber counters
   providers                           list model and agent provider descriptors
+  languages                           list declared language services
+  integrations                        list declared external integrations
   doctor                              check the store, hashes, dependencies and policy
   keygen <publisher> [--out <path>]   create an Ed25519 publisher key pair
   sign <path> --publisher <name> --key <file-or-base64>
@@ -130,6 +132,8 @@ pub(crate) fn run(args: &[String]) -> i32 {
         "doctor" => command_doctor(root.clone(), json),
         "metrics" => command_metrics(root.clone()),
         "providers" => command_providers(root.clone()),
+        "languages" => command_languages(root.clone()),
+        "integrations" => command_integrations(root.clone()),
         "keygen" => command_keygen(&rest[1..]),
         "sign" => command_sign(&rest[1..]),
         "verify" => command_verify(&rest[1..], root.clone()),
@@ -1414,6 +1418,61 @@ fn command_providers(root: Option<PathBuf>) -> Result<i32, String> {
     Ok(0)
 }
 
+fn command_languages(root: Option<PathBuf>) -> Result<i32, String> {
+    let store = ExtensionStore::open(config(root).root).map_err(|error| error.to_string())?;
+    let host = ExtensionHost::open(HostConfig {
+        root: store.root().to_path_buf(),
+        workspace: None,
+        disabled: BTreeSet::new(),
+        preset_allowed: None,
+    })
+    .map_err(|error| error.to_string())?;
+    for entry in host.languages() {
+        let tool = entry
+            .contribution
+            .tool
+            .as_ref()
+            .map(|tool| tool.as_str())
+            .unwrap_or("-");
+        println!(
+            "{}\t{}\t{}\t{}\t{}",
+            entry.owner,
+            entry.contribution.id,
+            entry.contribution.name,
+            entry.contribution.extensions.join(","),
+            tool
+        );
+    }
+    Ok(0)
+}
+
+fn command_integrations(root: Option<PathBuf>) -> Result<i32, String> {
+    let store = ExtensionStore::open(config(root).root).map_err(|error| error.to_string())?;
+    let host = ExtensionHost::open(HostConfig {
+        root: store.root().to_path_buf(),
+        workspace: None,
+        disabled: BTreeSet::new(),
+        preset_allowed: None,
+    })
+    .map_err(|error| error.to_string())?;
+    for entry in host.integrations() {
+        let action = entry
+            .contribution
+            .action
+            .as_ref()
+            .map(|action| action.as_str())
+            .unwrap_or("-");
+        println!(
+            "{}\t{}\t{}\t{}\t{}",
+            entry.owner,
+            entry.contribution.id,
+            entry.contribution.name,
+            entry.contribution.kind,
+            action
+        );
+    }
+    Ok(0)
+}
 fn command_reproduce(args: &[String], root: Option<PathBuf>) -> Result<i32, String> {
     let lock_path = PathBuf::from(one_argument(args, "bsh ext reproduce <lock>")?);
     let text = std::fs::read_to_string(&lock_path).map_err(|error| error.to_string())?;

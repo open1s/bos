@@ -341,6 +341,26 @@ pub(crate) struct ExtensionHost {
     calls: Mutex<CallMetrics>,
     startup_millis: u64,
     crash_history: Vec<String>,
+    languages: Vec<LanguageEntry>,
+    integrations: Vec<IntegrationEntry>,
+}
+
+/// One language service contributed by an applied extension.
+#[derive(Debug, Clone)]
+pub(crate) struct LanguageEntry {
+    /// Package that owns the descriptor.
+    pub(crate) owner: ExtensionId,
+    /// Descriptor.
+    pub(crate) contribution: super::runtime::declarative::LanguageContribution,
+}
+
+/// One external-system integration contributed by an applied extension.
+#[derive(Debug, Clone)]
+pub(crate) struct IntegrationEntry {
+    /// Package that owns the descriptor.
+    pub(crate) owner: ExtensionId,
+    /// Descriptor.
+    pub(crate) contribution: super::runtime::declarative::IntegrationContribution,
 }
 
 impl ExtensionHost {
@@ -371,6 +391,8 @@ impl ExtensionHost {
             calls: Mutex::new(CallMetrics::default()),
             startup_millis: 0,
             crash_history: Vec::new(),
+            languages: Vec::new(),
+            integrations: Vec::new(),
         };
         host.register_builtins();
         host.rebuild()?;
@@ -614,6 +636,24 @@ impl ExtensionHost {
         self.manager = manager;
         self.loaded = loaded;
         self.issues = issues;
+        let mut languages = Vec::new();
+        let mut integrations = Vec::new();
+        for entry in self.loaded.values().filter(|entry| entry.applied) {
+            for contribution in &entry.contributions.languages {
+                languages.push(LanguageEntry {
+                    owner: entry.package.id().clone(),
+                    contribution: contribution.clone(),
+                });
+            }
+            for contribution in &entry.contributions.integrations {
+                integrations.push(IntegrationEntry {
+                    owner: entry.package.id().clone(),
+                    contribution: contribution.clone(),
+                });
+            }
+        }
+        self.languages = languages;
+        self.integrations = integrations;
         for entry in self.loaded.values() {
             if entry.applied {
                 let _ = self.store.record_started(entry.package.id());
@@ -895,6 +935,16 @@ impl ExtensionHost {
             .values()
             .map(|entry| self.status_of(entry))
             .collect()
+    }
+
+    /// Language services from every applied extension.
+    pub(crate) fn languages(&self) -> &[LanguageEntry] {
+        &self.languages
+    }
+
+    /// External-system integrations from every applied extension.
+    pub(crate) fn integrations(&self) -> &[IntegrationEntry] {
+        &self.integrations
     }
 
     /// Clear a persisted failure and reload the package set.
