@@ -36,7 +36,7 @@ Status legend:
 | Extism plugin runtime | done | runtime/extism.rs; bsh_host bridge, policy-checked host calls, fuel/memory caps, plugin fixture |
 | External process + JSON-RPC runtime | done | runtime/process.rs |
 | WIT interface definition | done | crates/bsh/wit/extension.wit |
-| Host-managed GPUI panels | done | Settings hosts all; left sidebar, right panel, bottom composer dock and center tab host their declared locations |
+| Host-managed GPUI panels | done | Settings hosts all; the Extensions rail opens the installed inventory with MCP and Skills tabs; left sidebar, right panel, bottom composer dock and center tab host their declared locations |
 | Declarative UI | done | contract, validation, GPUI renderer, action routing and stale-revision refusal |
 | Unified tool/context/prompt contracts | done | agent.rs |
 | Capability authorization, quotas, audit | done | authorization, audit, memory/time/output/event/progress limits and a 20/s network window |
