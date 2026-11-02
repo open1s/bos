@@ -370,9 +370,70 @@ pub(crate) struct AppliedExtension {
     pub(crate) info: crate::plugins::PluginInfo,
     fiber: Fiber,
     lease: contribution::ContributionLease,
+    services: Arc<super::composable::ServiceRegistry>,
+    extension_id: String,
+    workspace: String,
+    service_provides: Vec<super::manifest::ServiceProvideSpec>,
+    service_requires: Vec<super::manifest::ServiceRequireSpec>,
 }
 
 impl AppliedExtension {
+    /// Publish a typed value only when this extension declared the matching
+    /// service name and visibility scope in its manifest.
+    pub(crate) fn provide_service<T>(
+        &self,
+        scope: super::composable::Scope,
+        name: &str,
+        service: Arc<T>,
+    ) -> Option<super::composable::ServiceToken>
+    where
+        T: std::any::Any + Send + Sync,
+    {
+        let declaration = self.service_provides.iter().find(|declaration| {
+            declaration.name == name
+                && service_scope_matches(
+                    &declaration.scope,
+                    &scope,
+                    &self.extension_id,
+                    &self.workspace,
+                )
+        })?;
+        let _ = declaration;
+        Some(self.services.provide_owned(
+            scope,
+            name.to_owned(),
+            service,
+            // The activation Fiber owns the registration and revokes it on
+            // unload, preventing service values from outliving their provider.
+            &mut self.fiber,
+        ))
+    }
+
+    /// Acquire a typed service only when this extension declared a matching
+    /// requirement. The returned lease must be held for the full call.
+    pub(crate) fn acquire_service<T>(
+        &self,
+        scope: &super::composable::Scope,
+        name: &str,
+    ) -> Option<super::composable::ServiceLease<T>>
+    where
+        T: std::any::Any + Send + Sync,
+    {
+        self.service_requires
+            .iter()
+            .any(|requirement| {
+                requirement.name == name
+                    && service_scope_matches(
+                        &requirement.scope,
+                        scope,
+                        &self.extension_id,
+                        &self.workspace,
+                    )
+            })
+            .then(|| self.services.acquire(scope, name))
+            .flatten()
+    }
+
     /// Revoke this activation from the same Agent and PluginRegistry.
     pub(crate) fn unload(
         mut self,
@@ -386,6 +447,23 @@ impl AppliedExtension {
     /// Current live activation state.
     pub(crate) fn state(&self) -> FiberState {
         self.fiber.state()
+    }
+}
+
+fn service_scope_matches(
+    declared: &super::manifest::ServiceScope,
+    requested: &super::composable::Scope,
+    extension_id: &str,
+    workspace: &str,
+) -> bool {
+    use super::composable::Scope;
+    use super::manifest::ServiceScope;
+    match (declared, requested) {
+        (ServiceScope::Host, Scope::Host) => true,
+        (ServiceScope::Workspace, Scope::Workspace(id)) => id == workspace,
+        (ServiceScope::Session, Scope::Session(_)) => true,
+        (ServiceScope::Extension, Scope::Extension(id)) => id == extension_id,
+        _ => false,
     }
 }
 
@@ -1253,7 +1331,16 @@ impl ExtensionHost {
                 let _ = lease.revoke(agent, registry);
                 continue;
             }
-            applied.push(AppliedExtension { info, fiber, lease });
+            applied.push(AppliedExtension {
+                info,
+                fiber,
+                lease,
+                services: Arc::clone(&self.services),
+                extension_id: entry.package.id().as_str().to_owned(),
+                workspace: self.config.workspace.clone(),
+                service_provides: entry.package.manifest.services.provides.clone(),
+                service_requires: entry.package.manifest.services.requires.clone(),
+            });
         }
         applied
     }
