@@ -69,6 +69,8 @@ pub(crate) struct Contributed {
 pub(crate) struct ContributionLease {
     owner: String,
     tools: Vec<String>,
+    prompt_sections: Vec<String>,
+    skill_paths: Vec<PathBuf>,
     active: Arc<AtomicBool>,
 }
 
@@ -82,8 +84,14 @@ impl ContributionLease {
     ) -> usize {
         self.active.store(false, Ordering::SeqCst);
         let tools = agent.remove_async_tools(&self.tools);
+        let prompts = self
+            .prompt_sections
+            .iter()
+            .filter(|section| agent.remove_system_prompt_section(section))
+            .count();
+        let skills = agent.remove_skills_by_paths(&self.skill_paths);
         let items = registry.remove_owner(&self.owner);
-        tools + items
+        tools + prompts + skills + items
     }
 
     /// Bind this lease's liveness to a Fiber. Disposing the Fiber prevents
@@ -509,8 +517,9 @@ pub(crate) fn install_with_lease(
         }
     }
     let mut prompt_budget = 0usize;
+    let mut prompt_sections = Vec::new();
     for prompt in &contributed.prompts {
-        append_prompt(
+        if let Some(section) = append_prompt(
             agent,
             &contributed.extension,
             contributed.trust,
@@ -518,13 +527,15 @@ pub(crate) fn install_with_lease(
             "Extension prompt",
             prompt,
             &mut prompt_budget,
-        );
+        ) {
+            prompt_sections.push(section);
+        }
     }
     for context in &contributed.contexts {
         if !context_matches(context, contributed.workspace.as_deref()) {
             continue;
         }
-        append_prompt(
+        if let Some(section) = append_prompt(
             agent,
             &contributed.extension,
             contributed.trust,
@@ -532,22 +543,39 @@ pub(crate) fn install_with_lease(
             "Extension context",
             context,
             &mut prompt_budget,
-        );
+        ) {
+            prompt_sections.push(section);
+        }
     }
+    let mut skill_paths = Vec::new();
     if let Some(skills) = &contributed.skills_dir {
         if skills.is_dir() {
+            let before: std::collections::HashSet<PathBuf> = agent
+                .skills()
+                .iter()
+                .map(|skill| skill.metadata.path.clone())
+                .collect();
             if let Err(error) = agent.register_skills_from_dir(skills.clone()) {
                 log::warn!(
                     target: "bsh::extension",
                     "{}: skills were declared but could not be read: {error}",
                     contributed.extension
                 );
+            } else {
+                skill_paths = agent
+                    .skills()
+                    .iter()
+                    .filter(|skill| !before.contains(&skill.metadata.path))
+                    .map(|skill| skill.metadata.path.clone())
+                    .collect();
             }
         }
     }
     let lease = ContributionLease {
         owner: contributed.extension.as_str().to_string(),
         tools: installed_tools.clone(),
+        prompt_sections,
+        skill_paths,
         active,
     };
     (
@@ -568,7 +596,7 @@ fn append_prompt(
     heading: &str,
     contribution: &super::runtime::declarative::TextContribution,
     budget: &mut usize,
-) {
+) -> Option<String> {
     let capability = if heading == "Extension prompt" {
         Capability::AgentPromptsProvide
     } else {
@@ -578,11 +606,11 @@ fn append_prompt(
         .authorize_call(extension.as_str(), trust, capability, &CallScope::default())
         .is_err()
     {
-        return;
+        return None;
     }
     let text = contribution.text.trim();
     if text.is_empty() {
-        return;
+        return None;
     }
     let section = format!(
         "## {heading}: {} ({})
@@ -592,10 +620,11 @@ fn append_prompt(
         truncate(text, MAX_PROMPT_SECTION)
     );
     if *budget + section.len() > MAX_TOTAL_PROMPT {
-        return;
+        return None;
     }
     *budget += section.len();
     agent.append_system_prompt(&section);
+    Some(section)
 }
 
 #[cfg(test)]
