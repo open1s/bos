@@ -1041,37 +1041,100 @@ impl McpRuntime {
         let mut handle = tokio::task::spawn_blocking(move || {
             core.call_tool_blocking(&name, arguments, progress, deadline)
         });
-        match tokio::time::timeout(
+        match wait_for_blocking_call(
+            handle,
             Duration::from_millis(deadline.saturating_add(100)),
-            &mut handle,
+            || self.stop(),
         )
         .await
         {
-            Err(_) => {
-                self.stop();
-                // Timing out while awaiting a JoinHandle only stops waiting; it does not
-                // stop the blocking task. Keep call_gate held until the killed-child
-                // exchange has actually exited, or the next call could reset cancelled
-                // while this invocation is still running.
-                let _ = handle.await;
-                Err(ExtensionError::Timeout {
-                    extension: self.core.extension.to_string(),
-                    operation: "mcp tools/call".to_string(),
-                    millis: deadline,
-                })
-            }
-            Ok(Err(error)) => Err(ExtensionError::Runtime {
+            BlockingCallWait::TimedOut => Err(ExtensionError::Timeout {
+                extension: self.core.extension.to_string(),
+                operation: "mcp tools/call".to_string(),
+                millis: deadline,
+            }),
+            BlockingCallWait::Completed(Err(error)) => Err(ExtensionError::Runtime {
                 extension: self.core.extension.to_string(),
                 message: format!("MCP call task failed: {error}"),
             }),
-            Ok(Ok(result)) => result,
+            BlockingCallWait::Completed(Ok(result)) => result,
         }
     }
 }
+enum BlockingCallWait<T> {
+    Completed(Result<T, tokio::task::JoinError>),
+    TimedOut,
+}
+
+/// Wait for a blocking MCP exchange without detaching it on deadline.
+///
+/// Dropping a JoinHandle detaches its blocking task. The timeout path therefore
+/// cancels the child and then joins the worker before its caller can release the
+/// lifecycle gate.
+async fn wait_for_blocking_call<T: Send + 'static>(
+    mut handle: tokio::task::JoinHandle<T>,
+    timeout: Duration,
+    on_timeout: impl FnOnce(),
+) -> BlockingCallWait<T> {
+    match tokio::time::timeout(timeout, &mut handle).await {
+        Ok(result) => BlockingCallWait::Completed(result),
+        Err(_) => {
+            on_timeout();
+            let _ = handle.await;
+            BlockingCallWait::TimedOut
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::extension::manifest::Manifest;
+
+    #[tokio::test]
+    async fn timed_out_worker_keeps_call_gate_held_until_worker_exits() {
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let caller_gate = Arc::clone(&gate);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (timed_out_tx, timed_out_rx) = tokio::sync::oneshot::channel();
+
+        let caller = tokio::spawn(async move {
+            let _gate = caller_gate.lock().await;
+            let worker = tokio::task::spawn_blocking(move || {
+                let _ = started_tx.send(());
+                release_rx.recv().expect("test releases blocking worker");
+            });
+            wait_for_blocking_call(worker, Duration::from_millis(10), move || {
+                let _ = timed_out_tx.send(());
+            })
+            .await
+        });
+
+        started_rx.await.expect("blocking worker started");
+        timed_out_rx.await.expect("deadline callback ran");
+
+        let waiter_gate = Arc::clone(&gate);
+        let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
+        let mut waiter = tokio::spawn(async move {
+            let _ = waiting_tx.send(());
+            let _gate = waiter_gate.lock().await;
+        });
+        waiting_rx.await.expect("second call is waiting for the gate");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiter)
+                .await
+                .is_err(),
+            "the next call must not acquire the gate while the timed-out worker is alive"
+        );
+
+        release_tx.send(()).expect("release blocking worker");
+        assert!(matches!(
+            caller.await.expect("caller task"),
+            BlockingCallWait::TimedOut
+        ));
+        waiter.await.expect("second call acquires the gate after worker exit");
+    }
 
     #[test]
     fn child_handle_termination_is_portable() {
