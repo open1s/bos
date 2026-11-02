@@ -62,16 +62,20 @@ Extension Platform 扩展的是 BSH，而不是另建一套 Agent Runtime。
 </p>
 
 Runtime 集成 Agent 编排、工具与技能分发、消息通信、模型适配和弹性治理。
-配置、遥测、记忆、能力控制及外部集成提供基础支撑。
+配置、遥测、记忆、能力控制及外部集成提供基础支撑。下图展示系统子系统、集成边界和协作关系，而不是按时间顺序执行的流程。
+
+### BSH 扩展框架与 Agent 模型
+
+配套图展示 BSH 扩展框架的宿主边界，以及 Agent Runtime 所依赖的协作能力。扩展框架是集成在 BSH 中的子系统；Agent 模型由多个协作能力构成，并受统一的安全与运行时治理约束。
+
+<p align="center">
+  <img src="docs/assets/diagrams/bsh-extension-agent-model.svg" alt="BSH 扩展框架与 Agent 模型：宿主服务、扩展运行时、Agent Engine、上下文、工具、运行环境和治理能力。" width="100%">
+</p>
 
 ### Agent 执行流程
 
 ReAct 执行循环将模型推理与受策略约束的工具执行结合起来。工具结果会回到会话上下文，
 Agent 持续迭代，直到生成最终响应或达到配置的执行边界。
-
-<p align="center">
-  <img src="docs/assets/diagrams/agent-execution-flow.png" alt="BOS Agent 执行流程：输入、推理、决策、工具执行、观察反馈和最终响应。" width="100%">
-</p>
 
 ## 为什么选择 BOS？
 
@@ -241,10 +245,6 @@ bsh ext doctor
 
 扩展包从 Manifest 校验开始，经过依赖解析、不可变版本安装和运行时激活。
 宿主能力授权是独立的安全边界；操作系统级隔离能力取决于具体运行时和平台。
-
-<p align="center">
-  <img src="docs/assets/diagrams/extension-lifecycle.png" alt="BSH 扩展生命周期：扩展包、校验、依赖解析、安装、激活、运行时适配器与宿主能力边界。" width="100%">
-</p>
 
 ## 模型配置
 

@@ -55,18 +55,22 @@ JavaScript interfaces, or work with agents in BSH—the native GPUI desktop work
 BOS separates the shared execution core from its developer interfaces and desktop workspace. Rust applications, NBOS and JSBOS use the same native runtime; BSH is a native GPUI application built directly on BOS crates. The Extension Platform extends BSH—it is not a second agent runtime.
 
 <p align="center">
-  <img src="docs/assets/diagrams/bos-architecture.png" alt="BOS architecture: Rust, Python and JavaScript interfaces plus BSH share the BOS Runtime; the BSH Extension Platform extends the desktop workspace." width="100%">
+  <img src="docs/assets/diagrams/bos-platform-architecture.svg" alt="BOS architecture: Rust, Python and JavaScript interfaces plus BSH share the BOS Runtime; the BSH Extension Platform extends the desktop workspace." width="100%">
 </p>
 
-The runtime brings together agent orchestration, tool and skill dispatch, messaging, model adapters and resilience. Configuration, telemetry, memory, capability controls and external integrations provide the supporting foundation.
+The runtime brings together agent orchestration, tool and skill dispatch, messaging, model adapters and resilience. Configuration, telemetry, memory, capability controls and external integrations provide the supporting foundation. The diagram below presents the platform as a set of collaborating subsystems and integration boundaries—not as a sequential execution pipeline.
+
+### BSH extension and agent model
+
+The companion view shows the BSH extension boundary and the agent runtime environment. The extension framework is a host-integrated subsystem; the agent model is a set of cooperating capabilities governed by shared safety and runtime controls.
+
+<p align="center">
+  <img src="docs/assets/diagrams/bsh-extension-agent-model.svg" alt="BSH extension framework and agent execution model, showing host services, extension runtimes, agent engine, context, tools, runtime environment and governance." width="100%">
+</p>
 
 ### Agent execution
 
 The ReAct execution loop combines model reasoning with policy-aware tool execution. Tool results are fed back into the session context until the agent returns a final response or reaches its configured execution boundary.
-
-<p align="center">
-  <img src="docs/assets/diagrams/agent-execution-flow.png" alt="BOS agent execution flow: input, reasoning, decision, tool execution, observation and final response." width="100%">
-</p>
 
 ## Why BOS?
 
@@ -244,10 +248,6 @@ runtime. Consult the [extension standard](docs/bsh-extension-standard.md) and
 ### Extension package lifecycle
 
 The diagram shows the package path from manifest validation through dependency resolution, immutable installation and runtime activation. Host capability authorization is a separate boundary; operating-system isolation depends on the runtime and platform.
-
-<p align="center">
-  <img src="docs/assets/diagrams/extension-lifecycle.png" alt="BSH extension lifecycle: package, validate, resolve, install, activate, runtime adapters and host capability boundary." width="100%">
-</p>
 
 ## Model configuration
 
