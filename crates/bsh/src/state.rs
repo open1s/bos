@@ -8131,7 +8131,11 @@ mod tests {
             .trash()
             .into_iter()
             .find(|entry| {
-                entry.envelope.payload.get("id").and_then(serde_json::Value::as_str)
+                entry
+                    .envelope
+                    .payload
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
                     == Some(id.as_str())
             })
             .expect("the stopped session is recoverable");
@@ -8183,11 +8187,13 @@ mod tests {
         assert!(!state.delete_session(&id));
         assert!(state.store.session(&id).is_some());
         assert!(!state.streams.contains_key(&id));
-        assert!(marker.is_file(), "failed parking must leave history in place");
+        assert!(
+            marker.is_file(),
+            "failed parking must leave history in place"
+        );
         let queued = state.inbox.get(&id).expect("queued messages survive");
         assert_eq!(queued.len(), 2, "both queued and undelivered rows survive");
         assert!(queued.iter().any(|item| item.text == "already queued"));
         assert!(queued.iter().any(|item| item.text == "undelivered steer"));
     }
-
 }
