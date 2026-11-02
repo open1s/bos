@@ -147,6 +147,8 @@ A failed plan is rejected before activation. Patch application must be transacti
 - The host exposes `apply_with_fibers()`, returning one `AppliedExtension` handle per activation.
 - A contribution lease tracks installed async tools, exact prompt sections and newly registered skill manifest paths. Fiber cleanup first closes the shared tool-liveness gate; explicit unload then removes tools, prompt sections, skills and owner-scoped PluginRegistry entries.
 - Agent cache invalidation is part of tool, prompt and skill removal.
+- The production host rebuild now runs `plan_service_dependencies()` on the concrete package set selected by the SemVer resolver, before capability authorization and activation. Required service contracts add provider-before-consumer edges; missing providers, duplicate shared-scope providers, incompatible required versions and cycles prevent the resolved activation set from starting.
+- Extension-scoped service declarations are private to their declaring extension in the contract planner. Optional requirements tolerate both missing and version-incompatible providers; they do not create activation edges.
 
 ### Not yet complete / not yet verified
 
@@ -154,7 +156,8 @@ A failed plan is rejected before activation. Patch application must be transacti
 - Production teardown disposes the whole build rather than mutating a live Agent in place. Dropping the Fiber's effect set closes the shared tool-liveness gate; the Agent and its tool registry are then released with the build. The explicit `AppliedExtension::unload(agent, registry)` path remains available for future in-place replacement where the same registries survive.
 - Calls admitted before revocation are not drained or forcibly cancelled. The liveness gate prevents new invocations; already-running work may finish.
 - The production integration and new lifecycle test still require targeted Cargo tests, formatting and CI validation. A merged commit is not evidence that these checks passed.
-- Service notifications exist at the registry layer, but extension manifest contributions are not yet mapped onto typed services. Provider replacement reconciliation, dependent Fiber reload and in-flight drain remain future work.
+- Manifest service contracts now participate in the production activation plan, but manifest declarations are not yet bound to concrete typed service values in the registry. Provider replacement reconciliation, dependent Fiber reload, atomic generation switching and in-flight drain remain future work.
+- Service contract planning currently fails the configured root set conservatively when the selected set contains an invalid service graph; finer-grained failure isolation between independent roots remains future work.
 - DSH bundle patches remain unsupported until the composition engine is wired and covered by fixtures.
 
 Do not mark 2.0-B complete until tests prove that production turn ownership retains Fiber handles through the live turn, closes tool liveness on every teardown path, and cleans prompt/skill/tool/command/panel contributions on explicit unload and partial activation failure.
