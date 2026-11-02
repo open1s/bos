@@ -633,16 +633,20 @@ impl ExtismRuntime {
                     "Extism call state is not idle".to_string()
                 },
             })?;
+        // Install the guard immediately after the state transition. Every
+        // subsequent early return (including serialization and plugin lookup)
+        // must release CALL_RUNNING back to CALL_IDLE.
+        let _call_state = CallStateGuard(&self.call_state);
         drop(cancel_gate);
-        let plugin = guard.as_mut().expect("plugin was just built");
+        let plugin = guard.as_mut().ok_or_else(|| ExtensionError::Runtime {
+            extension: self.extension.to_string(),
+            message: "Extism plugin is unavailable".to_string(),
+        })?;
         let text = serde_json::to_string(input).map_err(|error| ExtensionError::Json {
             path: self.component.clone(),
             message: error.to_string(),
         })?;
-        let output = {
-            let _call_state = CallStateGuard(&self.call_state);
-            plugin.call::<&str, String>(name, text.as_str())
-        };
+        let output = plugin.call::<&str, String>(name, text.as_str());
         if let Some(fuel) = plugin.fuel_consumed() {
             self.fuel_used.store(fuel, Ordering::Relaxed);
         }
@@ -901,17 +905,47 @@ impl Runtime for ExtismRuntime {
 
     async fn pump(&self) -> Result<(), ExtensionError> {
         self.ensure_plugin()?;
-        let events = self.bridge.take_events();
-        if events.is_empty() {
-            return Ok(());
-        }
         let mut guard = self.plugin.lock().map_err(|_| ExtensionError::Corrupt {
             path: self.component.clone(),
             message: "Extism plugin lock is poisoned".to_string(),
         })?;
-        let plugin = guard.as_mut().expect("plugin was just built");
+        if self.stopped.load(Ordering::SeqCst) {
+            return Err(ExtensionError::Runtime {
+                extension: self.extension.to_string(),
+                message: "runtime is shut down".to_string(),
+            });
+        }
+        let cancel_gate = self
+            .cancel_gate
+            .lock()
+            .map_err(|_| ExtensionError::Corrupt {
+                path: self.component.clone(),
+                message: "Extism cancellation gate is poisoned".to_string(),
+            })?;
+        self.call_state
+            .compare_exchange(CALL_IDLE, CALL_RUNNING, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|state| ExtensionError::Runtime {
+                extension: self.extension.to_string(),
+                message: if state == CALL_STOPPED {
+                    "runtime is shut down".to_string()
+                } else {
+                    "Extism call state is not idle".to_string()
+                },
+            })?;
+        let _call_state = CallStateGuard(&self.call_state);
+        drop(cancel_gate);
+        let plugin = guard.as_mut().ok_or_else(|| ExtensionError::Runtime {
+            extension: self.extension.to_string(),
+            message: "Extism plugin is unavailable".to_string(),
+        })?;
+        // Do not drain the subscription until this invocation owns the plugin
+        // lifecycle; a busy/cancelled call must not silently lose queued events.
+        let events = self.bridge.take_events();
         for event in events {
-            let text = serde_json::to_string(&event).unwrap_or_default();
+            let text = serde_json::to_string(&event).map_err(|error| ExtensionError::Json {
+                path: self.component.clone(),
+                message: error.to_string(),
+            })?;
             let _ = plugin.call::<&str, String>("bsh_event", text.as_str());
         }
         Ok(())
