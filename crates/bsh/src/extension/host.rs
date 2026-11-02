@@ -3692,6 +3692,12 @@ tools = ["echo"]
         assert!(interceptor
             .authorize("com.example.interceptor", "tool.before")
             .is_err());
+        assert!(
+            interceptor
+                .authorize("com.example.other", "tool.before")
+                .is_err(),
+            "activation-bound policy must reject a different owner"
+        );
         let audit = std::fs::read_to_string(root.join("audit.jsonl")).unwrap_or_default();
         assert!(audit.contains("agent.intercept"), "audit: {audit}");
 
