@@ -413,6 +413,7 @@ pub(crate) struct ExtensionHost {
     store: ExtensionStore,
     policy: Arc<PolicyEngine>,
     events: Arc<EventBus>,
+    services: Arc<super::composable::ServiceRegistry>,
     manager: LifecycleManager,
     loaded: BTreeMap<String, LoadedExtension>,
     builtins: Vec<BuiltinLoaded>,
@@ -445,6 +446,11 @@ pub(crate) struct IntegrationEntry {
 }
 
 impl ExtensionHost {
+    /// The host-scoped service registry shared by its extension activations.
+    pub(crate) fn services(&self) -> Arc<super::composable::ServiceRegistry> {
+        Arc::clone(&self.services)
+    }
+
     /// Open a host: create the store, load policy, register built-ins and
     /// perform the first scan.
     pub(crate) fn open(config: HostConfig) -> Result<Self, ExtensionError> {
@@ -466,6 +472,7 @@ impl ExtensionHost {
             store,
             policy,
             events,
+            services: Arc::new(super::composable::ServiceRegistry::new()),
             manager: LifecycleManager::new(),
             loaded: BTreeMap::new(),
             builtins: Vec::new(),
