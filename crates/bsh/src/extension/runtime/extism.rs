@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD;
@@ -436,7 +436,6 @@ pub(crate) struct ExtismRuntime {
     cancelled: Arc<std::sync::atomic::AtomicBool>,
     /// Set by shutdown only; cancel is a per-call state the next call clears.
     stopped: std::sync::atomic::AtomicBool,
-    deadline: Mutex<Option<Instant>>,
 }
 
 impl ExtismRuntime {
@@ -511,7 +510,6 @@ impl ExtismRuntime {
             fuel_used: AtomicU64::new(0),
             cancelled,
             stopped: std::sync::atomic::AtomicBool::new(false),
-            deadline: Mutex::new(None),
         })
     }
 
@@ -528,6 +526,7 @@ impl ExtismRuntime {
             source,
         })?;
         let manifest = ExtismManifest::new([Wasm::data(bytes)])
+            .with_timeout(Duration::from_millis(self.execution_ms))
             .with_memory_max(self.memory_mb.saturating_mul(16).min(u32::MAX as u64) as u32);
         let bridge = Arc::clone(&self.bridge);
         let plugin = PluginBuilder::new(manifest)
@@ -650,15 +649,6 @@ impl ExtismRuntime {
         DeclarativeContributions::default()
     }
 
-    fn remaining(&self) -> bool {
-        !self.cancelled.load(Ordering::Relaxed)
-            && self
-                .deadline
-                .lock()
-                .ok()
-                .and_then(|deadline| *deadline)
-                .is_none_or(|deadline| Instant::now() < deadline)
-    }
 }
 
 #[async_trait]
