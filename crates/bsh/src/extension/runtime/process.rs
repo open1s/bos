@@ -52,6 +52,17 @@ struct ProcessSession {
 }
 
 impl ProcessSession {
+    fn terminate(&mut self) {
+        if self
+            .child
+            .id()
+            .is_some_and(terminate_process_group)
+        {
+            return;
+        }
+        let _ = self.child.start_kill();
+    }
+
     async fn request(
         &mut self,
         method: &str,
@@ -207,6 +218,24 @@ impl ProcessSession {
     }
 }
 
+/// Force-stop the process group created by the Unix pre-exec hook.
+///
+/// Returns true when the group was signalled or had already exited. A false
+/// result tells the caller to fall back to killing the direct child handle.
+#[cfg(unix)]
+pub(super) fn terminate_process_group(pid: u32) -> bool {
+    // SAFETY: a negative pid targets the dedicated process group created for
+    // this extension child, not an arbitrary process selected by user input.
+    let result = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+    result == 0
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+#[cfg(not(unix))]
+pub(super) fn terminate_process_group(_pid: u32) -> bool {
+    false
+}
+
 /// Kill a child whose resident memory exceeds its manifest ceiling.
 ///
 /// RLIMIT_AS is not honoured by macOS, so the host samples RSS and sends
@@ -225,9 +254,7 @@ fn spawn_memory_watchdog(pid: u32, limit: u64) {
                     // SAFETY: pid names the child this runtime spawned; a
                     // recycled pid would already be a different process, and
                     // the session clears its pid on stop.
-                    unsafe {
-                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
-                    }
+                    let _ = terminate_process_group(pid);
                     break;
                 }
                 Some(_) => {}
@@ -914,7 +941,7 @@ impl ProcessRuntime {
             .and_then(Value::as_str)
             .unwrap_or_default();
         if !version.starts_with("1.") {
-            let _ = session.child.start_kill();
+            session.terminate();
             return Err(ExtensionError::Protocol {
                 extension: self.extension.to_string(),
                 message: format!(
@@ -946,8 +973,11 @@ impl ProcessRuntime {
             session.request("shutdown", json!({}), SHUTDOWN_MS, &self.extension),
         )
         .await;
-        let _ = session.child.start_kill();
-        let _ = session.child.wait().await;
+        session.terminate();
+        // SIGKILL of the dedicated process group should make reaping prompt.
+        // Keep a bound here so shutdown cannot wait forever on a broken OS
+        // process handle; dropping the child still has kill_on_drop enabled.
+        let _ = tokio::time::timeout(Duration::from_secs(2), session.child.wait()).await;
         self.child_pid.store(0, Ordering::Relaxed);
     }
 }
