@@ -452,7 +452,9 @@ impl AppliedExtension {
 
 #[cfg(test)]
 mod service_scope_tests {
-    use super::{service_scope_matches, super::composable::Scope, super::manifest::ServiceScope};
+    use super::service_scope_matches;
+    use super::super::composable::Scope;
+    use super::super::manifest::ServiceScope;
 
     #[test]
     fn declared_service_scope_is_enforced() {
