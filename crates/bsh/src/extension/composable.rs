@@ -671,17 +671,17 @@ mod tests {
         let mut text = source[sample_start..sample_end].to_owned();
         text = text.replace("com.example.git-assistant", id);
         if !provides.is_empty() {
-            text.push_str("\\n[services]\\nprovides = ");
+            text.push_str("\n[services]\nprovides = ");
             text.push_str(provides);
-            text.push('\\n');
+            text.push('\n');
         }
         if !requires.is_empty() {
             if provides.is_empty() {
-                text.push_str("\\n[services]\\n");
+                text.push_str("\n[services]\n");
             }
             text.push_str("requires = ");
             text.push_str(requires);
-            text.push('\\n');
+            text.push('\n');
         }
         Manifest::parse(&text, std::path::Path::new("extension.toml")).unwrap()
     }
@@ -690,13 +690,13 @@ mod tests {
     fn service_contracts_add_dependency_edges_and_order_provider_first() {
         let provider = manifest_with_service_contract(
             "com.example.provider",
-            "[{ name = \\"com.example.search\\", contract = \\"com.example.search-api\\", version = \\"1.2.0\\", scope = \\"workspace\\" }]",
+            r#"[{ name = "com.example.search", contract = "com.example.search-api", version = "1.2.0", scope = "workspace" }]"#,
             "",
         );
         let consumer = manifest_with_service_contract(
             "com.example.consumer",
             "",
-            "[{ name = \\"com.example.search\\", contract = \\"com.example.search-api\\", version = \\"^1.0\\", scope = \\"workspace\\" }]",
+            r#"[{ name = "com.example.search", contract = "com.example.search-api", version = "^1.0", scope = "workspace" }]"#,
         );
         let plan = plan_service_dependencies(&[consumer, provider]).unwrap();
         assert_eq!(
@@ -710,7 +710,7 @@ mod tests {
         let consumer = manifest_with_service_contract(
             "com.example.consumer",
             "",
-            "[{ name = \\"com.example.search\\", contract = \\"com.example.search-api\\", version = \\"^2.0\\", scope = \\"workspace\\" }]",
+            r#"[{ name = "com.example.search", contract = "com.example.search-api", version = "^2.0", scope = "workspace" }]"#,
         );
         assert!(matches!(
             plan_service_dependencies(std::slice::from_ref(&consumer)),
@@ -719,7 +719,7 @@ mod tests {
 
         let provider = manifest_with_service_contract(
             "com.example.provider",
-            "[{ name = \\"com.example.search\\", contract = \\"com.example.search-api\\", version = \\"1.2.0\\", scope = \\"workspace\\" }]",
+            r#"[{ name = "com.example.search", contract = "com.example.search-api", version = "1.2.0", scope = "workspace" }]"#,
             "",
         );
         assert!(matches!(
@@ -733,7 +733,7 @@ mod tests {
         let consumer = manifest_with_service_contract(
             "com.example.consumer",
             "",
-            "[{ name = \\"com.example.telemetry\\", contract = \\"com.example.telemetry-api\\", version = \\"^1.0\\", scope = \\"host\\", optional = true }]",
+            r#"[{ name = "com.example.telemetry", contract = "com.example.telemetry-api", version = "^1.0", scope = "host", optional = true }]"#,
         );
         let plan = plan_service_dependencies(&[consumer]).unwrap();
         assert_eq!(plan.order, vec!["com.example.consumer"]);
