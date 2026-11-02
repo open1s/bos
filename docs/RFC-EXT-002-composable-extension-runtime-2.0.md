@@ -144,6 +144,7 @@ A failed plan is rejected before activation. Patch application must be transacti
 
 - The in-process scoped service registry, generation-safe provider tokens, deterministic dependency planner, Fiber state machine and reverse-order effect cleanup are implemented with unit tests. `ServiceRegistry::provide_owned()` binds a provider token to a Fiber through a weak registry reference, so stale Fiber cleanup cannot remove a newer provider generation.
 - The host now owns one host-scoped `ServiceRegistry`. Registry changes publish bounded `Available`, `Replaced` and `Unavailable` notifications; consumers must re-query the registry after receiving a notification.
+- The registry now offers call-scoped `ServiceLease<T>` acquisition and generation-specific `ServiceRetirement` handles. Replacement publishes the new generation atomically, rejects new leases on the old generation, and allows the host to await old in-flight leases with a timeout. Legacy `get()` remains an untracked snapshot and must not be used for drain-sensitive calls.
 - The host exposes `apply_with_fibers()`, returning one `AppliedExtension` handle per activation.
 - A contribution lease tracks installed async tools, exact prompt sections and newly registered skill manifest paths. Fiber cleanup first closes the shared tool-liveness gate; explicit unload then removes tools, prompt sections, skills and owner-scoped PluginRegistry entries.
 - Agent cache invalidation is part of tool, prompt and skill removal.
@@ -157,7 +158,7 @@ A failed plan is rejected before activation. Patch application must be transacti
 - Calls admitted before revocation are not drained or forcibly cancelled. The liveness gate prevents new invocations; already-running work may finish.
 - The production integration and new lifecycle test still require targeted Cargo tests, formatting and CI validation. A merged commit is not evidence that these checks passed.
 - Manifest service contracts now declare provider/consumer name, interface id, SemVer and explicit host/workspace/session scope. Planning rejects missing required providers, incompatible versions, duplicate providers and cycles; optional missing services do not block activation. Service requirements become provider-before-consumer graph edges, and the host now preserves the planner's topological order during activation.
-- Manifest declarations are not yet bound to concrete typed service values in the registry. Provider replacement reconciliation, dependent Fiber reload, atomic generation switching and in-flight drain remain future work.
+- Manifest declarations are not yet bound to concrete typed service values in the registry. Provider replacement reconciliation and dependent Fiber reload remain future work; the registry's lease/drain primitive exists but is not yet wired into extension Fiber replacement or unload.
 - Service contract planning currently fails the configured root set conservatively when the selected set contains an invalid service graph; finer-grained failure isolation between independent roots remains future work.
 - DSH bundle patches remain unsupported until the composition engine is wired and covered by fixtures.
 
