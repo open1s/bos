@@ -50,7 +50,9 @@ const PROTOCOL = 1;
 
 /** Registrations this shim has announced, keyed by id, never by name. */
 const registrations = new Map();
+const pendingHostCalls = new Map();
 let nextRegistration = 0;
+let nextHostCall = 1;
 /** Set once `load` has been answered, so a late async registration is refused. */
 let loaded = false;
 let closing = false;
@@ -408,6 +410,15 @@ function makeGet(ctx) {
  * named error rather than returning an empty stub, so a plugin cannot quietly
  * contribute half of what it declares.
  */
+/** Ask the host to run one typed service call. */
+function hostCall(service, method, params) {
+  const id = nextHostCall++;
+  return new Promise((resolve, reject) => {
+    pendingHostCalls.set(id, { resolve, reject });
+    emit({ type: 'host_call', id, service, method_name: method, params });
+  });
+}
+
 function makeContext(config) {
   const ctx = {};
   const refused = (seam, detail) => {
@@ -433,6 +444,9 @@ function makeContext(config) {
   ctx.tools = makeTools();
   ctx.commands = makeCommands();
   ctx.skills = makeSkills();
+  ctx.terminal = {
+    run: (command, cwd) => hostCall('terminal', 'run', { command, cwd: cwd || null }),
+  };
   const events = makeEvents();
   ctx.on = events.on;
   ctx.once = events.once;
@@ -451,7 +465,7 @@ function makeContext(config) {
   ctx.inject = (services, callback) => {
     const wanted = Array.isArray(services) ? services : [services];
     const available = wanted.filter((name) =>
-      ['tools', 'commands', 'skills', 'logger', 'events'].includes(name),
+      ['tools', 'commands', 'skills', 'logger', 'events', 'terminal'].includes(name),
     );
     if (typeof callback === 'function') {
       const scoped = Object.create(ctx);
@@ -681,6 +695,14 @@ async function handleFrame(frame) {
   const id = frame && frame.id;
   const method = frame && frame.method;
   const params = (frame && frame.params) || {};
+  if (method === 'host_result') {
+    const pending = pendingHostCalls.get(id);
+    if (!pending) return;
+    pendingHostCalls.delete(id);
+    if (params.ok === true) pending.resolve(params.value);
+    else pending.reject(new Error(params.error || 'host call failed'));
+    return;
+  }
   try {
     let value;
     if (method === 'load') {

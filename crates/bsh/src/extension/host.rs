@@ -1081,6 +1081,34 @@ impl ExtensionHost {
             }
             Err(error) => log::warn!("built-in diagnostics was not registered: {error}"),
         }
+
+        let annotations =
+            ClosureExtension::new(ANNOTATIONS_MANIFEST, Vec::new(), |_name, _arguments| {
+                Ok(serde_json::json!({}))
+            });
+        match BuiltinRuntime::new(Arc::new(annotations)) {
+            Ok(runtime) => {
+                let package = Package {
+                    root: PathBuf::from("<builtin>"),
+                    manifest: runtime.manifest().clone(),
+                    report: ValidationReport::default(),
+                    source: ExtensionSource::Builtin,
+                    trust: TrustLevel::Builtin,
+                    hash: String::new(),
+                    installed_at: 0,
+                    signature: None,
+                    verification: crate::extension::signing::SignatureVerification::Missing,
+                    source_path: None,
+                };
+                let tools = runtime.descriptors();
+                self.builtins.push(BuiltinLoaded {
+                    package,
+                    runtime: Arc::new(LazyRuntime::new(Arc::new(runtime))),
+                    tools,
+                });
+            }
+            Err(error) => log::warn!("built-in annotations was not registered: {error}"),
+        }
     }
 
     fn rebuild(&mut self) -> Result<(), ExtensionError> {
@@ -1356,6 +1384,14 @@ impl ExtensionHost {
             }
         }
         let statuses = self.statuses();
+        let annotations_enabled = statuses
+            .iter()
+            .any(|status| status.id == "com.bos.bsh.annotations" && status.applied);
+        if annotations_enabled {
+            super::notes::set_store(Arc::new(super::notes::FileNotesStore));
+        } else {
+            super::notes::set_store(Arc::new(super::notes::DisabledNotesStore));
+        }
         if let Ok(mut cache) = self.status_cache.lock() {
             *cache = statuses;
         }
@@ -1579,6 +1615,7 @@ impl ExtensionHost {
                     &package.manifest,
                     &package.root,
                     &data_root,
+                    Arc::new(super::terminal::HostTerminal),
                 )?;
                 let tools = runtime.descriptors()?;
                 let contributions =
@@ -2246,7 +2283,10 @@ impl ExtensionHost {
     pub(crate) fn panel_surfaces(&self) -> Vec<PanelSurface> {
         let mut surfaces = Vec::new();
         for entry in self.loaded.values() {
-            if !entry.applied || entry.error.is_some() {
+            if !entry.applied
+                || entry.error.is_some()
+                || super::live::is_suspended(entry.package.id().as_str())
+            {
                 continue;
             }
             let Some(runtime) = &entry.runtime else {
@@ -2329,7 +2369,10 @@ impl ExtensionHost {
     pub(crate) fn command_surfaces(&self) -> Vec<CommandSurface> {
         let mut commands = Vec::new();
         for entry in self.loaded.values() {
-            if !entry.applied || entry.error.is_some() {
+            if !entry.applied
+                || entry.error.is_some()
+                || super::live::is_suspended(entry.package.id().as_str())
+            {
                 continue;
             }
             for command in &entry.contributions.commands {
@@ -3091,6 +3134,28 @@ pub(crate) fn doctor_report(config: HostConfig) -> Result<DiagnosticsReport, Ext
     Ok(ExtensionHost::open(config)?.doctor())
 }
 
+/// The manifest of the first-party workspace-annotation provider.
+const ANNOTATIONS_MANIFEST: &str = r#"
+schema_version = "1.0"
+
+[extension]
+id = "com.bos.bsh.annotations"
+name = "Workspace Annotations"
+version = "1.0.0"
+description = "Owns the workspace note store used by the file annotations pane"
+authors = ["BrickOS Team"]
+license = "MIT"
+
+[compatibility]
+bsh = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+
+[runtime]
+kind = "builtin"
+entry = "annotations"
+startup = "on-startup"
+"#;
+
 /// The manifest of the built-in extension inspector.
 const INSPECTOR_MANIFEST: &str = r#"
 schema_version = "1.0"
@@ -3525,8 +3590,8 @@ tools = ["echo"]
         let host = ExtensionHost::open(config(&root)).expect("host");
         let metrics = host.metrics();
         assert_eq!(
-            metrics.applied, 3,
-            "the builtin inspector, diagnostics and good package still apply"
+            metrics.applied, 4,
+            "the builtin inspector, diagnostics, annotations and good package still apply"
         );
         let statuses = host.statuses();
         assert!(
@@ -3613,7 +3678,7 @@ tools = ["echo"]
             .services()
             .acquire::<crate::extension::terminal::TerminalHandle>(&Scope::Host, "terminal")
             .expect("terminal service");
-        let output = lease.run("printf hello", None).await.expect("command");
+        let output = lease.run("printf hello", None).expect("command");
         assert_eq!(output.stdout, "hello");
         assert_eq!(output.code, 0);
         let _ = std::fs::remove_dir_all(&root);

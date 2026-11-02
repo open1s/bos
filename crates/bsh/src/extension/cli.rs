@@ -7,6 +7,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::extension::capability::{Capability, GrantScope};
 use crate::extension::host::{DiagnosticsReport, ExtensionHost, ExtensionStatus, HostConfig};
@@ -1468,6 +1469,7 @@ fn command_mock(args: &[String]) -> Result<i32, String> {
                     &package.manifest,
                     &path,
                     &data_root,
+                    Arc::new(crate::extension::terminal::HostTerminal),
                 )
                 .map_err(|error| error.to_string())?,
             ),

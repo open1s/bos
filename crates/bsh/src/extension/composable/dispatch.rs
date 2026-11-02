@@ -239,12 +239,7 @@ impl EventDispatcher {
         chain.next(payload)
     }
 
-    fn first_value(
-        &self,
-        name: &str,
-        mode: DispatchMode,
-        payload: Value,
-    ) -> Option<Value> {
+    fn first_value(&self, name: &str, mode: DispatchMode, payload: Value) -> Option<Value> {
         for listener in self.snapshot(name, mode) {
             let chain = self.chain_for(&listener, 1);
             if let Some(value) = (listener.handler)(payload.clone(), chain) {
@@ -376,21 +371,16 @@ mod tests {
             (DispatchMode::Waterfall, "waterfall"),
         ] {
             let calls = Arc::clone(&calls);
-            subscriptions.push(dispatcher.on(
-                "modes",
-                mode,
-                0,
-                move |value, next| {
-                    calls.write().unwrap().push(label);
-                    if mode == DispatchMode::Waterfall {
-                        next.next(value)
-                    } else if mode == DispatchMode::Serial || mode == DispatchMode::Bail {
-                        Some(Value::Null)
-                    } else {
-                        None
-                    }
-                },
-            ));
+            subscriptions.push(dispatcher.on("modes", mode, 0, move |value, next| {
+                calls.write().unwrap().push(label);
+                if mode == DispatchMode::Waterfall {
+                    next.next(value)
+                } else if mode == DispatchMode::Serial || mode == DispatchMode::Bail {
+                    Some(Value::Null)
+                } else {
+                    None
+                }
+            }));
         }
 
         dispatcher.emit("modes", json!({}));

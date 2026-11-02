@@ -1185,7 +1185,11 @@ mod tests {
         resource: libc::c_int,
         _limit: *const libc::rlimit,
     ) -> libc::c_int {
-        if resource == libc::RLIMIT_CPU { -1 } else { 0 }
+        if resource == libc::RLIMIT_CPU {
+            -1
+        } else {
+            0
+        }
     }
 
     #[cfg(unix)]
@@ -1193,22 +1197,20 @@ mod tests {
         resource: libc::c_int,
         _limit: *const libc::rlimit,
     ) -> libc::c_int {
-        if resource == libc::RLIMIT_NOFILE { -1 } else { 0 }
+        if resource == libc::RLIMIT_NOFILE {
+            -1
+        } else {
+            0
+        }
     }
 
     #[cfg(unix)]
-    unsafe extern "C" fn test_setpgid_ok(
-        _pid: libc::pid_t,
-        _pgid: libc::pid_t,
-    ) -> libc::c_int {
+    unsafe extern "C" fn test_setpgid_ok(_pid: libc::pid_t, _pgid: libc::pid_t) -> libc::c_int {
         0
     }
 
     #[cfg(unix)]
-    unsafe extern "C" fn test_setpgid_fail(
-        _pid: libc::pid_t,
-        _pgid: libc::pid_t,
-    ) -> libc::c_int {
+    unsafe extern "C" fn test_setpgid_fail(_pid: libc::pid_t, _pgid: libc::pid_t) -> libc::c_int {
         -1
     }
 
@@ -1221,12 +1223,22 @@ mod tests {
         assert!(limit_failure.is_err(), "failed setrlimit must abort spawn");
 
         let cpu_failure = unsafe {
-            apply_unix_limits(64 * 1024 * 1024, 10, test_setrlimit_fail_cpu, test_setpgid_ok)
+            apply_unix_limits(
+                64 * 1024 * 1024,
+                10,
+                test_setrlimit_fail_cpu,
+                test_setpgid_ok,
+            )
         };
         assert!(cpu_failure.is_err(), "failed RLIMIT_CPU must abort spawn");
 
         let nofile_failure = unsafe {
-            apply_unix_limits(64 * 1024 * 1024, 10, test_setrlimit_fail_nofile, test_setpgid_ok)
+            apply_unix_limits(
+                64 * 1024 * 1024,
+                10,
+                test_setrlimit_fail_nofile,
+                test_setpgid_ok,
+            )
         };
         assert!(
             nofile_failure.is_err(),
@@ -1241,9 +1253,8 @@ mod tests {
             "failed process-group setup must abort spawn"
         );
 
-        let success = unsafe {
-            apply_unix_limits(64 * 1024 * 1024, 10, test_setrlimit_ok, test_setpgid_ok)
-        };
+        let success =
+            unsafe { apply_unix_limits(64 * 1024 * 1024, 10, test_setrlimit_ok, test_setpgid_ok) };
         assert!(success.is_ok());
     }
 
@@ -1323,7 +1334,10 @@ mod tests {
             "the sandbox must not rejoin the host network namespace"
         );
         for hidden in ["/home", "/root", "/run"] {
-            let index = plan.iter().position(|item| item == hidden).expect("hidden root");
+            let index = plan
+                .iter()
+                .position(|item| item == hidden)
+                .expect("hidden root");
             assert_eq!(plan[index - 1], "--tmpfs");
         }
         assert_eq!(

@@ -7,7 +7,7 @@
 //! in-process access to the host.
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
@@ -28,6 +28,7 @@ pub(crate) struct CordisRuntime {
     session: Mutex<Option<BridgeSession>>,
     registrations: Mutex<Vec<BridgeRegistration>>,
     tools: Mutex<Vec<ToolDescriptor>>,
+    terminal: Arc<dyn super::super::terminal::TerminalService>,
 }
 
 impl CordisRuntime {
@@ -37,6 +38,7 @@ impl CordisRuntime {
         manifest: &Manifest,
         root: &Path,
         data_root: &Path,
+        terminal: Arc<dyn super::super::terminal::TerminalService>,
     ) -> Result<Self, ExtensionError> {
         let extension = manifest.extension.id.as_str().to_owned();
         let interpreter = find_interpreter().ok_or_else(|| ExtensionError::UnsupportedRuntime {
@@ -66,6 +68,7 @@ impl CordisRuntime {
             session: Mutex::new(None),
             registrations: Mutex::new(Vec::new()),
             tools: Mutex::new(Vec::new()),
+            terminal,
         })
     }
 
@@ -91,8 +94,31 @@ impl CordisRuntime {
         if session.is_some() {
             return Ok(());
         }
-        let (started, manifest) = BridgeSession::start(self.options.clone())
+        let (mut started, manifest) = BridgeSession::start(self.options.clone())
             .map_err(|error| self.error(format!("{}: {error}", self.root.display())))?;
+        let terminal = Arc::clone(&self.terminal);
+        started.set_host_call(Arc::new(
+            move |service: &str, method: &str, params: Value| {
+                if service != "terminal" || method != "run" {
+                    return Err(format!("unsupported host service {service}.{method}"));
+                }
+                let command = params
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "terminal.run needs a command".to_string())?;
+                let cwd = params
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .map(std::path::PathBuf::from);
+                let output = terminal.run(command, cwd)?;
+                Ok(serde_json::json!({
+                    "stdout": output.stdout,
+                    "stderr": output.stderr,
+                    "code": output.code,
+                }))
+            },
+        ));
+
         let mut tools = Vec::new();
         for registration in &manifest.registrations {
             if registration.kind != BridgeKind::Tool {
@@ -240,7 +266,13 @@ mod tests {
         let manifest = Manifest::load(&root).expect("manifest");
         let data_root =
             std::env::temp_dir().join(format!("bsh-cordis-test-{}-{}", std::process::id(), "echo"));
-        let runtime = CordisRuntime::new(&manifest, &root, &data_root).expect("runtime");
+        let runtime = CordisRuntime::new(
+            &manifest,
+            &root,
+            &data_root,
+            Arc::new(crate::extension::terminal::HostTerminal),
+        )
+        .expect("runtime");
         let tools = runtime.tools().await.expect("tools");
         assert!(tools.iter().any(|tool| tool.id.as_str() == "echo"));
 
@@ -250,6 +282,7 @@ mod tests {
             .await
             .expect("call");
         assert_eq!(output["echoed"], "hi");
+        assert_eq!(output["terminal"], "bridge-ok");
         runtime.shutdown().await.expect("shutdown");
         let _ = std::fs::remove_dir_all(&data_root);
     }

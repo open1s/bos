@@ -37,6 +37,7 @@ mod events;
 pub(crate) mod hooks;
 pub(crate) mod host;
 pub(crate) mod live;
+pub(crate) mod notes;
 pub(crate) mod terminal;
 pub(crate) use host::shutdown;
 

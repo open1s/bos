@@ -125,20 +125,16 @@ wired into the model stream.
 
 These are the gaps that still need code, not just a seam:
 
-1. **Cordis live mounting** -- the runtime executes real apply(ctx, config)
-   packages, invokes their tools, and cordis.patch.yml rows lower to profile
-   entries; mounting those rows into the live build and non-tool registrations
-   are still owed.
-2. **Capability-bearing interceptors** -- service acquisition is policy-checked
-   by the host adapter; event interceptors still lack a separate capability.
-3. **Host wiring** -- CompositionRuntime, CompositionPlanner, and
-   EventDispatcher are tested primitives; the turn builder still uses the
-   existing install path.
-4. **Live HMR** -- package update reloads the host; in-place module replacement
+1. **Legacy feature migration** -- the annotations provider is now a
+   first-party package (`com.bos.bsh.annotations`) that gates the NotesStore,
+   and disabling it disables the store. The `Notes` value type and UI callsite
+   remain in core as a thin view; a process-package provider is still separate.
+2. **Live HMR** -- package update reloads the host; in-place module replacement
    is not implemented.
-5. **Native UI slots** -- the DSH client plane is browser JS; BSH draws native
+3. **Native UI slots** -- the DSH client plane is browser JS; BSH draws native
    GPUI, so ctx.slots stays refused rather than faked.
+4. **Cordis patch HMR** -- rows mount by writing config and rebuilding the host;
+   an in-place composition swap is not implemented.
 
-Closing 1--3 is the difference between "the model is complete" and "the product
-uses it everywhere". The tests in crates/bsh/src/extension/composable/ pin the
+The tests in crates/bsh/src/extension/composable/ pin the
 semantics that the wiring must preserve.

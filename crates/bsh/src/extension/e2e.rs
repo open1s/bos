@@ -328,6 +328,66 @@ async fn disabling_the_first_party_notes_package_removes_its_tools() {
 }
 
 #[tokio::test]
+async fn a_live_suspend_hides_commands_and_panels() {
+    let root = scratch("live-commands");
+    std::fs::create_dir_all(root.join("workspace")).expect("workspace");
+    let store = ExtensionStore::open(&root).expect("store");
+    let package = store.install(&examples().join("hello")).expect("install");
+    grant_all(
+        &store,
+        package.id(),
+        &package.manifest.capabilities.required,
+    );
+    let mut host = ExtensionHost::open(config(&root)).expect("host");
+    let id = package.id().as_str().to_string();
+    let commands = host.command_surfaces().len();
+    let panels = host.panel_surfaces().len();
+    assert!(commands > 0, "hello contributes a command");
+    assert!(panels > 0, "hello contributes a panel");
+    crate::extension::live::set_suspended(&id, true);
+    assert!(host.command_surfaces().len() < commands);
+    assert!(host.panel_surfaces().len() < panels);
+    crate::extension::live::set_suspended(&id, false);
+    assert_eq!(host.command_surfaces().len(), commands);
+    assert_eq!(host.panel_surfaces().len(), panels);
+    host.shutdown().await;
+}
+
+#[tokio::test]
+async fn disabling_the_annotations_package_disables_the_notes_store() {
+    let root = scratch("annotations-provider");
+    std::fs::create_dir_all(root.join("workspace")).expect("workspace");
+    let mut host = ExtensionHost::open(config(&root)).expect("host");
+    let id = crate::extension::types::ExtensionId::parse("com.bos.bsh.annotations").expect("id");
+    let status = host
+        .statuses()
+        .into_iter()
+        .find(|status| status.id == "com.bos.bsh.annotations")
+        .expect("annotations status");
+    assert!(status.applied, "annotations provider applies");
+    let mut notes = crate::notes::Notes::default();
+    notes.add(
+        std::path::Path::new("a.txt"),
+        crate::notes::Note {
+            line: None,
+            to: None,
+            text: "hi".into(),
+        },
+    );
+    notes.save(&root).expect("save through provider");
+    host.shutdown().await;
+
+    let store = ExtensionStore::open(&root).expect("store");
+    store.set_enabled(&id, false).expect("disable");
+    let mut host = ExtensionHost::open(config(&root)).expect("host");
+    assert!(crate::notes::Notes::load(&root)
+        .on(std::path::Path::new("a.txt"))
+        .is_empty());
+    assert!(notes.save(&root).is_err());
+    host.shutdown().await;
+}
+
+#[tokio::test]
 async fn the_allinone_example_covers_every_declared_contribution_kind() {
     let root = scratch("allinone");
     std::fs::create_dir_all(root.join("workspace")).expect("workspace");

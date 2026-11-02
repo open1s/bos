@@ -68,12 +68,13 @@ Pass evidence:
   internals;
 - disabling it removes the feature without a rebuild.
 
-Current status: **met**. The extension inspector (com.bos.bsh.extensions) and
-diagnostics (com.bos.bsh.diagnostics) are first-party packages with disable
-tests, and com.bos.bsh.notes is a first-party process package under the normal
-example extension root that an e2e installs through the store and host. New
-features follow the manifest/runtime/capability path; older in-core features
-predate the rule and are tracked as legacy.
+Current status: **met**. The extension inspector (com.bos.bsh.extensions),
+diagnostics (com.bos.bsh.diagnostics) and workspace annotations
+(com.bos.bsh.annotations) are first-party packages with disable tests; the
+annotations package owns the NotesStore gate, and disabling it disables the
+notes store (e2e). com.bos.bsh.notes is a first-party process package installed
+through the store. New features follow the manifest/runtime/capability path;
+older in-core features predate the rule and are tracked as legacy.
 
 ### G3 -- Composition parity with Cordis
 
@@ -124,8 +125,9 @@ model/tool plugin stages all dispatch through it.
 Current status: **met**. The Agent has interior-mutable live overlays for tools,
 prompt fragments and skills; `BuiltAgent` starts a service-change driver that
 suspends/resumes an activation, and its `ActivationList` disposes activations in
-reverse dependency order. Each effect scope disposes LIFO with a timeout/report;
-commands and panels are host surfaces refreshed by the host reload path.
+reverse dependency order. Each effect scope disposes LIFO with a timeout/report.
+Host command and panel surfaces skip an activation whose live state is
+suspended, so a service-change suspend hides them from the shell as well.
 
 ### G6 -- Performance budgets
 
@@ -275,26 +277,20 @@ It must run:
 - the Cordis runtime and host e2e;
 - the release benchmark suite when GOLD_STANDARD_RELEASE=1 or CI=1 (CI default).
 
-## 6. Roadmap to completion
+## 6. Completion status
 
-| Step | Closes | Work |
-|---|---|---|
-| 1 | G5, G9 | Wire CompositionRuntime into the turn builder; drain dependents on teardown |
-| 2 | G4 | Wire interceptor audit and host event dispatch |
-| 3 | G2 | Convert one real BSH feature to a first-party package; prove disable removes it |
-| 4 | G7 | Connect graph/why/effects/reload to the live runtime view |
-| 5 | G8 | Lower cordis.patch.yml rows into profiles; add the Cordis runtime adapter |
-| 6 | G6 | Release-mode benchmark harness and recorded CI budgets |
-| 7 | G9 | Make the conformance command a required check |
-
-The order is deliberate: G5 makes the runtime real, G4 makes it safe, G2 proves
-self-hosting, and only then can G6 claim performance superiority.
+All roadmap steps are closed: CompositionRuntime and dependency-aware teardown,
+policy-backed model/tool/turn dispatch, first-party packages (inspector,
+diagnostics, annotations, notes), live graph/why/effects/reload, the Cordis
+runtime and patch lowering, the release benchmark harness, and the required
+conformance command. The remaining non-gate work is tracked in
+`docs/bsh-extension-expressiveness.md` (live HMR and native UI slots).
 
 ## 7. Current proof
 
 What is already true:
 
-- 235 extension tests pass, including 64 composition tests and eight release
+- 237 extension tests pass, including 64 composition tests and eight release
   budget tests;
 - the all-in-one example covers tools, commands, panels, prompts, contexts,
   skills, languages, integrations, themes, presets, providers, workflows,
@@ -316,13 +312,16 @@ What is already true:
 - Agent has interior-mutable live overlays for tools, prompt fragments and
   skills; extensions install and uninstall them without `&mut Agent`, the engine
   merges them, and drop closes the liveness gate; BuiltAgent starts a
-  service-change watcher that suspends/resumes an activation's live overlay;
-  suspend/resume is covered by the caps test;
+  service-change watcher that suspends/resumes an activation's live overlay, and
+  host command/panel surfaces hide a suspended activation (caps + e2e tests);
 - a host ServicePolicyAuthorizer checks a provider's declared capabilities
   against the consumer's grants before an acquisition, with a deny/grant test;
 - EventDispatcher::on_interceptor refuses registration unless an InterceptorPolicy
   authorizes the owner; the host PolicyInterceptor checks agent.intercept and the
   denial is recorded in the audit log (deny/allow/audit test);
+- Cordis packages call host services through the bridge host_call frame; a
+  Cordis tool runs a terminal command through TerminalService and returns it
+  (runtime test), so the terminal seam is reachable from a non-builtin package;
 - the agent's DispatcherPlugin forwards model.before/model.after and
   tool.call.before/tool.call.after through the policy-backed EventDispatcher;
   extension tools also dispatch tool.before/tool.after, so registered

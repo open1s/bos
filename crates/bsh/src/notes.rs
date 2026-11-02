@@ -47,21 +47,20 @@ pub(crate) struct Notes(HashMap<String, Vec<Note>>);
 impl Notes {
     /// Read a workspace's notes, treating absence as none yet written.
     pub(crate) fn load(root: &Path) -> Self {
-        match std::fs::read(Self::path(root)) {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-            Err(_) => Self::default(),
+        let Ok(bytes) = crate::extension::notes::store().read(root) else {
+            return Self::default();
+        };
+        if bytes.is_empty() {
+            return Self::default();
         }
+        serde_json::from_slice(&bytes).unwrap_or_default()
     }
 
     /// Write the notes back to the workspace's `.bsh` directory, creating it
     /// on the first note the way the settings writer does.
     pub(crate) fn save(&self, root: &Path) -> std::io::Result<()> {
-        let path = Self::path(root);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let bytes = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(path, bytes)
+        crate::extension::notes::store().write(root, &bytes)
     }
 
     /// The notes file's path in the workspace.

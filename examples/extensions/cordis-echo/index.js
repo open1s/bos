@@ -11,11 +11,13 @@ module.exports = {
         required: ["value"],
       },
       output: { schema: {}, render: () => null },
-      execute(args) {
+      async execute(args) {
+        const terminal = await ctx.terminal.run("printf bridge-ok");
         return {
           echoed: args.value,
           source: "cordis",
           config: config && config.name ? config.name : "default",
+          terminal: terminal.stdout,
         };
       },
     });

@@ -349,6 +349,11 @@ pub fn bridge_available() -> bool {
     find_interpreter().is_some()
 }
 /// A live plugin process and the registrations it announced.
+/// Handler for a shim-to-host service call.
+pub type HostCallHandler =
+    std::sync::Arc<dyn Fn(&str, &str, Value) -> Result<Value, String> + Send + Sync>;
+
+/// A live bridge subprocess plus its registrations and host-call handler.
 pub struct BridgeSession {
     child: Child,
     stdin: ChildStdin,
@@ -357,6 +362,8 @@ pub struct BridgeSession {
     /// The scratch directory holding the extracted shim; removed on drop.
     _scratch: tempfile::TempDir,
     options: BridgeOptions,
+    /// Optional handler for shim-to-host service calls.
+    host_call: Option<HostCallHandler>,
 }
 
 impl std::fmt::Debug for BridgeSession {
@@ -407,9 +414,15 @@ impl BridgeSession {
             next_id: 1,
             _scratch: scratch,
             options,
+            host_call: None,
         };
         let manifest = session.load(&entry)?;
         Ok((session, manifest))
+    }
+
+    /// Install the handler for shim-to-host service calls.
+    pub fn set_host_call(&mut self, handler: HostCallHandler) {
+        self.host_call = Some(handler);
     }
 
     /// The child process id.
@@ -565,6 +578,37 @@ impl BridgeSession {
                             .unwrap_or("the plugin call failed")
                             .to_string(),
                     ));
+                }
+                Some("host_call") => {
+                    let call_id = frame.get("id").and_then(Value::as_u64);
+                    let service = frame
+                        .get("service")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let method = frame
+                        .get("method_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let params = frame.get("params").cloned().unwrap_or(Value::Null);
+                    let outcome = match &self.host_call {
+                        Some(handler) => handler(service, method, params),
+                        None => Err(format!("no host handler for {service}.{method}")),
+                    };
+                    let response = match outcome {
+                        Ok(value) => json!({
+                            "id": call_id,
+                            "method": "host_result",
+                            "params": { "ok": true, "value": value }
+                        }),
+                        Err(error) => json!({
+                            "id": call_id,
+                            "method": "host_result",
+                            "params": { "ok": false, "error": error }
+                        }),
+                    };
+                    self.write_frame(&response)
+                        .map_err(|error| ToolError::Failed(error.to_string()))?;
+                    continue;
                 }
                 _ => continue,
             }

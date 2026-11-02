@@ -72,7 +72,7 @@ pub(crate) fn snapshot() -> Vec<serde_json::Value> {
         .unwrap_or_default()
 }
 
-fn set_suspended(id: &str, suspended: bool) {
+pub(crate) fn set_suspended(id: &str, suspended: bool) {
     if let Ok(mut state) = live_state().lock() {
         state.insert(id.to_string(), suspended);
     }
