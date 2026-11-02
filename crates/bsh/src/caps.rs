@@ -430,6 +430,8 @@ pub(crate) struct BuiltAgent {
     pub(crate) tools_schema_chars: usize,
     /// The installed plugins, for the settings inventory.
     pub(crate) plugins: Vec<PluginInfo>,
+    /// Fiber activations held for exactly as long as this build is live.
+    pub(crate) extension_activations: Vec<crate::extension::host::AppliedExtension>,
     /// Why the provider credential could not be resolved, if it could not.
     ///
     /// A locked vault is named here rather than silently handing the engine an
@@ -935,13 +937,18 @@ fn build_agent_for_session_inner(
     // extension allowlist and the workspace's disabled list. A failure here is
     // logged and reflected in the status/doctor surfaces; it never stops the
     // turn from being built.
-    plugins.extend(crate::extension::install(
+    let extension_activations = crate::extension::install_with_fibers(
         &mut agent,
         &mut registry,
         settings,
         root.as_deref(),
         eff.preset_extensions.as_deref(),
-    ));
+    );
+    plugins.extend(
+        extension_activations
+            .iter()
+            .map(|activation| activation.info.clone()),
+    );
     // Hooks are installed after the extension platform has applied its
     // packages: the decision is "is a hook-attached package live for THIS
     // build", and a package installed in this build is live now.
@@ -1241,6 +1248,7 @@ fn build_agent_for_session_inner(
     BuiltAgent {
         agent: Arc::new(agent),
         plugins,
+        extension_activations,
         tools_schema_chars,
         credential_error,
         policy,
