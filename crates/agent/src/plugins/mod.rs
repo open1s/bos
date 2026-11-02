@@ -556,4 +556,21 @@ mod tests {
         assert!(!registry.is_empty());
         assert!(registry.tool_names().len() == 1);
     }
+
+    #[test]
+    fn removing_owner_revokes_only_that_owners_contributions() {
+        let mut registry = PluginRegistry::new();
+        registry.register_tool("alpha", Arc::new(EchoTool::new("alpha_tool"))).unwrap();
+        registry.register_panel("alpha", UiPanel::new("alpha_panel", "Alpha")).unwrap();
+        registry.register_command("alpha", PluginCommand::new("alpha_cmd", "Alpha")).unwrap();
+        registry.register_tool("beta", Arc::new(EchoTool::new("beta_tool"))).unwrap();
+
+        assert_eq!(registry.remove_owner("alpha"), 3);
+        assert_eq!(registry.len(), 1);
+        assert!(registry.tool("alpha_tool").is_none());
+        assert_eq!(registry.owner_of("alpha_panel"), None);
+        assert_eq!(registry.owner_of("alpha_cmd"), None);
+        assert_eq!(registry.owner_of("beta_tool"), Some((ItemKind::Tool, "beta")));
+        assert_eq!(registry.remove_owner("alpha"), 0);
+    }
 }
