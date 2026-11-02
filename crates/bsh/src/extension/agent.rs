@@ -76,8 +76,8 @@ pub(crate) struct ContributionLease {
 }
 
 impl ContributionLease {
-    /// Revoke this extension's tools, commands and panels from the same build.
-    /// Returns the number of registry entries removed.
+    /// Revoke this extension's tools, prompts, skills, commands and panels.
+    /// Returns the number of contributions removed from the build.
     pub(crate) fn revoke(
         &self,
         agent: &mut agent::Agent,
