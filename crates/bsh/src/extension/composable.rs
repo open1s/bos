@@ -18,6 +18,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+use super::manifest::{Manifest, ServiceScope};
+
 /// The lifetime boundary in which a service or Fiber is visible.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum Scope {
@@ -307,6 +309,126 @@ impl DependencyGraph {
     }
 }
 
+/// A provider selected for one declared service contract.
+#[derive(Debug, Clone)]
+struct ServiceProvider {
+    extension: String,
+    version: semver::Version,
+}
+
+/// Why service declarations cannot produce an activation graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ServiceContractError {
+    DuplicateProvider { service: String, first: String, second: String },
+    MissingProvider { extension: String, service: String },
+    VersionMismatch {
+        extension: String,
+        service: String,
+        required: String,
+        provided: String,
+    },
+    Dependency(DependencyError),
+}
+
+impl fmt::Display for ServiceContractError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicateProvider { service, first, second } => write!(
+                f,
+                "service {service} has multiple providers: {first} and {second}"
+            ),
+            Self::MissingProvider { extension, service } => {
+                write!(f, "{extension} requires missing service {service}")
+            }
+            Self::VersionMismatch { extension, service, required, provided } => write!(
+                f,
+                "{extension} requires {service} {required}, but provider exposes {provided}"
+            ),
+            Self::Dependency(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for ServiceContractError {}
+
+/// Build a dependency-first activation plan from package and service contracts.
+///
+/// Service contracts are resolved before any extension code runs. A required
+/// service contributes a provider -> consumer graph edge; optional missing
+/// services do not. Explicit package dependencies remain authoritative too.
+pub(crate) fn plan_service_dependencies(
+    manifests: &[Manifest],
+) -> Result<DependencyPlan, ServiceContractError> {
+    type ServiceKey = (ServiceScope, String, String);
+    let mut providers = BTreeMap::<ServiceKey, ServiceProvider>::new();
+
+    for manifest in manifests {
+        let extension = manifest.extension.id.as_str().to_owned();
+        for service in &manifest.services.provides {
+            let key = (
+                service.scope,
+                service.name.clone(),
+                service.contract.clone(),
+            );
+            let provider = ServiceProvider {
+                extension: extension.clone(),
+                version: service.version.clone(),
+            };
+            if let Some(previous) = providers.insert(key, provider.clone()) {
+                return Err(ServiceContractError::DuplicateProvider {
+                    service: format!(
+                        "{}@{}",
+                        service.name, service.contract
+                    ),
+                    first: previous.extension,
+                    second: provider.extension,
+                });
+            }
+        }
+    }
+
+    let mut graph = DependencyGraph::default();
+    for manifest in manifests {
+        let extension = manifest.extension.id.as_str().to_owned();
+        let mut dependencies: BTreeSet<String> = manifest
+            .dependencies
+            .keys()
+            .map(|id| id.as_str().to_owned())
+            .collect();
+
+        for requirement in &manifest.services.requires {
+            let key = (
+                requirement.scope,
+                requirement.name.clone(),
+                requirement.contract.clone(),
+            );
+            let Some(provider) = providers.get(&key) else {
+                if requirement.optional {
+                    continue;
+                }
+                return Err(ServiceContractError::MissingProvider {
+                    extension: extension.clone(),
+                    service: format!("{}@{}", requirement.name, requirement.contract),
+                });
+            };
+            if !requirement.version.matches(&provider.version) {
+                return Err(ServiceContractError::VersionMismatch {
+                    extension: extension.clone(),
+                    service: format!("{}@{}", requirement.name, requirement.contract),
+                    required: requirement.version.to_string(),
+                    provided: provider.version.to_string(),
+                });
+            }
+            if provider.extension != extension {
+                dependencies.insert(provider.extension.clone());
+            }
+        }
+        graph.insert(extension, dependencies);
+    }
+
+    graph.plan().map_err(ServiceContractError::Dependency)
+}
+
 /// Runtime state of one composable extension Fiber.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FiberState {
@@ -531,6 +653,90 @@ mod tests {
         assert!(registry.get::<u32>(&Scope::Workspace("w1".into()), "index").is_some());
         assert!(registry.get::<u32>(&Scope::Workspace("w2".into()), "index").is_none());
         assert!(registry.get::<u32>(&Scope::Host, "index").is_none());
+    }
+
+    fn manifest_with_service_contract(
+        id: &str,
+        provides: &str,
+        requires: &str,
+    ) -> Manifest {
+        let base = include_str!("manifest.rs");
+        let start = base.find("fn sample() -> String").expect("sample helper");
+        let source = &base[start..];
+        let sample_start = source.find("r#\"").expect("raw manifest start") + 3;
+        let sample_end = source[sample_start..]
+            .find("\"#")
+            .expect("raw manifest end")
+            + sample_start;
+        let mut text = source[sample_start..sample_end].to_owned();
+        text = text.replace("com.example.git-assistant", id);
+        if !provides.is_empty() {
+            text.push_str("\\n[services]\\nprovides = ");
+            text.push_str(provides);
+            text.push('\\n');
+        }
+        if !requires.is_empty() {
+            if provides.is_empty() {
+                text.push_str("\\n[services]\\n");
+            }
+            text.push_str("requires = ");
+            text.push_str(requires);
+            text.push('\\n');
+        }
+        Manifest::parse(&text, std::path::Path::new("extension.toml")).unwrap()
+    }
+
+    #[test]
+    fn service_contracts_add_dependency_edges_and_order_provider_first() {
+        let provider = manifest_with_service_contract(
+            "com.example.provider",
+            "[{ name = \\"com.example.search\\", contract = \\"com.example.search-api\\", version = \\"1.2.0\\", scope = \\"workspace\\" }]",
+            "",
+        );
+        let consumer = manifest_with_service_contract(
+            "com.example.consumer",
+            "",
+            "[{ name = \\"com.example.search\\", contract = \\"com.example.search-api\\", version = \\"^1.0\\", scope = \\"workspace\\" }]",
+        );
+        let plan = plan_service_dependencies(&[consumer, provider]).unwrap();
+        assert_eq!(
+            plan.order,
+            vec!["com.example.provider", "com.example.consumer"]
+        );
+    }
+
+    #[test]
+    fn service_contracts_reject_missing_and_incompatible_providers() {
+        let consumer = manifest_with_service_contract(
+            "com.example.consumer",
+            "",
+            "[{ name = \\"com.example.search\\", contract = \\"com.example.search-api\\", version = \\"^2.0\\", scope = \\"workspace\\" }]",
+        );
+        assert!(matches!(
+            plan_service_dependencies(std::slice::from_ref(&consumer)),
+            Err(ServiceContractError::MissingProvider { .. })
+        ));
+
+        let provider = manifest_with_service_contract(
+            "com.example.provider",
+            "[{ name = \\"com.example.search\\", contract = \\"com.example.search-api\\", version = \\"1.2.0\\", scope = \\"workspace\\" }]",
+            "",
+        );
+        assert!(matches!(
+            plan_service_dependencies(&[consumer, provider]),
+            Err(ServiceContractError::VersionMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn optional_service_requirement_does_not_block_activation() {
+        let consumer = manifest_with_service_contract(
+            "com.example.consumer",
+            "",
+            "[{ name = \\"com.example.telemetry\\", contract = \\"com.example.telemetry-api\\", version = \\"^1.0\\", scope = \\"host\\", optional = true }]",
+        );
+        let plan = plan_service_dependencies(&[consumer]).unwrap();
+        assert_eq!(plan.order, vec!["com.example.consumer"]);
     }
 
     #[test]
