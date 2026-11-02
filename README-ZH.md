@@ -58,7 +58,7 @@ BOS 将共享执行核心与开发者接口、桌面工作空间分离。Rust �
 Extension Platform 扩展的是 BSH，而不是另建一套 Agent Runtime。
 
 <p align="center">
-  <img src="docs/assets/diagrams/bos-architecture.png" alt="BOS 总体架构：Rust、Python、JavaScript 接口和 BSH 共用 BOS Runtime，BSH Extension Platform 扩展桌面工作空间。" width="100%">
+  <img src="docs/assets/diagrams/bos-platform-architecture.svg" alt="BOS 总体架构：Rust、Python、JavaScript 接口和 BSH 共用 BOS Runtime，BSH Extension Platform 扩展桌面工作空间。" width="100%">
 </p>
 
 Runtime 集成 Agent 编排、工具与技能分发、消息通信、模型适配和弹性治理。
@@ -72,7 +72,7 @@ Runtime 集成 Agent 编排、工具与技能分发、消息通信、模型适�
   <img src="docs/assets/diagrams/bsh-extension-agent-model.svg" alt="BSH 扩展框架与 Agent 模型：宿主服务、扩展运行时、Agent Engine、上下文、工具、运行环境和治理能力。" width="100%">
 </p>
 
-### Agent 执行流程
+### Agent 执行模型
 
 ReAct 执行循环将模型推理与受策略约束的工具执行结合起来。工具结果会回到会话上下文，
 Agent 持续迭代，直到生成最终响应或达到配置的执行边界。
