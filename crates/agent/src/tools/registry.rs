@@ -59,6 +59,19 @@ impl ToolRegistry {
         Ok(())
     }
 
+    /// Remove an asynchronous tool and all of its derived registry metadata.
+    ///
+    /// The caller is responsible for invalidating any cached execution engine
+    /// that captured a prior registry snapshot.
+    pub fn remove_async(&mut self, name: &str) -> bool {
+        let removed = self.async_tools.remove(name).is_some();
+        if removed {
+            self.schema_cache.remove(name);
+            self.mcp_tool_names.remove(name);
+        }
+        removed
+    }
+
     /// Look up a synchronous tool by name.
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.get(name).cloned()
