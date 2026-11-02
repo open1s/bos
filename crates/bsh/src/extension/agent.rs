@@ -834,12 +834,9 @@ mod tests {
             None,
             Arc::new(AtomicBool::new(false)),
         );
-        let error = react::tool::registry::AsyncTool::run(
-            &tool,
-            &serde_json::json!({}),
-        )
-        .await
-        .expect_err("revoked tool must not run");
+        let error = react::tool::registry::AsyncTool::run(&tool, &serde_json::json!({}))
+            .await
+            .expect_err("revoked tool must not run");
         assert!(error.to_string().contains("revoked"), "{error}");
     }
 

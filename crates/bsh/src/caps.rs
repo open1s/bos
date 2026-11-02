@@ -4140,7 +4140,8 @@ mod tests {
         // Its Fiber-owned liveness gate must still reject a new invocation.
         drop(built);
         assert!(
-            tool.run(&serde_json::json!({ "value": "after-unload" })).is_err(),
+            tool.run(&serde_json::json!({ "value": "after-unload" }))
+                .is_err(),
             "dropping the build must close the extension tool's liveness gate"
         );
     }

@@ -784,13 +784,17 @@ impl Manifest {
         let mut provided = BTreeSet::new();
         for (index, service) in self.services.provides.iter().enumerate() {
             let field = format!("services.provides[{index}]");
-            validate_service_identifier(&service.name)
-                .err()
-                .map(|reason| report.error(format!("{field}.name"), reason));
-            validate_service_identifier(&service.contract)
-                .err()
-                .map(|reason| report.error(format!("{field}.contract"), reason));
-            let key = (service.scope, service.name.as_str(), service.contract.as_str());
+            if let Some(reason) = validate_service_identifier(&service.name).err() {
+                report.error(format!("{field}.name"), reason);
+            }
+            if let Some(reason) = validate_service_identifier(&service.contract).err() {
+                report.error(format!("{field}.contract"), reason);
+            }
+            let key = (
+                service.scope,
+                service.name.as_str(),
+                service.contract.as_str(),
+            );
             if !provided.insert(key) {
                 report.error(&field, "duplicate service provider declaration");
             }
@@ -799,13 +803,17 @@ impl Manifest {
         let mut required = BTreeSet::new();
         for (index, service) in self.services.requires.iter().enumerate() {
             let field = format!("services.requires[{index}]");
-            validate_service_identifier(&service.name)
-                .err()
-                .map(|reason| report.error(format!("{field}.name"), reason));
-            validate_service_identifier(&service.contract)
-                .err()
-                .map(|reason| report.error(format!("{field}.contract"), reason));
-            let key = (service.scope, service.name.as_str(), service.contract.as_str());
+            if let Some(reason) = validate_service_identifier(&service.name).err() {
+                report.error(format!("{field}.name"), reason);
+            }
+            if let Some(reason) = validate_service_identifier(&service.contract).err() {
+                report.error(format!("{field}.contract"), reason);
+            }
+            let key = (
+                service.scope,
+                service.name.as_str(),
+                service.contract.as_str(),
+            );
             if !required.insert(key) {
                 report.error(&field, "duplicate service requirement declaration");
             }
@@ -1052,8 +1060,14 @@ provides = [
         );
         let report = parse(&text).validate();
         assert!(!report.is_valid(), "{report:?}");
-        assert!(report.errors.iter().any(|issue| issue.field == "services.provides[0].name"));
-        assert!(report.errors.iter().any(|issue| issue.field == "services.provides[2]"));
+        assert!(report
+            .errors
+            .iter()
+            .any(|issue| issue.field == "services.provides[0].name"));
+        assert!(report
+            .errors
+            .iter()
+            .any(|issue| issue.field == "services.provides[2]"));
     }
 
     #[test]

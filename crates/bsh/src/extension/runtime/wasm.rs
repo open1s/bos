@@ -1208,7 +1208,10 @@ mod tests {
         runtime.shutdown().await.expect("shutdown");
         assert!(runtime.tools().await.is_err(), "shutdown must be terminal");
         assert!(runtime.panel("status").await.is_err());
-        assert!(runtime.command("test", serde_json::json!({})).await.is_err());
+        assert!(runtime
+            .command("test", serde_json::json!({}))
+            .await
+            .is_err());
         assert!(runtime.pump().await.is_err());
         assert!(
             runtime.instance.lock().expect("instance lock").is_none(),

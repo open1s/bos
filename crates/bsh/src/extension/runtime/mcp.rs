@@ -1038,7 +1038,7 @@ impl McpRuntime {
         self.core.cancelled.store(false, Ordering::SeqCst);
         let core = Arc::clone(&self.core);
         let name = name.to_string();
-        let mut handle = tokio::task::spawn_blocking(move || {
+        let handle = tokio::task::spawn_blocking(move || {
             core.call_tool_blocking(&name, arguments, progress, deadline)
         });
         match wait_for_blocking_call(
@@ -1120,7 +1120,9 @@ mod tests {
             let _ = waiting_tx.send(());
             let _gate = waiter_gate.lock().await;
         });
-        waiting_rx.await.expect("second call is waiting for the gate");
+        waiting_rx
+            .await
+            .expect("second call is waiting for the gate");
         assert!(
             tokio::time::timeout(Duration::from_millis(20), &mut waiter)
                 .await
@@ -1133,7 +1135,9 @@ mod tests {
             caller.await.expect("caller task"),
             BlockingCallWait::TimedOut
         ));
-        waiter.await.expect("second call acquires the gate after worker exit");
+        waiter
+            .await
+            .expect("second call acquires the gate after worker exit");
     }
 
     #[test]
@@ -1449,6 +1453,9 @@ required = ["process.execute"]
             .call_tool("echo", serde_json::json!({"x": 2}), &context)
             .await
             .is_err());
-        runtime.shutdown().await.expect("repeated shutdown is idempotent");
+        runtime
+            .shutdown()
+            .await
+            .expect("repeated shutdown is idempotent");
     }
 }
