@@ -349,6 +349,7 @@ impl Fiber {
                 | (FiberState::Active, FiberState::Unloading)
                 | (FiberState::Failed, FiberState::Unloading)
                 | (FiberState::Pending, FiberState::Unloading)
+                | (FiberState::Loading, FiberState::Unloading)
                 | (FiberState::Unloading, FiberState::Disposed)
         );
         if !valid {
