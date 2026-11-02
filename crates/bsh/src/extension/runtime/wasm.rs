@@ -1052,7 +1052,7 @@ impl Runtime for WasmRuntime {
         self.ensure_instance()?;
         if let Ok(mut guard) = self.instance.lock() {
             if let Some(instance) = guard.as_mut() {
-        self.ensure_running()?;
+                self.ensure_running()?;
                 instance.store.data_mut().progress = progress;
             }
         }
