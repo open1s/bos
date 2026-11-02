@@ -1430,8 +1430,7 @@ impl AppState {
         // only AFTER parking and removing the session. If parking fails, the
         // still-live session keeps its queued messages.
         self.inbox.remove(id);
-        self.steering
-            .retain(|_, steering| steering.session != id);
+        self.steering.retain(|_, steering| steering.session != id);
 
         self.plans.remove(id);
         self.goals.remove(id);
@@ -8067,7 +8066,11 @@ mod tests {
             .trash()
             .into_iter()
             .find(|entry| {
-                entry.envelope.payload.get("id").and_then(serde_json::Value::as_str)
+                entry
+                    .envelope
+                    .payload
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
                     == Some(id.as_str())
             })
             .expect("the deleted session is recoverable");
@@ -8119,7 +8122,10 @@ mod tests {
         assert!(!state.turn_extension_activations.contains_key(&id));
         assert!(!state.turn_policy_generation.contains_key(&id));
         assert!(!state.inbox.contains_key(&id));
-        assert!(!state.steering.values().any(|steering| steering.session == id));
+        assert!(!state
+            .steering
+            .values()
+            .any(|steering| steering.session == id));
 
         let parked = state
             .trash()
@@ -8135,5 +8141,4 @@ mod tests {
             "the snapshot records that the live turn was stopped"
         );
     }
-
 }
