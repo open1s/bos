@@ -755,6 +755,53 @@ mod tests {
     }
 
     #[test]
+    fn extension_scoped_services_are_private_to_each_extension() {
+        let first = manifest_with_service_contract(
+            "com.example.first",
+            r#"[{ name = "com.example.cache", contract = "com.example.cache-api", version = "1.0.0", scope = "extension" }]"#,
+            "",
+        );
+        let second = manifest_with_service_contract(
+            "com.example.second",
+            r#"[{ name = "com.example.cache", contract = "com.example.cache-api", version = "1.0.0", scope = "extension" }]"#,
+            "",
+        );
+        let plan = plan_service_dependencies(&[first, second]).unwrap();
+        assert_eq!(plan.order, vec!["com.example.first", "com.example.second"]);
+
+        let external_consumer = manifest_with_service_contract(
+            "com.example.consumer",
+            "",
+            r#"[{ name = "com.example.cache", contract = "com.example.cache-api", version = "^1.0", scope = "extension" }]"#,
+        );
+        let provider = manifest_with_service_contract(
+            "com.example.provider",
+            r#"[{ name = "com.example.cache", contract = "com.example.cache-api", version = "1.0.0", scope = "extension" }]"#,
+            "",
+        );
+        assert!(matches!(
+            plan_service_dependencies(&[provider, external_consumer]),
+            Err(ServiceContractError::MissingProvider { .. })
+        ));
+    }
+
+    #[test]
+    fn optional_incompatible_service_does_not_block_activation() {
+        let consumer = manifest_with_service_contract(
+            "com.example.consumer",
+            "",
+            r#"[{ name = "com.example.metrics", contract = "com.example.metrics-api", version = "^2.0", scope = "host", optional = true }]"#,
+        );
+        let provider = manifest_with_service_contract(
+            "com.example.provider",
+            r#"[{ name = "com.example.metrics", contract = "com.example.metrics-api", version = "1.0.0", scope = "host" }]"#,
+            "",
+        );
+        let plan = plan_service_dependencies(&[consumer, provider]).unwrap();
+        assert_eq!(plan.order, vec!["com.example.consumer", "com.example.provider"]);
+    }
+
+    #[test]
     fn dependency_plan_is_stable_and_dependency_first() {
         let mut graph = DependencyGraph::default();
         graph.insert("app", ["db".into(), "cache".into()]);
