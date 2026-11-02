@@ -2358,3 +2358,49 @@ async fn compact_now_refuses_a_summary_that_does_not_shrink_the_context() {
         "a refused summary leaves the history untouched"
     );
 }
+
+#[test]
+fn extension_prompt_sections_revoke_only_their_exact_delimited_section() {
+    let mut agent = Agent::from_config(AgentConfig {
+        system_prompt: "base persona".to_string(),
+        ..AgentConfig::default()
+    });
+    agent.append_system_prompt("extension first");
+    agent.append_system_prompt("extension last");
+
+    assert!(agent.remove_system_prompt_section("extension first"));
+    assert_eq!(
+        agent.config().system_prompt,
+        "base persona\\n\\nextension last"
+    );
+    assert!(agent.remove_system_prompt_section("extension last"));
+    assert_eq!(agent.config().system_prompt, "base persona");
+}
+
+#[test]
+fn extension_prompt_section_removal_handles_first_and_only_sections() {
+    let mut agent = Agent::from_config(AgentConfig::default());
+    agent.append_system_prompt("only extension");
+    assert!(agent.remove_system_prompt_section("only extension"));
+    assert!(agent.config().system_prompt.is_empty());
+
+    agent.append_system_prompt("first extension");
+    agent.append_system_prompt("base follow-up");
+    assert!(agent.remove_system_prompt_section("first extension"));
+    assert_eq!(agent.config().system_prompt, "base follow-up");
+}
+
+#[test]
+fn extension_prompt_section_removal_rejects_substring_matches() {
+    let mut agent = Agent::from_config(AgentConfig {
+        system_prompt: "base persona".to_string(),
+        ..AgentConfig::default()
+    });
+    agent.append_system_prompt("extension section with suffix");
+
+    assert!(!agent.remove_system_prompt_section("extension section"));
+    assert_eq!(
+        agent.config().system_prompt,
+        "base persona\\n\\nextension section with suffix"
+    );
+}
