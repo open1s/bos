@@ -1,29 +1,54 @@
 digraph BOS {
- graph [bgcolor="#0B1020",pad="0.55",rankdir=TB,nodesep="0.34",ranksep="0.48",splines=none,newrank=true,outputorder=edgesfirst,fontname="DejaVu Sans",label="BOS  /  THE OPEN FOUNDATION FOR INTELLIGENT AGENTS",labelloc=t,fontsize=25,fontcolor="#F3F6FC"];
- node [shape=box,style="rounded,filled",fontname="DejaVu Sans",fontsize=12,margin="0.25,0.18",color="#405575",fillcolor="#17243A",fontcolor="#F3F6FC",penwidth=1.5];
- edge [style=invis,weight=30];
- subgraph cluster_surfaces {label="ONE PLATFORM  ·  MANY WAYS TO BUILD";labelloc=t;labeljust=l;fontsize=13;fontcolor="#55D6E8";color="#34445F";style="rounded";penwidth=1.4;margin=20;
- rust [label="RUST\nNative performance",color="#6EA8FE",fillcolor="#192B48"];
- python [label="PYTHON  /  NBOS\nAutomation · research",color="#FFBE78",fillcolor="#302719"];
- js [label="JAVASCRIPT  /  JSBOS\nNode.js · integrations",color="#67D6A3",fillcolor="#17352F"];
- bsh [label="BSH WORKSPACE\nBuild · operate · orchestrate",color="#B69CFF",fillcolor="#29213E",penwidth=2.2];
- {rank=same;rust;python;js;bsh;} rust -> python -> js -> bsh;
- }
- subgraph cluster_engine {label="THE BOS AGENT ENGINE";labelloc=t;labeljust=l;fontsize=17;fontcolor="#67D6A3";color="#398B7B";style="rounded";penwidth=2.4;margin=24;
- core [label="INTELLIGENT AGENT ORCHESTRATION\nReAct  ·  Multi-agent workflows  ·  Stateful execution",fontsize=16,width=8.8,height=1.0,fillcolor="#12443E",color="#67D6A3",penwidth=2.5];
- models [label="MODEL INTELLIGENCE\nMulti-provider · streaming",color="#B69CFF"];
- actions [label="ACTION ECOSYSTEM\nTools · Skills · MCP",color="#55D6E8"];
- memory [label="CONTEXT & MEMORY\nSessions · knowledge",color="#6EA8FE"];
- messaging [label="AGENT COMMUNICATION\nPub/Sub · Query · RPC",color="#FFBE78"];
- governance [label="TRUST & RELIABILITY\nPolicies · retries · telemetry",color="#67D6A3"];
- {rank=same;models;actions;memory;} {rank=same;messaging;governance;} models -> actions -> memory; messaging -> governance;
- }
- subgraph cluster_ecosystem {label="OPEN ECOSYSTEM";labelloc=t;labeljust=l;fontsize=13;fontcolor="#FFBE78";color="#66543A";style="rounded";penwidth=1.4;margin=20;
- providers [label="MODEL PROVIDERS\nOpenAI-compatible · Anthropic · NVIDIA · Google",color="#A88B55",fillcolor="#282318"];
- mcp [label="EXTERNAL ECOSYSTEM\nMCP servers · APIs · tools",color="#A88B55",fillcolor="#282318"];
- foundation [label="RUST FOUNDATION\nAsync · configuration · logging · security",color="#536987"];
- {rank=same;providers;mcp;foundation;} providers -> mcp -> foundation;
- }
- extensions [label="BSH EXTENSION PLATFORM\nDeclarative  ·  Process  ·  WASM Component  ·  Extism  ·  MCP  ·  Built-in\nTools  ·  Commands  ·  Panels  ·  Workflows  ·  Workspace contributions",fillcolor="#241C3B",color="#B69CFF",penwidth=2.2,fontsize=12,width=10.0,height=0.9];
- rust -> core; core -> providers; providers -> extensions;
+  graph [
+    bgcolor="#FFFFFF", pad="0.42", rankdir=TB, nodesep="0.28", ranksep="0.38",
+    splines=ortho, outputorder=edgesfirst, fontname="Arial",
+    label="BOS Platform Architecture", labelloc=t, labeljust=l,
+    fontsize=28, fontcolor="#111111"
+  ];
+  node [
+    shape=box, style="rounded,filled", fontname="Arial",
+    fontsize=14, margin="0.28,0.20", color="#D9DDE2",
+    fillcolor="#FFFFFF", fontcolor="#111111", penwidth=1.2
+  ];
+  edge [color="#111111", penwidth=1.4, arrowsize=0.7];
+
+  subgraph cluster_bos {
+    label=""; color="#D9DDE2"; penwidth=1.2; style="rounded"; margin=22;
+
+    interfaces [
+      label=<<B>Developer Interfaces</B><BR/><FONT POINT-SIZE="13" COLOR="#666666">Rust  ·  Python / NBOS  ·  JavaScript / JSBOS  ·  BSH Workspace</FONT>>,
+      fillcolor="#E8F3FA", color="#DDEBF4", width=9.0, height=0.95
+    ];
+    agent [
+      label=<<B>BOS Agent Engine</B><BR/><FONT POINT-SIZE="13" COLOR="#666666">Agent orchestration  ·  ReAct  ·  Stateful execution  ·  Multi-agent coordination</FONT>>,
+      fillcolor="#F2F2F2", color="#E8E8E8", width=9.0, height=1.0
+    ];
+
+    models [label=<<B>Model Runtime</B><BR/><FONT POINT-SIZE="12" COLOR="#666666">Providers  ·  Streaming  ·  Tool calling</FONT>>, width=2.7];
+    tools [label=<<B>Action Runtime</B><BR/><FONT POINT-SIZE="12" COLOR="#666666">Tools  ·  Skills  ·  MCP</FONT>>, width=2.7];
+    context [label=<<B>Context & Memory</B><BR/><FONT POINT-SIZE="12" COLOR="#666666">Sessions  ·  Knowledge</FONT>>, width=2.7];
+    events [label=<<B>Agent Communication</B><BR/><FONT POINT-SIZE="12" COLOR="#666666">Pub/Sub  ·  Query  ·  RPC</FONT>>, width=2.7];
+    trust [label=<<B>Trust & Reliability</B><BR/><FONT POINT-SIZE="12" COLOR="#666666">Policies  ·  Limits  ·  Telemetry</FONT>>, width=2.7];
+
+    foundation [
+      label=<<B>Shared Rust Foundation</B><BR/><FONT POINT-SIZE="13" COLOR="#666666">Async Runtime  ·  Configuration  ·  Logging  ·  Security  ·  Storage</FONT>>,
+      fillcolor="#F2F2F2", color="#E8E8E8", width=9.0, height=0.95
+    ];
+    ecosystem [
+      label=<<B>Open Ecosystem</B><BR/><FONT POINT-SIZE="13" COLOR="#666666">Model Providers  ·  External APIs  ·  MCP Servers  ·  Extension Runtimes</FONT>>,
+      fillcolor="#E8F3FA", color="#DDEBF4", width=9.0, height=0.95
+    ];
+
+    {rank=same; models; tools; context;}
+    {rank=same; events; trust;}
+    interfaces -> agent;
+    agent -> models;
+    agent -> tools;
+    agent -> context;
+    models -> events;
+    tools -> trust;
+    events -> foundation;
+    trust -> foundation;
+    foundation -> ecosystem;
+  }
 }
