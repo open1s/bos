@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
-use extism::{Manifest as ExtismManifest, Plugin, PluginBuilder, UserData, ValType, Wasm};
+use extism::{CancelHandle, Manifest as ExtismManifest, Plugin, PluginBuilder, UserData, ValType, Wasm};
 use serde_json::{json, Value};
 
 use super::declarative::DeclarativeContributions;
@@ -426,6 +426,8 @@ pub(crate) struct ExtismRuntime {
     config: String,
     bridge: Arc<Bridge>,
     plugin: Mutex<Option<Plugin>>,
+    /// Cloneable handle used to interrupt a running plugin without taking its lock.
+    cancel_handle: Mutex<Option<CancelHandle>>,
     tools: Vec<ToolDescriptor>,
     execution_ms: u64,
     memory_mb: u64,
@@ -501,6 +503,7 @@ impl ExtismRuntime {
             config,
             bridge,
             plugin: Mutex::new(None),
+            cancel_handle: Mutex::new(None),
             tools,
             execution_ms: manifest.resources.execution_ms(),
             memory_mb: manifest.resources.memory_mb(),
@@ -552,6 +555,11 @@ impl ExtismRuntime {
                 extension: self.extension.to_string(),
                 message: error.to_string(),
             })?;
+        let cancel_handle = plugin.cancel_handle();
+        *self.cancel_handle.lock().map_err(|_| ExtensionError::Corrupt {
+            path: self.component.clone(),
+            message: "Extism cancel-handle lock is poisoned".to_string(),
+        })? = Some(cancel_handle);
         *guard = Some(plugin);
         Ok(())
     }
@@ -672,19 +680,32 @@ impl Runtime for ExtismRuntime {
     }
 
     async fn deactivate(&self) -> Result<(), ExtensionError> {
-        if let Ok(mut plugin) = self.plugin.lock() {
-            *plugin = None;
-        }
+        let mut plugin = self.plugin.lock().map_err(|_| ExtensionError::Corrupt {
+            path: self.component.clone(),
+            message: "Extism plugin lock is poisoned".to_string(),
+        })?;
+        *plugin = None;
+        let mut cancel_handle = self.cancel_handle.lock().map_err(|_| ExtensionError::Corrupt {
+            path: self.component.clone(),
+            message: "Extism cancel-handle lock is poisoned".to_string(),
+        })?;
+        *cancel_handle = None;
         Ok(())
     }
 
     async fn cancel(&self) -> Result<(), ExtensionError> {
         self.cancelled.store(true, Ordering::SeqCst);
-        // Do not wait on a running call's plugin lock: the bridge traps the
-        // guest at its next host call, and dropping the plugin here would
-        // block the cancel task until that call returns.
-        if let Ok(mut plugin) = self.plugin.try_lock() {
-            *plugin = None;
+        // Extism's handle sends an interruption request to the running guest
+        // without requiring the plugin mutex held by Plugin::call.
+        let handle = self.cancel_handle.lock().map_err(|_| ExtensionError::Corrupt {
+            path: self.component.clone(),
+            message: "Extism cancel-handle lock is poisoned".to_string(),
+        })?.clone();
+        if let Some(handle) = handle {
+            handle.cancel().map_err(|error| ExtensionError::Runtime {
+                extension: self.extension.to_string(),
+                message: format!("failed to cancel Extism plugin: {error}"),
+            })?;
         }
         Ok(())
     }
@@ -745,7 +766,7 @@ impl Runtime for ExtismRuntime {
 
     async fn shutdown(&self) -> Result<(), ExtensionError> {
         self.stopped.store(true, Ordering::SeqCst);
-        self.cancelled.store(true, Ordering::SeqCst);
+        self.cancel().await?;
         self.deactivate().await
     }
 
