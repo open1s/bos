@@ -2379,7 +2379,10 @@ fn extension_prompt_sections_revoke_only_their_exact_delimited_section() {
 
 #[test]
 fn extension_prompt_section_removal_handles_first_and_only_sections() {
-    let mut agent = Agent::from_config(AgentConfig::default());
+    let mut agent = Agent::from_config(AgentConfig {
+        system_prompt: String::new(),
+        ..AgentConfig::default()
+    });
     agent.append_system_prompt("only extension");
     assert!(agent.remove_system_prompt_section("only extension"));
     assert!(agent.config().system_prompt.is_empty());
