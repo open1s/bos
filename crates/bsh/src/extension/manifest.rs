@@ -1024,7 +1024,11 @@ max_concurrent_calls = 4
     fn service_contracts_parse_and_validate() {
         let text = sample().replace(
             "[resources]",
-            "[services]\\nprovides = [{ name = \\"com.example.search\\", contract = \\"com.example.search-api\\", version = \\"1.2.0\\", scope = \\"workspace\\" }]\\nrequires = [{ name = \\"com.example.cache\\", contract = \\"com.example.cache-api\\", version = \\"^2.0\\", scope = \\"session\\", optional = true }]\\n\\n[resources]",
+            r#"[services]
+provides = [{ name = "com.example.search", contract = "com.example.search-api", version = "1.2.0", scope = "workspace" }]
+requires = [{ name = "com.example.cache", contract = "com.example.cache-api", version = "^2.0", scope = "session", optional = true }]
+
+[resources]"#,
         );
         let manifest = parse(&text);
         assert_eq!(manifest.services.provides.len(), 1);
@@ -1036,7 +1040,14 @@ max_concurrent_calls = 4
     fn invalid_and_duplicate_service_contracts_are_refused() {
         let text = sample().replace(
             "[resources]",
-            "[services]\\nprovides = [\\n  { name = \\"Bad Service\\", contract = \\"com.example.api\\", version = \\"1.0.0\\", scope = \\"host\\" },\\n  { name = \\"com.example.search\\", contract = \\"com.example.api\\", version = \\"1.0.0\\", scope = \\"host\\" },\\n  { name = \\"com.example.search\\", contract = \\"com.example.api\\", version = \\"2.0.0\\", scope = \\"host\\" }\\n]\\n\\n[resources]",
+            r#"[services]
+provides = [
+  { name = "Bad Service", contract = "com.example.api", version = "1.0.0", scope = "host" },
+  { name = "com.example.search", contract = "com.example.api", version = "1.0.0", scope = "host" },
+  { name = "com.example.search", contract = "com.example.api", version = "2.0.0", scope = "host" }
+]
+
+[resources]"#,
         );
         let report = parse(&text).validate();
         assert!(!report.is_valid(), "{report:?}");
