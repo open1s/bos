@@ -744,6 +744,42 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_service_providers_are_rejected_before_activation() {
+        let first = manifest_with_service_contract(
+            "com.example.provider-a",
+            r#"[{ name = "com.example.search", contract = "com.example.search-api", version = "1.0.0", scope = "host" }]"#,
+            "",
+        );
+        let second = manifest_with_service_contract(
+            "com.example.provider-b",
+            r#"[{ name = "com.example.search", contract = "com.example.search-api", version = "1.1.0", scope = "host" }]"#,
+            "",
+        );
+        assert!(matches!(
+            plan_service_dependencies(&[first, second]),
+            Err(ServiceContractError::DuplicateProvider { .. })
+        ));
+    }
+
+    #[test]
+    fn service_contract_cycles_are_rejected() {
+        let first = manifest_with_service_contract(
+            "com.example.first",
+            r#"[{ name = "com.example.first-api", contract = "com.example.first-contract", version = "1.0.0", scope = "host" }]"#,
+            r#"[{ name = "com.example.second-api", contract = "com.example.second-contract", version = "^1.0", scope = "host" }]"#,
+        );
+        let second = manifest_with_service_contract(
+            "com.example.second",
+            r#"[{ name = "com.example.second-api", contract = "com.example.second-contract", version = "1.0.0", scope = "host" }]"#,
+            r#"[{ name = "com.example.first-api", contract = "com.example.first-contract", version = "^1.0", scope = "host" }]"#,
+        );
+        assert!(matches!(
+            plan_service_dependencies(&[first, second]),
+            Err(ServiceContractError::Dependency(DependencyError::Cycle { .. }))
+        ));
+    }
+
+    #[test]
     fn optional_service_requirement_does_not_block_activation() {
         let consumer = manifest_with_service_contract(
             "com.example.consumer",
