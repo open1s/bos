@@ -794,6 +794,7 @@ mod tests {
     #[test]
     fn concurrent_provider_replacements_publish_monotonic_generations() {
         let registry = Arc::new(ServiceRegistry::new());
+        let mut changes = registry.subscribe_changes();
         let mut workers = Vec::new();
         for value in 0..8_u64 {
             let registry = Arc::clone(&registry);
@@ -812,6 +813,14 @@ mod tests {
             .expect("at least one provider");
         let current = registry.acquire::<u64>(&Scope::Host, "clock").unwrap();
         assert_eq!(current.generation(), newest);
+
+        let generations: Vec<_> = (0..8)
+            .map(|_| changes.try_recv().expect("provider change event").generation)
+            .collect();
+        assert!(
+            generations.windows(2).all(|pair| pair[0] < pair[1]),
+            "broadcast events must follow committed generation order: {generations:?}"
+        );
     }
 
     #[tokio::test]
