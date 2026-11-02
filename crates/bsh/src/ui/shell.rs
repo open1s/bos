@@ -3303,9 +3303,9 @@ impl Shell {
             self.refuse_compact(&id, text, true, cx);
             return;
         }
-        // Keep Fiber cleanup alive until the temporary summarizer build is done.
-        let _extension_activations = built.extension_activations;
         let agent = built.agent;
+        // Drop Fiber handles before the temporary summarizer Agent at scope exit.
+        let _extension_activations = built.extension_activations;
         // The manual command condenses everything safe, which is the
         // contract's own rule for `/compact`: it does not wait for pressure,
         // so it retains no minimum tail beyond a balanced cut.
