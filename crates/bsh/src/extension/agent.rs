@@ -62,6 +62,39 @@ pub(crate) struct Contributed {
     pub(crate) timeout_ms: u64,
 }
 
+/// A revocation handle for the contributions installed into one Agent build.
+///
+/// The lease is deliberately tied to the Agent/PluginRegistry pair that
+/// received the contributions. It must not be reused with another build.
+pub(crate) struct ContributionLease {
+    owner: String,
+    tools: Vec<String>,
+}
+
+impl ContributionLease {
+    /// Revoke this extension's tools, commands and panels from the same build.
+    /// Returns the number of registry entries removed.
+    pub(crate) fn revoke(
+        &self,
+        agent: &mut agent::Agent,
+        registry: &mut agent::plugins::PluginRegistry,
+    ) -> usize {
+        let tools = agent.remove_async_tools(&self.tools);
+        let items = registry.remove_owner(&self.owner);
+        tools + items
+    }
+
+    /// Names of the async tools owned by this lease.
+    pub(crate) fn tool_names(&self) -> &[String] {
+        &self.tools
+    }
+
+    /// Extension owner identifier.
+    pub(crate) fn owner(&self) -> &str {
+        &self.owner
+    }
+}
+
 /// One extension tool exposed to the agent.
 #[derive(Clone)]
 pub(crate) struct ExtensionTool {
@@ -385,6 +418,18 @@ pub(crate) fn install(
     events: Arc<EventBus>,
     workspace: Option<PathBuf>,
 ) -> PluginInfo {
+    install_with_lease(agent, registry, contributed, policy, events, workspace).0
+}
+
+/// Install contributions and return the exact revocation handle for this build.
+pub(crate) fn install_with_lease(
+    agent: &mut agent::Agent,
+    registry: &mut agent::plugins::PluginRegistry,
+    contributed: &Contributed,
+    policy: Arc<PolicyEngine>,
+    events: Arc<EventBus>,
+    workspace: Option<PathBuf>,
+) -> (PluginInfo, ContributionLease) {
     let mut installed_tools = Vec::new();
     for descriptor in &contributed.tools {
         let tool = ExtensionTool::new(
@@ -464,11 +509,18 @@ pub(crate) fn install(
             }
         }
     }
-    PluginInfo {
-        name: contributed.extension.as_str().to_string(),
-        tools: installed_tools,
-        enabled: true,
-    }
+    let lease = ContributionLease {
+        owner: contributed.extension.as_str().to_string(),
+        tools: installed_tools.clone(),
+    };
+    (
+        PluginInfo {
+            name: contributed.extension.as_str().to_string(),
+            tools: installed_tools,
+            enabled: true,
+        },
+        lease,
+    )
 }
 
 fn append_prompt(

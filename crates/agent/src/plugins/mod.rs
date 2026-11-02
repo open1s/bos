@@ -238,6 +238,25 @@ impl PluginRegistry {
             .map(|(kind, owner)| (*kind, owner.as_str()))
     }
 
+    /// Revoke every tool, panel and command owned by the supplied owner.
+    ///
+    /// Ownership is checked against the registry's authoritative owner map;
+    /// names contributed by another extension are never removed.
+    pub fn remove_owner(&mut self, owner: &str) -> usize {
+        let names: Vec<String> = self
+            .owners
+            .iter()
+            .filter_map(|(name, (_, item_owner))| (item_owner == owner).then_some(name.clone()))
+            .collect();
+        for name in &names {
+            self.tools.remove(name);
+            self.panels.remove(name);
+            self.commands.remove(name);
+            self.owners.remove(name);
+        }
+        names.len()
+    }
+
     /// Total number of registered items across all kinds.
     pub fn len(&self) -> usize {
         self.owners.len()
@@ -536,5 +555,22 @@ mod tests {
         assert_eq!(registry.len(), 3);
         assert!(!registry.is_empty());
         assert!(registry.tool_names().len() == 1);
+    }
+
+    #[test]
+    fn removing_owner_revokes_only_that_owners_contributions() {
+        let mut registry = PluginRegistry::new();
+        registry.register_tool("alpha", Arc::new(EchoTool::new("alpha_tool"))).unwrap();
+        registry.register_panel("alpha", UiPanel::new("alpha_panel", "Alpha")).unwrap();
+        registry.register_command("alpha", PluginCommand::new("alpha_cmd", "Alpha")).unwrap();
+        registry.register_tool("beta", Arc::new(EchoTool::new("beta_tool"))).unwrap();
+
+        assert_eq!(registry.remove_owner("alpha"), 3);
+        assert_eq!(registry.len(), 1);
+        assert!(registry.tool("alpha_tool").is_none());
+        assert_eq!(registry.owner_of("alpha_panel"), None);
+        assert_eq!(registry.owner_of("alpha_cmd"), None);
+        assert_eq!(registry.owner_of("beta_tool"), Some((ItemKind::Tool, "beta")));
+        assert_eq!(registry.remove_owner("alpha"), 0);
     }
 }

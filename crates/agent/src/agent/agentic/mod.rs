@@ -908,6 +908,27 @@ impl Agent {
         Ok(())
     }
 
+    /// Remove asynchronous tools by their registered names.
+    ///
+    /// This is the revocation seam used by extension Fiber cleanup. It also
+    /// invalidates the cached engine/context so subsequent turns cannot retain
+    /// the old tool snapshot.
+    pub fn remove_async_tools(&mut self, names: &[String]) -> usize {
+        let Some(registry) = self.registry.as_mut() else {
+            return 0;
+        };
+        let registry = Arc::make_mut(registry);
+        let removed = names
+            .iter()
+            .filter(|name| registry.remove_async(name))
+            .count();
+        if removed > 0 {
+            self.engine_cache.lock().unwrap().take();
+            self.context_cache.lock().unwrap().take();
+        }
+        removed
+    }
+
     /// Get skills schemas for LLM.
     pub fn get_skills_schemas(&self) -> Vec<serde_json::Value> {
         self.skills
