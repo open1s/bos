@@ -3137,8 +3137,6 @@ impl AppState {
 
     /// The agent a session's running turn was built with.
     ///
-    /// None for an idle session: there is no live build to ask, and the next
-    /// turn's own build answers instead.
     /// Keep extension Fiber handles alive for the same duration as this turn.
     pub(crate) fn attach_turn_extensions(
         &mut self,
@@ -3151,6 +3149,10 @@ impl AppState {
             .insert(id.to_string(), activations);
     }
 
+    /// The agent a session's running turn was built with.
+    ///
+    /// None for an idle session: there is no live build to ask, and the next
+    /// turn's own build answers instead.
     pub(crate) fn turn_agent(&self, id: &str) -> Option<Arc<agent::Agent>> {
         self.turn_agents.get(id).cloned()
     }
