@@ -234,12 +234,14 @@ impl ServiceRegistry {
             scope,
             type_id: TypeId::of::<T>(),
         };
-        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
-        let new_generation = Arc::new(ServiceGeneration::new(service));
         let mut entries = self
             .entries
             .write()
             .expect("service registry lock poisoned");
+        // Allocate under the write lock so concurrent registrations cannot
+        // publish generations out of order.
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let new_generation = Arc::new(ServiceGeneration::new(service));
         let previous = entries.insert(key.clone(), (generation, new_generation));
         // Retire while holding the write lock. No new lease can race in after
         // the replacement becomes visible.
