@@ -142,7 +142,7 @@ A failed plan is rejected before activation. Patch application must be transacti
 
 ### Implemented
 
-- The in-process scoped service registry, generation-safe provider tokens, deterministic dependency planner, Fiber state machine and reverse-order effect cleanup are implemented with unit tests.
+- The in-process scoped service registry, generation-safe provider tokens, deterministic dependency planner, Fiber state machine and reverse-order effect cleanup are implemented with unit tests. `ServiceRegistry::provide_owned()` now binds a provider token to a Fiber through a weak registry reference, so stale Fiber cleanup cannot remove a newer provider generation.
 - The host exposes `apply_with_fibers()`, returning one `AppliedExtension` handle per activation.
 - A contribution lease tracks installed async tools, exact prompt sections and newly registered skill manifest paths. Fiber cleanup first closes the shared tool-liveness gate; explicit unload then removes tools, prompt sections, skills and owner-scoped PluginRegistry entries.
 - Agent cache invalidation is part of tool, prompt and skill removal.
