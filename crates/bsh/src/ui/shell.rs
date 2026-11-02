@@ -3303,6 +3303,8 @@ impl Shell {
             self.refuse_compact(&id, text, true, cx);
             return;
         }
+        // Keep Fiber cleanup alive until the temporary summarizer build is done.
+        let _extension_activations = built.extension_activations;
         let agent = built.agent;
         // The manual command condenses everything safe, which is the
         // contract's own rule for `/compact`: it does not wait for pressure,
@@ -3533,6 +3535,8 @@ impl Shell {
         // store, and the pump settles the recorded transition when the turn
         // ends, before it decides whether to continue.
         let goal_store = built.goal.clone();
+        self.state
+            .attach_turn_extensions(&id, built.extension_activations);
         let agent = built.agent;
         // The reader's `/name` gesture loads that skill into THIS turn - the
         // reference's pre-step listener - and the block is recorded on the
