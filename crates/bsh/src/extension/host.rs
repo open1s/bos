@@ -16,6 +16,7 @@ use std::time::SystemTime;
 use serde::Serialize;
 
 use super::agent as contribution;
+use super::composable::{Fiber, FiberState};
 use super::capability::{CallScope, Capability, Decision, GrantScope, PolicyEngine, PolicyMode};
 use super::events::{lifecycle_event, topics, EventBus, ExtensionEvent};
 use super::lifecycle::{Health, LifecycleManager};
@@ -359,6 +360,34 @@ type BuiltRuntime = (
     Vec<ToolDescriptor>,
     DeclarativeContributions,
 );
+
+/// One extension's contributions installed into a single Agent build.
+///
+/// This is a build-scoped activation. The caller must invoke unload before
+/// reusing the Agent/PluginRegistry for another build; dropping the build
+/// naturally drops both registries and the Fiber's liveness guard.
+pub(crate) struct AppliedExtension {
+    pub(crate) info: crate::plugins::PluginInfo,
+    fiber: Fiber,
+    lease: contribution::ContributionLease,
+}
+
+impl AppliedExtension {
+    /// Revoke this activation from the same Agent and PluginRegistry.
+    pub(crate) fn unload(
+        mut self,
+        agent: &mut ::agent::Agent,
+        registry: &mut ::agent::plugins::PluginRegistry,
+    ) -> Result<usize, super::composable::FiberTransitionError> {
+        self.fiber.unload()?;
+        Ok(self.lease.revoke(agent, registry))
+    }
+
+    /// Current live activation state.
+    pub(crate) fn state(&self) -> FiberState {
+        self.fiber.state()
+    }
+}
 
 /// One runtime attached to an observe hook point.
 pub(crate) struct HookTarget {
@@ -1119,6 +1148,83 @@ impl ExtensionHost {
             ));
         }
         infos
+    }
+
+    /// Apply enabled extensions with explicit Fiber ownership.
+    ///
+    /// Unlike the compatibility apply() path, this returns a lease for each
+    /// activation. The caller retains these handles for the lifetime of the
+    /// Agent build and calls AppliedExtension::unload before reusing its
+    /// registries. The Fiber revokes tool liveness first; the lease then
+    /// physically removes tools, commands and panels from their registries.
+    pub(crate) fn apply_with_fibers(
+        &self,
+        agent: &mut ::agent::Agent,
+        registry: &mut ::agent::plugins::PluginRegistry,
+        preset_allowed: Option<&BTreeSet<String>>,
+    ) -> Vec<AppliedExtension> {
+        let mut applied = Vec::new();
+        for entry in self.loaded.values() {
+            if !entry.applied || entry.error.is_some() {
+                continue;
+            }
+            if preset_allowed.is_some_and(|allowed| !allowed.contains(entry.package.id().as_str())) {
+                continue;
+            }
+            let Some(runtime) = &entry.runtime else {
+                continue;
+            };
+            let contributions = &entry.contributions;
+            let has_agent_contribution = !entry.tools.is_empty()
+                || !contributions.commands.is_empty()
+                || !contributions.panels.is_empty()
+                || !contributions.prompts.is_empty()
+                || !contributions.contexts.is_empty()
+                || !entry.package.manifest.contributes.skills.is_empty();
+            if !has_agent_contribution {
+                continue;
+            }
+            let contributed = contribution::Contributed {
+                extension: entry.package.id().clone(),
+                name: entry.package.manifest.extension.name.clone(),
+                runtime: Arc::clone(runtime),
+                trust: entry.package.trust,
+                tools: entry.tools.clone(),
+                commands: contributions.commands.clone(),
+                panels: contributions.panels.clone(),
+                prompts: contributions.prompts.clone(),
+                contexts: contributions.contexts.clone(),
+                workspace: self.config.workspace.clone(),
+                skills_dir: (!entry.package.manifest.contributes.skills.is_empty())
+                    .then(|| entry.package.root.join("skills")),
+                workflows: contributions.workflows.clone(),
+                themes: contributions.themes.clone(),
+                timeout_ms: entry.package.manifest.resources.execution_ms(),
+            };
+            let (info, lease) = contribution::install_with_lease(
+                agent,
+                registry,
+                &contributed,
+                Arc::clone(&self.policy),
+                Arc::clone(&self.events),
+                self.config.workspace.clone(),
+            );
+            let mut fiber = Fiber::new(entry.package.id().as_str());
+            if let Err(error) = fiber.transition(FiberState::Loading) {
+                log::error!("extension {}: Fiber could not start: {error}", entry.package.id());
+                let _ = lease.revoke(agent, registry);
+                continue;
+            }
+            lease.attach_to_fiber(&mut fiber);
+            if let Err(error) = fiber.transition(FiberState::Active) {
+                log::error!("extension {}: Fiber could not activate: {error}", entry.package.id());
+                let _ = fiber.unload();
+                let _ = lease.revoke(agent, registry);
+                continue;
+            }
+            applied.push(AppliedExtension { info, fiber, lease });
+        }
+        applied
     }
 
     /// Every known extension as a status row.
