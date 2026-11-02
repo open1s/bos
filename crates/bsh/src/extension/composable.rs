@@ -160,6 +160,8 @@ impl ServiceRetirement {
         let wait = async {
             loop {
                 let notified = self.owner.drained.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
                 if self.is_drained() {
                     break;
                 }
