@@ -2036,13 +2036,13 @@ static CALLS: Mutex<CallMetrics> = Mutex::new(CallMetrics {
 /// This is the only function the rest of BSH needs. It never panics and never
 /// fails a build: a broken extension is logged and reported through the status
 /// and doctor surfaces, not by making the harness unusable.
-pub(crate) fn install(
+pub(crate) fn install_with_fibers(
     agent: &mut ::agent::Agent,
     registry: &mut ::agent::plugins::PluginRegistry,
     settings: &crate::settings::Settings,
     workspace: Option<&Path>,
     preset_allowed: Option<&[String]>,
-) -> Vec<crate::plugins::PluginInfo> {
+) -> Vec<AppliedExtension> {
     let config =
         HostConfig::from_settings(settings, workspace.map(Path::to_path_buf), preset_allowed);
     let slot = HOST.get_or_init(|| Mutex::new(None));
@@ -2071,7 +2071,7 @@ pub(crate) fn install(
         preset_allowed.map(|ids| ids.iter().cloned().collect::<BTreeSet<_>>());
     guard
         .as_ref()
-        .map(|host| host.apply(agent, registry, allowed.as_ref()))
+        .map(|host| host.apply_with_fibers(agent, registry, allowed.as_ref()))
         .unwrap_or_default()
 }
 
