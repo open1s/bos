@@ -717,14 +717,36 @@ impl ExtensionHost {
         let mut ordered: BTreeSet<String> = BTreeSet::new();
         match resolver::resolve(&available, &roots) {
             Ok(resolution) => {
-                for package in &resolution.packages {
-                    ordered.insert(package.id().as_str().to_string());
+                // Package SemVer resolution chooses the concrete installed set;
+                // service-contract planning then adds provider -> consumer edges
+                // and validates interface versions before any package activates.
+                let manifests: Vec<_> = resolution
+                    .packages
+                    .iter()
+                    .map(|package| package.manifest.clone())
+                    .collect();
+                match super::composable::plan_service_dependencies(&manifests) {
+                    Ok(plan) => {
+                        ordered.extend(plan.order);
+                    }
+                    Err(error) => {
+                        let message = format!("service dependency planning failed: {error}");
+                        issues.push(message.clone());
+                        for root in &roots {
+                            if let Some(entry) = loaded.get_mut(root.as_str()) {
+                                entry.error = Some(message.clone());
+                                manager.fail(root.as_str(), message.clone());
+                            }
+                        }
+                    }
                 }
-                if let Err(error) = write_atomic(
-                    &self.store.lock_path(),
-                    resolution.lock.to_toml()?.as_bytes(),
-                ) {
-                    issues.push(format!("lockfile was not written: {error}"));
+                if !ordered.is_empty() {
+                    if let Err(error) = write_atomic(
+                        &self.store.lock_path(),
+                        resolution.lock.to_toml()?.as_bytes(),
+                    ) {
+                        issues.push(format!("lockfile was not written: {error}"));
+                    }
                 }
             }
             Err(error) => {
