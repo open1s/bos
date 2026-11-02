@@ -675,11 +675,24 @@ impl WasmRuntime {
         })
     }
 
+    fn ensure_running(&self) -> Result<(), ExtensionError> {
+        if self.stopped.load(Ordering::SeqCst) {
+            return Err(ExtensionError::Runtime {
+                extension: self.extension.to_string(),
+                message: "runtime is shut down".to_string(),
+            });
+        }
+        Ok(())
+    }
+
     fn ensure_instance(&self) -> Result<(), ExtensionError> {
+        self.ensure_running()?;
         let mut guard = self.instance.lock().map_err(|_| ExtensionError::Corrupt {
             path: self.component.clone(),
             message: "wasm instance lock is poisoned".to_string(),
         })?;
+        // Shutdown can race with a caller waiting for the instance mutex.
+        self.ensure_running()?;
         if guard.is_some() {
             return Ok(());
         }
@@ -835,6 +848,7 @@ impl WasmRuntime {
             path: self.component.clone(),
             message: "wasm instance lock is poisoned".to_string(),
         })?;
+        self.ensure_running()?;
         let instance = guard.as_mut().expect("instance");
         self.prepare_call(instance, self.resources.execution_ms())?;
         let tools = instance
@@ -890,6 +904,7 @@ impl Runtime for WasmRuntime {
             path: self.component.clone(),
             message: "wasm instance lock is poisoned".to_string(),
         })?;
+        self.ensure_running()?;
         let instance = guard.as_mut().expect("instance was just created");
         self.prepare_call(instance, self.resources.execution_ms())?;
         instance
@@ -1037,6 +1052,7 @@ impl Runtime for WasmRuntime {
         self.ensure_instance()?;
         if let Ok(mut guard) = self.instance.lock() {
             if let Some(instance) = guard.as_mut() {
+        self.ensure_running()?;
                 instance.store.data_mut().progress = progress;
             }
         }
@@ -1055,6 +1071,7 @@ impl Runtime for WasmRuntime {
             path: self.component.clone(),
             message: "wasm instance lock is poisoned".to_string(),
         })?;
+        self.ensure_running()?;
         let instance = guard.as_mut().expect("instance");
         self.prepare_call(instance, self.resources.execution_ms())?;
         let text = instance
@@ -1077,6 +1094,7 @@ impl Runtime for WasmRuntime {
             path: self.component.clone(),
             message: "wasm instance lock is poisoned".to_string(),
         })?;
+        self.ensure_running()?;
         let instance = guard.as_mut().expect("instance");
         self.prepare_call(instance, self.resources.execution_ms())?;
         let text = instance
@@ -1097,10 +1115,17 @@ impl Runtime for WasmRuntime {
     }
 
     async fn pump(&self) -> Result<(), ExtensionError> {
+        if self.stopped.load(Ordering::SeqCst) {
+            return Err(ExtensionError::Runtime {
+                extension: self.extension.to_string(),
+                message: "runtime is shut down".to_string(),
+            });
+        }
         let mut guard = self.instance.lock().map_err(|_| ExtensionError::Corrupt {
             path: self.component.clone(),
             message: "wasm instance lock is poisoned".to_string(),
         })?;
+        self.ensure_running()?;
         let Some(instance) = guard.as_mut() else {
             return Ok(());
         };
@@ -1181,6 +1206,14 @@ mod tests {
         assert!(runtime.fuel_used().unwrap_or(0) > 0);
         assert!(runtime.memory_used().unwrap_or(0) > 0);
         runtime.shutdown().await.expect("shutdown");
+        assert!(runtime.tools().await.is_err(), "shutdown must be terminal");
+        assert!(runtime.panel("status").await.is_err());
+        assert!(runtime.command("test", serde_json::json!({})).await.is_err());
+        assert!(runtime.pump().await.is_err());
+        assert!(
+            runtime.instance.lock().expect("instance lock").is_none(),
+            "post-shutdown entry points must not recreate the component"
+        );
         let _ = std::fs::remove_dir_all(&scratch);
     }
 }
