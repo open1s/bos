@@ -116,9 +116,6 @@ impl<T> ServiceLease<T> {
         self.generation
     }
 
-    pub(crate) fn service(&self) -> &Arc<T> {
-        &self.value
-    }
 }
 
 impl<T> Deref for ServiceLease<T> {
@@ -267,7 +264,10 @@ impl ServiceRegistry {
         (ServiceToken { key, generation }, retirement)
     }
 
-    /// Resolve a typed service in exactly the requested scope.
+    /// Resolve an untracked typed snapshot in exactly the requested scope.
+    ///
+    /// This compatibility lookup does not participate in in-flight draining;
+    /// callers that perform work through the service must use acquire().
     pub(crate) fn get<T>(
         &self,
         scope: &Scope,
