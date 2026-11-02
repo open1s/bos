@@ -787,6 +787,57 @@ mod tests {
         assert!(!registry.contains::<u64>(&scope, "clock"));
     }
 
+    #[tokio::test]
+    async fn replacement_keeps_old_generation_alive_until_leases_drain() {
+        let registry = ServiceRegistry::new();
+        let scope = Scope::Workspace("w1".into());
+        registry.provide(scope.clone(), "index", Arc::new("old".to_string()));
+
+        let old_lease = registry.acquire::<String>(&scope, "index").unwrap();
+        let old_generation = old_lease.generation();
+        let (new_token, retirement) = registry.provide_with_retirement(
+            scope.clone(),
+            "index",
+            Arc::new("new".to_string()),
+        );
+        let retirement = retirement.expect("replaced generation");
+        assert_eq!(retirement.generation(), old_generation);
+        assert_eq!(retirement.in_flight(), 1);
+        assert_eq!(&**old_lease, "old");
+
+        let new_lease = registry.acquire::<String>(&scope, "index").unwrap();
+        assert_eq!(&**new_lease, "new");
+        assert_eq!(new_lease.generation(), new_token.generation);
+        assert!(!retirement.is_drained());
+
+        drop(old_lease);
+        assert!(
+            retirement.wait_drained(Duration::from_millis(100)).await,
+            "retired provider must drain after its last lease is dropped"
+        );
+        drop(new_lease);
+        assert!(registry.revoke(&new_token));
+    }
+
+    #[tokio::test]
+    async fn revoked_service_rejects_new_leases_and_waits_for_existing_calls() {
+        let registry = ServiceRegistry::new();
+        let scope = Scope::Session("s1".into());
+        let token = registry.provide(scope.clone(), "session", Arc::new(7_u64));
+        let lease = registry.acquire::<u64>(&scope, "session").unwrap();
+
+        let retirement = registry
+            .revoke_with_retirement(&token)
+            .expect("current provider revoked");
+        assert!(registry.acquire::<u64>(&scope, "session").is_none());
+        assert!(!retirement.is_drained());
+        assert!(!retirement.wait_drained(Duration::from_millis(1)).await);
+
+        drop(lease);
+        assert!(retirement.wait_drained(Duration::from_millis(100)).await);
+        assert!(registry.revoke_with_retirement(&token).is_none());
+    }
+
     #[test]
     fn service_registry_publishes_availability_and_replacement() {
         let registry = ServiceRegistry::new();
