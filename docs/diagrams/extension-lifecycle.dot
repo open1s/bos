@@ -1,39 +1,50 @@
 digraph ExtensionLifecycle {
   graph [
-    bgcolor="#0B1020", pad="0.42", rankdir=TB,
-    nodesep="0.36", ranksep="0.48", splines=ortho,
+    bgcolor="#0B1020", pad="0.48", rankdir=TB,
+    nodesep="0.48", ranksep="0.64", splines=curved,
     newrank=true, outputorder=edgesfirst,
-    fontname="DejaVu Sans", label="BSH EXTENSION PLATFORM  /  PACKAGE LIFECYCLE",
-    labelloc=t, fontsize=23, fontcolor="#F3F6FC"
+    fontname="DejaVu Sans", label="BSH EXTENSION PLATFORM  /  MAKE THE WORKSPACE YOURS",
+    labelloc=t, fontsize=24, fontcolor="#F3F6FC"
   ];
-  node [
-    shape=box, style="rounded,filled", fontname="DejaVu Sans",
-    fontsize=12, margin="0.24,0.16", color="#3B506F",
-    fillcolor="#17243A", fontcolor="#F3F6FC", penwidth=1.6,
-    width=3.2
-  ];
-  edge [color="#647A99", penwidth=1.6, arrowsize=0.75];
+  node [shape=box, style="rounded,filled", fontname="DejaVu Sans",
+    fontsize=12, margin="0.25,0.18", color="#405575",
+    fillcolor="#17243A", fontcolor="#F3F6FC", penwidth=1.6];
+  edge [color="#7186A5", penwidth=1.8, arrowsize=0.8];
 
-  package [label="01  PACKAGE\nextension.toml · files · runtime type", color="#6EA8FE"];
-  validate [label="02  VALIDATE\nSchema · content · hash · compatibility", color="#55D6E8"];
-  resolve [label="03  RESOLVE\nDependencies · version constraints", color="#B69CFF"];
-  install [label="04  INSTALL\nStage · verify · publish managed version", color="#67D6A3"];
-  activate [label="05  ACTIVATE\nStart adapter · register contributions", color="#FFBE78"];
-  package -> validate -> resolve -> install -> activate;
+  manifest [label="DESCRIBE\nextension.toml · identity · version · contributions", color="#6EA8FE", width=5.2];
+  verify [label="VERIFY\nSchema · package integrity · compatibility", color="#55D6E8", width=5.2];
+  resolve [label="RESOLVE\nDependencies · runtime · permissions", color="#B69CFF", width=5.2];
+  install [label="INSTALL & MANAGE\nVerified package · managed versions · rollback", color="#67D6A3", width=5.2];
+  activate [label="ACTIVATE\nRegister contributions · start extension runtime", color="#FFBE78", width=5.2];
+  manifest -> verify -> resolve -> install -> activate;
 
-  subgraph cluster_host {
-    label="RUNTIME & HOST BOUNDARY";
-    labelloc=t; labeljust=l; fontsize=12; fontcolor="#B69CFF";
-    color="#59477C"; style="rounded"; penwidth=1.5; margin=18;
-    adapters [label="RUNTIME ADAPTERS\nDeclarative · Process / JSON-RPC\nWASM Component · Extism · MCP · Built-in Rust", fillcolor="#121B2E", color="#536987", fontsize=11, width=5.0];
-    host [label="HOST CAPABILITY BOUNDARY\nRequest → policy decision → host API\nAudit authorization decisions", fillcolor="#241C3B", color="#B69CFF", fontsize=11, width=5.0];
-    adapters -> host;
+  subgraph cluster_runtimes {
+    label="MEET DEVELOPERS WHERE THEY ARE  /  MULTIPLE EXTENSION RUNTIMES";
+    labelloc=t; labeljust=l; fontsize=13; fontcolor="#B69CFF";
+    color="#59477C"; style="rounded"; penwidth=1.7; margin=22;
+    declarative [label="DECLARATIVE\nJSON-defined contributions", color="#6EA8FE"];
+    process [label="PROCESS\nExternal programs · JSON-RPC", color="#55D6E8"];
+    wasm [label="WASM COMPONENT\nPortable components · WIT", color="#67D6A3"];
+    extism [label="EXTISM / MCP\nPlugin and server reuse", color="#FFBE78"];
+    builtin [label="BUILT-IN RUST\nFirst-party native extensions", color="#B69CFF"];
+    {rank=same; declarative; process; wasm;}
+    {rank=same; extism; builtin;}
   }
-  activate -> adapters;
+  activate -> declarative;
+  activate -> process;
+  activate -> wasm;
+  activate -> extism;
+  activate -> builtin;
 
-  note [
-    shape=note, style="filled", label="SECURITY IS LAYERED\nCapability authorization and OS-level isolation are separate controls.\nEnforcement depends on the runtime and operating system.",
-    fillcolor="#121B2E", color="#536987", fontsize=10, width=5.0
-  ];
-  host -> note [style=dashed, arrowhead=none, color="#536987"];
+  host [label="HOST INTEGRATION SURFACE\nTools · commands · panels · prompts · skills · themes\nWorkflows · language services · storage · hooks",
+    fillcolor="#241C3B", color="#B69CFF", penwidth=2.1, fontsize=12, width=7.4];
+  declarative -> host;
+  process -> host;
+  wasm -> host;
+  extism -> host;
+  builtin -> host;
+
+  security [label="TRUST BOUNDARY\nCapability request → policy decision → host API\nAuthorization is distinct from OS-level isolation",
+    fillcolor="#302719", color="#FFBE78", penwidth=1.7, fontsize=11, width=6.4];
+  host -> security;
 }

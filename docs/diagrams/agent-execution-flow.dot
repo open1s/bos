@@ -1,35 +1,40 @@
 digraph AgentFlow {
   graph [
-    bgcolor="#0B1020", pad="0.42", rankdir=TB,
-    nodesep="0.38", ranksep="0.48", splines=ortho,
+    bgcolor="#0B1020", pad="0.48", rankdir=LR,
+    nodesep="0.48", ranksep="0.72", splines=curved,
     newrank=true, outputorder=edgesfirst,
-    fontname="DejaVu Sans", label="AGENT EXECUTION  /  REACT LOOP",
-    labelloc=t, fontsize=23, fontcolor="#F3F6FC"
+    fontname="DejaVu Sans", label="BOS AGENT ENGINE  /  FROM INTENT TO ACTION",
+    labelloc=t, fontsize=24, fontcolor="#F3F6FC"
   ];
-  node [
-    shape=box, style="rounded,filled", fontname="DejaVu Sans",
-    fontsize=12, margin="0.24,0.16", color="#3B506F",
-    fillcolor="#17243A", fontcolor="#F3F6FC", penwidth=1.6
-  ];
-  edge [color="#647A99", penwidth=1.6, arrowsize=0.75];
+  node [shape=box, style="rounded,filled", fontname="DejaVu Sans",
+    fontsize=12, margin="0.25,0.18", color="#405575",
+    fillcolor="#17243A", fontcolor="#F3F6FC", penwidth=1.6];
+  edge [color="#7186A5", penwidth=1.8, arrowsize=0.8];
 
-  input [label="01  INPUT\nUser request + session context", color="#6EA8FE", width=3.5];
-  reason [label="02  REASON\nBuild context · call model · stream", color="#B69CFF", width=3.5];
-  decide [shape=diamond, style="filled", label="03\nDECIDE", color="#FFBE78", fillcolor="#352B1B", width=1.7, height=0.95, margin=0.08];
-  execute [label="04  EXECUTE TOOL\nResolve · authorize · invoke", color="#67D6A3", width=3.5];
-  observe [label="05  OBSERVE\nCapture result · update context", color="#55D6E8", width=3.5];
-  finish [label="RETURN\nFinal response + execution metadata", fillcolor="#102C31", color="#67D6A3", penwidth=2, width=3.5];
+  request [label="USER INTENT\nRequest · goals · session", color="#6EA8FE", width=2.5];
+  understand [label="UNDERSTAND\nContext · memory · skills", color="#55D6E8", width=2.6];
+  reason [label="REASON & PLAN\nModel intelligence · decisions", color="#B69CFF", fillcolor="#29213E", penwidth=2.2, width=2.8];
+  decide [shape=diamond, style="filled", label="NEXT\nACTION?", color="#FFBE78", fillcolor="#352B1B", width=1.45, height=1.05, margin=0.08];
+  execute [label="ACT\nTools · MCP · agents", color="#67D6A3", fillcolor="#123C35", width=2.5];
+  observe [label="OBSERVE & LEARN\nResults · events · context update", color="#55D6E8", width=2.8];
+  answer [label="DELIVER\nResponse · artifacts · events", color="#67D6A3", fillcolor="#102F2B", penwidth=2.2, width=2.6];
 
-  input -> reason -> decide;
-  decide -> finish [label="  final answer", color="#67D6A3", fontcolor="#67D6A3", minlen=2];
-  decide -> execute [label="  tool call", color="#FFBE78", fontcolor="#FFBE78"];
+  request -> understand -> reason -> decide;
+  decide -> answer [label="  complete", color="#67D6A3", fontcolor="#67D6A3", minlen=2];
+  decide -> execute [label="  act", color="#FFBE78", fontcolor="#FFBE78"];
   execute -> observe [color="#55D6E8"];
-  observe -> reason [label="  feedback to context", color="#55D6E8", fontcolor="#55D6E8", constraint=false, minlen=2];
+  observe -> reason [label="  feedback loop", color="#55D6E8", fontcolor="#55D6E8", constraint=false, minlen=2];
 
-  guard [
-    shape=box, style="rounded,filled", label="EXECUTION GUARDRAILS\nTool registry · capability policy · deadlines · cancellation\nRetry / rate limits · observability",
-    fillcolor="#121B2E", color="#536987", fontsize=10, width=7.2
-  ];
-  {rank=same; execute; guard;}
-  execute -> guard [style=dashed, arrowhead=none, color="#536987", constraint=false];
+  subgraph cluster_control {
+    label="ALWAYS-ON EXECUTION CONTROL";
+    labelloc=t; labeljust=l; fontsize=12; fontcolor="#FFBE78";
+    color="#66543A"; style="rounded"; penwidth=1.4; margin=18;
+    policy [label="CAPABILITY POLICY\nAuthorize every host action", color="#FFBE78", fillcolor="#302719"];
+    resilience [label="RESILIENCE\nDeadlines · retries · rate limits", color="#67D6A3", fillcolor="#17352F"];
+    trace [label="OBSERVABILITY\nLogs · metrics · execution state", color="#6EA8FE", fillcolor="#192B48"];
+    {rank=same; policy; resilience; trace;}
+  }
+  execute -> policy [style=dashed, arrowhead=none, color="#FFBE78", constraint=false];
+  reason -> resilience [style=dashed, arrowhead=none, color="#67D6A3", constraint=false];
+  observe -> trace [style=dashed, arrowhead=none, color="#6EA8FE", constraint=false];
 }

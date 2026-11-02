@@ -1,65 +1,71 @@
 digraph BOS {
   graph [
-    bgcolor="#0B1020", pad="0.42", rankdir=TB,
-    nodesep="0.42", ranksep="0.62", splines=ortho,
+    bgcolor="#0B1020", pad="0.48", rankdir=TB,
+    nodesep="0.48", ranksep="0.72", splines=curved,
     compound=true, newrank=true, outputorder=edgesfirst,
-    fontname="DejaVu Sans", label="BOS  /  ONE RUNTIME · MULTIPLE INTERFACES",
-    labelloc=t, fontsize=23, fontcolor="#F3F6FC"
+    fontname="DejaVu Sans", label="BOS  /  THE OPEN FOUNDATION FOR INTELLIGENT AGENTS",
+    labelloc=t, fontsize=24, fontcolor="#F3F6FC"
   ];
-  node [
-    shape=box, style="rounded,filled", fontname="DejaVu Sans",
-    fontsize=12, margin="0.24,0.16", color="#3B506F",
-    fillcolor="#17243A", fontcolor="#F3F6FC", penwidth=1.5
-  ];
-  edge [color="#647A99", penwidth=1.5, arrowsize=0.7];
+  node [shape=box, style="rounded,filled", fontname="DejaVu Sans",
+    fontsize=12, margin="0.25,0.18", color="#405575",
+    fillcolor="#17243A", fontcolor="#F3F6FC", penwidth=1.5];
+  edge [color="#7186A5", penwidth=1.7, arrowsize=0.75];
 
-  subgraph cluster_surfaces {
-    label="DEVELOPER & PRODUCT SURFACES";
+  subgraph cluster_experience {
+    label="BUILD  ·  INTEGRATE  ·  OPERATE";
     labelloc=t; labeljust=l; fontsize=13; fontcolor="#55D6E8";
-    color="#34445F"; style="rounded"; penwidth=1.3; margin=20;
-    rust [label="RUST API\nNative crates", color="#6EA8FE"];
-    nbos [label="NBOS\nPython bindings", color="#FFBE78"];
-    jsbos [label="JSBOS\nJavaScript / Node.js", color="#67D6A3"];
-    bsh [label="BSH\nNative GPUI workspace", color="#B69CFF"];
-    {rank=same; rust; nbos; jsbos; bsh;}
+    color="#34445F"; style="rounded"; penwidth=1.4; margin=22;
+    rust [label="RUST\nNative applications", color="#6EA8FE", fillcolor="#192B48"];
+    python [label="PYTHON / NBOS\nAutomation · prototypes", color="#FFBE78", fillcolor="#302719"];
+    javascript [label="JAVASCRIPT / JSBOS\nNode.js · tooling", color="#67D6A3", fillcolor="#17352F"];
+    bsh [label="BSH DESKTOP WORKSPACE\nBuild · use · orchestrate agents", color="#B69CFF", fillcolor="#29213E", penwidth=2];
+    {rank=same; rust; python; javascript; bsh;}
   }
 
-  subgraph cluster_runtime {
-    label="BOS RUNTIME  /  SHARED RUST EXECUTION CORE";
-    labelloc=t; labeljust=l; fontsize=15; fontcolor="#67D6A3";
-    color="#398B7B"; style="rounded"; penwidth=2; margin=22;
-    agent [label="AGENT + REACT\nReason · act · observe", fillcolor="#123C3A", color="#3A9D88"];
-    tools [label="TOOLS + SKILLS\nRegistry · dispatch · MCP", fillcolor="#123C3A", color="#3A9D88"];
-    bus [label="MESSAGE BUS\nPub/Sub · query · RPC", fillcolor="#123C3A", color="#3A9D88"];
-    llm [label="LLM ADAPTERS\nProviders · streaming", fillcolor="#123C3A", color="#3A9D88"];
-    resilience [label="RESILIENCE\nRetry · limits · breaker", fillcolor="#123C3A", color="#3A9D88"];
-    context [label="CONTEXT & MEMORY\nSession · skills · memory", fillcolor="#123C3A", color="#3A9D88"];
-    {rank=same; agent; tools; bus;}
-    {rank=same; llm; resilience; context;}
-    agent -> llm [style=invis, weight=12];
-    tools -> resilience [style=invis, weight=12];
-    bus -> context [style=invis, weight=12];
+  subgraph cluster_core {
+    label="BOS RUNTIME  /  ONE SHARED RUST-NATIVE AGENT ENGINE";
+    labelloc=t; labeljust=l; fontsize=16; fontcolor="#67D6A3";
+    color="#398B7B"; style="rounded"; penwidth=2.2; margin=24;
+
+    orchestration [label="AGENT ORCHESTRATION\nReAct · multi-step execution · lifecycle", fontsize=15,
+      fillcolor="#12443E", color="#67D6A3", penwidth=2.4, width=5.2, height=0.9];
+
+    models [label="MODEL INTELLIGENCE\nProvider adapters · streaming", color="#B69CFF"];
+    tools [label="ACTION ECOSYSTEM\nTools · skills · MCP", color="#55D6E8"];
+    context [label="CONTEXT & MEMORY\nSessions · reusable knowledge", color="#6EA8FE"];
+    messaging [label="AGENT COMMUNICATION\nPub/Sub · query · RPC", color="#FFBE78"];
+    governance [label="RELIABILITY & GOVERNANCE\nPolicies · retries · limits · telemetry", color="#67D6A3"];
+
+    {rank=same; models; tools; context;}
+    {rank=same; messaging; governance;}
+    orchestration -> models [dir=both, arrowtail=none];
+    orchestration -> tools [dir=both, arrowtail=none];
+    orchestration -> context [dir=both, arrowtail=none];
+    orchestration -> messaging [dir=both, arrowtail=none];
+    orchestration -> governance [dir=both, arrowtail=none];
   }
 
-  foundation [
-    label="FOUNDATION & INTEGRATIONS\nConfiguration  ·  Logging / Telemetry  ·  Security / Capabilities  ·  External LLMs  ·  MCP Servers",
-    fillcolor="#121B2E", color="#536987", fontsize=11, penwidth=1.5,
-    width=8.8
-  ];
+  subgraph cluster_ecosystem {
+    label="CONNECTED ECOSYSTEM";
+    labelloc=t; labeljust=l; fontsize=12; fontcolor="#FFBE78";
+    color="#66543A"; style="rounded"; penwidth=1.4; margin=18;
+    providers [label="LLM PROVIDERS\nOpenAI-compatible · Anthropic · NVIDIA · Google", fillcolor="#282318", color="#A88B55"];
+    mcp [label="MCP SERVERS & EXTERNAL TOOLS\nTools · resources · prompts", fillcolor="#282318", color="#A88B55"];
+    platform [label="RUST FOUNDATION\nAsync runtime · configuration · logging · security", fillcolor="#17243A", color="#536987"];
+    {rank=same; providers; mcp; platform;}
+  }
 
-  extension [
-    label="BSH EXTENSION PLATFORM\nWorkspace contributions · tools · commands · panels",
-    fillcolor="#241C3B", color="#B69CFF", fontsize=11, penwidth=1.7,
-    width=5.4
-  ];
+  extensions [label="BSH EXTENSION PLATFORM\nDeclarative · Process · WASM Component · Extism · MCP · Built-in\nTools · commands · panels · workflows · workspace contributions",
+    fillcolor="#241C3B", color="#B69CFF", penwidth=2, fontsize=11, width=8.0];
 
-  rust -> agent;
-  nbos -> agent;
-  jsbos -> agent;
-  bsh -> agent;
-  llm -> foundation [color="#67D6A3"];
-  resilience -> foundation [color="#67D6A3"];
-  context -> foundation [color="#67D6A3"];
-  bsh -> extension [style=dashed, color="#B69CFF", penwidth=1.8, constraint=false];
-  {rank=same; foundation; extension;}
+  rust -> orchestration;
+  python -> orchestration;
+  javascript -> orchestration;
+  bsh -> orchestration [penwidth=2.2, color="#B69CFF"];
+  models -> providers;
+  tools -> mcp;
+  context -> platform;
+  governance -> platform;
+  bsh -> extensions [style=dashed, color="#B69CFF", penwidth=2, constraint=false];
+  {rank=same; extensions; platform;}
 }
