@@ -501,6 +501,12 @@ pub(crate) struct AppState {
     /// skills that resolution needs. Attached with the steer mailbox and
     /// dropped with it, so only a live turn's agent is reachable here.
     turn_agents: HashMap<String, Arc<agent::Agent>>,
+    /// Fiber activations owned by each live turn's Agent build.
+    ///
+    /// Dropping these handles runs Fiber effect cleanup and closes each
+    /// extension tool's liveness gate before the turn's Agent is released.
+    turn_extension_activations:
+        HashMap<String, Vec<crate::extension::host::AppliedExtension>>,
     /// Messages taken off a queue to steer, by ticket.
     ///
     /// A message is removed from the queue the moment the reader asks for it
@@ -798,6 +804,7 @@ impl AppState {
             inbox_seq: 0,
             steer_mailboxes: HashMap::new(),
             turn_agents: HashMap::new(),
+            turn_extension_activations: HashMap::new(),
             steering: HashMap::new(),
             search_open: false,
             search_query: String::new(),
@@ -1896,6 +1903,7 @@ impl AppState {
         // delivered them, and the next turn is seeded from the store.
         self.steer_mailboxes.remove(id);
         self.turn_agents.remove(id);
+        self.turn_extension_activations.remove(id);
         self.restore_orphan_steers(id);
         let stopped = now_ms();
         if let Some(session) = self.store.session_mut(id) {
@@ -3131,6 +3139,18 @@ impl AppState {
     ///
     /// None for an idle session: there is no live build to ask, and the next
     /// turn's own build answers instead.
+    /// Keep extension Fiber handles alive for the same duration as this turn.
+    pub(crate) fn attach_turn_extensions(
+        &mut self,
+        id: &str,
+        activations: Vec<crate::extension::host::AppliedExtension>,
+    ) {
+        if !activations.is_empty() {
+            self.turn_extension_activations
+                .insert(id.to_string(), activations);
+        }
+    }
+
     pub(crate) fn turn_agent(&self, id: &str) -> Option<Arc<agent::Agent>> {
         self.turn_agents.get(id).cloned()
     }
@@ -3380,6 +3400,7 @@ impl AppState {
             // row it never answered for goes back to the queue.
             self.steer_mailboxes.remove(id);
             self.turn_agents.remove(id);
+            self.turn_extension_activations.remove(id);
             self.restore_orphan_steers(id);
             self.turn_started = None;
             self.refresh_policy_audit();
