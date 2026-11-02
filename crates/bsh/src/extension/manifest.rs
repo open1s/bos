@@ -224,7 +224,6 @@ pub(crate) enum ServiceScope {
     Host,
     Workspace,
     Session,
-    Extension,
 }
 
 /// A service contract published by this extension.
