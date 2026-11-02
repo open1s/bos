@@ -1,0 +1,28 @@
+digraph BOS {
+  graph [bgcolor="#0B1020", pad="0.35", rankdir=TB, nodesep="0.32", ranksep="0.42", splines=polyline, compound=true, fontname="DejaVu Sans", label="BOS  /  ONE RUNTIME · MULTIPLE INTERFACES", labelloc=t, fontsize=25, fontcolor="#F3F6FC"];
+  node [shape=box, style="rounded,filled", fontname="DejaVu Sans", fontsize=14, margin="0.22,0.14", color="#3B506F", fillcolor="#17243A", fontcolor="#F3F6FC", penwidth=1.6];
+  edge [color="#536987", penwidth=1.7, arrowsize=0.75];
+  subgraph cluster_surface { label="DEVELOPER & PRODUCT SURFACES"; color="#34445F"; fontcolor="#55D6E8"; fontsize=15; style="rounded"; penwidth=1.4;
+    rust [label="RUST API\nNative crates", color="#6EA8FE"];
+    nbos [label="NBOS\nPython bindings", color="#FFBE78"];
+    jsbos [label="JSBOS\nJavaScript / Node.js", color="#67D6A3"];
+    bsh [label="BSH\nNative GPUI workspace", color="#B69CFF"];
+    {rank=same; rust; nbos;}
+    {rank=same; jsbos; bsh;}
+    rust -> jsbos [style=invis, weight=10]; nbos -> bsh [style=invis, weight=10];
+  }
+  subgraph cluster_runtime { label="BOS RUNTIME  /  SHARED RUST EXECUTION CORE"; color="#67D6A3"; fontcolor="#67D6A3"; fontsize=17; style="rounded"; penwidth=2.2;
+    agent [label="AGENT + REACT\nReason · act · observe", fillcolor="#123C3A", color="#3A9D88"];
+    tools [label="TOOLS + SKILLS\nRegistry · dispatch · MCP", fillcolor="#123C3A", color="#3A9D88"];
+    bus [label="MESSAGE BUS\nPub/Sub · query · RPC", fillcolor="#123C3A", color="#3A9D88"];
+    llm [label="LLM ADAPTERS\nProviders · streaming", fillcolor="#123C3A", color="#3A9D88"];
+    resilience [label="RESILIENCE\nRetry · limits · breaker", fillcolor="#123C3A", color="#3A9D88"];
+    {rank=same; agent; tools; bus;}
+    {rank=same; llm; resilience;}
+    agent -> llm [style=invis, weight=10]; tools -> resilience [style=invis, weight=10];
+  }
+  foundation [label="FOUNDATION & INTEGRATIONS\nConfig  ·  Logging / Telemetry  ·  Memory  ·  Security / Capabilities  ·  External LLMs  ·  MCP Servers", fillcolor="#121B2E", color="#536987", fontsize=13];
+  ext [label="BSH EXTENSION PLATFORM\nExtends BSH — not another runtime", fillcolor="#241C3B", color="#B69CFF", fontsize=13];
+  rust -> agent; nbos -> agent; jsbos -> agent; bsh -> agent;
+  resilience -> foundation [color="#67D6A3", penwidth=2]; bsh -> ext [style=dashed, color="#B69CFF", constraint=false];
+}
