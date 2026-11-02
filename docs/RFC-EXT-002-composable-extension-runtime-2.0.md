@@ -149,10 +149,11 @@ A failed plan is rejected before activation. Patch application must be transacti
 
 ### Not yet complete / not yet verified
 
-- The production Agent construction path still calls the compatibility `apply()` API. It does not yet retain `AppliedExtension` handles or invoke deterministic unload during Agent rebuild/teardown. Therefore Fiber-owned revocation is available as a host API but is not yet the production lifecycle.
+- The production turn builder now calls `install_with_fibers()` and carries each `AppliedExtension` in `BuiltAgent`. The live shell stores those handles by session alongside the turn Agent, and drops them on terminal completion, stop or archive. The temporary compaction build retains its handles until the compaction task exits.
+- Production teardown disposes the whole build rather than mutating a live Agent in place. Dropping the Fiber's effect set closes the shared tool-liveness gate; the Agent and its tool registry are then released with the build. The explicit `AppliedExtension::unload(agent, registry)` path remains available for future in-place replacement where the same registries survive.
 - Calls admitted before revocation are not drained or forcibly cancelled. The liveness gate prevents new invocations; already-running work may finish.
-- The new host adapter and Agent removal paths still require targeted Cargo tests, formatting and CI validation. A merged PR is not evidence that these checks passed.
+- The production integration and new lifecycle test still require targeted Cargo tests, formatting and CI validation. A merged commit is not evidence that these checks passed.
 - Service availability notifications, provider replacement reconciliation and dependency-driven activation remain future work.
 - DSH bundle patches remain unsupported until the composition engine is wired and covered by fixtures.
 
-Do not mark 2.0-B complete until production construction retains activation handles and unloads them against the same Agent/PluginRegistry pair, and tests prove prompt/skill/tool/command/panel cleanup on both normal teardown and partial activation failure.
+Do not mark 2.0-B complete until tests prove that production turn ownership retains Fiber handles through the live turn, closes tool liveness on every teardown path, and cleans prompt/skill/tool/command/panel contributions on explicit unload and partial activation failure.
