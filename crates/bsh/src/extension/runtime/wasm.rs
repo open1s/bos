@@ -676,6 +676,12 @@ impl WasmRuntime {
     }
 
     fn ensure_instance(&self) -> Result<(), ExtensionError> {
+        if self.stopped.load(Ordering::SeqCst) {
+            return Err(ExtensionError::Runtime {
+                extension: self.extension.to_string(),
+                message: "runtime is shut down".to_string(),
+            });
+        }
         let mut guard = self.instance.lock().map_err(|_| ExtensionError::Corrupt {
             path: self.component.clone(),
             message: "wasm instance lock is poisoned".to_string(),
@@ -1097,6 +1103,12 @@ impl Runtime for WasmRuntime {
     }
 
     async fn pump(&self) -> Result<(), ExtensionError> {
+        if self.stopped.load(Ordering::SeqCst) {
+            return Err(ExtensionError::Runtime {
+                extension: self.extension.to_string(),
+                message: "runtime is shut down".to_string(),
+            });
+        }
         let mut guard = self.instance.lock().map_err(|_| ExtensionError::Corrupt {
             path: self.component.clone(),
             message: "wasm instance lock is poisoned".to_string(),
@@ -1181,6 +1193,14 @@ mod tests {
         assert!(runtime.fuel_used().unwrap_or(0) > 0);
         assert!(runtime.memory_used().unwrap_or(0) > 0);
         runtime.shutdown().await.expect("shutdown");
+        assert!(runtime.tools().await.is_err(), "shutdown must be terminal");
+        assert!(runtime.panel("status").await.is_err());
+        assert!(runtime.command("test", serde_json::json!({})).await.is_err());
+        assert!(runtime.pump().await.is_err());
+        assert!(
+            runtime.instance.lock().expect("instance lock").is_none(),
+            "post-shutdown entry points must not recreate the component"
+        );
         let _ = std::fs::remove_dir_all(&scratch);
     }
 }
