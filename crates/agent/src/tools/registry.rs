@@ -343,4 +343,14 @@ mod mcp_projection_tests {
     fn non_mcp_tools_are_excluded() {
         assert!(registry("plain", false).mcp_tool_entries().is_empty());
     }
+
+    #[test]
+    fn removing_async_tool_clears_schema_and_mcp_metadata() {
+        let mut registry = registry("ns_echo", true);
+        assert_eq!(registry.mcp_tool_entries().len(), 1);
+        assert!(registry.remove_async("ns_echo"));
+        assert!(registry.get_async("ns_echo").is_none());
+        assert!(registry.mcp_tool_entries().is_empty());
+        assert!(!registry.remove_async("ns_echo"));
+    }
 }
