@@ -1,0 +1,18 @@
+digraph AgentFlow {
+  graph [bgcolor="#0B1020", pad="0.35", rankdir=LR, nodesep="0.34", ranksep="0.48", splines=ortho, fontname="DejaVu Sans", label="AGENT EXECUTION  /  REACT LOOP", labelloc=t, fontsize=25, fontcolor="#F3F6FC"];
+  node [shape=box, style="rounded,filled", fontname="DejaVu Sans", fontsize=14, margin="0.22,0.16", color="#3B506F", fillcolor="#17243A", fontcolor="#F3F6FC", penwidth=1.7];
+  edge [color="#536987", penwidth=1.8, arrowsize=0.8];
+  input [label="01  INPUT\nUser request\n+ session context", color="#6EA8FE"];
+  reason [label="02  REASON\nBuild prompt\nCall model / stream", color="#B69CFF"];
+  decide [label="03  DECIDE\nFinal answer?\nOr tool action?", color="#FFBE78"];
+  execute [label="04  EXECUTE\nResolve tool\nAuthorize & run", color="#67D6A3"];
+  observe [label="05  OBSERVE\nCapture result\nUpdate context", color="#55D6E8"];
+  finish [label="RETURN\nFinal response\n+ execution metadata", fillcolor="#102C31", color="#67D6A3", penwidth=2.2];
+  input -> reason -> decide;
+  decide -> finish [label="final", fontcolor="#67D6A3", color="#67D6A3"];
+  decide -> execute [label="tool call", fontcolor="#FFBE78", color="#FFBE78"];
+  execute -> observe -> reason [label="feedback", fontcolor="#55D6E8", color="#55D6E8", constraint=false];
+  guard [shape=note, label="GUARDRAILS\nTool registry · capability authorization\nTimeouts · retry / rate limits · cancellation · observability", fillcolor="#121B2E", color="#536987", fontsize=12];
+  {rank=same; execute; guard;}
+  execute -> guard [style=dashed, arrowhead=none, color="#536987"];
+}
