@@ -347,7 +347,11 @@ pub(super) fn linux_bwrap_plan(
 /// This is a filesystem profile, not a network sandbox: the process protocol
 /// has no host network bridge, so network policy for a process package remains
 /// the capability decision that authorized spawning it.
-pub(super) fn sandbox_profile(root: &Path, workspace: Option<&Path>, data_root: Option<&Path>) -> String {
+pub(super) fn sandbox_profile(
+    root: &Path,
+    workspace: Option<&Path>,
+    data_root: Option<&Path>,
+) -> String {
     let mut profile = "(version 1)(allow default)(deny file-write*)(allow file-write*".to_string();
     let mut paths: Vec<PathBuf> = vec![
         root.canonicalize().unwrap_or_else(|_| root.to_path_buf()),
