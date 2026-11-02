@@ -108,6 +108,7 @@ pub(crate) struct ExtensionTool {
     timeout_ms: u64,
     qualified: String,
     cancelled: Arc<AtomicBool>,
+    active: Arc<AtomicBool>,
 }
 
 /// The progress events one tool may emit in a one-second window.
@@ -156,6 +157,24 @@ impl ExtensionTool {
         events: Arc<EventBus>,
         workspace: Option<PathBuf>,
     ) -> Self {
+        Self::new_with_liveness(
+            contributed,
+            descriptor,
+            policy,
+            events,
+            workspace,
+            Arc::new(AtomicBool::new(true)),
+        )
+    }
+
+    fn new_with_liveness(
+        contributed: &Contributed,
+        descriptor: ToolDescriptor,
+        policy: Arc<PolicyEngine>,
+        events: Arc<EventBus>,
+        workspace: Option<PathBuf>,
+        active: Arc<AtomicBool>,
+    ) -> Self {
         let qualified = contributed.extension.qualify(&descriptor.id);
         Self {
             owner: contributed.extension.clone(),
@@ -168,6 +187,7 @@ impl ExtensionTool {
             timeout_ms: contributed.timeout_ms,
             qualified,
             cancelled: Arc::new(AtomicBool::new(false)),
+            active,
         }
     }
 
@@ -273,6 +293,11 @@ impl ExtensionTool {
         arguments: &Value,
         progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
     ) -> Result<Value, agent::tools::ToolError> {
+        if !self.active.load(Ordering::SeqCst) {
+            return Err(agent::tools::ToolError::Failed(
+                "extension contribution has been revoked".to_string(),
+            ));
+        }
         self.cancelled.store(false, Ordering::SeqCst);
         let started = std::time::Instant::now();
         let correlation = uuid::Uuid::new_v4().to_string();
@@ -431,13 +456,15 @@ pub(crate) fn install_with_lease(
     workspace: Option<PathBuf>,
 ) -> (PluginInfo, ContributionLease) {
     let mut installed_tools = Vec::new();
+    let active = Arc::new(AtomicBool::new(true));
     for descriptor in &contributed.tools {
-        let tool = ExtensionTool::new(
+        let tool = ExtensionTool::new_with_liveness(
             contributed,
             descriptor.clone(),
             Arc::clone(&policy),
             Arc::clone(&events),
             workspace.clone(),
+            Arc::clone(&active),
         );
         let name = tool.name().to_string();
         match agent.try_add_async_tool(Arc::new(tool)) {
@@ -473,8 +500,9 @@ pub(crate) fn install_with_lease(
         }
     }
     let mut prompt_budget = 0usize;
+    let mut prompt_sections = Vec::new();
     for prompt in &contributed.prompts {
-        append_prompt(
+        if let Some(section) = append_prompt(
             agent,
             &contributed.extension,
             contributed.trust,
@@ -482,13 +510,15 @@ pub(crate) fn install_with_lease(
             "Extension prompt",
             prompt,
             &mut prompt_budget,
-        );
+        ) {
+            prompt_sections.push(section);
+        }
     }
     for context in &contributed.contexts {
         if !context_matches(context, contributed.workspace.as_deref()) {
             continue;
         }
-        append_prompt(
+        if let Some(section) = append_prompt(
             agent,
             &contributed.extension,
             contributed.trust,
@@ -496,16 +526,31 @@ pub(crate) fn install_with_lease(
             "Extension context",
             context,
             &mut prompt_budget,
-        );
+        ) {
+            prompt_sections.push(section);
+        }
     }
+    let mut skill_paths = Vec::new();
     if let Some(skills) = &contributed.skills_dir {
         if skills.is_dir() {
+            let before: std::collections::HashSet<PathBuf> = agent
+                .skills()
+                .iter()
+                .map(|skill| skill.metadata.path.clone())
+                .collect();
             if let Err(error) = agent.register_skills_from_dir(skills.clone()) {
                 log::warn!(
                     target: "bsh::extension",
                     "{}: skills were declared but could not be read: {error}",
                     contributed.extension
                 );
+            } else {
+                skill_paths = agent
+                    .skills()
+                    .iter()
+                    .filter(|skill| !before.contains(&skill.metadata.path))
+                    .map(|skill| skill.metadata.path.clone())
+                    .collect();
             }
         }
     }
@@ -531,7 +576,7 @@ fn append_prompt(
     heading: &str,
     contribution: &super::runtime::declarative::TextContribution,
     budget: &mut usize,
-) {
+) -> Option<String> {
     let capability = if heading == "Extension prompt" {
         Capability::AgentPromptsProvide
     } else {
@@ -541,11 +586,11 @@ fn append_prompt(
         .authorize_call(extension.as_str(), trust, capability, &CallScope::default())
         .is_err()
     {
-        return;
+        return None;
     }
     let text = contribution.text.trim();
     if text.is_empty() {
-        return;
+        return None;
     }
     let section = format!(
         "## {heading}: {} ({})
@@ -555,10 +600,11 @@ fn append_prompt(
         truncate(text, MAX_PROMPT_SECTION)
     );
     if *budget + section.len() > MAX_TOTAL_PROMPT {
-        return;
+        return None;
     }
     *budget += section.len();
     agent.append_system_prompt(&section);
+    Some(section)
 }
 
 #[cfg(test)]
@@ -754,6 +800,27 @@ mod tests {
         }
         assert!(items.iter().any(|item| item.contains("half")), "{items:?}");
         assert_eq!(items.last().map(String::as_str), Some("done"));
+    }
+
+    #[tokio::test]
+    async fn a_revoked_extension_tool_cannot_start_a_new_call() {
+        let scratch = Scratch::new("revoked");
+        let contributed = contributed(vec![], TrustLevel::Builtin);
+        let tool = ExtensionTool::new_with_liveness(
+            &contributed,
+            contributed.tools[0].clone(),
+            policy(&scratch),
+            EventBus::new(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let error = react::tool::registry::AsyncTool::run(
+            &tool,
+            &serde_json::json!({}),
+        )
+        .await
+        .expect_err("revoked tool must not run");
+        assert!(error.to_string().contains("revoked"), "{error}");
     }
 
     #[tokio::test]
