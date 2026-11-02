@@ -497,8 +497,8 @@ mod service_scope_tests {
             &ServiceScope::Host,
             &Scope::Host,
             "ext",
-            Some(Path::new("/repo")),
-            session
+            "/repo",
+            session,
         ));
         assert!(service_scope_matches(
             &ServiceScope::Workspace,
