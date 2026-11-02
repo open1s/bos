@@ -8046,4 +8046,93 @@ mod tests {
             );
         }
     }
+
+    /// Deleting an idle session parks its transcript without inventing a
+    /// cancellation marker on the last assistant row.
+    #[test]
+    fn deleting_an_idle_session_does_not_mark_it_cancelled() {
+        let (mut state, id) = goal_state("delete-idle");
+        state
+            .store
+            .session_mut(&id)
+            .expect("session")
+            .messages
+            .push(crate::model::ChatMessage::assistant());
+
+        assert!(state.delete_session(&id));
+        assert!(state.store.session(&id).is_none());
+
+        let parked = state
+            .trash()
+            .into_iter()
+            .find(|entry| {
+                entry.envelope.payload.get("id").and_then(serde_json::Value::as_str)
+                    == Some(id.as_str())
+            })
+            .expect("the deleted session is recoverable");
+        let cancelled = parked.envelope.payload["messages"][0]["meta"]["cancelled"]
+            .as_bool()
+            .unwrap_or(false);
+        assert!(!cancelled, "an idle assistant row is not a cancelled turn");
+    }
+
+    /// Deleting a live session stops its turn before taking the trash snapshot,
+    /// releases build-scoped extension handles, and discards queued steering
+    /// that can no longer be delivered to a deleted session.
+    #[test]
+    fn deleting_a_running_session_stops_and_releases_runtime_state() {
+        let (mut state, id) = goal_state("delete-running");
+        state
+            .store
+            .session_mut(&id)
+            .expect("session")
+            .messages
+            .push(crate::model::ChatMessage::assistant());
+        state.streams.insert(id.clone(), super::now());
+        state
+            .turn_extension_activations
+            .insert(id.clone(), Vec::new());
+        state.turn_policy_generation.insert(id.clone(), 7);
+        state.inbox.insert(
+            id.clone(),
+            vec![super::Queued {
+                seq: 1,
+                text: "queued".to_string(),
+                attachments: Vec::new(),
+            }],
+        );
+        state.steering.insert(
+            9,
+            super::Steering {
+                session: id.clone(),
+                queued: super::Queued {
+                    seq: 2,
+                    text: "steered".to_string(),
+                    attachments: Vec::new(),
+                },
+            },
+        );
+
+        assert!(state.delete_session(&id));
+        assert!(!state.streams.contains_key(&id));
+        assert!(!state.turn_extension_activations.contains_key(&id));
+        assert!(!state.turn_policy_generation.contains_key(&id));
+        assert!(!state.inbox.contains_key(&id));
+        assert!(!state.steering.values().any(|steering| steering.session == id));
+
+        let parked = state
+            .trash()
+            .into_iter()
+            .find(|entry| {
+                entry.envelope.payload.get("id").and_then(serde_json::Value::as_str)
+                    == Some(id.as_str())
+            })
+            .expect("the stopped session is recoverable");
+        assert_eq!(
+            parked.envelope.payload["messages"][0]["meta"]["cancelled"].as_bool(),
+            Some(true),
+            "the snapshot records that the live turn was stopped"
+        );
+    }
+
 }
