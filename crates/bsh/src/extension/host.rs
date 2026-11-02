@@ -460,6 +460,15 @@ impl AppliedExtension {
     pub(crate) fn state(&self) -> FiberState {
         self.fiber.state()
     }
+
+    /// Names of the async tools this activation registered on the build.
+    ///
+    /// The names are the qualified ones the tool registry holds, so a caller
+    /// can look the live tool up and prove the Fiber-owned liveness gate
+    /// without reaching into the lease.
+    pub(crate) fn tool_names(&self) -> &[String] {
+        self.lease.tool_names()
+    }
 }
 
 #[cfg(test)]
@@ -497,7 +506,7 @@ mod service_scope_tests {
             &ServiceScope::Host,
             &Scope::Host,
             "ext",
-            "/repo",
+            Some(Path::new("/repo")),
             session,
         ));
         assert!(service_scope_matches(
@@ -547,6 +556,15 @@ mod service_scope_tests {
             &Scope::Session("session-1".into()),
             "ext",
             Some(Path::new("/repo")),
+            session,
+        ));
+        // A build with no workspace open cannot satisfy a workspace scope, even
+        // when the requested id names a real path: the grant fails closed.
+        assert!(!service_scope_matches(
+            &ServiceScope::Workspace,
+            &Scope::Workspace("/repo".into()),
+            "ext",
+            None,
             session,
         ));
     }

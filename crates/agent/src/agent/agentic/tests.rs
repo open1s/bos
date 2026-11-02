@@ -2371,7 +2371,7 @@ fn extension_prompt_sections_revoke_only_their_exact_delimited_section() {
     assert!(agent.remove_system_prompt_section("extension first"));
     assert_eq!(
         agent.config().system_prompt,
-        "base persona\\n\\nextension last"
+        "base persona\n\nextension last"
     );
     assert!(agent.remove_system_prompt_section("extension last"));
     assert_eq!(agent.config().system_prompt, "base persona");
@@ -2404,6 +2404,6 @@ fn extension_prompt_section_removal_rejects_substring_matches() {
     assert!(!agent.remove_system_prompt_section("extension section"));
     assert_eq!(
         agent.config().system_prompt,
-        "base persona\\n\\nextension section with suffix"
+        "base persona\n\nextension section with suffix"
     );
 }

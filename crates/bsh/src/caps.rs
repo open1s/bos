@@ -4088,9 +4088,11 @@ mod tests {
 
     /// An installed extension named by a path reaches the very agent the turn
     /// runs: its tool is in the tool registry, its skill is in the prompt set,
-    /// and the settings inventory lists the package.
-    #[test]
-    fn an_installed_extension_reaches_the_turn() {
+    /// and the settings inventory lists the package. The platform's activation
+    /// is proven too: its own tool runs while the build is live, and is refused
+    /// once the build - and the Fiber that gates it - is dropped.
+    #[tokio::test]
+    async fn an_installed_extension_reaches_the_turn() {
         let mut settings = bare();
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../agent/tests/fixtures/extensions/dsh-echo");
@@ -4136,11 +4138,34 @@ mod tests {
             crate::extension::composable::FiberState::Active
         );
 
-        // The tool may be held by another Arc after the Agent build is dropped.
-        // Its Fiber-owned liveness gate must still reject a new invocation.
+        // The path-installed package above is served by the legacy DSH shim,
+        // whose synchronous tool carries no gate. The Fiber-owned gate belongs
+        // to the package the extension platform activated, so it is proven on
+        // that package's own async tool: a handle kept past the build must
+        // still be refused after the build is dropped.
+        let platform_tool = {
+            let name = built.extension_activations[0]
+                .tool_names()
+                .first()
+                .cloned()
+                .expect("the activation registered a tool");
+            built
+                .agent
+                .registry()
+                .expect("tool registry")
+                .get_async(&name)
+                .expect("the platform tool is registered asynchronously")
+        };
+        assert!(
+            react::tool::registry::AsyncTool::run(&*platform_tool, &serde_json::json!({}))
+                .await
+                .is_ok(),
+            "the live activation's tool runs"
+        );
         drop(built);
         assert!(
-            tool.run(&serde_json::json!({ "value": "after-unload" }))
+            react::tool::registry::AsyncTool::run(&*platform_tool, &serde_json::json!({}))
+                .await
                 .is_err(),
             "dropping the build must close the extension tool's liveness gate"
         );

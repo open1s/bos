@@ -468,7 +468,12 @@ impl McpCore {
             command
                 .arg("-p")
                 .arg(super::process::sandbox_profile(&self.root, None, None))
-                .arg(&program);
+                .arg(&program)
+                // The profile and the program are sandbox-exec's own arguments;
+                // the package's argument vector belongs to the program it execs.
+                // Passing only the program ran it with no arguments, so an MCP
+                // server whose entry needs a script path never answered.
+                .args(&self.args);
             command
         } else {
             let mut command = Command::new(&program);
