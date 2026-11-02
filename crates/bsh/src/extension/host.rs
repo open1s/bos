@@ -450,6 +450,47 @@ impl AppliedExtension {
     }
 }
 
+#[cfg(test)]
+mod service_scope_tests {
+    use super::{service_scope_matches, super::composable::Scope, super::manifest::ServiceScope};
+
+    #[test]
+    fn declared_service_scope_is_enforced() {
+        assert!(service_scope_matches(&ServiceScope::Host, &Scope::Host, "ext", "/repo"));
+        assert!(service_scope_matches(
+            &ServiceScope::Workspace,
+            &Scope::Workspace("/repo".into()),
+            "ext",
+            "/repo",
+        ));
+        assert!(service_scope_matches(
+            &ServiceScope::Session,
+            &Scope::Session("session-1".into()),
+            "ext",
+            "/repo",
+        ));
+        assert!(service_scope_matches(
+            &ServiceScope::Extension,
+            &Scope::Extension("ext".into()),
+            "ext",
+            "/repo",
+        ));
+        assert!(!service_scope_matches(
+            &ServiceScope::Workspace,
+            &Scope::Workspace("/other".into()),
+            "ext",
+            "/repo",
+        ));
+        assert!(!service_scope_matches(
+            &ServiceScope::Extension,
+            &Scope::Extension("other".into()),
+            "ext",
+            "/repo",
+        ));
+        assert!(!service_scope_matches(&ServiceScope::Host, &Scope::Session("s".into()), "ext", "/repo"));
+    }
+}
+
 fn service_scope_matches(
     declared: &super::manifest::ServiceScope,
     requested: &super::composable::Scope,
@@ -1226,7 +1267,9 @@ impl ExtensionHost {
                 || !contributions.contexts.is_empty()
                 // A package may contribute only skills; skipping it here
                 // silently dropped every skill it declared.
-                || !entry.package.manifest.contributes.skills.is_empty();
+                || !entry.package.manifest.contributes.skills.is_empty()
+                || !entry.package.manifest.services.provides.is_empty()
+                || !entry.package.manifest.services.requires.is_empty();
             if !has_agent_contribution {
                 continue;
             }
