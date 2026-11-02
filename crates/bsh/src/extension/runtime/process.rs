@@ -273,8 +273,9 @@ pub(super) fn linux_bwrap_plan(
 ) -> Vec<String> {
     let mut plan = vec![
         "--die-with-parent".to_string(),
+        // Keep the network namespace private; process extensions do not
+        // implicitly inherit host network access.
         "--unshare-all".to_string(),
-        "--share-net".to_string(),
         "--ro-bind".to_string(),
         "/".to_string(),
         "/".to_string(),
@@ -282,6 +283,14 @@ pub(super) fn linux_bwrap_plan(
         "/proc".to_string(),
         "--dev".to_string(),
         "/dev".to_string(),
+        // The read-only root is a runtime filesystem view, not a source of
+        // host-user data. Hide common credential/config locations.
+        "--tmpfs".to_string(),
+        "/home".to_string(),
+        "--tmpfs".to_string(),
+        "/root".to_string(),
+        "--tmpfs".to_string(),
+        "/run".to_string(),
         "--tmpfs".to_string(),
         "/tmp".to_string(),
     ];
@@ -309,26 +318,42 @@ pub(super) fn linux_bwrap_plan(
     writable.dedup();
 
     let mut bound = Vec::<PathBuf>::new();
-    let mut created_tmp_dirs = Vec::<PathBuf>::new();
+    let mut created_hidden_dirs = Vec::<PathBuf>::new();
+    let hidden_roots = [
+        Path::new("/tmp"),
+        Path::new("/home"),
+        Path::new("/root"),
+        Path::new("/run"),
+    ];
     for path in writable {
-        if path != Path::new("/tmp") && !bound.iter().any(|parent| path.starts_with(parent)) {
-            // /tmp is a fresh tmpfs in the sandbox. Recreate destination
-            // directories before binding a package/workspace/data root that
-            // was originally located under the host's /tmp.
-            if let Ok(relative) = path.strip_prefix("/tmp") {
-                let mut destination = PathBuf::from("/tmp");
+        if hidden_roots.contains(&path.as_path())
+            || bound.iter().any(|parent| path.starts_with(parent))
+        {
+            continue;
+        }
+
+        // Recreate mount destinations below tmpfs-hidden roots. This permits
+        // an explicitly declared package/workspace without exposing sibling
+        // files from the host user's home directory.
+        if let Some(hidden_root) = hidden_roots
+            .iter()
+            .find(|hidden_root| path.starts_with(*hidden_root) && path.as_path() != *hidden_root)
+        {
+            if let Ok(relative) = path.strip_prefix(*hidden_root) {
+                let mut destination = hidden_root.to_path_buf();
                 for component in relative.components() {
                     if let std::path::Component::Normal(name) = component {
                         destination.push(name);
-                        if !created_tmp_dirs.contains(&destination) {
+                        if !created_hidden_dirs.contains(&destination) {
                             plan.push("--dir".to_string());
                             plan.push(destination.display().to_string());
-                            created_tmp_dirs.push(destination.clone());
+                            created_hidden_dirs.push(destination.clone());
                         }
                     }
                 }
             }
         }
+
         plan.push("--bind".to_string());
         plan.push(path.display().to_string());
         plan.push(path.display().to_string());
@@ -1231,6 +1256,35 @@ mod tests {
     }
 
     #[test]
+    fn the_linux_plan_recreates_only_declared_roots_under_hidden_home() {
+        let plan = linux_bwrap_plan(
+            Path::new("/home/alice/projects/plugin"),
+            Some(Path::new("/home/alice/workspace")),
+            None,
+            Path::new("/home/alice/projects/plugin/server"),
+            &[],
+        );
+        let hidden_home = plan
+            .iter()
+            .position(|item| item == "/home")
+            .expect("home is hidden");
+        let home_plugin_dir = plan
+            .iter()
+            .position(|item| item == "/home/alice/projects/plugin")
+            .expect("declared package mount point is recreated");
+        let package_bind = plan
+            .iter()
+            .enumerate()
+            .skip(home_plugin_dir)
+            .find(|(_, item)| *item == "--bind")
+            .map(|(index, _)| index)
+            .expect("package bind");
+        assert!(hidden_home < home_plugin_dir);
+        assert!(home_plugin_dir < package_bind);
+        assert!(!plan.iter().any(|item| item == "/home/alice/.ssh"));
+    }
+
+    #[test]
     fn the_linux_plan_creates_tmpfs_targets_before_binding_temp_roots() {
         let plan = linux_bwrap_plan(
             Path::new("/tmp/bsh-package"),
@@ -1264,6 +1318,14 @@ mod tests {
             &["--flag".to_string()],
         );
         assert!(plan.contains(&"--unshare-all".to_string()));
+        assert!(
+            !plan.contains(&"--share-net".to_string()),
+            "the sandbox must not rejoin the host network namespace"
+        );
+        for hidden in ["/home", "/root", "/run"] {
+            let index = plan.iter().position(|item| item == hidden).expect("hidden root");
+            assert_eq!(plan[index - 1], "--tmpfs");
+        }
         assert_eq!(
             plan.iter().filter(|item| item.as_str() == "--bind").count(),
             3
