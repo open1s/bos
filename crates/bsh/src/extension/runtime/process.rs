@@ -412,7 +412,7 @@ unsafe fn apply_unix_limits(
         rlim_cur: memory,
         rlim_max: memory,
     };
-    if setrlimit(libc::RLIMIT_AS, &address) != 0 {
+    if unsafe { setrlimit(libc::RLIMIT_AS, &address) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
 
@@ -421,7 +421,7 @@ unsafe fn apply_unix_limits(
         rlim_cur: cpu,
         rlim_max: cpu,
     };
-    if setrlimit(libc::RLIMIT_CPU, &cpu_limit) != 0 {
+    if unsafe { setrlimit(libc::RLIMIT_CPU, &cpu_limit) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
 
@@ -429,11 +429,11 @@ unsafe fn apply_unix_limits(
         rlim_cur: 256,
         rlim_max: 256,
     };
-    if setrlimit(libc::RLIMIT_NOFILE, &descriptors) != 0 {
+    if unsafe { setrlimit(libc::RLIMIT_NOFILE, &descriptors) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
 
-    if setpgid(0, 0) != 0 {
+    if unsafe { setpgid(0, 0) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
 
@@ -1155,6 +1155,21 @@ mod tests {
     ) -> libc::c_int {
         -1
     }
+    #[cfg(unix)]
+    unsafe extern "C" fn test_setrlimit_fail_cpu(
+        resource: libc::c_int,
+        _limit: *const libc::rlimit,
+    ) -> libc::c_int {
+        if resource == libc::RLIMIT_CPU { -1 } else { 0 }
+    }
+
+    #[cfg(unix)]
+    unsafe extern "C" fn test_setrlimit_fail_nofile(
+        resource: libc::c_int,
+        _limit: *const libc::rlimit,
+    ) -> libc::c_int {
+        if resource == libc::RLIMIT_NOFILE { -1 } else { 0 }
+    }
 
     #[cfg(unix)]
     unsafe extern "C" fn test_setpgid_ok(
@@ -1179,6 +1194,19 @@ mod tests {
             apply_unix_limits(64 * 1024 * 1024, 10, test_setrlimit_fail, test_setpgid_ok)
         };
         assert!(limit_failure.is_err(), "failed setrlimit must abort spawn");
+
+        let cpu_failure = unsafe {
+            apply_unix_limits(64 * 1024 * 1024, 10, test_setrlimit_fail_cpu, test_setpgid_ok)
+        };
+        assert!(cpu_failure.is_err(), "failed RLIMIT_CPU must abort spawn");
+
+        let nofile_failure = unsafe {
+            apply_unix_limits(64 * 1024 * 1024, 10, test_setrlimit_fail_nofile, test_setpgid_ok)
+        };
+        assert!(
+            nofile_failure.is_err(),
+            "failed RLIMIT_NOFILE must abort spawn"
+        );
 
         let process_group_failure = unsafe {
             apply_unix_limits(64 * 1024 * 1024, 10, test_setrlimit_ok, test_setpgid_fail)
