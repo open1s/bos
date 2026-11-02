@@ -714,7 +714,9 @@ impl ExtensionHost {
             .filter(|entry| entry.error.is_none() && entry.runtime.is_some())
             .map(|entry| entry.package.id().clone())
             .collect();
-        let mut ordered: BTreeSet<String> = BTreeSet::new();
+        // Preserve the dependency planner's topological order. A BTreeSet here
+        // would silently turn Provider -> Consumer ordering into lexical order.
+        let mut ordered: Vec<String> = Vec::new();
         match resolver::resolve(&available, &roots) {
             Ok(resolution) => {
                 // Package SemVer resolution chooses the concrete installed set;
@@ -727,7 +729,7 @@ impl ExtensionHost {
                     .collect();
                 match super::composable::plan_service_dependencies(&manifests) {
                     Ok(plan) => {
-                        ordered.extend(plan.order);
+                        ordered = plan.order;
                     }
                     Err(error) => {
                         let message = format!("service dependency planning failed: {error}");
@@ -759,10 +761,10 @@ impl ExtensionHost {
                 }
             }
         }
-        for (id, entry) in loaded.iter_mut() {
-            if !ordered.contains(id) {
+        for id in ordered {
+            let Some(entry) = loaded.get_mut(&id) else {
                 continue;
-            }
+            };
             let mut scope = self.host_scope();
             if matches!(
                 entry.package.manifest.runtime.kind,
@@ -778,20 +780,20 @@ impl ExtensionHost {
             }
             let started = std::time::Instant::now();
             if let Err(error) = self.policy.authorize_required(
-                id,
+                &id,
                 entry.package.trust,
                 &entry.package.manifest.capabilities.required,
                 &scope,
             ) {
                 entry.error = Some(error.to_string());
-                manager.fail(id, error.to_string());
+                manager.fail(&id, error.to_string());
                 continue;
             }
             entry.applied = true;
-            manager.transition(id, LifecycleState::Loading).ok();
-            manager.transition(id, LifecycleState::Starting).ok();
+            manager.transition(&id, LifecycleState::Loading).ok();
+            manager.transition(&id, LifecycleState::Starting).ok();
             manager
-                .activated(id, started.elapsed().as_millis() as u64)
+                .activated(&id, started.elapsed().as_millis() as u64)
                 .ok();
         }
 
