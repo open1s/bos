@@ -359,7 +359,9 @@ impl std::error::Error for ServiceContractError {}
 pub(crate) fn plan_service_dependencies(
     manifests: &[Manifest],
 ) -> Result<DependencyPlan, ServiceContractError> {
-    type ServiceKey = (ServiceScope, String, String);
+    // Extension-scoped services are private to their declaring extension.
+    // Other scopes are shared within their respective host/workspace/session.
+    type ServiceKey = (ServiceScope, String, String, String);
     let mut providers = BTreeMap::<ServiceKey, ServiceProvider>::new();
 
     for manifest in manifests {
@@ -367,6 +369,11 @@ pub(crate) fn plan_service_dependencies(
         for service in &manifest.services.provides {
             let key = (
                 service.scope,
+                if service.scope == ServiceScope::Extension {
+                    extension.clone()
+                } else {
+                    String::new()
+                },
                 service.name.clone(),
                 service.contract.clone(),
             );
@@ -399,6 +406,11 @@ pub(crate) fn plan_service_dependencies(
         for requirement in &manifest.services.requires {
             let key = (
                 requirement.scope,
+                if requirement.scope == ServiceScope::Extension {
+                    extension.clone()
+                } else {
+                    String::new()
+                },
                 requirement.name.clone(),
                 requirement.contract.clone(),
             );
@@ -412,6 +424,9 @@ pub(crate) fn plan_service_dependencies(
                 });
             };
             if !requirement.version.matches(&provider.version) {
+                if requirement.optional {
+                    continue;
+                }
                 return Err(ServiceContractError::VersionMismatch {
                     extension: extension.clone(),
                     service: format!("{}@{}", requirement.name, requirement.contract),
