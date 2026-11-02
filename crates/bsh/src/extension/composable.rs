@@ -344,7 +344,7 @@ impl fmt::Display for ServiceContractError {
                 f,
                 "{extension} requires {service} {required}, but provider exposes {provided}"
             ),
-            Self::Dependency(error) => error.fmt(f),
+            Self::Dependency(error) => fmt::Display::fmt(error, f),
         }
     }
 }
