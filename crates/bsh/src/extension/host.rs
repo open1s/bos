@@ -490,39 +490,58 @@ mod service_scope_tests {
     }
 
     #[test]
-    fn declared_service_scope_is_enforced() {
-        assert!(service_scope_matches(&ServiceScope::Host, &Scope::Host, "ext", "/repo"));
+    fn declared_service_scope_is_enforced_and_session_isolation_is_exact() {
+        let session = "session-1";
+        assert!(service_scope_matches(&ServiceScope::Host, &Scope::Host, "ext", "/repo", session));
         assert!(service_scope_matches(
             &ServiceScope::Workspace,
             &Scope::Workspace("/repo".into()),
             "ext",
             "/repo",
+            session,
         ));
         assert!(service_scope_matches(
             &ServiceScope::Session,
-            &Scope::Session("session-1".into()),
+            &Scope::Session(session.into()),
             "ext",
             "/repo",
+            session,
         ));
         assert!(service_scope_matches(
             &ServiceScope::Extension,
             &Scope::Extension("ext".into()),
             "ext",
             "/repo",
+            session,
+        ));
+        assert!(!service_scope_matches(
+            &ServiceScope::Session,
+            &Scope::Session("session-2".into()),
+            "ext",
+            "/repo",
+            session,
         ));
         assert!(!service_scope_matches(
             &ServiceScope::Workspace,
             &Scope::Workspace("/other".into()),
             "ext",
             "/repo",
+            session,
         ));
         assert!(!service_scope_matches(
             &ServiceScope::Extension,
             &Scope::Extension("other".into()),
             "ext",
             "/repo",
+            session,
         ));
-        assert!(!service_scope_matches(&ServiceScope::Host, &Scope::Session("s".into()), "ext", "/repo"));
+        assert!(!service_scope_matches(
+            &ServiceScope::Host,
+            &Scope::Session("session-1".into()),
+            "ext",
+            "/repo",
+            session,
+        ));
     }
 }
 
