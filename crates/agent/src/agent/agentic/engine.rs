@@ -216,6 +216,24 @@ impl Agent {
             }
         }
 
+        if let Ok(live) = self.live_tools.read() {
+            for (_name, tool) in live.iter() {
+                let tool_adapter = Box::new(ExtensibleToolAdapter::new(
+                    tool.clone(),
+                    self.plugins.clone(),
+                    self.hooks.clone(),
+                    self.config.name.clone(),
+                ));
+                builder = builder.with_tool(ToolVariant::Sync(tool_adapter));
+            }
+            for name in live.async_tool_names() {
+                if let Some(async_tool) = live.get_async(&name) {
+                    let tool_adapter = Box::new(AsyncExtensibleToolAdapter::new(async_tool));
+                    builder = builder.with_tool(ToolVariant::Async(tool_adapter));
+                }
+            }
+        }
+
         // The loader advertises the MODEL-INVOCABLE skills only: a skill whose
         // manifest reserves it for the reader is still registered (the `/name`
         // gesture loads it), but the tool must not open it. With none left, no
@@ -252,7 +270,7 @@ impl Agent {
                     "required": ["name"]
                 }),
                 {
-                    let skills = self.skills.clone();
+                    let skills = self.all_skills();
                     move |args: &serde_json::Value| {
                         let name = args
                             .get("name")
@@ -297,7 +315,15 @@ impl Agent {
     /// Non-text input (images/audio only) has no query to match against, so
     /// it uses the configured prompt unchanged.
     async fn system_prompt_for(&self, task: &Content) -> String {
-        let base = self.config.system_prompt.clone();
+        let mut base = self.config.system_prompt.clone();
+        if let Ok(prompts) = self.live_prompts.read() {
+            for prompt in prompts.iter() {
+                if !base.is_empty() {
+                    base.push_str("\n\n");
+                }
+                base.push_str(prompt);
+            }
+        }
         let Some(query) = task.as_text() else {
             return base;
         };
@@ -315,6 +341,13 @@ impl Agent {
     pub async fn react(&self, task: impl Into<Content>) -> Result<String, AgentError> {
         let task_content = task.into();
         let wall_start = std::time::Instant::now();
+        let turn_start = crate::agent::TurnStartWrapper::new(
+            self.config.name.clone(),
+            task_content.as_text().unwrap_or_default(),
+        );
+        if self.plugins.on_turn_start(turn_start).await.is_none() {
+            return Ok("turn aborted by plugin".to_string());
+        }
 
         let (mut engine, mut context) = {
             let mut engine_cache = self.engine_cache.lock().unwrap();
@@ -429,6 +462,14 @@ impl Agent {
                 ctx.set("total_tokens", (input_delta + output_delta).to_string());
                 self.hooks.trigger_all(HookEvent::OnComplete, ctx).await;
                 self.remember_exchange(&prompt_text, &answer).await;
+                let _ = self
+                    .plugins
+                    .on_turn_end(crate::agent::TurnEndWrapper {
+                        agent: self.config.name.clone(),
+                        output: Some(answer.clone()),
+                        error: None,
+                    })
+                    .await;
                 Ok(answer)
             }
             Err(e) => {
@@ -463,6 +504,14 @@ impl Agent {
                     HookDecision::Abort => return Ok("LLM call aborted by hook".to_string()),
                     HookDecision::Continue => {}
                 }
+                let _ = self
+                    .plugins
+                    .on_turn_end(crate::agent::TurnEndWrapper {
+                        agent: self.config.name.clone(),
+                        output: None,
+                        error: Some(e.to_string()),
+                    })
+                    .await;
                 Err(react_failure(e))
             }
         }

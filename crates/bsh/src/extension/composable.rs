@@ -15,12 +15,22 @@ use std::any::{Any, TypeId};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::ops::Deref;
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use super::manifest::{Manifest, ServiceScope};
+
+mod context;
+pub(crate) mod dispatch;
+mod effects;
+pub(crate) mod plan;
+mod reactivity;
+pub(crate) mod runtime;
+
+pub(crate) use context::{Context, ServiceAuthorizer};
+pub(crate) use effects::{BoxFuture, DisposalReport, EffectScope};
+pub(crate) use reactivity::{Epoch, Inject};
 
 /// The lifetime boundary in which a service or Fiber is visible.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -40,6 +50,7 @@ struct ServiceKey {
     name: String,
     scope: Scope,
     type_id: TypeId,
+    realm: Option<String>,
 }
 
 /// A generation-specific ownership token for one provided service.
@@ -62,6 +73,7 @@ pub(crate) enum ServiceChangeKind {
 pub(crate) struct ServiceChange {
     pub(crate) name: String,
     pub(crate) scope: Scope,
+    pub(crate) realm: Option<String>,
     pub(crate) generation: u64,
     pub(crate) kind: ServiceChangeKind,
 }
@@ -172,8 +184,13 @@ impl ServiceRetirement {
 /// cleanup from an older provider cannot accidentally remove its replacement.
 /// Subscribers receive bounded availability notifications and can re-query the
 /// registry for the current provider.
+type GenerationKey = (Scope, Option<String>, String);
+
 pub(crate) struct ServiceRegistry {
     entries: RwLock<HashMap<ServiceKey, (u64, Arc<ServiceGeneration>)>>,
+    /// Generation index keyed by scope, realm and name, independent of the
+    /// concrete Rust type. Coeffect snapshots use it to detect replacement.
+    generations: RwLock<HashMap<GenerationKey, u64>>,
     next_generation: AtomicU64,
     changes: tokio::sync::broadcast::Sender<ServiceChange>,
 }
@@ -183,6 +200,7 @@ impl Default for ServiceRegistry {
         let (changes, _) = tokio::sync::broadcast::channel(128);
         Self {
             entries: RwLock::new(HashMap::new()),
+            generations: RwLock::new(HashMap::new()),
             next_generation: AtomicU64::new(0),
             changes,
         }
@@ -216,6 +234,22 @@ impl ServiceRegistry {
         self.provide_with_retirement(scope, name, service).0
     }
 
+    /// Provide in a named isolation realm. A realm is part of the service key,
+    /// so the same scope/name in two realms are independent services.
+    pub(crate) fn provide_in_realm<T>(
+        &self,
+        scope: Scope,
+        realm: Option<&str>,
+        name: impl Into<String>,
+        service: Arc<T>,
+    ) -> ServiceToken
+    where
+        T: Any + Send + Sync,
+    {
+        self.provide_with_retirement_in_realm(scope, realm, name, service)
+            .0
+    }
+
     /// Replace a provider and return a drain handle for its previous generation.
     pub(crate) fn provide_with_retirement<T>(
         &self,
@@ -226,10 +260,25 @@ impl ServiceRegistry {
     where
         T: Any + Send + Sync,
     {
+        self.provide_with_retirement_in_realm(scope, None, name, service)
+    }
+
+    /// Replace a provider in a named realm.
+    pub(crate) fn provide_with_retirement_in_realm<T>(
+        &self,
+        scope: Scope,
+        realm: Option<&str>,
+        name: impl Into<String>,
+        service: Arc<T>,
+    ) -> (ServiceToken, Option<ServiceRetirement>)
+    where
+        T: Any + Send + Sync,
+    {
         let key = ServiceKey {
             name: name.into(),
             scope,
             type_id: TypeId::of::<T>(),
+            realm: realm.map(str::to_owned),
         };
         let mut entries = self
             .entries
@@ -240,6 +289,12 @@ impl ServiceRegistry {
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
         let new_generation = Arc::new(ServiceGeneration::new(service));
         let previous = entries.insert(key.clone(), (generation, new_generation));
+        if let Ok(mut generations) = self.generations.write() {
+            generations.insert(
+                (key.scope.clone(), key.realm.clone(), key.name.clone()),
+                generation,
+            );
+        }
         // Retire while holding the write lock. No new lease can race in after
         // the replacement becomes visible.
         let retirement = previous.map(|(old_generation, owner)| {
@@ -254,6 +309,7 @@ impl ServiceRegistry {
         let _ = self.changes.send(ServiceChange {
             name: key.name.clone(),
             scope: key.scope.clone(),
+            realm: key.realm.clone(),
             generation,
             kind: if retirement.is_some() {
                 ServiceChangeKind::Replaced
@@ -273,10 +329,24 @@ impl ServiceRegistry {
     where
         T: Any + Send + Sync,
     {
+        self.get_in_realm(scope, None, name)
+    }
+
+    /// Resolve in one named isolation realm.
+    pub(crate) fn get_in_realm<T>(
+        &self,
+        scope: &Scope,
+        realm: Option<&str>,
+        name: &str,
+    ) -> Option<Arc<T>>
+    where
+        T: Any + Send + Sync,
+    {
         let key = ServiceKey {
             name: name.to_owned(),
             scope: scope.clone(),
             type_id: TypeId::of::<T>(),
+            realm: realm.map(str::to_owned),
         };
         let entries = self.entries.read().ok()?;
         let service = entries.get(&key)?.1.value.clone();
@@ -291,10 +361,24 @@ impl ServiceRegistry {
     where
         T: Any + Send + Sync,
     {
+        self.acquire_in_realm(scope, None, name)
+    }
+
+    /// Acquire in one named isolation realm.
+    pub(crate) fn acquire_in_realm<T>(
+        &self,
+        scope: &Scope,
+        realm: Option<&str>,
+        name: &str,
+    ) -> Option<ServiceLease<T>>
+    where
+        T: Any + Send + Sync,
+    {
         let key = ServiceKey {
             name: name.to_owned(),
             scope: scope.clone(),
             type_id: TypeId::of::<T>(),
+            realm: realm.map(str::to_owned),
         };
         let entries = self.entries.read().ok()?;
         let (generation, owner) = entries.get(&key)?;
@@ -358,15 +442,51 @@ impl ServiceRegistry {
             return None;
         }
         let (generation, owner) = entries.remove(&token.key)?;
+        if let Ok(mut generations) = self.generations.write() {
+            generations.remove(&(
+                token.key.scope.clone(),
+                token.key.realm.clone(),
+                token.key.name.clone(),
+            ));
+        }
         owner.retire();
         let _ = self.changes.send(ServiceChange {
             name: token.key.name.clone(),
             scope: token.key.scope.clone(),
+            realm: token.key.realm.clone(),
             generation,
             kind: ServiceChangeKind::Unavailable,
         });
         drop(entries);
         Some(ServiceRetirement { generation, owner })
+    }
+
+    /// Current generation for a scope and name, independent of the concrete
+    /// type. A missing value means no provider is available.
+    pub(crate) fn generation(&self, scope: &Scope, name: &str) -> Option<u64> {
+        self.generation_in_realm(scope, None, name)
+    }
+
+    /// Whether any scope currently publishes `name`.
+    pub(crate) fn has_name(&self, name: &str) -> bool {
+        self.generations
+            .read()
+            .map(|generations| generations.keys().any(|(_, _, service)| service == name))
+            .unwrap_or(false)
+    }
+
+    /// Current generation in one named isolation realm.
+    pub(crate) fn generation_in_realm(
+        &self,
+        scope: &Scope,
+        realm: Option<&str>,
+        name: &str,
+    ) -> Option<u64> {
+        self.generations
+            .read()
+            .ok()?
+            .get(&(scope.clone(), realm.map(str::to_owned), name.to_owned()))
+            .copied()
     }
 
     /// Whether a service of this exact type/name/scope is currently available.
@@ -375,6 +495,19 @@ impl ServiceRegistry {
         T: Any + Send + Sync,
     {
         self.get::<T>(scope, name).is_some()
+    }
+
+    /// Whether one named realm has a service of this type/name/scope.
+    pub(crate) fn contains_in_realm<T>(
+        &self,
+        scope: &Scope,
+        realm: Option<&str>,
+        name: &str,
+    ) -> bool
+    where
+        T: Any + Send + Sync,
+    {
+        self.get_in_realm::<T>(scope, realm, name).is_some()
     }
 }
 
@@ -663,62 +796,18 @@ impl fmt::Display for FiberTransitionError {
 
 impl std::error::Error for FiberTransitionError {}
 
-type Cleanup = Box<dyn FnOnce() + Send + 'static>;
-
-/// A set of effects owned by one Fiber. Cleanup is idempotent, runs in reverse
-/// registration order, and continues after an individual cleanup panics.
-#[derive(Default)]
-pub(crate) struct EffectSet {
-    cleanups: Vec<Cleanup>,
-    disposed: bool,
-}
-
-impl EffectSet {
-    /// Create an empty effect set.
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
-    /// Register an undo action. Actions added after disposal are run immediately.
-    pub(crate) fn push(&mut self, cleanup: impl FnOnce() + Send + 'static) {
-        if self.disposed {
-            let _ = catch_unwind(AssertUnwindSafe(cleanup));
-        } else {
-            self.cleanups.push(Box::new(cleanup));
-        }
-    }
-
-    /// Run all cleanup actions in reverse order. Returns the number attempted.
-    pub(crate) fn rollback(&mut self) -> usize {
-        if self.disposed {
-            return 0;
-        }
-        self.disposed = true;
-        let mut attempted = 0;
-        while let Some(cleanup) = self.cleanups.pop() {
-            attempted += 1;
-            let _ = catch_unwind(AssertUnwindSafe(cleanup));
-        }
-        attempted
-    }
-
-    /// Number of pending cleanup actions.
-    pub(crate) fn pending(&self) -> usize {
-        self.cleanups.len()
-    }
-}
-
-impl Drop for EffectSet {
-    fn drop(&mut self) {
-        self.rollback();
-    }
-}
+/// Compatibility name for the effect scope owned by a Fiber.
+pub(crate) type EffectSet = EffectScope;
 
 /// A Cordis-inspired runtime Fiber with explicit effect ownership.
 pub(crate) struct Fiber {
     id: String,
     state: FiberState,
-    effects: EffectSet,
+    effects: EffectScope,
+    context: Option<Context>,
+    inject: Inject,
+    epoch: Epoch,
+    revision: u64,
 }
 
 impl Fiber {
@@ -727,7 +816,24 @@ impl Fiber {
         Self {
             id: id.into(),
             state: FiberState::Pending,
-            effects: EffectSet::new(),
+            effects: EffectScope::new(),
+            context: None,
+            inject: Inject::default(),
+            epoch: Epoch::default(),
+            revision: 0,
+        }
+    }
+
+    /// Create a Fiber whose effects are owned by a context.
+    pub(crate) fn with_context(id: impl Into<String>, context: Context) -> Self {
+        Self {
+            id: id.into(),
+            state: FiberState::Pending,
+            effects: context.effects().clone(),
+            context: Some(context),
+            inject: Inject::default(),
+            epoch: Epoch::default(),
+            revision: 0,
         }
     }
 
@@ -741,9 +847,45 @@ impl Fiber {
         self.state
     }
 
+    /// Number of effects still waiting to be disposed.
+    pub(crate) fn pending_effects(&self) -> usize {
+        self.effects.pending()
+    }
+
+    /// The context this Fiber activates, when one was attached.
+    pub(crate) fn context(&self) -> Option<&Context> {
+        self.context.as_ref()
+    }
+
+    /// Attach a context and share its effect scope. Effects registered before
+    /// this call are disposed rather than silently leaked.
+    pub(crate) fn attach_context(&mut self, context: Context) {
+        let previous = std::mem::replace(&mut self.effects, context.effects().clone());
+        previous.dispose_sync();
+        self.context = Some(context);
+    }
+
     /// Register a cleanup owned by this Fiber.
     pub(crate) fn own(&mut self, cleanup: impl FnOnce() + Send + 'static) {
-        self.effects.push(cleanup);
+        self.own_named("fiber.own", cleanup);
+    }
+
+    /// Register a labelled synchronous cleanup owned by this Fiber.
+    pub(crate) fn own_named(
+        &mut self,
+        label: impl Into<String>,
+        cleanup: impl FnOnce() + Send + 'static,
+    ) {
+        self.effects.push_sync(label, cleanup);
+    }
+
+    /// Register an asynchronous cleanup owned by this Fiber.
+    pub(crate) fn own_async(
+        &mut self,
+        label: impl Into<String>,
+        cleanup: impl FnOnce() -> BoxFuture + Send + 'static,
+    ) {
+        self.effects.push_async(label, cleanup);
     }
 
     /// Move to the next state if the transition is legal.
@@ -768,12 +910,18 @@ impl Fiber {
         }
         self.state = to;
         if to == FiberState::Disposed {
-            self.effects.rollback();
+            if let Some(context) = &self.context {
+                context.deactivate();
+            }
+            self.effects.dispose_sync();
         }
         Ok(())
     }
 
     /// Unload and revoke every effect owned by this Fiber.
+    ///
+    /// Async cleanups are spawned rather than awaited; use dispose_async when
+    /// the caller can await.
     pub(crate) fn unload(&mut self) -> Result<usize, FiberTransitionError> {
         if self.state == FiberState::Disposed {
             return Ok(0);
@@ -781,12 +929,30 @@ impl Fiber {
         if self.state != FiberState::Unloading {
             self.transition(FiberState::Unloading)?;
         }
-        let attempted = self.effects.rollback();
+        if let Some(context) = &self.context {
+            context.deactivate();
+        }
+        let attempted = self.effects.dispose_sync().attempted;
         self.transition(FiberState::Disposed)?;
         Ok(attempted)
     }
-}
 
+    /// Unload and await every effect owned by this Fiber.
+    pub(crate) async fn dispose_async(&mut self) -> Result<DisposalReport, FiberTransitionError> {
+        if self.state == FiberState::Disposed {
+            return Ok(DisposalReport::default());
+        }
+        if self.state != FiberState::Unloading {
+            self.transition(FiberState::Unloading)?;
+        }
+        if let Some(context) = &self.context {
+            context.deactivate();
+        }
+        let report = self.effects.dispose().await;
+        self.transition(FiberState::Disposed)?;
+        Ok(report)
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1171,7 +1337,7 @@ mod tests {
     #[test]
     fn effect_cleanup_continues_after_a_panicking_action() {
         let count = Arc::new(AtomicUsize::new(0));
-        let mut effects = EffectSet::new();
+        let effects = EffectSet::new();
         let first = count.clone();
         effects.push(move || {
             first.fetch_add(1, Ordering::SeqCst);
@@ -1185,5 +1351,71 @@ mod tests {
         assert_eq!(effects.rollback(), 3);
         assert_eq!(count.load(Ordering::SeqCst), 2);
         assert_eq!(effects.rollback(), 0);
+    }
+
+    #[test]
+    #[ignore = "release benchmark; run with --release --ignored"]
+    fn gold_standard_release_lookup_budget() {
+        let registry = ServiceRegistry::new();
+        let scope = Scope::Host;
+        registry.provide(scope.clone(), "clock", Arc::new(1_u64));
+        let start = std::time::Instant::now();
+        for _ in 0..1_000_000 {
+            assert!(registry.acquire::<u64>(&scope, "clock").is_some());
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "1M exact lookups took {elapsed:?} in release"
+        );
+    }
+
+    #[test]
+    #[ignore = "release benchmark; run with --release --ignored"]
+    fn gold_standard_release_effect_budget() {
+        let scope = EffectScope::new();
+        let start = std::time::Instant::now();
+        for _ in 0..100_000 {
+            scope.push_sync("bench", || {});
+        }
+        let report = scope.dispose_sync();
+        let elapsed = start.elapsed();
+        assert_eq!(report.attempted, 100_000);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "100k effect registrations took {elapsed:?} in release"
+        );
+    }
+
+    #[test]
+    fn gold_standard_exact_service_lookup_budget() {
+        let registry = ServiceRegistry::new();
+        let scope = Scope::Host;
+        registry.provide(scope.clone(), "clock", Arc::new(1_u64));
+        let start = std::time::Instant::now();
+        for _ in 0..100_000 {
+            assert!(registry.acquire::<u64>(&scope, "clock").is_some());
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "100k exact lookups took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn gold_standard_effect_registration_budget() {
+        let scope = EffectScope::new();
+        let start = std::time::Instant::now();
+        for _ in 0..10_000 {
+            scope.push_sync("bench", || {});
+        }
+        let report = scope.dispose_sync();
+        let elapsed = start.elapsed();
+        assert_eq!(report.attempted, 10_000);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "10k effect registrations took {elapsed:?}"
+        );
     }
 }

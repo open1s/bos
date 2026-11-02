@@ -275,6 +275,9 @@ pub(crate) enum RuntimeKind {
     /// A WebAssembly Component. The contract is published in `wit/` and
     /// executed by the Wasmtime component runtime.
     WasmComponent,
+    /// A DeepSeek Harness / Cordis package whose payload is `apply(ctx, config)`,
+    /// executed by the sandboxed Node bridge.
+    Cordis,
 }
 
 impl RuntimeKind {
@@ -287,6 +290,7 @@ impl RuntimeKind {
             Self::Mcp => "mcp",
             Self::Extism => "extism",
             Self::WasmComponent => "wasm-component",
+            Self::Cordis => "cordis",
         }
     }
 }

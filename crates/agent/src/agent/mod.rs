@@ -17,7 +17,7 @@ pub use hooks::external::{EventMatcher, ExternalHook, HookDispatcher, HookOutcom
 pub use hooks::{AgentHook, HookContext, HookEvent, HookRegistry};
 pub use plugin::{
     AgentPlugin, LlmRequestWrapper, LlmResponseWrapper, PluginRegistry, StreamTokenWrapper,
-    ToolCallWrapper, ToolResultWrapper,
+    ToolCallWrapper, ToolResultWrapper, TurnEndWrapper, TurnStartWrapper,
 };
 pub use prompts::{
     compose_system_prompt, compose_system_prompt_with, guidance_for_tool, DEFAULT_PERSONA,

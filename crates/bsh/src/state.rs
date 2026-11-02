@@ -505,7 +505,7 @@ pub(crate) struct AppState {
     ///
     /// Dropping these handles runs Fiber effect cleanup and closes each
     /// extension tool's liveness gate before the turn's Agent is released.
-    turn_extension_activations: HashMap<String, Vec<crate::extension::host::AppliedExtension>>,
+    turn_extension_activations: HashMap<String, crate::extension::host::ActivationList>,
     /// Messages taken off a queue to steer, by ticket.
     ///
     /// A message is removed from the queue the moment the reader asks for it
@@ -3209,7 +3209,7 @@ impl AppState {
     pub(crate) fn attach_turn_extensions(
         &mut self,
         id: &str,
-        activations: Vec<crate::extension::host::AppliedExtension>,
+        activations: crate::extension::host::ActivationList,
     ) {
         // Replace even with an empty set: a rebuild with no extensions
         // must release any stale activation set for this session.
@@ -8093,9 +8093,10 @@ mod tests {
             .messages
             .push(crate::model::ChatMessage::assistant());
         state.streams.insert(id.clone(), super::now());
-        state
-            .turn_extension_activations
-            .insert(id.clone(), Vec::new());
+        state.turn_extension_activations.insert(
+            id.clone(),
+            crate::extension::host::ActivationList::default(),
+        );
         state.turn_policy_generation.insert(id.clone(), 7);
         state.inbox.insert(
             id.clone(),

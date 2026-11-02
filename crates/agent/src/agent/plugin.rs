@@ -25,6 +25,39 @@ pub enum ToolStage {
     PostExecute,
 }
 
+/// A turn about to start.
+#[derive(Debug, Clone)]
+pub struct TurnStartWrapper {
+    /// Agent name.
+    pub agent: String,
+    /// Text input, when the turn has one.
+    pub input: String,
+    /// Free-form metadata.
+    pub metadata: std::collections::HashMap<String, String>,
+}
+
+impl TurnStartWrapper {
+    /// Create a turn-start wrapper.
+    pub fn new(agent: impl Into<String>, input: impl Into<String>) -> Self {
+        Self {
+            agent: agent.into(),
+            input: input.into(),
+            metadata: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// A turn that has finished, successfully or not.
+#[derive(Debug, Clone)]
+pub struct TurnEndWrapper {
+    /// Agent name.
+    pub agent: String,
+    /// Final text, when the turn succeeded.
+    pub output: Option<String>,
+    /// Error text, when the turn failed.
+    pub error: Option<String>,
+}
+
 /// A plugin-facing view of an LLM request.
 #[derive(Debug, Clone)]
 pub struct LlmRequestWrapper {
@@ -283,6 +316,16 @@ pub trait AgentPlugin: Send + Sync + 'static {
     async fn on_stream_token(&self, token: StreamTokenWrapper) -> Option<StreamTokenWrapper> {
         Some(token)
     }
+
+    /// Rewrite a turn before it starts; return `None` to veto.
+    async fn on_turn_start(&self, turn: TurnStartWrapper) -> Option<TurnStartWrapper> {
+        Some(turn)
+    }
+
+    /// Observe or rewrite a finished turn.
+    async fn on_turn_end(&self, turn: TurnEndWrapper) -> Option<TurnEndWrapper> {
+        Some(turn)
+    }
 }
 
 #[derive(Default, Clone)]
@@ -368,6 +411,31 @@ impl PluginRegistry {
             }
         }
         Some(request)
+    }
+
+    /// Run all plugins' on_turn_start in order.
+    pub async fn on_turn_start(
+        &self,
+        mut turn: TurnStartWrapper,
+    ) -> Option<TurnStartWrapper> {
+        for plugin in self.plugins() {
+            match plugin.on_turn_start(turn).await {
+                Some(next) => turn = next,
+                None => return None,
+            }
+        }
+        Some(turn)
+    }
+
+    /// Run all plugins' on_turn_end in order.
+    pub async fn on_turn_end(&self, mut turn: TurnEndWrapper) -> Option<TurnEndWrapper> {
+        for plugin in self.plugins() {
+            match plugin.on_turn_end(turn).await {
+                Some(next) => turn = next,
+                None => return None,
+            }
+        }
+        Some(turn)
     }
 
     /// Run all plugins' on_llm_response in order.
@@ -471,6 +539,48 @@ mod tests {
         async fn on_stream_token(&self, _token: StreamTokenWrapper) -> Option<StreamTokenWrapper> {
             None
         }
+    }
+
+
+    struct Turns;
+
+    #[async_trait]
+    impl AgentPlugin for Turns {
+        fn name(&self) -> &str {
+            "turns"
+        }
+
+        async fn on_turn_start(&self, mut turn: TurnStartWrapper) -> Option<TurnStartWrapper> {
+            turn.input.push_str("!");
+            Some(turn)
+        }
+
+        async fn on_turn_end(&self, mut turn: TurnEndWrapper) -> Option<TurnEndWrapper> {
+            if let Some(output) = turn.output.take() {
+                turn.output = Some(output.to_uppercase());
+            }
+            Some(turn)
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_hooks_rewrite_start_and_end() {
+        let registry = PluginRegistry::new();
+        registry.register(Arc::new(Turns));
+        let started = registry
+            .on_turn_start(TurnStartWrapper::new("agent", "hello"))
+            .await
+            .expect("start");
+        assert_eq!(started.input, "hello!");
+        let ended = registry
+            .on_turn_end(TurnEndWrapper {
+                agent: "agent".into(),
+                output: Some("done".into()),
+                error: None,
+            })
+            .await
+            .expect("end");
+        assert_eq!(ended.output.as_deref(), Some("DONE"));
     }
 
     #[test]

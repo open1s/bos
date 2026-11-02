@@ -274,6 +274,15 @@ pub struct Agent {
     llm: Arc<LlmProvider>,
     #[rkyv(with = qserde::rkyv::with::Skip)]
     registry: Option<Arc<ToolRegistry>>,
+    /// Extension tools that can be added or removed while the agent is shared.
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    live_tools: Arc<std::sync::RwLock<ToolRegistry>>,
+    /// Extension prompt fragments that can change while the agent is shared.
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    live_prompts: Arc<std::sync::RwLock<Vec<String>>>,
+    /// Extension skills that can change while the agent is shared.
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    live_skills: Arc<std::sync::RwLock<Vec<crate::skills::SkillContent>>>,
     #[rkyv(with = qserde::rkyv::with::Map<qserde::rkyv::with::AsString>)]
     skills_dir: Option<std::path::PathBuf>,
     skills: Vec<crate::skills::SkillContent>,
@@ -337,6 +346,9 @@ impl Agent {
             context_budget: 0,
             llm,
             registry: Some(Arc::new(ToolRegistry::new())),
+            live_tools: Arc::new(std::sync::RwLock::new(ToolRegistry::new())),
+            live_prompts: Arc::new(std::sync::RwLock::new(Vec::new())),
+            live_skills: Arc::new(std::sync::RwLock::new(Vec::new())),
             skills_dir: None,
             skills: Vec::new(),
             resilience,
@@ -686,6 +698,138 @@ impl Agent {
         self.registry.as_ref()
     }
 
+    /// The mutable extension-tool overlay.
+    pub fn live_tools(&self) -> &Arc<std::sync::RwLock<ToolRegistry>> {
+        &self.live_tools
+    }
+
+    /// Register an extension tool without requiring a mutable Agent.
+    pub fn add_live_tool(&self, tool: Arc<dyn Tool>) -> Result<(), crate::ToolError> {
+        self.live_tools
+            .write()
+            .expect("live tool registry")
+            .register(tool)?;
+        self.engine_cache.lock().unwrap().take();
+        self.context_cache.lock().unwrap().take();
+        Ok(())
+    }
+
+    /// Register an async extension tool without requiring a mutable Agent.
+    pub fn add_live_async_tool(
+        &self,
+        tool: Arc<dyn react::tool::registry::AsyncTool>,
+    ) -> Result<(), crate::ToolError> {
+        self.live_tools
+            .write()
+            .expect("live tool registry")
+            .register_async(tool)?;
+        self.engine_cache.lock().unwrap().take();
+        self.context_cache.lock().unwrap().take();
+        Ok(())
+    }
+
+    /// Remove async extension tools without requiring a mutable Agent.
+    pub fn remove_live_async_tools(&self, names: &[String]) -> usize {
+        let mut live = self.live_tools.write().expect("live tool registry");
+        let removed = names
+            .iter()
+            .filter(|name| live.remove_async(name))
+            .count();
+        if removed > 0 {
+            self.engine_cache.lock().unwrap().take();
+            self.context_cache.lock().unwrap().take();
+        }
+        removed
+    }
+
+    /// Append one live extension prompt fragment.
+    pub fn add_live_prompt_section(&self, section: impl Into<String>) {
+        self.live_prompts
+            .write()
+            .expect("live prompt registry")
+            .push(section.into());
+        self.engine_cache.lock().unwrap().take();
+        self.context_cache.lock().unwrap().take();
+    }
+
+    /// Remove one live extension prompt fragment.
+    pub fn remove_live_prompt_section(&self, section: &str) -> bool {
+        let mut prompts = self.live_prompts.write().expect("live prompt registry");
+        let before = prompts.len();
+        prompts.retain(|prompt| prompt != section);
+        let removed = prompts.len() != before;
+        drop(prompts);
+        if removed {
+            self.engine_cache.lock().unwrap().take();
+            self.context_cache.lock().unwrap().take();
+        }
+        removed
+    }
+
+    /// Register one live extension skill.
+    pub fn add_live_skill(&self, skill: crate::skills::SkillContent) {
+        self.live_skills
+            .write()
+            .expect("live skill registry")
+            .push(skill);
+        self.engine_cache.lock().unwrap().take();
+        self.context_cache.lock().unwrap().take();
+    }
+
+    /// Remove live skills whose directory matches one of the paths.
+    pub fn remove_live_skills_by_paths(&self, paths: &[std::path::PathBuf]) -> usize {
+        let mut skills = self.live_skills.write().expect("live skill registry");
+        let before = skills.len();
+        skills.retain(|skill| !paths.iter().any(|path| path == &skill.skill_dir));
+        let removed = before - skills.len();
+        drop(skills);
+        if removed > 0 {
+            self.engine_cache.lock().unwrap().take();
+            self.context_cache.lock().unwrap().take();
+        }
+        removed
+    }
+
+    /// Load skills from a directory into the live overlay.
+    pub fn add_live_skills_from_dir(
+        &self,
+        dir: std::path::PathBuf,
+    ) -> Result<usize, crate::skills::SkillError> {
+        use crate::skills::SkillLoader;
+        let mut loader = SkillLoader::new(dir);
+        let metas = loader.discover().map_err(crate::skills::SkillError::Io)?;
+        let mut added = 0;
+        for meta in metas {
+            if let Some(content) = loader.load(&meta.name) {
+                self.add_live_skill(content);
+                added += 1;
+            }
+        }
+        Ok(added)
+    }
+
+    /// Paths owned by the live skill overlay.
+    pub fn live_skill_paths(&self) -> Vec<std::path::PathBuf> {
+        self.live_skills
+            .read()
+            .map(|skills| {
+                skills
+                    .iter()
+                    .map(|skill| skill.skill_dir.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Base skills plus the live extension overlay.
+    fn all_skills(&self) -> Vec<crate::skills::SkillContent> {
+        let mut skills = self.skills.clone();
+        if let Ok(live) = self.live_skills.read() {
+            skills.extend(live.iter().cloned());
+        }
+        skills
+    }
+
     /// Get hooks registry for external registration.
     pub fn hooks(&self) -> &HookRegistry {
         &self.hooks
@@ -1032,6 +1176,14 @@ impl Agent {
         self.context_cache.lock().unwrap().take();
     }
 
+    /// Base plus live skills as owned name/instructions pairs.
+    pub fn all_skills_content(&self) -> Vec<(String, String)> {
+        self.all_skills()
+            .into_iter()
+            .map(|skill| (skill.metadata.name, skill.instructions))
+            .collect()
+    }
+
     /// Register skills from directory.
     pub fn register_skills_from_dir(
         &mut self,
@@ -1276,6 +1428,9 @@ impl Clone for Agent {
             context_budget: self.context_budget,
             llm: self.llm.clone(),
             registry: self.registry.clone(),
+            live_tools: Arc::clone(&self.live_tools),
+            live_prompts: Arc::clone(&self.live_prompts),
+            live_skills: Arc::clone(&self.live_skills),
             skills_dir: self.skills_dir.clone(),
             skills: self.skills.clone(),
             resilience: self.resilience.clone(),

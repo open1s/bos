@@ -25,6 +25,8 @@
 #![allow(dead_code)]
 
 mod agent;
+use std::sync::Arc;
+
 pub(crate) mod capability;
 mod cli;
 pub(crate) mod composable;
@@ -34,7 +36,17 @@ mod e2e;
 mod events;
 pub(crate) mod hooks;
 pub(crate) mod host;
+pub(crate) mod live;
+pub(crate) mod terminal;
 pub(crate) use host::shutdown;
+
+/// The process-wide event dispatcher for extension tool seams.
+static DISPATCHER: std::sync::OnceLock<Arc<composable::dispatch::EventDispatcher>> =
+    std::sync::OnceLock::new();
+
+pub(crate) fn dispatcher() -> Arc<composable::dispatch::EventDispatcher> {
+    Arc::clone(DISPATCHER.get_or_init(|| Arc::new(composable::dispatch::EventDispatcher::new())))
+}
 
 /// A process-wide Tokio runtime for extension work that starts outside a Tokio
 /// context, such as a GPUI click listener. Extension runtimes own Tokio process

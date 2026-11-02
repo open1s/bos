@@ -17,7 +17,10 @@ use serde::Serialize;
 
 use super::agent as contribution;
 use super::capability::{CallScope, Capability, Decision, GrantScope, PolicyEngine, PolicyMode};
-use super::composable::{Fiber, FiberState};
+use super::composable::dispatch::InterceptorPolicy;
+use super::composable::{
+    Context, DisposalReport, Fiber, FiberState, Scope, ServiceAuthorizer, ServiceToken,
+};
 use super::events::{lifecycle_event, topics, EventBus, ExtensionEvent};
 use super::lifecycle::{Health, LifecycleManager};
 use super::package::{write_atomic, ExtensionStore, Package};
@@ -150,6 +153,33 @@ pub(crate) struct CapabilityStatus {
     pub(crate) risk: String,
     /// Whether this capability is required for activation.
     pub(crate) required: bool,
+}
+
+/// One node in the extension composition graph.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ExtensionGraphNode {
+    /// Extension id.
+    pub(crate) id: String,
+    /// Lifecycle state.
+    pub(crate) state: String,
+    /// Runtime kind.
+    pub(crate) runtime: String,
+    /// Whether configuration enables it.
+    pub(crate) enabled: bool,
+    /// Whether it is applied to a build.
+    pub(crate) applied: bool,
+    /// Declared package dependencies.
+    pub(crate) dependencies: Vec<String>,
+    /// Declared service providers, as name@version[scope].
+    pub(crate) provides: Vec<String>,
+    /// Declared service requirements, as name@range[scope].
+    pub(crate) requires: Vec<String>,
+    /// Declared effect surface, as kind:id (tool, command, panel, service, ...).
+    pub(crate) effects: Vec<String>,
+    /// Whether the live service-change driver has suspended this activation.
+    pub(crate) live_suspended: bool,
+    /// The last error, if any.
+    pub(crate) error: Option<String>,
 }
 
 /// One extension as a status row.
@@ -361,6 +391,99 @@ type BuiltRuntime = (
     DeclarativeContributions,
 );
 
+/// Host-side authorizer for service acquisition. A provider's declared
+/// capabilities are checked against the consumer's grants at acquisition time;
+/// a service with no declared capabilities keeps the declaration-only rule.
+struct ServicePolicyAuthorizer {
+    policy: Arc<PolicyEngine>,
+    consumer: String,
+    trust: TrustLevel,
+    capabilities: BTreeMap<String, Vec<Capability>>,
+    workspace: Option<PathBuf>,
+}
+
+impl ServiceAuthorizer for ServicePolicyAuthorizer {
+    fn authorize(&self, _consumer: &str, _scope: &Scope, name: &str) -> Result<(), String> {
+        let Some(capabilities) = self.capabilities.get(name) else {
+            return Ok(());
+        };
+        let call_scope = CallScope {
+            workspace: self.workspace.clone(),
+            path: self.workspace.clone(),
+            ..CallScope::default()
+        };
+        for capability in capabilities {
+            self.policy
+                .authorize_call(&self.consumer, self.trust, *capability, &call_scope)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+}
+
+/// Host-side interceptor authorizer. Registration is checked against the
+/// consumer's agent.intercept grant and recorded in the audit log.
+struct PolicyInterceptor {
+    policy: Arc<PolicyEngine>,
+    owner: String,
+    trust: TrustLevel,
+    workspace: Option<PathBuf>,
+}
+
+impl InterceptorPolicy for PolicyInterceptor {
+    fn authorize(&self, owner: &str, _event: &str) -> Result<(), String> {
+        if !self.owner.is_empty() && owner != self.owner {
+            return Err("interceptor owner does not match the activation".to_string());
+        }
+        let scope = CallScope {
+            workspace: self.workspace.clone(),
+            path: self.workspace.clone(),
+            ..CallScope::default()
+        };
+        self.policy
+            .authorize_call(&self.owner, self.trust, Capability::AgentIntercept, &scope)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// Activation handles held for one build.
+///
+/// Popping on drop disposes dependents before their providers because the
+/// activation order is dependency-first. A caller that moves the set into a
+/// turn keeps the same order through into_vec and the state map.
+#[derive(Default)]
+pub(crate) struct ActivationList(Vec<AppliedExtension>);
+
+impl ActivationList {
+    /// Take the underlying vector, preserving its order.
+    pub(crate) fn into_vec(self) -> Vec<AppliedExtension> {
+        let this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: this is not dropped, so the vector is moved exactly once.
+        unsafe { std::ptr::read(&this.0) }
+    }
+}
+
+impl From<Vec<AppliedExtension>> for ActivationList {
+    fn from(value: Vec<AppliedExtension>) -> Self {
+        Self(value)
+    }
+}
+
+impl std::ops::Deref for ActivationList {
+    type Target = [AppliedExtension];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for ActivationList {
+    fn drop(&mut self) {
+        while self.0.pop().is_some() {}
+    }
+}
+
 /// One extension's contributions installed into a single Agent build.
 ///
 /// This is a build-scoped activation. The caller must invoke unload before
@@ -442,8 +565,23 @@ impl AppliedExtension {
                         &self.session_id,
                     )
             })
-            .then(|| self.services.acquire(scope, name))
+            .then(|| {
+                self.fiber
+                    .context()
+                    .and_then(|context| context.acquire_at(scope, name))
+            })
             .flatten()
+    }
+
+    /// Remove this activation's live tools/prompts/skills while keeping the
+    /// commands and panels installed.
+    pub(crate) fn suspend_live(&self, agent: &::agent::Agent) -> usize {
+        self.lease.suspend_live(agent)
+    }
+
+    /// Restore the live overlay after a suspend.
+    pub(crate) fn resume_live(&self, agent: &::agent::Agent) -> usize {
+        self.lease.resume_live(agent)
     }
 
     /// Revoke this activation from the same Agent and PluginRegistry.
@@ -454,6 +592,42 @@ impl AppliedExtension {
     ) -> Result<usize, super::composable::FiberTransitionError> {
         self.fiber.unload()?;
         Ok(self.lease.revoke(agent, registry))
+    }
+
+    /// Revoke this activation, awaiting async effect cleanups.
+    pub(crate) async fn unload_async(
+        mut self,
+        agent: &mut ::agent::Agent,
+        registry: &mut ::agent::plugins::PluginRegistry,
+    ) -> Result<DisposalReport, super::composable::FiberTransitionError> {
+        let report = self.fiber.dispose_async().await?;
+        let _ = self.lease.revoke(agent, registry);
+        Ok(report)
+    }
+
+    /// The composition context attached to this activation.
+    pub(crate) fn context(&self) -> Option<&Context> {
+        self.fiber.context()
+    }
+
+    /// The service registry this activation resolves against.
+    pub(crate) fn services(&self) -> Arc<super::composable::ServiceRegistry> {
+        Arc::clone(&self.services)
+    }
+
+    /// A cloneable snapshot of the live lease for the reload driver.
+    pub(crate) fn lease_snapshot(&self) -> contribution::ContributionLease {
+        self.lease.clone()
+    }
+
+    /// Declared service requirements, for the reload driver.
+    pub(crate) fn service_requirements(&self) -> &[super::manifest::ServiceRequireSpec] {
+        &self.service_requires
+    }
+
+    /// Stable extension id for this activation.
+    pub(crate) fn extension_id(&self) -> &str {
+        &self.extension_id
     }
 
     /// Current live activation state.
@@ -626,11 +800,13 @@ pub(crate) struct ExtensionHost {
     policy: Arc<PolicyEngine>,
     events: Arc<EventBus>,
     services: Arc<super::composable::ServiceRegistry>,
+    terminal_token: Option<ServiceToken>,
     manager: LifecycleManager,
     loaded: BTreeMap<String, LoadedExtension>,
     builtins: Vec<BuiltinLoaded>,
     issues: Vec<String>,
     status_cache: Arc<Mutex<Vec<ExtensionStatus>>>,
+    graph_cache: Arc<Mutex<Vec<ExtensionGraphNode>>>,
     last_stamp: Option<SystemTime>,
     pump_generation: Arc<AtomicU64>,
     startup_millis: u64,
@@ -673,23 +849,32 @@ impl ExtensionHost {
             store.audit_path(),
             PolicyMode::Enforce,
         )?);
+        crate::extension::dispatcher().set_interceptor_policy(Arc::new(PolicyInterceptor {
+            policy: Arc::clone(&policy),
+            owner: String::new(),
+            trust: TrustLevel::Community,
+            workspace: config.workspace.clone(),
+        }));
         let events = EventBus::new();
         if let Ok(mut slot) = bus_slot().write() {
             *slot = Some(Arc::clone(&events));
         }
         super::hooks::install_http_tap();
         let status_cache = Arc::new(Mutex::new(Vec::new()));
+        let graph_cache = Arc::new(Mutex::new(Vec::new()));
         let mut host = Self {
             config,
             store,
             policy,
             events,
             services: Arc::new(super::composable::ServiceRegistry::new()),
+            terminal_token: None,
             manager: LifecycleManager::new(),
             loaded: BTreeMap::new(),
             builtins: Vec::new(),
             issues: Vec::new(),
             status_cache,
+            graph_cache,
             last_stamp: None,
             pump_generation: Arc::new(AtomicU64::new(0)),
             startup_millis: 0,
@@ -697,6 +882,10 @@ impl ExtensionHost {
             languages: Vec::new(),
             integrations: Vec::new(),
         };
+        let terminal = Arc::new(super::terminal::TerminalHandle(Arc::new(
+            super::terminal::HostTerminal,
+        )));
+        host.terminal_token = Some(host.services.provide(Scope::Host, "terminal", terminal));
         host.register_builtins();
         host.rebuild()?;
         host.crash_history = host.store.crash_history(16);
@@ -798,6 +987,90 @@ impl ExtensionHost {
                 });
             }
             Err(error) => log::warn!("built-in extension inspector was not registered: {error}"),
+        }
+
+        let graph_cache = Arc::clone(&self.graph_cache);
+        let diagnostics = ClosureExtension::new(
+            DIAGNOSTICS_MANIFEST,
+            vec![
+                ToolDescriptor {
+                    id: ContributionId::parse("graph").expect("diagnostics tool id"),
+                    description:
+                        "Return the declared extension graph: state, runtime, applied flag, dependencies, services and effect surface."
+                            .to_string(),
+                    input_schema: empty_schema(),
+                    capabilities: Vec::new(),
+                },
+                ToolDescriptor {
+                    id: ContributionId::parse("why").expect("diagnostics tool id"),
+                    description:
+                        "Explain why one extension is or is not applied, including its declared effect surface."
+                            .to_string(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": { "id": { "type": "string" } },
+                        "required": ["id"]
+                    }),
+                    capabilities: Vec::new(),
+                },
+            ],
+            move |name, arguments| {
+                let nodes = graph_cache
+                    .lock()
+                    .map(|nodes| nodes.clone())
+                    .unwrap_or_default();
+                match name {
+                    "graph" => Ok(serde_json::json!({
+                        "extensions": nodes,
+                        "fibers": super::live::snapshot(),
+                    })),
+                    "why" => {
+                        let id = arguments
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| ExtensionError::Runtime {
+                                extension: "com.bos.bsh.diagnostics".to_string(),
+                                message: "why needs an id".to_string(),
+                            })?;
+                        let node = nodes.into_iter().find(|node| node.id == id).ok_or_else(|| {
+                            ExtensionError::Runtime {
+                                extension: "com.bos.bsh.diagnostics".to_string(),
+                                message: format!("extension {id} is not installed"),
+                            }
+                        })?;
+                        serde_json::to_value(node).map_err(|error| ExtensionError::Runtime {
+                            extension: "com.bos.bsh.diagnostics".to_string(),
+                            message: error.to_string(),
+                        })
+                    }
+                    _ => Err(ExtensionError::UnsupportedRuntime {
+                        kind: format!("diagnostics tool {name}"),
+                    }),
+                }
+            },
+        );
+        match BuiltinRuntime::new(Arc::new(diagnostics)) {
+            Ok(runtime) => {
+                let package = Package {
+                    root: PathBuf::from("<builtin>"),
+                    manifest: runtime.manifest().clone(),
+                    report: ValidationReport::default(),
+                    source: ExtensionSource::Builtin,
+                    trust: TrustLevel::Builtin,
+                    hash: String::new(),
+                    installed_at: 0,
+                    signature: None,
+                    verification: crate::extension::signing::SignatureVerification::Missing,
+                    source_path: None,
+                };
+                let tools = runtime.descriptors();
+                self.builtins.push(BuiltinLoaded {
+                    package,
+                    runtime: Arc::new(LazyRuntime::new(Arc::new(runtime))),
+                    tools,
+                });
+            }
+            Err(error) => log::warn!("built-in diagnostics was not registered: {error}"),
         }
     }
 
@@ -1077,6 +1350,10 @@ impl ExtensionHost {
         if let Ok(mut cache) = self.status_cache.lock() {
             *cache = statuses;
         }
+        let graph = self.graph();
+        if let Ok(mut cache) = self.graph_cache.lock() {
+            *cache = graph;
+        }
         self.last_stamp = self.stamp();
         self.start_event_pump();
         self.warm_startup_runtimes();
@@ -1288,6 +1565,21 @@ impl ExtensionHost {
                     contributions,
                 ))
             }
+            RuntimeKind::Cordis => {
+                let runtime = super::runtime::cordis::CordisRuntime::new(
+                    &package.manifest,
+                    &package.root,
+                    &data_root,
+                )?;
+                let tools = runtime.descriptors()?;
+                let contributions =
+                    declarative::load_contributions(&package.root, &package.manifest)?;
+                Ok((
+                    Arc::new(LazyRuntime::new(Arc::new(runtime))),
+                    tools,
+                    contributions,
+                ))
+            }
             RuntimeKind::Builtin => Err(ExtensionError::Manifest {
                 path: package.root.join("extension.toml"),
                 message: "the builtin runtime is linked in; an installed package cannot claim it"
@@ -1377,8 +1669,10 @@ impl ExtensionHost {
                 prompts: contributions.prompts.clone(),
                 contexts: contributions.contexts.clone(),
                 workspace: self.config.workspace.clone(),
-                skills_dir: (!entry.package.manifest.contributes.skills.is_empty())
-                    .then(|| entry.package.root.join("skills")),
+                skills_dir: runtime.skills_dir().or_else(|| {
+                    (!entry.package.manifest.contributes.skills.is_empty())
+                        .then(|| entry.package.root.join("skills"))
+                }),
                 workflows: contributions.workflows.clone(),
                 themes: contributions.themes.clone(),
                 timeout_ms: entry.package.manifest.resources.execution_ms(),
@@ -1410,6 +1704,7 @@ impl ExtensionHost {
         session_id: &str,
     ) -> Vec<AppliedExtension> {
         let mut applied = Vec::new();
+        let service_capabilities = self.service_capability_map();
         for entry in self.loaded.values() {
             if !entry.applied || entry.error.is_some() {
                 continue;
@@ -1444,8 +1739,10 @@ impl ExtensionHost {
                 prompts: contributions.prompts.clone(),
                 contexts: contributions.contexts.clone(),
                 workspace: self.config.workspace.clone(),
-                skills_dir: (!entry.package.manifest.contributes.skills.is_empty())
-                    .then(|| entry.package.root.join("skills")),
+                skills_dir: runtime.skills_dir().or_else(|| {
+                    (!entry.package.manifest.contributes.skills.is_empty())
+                        .then(|| entry.package.root.join("skills"))
+                }),
                 workflows: contributions.workflows.clone(),
                 themes: contributions.themes.clone(),
                 timeout_ms: entry.package.manifest.resources.execution_ms(),
@@ -1458,7 +1755,21 @@ impl ExtensionHost {
                 Arc::clone(&self.events),
                 self.config.workspace.clone(),
             );
-            let mut fiber = Fiber::new(entry.package.id().as_str());
+            let extension_id = entry.package.id().as_str().to_owned();
+            let authorizer = Arc::new(ServicePolicyAuthorizer {
+                policy: Arc::clone(&self.policy),
+                consumer: extension_id.clone(),
+                trust: entry.package.trust,
+                capabilities: service_capabilities.clone(),
+                workspace: self.config.workspace.clone(),
+            });
+            let context = Context::root_authorized(
+                Arc::clone(&self.services),
+                Scope::Extension(extension_id.clone()),
+                extension_id,
+                Some(authorizer),
+            );
+            let mut fiber = Fiber::with_context(entry.package.id().as_str(), context);
             if let Err(error) = fiber.transition(FiberState::Loading) {
                 log::error!(
                     "extension {}: Fiber could not start: {error}",
@@ -1498,6 +1809,133 @@ impl ExtensionHost {
             .values()
             .map(|entry| self.status_of(entry))
             .collect()
+    }
+
+    /// The composition graph as declared by the loaded packages.
+    pub(crate) fn graph(&self) -> Vec<ExtensionGraphNode> {
+        self.loaded
+            .values()
+            .map(|entry| {
+                let manifest = &entry.package.manifest;
+                let provides = manifest
+                    .services
+                    .provides
+                    .iter()
+                    .map(|service| {
+                        format!("{}@{}[{:?}]", service.name, service.version, service.scope)
+                    })
+                    .collect();
+                let requires = manifest
+                    .services
+                    .requires
+                    .iter()
+                    .map(|service| {
+                        format!(
+                            "{}@{}{}[{:?}]",
+                            service.name,
+                            service.version,
+                            if service.optional { "?" } else { "" },
+                            service.scope
+                        )
+                    })
+                    .collect();
+                let mut effects = Vec::new();
+                for (kind, ids) in [
+                    ("tool", &manifest.contributes.tools),
+                    ("command", &manifest.contributes.commands),
+                    ("panel", &manifest.contributes.panels),
+                    ("prompt", &manifest.contributes.prompts),
+                    ("context", &manifest.contributes.contexts),
+                    ("skill", &manifest.contributes.skills),
+                    ("workflow", &manifest.contributes.workflows),
+                    ("language", &manifest.contributes.languages),
+                    ("integration", &manifest.contributes.integrations),
+                    ("model", &manifest.contributes.model_providers),
+                    ("agent", &manifest.contributes.agent_providers),
+                    ("theme", &manifest.contributes.themes),
+                    ("preset", &manifest.contributes.presets),
+                ] {
+                    for id in ids {
+                        effects.push(format!("{kind}:{id}"));
+                    }
+                }
+                for topic in &manifest.contributes.events {
+                    effects.push(format!("event:{topic}"));
+                }
+                for topic in &manifest.contributes.publishes {
+                    effects.push(format!("publish:{topic}"));
+                }
+                for hook in &manifest.contributes.hooks {
+                    effects.push(format!("hook:{hook}"));
+                }
+                for service in &manifest.services.provides {
+                    effects.push(format!("service:{}", service.name));
+                }
+                ExtensionGraphNode {
+                    id: entry.package.id().as_str().to_owned(),
+                    state: self
+                        .manager
+                        .get(entry.package.id().as_str())
+                        .map(|record| record.state.as_str().to_owned())
+                        .unwrap_or_else(|| "unknown".to_owned()),
+                    runtime: manifest.runtime.kind.as_str().to_owned(),
+                    enabled: entry.configured,
+                    applied: entry.applied,
+                    dependencies: manifest
+                        .dependencies
+                        .keys()
+                        .map(|id| id.as_str().to_owned())
+                        .collect(),
+                    provides,
+                    requires,
+                    effects,
+                    live_suspended: super::live::is_suspended(entry.package.id().as_str()),
+                    error: entry.error.clone(),
+                }
+            })
+            .collect()
+    }
+
+    /// Capabilities a consumer must hold for each declared service name.
+    fn service_capability_map(&self) -> BTreeMap<String, Vec<Capability>> {
+        let mut capabilities = BTreeMap::new();
+        for entry in self.loaded.values() {
+            for provide in &entry.package.manifest.services.provides {
+                capabilities
+                    .entry(provide.name.clone())
+                    .or_insert_with(Vec::new)
+                    .extend(provide.capabilities.iter().copied());
+            }
+        }
+        capabilities
+            .entry("terminal".to_string())
+            .or_default()
+            .push(Capability::ProcessExecute);
+        capabilities
+    }
+
+    /// Explain why one extension is or is not applied.
+    pub(crate) fn why(&self, id: &str) -> Option<String> {
+        let entry = self.loaded.get(id)?;
+        if entry.applied {
+            if super::live::is_suspended(entry.package.id().as_str()) {
+                return Some(
+                    "applied; live overlay suspended because a required service is missing"
+                        .to_string(),
+                );
+            }
+            return Some("applied".to_string());
+        }
+        if let Some(error) = &entry.error {
+            return Some(format!("not applied: {error}"));
+        }
+        if !entry.configured {
+            return Some("not applied: disabled by configuration".to_string());
+        }
+        Some(format!(
+            "not applied: startup policy is {:?}",
+            entry.package.manifest.runtime.startup
+        ))
     }
 
     /// Language services from every applied extension.
@@ -1674,6 +2112,55 @@ impl ExtensionHost {
         }
     }
     /// Clear a persisted failure and reload the package set.
+    /// Apply a Cordis/profile patch file to installed packages and reload them.
+    ///
+    /// Rows name a package with package:<id> (or their own id). A row config
+    /// is written to that package's extension config before the host rebuilds,
+    /// so lowering a patch row is an actual mount, not only a plan.
+    pub(crate) fn mount_profile(&mut self, path: &Path) -> Result<Vec<String>, ExtensionError> {
+        let entries =
+            super::composable::plan::load_cordis_patch(path, "profile").map_err(|error| {
+                ExtensionError::Runtime {
+                    extension: "profile".to_string(),
+                    message: error.to_string(),
+                }
+            })?;
+        let candidates: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry.enabled && !entry.group)
+            .filter_map(|entry| {
+                let wanted = entry
+                    .source
+                    .split_once('#')
+                    .map(|(_, name)| name)
+                    .unwrap_or(entry.id.as_str());
+                let loaded = self.loaded.get(entry.id.as_str()).or_else(|| {
+                    self.loaded.values().find(|loaded| {
+                        loaded.package.manifest.extension.name == wanted
+                            || loaded.package.id().as_str() == wanted
+                            || loaded.package.id().as_str().ends_with(entry.id.as_str())
+                    })
+                })?;
+                Some((
+                    loaded.package.id().as_str().to_string(),
+                    loaded.package.manifest.clone(),
+                    loaded.package.root.clone(),
+                    entry.config.clone(),
+                ))
+            })
+            .collect();
+        let mut mounted = Vec::new();
+        for (id, manifest, root, config) in candidates {
+            if let Some(config) = config {
+                let id = crate::extension::types::ExtensionId::parse(id.clone())?;
+                super::config::save(&manifest, &root, &self.store.data_dir(&id), config)?;
+            }
+            self.retry(&id)?;
+            mounted.push(id);
+        }
+        Ok(mounted)
+    }
+
     pub(crate) fn retry(&mut self, id: &str) -> Result<(), ExtensionError> {
         let id = crate::extension::types::ExtensionId::parse(id.to_string())?;
         self.store.clear_failure(&id)?;
@@ -2623,6 +3110,34 @@ required = ["agent.tools.register"]
 tools = ["list"]
 "#;
 
+/// The manifest of the built-in extension diagnostics package.
+const DIAGNOSTICS_MANIFEST: &str = r#"
+schema_version = "1.0"
+
+[extension]
+id = "com.bos.bsh.diagnostics"
+name = "Extension Diagnostics"
+version = "1.0.0"
+description = "Graph and why diagnostics for the extension composition"
+authors = ["BrickOS Team"]
+license = "MIT"
+
+[compatibility]
+bsh = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+
+[runtime]
+kind = "builtin"
+entry = "diagnostics"
+startup = "on-demand"
+
+[capabilities]
+required = ["agent.tools.register"]
+
+[contributes]
+tools = ["graph", "why"]
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3001,8 +3516,8 @@ tools = ["echo"]
         let host = ExtensionHost::open(config(&root)).expect("host");
         let metrics = host.metrics();
         assert_eq!(
-            metrics.applied, 2,
-            "the builtin inspector and good package still apply"
+            metrics.applied, 3,
+            "the builtin inspector, diagnostics and good package still apply"
         );
         let statuses = host.statuses();
         assert!(
@@ -3030,6 +3545,177 @@ tools = ["echo"]
         assert!(status.applied);
         assert_eq!(status.tools, vec!["extensions__list"]);
         assert_eq!(status.state, LifecycleState::Active);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn disabling_the_builtin_inspector_removes_its_tool() {
+        let root = scratch("builtin-disabled");
+        let host = ExtensionHost::open(config(&root)).expect("host");
+        let id = ExtensionId::parse("com.bos.bsh.extensions").expect("id");
+        host.store().set_enabled(&id, false).expect("disable");
+        drop(host);
+
+        let host = ExtensionHost::open(config(&root)).expect("reopen");
+        let status = host
+            .statuses()
+            .into_iter()
+            .find(|status| status.id == "com.bos.bsh.extensions")
+            .expect("inspector");
+        assert!(!status.configured);
+        // The descriptor is still discovered, but it is not applied to an agent,
+        // so the tool is not reachable.
+        assert!(!status.applied);
+        assert_ne!(status.state, LifecycleState::Active);
+        assert!(host
+            .why("com.bos.bsh.extensions")
+            .is_some_and(|why| why.contains("disabled")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn disabling_the_builtin_diagnostics_removes_its_tools() {
+        let root = scratch("diagnostics-disabled");
+        let host = ExtensionHost::open(config(&root)).expect("host");
+        let id = ExtensionId::parse("com.bos.bsh.diagnostics").expect("id");
+        host.store().set_enabled(&id, false).expect("disable");
+        drop(host);
+
+        let host = ExtensionHost::open(config(&root)).expect("reopen");
+        let status = host
+            .statuses()
+            .into_iter()
+            .find(|status| status.id == "com.bos.bsh.diagnostics")
+            .expect("diagnostics");
+        assert!(!status.configured);
+        assert!(!status.applied);
+        assert_ne!(status.state, LifecycleState::Active);
+        assert!(host
+            .why("com.bos.bsh.diagnostics")
+            .is_some_and(|why| why.contains("disabled")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn the_host_terminal_service_runs_a_command() {
+        let root = scratch("terminal");
+        let host = ExtensionHost::open(config(&root)).expect("host");
+        let lease = host
+            .services()
+            .acquire::<crate::extension::terminal::TerminalHandle>(&Scope::Host, "terminal")
+            .expect("terminal service");
+        let output = lease.run("printf hello", None).await.expect("command");
+        assert_eq!(output.stdout, "hello");
+        assert_eq!(output.code, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn service_acquisition_checks_declared_capabilities() {
+        let root = scratch("policy-authorizer");
+        let policy = Arc::new(
+            PolicyEngine::open(
+                root.join("grants.toml"),
+                root.join("audit.jsonl"),
+                PolicyMode::Enforce,
+            )
+            .expect("policy"),
+        );
+        let mut capabilities = BTreeMap::new();
+        capabilities.insert("search".to_string(), vec![Capability::SecretsRead]);
+        let authorizer = ServicePolicyAuthorizer {
+            policy: Arc::clone(&policy),
+            consumer: "com.example.consumer".to_string(),
+            trust: TrustLevel::Community,
+            capabilities,
+            workspace: Some(root.clone()),
+        };
+
+        assert!(authorizer
+            .authorize("com.example.consumer", &Scope::Host, "search")
+            .is_err());
+        policy
+            .grant(
+                "com.example.consumer",
+                Capability::SecretsRead,
+                GrantScope::Any,
+                None,
+            )
+            .expect("grant");
+        assert!(authorizer
+            .authorize("com.example.consumer", &Scope::Host, "search")
+            .is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_builtin_diagnostics_is_registered_and_applied() {
+        let root = scratch("diagnostics");
+        let host = ExtensionHost::open(config(&root)).expect("host");
+        let status = host
+            .statuses()
+            .into_iter()
+            .find(|status| status.id == "com.bos.bsh.diagnostics")
+            .expect("diagnostics");
+        assert!(status.applied);
+        assert!(status.tools.iter().any(|tool| tool.ends_with("__graph")));
+        assert!(status.tools.iter().any(|tool| tool.ends_with("__why")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn interceptor_registration_is_audited_and_capability_gated() {
+        let root = scratch("interceptor-audit");
+        let policy = Arc::new(
+            PolicyEngine::open(
+                root.join("grants.toml"),
+                root.join("audit.jsonl"),
+                PolicyMode::Enforce,
+            )
+            .expect("policy"),
+        );
+        let interceptor = PolicyInterceptor {
+            policy: Arc::clone(&policy),
+            owner: "com.example.interceptor".to_string(),
+            trust: TrustLevel::Community,
+            workspace: Some(root.clone()),
+        };
+        assert!(interceptor
+            .authorize("com.example.interceptor", "tool.before")
+            .is_err());
+        let audit = std::fs::read_to_string(root.join("audit.jsonl")).unwrap_or_default();
+        assert!(audit.contains("agent.intercept"), "audit: {audit}");
+
+        policy
+            .grant(
+                "com.example.interceptor",
+                Capability::AgentIntercept,
+                GrantScope::Any,
+                None,
+            )
+            .expect("grant");
+        assert!(interceptor
+            .authorize("com.example.interceptor", "tool.before")
+            .is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn graph_and_why_report_the_live_inventory() {
+        let root = scratch("graph");
+        let host = ExtensionHost::open(config(&root)).expect("host");
+        let graph = host.graph();
+        let node = graph
+            .iter()
+            .find(|node| node.id == "com.bos.bsh.extensions")
+            .expect("inspector node");
+        assert!(node.applied);
+        assert_eq!(node.runtime, "builtin");
+        assert_eq!(
+            host.why("com.bos.bsh.extensions").as_deref(),
+            Some("applied")
+        );
+        assert!(host.why("com.example.missing").is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 

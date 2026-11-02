@@ -1,0 +1,26 @@
+schema_version = "1.0"
+
+[extension]
+id = "com.example.cordis-echo"
+name = "Cordis Echo"
+version = "1.0.0"
+description = "A real Cordis apply(ctx, config) package executed by the BSH Node bridge"
+authors = ["BSH Example"]
+license = "MIT"
+
+[compatibility]
+bsh = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+
+[runtime]
+kind = "cordis"
+entry = "index.js"
+startup = "on-demand"
+
+[capabilities]
+required = ["process.execute", "agent.tools.register"]
+
+[contributes]
+tools = ["echo"]
+commands = ["hello"]
+skills = ["greet"]

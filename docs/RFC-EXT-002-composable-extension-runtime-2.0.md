@@ -163,4 +163,9 @@ A failed plan is rejected before activation. Patch application must be transacti
 - Service contract planning currently fails the configured root set conservatively when the selected set contains an invalid service graph; finer-grained failure isolation between independent roots remains future work.
 - DSH bundle patches remain unsupported until the composition engine is wired and covered by fixtures.
 
+> The follow-up design for reactive dependency reconciliation, async effect
+> scopes, host-level composition profiles/patches, typed dispatch, and a
+> first-class Cordis runtime is `docs/RFC-EXT-003-cordis-composable-extension-runtime.md`.
+> It keeps this RFC's package, trust, capability, and runtime boundaries.
+
 Do not mark 2.0-B complete until tests prove that production turn ownership retains Fiber handles through the live turn, closes tool liveness on every teardown path, and cleans prompt/skill/tool/command/panel contributions on explicit unload and partial activation failure.

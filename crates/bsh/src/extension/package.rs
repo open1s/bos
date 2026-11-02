@@ -242,7 +242,17 @@ pub(crate) fn package_hash(root: &Path) -> Result<String, ExtensionError> {
         hasher.update(file_bytes.to_le_bytes());
         hasher.update(digest);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex_digest(hasher.finalize()))
+}
+
+fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
+    use std::fmt::Write;
+    let bytes = bytes.as_ref();
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 fn is_ignored(path: &Path) -> bool {

@@ -36,6 +36,11 @@ Commands:
               [--registry <name|url> <id>[@version]]
   uninstall <id> [--purge-data]       remove a package; keep data by default
   list                                list installed and built-in extensions
+  graph [--json]                      print the declared service/dependency graph
+  why <id>                            explain why an extension is or is not applied
+  effects <id>                        list the declared effect surface of one extension
+  reload <id>                         rebuild the host's view of one extension
+  mount <file>                        apply a Cordis/profile patch to installed packages
   info <id>                           show one extension in detail
   enable <id>                         enable an extension
   disable <id>                        disable an extension
@@ -123,6 +128,11 @@ pub(crate) fn run(args: &[String]) -> i32 {
         "install" => command_install(&rest[1..], root.clone()),
         "uninstall" => command_uninstall(&rest[1..], root.clone()),
         "list" => command_list(root.clone(), json),
+        "graph" => command_graph(root.clone(), json),
+        "why" => command_why(&rest[1..], root.clone(), json),
+        "effects" => command_effects(&rest[1..], root.clone(), json),
+        "reload" => command_reload(&rest[1..], root.clone(), json),
+        "mount" => command_mount(&rest[1..], root.clone(), json),
         "info" => command_info(&rest[1..], root.clone(), json),
         "enable" | "disable" => command_toggle(&command, &rest[1..], root.clone()),
         "versions" => command_versions(&rest[1..], root.clone()),
@@ -412,6 +422,23 @@ fn validate_runtime(package: &Package) -> Result<(), String> {
                 .map(|_| ())
                 .map_err(|error| error.to_string())
         }
+        RuntimeKind::Cordis => {
+            let entry = package
+                .manifest
+                .runtime
+                .entry
+                .as_deref()
+                .ok_or_else(|| "runtime.entry is missing".to_string())?;
+            if !package.root.join(entry).is_file() {
+                return Err(format!("runtime.entry {entry} is missing"));
+            }
+            if agent::extensions::bridge::find_interpreter().is_none() {
+                return Err("the Cordis runtime needs a Node interpreter".to_string());
+            }
+            load_contributions(&package.root, &package.manifest)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        }
         RuntimeKind::Builtin => Err(
             "the builtin runtime is linked into the host; a package may not claim it".to_string(),
         ),
@@ -545,6 +572,109 @@ fn command_list(root: Option<PathBuf>, json: bool) -> Result<i32, String> {
             if status.applied { "yes" } else { "no" },
             status.tools.join(", ")
         );
+    }
+    Ok(0)
+}
+
+fn command_graph(root: Option<PathBuf>, json: bool) -> Result<i32, String> {
+    let host = open_host(root).map_err(|error| error.to_string())?;
+    let graph = host.graph();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&graph).unwrap_or_default()
+        );
+        return Ok(0);
+    }
+    println!(
+        "{:<34} {:<12} {:<10} {:<8} PROVIDES -> REQUIRES",
+        "ID", "STATE", "RUNTIME", "APPLIED"
+    );
+    for node in graph {
+        println!(
+            "{:<34} {:<12} {:<10} {:<8} {} -> {}",
+            node.id,
+            node.state,
+            node.runtime,
+            if node.applied { "yes" } else { "no" },
+            node.provides.join(", "),
+            node.requires.join(", ")
+        );
+    }
+    Ok(0)
+}
+
+fn command_why(args: &[String], root: Option<PathBuf>, json: bool) -> Result<i32, String> {
+    let id = one_argument(args, "bsh ext why <id>")?;
+    let host = open_host(root).map_err(|error| error.to_string())?;
+    let Some(why) = host.why(&id) else {
+        return Err(format!("extension {id} is not installed"));
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "id": id, "why": why }))
+                .unwrap_or_default()
+        );
+        return Ok(0);
+    }
+    println!("{id}: {why}");
+    Ok(0)
+}
+
+fn command_mount(args: &[String], root: Option<PathBuf>, json: bool) -> Result<i32, String> {
+    let path = one_argument(args, "bsh ext mount <file>")?;
+    let mut host = open_host(root).map_err(|error| error.to_string())?;
+    let mounted = host
+        .mount_profile(Path::new(&path))
+        .map_err(|error| error.to_string())?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "mounted": mounted }))
+                .unwrap_or_default()
+        );
+    } else if mounted.is_empty() {
+        println!("no installed package matched the profile rows");
+    } else {
+        for id in mounted {
+            println!("{id}: mounted");
+        }
+    }
+    Ok(0)
+}
+
+fn command_effects(args: &[String], root: Option<PathBuf>, json: bool) -> Result<i32, String> {
+    let id = one_argument(args, "bsh ext effects <id>")?;
+    let host = open_host(root).map_err(|error| error.to_string())?;
+    let Some(node) = host.graph().into_iter().find(|node| node.id == id) else {
+        return Err(format!("extension {id} is not installed"));
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&node.effects).unwrap_or_default()
+        );
+        return Ok(0);
+    }
+    for effect in node.effects {
+        println!("{effect}");
+    }
+    Ok(0)
+}
+
+fn command_reload(args: &[String], root: Option<PathBuf>, json: bool) -> Result<i32, String> {
+    let id = one_argument(args, "bsh ext reload <id>")?;
+    let mut host = open_host(root).map_err(|error| error.to_string())?;
+    host.retry(&id).map_err(|error| error.to_string())?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "id": id, "reloaded": true }))
+                .unwrap_or_default()
+        );
+    } else {
+        println!("{id}: reloaded");
     }
     Ok(0)
 }
@@ -1330,6 +1460,14 @@ fn command_mock(args: &[String]) -> Result<i32, String> {
                     None,
                     config,
                     TrustLevel::Local,
+                )
+                .map_err(|error| error.to_string())?,
+            ),
+            RuntimeKind::Cordis => std::sync::Arc::new(
+                crate::extension::runtime::cordis::CordisRuntime::new(
+                    &package.manifest,
+                    &path,
+                    &data_root,
                 )
                 .map_err(|error| error.to_string())?,
             ),

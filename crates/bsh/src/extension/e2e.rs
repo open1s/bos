@@ -206,6 +206,174 @@ async fn the_computer_use_example_exposes_every_declared_surface() {
 }
 
 #[tokio::test]
+async fn the_cordis_example_runs_through_the_host() {
+    let root = scratch("cordis");
+    std::fs::create_dir_all(root.join("workspace")).expect("workspace");
+    let store = ExtensionStore::open(&root).expect("store");
+    let package = store
+        .install(&examples().join("cordis-echo"))
+        .expect("install");
+    grant_all(
+        &store,
+        package.id(),
+        &package.manifest.capabilities.required,
+    );
+    let mut host = ExtensionHost::open(config(&root)).expect("host");
+    let status = host
+        .statuses()
+        .into_iter()
+        .find(|status| status.id == "com.example.cordis-echo")
+        .expect("cordis status");
+    assert!(status.applied, "cordis applies: {:?}", status.error);
+    assert_eq!(status.runtime, "cordis");
+    assert!(
+        status.tools.iter().any(|tool| tool.ends_with("__echo")),
+        "tools: {:?}",
+        status.tools
+    );
+    assert!(
+        status
+            .commands
+            .iter()
+            .any(|command| command.ends_with("__hello")),
+        "commands: {:?}",
+        status.commands
+    );
+    assert!(
+        status.skills.iter().any(|skill| skill == "greet"),
+        "skills: {:?}",
+        status.skills
+    );
+    host.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_profile_mount_applies_config_to_an_installed_package() {
+    let root = scratch("mount");
+    std::fs::create_dir_all(root.join("workspace")).expect("workspace");
+    let store = ExtensionStore::open(&root).expect("store");
+    let package = store.install(&examples().join("hello")).expect("install");
+    grant_all(
+        &store,
+        package.id(),
+        &package.manifest.capabilities.required,
+    );
+    let mut host = ExtensionHost::open(config(&root)).expect("host");
+    let profile = root.join("profile.yml");
+    std::fs::write(
+        &profile,
+        "- insert:\n    - id: com.example.hello\n      name: hello\n      config:\n        greeting: hi\n",
+    )
+    .expect("profile");
+    let mounted = host.mount_profile(&profile).expect("mount");
+    assert_eq!(mounted, vec!["com.example.hello".to_string()]);
+    assert!(host
+        .statuses()
+        .into_iter()
+        .any(|status| status.id == "com.example.hello" && status.applied));
+    host.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_first_party_notes_package_installs_through_the_store() {
+    let root = scratch("bsh-notes");
+    std::fs::create_dir_all(root.join("workspace")).expect("workspace");
+    let store = ExtensionStore::open(&root).expect("store");
+    let package = store
+        .install(&examples().join("bsh-notes"))
+        .expect("install");
+    grant_all(
+        &store,
+        package.id(),
+        &package.manifest.capabilities.required,
+    );
+    let mut host = ExtensionHost::open(config(&root)).expect("host");
+    let status = host
+        .statuses()
+        .into_iter()
+        .find(|status| status.id == "com.bos.bsh.notes")
+        .expect("notes status");
+    assert!(status.applied, "notes applies: {:?}", status.error);
+    assert_eq!(status.runtime, "process");
+    assert!(status.tools.iter().any(|tool| tool.ends_with("__save")));
+    assert!(status.tools.iter().any(|tool| tool.ends_with("__list")));
+    host.shutdown().await;
+}
+
+#[tokio::test]
+async fn disabling_the_first_party_notes_package_removes_its_tools() {
+    let root = scratch("bsh-notes-disabled");
+    std::fs::create_dir_all(root.join("workspace")).expect("workspace");
+    let store = ExtensionStore::open(&root).expect("store");
+    let package = store
+        .install(&examples().join("bsh-notes"))
+        .expect("install");
+    grant_all(
+        &store,
+        package.id(),
+        &package.manifest.capabilities.required,
+    );
+    store
+        .set_enabled(package.id(), false)
+        .expect("disable notes");
+    let mut host = ExtensionHost::open(config(&root)).expect("host");
+    let status = host
+        .statuses()
+        .into_iter()
+        .find(|status| status.id == "com.bos.bsh.notes")
+        .expect("notes status");
+    assert!(!status.configured);
+    assert!(!status.applied);
+    host.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_allinone_example_covers_every_declared_contribution_kind() {
+    let root = scratch("allinone");
+    std::fs::create_dir_all(root.join("workspace")).expect("workspace");
+    let store = ExtensionStore::open(&root).expect("store");
+    let package = store
+        .install(&examples().join("allinone"))
+        .expect("install");
+    grant_all(
+        &store,
+        package.id(),
+        &package.manifest.capabilities.required,
+    );
+    let mut host = ExtensionHost::open(config(&root)).expect("host");
+    let status = host
+        .statuses()
+        .into_iter()
+        .find(|status| status.id == "com.example.allinone")
+        .expect("allinone status");
+    assert!(status.applied, "allinone applies: {:?}", status.error);
+    assert_eq!(status.runtime, "process");
+    assert!(
+        status.tools.iter().any(|tool| tool.ends_with("__describe")),
+        "tools: {:?}",
+        status.tools
+    );
+    assert!(
+        !status.commands.is_empty(),
+        "commands: {:?}",
+        status.commands
+    );
+    assert!(!status.panels.is_empty(), "panels: {:?}", status.panels);
+    assert!(!status.skills.is_empty(), "skills: {:?}", status.skills);
+    assert!(
+        !status.languages.is_empty(),
+        "languages: {:?}",
+        status.languages
+    );
+    assert!(
+        !status.integrations.is_empty(),
+        "integrations: {:?}",
+        status.integrations
+    );
+    host.shutdown().await;
+}
+
+#[tokio::test]
 async fn the_grant_button_path_activates_a_denied_community_package() {
     let root = scratch("grant-required");
     std::fs::create_dir_all(root.join("workspace")).expect("workspace");

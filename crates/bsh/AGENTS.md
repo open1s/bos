@@ -47,6 +47,13 @@ agent tool registration, diagnostics and `bsh ext ...`.
 - The legacy Codex/DSH shim in `crates/agent/src/extensions` still backs the old
   installed-plugin inventory. Do not extend it for new work; new packages target
   `extension.toml` and the BSH standard.
+- **Extension-first rule (gold standard):** every new BSH feature must be built as
+  a first-party extension through the same manifest, capability, lifecycle and
+  effect path as a third-party package. A feature that needs a new host seam must
+  expose that seam as a typed service or an event; adding a privileged in-core
+  shortcut is an exception requiring an RFC and a migration plan. The acceptance
+  standard is `docs/bsh-extension-gold-standard.md`; do not call the framework
+  complete while its conformance gates are unmet.
 
 ## Standing rule: every UI increment ends with a gap check
 

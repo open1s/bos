@@ -6,6 +6,7 @@
 //! same diagnostics. Concrete runtimes live in this module's children.
 
 pub(crate) mod builtin;
+pub(crate) mod cordis;
 pub(crate) mod declarative;
 pub(crate) mod extism;
 pub(crate) mod mcp;
@@ -257,6 +258,11 @@ pub(crate) trait Runtime: Send + Sync {
 
     /// The memory ceiling the manifest requested, in bytes.
     fn memory_limit(&self) -> Option<u64> {
+        None
+    }
+
+    /// A runtime-materialized skills directory, when the runtime provides one.
+    fn skills_dir(&self) -> Option<PathBuf> {
         None
     }
 

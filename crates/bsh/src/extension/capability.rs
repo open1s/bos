@@ -78,11 +78,13 @@ pub(crate) enum Capability {
     UiTheme,
     /// Receive observe-hook batches from host seams.
     HooksObserve,
+    /// Register an event interceptor that may rewrite or short-circuit a host seam.
+    AgentIntercept,
 }
 
 impl Capability {
     /// Every capability, in declaration order.
-    pub(crate) const ALL: [Capability; 20] = [
+    pub(crate) const ALL: [Capability; 21] = [
         Self::WorkspaceRead,
         Self::WorkspaceWrite,
         Self::NetworkHttp,
@@ -103,6 +105,7 @@ impl Capability {
         Self::UiCommands,
         Self::UiTheme,
         Self::HooksObserve,
+        Self::AgentIntercept,
     ];
 
     /// The stable manifest string.
@@ -128,6 +131,7 @@ impl Capability {
             Self::UiCommands => "ui.commands",
             Self::UiTheme => "ui.theme",
             Self::HooksObserve => "hooks.observe",
+            Self::AgentIntercept => "agent.intercept",
         }
     }
 
@@ -154,6 +158,7 @@ impl Capability {
             Self::UiCommands => "contribute host commands and keybindings",
             Self::UiTheme => "contribute visual theme resources",
             Self::HooksObserve => "receive observe-hook batches from host seams",
+            Self::AgentIntercept => "intercept and rewrite host events and requests",
         }
     }
 
@@ -174,7 +179,10 @@ impl Capability {
             | Self::AgentAgentsProvide
             | Self::AgentWorkflowsProvide
             | Self::AgentSkillsProvide => Risk::Medium,
-            Self::WorkspaceWrite | Self::NetworkHttp | Self::HooksObserve => Risk::High,
+            Self::WorkspaceWrite
+            | Self::NetworkHttp
+            | Self::HooksObserve
+            | Self::AgentIntercept => Risk::High,
             Self::ProcessExecute | Self::ComputerUse | Self::SecretsRead => Risk::Critical,
         }
     }

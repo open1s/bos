@@ -309,7 +309,7 @@ any extension is marked active.
 ~~~toml
 [services]
 provides = [
-  { name = "com.example.search", contract = "com.example.search-api", version = "1.2.0", scope = "workspace" }
+  { name = "com.example.search", contract = "com.example.search-api", version = "1.2.0", scope = "workspace", capabilities = ["workspace.read"] }
 ]
 requires = [
   { name = "com.example.search", contract = "com.example.search-api", version = "^1.0", scope = "workspace" },
@@ -333,6 +333,9 @@ requires = [
 - Each service requirement adds a provider-before-consumer dependency edge.
   The combined graph is checked for missing dependencies and cycles, and the
   resulting topological order is the order used by the host activation pass.
+- A provider may declare capabilities = [...] on a provides entry. A consumer
+  must hold every listed capability at acquisition time; an empty list keeps
+  the declaration-only rule. A denial is an absence, not a panic.
 - A declaration is not a capability grant. Service discovery never bypasses
   the extension's existing capability and policy checks. The manifest planner
   validates and orders contracts; runtime transport/binding of manifest

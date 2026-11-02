@@ -240,6 +240,10 @@ pub(crate) struct ServiceProvideSpec {
     pub(crate) version: Version,
     /// Visibility boundary. Required to avoid accidental global exposure.
     pub(crate) scope: ServiceScope,
+    /// Capabilities a consumer must hold to acquire this service. Empty means
+    /// the declaration alone is sufficient.
+    #[serde(default)]
+    pub(crate) capabilities: Vec<Capability>,
 }
 
 /// A service contract consumed by this extension.
@@ -521,6 +525,23 @@ impl Manifest {
                     }
                 }
             }
+            RuntimeKind::Cordis => match &self.runtime.entry {
+                None => report.error(
+                    "runtime.entry",
+                    "the Cordis runtime needs a package-relative JavaScript entry",
+                ),
+                Some(entry) => match validate_relative_path(entry) {
+                    Ok(path) => {
+                        if !matches!(
+                            path.extension().and_then(|value| value.to_str()),
+                            Some("js" | "cjs" | "mjs")
+                        ) {
+                            report.error("runtime.entry", "must name a .js, .cjs or .mjs file");
+                        }
+                    }
+                    Err(reason) => report.error("runtime.entry", reason),
+                },
+            },
             RuntimeKind::WasmComponent | RuntimeKind::Extism => match &self.runtime.entry {
                 None => report.error(
                     "runtime.entry",
@@ -539,6 +560,17 @@ impl Manifest {
                     Err(reason) => report.error("runtime.entry", reason),
                 },
             },
+        }
+        if self.runtime.kind == RuntimeKind::Cordis
+            && !self
+                .capabilities
+                .required
+                .contains(&Capability::ProcessExecute)
+        {
+            report.error(
+                "capabilities.required",
+                "the Cordis runtime spawns Node and must request process.execute",
+            );
         }
         if self.runtime.args.len() > 64 {
             report.error("runtime.args", "must contain at most 64 arguments");

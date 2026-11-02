@@ -1,0 +1,752 @@
+//! A small live composition runtime.
+//!
+//! This is the driver that turns the primitives (context, effects, epochs,
+//! dependency index) into behavior. It owns fibers, activates components when
+//! their hard dependencies are available, reloads them when a provider changes,
+//! and suspends them when a provider disappears.
+//!
+//! It is deliberately host-agnostic: a component is a closure over a Context.
+//! The BSH host can adapt its install path to this runtime without moving the
+//! package, trust, or capability layers.
+
+use std::collections::BTreeMap;
+use std::fmt;
+use std::sync::{Arc, Mutex};
+
+use super::context::Context;
+use super::effects::DisposalReport;
+use super::reactivity::{Inject, Reconciler, RefreshAction};
+use super::{Fiber, FiberState, FiberTransitionError, Scope, ServiceChange, ServiceRegistry};
+
+/// A unit of live composition. Applying it registers effects on the context.
+pub(crate) trait Component: Send + Sync + 'static {
+    /// Apply the component. Every registration should go through the context.
+    fn apply(&self, ctx: &Context) -> Result<(), String>;
+}
+
+impl<F> Component for F
+where
+    F: Fn(&Context) -> Result<(), String> + Send + Sync + 'static,
+{
+    fn apply(&self, ctx: &Context) -> Result<(), String> {
+        self(ctx)
+    }
+}
+
+/// Why a runtime operation failed.
+#[derive(Debug)]
+pub(crate) enum RuntimeError {
+    /// The id is already active or suspended.
+    AlreadyRegistered(String),
+    /// The id is unknown.
+    NotRegistered(String),
+    /// A state transition was illegal.
+    Transition(FiberTransitionError),
+    /// The component rejected activation.
+    Apply(String),
+}
+
+impl fmt::Display for RuntimeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AlreadyRegistered(id) => write!(f, "component {id} is already registered"),
+            Self::NotRegistered(id) => write!(f, "component {id} is not registered"),
+            Self::Transition(error) => fmt::Display::fmt(error, f),
+            Self::Apply(message) => write!(f, "component apply failed: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for RuntimeError {}
+
+impl From<FiberTransitionError> for RuntimeError {
+    fn from(error: FiberTransitionError) -> Self {
+        Self::Transition(error)
+    }
+}
+
+/// Live state of one node in a runtime snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RuntimeState {
+    /// Applied and running.
+    Active,
+    /// Waiting for a hard dependency.
+    Suspended,
+}
+
+/// One node in a runtime snapshot.
+#[derive(Clone, Debug)]
+pub(crate) struct RuntimeNode {
+    /// Fiber id.
+    pub(crate) id: String,
+    /// Live state.
+    pub(crate) state: RuntimeState,
+    /// Declared scope.
+    pub(crate) scope: Scope,
+    /// Available service generations, sorted by name.
+    pub(crate) dependencies: Vec<(String, u64)>,
+    /// Effects still registered by an active fiber.
+    pub(crate) pending_effects: usize,
+}
+
+/// A point-in-time view of the live graph.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RuntimeSnapshot {
+    /// Nodes sorted by id.
+    pub(crate) nodes: Vec<RuntimeNode>,
+}
+
+struct ManagedFiber {
+    fiber: Fiber,
+    component: Arc<dyn Component>,
+}
+
+struct SuspendedFiber {
+    component: Arc<dyn Component>,
+    inject: Inject,
+    scope: Scope,
+}
+
+/// A live graph of components, fibers, and service dependencies.
+pub(crate) struct CompositionRuntime {
+    services: Arc<ServiceRegistry>,
+    fibers: Mutex<BTreeMap<String, ManagedFiber>>,
+    suspended: Mutex<BTreeMap<String, SuspendedFiber>>,
+    reconciler: Mutex<Reconciler>,
+}
+
+impl Default for CompositionRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CompositionRuntime {
+    /// Create an empty runtime over a fresh registry.
+    pub(crate) fn new() -> Self {
+        Self::with_registry(Arc::new(ServiceRegistry::new()))
+    }
+
+    /// Create an empty runtime over an existing registry.
+    pub(crate) fn with_registry(services: Arc<ServiceRegistry>) -> Self {
+        Self {
+            services,
+            fibers: Mutex::new(BTreeMap::new()),
+            suspended: Mutex::new(BTreeMap::new()),
+            reconciler: Mutex::new(Reconciler::new()),
+        }
+    }
+
+    /// The service registry this runtime composes against.
+    pub(crate) fn services(&self) -> Arc<ServiceRegistry> {
+        Arc::clone(&self.services)
+    }
+
+    /// Activate a component, or leave it suspended until its hard dependencies
+    /// are available.
+    pub(crate) async fn activate(
+        &self,
+        id: impl Into<String>,
+        scope: Scope,
+        component: Arc<dyn Component>,
+        inject: Inject,
+    ) -> Result<(), RuntimeError> {
+        let id = id.into();
+        if self.is_active(&id) || self.is_suspended(&id) {
+            return Err(RuntimeError::AlreadyRegistered(id));
+        }
+        if let Ok(reconciler) = self.reconciler.lock() {
+            reconciler.register(&id, &inject);
+        }
+        let inject_for_cleanup = inject.clone();
+        if let Err(error) = self.start(&id, scope, component, inject).await {
+            if let Ok(reconciler) = self.reconciler.lock() {
+                reconciler.unregister(&id, &inject_for_cleanup);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn start(
+        &self,
+        id: &str,
+        scope: Scope,
+        component: Arc<dyn Component>,
+        inject: Inject,
+    ) -> Result<(), RuntimeError> {
+        if !inject.hard_ready(&self.services) {
+            self.suspended
+                .lock()
+                .expect("suspended map poisoned")
+                .insert(
+                    id.to_owned(),
+                    SuspendedFiber {
+                        component,
+                        inject,
+                        scope,
+                    },
+                );
+            return Ok(());
+        }
+
+        let context = Context::root(Arc::clone(&self.services), scope);
+        let mut fiber = Fiber::with_context(id, context.clone());
+        fiber.set_inject(inject);
+        // Snapshot the dependency generations before applying. Without this the
+        // new fiber would start with an empty epoch and a later provider
+        // removal would look like Noop.
+        let _ = fiber.refresh(&self.services);
+        fiber.transition(FiberState::Loading)?;
+        if let Err(message) = component.apply(&context) {
+            let _ = fiber.transition(FiberState::Failed);
+            return Err(RuntimeError::Apply(message));
+        }
+        fiber.transition(FiberState::Active)?;
+        self.fibers
+            .lock()
+            .expect("fiber map poisoned")
+            .insert(id.to_owned(), ManagedFiber { fiber, component });
+        Ok(())
+    }
+
+    /// Unload one component and await its effects.
+    pub(crate) async fn unload(&self, id: &str) -> Result<DisposalReport, RuntimeError> {
+        let managed = self.fibers.lock().expect("fiber map poisoned").remove(id);
+        let suspended = self
+            .suspended
+            .lock()
+            .expect("suspended map poisoned")
+            .remove(id);
+
+        let (inject, report) = if let Some(mut managed) = managed {
+            let inject = managed.fiber.inject().clone();
+            let report = managed.fiber.dispose_async().await?;
+            (Some(inject), report)
+        } else if let Some(suspended) = suspended {
+            (Some(suspended.inject), DisposalReport::default())
+        } else {
+            (None, DisposalReport::default())
+        };
+
+        let Some(inject) = inject else {
+            return Err(RuntimeError::NotRegistered(id.to_owned()));
+        };
+        if let Ok(reconciler) = self.reconciler.lock() {
+            reconciler.unregister(id, &inject);
+        }
+        Ok(report)
+    }
+
+    /// Apply one service availability change, reloading or suspending exactly
+    /// the affected fibers. Returns how many fibers changed state.
+    pub(crate) async fn on_change(&self, change: &ServiceChange) -> Result<usize, RuntimeError> {
+        let affected = {
+            let mut reconciler = self.reconciler.lock().expect("reconciler poisoned");
+            reconciler.on_change(change);
+            reconciler.drain()
+        };
+        let mut changed = 0;
+        for id in affected {
+            changed += self.reconcile_one(&id).await?;
+        }
+        Ok(changed)
+    }
+
+    async fn reconcile_one(&self, id: &str) -> Result<usize, RuntimeError> {
+        let managed = { self.fibers.lock().expect("fiber map poisoned").remove(id) };
+        if let Some(managed) = managed {
+            return self.reconcile_active(id, managed).await;
+        }
+        let suspended = {
+            self.suspended
+                .lock()
+                .expect("suspended map poisoned")
+                .remove(id)
+        };
+        if let Some(suspended) = suspended {
+            if suspended.inject.hard_ready(&self.services) {
+                self.start(
+                    id,
+                    suspended.scope,
+                    Arc::clone(&suspended.component),
+                    suspended.inject,
+                )
+                .await?;
+                return Ok(1);
+            }
+            self.suspended
+                .lock()
+                .expect("suspended map poisoned")
+                .insert(id.to_owned(), suspended);
+        }
+        Ok(0)
+    }
+
+    async fn reconcile_active(
+        &self,
+        id: &str,
+        mut managed: ManagedFiber,
+    ) -> Result<usize, RuntimeError> {
+        let scope = managed
+            .fiber
+            .context()
+            .map(|context| context.scope().clone())
+            .unwrap_or(Scope::Host);
+        let action = managed.fiber.refresh(&self.services);
+        match action {
+            RefreshAction::Reload => {
+                let inject = managed.fiber.inject().clone();
+                let component = Arc::clone(&managed.component);
+                managed.fiber.dispose_async().await?;
+                self.start(id, scope, component, inject).await?;
+                Ok(1)
+            }
+            RefreshAction::Suspend => {
+                let inject = managed.fiber.inject().clone();
+                let component = Arc::clone(&managed.component);
+                managed.fiber.dispose_async().await?;
+                self.suspended
+                    .lock()
+                    .expect("suspended map poisoned")
+                    .insert(
+                        id.to_owned(),
+                        SuspendedFiber {
+                            component,
+                            inject,
+                            scope,
+                        },
+                    );
+                Ok(1)
+            }
+            RefreshAction::Noop | RefreshAction::Notify => {
+                self.fibers
+                    .lock()
+                    .expect("fiber map poisoned")
+                    .insert(id.to_owned(), managed);
+                Ok(0)
+            }
+        }
+    }
+
+    /// Whether a component is currently active.
+    pub(crate) fn is_active(&self, id: &str) -> bool {
+        self.fibers
+            .lock()
+            .map(|fibers| fibers.contains_key(id))
+            .unwrap_or(false)
+    }
+
+    /// Whether a component is waiting for a hard dependency.
+    pub(crate) fn is_suspended(&self, id: &str) -> bool {
+        self.suspended
+            .lock()
+            .map(|suspended| suspended.contains_key(id))
+            .unwrap_or(false)
+    }
+
+    /// Number of active fibers.
+    pub(crate) fn active_count(&self) -> usize {
+        self.fibers.lock().map(|fibers| fibers.len()).unwrap_or(0)
+    }
+
+    /// Number of suspended fibers.
+    pub(crate) fn suspended_count(&self) -> usize {
+        self.suspended
+            .lock()
+            .map(|suspended| suspended.len())
+            .unwrap_or(0)
+    }
+
+    /// Point-in-time view of every active and suspended node.
+    pub(crate) fn snapshot(&self) -> RuntimeSnapshot {
+        let mut nodes = Vec::new();
+
+        if let Ok(fibers) = self.fibers.lock() {
+            for (id, managed) in fibers.iter() {
+                let scope = managed
+                    .fiber
+                    .context()
+                    .map(|context| context.scope().clone())
+                    .unwrap_or(Scope::Host);
+                let mut dependencies: Vec<(String, u64)> = managed
+                    .fiber
+                    .epoch()
+                    .deps
+                    .iter()
+                    .map(|((_, _, name), generation)| (name.clone(), *generation))
+                    .collect();
+                dependencies.sort();
+                nodes.push(RuntimeNode {
+                    id: id.clone(),
+                    state: RuntimeState::Active,
+                    scope,
+                    dependencies,
+                    pending_effects: managed.fiber.pending_effects(),
+                });
+            }
+        }
+
+        if let Ok(suspended) = self.suspended.lock() {
+            for (id, entry) in suspended.iter() {
+                let mut dependencies: Vec<(String, u64)> = entry
+                    .inject
+                    .all()
+                    .filter_map(|requirement| {
+                        self.services
+                            .generation(&requirement.scope, &requirement.name)
+                            .map(|generation| (requirement.name.clone(), generation))
+                    })
+                    .collect();
+                dependencies.sort();
+                nodes.push(RuntimeNode {
+                    id: id.clone(),
+                    state: RuntimeState::Suspended,
+                    scope: entry.scope.clone(),
+                    dependencies,
+                    pending_effects: 0,
+                });
+            }
+        }
+
+        nodes.sort_by(|left, right| left.id.cmp(&right.id));
+        RuntimeSnapshot { nodes }
+    }
+
+    /// Explain why a node is active, suspended, or unknown.
+    pub(crate) fn why(&self, id: &str) -> Option<String> {
+        if self.is_active(id) {
+            return Some("active".to_string());
+        }
+        let suspended = self.suspended.lock().ok()?;
+        let entry = suspended.get(id)?;
+        let missing = entry.inject.missing_hard(&self.services);
+        if missing.is_empty() {
+            return Some("suspended: waiting for update".to_string());
+        }
+        let names = missing
+            .into_iter()
+            .map(|(scope, realm, name)| match realm {
+                Some(realm) => format!("{name}@{realm} [{scope:?}]"),
+                None => format!("{name} [{scope:?}]"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(format!("suspended: missing {names}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::context::EffectCleanup;
+    use super::*;
+    use crate::extension::composable::{ServiceChangeKind, ServiceToken};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn change(kind: ServiceChangeKind, name: &str, generation: u64) -> ServiceChange {
+        ServiceChange {
+            name: name.to_owned(),
+            scope: Scope::Host,
+            realm: None,
+            generation,
+            kind,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "release benchmark; run with --release --ignored"]
+    async fn gold_standard_release_activation_budget() {
+        let runtime = CompositionRuntime::new();
+        let component = |_ctx: &Context| Ok(());
+        let start = std::time::Instant::now();
+        for index in 0..1_000 {
+            runtime
+                .activate(
+                    format!("c{index}"),
+                    Scope::Host,
+                    Arc::new(component),
+                    Inject::default(),
+                )
+                .await
+                .expect("activate");
+        }
+        let elapsed = start.elapsed();
+        assert_eq!(runtime.active_count(), 1_000);
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "1k activations took {elapsed:?} in release"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "release benchmark; run with --release --ignored"]
+    async fn gold_standard_release_reload_budget() {
+        let runtime = CompositionRuntime::new();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let component = {
+            let runs = Arc::clone(&runs);
+            move |_ctx: &Context| {
+                runs.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        };
+        runtime
+            .activate(
+                "consumer",
+                Scope::Host,
+                Arc::new(component),
+                Inject::default().require(Scope::Host, "clock"),
+            )
+            .await
+            .expect("activate");
+        let _first = runtime
+            .services()
+            .provide(Scope::Host, "clock", Arc::new(0_u64));
+        runtime
+            .on_change(&change(ServiceChangeKind::Available, "clock", 1))
+            .await
+            .expect("available");
+
+        let start = std::time::Instant::now();
+        for generation in 1..1_000 {
+            let _token = runtime
+                .services()
+                .provide(Scope::Host, "clock", Arc::new(generation));
+            runtime
+                .on_change(&change(ServiceChangeKind::Replaced, "clock", generation))
+                .await
+                .expect("replaced");
+        }
+        let elapsed = start.elapsed();
+        assert!(runs.load(Ordering::Relaxed) >= 1_000);
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "1k reloads took {elapsed:?} in release"
+        );
+    }
+
+    #[tokio::test]
+    async fn consumer_waits_then_reloads_on_provider_change() {
+        let runtime = CompositionRuntime::new();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let cleanups = Arc::new(AtomicUsize::new(0));
+
+        let component = {
+            let seen = Arc::clone(&seen);
+            let cleanups = Arc::clone(&cleanups);
+            move |ctx: &Context| {
+                let clock = ctx.acquire::<u64>("clock").ok_or("clock missing")?;
+                seen.lock().expect("seen").push(*clock);
+                let cleanups = Arc::clone(&cleanups);
+                ctx.effect("consumer.cleanup", move |_| {
+                    EffectCleanup::sync(move || {
+                        cleanups.fetch_add(1, Ordering::SeqCst);
+                    })
+                })
+                .map_err(|error| error.to_string())?;
+                Ok(())
+            }
+        };
+
+        runtime
+            .activate(
+                "consumer",
+                Scope::Host,
+                Arc::new(component),
+                Inject::default().require(Scope::Host, "clock"),
+            )
+            .await
+            .expect("activate");
+        assert!(!runtime.is_active("consumer"));
+        assert!(runtime.is_suspended("consumer"));
+
+        let first = runtime
+            .services()
+            .provide(Scope::Host, "clock", Arc::new(1_u64));
+        runtime
+            .on_change(&change(ServiceChangeKind::Available, "clock", 1))
+            .await
+            .expect("available");
+        assert!(runtime.is_active("consumer"));
+        assert_eq!(*seen.lock().expect("seen"), vec![1]);
+        assert_eq!(cleanups.load(Ordering::SeqCst), 0);
+
+        let second = runtime
+            .services()
+            .provide(Scope::Host, "clock", Arc::new(2_u64));
+        runtime
+            .on_change(&change(ServiceChangeKind::Replaced, "clock", 2))
+            .await
+            .expect("replaced");
+        assert!(runtime.is_active("consumer"));
+        assert_eq!(*seen.lock().expect("seen"), vec![1, 2]);
+        assert_eq!(cleanups.load(Ordering::SeqCst), 1);
+
+        let _ = first;
+        runtime.services().revoke(&second);
+        runtime
+            .on_change(&change(ServiceChangeKind::Unavailable, "clock", 2))
+            .await
+            .expect("unavailable");
+        assert!(!runtime.is_active("consumer"));
+        assert!(runtime.is_suspended("consumer"));
+        assert_eq!(cleanups.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn unload_disposes_effects_and_forgets_the_fiber() {
+        let runtime = CompositionRuntime::new();
+        let cleanups = Arc::new(AtomicUsize::new(0));
+        let component = {
+            let cleanups = Arc::clone(&cleanups);
+            move |ctx: &Context| {
+                let marker = Arc::clone(&cleanups);
+                ctx.effect("cleanup", move |_| {
+                    EffectCleanup::sync(move || {
+                        marker.fetch_add(1, Ordering::SeqCst);
+                    })
+                })
+                .map_err(|error| error.to_string())?;
+                Ok(())
+            }
+        };
+
+        runtime
+            .activate("idle", Scope::Host, Arc::new(component), Inject::default())
+            .await
+            .expect("activate");
+        assert!(runtime.is_active("idle"));
+        let report = runtime.unload("idle").await.expect("unload");
+        assert_eq!(report.attempted, 1);
+        assert_eq!(cleanups.load(Ordering::SeqCst), 1);
+        assert!(!runtime.is_active("idle"));
+        assert!(matches!(
+            runtime.unload("idle").await,
+            Err(RuntimeError::NotRegistered(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn soft_notify_keeps_the_fiber_active() {
+        let runtime = CompositionRuntime::new();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let component = {
+            let runs = Arc::clone(&runs);
+            move |_ctx: &Context| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        };
+
+        runtime
+            .activate(
+                "observer",
+                Scope::Host,
+                Arc::new(component),
+                Inject::default().optional(
+                    Scope::Host,
+                    "telemetry",
+                    super::super::reactivity::Reaction::Notify,
+                ),
+            )
+            .await
+            .expect("activate");
+        assert!(runtime.is_active("observer"));
+
+        let token = runtime
+            .services()
+            .provide(Scope::Host, "telemetry", Arc::new(1_u64));
+        runtime
+            .on_change(&change(ServiceChangeKind::Available, "telemetry", 1))
+            .await
+            .expect("available");
+        assert!(runtime.is_active("observer"));
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        runtime.services().revoke(&token);
+        runtime
+            .on_change(&change(ServiceChangeKind::Unavailable, "telemetry", 1))
+            .await
+            .expect("unavailable");
+        assert!(runtime.is_active("observer"));
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn replacement_can_activate_a_suspended_consumer() {
+        let runtime = CompositionRuntime::new();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let component = {
+            let runs = Arc::clone(&runs);
+            move |_ctx: &Context| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        };
+
+        runtime
+            .activate(
+                "consumer",
+                Scope::Host,
+                Arc::new(component),
+                Inject::default().require(Scope::Host, "clock"),
+            )
+            .await
+            .expect("activate");
+        assert!(runtime.is_suspended("consumer"));
+
+        let token: ServiceToken = runtime
+            .services()
+            .provide(Scope::Host, "clock", Arc::new(1_u64));
+        runtime
+            .on_change(&change(ServiceChangeKind::Available, "clock", 1))
+            .await
+            .expect("available");
+        assert!(runtime.is_active("consumer"));
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        runtime.services().revoke(&token);
+        runtime
+            .on_change(&change(ServiceChangeKind::Unavailable, "clock", 1))
+            .await
+            .expect("unavailable");
+        assert!(runtime.is_suspended("consumer"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_and_why_explain_the_live_graph() {
+        let runtime = CompositionRuntime::new();
+        let component = |_ctx: &Context| Ok(());
+        runtime
+            .activate(
+                "consumer",
+                Scope::Host,
+                Arc::new(component),
+                Inject::default().require(Scope::Host, "clock"),
+            )
+            .await
+            .expect("activate");
+
+        let snapshot = runtime.snapshot();
+        assert_eq!(snapshot.nodes.len(), 1);
+        assert_eq!(snapshot.nodes[0].state, RuntimeState::Suspended);
+        assert!(runtime.why("consumer").unwrap().contains("clock"));
+
+        let _token = runtime
+            .services()
+            .provide(Scope::Host, "clock", Arc::new(1_u64));
+        runtime
+            .on_change(&change(ServiceChangeKind::Available, "clock", 1))
+            .await
+            .expect("available");
+
+        let snapshot = runtime.snapshot();
+        assert_eq!(snapshot.nodes[0].state, RuntimeState::Active);
+        assert_eq!(
+            snapshot.nodes[0].dependencies,
+            vec![("clock".to_string(), 1)]
+        );
+        assert_eq!(runtime.why("consumer").unwrap(), "active");
+        assert!(runtime.why("missing").is_none());
+    }
+}

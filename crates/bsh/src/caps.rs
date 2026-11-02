@@ -419,6 +419,99 @@ pub(crate) fn stop_bridge_pool() {
 }
 
 /// A built agent together with the plugins its tools came from.
+/// Forwards the agent's own LLM/tool plugin stages to the extension
+/// EventDispatcher. Observers and policy-authorized interceptors see the same
+/// model and tool events the extension runtime sees.
+struct DispatcherPlugin;
+
+#[async_trait::async_trait]
+impl agent::agent::AgentPlugin for DispatcherPlugin {
+    fn name(&self) -> &str {
+        "bsh-extension-dispatcher"
+    }
+
+    async fn on_llm_request(
+        &self,
+        mut request: agent::agent::LlmRequestWrapper,
+    ) -> Option<agent::agent::LlmRequestWrapper> {
+        let payload = serde_json::json!({
+            "model": request.model,
+            "input": request.input.as_text().unwrap_or_default(),
+            "temperature": request.temperature,
+        });
+        if let Some(value) = crate::extension::dispatcher().waterfall("model.before", payload) {
+            if let Some(model) = value.get("model").and_then(serde_json::Value::as_str) {
+                request.model = model.to_string();
+            }
+        }
+        Some(request)
+    }
+
+    async fn on_turn_start(
+        &self,
+        turn: agent::agent::TurnStartWrapper,
+    ) -> Option<agent::agent::TurnStartWrapper> {
+        crate::extension::dispatcher().waterfall(
+            "agent.turn.start",
+            serde_json::json!({
+                "agent": turn.agent,
+                "input": turn.input,
+            }),
+        );
+        Some(turn)
+    }
+
+    async fn on_turn_end(
+        &self,
+        turn: agent::agent::TurnEndWrapper,
+    ) -> Option<agent::agent::TurnEndWrapper> {
+        crate::extension::dispatcher().emit(
+            "agent.turn.end",
+            serde_json::json!({
+                "agent": turn.agent,
+                "ok": turn.error.is_none(),
+            }),
+        );
+        Some(turn)
+    }
+
+    async fn on_llm_response(
+        &self,
+        response: agent::agent::LlmResponseWrapper,
+    ) -> Option<agent::agent::LlmResponseWrapper> {
+        crate::extension::dispatcher().emit("model.after", serde_json::json!({ "ok": true }));
+        Some(response)
+    }
+
+    async fn on_tool_call(
+        &self,
+        mut call: agent::agent::ToolCallWrapper,
+    ) -> Option<agent::agent::ToolCallWrapper> {
+        let payload = serde_json::json!({ "tool": call.name, "arguments": call.args });
+        if let Some(value) = crate::extension::dispatcher().waterfall("tool.call.before", payload) {
+            if let Some(name) = value.get("tool").and_then(serde_json::Value::as_str) {
+                call.name = name.to_string();
+            }
+            if let Some(arguments) = value.get("arguments") {
+                call.args = arguments.clone();
+            }
+        }
+        Some(call)
+    }
+
+    async fn on_tool_result(
+        &self,
+        mut result: agent::agent::ToolResultWrapper,
+    ) -> Option<agent::agent::ToolResultWrapper> {
+        if let Some(value) =
+            crate::extension::dispatcher().waterfall("tool.call.after", result.result.clone())
+        {
+            result.result = value;
+        }
+        Some(result)
+    }
+}
+
 pub(crate) struct BuiltAgent {
     /// The agent the shell runs turns against.
     pub(crate) agent: Arc<Agent>,
@@ -431,7 +524,7 @@ pub(crate) struct BuiltAgent {
     /// The installed plugins, for the settings inventory.
     pub(crate) plugins: Vec<PluginInfo>,
     /// Fiber activations held for exactly as long as this build is live.
-    pub(crate) extension_activations: Vec<crate::extension::host::AppliedExtension>,
+    pub(crate) extension_activations: crate::extension::host::ActivationList,
     /// Why the provider credential could not be resolved, if it could not.
     ///
     /// A locked vault is named here rather than silently handing the engine an
@@ -460,6 +553,58 @@ pub(crate) struct BuiltAgent {
     /// recorded when the turn ends; a build without a goal (a pricing build, or
     /// a session that never set one) carries none.
     pub(crate) goal: Option<GoalStore>,
+}
+
+impl BuiltAgent {
+    /// Start the service-change watcher for this build.
+    pub(crate) fn start_live_driver(&self) {
+        let Some(services) = self
+            .extension_activations
+            .first()
+            .map(|activation| activation.services())
+        else {
+            return;
+        };
+        let entries = self
+            .extension_activations
+            .iter()
+            .map(|activation| {
+                let requirements = activation
+                    .service_requirements()
+                    .iter()
+                    .map(|requirement| (requirement.name.clone(), requirement.optional))
+                    .collect();
+                crate::extension::live::LiveEntry::new(
+                    activation.extension_id().to_string(),
+                    activation.lease_snapshot(),
+                    requirements,
+                    &services,
+                )
+            })
+            .collect();
+        crate::extension::live::start(Arc::clone(&self.agent), services, entries);
+    }
+
+    /// Suspend one extension's live tools/prompts/skills without dropping the
+    /// build. Commands and panels remain for the running turn.
+    #[allow(dead_code)] // driver lands with the service-change supervisor
+    pub(crate) fn suspend_extension(&self, id: &str) -> usize {
+        self.extension_activations
+            .iter()
+            .find(|activation| activation.extension_id() == id)
+            .map(|activation| activation.suspend_live(&self.agent))
+            .unwrap_or(0)
+    }
+
+    /// Resume a previously suspended extension's live overlay.
+    #[allow(dead_code)] // driver lands with the service-change supervisor
+    pub(crate) fn resume_extension(&self, id: &str) -> usize {
+        self.extension_activations
+            .iter()
+            .find(|activation| activation.extension_id() == id)
+            .map(|activation| activation.resume_live(&self.agent))
+            .unwrap_or(0)
+    }
 }
 
 /// Build the agent for one session.
@@ -675,6 +820,7 @@ fn build_agent_for_session_inner(
     };
 
     let mut agent = Agent::from_config(config).with_context_budget(mid_turn_budget);
+    agent.add_plugin(Arc::new(DispatcherPlugin));
     // Canonicalise once: `resolve_path` canonicalises every target, so the
     // policy data and the shell cwd must carry the same spelling of the root or
     // a symlinked workspace would look outside itself.
@@ -1246,16 +1392,18 @@ fn build_agent_for_session_inner(
             "schema_chars": tools_schema_chars,
         }),
     );
-    BuiltAgent {
+    let built = BuiltAgent {
         agent: Arc::new(agent),
         plugins,
-        extension_activations,
+        extension_activations: extension_activations.into(),
         tools_schema_chars,
         credential_error,
         policy,
         effective: eff,
         goal: goal_store,
-    }
+    };
+    built.start_live_driver();
+    built
 }
 
 /// Resolve one provider's credential from the vault, and the refusal when a
@@ -1490,7 +1638,7 @@ pub(crate) fn capabilities(agent: &Agent) -> Vec<CapInfo> {
             });
         }
     }
-    for (name, instructions) in agent.get_skills_content() {
+    for (name, instructions) in agent.all_skills_content() {
         let summary = instructions
             .lines()
             .map(str::trim)
@@ -4119,24 +4267,31 @@ mod tests {
         assert!(
             built
                 .agent
-                .get_skills_content()
+                .all_skills_content()
                 .iter()
-                .any(|(name, _)| *name == "greet"),
+                .any(|(name, _)| name == "greet"),
             "the extension skill is registered on the agent"
         );
         assert!(
             built.plugins.iter().any(|plugin| plugin.name == "dsh-echo"),
             "the settings inventory lists the extension under the id its toggle writes"
         );
-        assert_eq!(
-            built.extension_activations.len(),
-            1,
-            "the production build must retain one Fiber handle for the package"
+        let suspended_id = built
+            .extension_activations
+            .first()
+            .expect("extension activation")
+            .extension_id()
+            .to_string();
+        assert!(built.suspend_extension(&suspended_id) > 0);
+        assert!(built.resume_extension(&suspended_id) > 0);
+
+        assert!(
+            !built.extension_activations.is_empty(),
+            "the production build retains the package Fiber handle"
         );
-        assert_eq!(
-            built.extension_activations[0].state(),
-            crate::extension::composable::FiberState::Active
-        );
+        assert!(built.extension_activations.iter().all(
+            |activation| activation.state() == crate::extension::composable::FiberState::Active
+        ));
 
         // The path-installed package above is served by the legacy DSH shim,
         // whose synchronous tool carries no gate. The Fiber-owned gate belongs
@@ -4144,17 +4299,15 @@ mod tests {
         // that package's own async tool: a handle kept past the build must
         // still be refused after the build is dropped.
         let platform_tool = {
-            let name = built.extension_activations[0]
-                .tool_names()
-                .first()
-                .cloned()
-                .expect("the activation registered a tool");
-            built
-                .agent
-                .registry()
-                .expect("tool registry")
-                .get_async(&name)
-                .expect("the platform tool is registered asynchronously")
+            let live = built.agent.live_tools().read().expect("live registry");
+            let tool = built
+                .extension_activations
+                .iter()
+                .flat_map(|activation| activation.tool_names())
+                .find_map(|name| live.get_async(name))
+                .expect("the platform tool is registered asynchronously");
+            drop(live);
+            tool
         };
         assert!(
             react::tool::registry::AsyncTool::run(&*platform_tool, &serde_json::json!({}))
@@ -5371,7 +5524,11 @@ mod tests {
         carrying.sort();
         assert_eq!(
             carrying,
-            vec!["com.bos.bsh.extensions".to_string(), "shell".to_string()],
+            vec![
+                "com.bos.bsh.diagnostics".to_string(),
+                "com.bos.bsh.extensions".to_string(),
+                "shell".to_string()
+            ],
             "the preset allows bash and the enabled built-in extension, so every other bundle keeps no tool"
         );
         let shell = built
@@ -5608,6 +5765,8 @@ mod tests {
             names(&confined),
             vec![
                 "bash".to_string(),
+                "diagnostics__graph".to_string(),
+                "diagnostics__why".to_string(),
                 "edit_file".to_string(),
                 "extensions__list".to_string(),
                 "glob".to_string(),
@@ -5625,6 +5784,8 @@ mod tests {
         assert_eq!(
             names(&read_only),
             vec![
+                "diagnostics__graph".to_string(),
+                "diagnostics__why".to_string(),
                 "extensions__list".to_string(),
                 "glob".to_string(),
                 "grep".to_string(),

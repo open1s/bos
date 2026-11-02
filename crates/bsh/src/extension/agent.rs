@@ -67,9 +67,11 @@ pub(crate) struct Contributed {
 ///
 /// The lease is deliberately tied to the Agent/PluginRegistry pair that
 /// received the contributions. It must not be reused with another build.
+#[derive(Clone)]
 pub(crate) struct ContributionLease {
     owner: String,
     tools: Vec<String>,
+    tool_handles: Vec<Arc<dyn react::tool::registry::AsyncTool>>,
     prompt_sections: Vec<String>,
     skill_paths: Vec<PathBuf>,
     active: Arc<AtomicBool>,
@@ -84,15 +86,42 @@ impl ContributionLease {
         registry: &mut agent::plugins::PluginRegistry,
     ) -> usize {
         self.active.store(false, Ordering::SeqCst);
-        let tools = agent.remove_async_tools(&self.tools);
+        let tools = agent.remove_live_async_tools(&self.tools);
         let prompts = self
             .prompt_sections
             .iter()
-            .filter(|section| agent.remove_system_prompt_section(section))
+            .filter(|section| agent.remove_live_prompt_section(section))
             .count();
-        let skills = agent.remove_skills_by_paths(&self.skill_paths);
+        let skills = agent.remove_live_skills_by_paths(&self.skill_paths);
         let items = registry.remove_owner(&self.owner);
         tools + prompts + skills + items
+    }
+
+    /// Remove only the live overlay pieces, keeping commands/panels in place.
+    pub(crate) fn suspend_live(&self, agent: &agent::Agent) -> usize {
+        let tools = agent.remove_live_async_tools(&self.tools);
+        let prompts = self
+            .prompt_sections
+            .iter()
+            .filter(|section| agent.remove_live_prompt_section(section))
+            .count();
+        let skills = agent.remove_live_skills_by_paths(&self.skill_paths);
+        tools + prompts + skills
+    }
+
+    /// Re-install the live overlay pieces after a suspend.
+    pub(crate) fn resume_live(&self, agent: &agent::Agent) -> usize {
+        let mut restored = 0;
+        for tool in &self.tool_handles {
+            if agent.add_live_async_tool(Arc::clone(tool)).is_ok() {
+                restored += 1;
+            }
+        }
+        for section in &self.prompt_sections {
+            agent.add_live_prompt_section(section.clone());
+            restored += 1;
+        }
+        restored
     }
 
     /// Bind the lease's liveness to the owning Fiber.
@@ -318,7 +347,10 @@ impl ExtensionTool {
         self.cancelled.store(false, Ordering::SeqCst);
         let started = std::time::Instant::now();
         let correlation = uuid::Uuid::new_v4().to_string();
-        let scope = self.scope(arguments);
+        let arguments = crate::extension::dispatcher()
+            .waterfall("tool.before", arguments.clone())
+            .unwrap_or_else(|| arguments.clone());
+        let scope = self.scope(&arguments);
         if let Err(error) = super::capability::authorize_each(
             &self.policy,
             self.owner.as_str(),
@@ -330,6 +362,7 @@ impl ExtensionTool {
                 topics::TOOL_FAILED,
                 serde_json::json!({
                     "tool": self.descriptor.id.as_str(),
+                    "fiber": self.owner.as_str(),
                     "error": error.to_string(),
                 }),
                 &correlation,
@@ -338,7 +371,10 @@ impl ExtensionTool {
         }
         self.emit(
             topics::TOOL_INVOKED,
-            serde_json::json!({ "tool": self.descriptor.id.as_str() }),
+            serde_json::json!({
+                "tool": self.descriptor.id.as_str(),
+                "fiber": self.owner.as_str(),
+            }),
             &correlation,
         );
         let context = CallContext::new(
@@ -386,6 +422,9 @@ impl ExtensionTool {
         match outcome {
             Ok(result) => {
                 let value = result.to_value();
+                let value = crate::extension::dispatcher()
+                    .waterfall("tool.after", value.clone())
+                    .unwrap_or(value);
                 let bytes = serde_json::to_vec(&value)
                     .map(|bytes| bytes.len())
                     .unwrap_or(0);
@@ -398,6 +437,7 @@ impl ExtensionTool {
                     topics::TOOL_COMPLETED,
                     serde_json::json!({
                         "tool": self.descriptor.id.as_str(),
+                        "fiber": self.owner.as_str(),
                         "bytes": bytes,
                     }),
                     &correlation,
@@ -410,6 +450,7 @@ impl ExtensionTool {
                     topics::TOOL_FAILED,
                     serde_json::json!({
                         "tool": self.descriptor.id.as_str(),
+                        "fiber": self.owner.as_str(),
                         "error": truncate(&error.to_string(), 512),
                     }),
                     &correlation,
@@ -473,6 +514,7 @@ pub(crate) fn install_with_lease(
     workspace: Option<PathBuf>,
 ) -> (PluginInfo, ContributionLease) {
     let mut installed_tools = Vec::new();
+    let mut installed_handles = Vec::new();
     let active = Arc::new(AtomicBool::new(true));
     for descriptor in &contributed.tools {
         let tool = ExtensionTool::new_with_liveness(
@@ -484,8 +526,12 @@ pub(crate) fn install_with_lease(
             Arc::clone(&active),
         );
         let name = tool.name().to_string();
-        match agent.try_add_async_tool(Arc::new(tool)) {
-            Ok(()) => installed_tools.push(name),
+        let handle: Arc<dyn react::tool::registry::AsyncTool> = Arc::new(tool);
+        match agent.add_live_async_tool(Arc::clone(&handle)) {
+            Ok(()) => {
+                installed_tools.push(name);
+                installed_handles.push(handle);
+            }
             Err(error) => log::warn!(
                 "extension {}: tool {} was not registered: {error}",
                 contributed.extension,
@@ -550,12 +596,9 @@ pub(crate) fn install_with_lease(
     let mut skill_paths = Vec::new();
     if let Some(skills) = &contributed.skills_dir {
         if skills.is_dir() {
-            let before: std::collections::HashSet<PathBuf> = agent
-                .skills()
-                .iter()
-                .map(|skill| skill.metadata.path.clone())
-                .collect();
-            if let Err(error) = agent.register_skills_from_dir(skills.clone()) {
+            let before: std::collections::HashSet<PathBuf> =
+                agent.live_skill_paths().into_iter().collect();
+            if let Err(error) = agent.add_live_skills_from_dir(skills.clone()) {
                 log::warn!(
                     target: "bsh::extension",
                     "{}: skills were declared but could not be read: {error}",
@@ -563,10 +606,9 @@ pub(crate) fn install_with_lease(
                 );
             } else {
                 skill_paths = agent
-                    .skills()
-                    .iter()
-                    .filter(|skill| !before.contains(&skill.metadata.path))
-                    .map(|skill| skill.metadata.path.clone())
+                    .live_skill_paths()
+                    .into_iter()
+                    .filter(|path| !before.contains(path))
                     .collect();
             }
         }
@@ -574,6 +616,7 @@ pub(crate) fn install_with_lease(
     let lease = ContributionLease {
         owner: contributed.extension.as_str().to_string(),
         tools: installed_tools.clone(),
+        tool_handles: installed_handles,
         prompt_sections,
         skill_paths,
         active,
@@ -623,7 +666,7 @@ fn append_prompt(
         return None;
     }
     *budget += section.len();
-    agent.append_system_prompt(&section);
+    agent.add_live_prompt_section(&section);
     Some(section)
 }
 

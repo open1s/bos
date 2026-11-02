@@ -289,7 +289,7 @@ pub(crate) fn download(
         });
     }
     if let Some(expected) = expected_hash {
-        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let digest = hex_digest(Sha256::digest(&bytes));
         if !digest.eq_ignore_ascii_case(expected) {
             return Err(ExtensionError::Corrupt {
                 path: target,
@@ -499,6 +499,16 @@ fn sanitize(raw: &str) -> String {
         })
         .collect();
     sanitized.trim_matches('-').chars().take(80).collect()
+}
+
+fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
+    use std::fmt::Write;
+    let bytes = bytes.as_ref();
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 #[cfg(test)]
