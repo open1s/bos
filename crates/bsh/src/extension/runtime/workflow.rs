@@ -136,11 +136,12 @@ impl WorkflowRuntime {
         let mut outputs = serde_json::Map::new();
         for step in &workflow.steps {
             let arguments = resolve(&step.arguments, &input, &outputs);
-            let descriptor = self.inner_tools.get(&step.tool).ok_or_else(|| {
-                ExtensionError::NotFound {
-                    id: format!("{}::{}", context.extension, step.tool),
-                }
-            })?;
+            let descriptor =
+                self.inner_tools
+                    .get(&step.tool)
+                    .ok_or_else(|| ExtensionError::NotFound {
+                        id: format!("{}::{}", context.extension, step.tool),
+                    })?;
             let scope = call_scope(&arguments, context.workspace.as_deref());
             authorize_each(
                 &self.policy,
@@ -370,10 +371,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_workflow_authorizes_each_step_against_resolved_arguments() {
-        let scratch = std::env::temp_dir().join(format!(
-            "bsh-workflow-policy-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let scratch =
+            std::env::temp_dir().join(format!("bsh-workflow-policy-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&scratch).expect("scratch");
         let path = scratch.join("fetch.json");
         std::fs::write(

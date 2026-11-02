@@ -628,14 +628,13 @@ impl ExtensionHost {
                     let (runtime, tools) = if contributions.workflows.is_empty() {
                         (runtime, tools)
                     } else {
-                        let wrapped =
-                            WorkflowRuntime::new(
-                                runtime,
-                                &contributions.workflows,
-                                &tools,
-                                Arc::clone(&self.policy),
-                                package.trust,
-                            )?;
+                        let wrapped = WorkflowRuntime::new(
+                            runtime,
+                            &contributions.workflows,
+                            &tools,
+                            Arc::clone(&self.policy),
+                            package.trust,
+                        )?;
                         let tools = wrapped.descriptors();
                         (
                             Arc::new(LazyRuntime::new(Arc::new(wrapped))) as Arc<dyn Runtime>,
