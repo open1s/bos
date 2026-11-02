@@ -1,40 +1,25 @@
-digraph AgentFlow {
-  graph [
-    bgcolor="#0B1020", pad="0.48", rankdir=LR,
-    nodesep="0.48", ranksep="0.72", splines=curved,
-    newrank=true, outputorder=edgesfirst,
-    fontname="DejaVu Sans", label="BOS AGENT ENGINE  /  FROM INTENT TO ACTION",
-    labelloc=t, fontsize=24, fontcolor="#F3F6FC"
-  ];
-  node [shape=box, style="rounded,filled", fontname="DejaVu Sans",
-    fontsize=12, margin="0.25,0.18", color="#405575",
-    fillcolor="#17243A", fontcolor="#F3F6FC", penwidth=1.6];
-  edge [color="#7186A5", penwidth=1.8, arrowsize=0.8];
-
-  request [label="USER INTENT\nRequest · goals · session", color="#6EA8FE", width=2.5];
-  understand [label="UNDERSTAND\nContext · memory · skills", color="#55D6E8", width=2.6];
-  reason [label="REASON & PLAN\nModel intelligence · decisions", color="#B69CFF", fillcolor="#29213E", penwidth=2.2, width=2.8];
-  decide [shape=diamond, style="filled", label="NEXT\nACTION?", color="#FFBE78", fillcolor="#352B1B", width=1.45, height=1.05, margin=0.08];
-  execute [label="ACT\nTools · MCP · agents", color="#67D6A3", fillcolor="#123C35", width=2.5];
-  observe [label="OBSERVE & LEARN\nResults · events · context update", color="#55D6E8", width=2.8];
-  answer [label="DELIVER\nResponse · artifacts · events", color="#67D6A3", fillcolor="#102F2B", penwidth=2.2, width=2.6];
-
-  request -> understand -> reason -> decide;
-  decide -> answer [label="  complete", color="#67D6A3", fontcolor="#67D6A3", minlen=2];
-  decide -> execute [label="  act", color="#FFBE78", fontcolor="#FFBE78"];
-  execute -> observe [color="#55D6E8"];
-  observe -> reason [label="  feedback loop", color="#55D6E8", fontcolor="#55D6E8", constraint=false, minlen=2];
-
-  subgraph cluster_control {
-    label="ALWAYS-ON EXECUTION CONTROL";
-    labelloc=t; labeljust=l; fontsize=12; fontcolor="#FFBE78";
-    color="#66543A"; style="rounded"; penwidth=1.4; margin=18;
-    policy [label="CAPABILITY POLICY\nAuthorize every host action", color="#FFBE78", fillcolor="#302719"];
-    resilience [label="RESILIENCE\nDeadlines · retries · rate limits", color="#67D6A3", fillcolor="#17352F"];
-    trace [label="OBSERVABILITY\nLogs · metrics · execution state", color="#6EA8FE", fillcolor="#192B48"];
-    {rank=same; policy; resilience; trace;}
-  }
-  execute -> policy [style=dashed, arrowhead=none, color="#FFBE78", constraint=false];
-  reason -> resilience [style=dashed, arrowhead=none, color="#67D6A3", constraint=false];
-  observe -> trace [style=dashed, arrowhead=none, color="#6EA8FE", constraint=false];
+digraph AgentCapabilities {
+ graph [bgcolor="#0B1020",pad="0.55",rankdir=TB,nodesep="0.38",ranksep="0.52",splines=none,newrank=true,outputorder=edgesfirst,fontname="DejaVu Sans",label="BOS AGENT ENGINE  /  INTELLIGENCE THAT GETS THINGS DONE",labelloc=t,fontsize=25,fontcolor="#F3F6FC"];
+ node [shape=box,style="rounded,filled",fontname="DejaVu Sans",fontsize=12,margin="0.28,0.22",color="#405575",fillcolor="#17243A",fontcolor="#F3F6FC",penwidth=1.5];
+ edge [style=invis,weight=30];
+ hero [label="FROM NATURAL LANGUAGE TO REAL-WORLD ACTION\nUnderstand  ·  Reason  ·  Coordinate  ·  Execute  ·  Learn",fontsize=17,width=10.0,height=1.0,fillcolor="#172F46",color="#55D6E8",penwidth=2.4];
+ subgraph cluster_intelligence {label="INTELLIGENCE";labelloc=t;fontsize=13;fontcolor="#B69CFF";color="#59477C";style="rounded";penwidth=1.5;margin=20;
+ reasoning [label="REASONING & PLANNING\nReAct · multi-step decisions",color="#B69CFF",fillcolor="#29213E"];
+ context [label="CONTEXT AWARENESS\nSessions · memory · skills",color="#6EA8FE",fillcolor="#192B48"];
+ coordination [label="AGENT COORDINATION\nDelegation · collaboration",color="#55D6E8",fillcolor="#17313A"];
+ {rank=same;reasoning;context;coordination;} reasoning -> context -> coordination;
+ }
+ subgraph cluster_execution {label="EXECUTION";labelloc=t;fontsize=13;fontcolor="#67D6A3";color="#398B7B";style="rounded";penwidth=1.5;margin=20;
+ models [label="MODEL CONNECTIVITY\nProviders · streaming · fallback",color="#B69CFF"];
+ tools [label="TOOL & SKILL ECOSYSTEM\nNative tools · MCP · extensions",color="#55D6E8"];
+ events [label="EVENT-DRIVEN RUNTIME\nPub/Sub · query · RPC",color="#FFBE78"];
+ {rank=same;models;tools;events;} models -> tools -> events;
+ }
+ subgraph cluster_control {label="TRUST  ·  RELIABILITY  ·  VISIBILITY";labelloc=t;fontsize=13;fontcolor="#FFBE78";color="#66543A";style="rounded";penwidth=1.5;margin=20;
+ security [label="CAPABILITY GOVERNANCE\nPolicy-controlled host access",color="#FFBE78",fillcolor="#302719"];
+ resilience [label="RESILIENT EXECUTION\nDeadlines · retries · limits",color="#67D6A3",fillcolor="#17352F"];
+ observability [label="FULL OBSERVABILITY\nLogs · metrics · execution state",color="#6EA8FE",fillcolor="#192B48"];
+ {rank=same;security;resilience;observability;} security -> resilience -> observability;
+ }
+ hero -> reasoning; reasoning -> models; models -> security;
 }
