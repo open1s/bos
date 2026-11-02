@@ -10,12 +10,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
-use extism::{CancelHandle, Manifest as ExtismManifest, Plugin, PluginBuilder, UserData, ValType, Wasm};
+use extism::{
+    CancelHandle, Manifest as ExtismManifest, Plugin, PluginBuilder, UserData, ValType, Wasm,
+};
 use serde_json::{json, Value};
 
 use super::declarative::DeclarativeContributions;
@@ -44,12 +46,9 @@ struct CallStateGuard<'a>(&'a AtomicU8);
 
 impl Drop for CallStateGuard<'_> {
     fn drop(&mut self) {
-        let _ = self.0.compare_exchange(
-            CALL_RUNNING,
-            CALL_IDLE,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        );
+        let _ =
+            self.0
+                .compare_exchange(CALL_RUNNING, CALL_IDLE, Ordering::SeqCst, Ordering::SeqCst);
     }
 }
 
@@ -107,7 +106,10 @@ impl Bridge {
     fn dispatch(&self, raw: &str) -> Value {
         // A guest that keeps running after Stop has no other interruption
         // point: the bridge is where a cancelled call is trapped.
-        if matches!(self.call_state.load(Ordering::SeqCst), CALL_CANCELLED | CALL_STOPPED) {
+        if matches!(
+            self.call_state.load(Ordering::SeqCst),
+            CALL_CANCELLED | CALL_STOPPED
+        ) {
             return json!({"ok": false, "error": "the call was cancelled"});
         }
         let request: Value = match serde_json::from_str(raw) {
@@ -587,10 +589,13 @@ impl ExtismRuntime {
                 message: error.to_string(),
             })?;
         let cancel_handle = plugin.cancel_handle();
-        *self.cancel_handle.lock().map_err(|_| ExtensionError::Corrupt {
-            path: self.component.clone(),
-            message: "Extism cancel-handle lock is poisoned".to_string(),
-        })? = Some(cancel_handle);
+        *self
+            .cancel_handle
+            .lock()
+            .map_err(|_| ExtensionError::Corrupt {
+                path: self.component.clone(),
+                message: "Extism cancel-handle lock is poisoned".to_string(),
+            })? = Some(cancel_handle);
         *guard = Some(plugin);
         Ok(())
     }
@@ -619,12 +624,7 @@ impl ExtismRuntime {
                 message: "Extism cancellation gate is poisoned".to_string(),
             })?;
         self.call_state
-            .compare_exchange(
-                CALL_IDLE,
-                CALL_RUNNING,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            )
+            .compare_exchange(CALL_IDLE, CALL_RUNNING, Ordering::SeqCst, Ordering::SeqCst)
             .map_err(|state| ExtensionError::Runtime {
                 extension: self.extension.to_string(),
                 message: if state == CALL_STOPPED {
@@ -732,7 +732,6 @@ impl ExtismRuntime {
     pub(crate) fn contributions(&self) -> DeclarativeContributions {
         DeclarativeContributions::default()
     }
-
 }
 
 #[async_trait]
@@ -759,10 +758,13 @@ impl Runtime for ExtismRuntime {
             message: "Extism plugin lock is poisoned".to_string(),
         })?;
         *plugin = None;
-        let mut cancel_handle = self.cancel_handle.lock().map_err(|_| ExtensionError::Corrupt {
-            path: self.component.clone(),
-            message: "Extism cancel-handle lock is poisoned".to_string(),
-        })?;
+        let mut cancel_handle = self
+            .cancel_handle
+            .lock()
+            .map_err(|_| ExtensionError::Corrupt {
+                path: self.component.clone(),
+                message: "Extism cancel-handle lock is poisoned".to_string(),
+            })?;
         *cancel_handle = None;
         Ok(())
     }
@@ -857,10 +859,13 @@ impl Runtime for ExtismRuntime {
     async fn shutdown(&self) -> Result<(), ExtensionError> {
         self.stopped.store(true, Ordering::SeqCst);
         {
-            let _cancel_gate = self.cancel_gate.lock().map_err(|_| ExtensionError::Corrupt {
-                path: self.component.clone(),
-                message: "Extism cancellation gate is poisoned".to_string(),
-            })?;
+            let _cancel_gate = self
+                .cancel_gate
+                .lock()
+                .map_err(|_| ExtensionError::Corrupt {
+                    path: self.component.clone(),
+                    message: "Extism cancellation gate is poisoned".to_string(),
+                })?;
             let previous = self.call_state.swap(CALL_STOPPED, Ordering::SeqCst);
             if matches!(previous, CALL_RUNNING | CALL_CANCELLED) {
                 self.interrupt_active_call()?;
@@ -1104,7 +1109,7 @@ mod tests {
             config: "{}".to_string(),
             subscriptions: Mutex::new(Vec::new()),
             events_out: Mutex::new(Vec::new()),
-            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            call_state: Arc::new(AtomicU8::new(CALL_IDLE)),
         };
         let response = bridge.dispatch(r#"{"op":"nope"}"#);
         assert_eq!(response["ok"], false);
