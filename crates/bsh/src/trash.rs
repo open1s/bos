@@ -120,7 +120,10 @@ pub(crate) fn stash(dir: &Path, envelope: &Envelope) -> std::io::Result<PathBuf>
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),
         };
-        if let Err(error) = file.write_all(text.as_bytes()).and_then(|()| file.sync_all()) {
+        if let Err(error) = file
+            .write_all(text.as_bytes())
+            .and_then(|()| file.sync_all())
+        {
             drop(file);
             let _ = fs::remove_file(&path);
             return Err(error);
