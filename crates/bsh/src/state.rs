@@ -3145,10 +3145,10 @@ impl AppState {
         id: &str,
         activations: Vec<crate::extension::host::AppliedExtension>,
     ) {
-        if !activations.is_empty() {
-            self.turn_extension_activations
-                .insert(id.to_string(), activations);
-        }
+        // Replace even with an empty set: a rebuild with no extensions
+        // must release any stale activation set for this session.
+        self.turn_extension_activations
+            .insert(id.to_string(), activations);
     }
 
     pub(crate) fn turn_agent(&self, id: &str) -> Option<Arc<agent::Agent>> {
