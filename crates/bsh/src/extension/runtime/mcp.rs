@@ -275,8 +275,7 @@ impl McpRuntime {
         self.core.cancelled.store(true, Ordering::SeqCst);
         self.core.kill_child();
     }
-
-
+}
 
 impl McpCore {
     fn ensure_running(&self) -> Result<(), ExtensionError> {
