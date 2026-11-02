@@ -141,6 +141,7 @@ additions use serde defaults, which is the forward-compatibility rule.
 | configuration | table | no | JSON Schema path and defaults |
 | resources | table | no | requested ceilings |
 | dependencies | table | no | id -> version range, at most 64 |
+| services | table | no | versioned service contracts, at most 64 provides and 64 requires |
 
 ### 4.2 extension
 
@@ -298,6 +299,45 @@ namespace. Resolution is depth-first, dependencies before dependents, highest
 matching version. Cycles and missing ids are named in the error. A disabled
 package is not a candidate, even as a dependency; the dependent then fails to
 resolve rather than running code the reader switched off.
+
+### 4.8 Service contracts
+
+A package may publish or consume named service contracts. These declarations
+are resolved against the exact package set selected by [dependencies], before
+any extension is marked active.
+
+~~~toml
+[services]
+provides = [
+  { name = "com.example.search", contract = "com.example.search-api", version = "1.2.0", scope = "workspace" }
+]
+requires = [
+  { name = "com.example.search", contract = "com.example.search-api", version = "^1.0", scope = "workspace" },
+  { name = "com.example.telemetry", contract = "com.example.telemetry-api", version = "^1.0", scope = "host", optional = true }
+]
+~~~
+
+- name and contract are stable lowercase ASCII identifiers (letters, digits,
+  dot, hyphen and underscore; 1–128 bytes).
+- A provider declares a concrete SemVer version; a consumer declares a
+  SemVer range in version.
+- scope is required and is one of host, workspace or session. Extension-private
+  services are not publishable through this cross-extension contract.
+- A resolved activation graph may contain only one provider for a given
+  (scope, name, contract) tuple. Multiple providers fail planning; the host
+  does not pick one by load order.
+- A required service with no provider, or with an incompatible provider
+  version, fails planning. An optional = true requirement may be absent;
+  if a provider is present but its version is incompatible, planning still
+  fails rather than binding an incompatible interface.
+- Each service requirement adds a provider-before-consumer dependency edge.
+  The combined graph is checked for missing dependencies and cycles, and the
+  resulting topological order is the order used by the host activation pass.
+- A declaration is not a capability grant. Service discovery never bypasses
+  the extension's existing capability and policy checks. The manifest planner
+  currently validates and orders contracts; runtime transport/binding of
+  manifest contracts to typed service values is a subsequent implementation
+  step.
 
 ## 5. Tool descriptors
 
