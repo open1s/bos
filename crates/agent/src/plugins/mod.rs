@@ -238,6 +238,25 @@ impl PluginRegistry {
             .map(|(kind, owner)| (*kind, owner.as_str()))
     }
 
+    /// Revoke every tool, panel and command owned by the supplied owner.
+    ///
+    /// Ownership is checked against the registry's authoritative owner map;
+    /// names contributed by another extension are never removed.
+    pub fn remove_owner(&mut self, owner: &str) -> usize {
+        let names: Vec<String> = self
+            .owners
+            .iter()
+            .filter_map(|(name, (_, item_owner))| (item_owner == owner).then_some(name.clone()))
+            .collect();
+        for name in &names {
+            self.tools.remove(name);
+            self.panels.remove(name);
+            self.commands.remove(name);
+            self.owners.remove(name);
+        }
+        names.len()
+    }
+
     /// Total number of registered items across all kinds.
     pub fn len(&self) -> usize {
         self.owners.len()
