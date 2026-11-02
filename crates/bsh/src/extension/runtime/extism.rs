@@ -38,7 +38,8 @@ const CALL_RUNNING: u8 = 1;
 const CALL_CANCELLED: u8 = 2;
 const CALL_STOPPED: u8 = 3;
 
-/// Returns a cancelled call to IDLE when it exits. STOPPED is terminal.
+/// Returns a normally completed call to IDLE. CANCELLED is held until the
+/// native cancel request completes; STOPPED is terminal.
 struct CallStateGuard<'a>(&'a AtomicU8);
 
 impl Drop for CallStateGuard<'_> {
@@ -49,7 +50,7 @@ impl Drop for CallStateGuard<'_> {
             Ordering::SeqCst,
             Ordering::SeqCst,
         );
-     }
+    }
 }
 
 /// The Extism host bridge shared by one plugin.
@@ -451,12 +452,14 @@ pub(crate) struct ExtismRuntime {
     cancel_handle: Mutex<Option<CancelHandle>>,
     /// Serializes cancellation semantics independently from the plugin mutex.
     call_state: Arc<AtomicU8>,
+    /// Prevents a new call from entering while a native cancellation is in flight.
+    cancel_gate: Mutex<()> ,
     tools: Vec<ToolDescriptor>,
     execution_ms: u64,
     memory_mb: u64,
     output_bytes: u64,
     fuel_used: AtomicU64,
-     /// Set by shutdown only; cancel is a per-call state the next call clears.
+     /// Terminal shutdown guard, separate from per-call cancellation.
     stopped: std::sync::atomic::AtomicBool,
 }
 
@@ -526,6 +529,7 @@ impl ExtismRuntime {
             plugin: Mutex::new(None),
             cancel_handle: Mutex::new(None),
             call_state,
+            cancel_gate: Mutex::new(()),
             tools,
             execution_ms: manifest.resources.execution_ms(),
             memory_mb: manifest.resources.memory_mb(),
@@ -607,6 +611,10 @@ impl ExtismRuntime {
                 message: "runtime is shut down".to_string(),
             });
         }
+        let cancel_gate = self.cancel_gate.lock().map_err(|_| ExtensionError::Corrupt {
+            path: self.component.clone(),
+            message: "Extism cancellation gate is poisoned".to_string(),
+        })?;
         self.call_state
             .compare_exchange(
                 CALL_IDLE,
@@ -622,6 +630,7 @@ impl ExtismRuntime {
                     "Extism call state is not idle".to_string()
                 },
             })?;
+        drop(cancel_gate);
         let _call_state = CallStateGuard(&self.call_state);
         let plugin = guard.as_mut().expect("plugin was just built");
         let text = serde_json::to_string(input).map_err(|error| ExtensionError::Json {
@@ -753,6 +762,10 @@ impl Runtime for ExtismRuntime {
         // Cancellation is meaningful only after a caller has acquired the
         // plugin mutex and transitioned IDLE -> RUNNING. A cancel arriving
         // while idle must not poison the next queued call.
+        let _cancel_gate = self.cancel_gate.lock().map_err(|_| ExtensionError::Corrupt {
+            path: self.component.clone(),
+            message: "Extism cancellation gate is poisoned".to_string(),
+        })?;
         if self.call_state.compare_exchange(
             CALL_RUNNING,
             CALL_CANCELLED,
@@ -827,9 +840,15 @@ impl Runtime for ExtismRuntime {
 
     async fn shutdown(&self) -> Result<(), ExtensionError> {
         self.stopped.store(true, Ordering::SeqCst);
-        let previous = self.call_state.swap(CALL_STOPPED, Ordering::SeqCst);
-        if matches!(previous, CALL_RUNNING | CALL_CANCELLED) {
-            self.interrupt_active_call()?;
+        {
+            let _cancel_gate = self.cancel_gate.lock().map_err(|_| ExtensionError::Corrupt {
+                path: self.component.clone(),
+                message: "Extism cancellation gate is poisoned".to_string(),
+            })?;
+            let previous = self.call_state.swap(CALL_STOPPED, Ordering::SeqCst);
+            if matches!(previous, CALL_RUNNING | CALL_CANCELLED) {
+                self.interrupt_active_call()?;
+            }
         }
         self.deactivate().await
     }
@@ -897,6 +916,15 @@ mod tests {
             assert_eq!(state.load(Ordering::SeqCst), CALL_RUNNING);
         }
         assert_eq!(state.load(Ordering::SeqCst), CALL_IDLE);
+    }
+
+    #[test]
+    fn call_state_guard_preserves_cancelled_state_until_cancel_finishes() {
+        let state = AtomicU8::new(CALL_RUNNING);
+        let guard = CallStateGuard(&state);
+        state.store(CALL_CANCELLED, Ordering::SeqCst);
+        drop(guard);
+        assert_eq!(state.load(Ordering::SeqCst), CALL_CANCELLED);
     }
 
     #[test]
