@@ -69,6 +69,7 @@ pub(crate) struct Contributed {
 pub(crate) struct ContributionLease {
     owner: String,
     tools: Vec<String>,
+    active: Arc<AtomicBool>,
 }
 
 impl ContributionLease {
@@ -79,9 +80,17 @@ impl ContributionLease {
         agent: &mut agent::Agent,
         registry: &mut agent::plugins::PluginRegistry,
     ) -> usize {
+        self.active.store(false, Ordering::SeqCst);
         let tools = agent.remove_async_tools(&self.tools);
         let items = registry.remove_owner(&self.owner);
         tools + items
+    }
+
+    /// Bind this lease's liveness to a Fiber. Disposing the Fiber prevents
+    /// any retained tool handle from starting another invocation.
+    pub(crate) fn attach_to_fiber(&self, fiber: &mut super::composable::Fiber) {
+        let active = Arc::clone(&self.active);
+        fiber.own(move || active.store(false, Ordering::SeqCst));
     }
 
     /// Names of the async tools owned by this lease.
@@ -108,6 +117,7 @@ pub(crate) struct ExtensionTool {
     timeout_ms: u64,
     qualified: String,
     cancelled: Arc<AtomicBool>,
+    active: Arc<AtomicBool>,
 }
 
 /// The progress events one tool may emit in a one-second window.
@@ -156,6 +166,24 @@ impl ExtensionTool {
         events: Arc<EventBus>,
         workspace: Option<PathBuf>,
     ) -> Self {
+        Self::new_with_liveness(
+            contributed,
+            descriptor,
+            policy,
+            events,
+            workspace,
+            Arc::new(AtomicBool::new(true)),
+        )
+    }
+
+    fn new_with_liveness(
+        contributed: &Contributed,
+        descriptor: ToolDescriptor,
+        policy: Arc<PolicyEngine>,
+        events: Arc<EventBus>,
+        workspace: Option<PathBuf>,
+        active: Arc<AtomicBool>,
+    ) -> Self {
         let qualified = contributed.extension.qualify(&descriptor.id);
         Self {
             owner: contributed.extension.clone(),
@@ -168,6 +196,7 @@ impl ExtensionTool {
             timeout_ms: contributed.timeout_ms,
             qualified,
             cancelled: Arc::new(AtomicBool::new(false)),
+            active,
         }
     }
 
@@ -273,6 +302,11 @@ impl ExtensionTool {
         arguments: &Value,
         progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
     ) -> Result<Value, agent::tools::ToolError> {
+        if !self.active.load(Ordering::SeqCst) {
+            return Err(agent::tools::ToolError::Failed(
+                "extension contribution has been revoked".to_string(),
+            ));
+        }
         self.cancelled.store(false, Ordering::SeqCst);
         let started = std::time::Instant::now();
         let correlation = uuid::Uuid::new_v4().to_string();
@@ -431,13 +465,15 @@ pub(crate) fn install_with_lease(
     workspace: Option<PathBuf>,
 ) -> (PluginInfo, ContributionLease) {
     let mut installed_tools = Vec::new();
+    let active = Arc::new(AtomicBool::new(true));
     for descriptor in &contributed.tools {
-        let tool = ExtensionTool::new(
+        let tool = ExtensionTool::new_with_liveness(
             contributed,
             descriptor.clone(),
             Arc::clone(&policy),
             Arc::clone(&events),
             workspace.clone(),
+            Arc::clone(&active),
         );
         let name = tool.name().to_string();
         match agent.try_add_async_tool(Arc::new(tool)) {
@@ -512,6 +548,7 @@ pub(crate) fn install_with_lease(
     let lease = ContributionLease {
         owner: contributed.extension.as_str().to_string(),
         tools: installed_tools.clone(),
+        active,
     };
     (
         PluginInfo {
