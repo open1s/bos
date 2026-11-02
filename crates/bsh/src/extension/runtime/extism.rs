@@ -453,13 +453,13 @@ pub(crate) struct ExtismRuntime {
     /// Serializes cancellation semantics independently from the plugin mutex.
     call_state: Arc<AtomicU8>,
     /// Prevents a new call from entering while a native cancellation is in flight.
-    cancel_gate: Mutex<()> ,
+    cancel_gate: Mutex<()>,
     tools: Vec<ToolDescriptor>,
     execution_ms: u64,
     memory_mb: u64,
     output_bytes: u64,
     fuel_used: AtomicU64,
-     /// Terminal shutdown guard, separate from per-call cancellation.
+    /// Terminal shutdown guard, separate from per-call cancellation.
     stopped: std::sync::atomic::AtomicBool,
 }
 
@@ -535,7 +535,7 @@ impl ExtismRuntime {
             memory_mb: manifest.resources.memory_mb(),
             output_bytes: manifest.resources.output_bytes(),
             fuel_used: AtomicU64::new(0),
-             stopped: std::sync::atomic::AtomicBool::new(false),
+            stopped: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -611,10 +611,13 @@ impl ExtismRuntime {
                 message: "runtime is shut down".to_string(),
             });
         }
-        let cancel_gate = self.cancel_gate.lock().map_err(|_| ExtensionError::Corrupt {
-            path: self.component.clone(),
-            message: "Extism cancellation gate is poisoned".to_string(),
-        })?;
+        let cancel_gate = self
+            .cancel_gate
+            .lock()
+            .map_err(|_| ExtensionError::Corrupt {
+                path: self.component.clone(),
+                message: "Extism cancellation gate is poisoned".to_string(),
+            })?;
         self.call_state
             .compare_exchange(
                 CALL_IDLE,
@@ -631,13 +634,15 @@ impl ExtismRuntime {
                 },
             })?;
         drop(cancel_gate);
-        let _call_state = CallStateGuard(&self.call_state);
         let plugin = guard.as_mut().expect("plugin was just built");
         let text = serde_json::to_string(input).map_err(|error| ExtensionError::Json {
             path: self.component.clone(),
             message: error.to_string(),
         })?;
-        let output = plugin.call::<&str, String>(name, text.as_str());
+        let output = {
+            let _call_state = CallStateGuard(&self.call_state);
+            plugin.call::<&str, String>(name, text.as_str())
+        };
         if let Some(fuel) = plugin.fuel_consumed() {
             self.fuel_used.store(fuel, Ordering::Relaxed);
         }
@@ -667,10 +672,14 @@ impl ExtismRuntime {
     fn interrupt_active_call(&self) -> Result<(), ExtensionError> {
         // The handle has its own mutex, independent of the plugin mutex held
         // across Plugin::call. Never wait for the guest while cancelling it.
-        let handle = self.cancel_handle.lock().map_err(|_| ExtensionError::Corrupt {
-            path: self.component.clone(),
-            message: "Extism cancel-handle lock is poisoned".to_string(),
-        })?.clone();
+        let handle = self
+            .cancel_handle
+            .lock()
+            .map_err(|_| ExtensionError::Corrupt {
+                path: self.component.clone(),
+                message: "Extism cancel-handle lock is poisoned".to_string(),
+            })?
+            .clone();
         if let Some(handle) = handle {
             handle.cancel().map_err(|error| ExtensionError::Runtime {
                 extension: self.extension.to_string(),
@@ -762,16 +771,23 @@ impl Runtime for ExtismRuntime {
         // Cancellation is meaningful only after a caller has acquired the
         // plugin mutex and transitioned IDLE -> RUNNING. A cancel arriving
         // while idle must not poison the next queued call.
-        let _cancel_gate = self.cancel_gate.lock().map_err(|_| ExtensionError::Corrupt {
-            path: self.component.clone(),
-            message: "Extism cancellation gate is poisoned".to_string(),
-        })?;
-        if self.call_state.compare_exchange(
-            CALL_RUNNING,
-            CALL_CANCELLED,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        ).is_err() {
+        let _cancel_gate = self
+            .cancel_gate
+            .lock()
+            .map_err(|_| ExtensionError::Corrupt {
+                path: self.component.clone(),
+                message: "Extism cancellation gate is poisoned".to_string(),
+            })?;
+        if self
+            .call_state
+            .compare_exchange(
+                CALL_RUNNING,
+                CALL_CANCELLED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_err()
+        {
             return Ok(());
         }
         let result = self.interrupt_active_call();
