@@ -363,6 +363,9 @@ impl Fiber {
 
     /// Unload and revoke every effect owned by this Fiber.
     pub(crate) fn unload(&mut self) -> Result<usize, FiberTransitionError> {
+        if self.state == FiberState::Disposed {
+            return Ok(0);
+        }
         if self.state != FiberState::Unloading {
             self.transition(FiberState::Unloading)?;
         }
