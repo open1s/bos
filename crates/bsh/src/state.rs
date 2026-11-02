@@ -1383,6 +1383,37 @@ impl AppState {
     /// refusing the delete. The selection then moves to the next chat in the list,
     /// or to none when that was the last one.
     pub(crate) fn delete_session(&mut self, id: &str) -> bool {
+        if self.store.session(id).is_none() {
+            return false;
+        }
+
+        // Stop a live turn before taking the recovery snapshot. Calling stop on
+        // an idle session would incorrectly mark its last empty assistant row
+        // as cancelled, so the idle path only releases runtime handles.
+        if self.streams.contains_key(id) {
+            self.stop(id);
+        } else {
+            self.runner.stop(id);
+            self.steer_mailboxes.remove(id);
+            self.turn_extension_activations.remove(id);
+            self.turn_agents.remove(id);
+            self.restore_orphan_steers(id);
+        }
+        if self.streams.is_empty() {
+            self.turn_started = None;
+        }
+
+        // stop() restores undelivered steering rows for an ordinary stop. A
+        // deleted session has nowhere to receive them, so discard those rows
+        // rather than leaving unreachable inbox state behind.
+        self.inbox.remove(id);
+        self.steering
+            .retain(|_, steering| steering.session != id);
+
+        // The snapshot must include the stopped turn's final transcript state.
+        // If parking fails, the session remains in the store (but a live turn
+        // has already been stopped); preserving data takes priority over
+        // pretending the deletion succeeded.
         let Some(session) = self.store.session(id).cloned() else {
             return false;
         };
@@ -1400,7 +1431,13 @@ impl AppState {
         if !self.store.remove(id) {
             return false;
         }
+
         self.plans.remove(id);
+        self.goals.remove(id);
+        self.turn_policy_generation.remove(id);
+        // A manual compaction owns its admission flag until its async completion
+        // callback runs stop_compacting(); it is not safe to clear that flag
+        // while its task is still executing.
         crate::extension::publish(
             crate::extension::topics::SESSION_DELETED,
             serde_json::json!({ "session": id, "title": session.title }),
@@ -1442,28 +1479,60 @@ impl AppState {
             .and_then(|id| id.as_str())
             .unwrap_or("item")
             .to_string();
+        let deleted_at = now();
         let envelope = crate::trash::Envelope {
             kind: kind.key().to_string(),
-            deleted_at: now(),
+            deleted_at,
             workspace: workspace.to_string(),
             workspace_name,
             name: name.to_string(),
-            // A chat's transcript lives in Parquet pages beside its document, so
-            // the park carries them: the bin holds the whole chat, and restoring
-            // does not depend on a directory a purge or a moved workspace could
-            // take away.
+            // Include the millisecond clock in the parked directory name: a
+            // restored session may be deleted again while an older copy remains
+            // in the bin, and the earlier recovery point must never be replaced.
             log: match kind {
-                crate::trash::Kind::Session => format!("log-{id}"),
+                crate::trash::Kind::Session => format!("log-{id}-{}", now_ms()),
                 crate::trash::Kind::Workspace => String::new(),
             },
             payload,
         };
         let dir = self.settings.trash_dir();
-        if kind == crate::trash::Kind::Session {
+        let parked_log = if kind == crate::trash::Kind::Session {
             let from = crate::history::History::dir_for(&self.store.dir_for_id(&id), &id);
-            let _ = crate::trash::park_log(&dir, &from, &envelope);
+            let into = crate::trash::log_dir(&dir, &envelope);
+            let had_log = from.exists();
+            if let Err(error) = crate::trash::park_log(&dir, &from, &envelope) {
+                log::warn!(
+                    "session {id}: could not park history ({}): {error}",
+                    from.display()
+                );
+                return None;
+            }
+            had_log.then_some((from, into))
+        } else {
+            None
+        };
+
+        match crate::trash::stash(&dir, &envelope) {
+            Ok(path) => Some(path),
+            Err(error) => {
+                // The original session is still present. If writing its
+                // envelope failed after the history move, put the pages back
+                // before refusing the delete.
+                if let Some((from, parked)) = parked_log {
+                    if let Some(parent) = from.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if let Err(rollback) = std::fs::rename(&parked, &from) {
+                        log::error!(
+                            "session {id}: trash write failed ({error}); history rollback failed ({}): {rollback}",
+                            from.display()
+                        );
+                    }
+                }
+                log::warn!("session {id}: could not write trash envelope: {error}");
+                None
+            }
         }
-        crate::trash::stash(&dir, &envelope).ok()
     }
 
     /// Everything in the bin, newest first.
