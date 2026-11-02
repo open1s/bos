@@ -1335,7 +1335,9 @@ impl ExtensionHost {
                 || !contributions.panels.is_empty()
                 || !contributions.prompts.is_empty()
                 || !contributions.contexts.is_empty()
-                || !entry.package.manifest.contributes.skills.is_empty();
+                || !entry.package.manifest.contributes.skills.is_empty()
+                || !entry.package.manifest.services.provides.is_empty()
+                || !entry.package.manifest.services.requires.is_empty();
             if !has_agent_contribution {
                 continue;
             }
