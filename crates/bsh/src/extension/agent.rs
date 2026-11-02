@@ -794,6 +794,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_revoked_extension_tool_cannot_start_a_new_call() {
+        let scratch = Scratch::new("revoked");
+        let contributed = contributed(vec![], TrustLevel::Builtin);
+        let tool = ExtensionTool::new_with_liveness(
+            &contributed,
+            contributed.tools[0].clone(),
+            policy(&scratch),
+            EventBus::new(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let error = react::tool::registry::AsyncTool::run(
+            &tool,
+            &serde_json::json!({}),
+        )
+        .await
+        .expect_err("revoked tool must not run");
+        assert!(error.to_string().contains("revoked"), "{error}");
+    }
+
+    #[tokio::test]
     async fn a_sensitive_capability_is_denied_without_a_grant() {
         let scratch = Scratch::new("deny");
         let contributed = contributed(vec![Capability::WorkspaceWrite], TrustLevel::Local);
