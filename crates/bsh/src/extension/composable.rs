@@ -14,9 +14,11 @@
 use std::any::{Any, TypeId};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
+use std::ops::Deref;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use super::manifest::{Manifest, ServiceScope};
 
@@ -64,12 +66,116 @@ pub(crate) struct ServiceChange {
     pub(crate) kind: ServiceChangeKind,
 }
 
+/// One immutable provider generation. Leases keep the value alive and
+/// account for in-flight calls after the generation stops accepting new calls.
+struct ServiceGeneration {
+    value: Arc<dyn Any + Send + Sync>,
+    in_flight: AtomicUsize,
+    accepting: AtomicBool,
+    drained: tokio::sync::Notify,
+}
+
+impl ServiceGeneration {
+    fn new(value: Arc<dyn Any + Send + Sync>) -> Self {
+        Self {
+            value,
+            in_flight: AtomicUsize::new(0),
+            accepting: AtomicBool::new(true),
+            drained: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn retire(&self) {
+        self.accepting.store(false, Ordering::Release);
+        if self.in_flight.load(Ordering::Acquire) == 0 {
+            self.drained.notify_waiters();
+        }
+    }
+
+    fn release(&self) {
+        if self.in_flight.fetch_sub(1, Ordering::AcqRel) == 1
+            && !self.accepting.load(Ordering::Acquire)
+        {
+            self.drained.notify_waiters();
+        }
+    }
+}
+
+/// A call-scoped reference to one immutable provider generation.
+///
+/// The lease must be held for the complete operation. Dropping it decrements
+/// the generation's in-flight count and may complete a pending drain.
+pub(crate) struct ServiceLease<T> {
+    value: Arc<T>,
+    generation: u64,
+    owner: Arc<ServiceGeneration>,
+}
+
+impl<T> ServiceLease<T> {
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn service(&self) -> &Arc<T> {
+        &self.value
+    }
+}
+
+impl<T> Deref for ServiceLease<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+impl<T> Drop for ServiceLease<T> {
+    fn drop(&mut self) {
+        self.owner.release();
+    }
+}
+
+/// Handle to a replaced or revoked provider generation.
+pub(crate) struct ServiceRetirement {
+    generation: u64,
+    owner: Arc<ServiceGeneration>,
+}
+
+impl ServiceRetirement {
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn in_flight(&self) -> usize {
+        self.owner.in_flight.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn is_drained(&self) -> bool {
+        self.in_flight() == 0
+    }
+
+    /// Wait until all calls using this generation release their leases.
+    /// Returns false when the timeout expires.
+    pub(crate) async fn wait_drained(&self, timeout: Duration) -> bool {
+        let wait = async {
+            loop {
+                let notified = self.owner.drained.notified();
+                if self.is_drained() {
+                    break;
+                }
+                notified.await;
+            }
+        };
+        tokio::time::timeout(timeout, wait).await.is_ok()
+    }
+}
+
 /// A typed service registry. Replacing a service invalidates the old token, so
 /// cleanup from an older provider cannot accidentally remove its replacement.
 /// Subscribers receive bounded availability notifications and can re-query the
 /// registry for the current provider.
 pub(crate) struct ServiceRegistry {
-    entries: RwLock<HashMap<ServiceKey, (u64, Arc<dyn Any + Send + Sync>)>>,
+    entries: RwLock<HashMap<ServiceKey, (u64, Arc<ServiceGeneration>)>>,
     next_generation: AtomicU64,
     changes: tokio::sync::broadcast::Sender<ServiceChange>,
 }
@@ -99,6 +205,9 @@ impl ServiceRegistry {
     }
 
     /// Provide or replace a typed service in a scope.
+    ///
+    /// Existing callers retain the legacy token-only result. Use
+    /// provide_with_retirement when the previous generation must be drained.
     pub(crate) fn provide<T>(
         &self,
         scope: Scope,
@@ -108,28 +217,52 @@ impl ServiceRegistry {
     where
         T: Any + Send + Sync,
     {
+        self.provide_with_retirement(scope, name, service).0
+    }
+
+    /// Replace a provider and return a drain handle for its previous generation.
+    pub(crate) fn provide_with_retirement<T>(
+        &self,
+        scope: Scope,
+        name: impl Into<String>,
+        service: Arc<T>,
+    ) -> (ServiceToken, Option<ServiceRetirement>)
+    where
+        T: Any + Send + Sync,
+    {
         let key = ServiceKey {
             name: name.into(),
             scope,
             type_id: TypeId::of::<T>(),
         };
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
-        let previous = self
+        let new_generation = Arc::new(ServiceGeneration::new(service));
+        let mut entries = self
             .entries
             .write()
-            .expect("service registry lock poisoned")
-            .insert(key.clone(), (generation, service));
+            .expect("service registry lock poisoned");
+        let previous = entries.insert(key.clone(), (generation, new_generation));
+        // Retire while holding the write lock. No new lease can race in after
+        // the replacement becomes visible.
+        let retirement = previous.map(|(old_generation, owner)| {
+            owner.retire();
+            ServiceRetirement {
+                generation: old_generation,
+                owner,
+            }
+        });
+        drop(entries);
         let _ = self.changes.send(ServiceChange {
             name: key.name.clone(),
             scope: key.scope.clone(),
             generation,
-            kind: if previous.is_some() {
+            kind: if retirement.is_some() {
                 ServiceChangeKind::Replaced
             } else {
                 ServiceChangeKind::Available
             },
         });
-        ServiceToken { key, generation }
+        (ServiceToken { key, generation }, retirement)
     }
 
     /// Resolve a typed service in exactly the requested scope.
@@ -147,8 +280,41 @@ impl ServiceRegistry {
             type_id: TypeId::of::<T>(),
         };
         let entries = self.entries.read().ok()?;
-        let service = entries.get(&key)?.1.clone();
+        let service = entries.get(&key)?.1.value.clone();
         Arc::downcast::<T>(service).ok()
+    }
+
+    /// Acquire a call-scoped lease on the current provider generation.
+    ///
+    /// New calls are rejected after replacement/revocation. Existing leases
+    /// continue to use their original immutable generation until dropped.
+    pub(crate) fn acquire<T>(&self, scope: &Scope, name: &str) -> Option<ServiceLease<T>>
+    where
+        T: Any + Send + Sync,
+    {
+        let key = ServiceKey {
+            name: name.to_owned(),
+            scope: scope.clone(),
+            type_id: TypeId::of::<T>(),
+        };
+        let entries = self.entries.read().ok()?;
+        let (generation, owner) = entries.get(&key)?;
+        if !owner.accepting.load(Ordering::Acquire) {
+            return None;
+        }
+        owner.in_flight.fetch_add(1, Ordering::AcqRel);
+        let value = match Arc::downcast::<T>(Arc::clone(&owner.value)) {
+            Ok(value) => value,
+            Err(_) => {
+                owner.release();
+                return None;
+            }
+        };
+        Some(ServiceLease {
+            value,
+            generation: *generation,
+            owner: Arc::clone(owner),
+        })
     }
 
     /// Provide a service whose registration is revoked with its owning Fiber.
@@ -180,25 +346,31 @@ impl ServiceRegistry {
     /// Remove a service only if the token still owns the current generation.
     /// Returns false for stale tokens and already-removed entries.
     pub(crate) fn revoke(&self, token: &ServiceToken) -> bool {
-        let Ok(mut entries) = self.entries.write() else {
-            return false;
-        };
-        if entries
+        self.revoke_with_retirement(token).is_some()
+    }
+
+    /// Revoke the current generation and return a handle for draining its calls.
+    pub(crate) fn revoke_with_retirement(
+        &self,
+        token: &ServiceToken,
+    ) -> Option<ServiceRetirement> {
+        let mut entries = self.entries.write().ok()?;
+        if !entries
             .get(&token.key)
             .is_some_and(|(generation, _)| *generation == token.generation)
         {
-            entries.remove(&token.key);
-            drop(entries);
-            let _ = self.changes.send(ServiceChange {
-                name: token.key.name.clone(),
-                scope: token.key.scope.clone(),
-                generation: token.generation,
-                kind: ServiceChangeKind::Unavailable,
-            });
-            true
-        } else {
-            false
+            return None;
         }
+        let (generation, owner) = entries.remove(&token.key)?;
+        owner.retire();
+        drop(entries);
+        let _ = self.changes.send(ServiceChange {
+            name: token.key.name.clone(),
+            scope: token.key.scope.clone(),
+            generation,
+            kind: ServiceChangeKind::Unavailable,
+        });
+        Some(ServiceRetirement { generation, owner })
     }
 
     /// Whether a service of this exact type/name/scope is currently available.
