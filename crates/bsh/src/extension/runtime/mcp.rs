@@ -276,6 +276,9 @@ impl McpRuntime {
         self.core.kill_child();
     }
 
+
+
+impl McpCore {
     fn ensure_running(&self) -> Result<(), ExtensionError> {
         if self.stopped.load(Ordering::SeqCst) {
             Err(self.cancellation_error())
@@ -283,9 +286,7 @@ impl McpRuntime {
             Ok(())
         }
     }
-}
 
-impl McpCore {
     fn new(
         manifest: &Manifest,
         root: &Path,
