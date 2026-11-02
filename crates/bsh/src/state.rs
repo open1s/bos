@@ -1383,6 +1383,30 @@ impl AppState {
     /// refusing the delete. The selection then moves to the next chat in the list,
     /// or to none when that was the last one.
     pub(crate) fn delete_session(&mut self, id: &str) -> bool {
+        if self.store.session(id).is_none() {
+            return false;
+        }
+
+        // Stop a live turn before taking the recovery snapshot. Calling stop on
+        // an idle session would incorrectly mark its last empty assistant row
+        // as cancelled, so the idle path only releases runtime handles.
+        if self.streams.contains_key(id) {
+            self.stop(id);
+        } else {
+            self.runner.stop(id);
+            self.steer_mailboxes.remove(id);
+            self.turn_extension_activations.remove(id);
+            self.turn_agents.remove(id);
+            self.restore_orphan_steers(id);
+        }
+        if self.streams.is_empty() {
+            self.turn_started = None;
+        }
+
+        // The snapshot must include the stopped turn's final transcript state.
+        // If parking fails, the session remains in the store (but a live turn
+        // has already been stopped); preserving data takes priority over
+        // pretending the deletion succeeded.
         let Some(session) = self.store.session(id).cloned() else {
             return false;
         };
@@ -1400,7 +1424,20 @@ impl AppState {
         if !self.store.remove(id) {
             return false;
         }
+
+        // stop() restores undelivered steering rows for an ordinary stop. A
+        // deleted session has nowhere to receive them, so discard those rows
+        // only AFTER parking and removing the session. If parking fails, the
+        // still-live session keeps its queued messages.
+        self.inbox.remove(id);
+        self.steering.retain(|_, steering| steering.session != id);
+
         self.plans.remove(id);
+        self.goals.remove(id);
+        self.turn_policy_generation.remove(id);
+        // A manual compaction owns its admission flag until its async completion
+        // callback runs stop_compacting(); it is not safe to clear that flag
+        // while its task is still executing.
         crate::extension::publish(
             crate::extension::topics::SESSION_DELETED,
             serde_json::json!({ "session": id, "title": session.title }),
@@ -1442,28 +1479,60 @@ impl AppState {
             .and_then(|id| id.as_str())
             .unwrap_or("item")
             .to_string();
+        let deleted_at = now();
         let envelope = crate::trash::Envelope {
             kind: kind.key().to_string(),
-            deleted_at: now(),
+            deleted_at,
             workspace: workspace.to_string(),
             workspace_name,
             name: name.to_string(),
-            // A chat's transcript lives in Parquet pages beside its document, so
-            // the park carries them: the bin holds the whole chat, and restoring
-            // does not depend on a directory a purge or a moved workspace could
-            // take away.
+            // Include the millisecond clock in the parked directory name: a
+            // restored session may be deleted again while an older copy remains
+            // in the bin, and the earlier recovery point must never be replaced.
             log: match kind {
-                crate::trash::Kind::Session => format!("log-{id}"),
+                crate::trash::Kind::Session => format!("log-{id}-{}", now_ms()),
                 crate::trash::Kind::Workspace => String::new(),
             },
             payload,
         };
         let dir = self.settings.trash_dir();
-        if kind == crate::trash::Kind::Session {
+        let parked_log = if kind == crate::trash::Kind::Session {
             let from = crate::history::History::dir_for(&self.store.dir_for_id(&id), &id);
-            let _ = crate::trash::park_log(&dir, &from, &envelope);
+            let into = crate::trash::log_dir(&dir, &envelope);
+            let had_log = from.exists();
+            if let Err(error) = crate::trash::park_log(&dir, &from, &envelope) {
+                log::warn!(
+                    "session {id}: could not park history ({}): {error}",
+                    from.display()
+                );
+                return None;
+            }
+            had_log.then_some((from, into))
+        } else {
+            None
+        };
+
+        match crate::trash::stash(&dir, &envelope) {
+            Ok(path) => Some(path),
+            Err(error) => {
+                // The original session is still present. If writing its
+                // envelope failed after the history move, put the pages back
+                // before refusing the delete.
+                if let Some((from, parked)) = parked_log {
+                    if let Some(parent) = from.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if let Err(rollback) = std::fs::rename(&parked, &from) {
+                        log::error!(
+                            "session {id}: trash write failed ({error}); history rollback failed ({}): {rollback}",
+                            from.display()
+                        );
+                    }
+                }
+                log::warn!("session {id}: could not write trash envelope: {error}");
+                None
+            }
         }
-        crate::trash::stash(&dir, &envelope).ok()
     }
 
     /// Everything in the bin, newest first.
@@ -7977,4 +8046,148 @@ mod tests {
             );
         }
     }
+
+    /// Deleting an idle session parks its transcript without inventing a
+    /// cancellation marker on the last assistant row.
+    #[test]
+    fn deleting_an_idle_session_does_not_mark_it_cancelled() {
+        let (mut state, id) = goal_state("delete-idle");
+        state
+            .store
+            .session_mut(&id)
+            .expect("session")
+            .messages
+            .push(crate::model::ChatMessage::assistant());
+
+        assert!(state.delete_session(&id));
+        assert!(state.store.session(&id).is_none());
+
+        let parked = state
+            .trash()
+            .into_iter()
+            .find(|entry| {
+                entry
+                    .envelope
+                    .payload
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(id.as_str())
+            })
+            .expect("the deleted session is recoverable");
+        let cancelled = parked.envelope.payload["messages"][0]["meta"]["cancelled"]
+            .as_bool()
+            .unwrap_or(false);
+        assert!(!cancelled, "an idle assistant row is not a cancelled turn");
+    }
+
+    /// Deleting a live session stops its turn before taking the trash snapshot,
+    /// releases build-scoped extension handles, and discards queued steering
+    /// that can no longer be delivered to a deleted session.
+    #[test]
+    fn deleting_a_running_session_stops_and_releases_runtime_state() {
+        let (mut state, id) = goal_state("delete-running");
+        state
+            .store
+            .session_mut(&id)
+            .expect("session")
+            .messages
+            .push(crate::model::ChatMessage::assistant());
+        state.streams.insert(id.clone(), super::now());
+        state
+            .turn_extension_activations
+            .insert(id.clone(), Vec::new());
+        state.turn_policy_generation.insert(id.clone(), 7);
+        state.inbox.insert(
+            id.clone(),
+            vec![super::Queued {
+                seq: 1,
+                text: "queued".to_string(),
+                attachments: Vec::new(),
+            }],
+        );
+        state.steering.insert(
+            9,
+            super::Steering {
+                session: id.clone(),
+                queued: super::Queued {
+                    seq: 2,
+                    text: "steered".to_string(),
+                    attachments: Vec::new(),
+                },
+            },
+        );
+
+        assert!(state.delete_session(&id));
+        assert!(!state.streams.contains_key(&id));
+        assert!(!state.turn_extension_activations.contains_key(&id));
+        assert!(!state.turn_policy_generation.contains_key(&id));
+        assert!(!state.inbox.contains_key(&id));
+        assert!(!state
+            .steering
+            .values()
+            .any(|steering| steering.session == id));
+
+        let parked = state
+            .trash()
+            .into_iter()
+            .find(|entry| {
+                entry.envelope.payload.get("id").and_then(serde_json::Value::as_str)
+                    == Some(id.as_str())
+            })
+            .expect("the stopped session is recoverable");
+        assert_eq!(
+            parked.envelope.payload["messages"][0]["meta"]["cancelled"].as_bool(),
+            Some(true),
+            "the snapshot records that the live turn was stopped"
+        );
+    }
+
+    /// If the recycle-bin path cannot be created, deletion refuses without
+    /// losing the source history or queued steering. A running turn is stopped,
+    /// but the session remains available for a later retry.
+    #[test]
+    fn failed_session_parking_keeps_the_session_history_and_queue() {
+        let (mut state, id) = goal_state("delete-trash-failure");
+        let session_dir = state.store.dir_for_id(&id);
+        let history = crate::history::History::dir_for(&session_dir, &id);
+        std::fs::create_dir_all(&history).expect("history directory");
+        let marker = history.join("preserve-me");
+        std::fs::write(&marker, b"history").expect("history marker");
+
+        state.streams.insert(id.clone(), super::now());
+        state.inbox.insert(
+            id.clone(),
+            vec![super::Queued {
+                seq: 1,
+                text: "already queued".to_string(),
+                attachments: Vec::new(),
+            }],
+        );
+        state.steering.insert(
+            11,
+            super::Steering {
+                session: id.clone(),
+                queued: super::Queued {
+                    seq: 2,
+                    text: "undelivered steer".to_string(),
+                    attachments: Vec::new(),
+                },
+            },
+        );
+
+        // A regular file at the bin path makes create_dir_all fail on every
+        // platform, without relying on permission behavior or running as root.
+        let trash_dir = state.settings.trash_dir();
+        std::fs::write(&trash_dir, b"not a directory").expect("block trash directory");
+
+        assert!(!state.delete_session(&id));
+        assert!(state.store.session(&id).is_some());
+        assert!(!state.streams.contains_key(&id));
+        assert!(marker.is_file(), "failed parking must leave history in place");
+        let queued = state.inbox.get(&id).expect("queued messages survive");
+        assert_eq!(queued.len(), 2, "both queued and undelivered rows survive");
+        assert!(queued.iter().any(|item| item.text == "already queued"));
+        assert!(queued.iter().any(|item| item.text == "undelivered steer"));
+    }
+
 }

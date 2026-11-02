@@ -14,7 +14,8 @@
 //! `WorkspaceRef`), not a pointer to the original file, so restoring cannot depend
 //! on a workspace that may have moved or a file somebody edited in between.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -103,13 +104,33 @@ pub(crate) fn stash(dir: &Path, envelope: &Envelope) -> std::io::Result<PathBuf>
         .get("id")
         .and_then(|id| id.as_str())
         .unwrap_or("item");
-    let path = dir.join(format!(
-        "{}-{}-{}.json",
-        envelope.kind, envelope.deleted_at, id
-    ));
+    let stem = format!("{}-{}-{}", envelope.kind, envelope.deleted_at, id);
     let text = serde_json::to_string_pretty(envelope)?;
-    fs::write(&path, text)?;
-    Ok(path)
+    // A restored session can be deleted again while an older copy is still in
+    // the bin. Never overwrite that earlier recovery point.
+    for suffix in 0_u64.. {
+        let filename = if suffix == 0 {
+            format!("{stem}.json")
+        } else {
+            format!("{stem}-{suffix}.json")
+        };
+        let path = dir.join(filename);
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+        if let Err(error) = file
+            .write_all(text.as_bytes())
+            .and_then(|()| file.sync_all())
+        {
+            drop(file);
+            let _ = fs::remove_file(&path);
+            return Err(error);
+        }
+        return Ok(path);
+    }
+    unreachable!("the envelope filename suffix space is exhausted")
 }
 
 /// The directory a parked item's log lives in, inside the bin.
@@ -128,7 +149,14 @@ pub(crate) fn park_log(dir: &Path, from: &Path, envelope: &Envelope) -> std::io:
     }
     fs::create_dir_all(dir)?;
     let into = log_dir(dir, envelope);
-    let _ = fs::remove_dir_all(&into);
+    // Refuse collisions instead of deleting a previously parked transcript.
+    // The caller can then leave the source session untouched.
+    if into.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "a parked session log already exists",
+        ));
+    }
     fs::rename(from, &into)
 }
 
