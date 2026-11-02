@@ -321,15 +321,15 @@ requires = [
   dot, hyphen and underscore; 1–128 bytes).
 - A provider declares a concrete SemVer version; a consumer declares a
   SemVer range in version.
-- scope is required and is one of host, workspace or session. Extension-private
-  services are not publishable through this cross-extension contract.
+- scope is required and is one of host, workspace, session or extension.
+  The extension scope is private to the declaring extension and cannot satisfy
+  another extension's requirement.
 - A resolved activation graph may contain only one provider for a given
   (scope, name, contract) tuple. Multiple providers fail planning; the host
   does not pick one by load order.
 - A required service with no provider, or with an incompatible provider
-  version, fails planning. An optional = true requirement may be absent;
-  if a provider is present but its version is incompatible, planning still
-  fails rather than binding an incompatible interface.
+  version, fails planning. An optional = true requirement may be absent or
+  have an incompatible provider; in either case no provider edge is created.
 - Each service requirement adds a provider-before-consumer dependency edge.
   The combined graph is checked for missing dependencies and cycles, and the
   resulting topological order is the order used by the host activation pass.
