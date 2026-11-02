@@ -217,6 +217,57 @@ impl ResourcesSpec {
     }
 }
 
+/// Visibility boundary for a declared extension service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ServiceScope {
+    Host,
+    Workspace,
+    Session,
+    Extension,
+}
+
+/// A service contract published by this extension.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ServiceProvideSpec {
+    /// Stable service name, e.g. `com.example.search`.
+    pub(crate) name: String,
+    /// Stable interface identifier, e.g. `com.example.search-api`.
+    pub(crate) contract: String,
+    /// Provider's concrete semantic version.
+    pub(crate) version: Version,
+    /// Visibility boundary. Required to avoid accidental global exposure.
+    pub(crate) scope: ServiceScope,
+}
+
+/// A service contract consumed by this extension.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ServiceRequireSpec {
+    /// Stable service name.
+    pub(crate) name: String,
+    /// Stable interface identifier.
+    pub(crate) contract: String,
+    /// Accepted provider versions.
+    pub(crate) version: Requirement,
+    /// Visibility boundary required by this consumer.
+    pub(crate) scope: ServiceScope,
+    /// Missing providers do not block activation when true.
+    #[serde(default)]
+    pub(crate) optional: bool,
+}
+
+/// Services exposed and consumed by an extension.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ServicesSpec {
+    #[serde(default)]
+    pub(crate) provides: Vec<ServiceProvideSpec>,
+    #[serde(default)]
+    pub(crate) requires: Vec<ServiceRequireSpec>,
+}
+
 /// A complete package manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -244,6 +295,9 @@ pub(crate) struct Manifest {
     /// Dependency map: extension id -> version range.
     #[serde(default)]
     pub(crate) dependencies: BTreeMap<ExtensionId, Requirement>,
+    /// Explicit service contracts; omitted in legacy manifests.
+    #[serde(default)]
+    pub(crate) services: ServicesSpec,
 }
 
 impl Manifest {
@@ -357,6 +411,7 @@ impl Manifest {
         self.validate_configuration(&mut report);
         self.validate_resources(&mut report);
         self.validate_dependencies(&mut report);
+        self.validate_services(&mut report);
         report
     }
 
@@ -717,6 +772,45 @@ impl Manifest {
         }
     }
 
+    fn validate_services(&self, report: &mut ValidationReport) {
+        if self.services.provides.len() > 64 {
+            report.error("services.provides", "must contain at most 64 entries");
+        }
+        if self.services.requires.len() > 64 {
+            report.error("services.requires", "must contain at most 64 entries");
+        }
+
+        let mut provided = BTreeSet::new();
+        for (index, service) in self.services.provides.iter().enumerate() {
+            let field = format!("services.provides[{index}]");
+            validate_service_identifier(&service.name)
+                .err()
+                .map(|reason| report.error(format!("{field}.name"), reason));
+            validate_service_identifier(&service.contract)
+                .err()
+                .map(|reason| report.error(format!("{field}.contract"), reason));
+            let key = (service.scope, service.name.as_str(), service.contract.as_str());
+            if !provided.insert(key) {
+                report.error(&field, "duplicate service provider declaration");
+            }
+        }
+
+        let mut required = BTreeSet::new();
+        for (index, service) in self.services.requires.iter().enumerate() {
+            let field = format!("services.requires[{index}]");
+            validate_service_identifier(&service.name)
+                .err()
+                .map(|reason| report.error(format!("{field}.name"), reason));
+            validate_service_identifier(&service.contract)
+                .err()
+                .map(|reason| report.error(format!("{field}.contract"), reason));
+            let key = (service.scope, service.name.as_str(), service.contract.as_str());
+            if !required.insert(key) {
+                report.error(&field, "duplicate service requirement declaration");
+            }
+        }
+    }
+
     /// The trust level this package is loaded at. Built-in manifests are
     /// linked in; everything read from disk is local until a publisher
     /// verification path exists.
@@ -727,6 +821,23 @@ impl Manifest {
             TrustLevel::Local
         }
     }
+}
+
+/// Validate a stable service or contract identifier.
+fn validate_service_identifier(value: &str) -> Result<(), String> {
+    if value.is_empty() || value.len() > 128 {
+        return Err("must contain 1..=128 bytes".into());
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b".-_".contains(&byte))
+        || value.starts_with('.')
+        || value.ends_with('.')
+        || value.contains("..")
+    {
+        return Err("must use lowercase ASCII letters, digits, '.', '-' or '_' and cannot contain empty dotted segments".into());
+    }
+    Ok(())
 }
 
 /// Validate a package-relative path: no absolute paths, no parent traversal,
