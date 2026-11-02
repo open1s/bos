@@ -1,23 +1,55 @@
 digraph ExtensionPlatform {
- graph [bgcolor="#0B1020",pad="0.55",rankdir=TB,nodesep="0.38",ranksep="0.52",splines=none,newrank=true,outputorder=edgesfirst,fontname="DejaVu Sans",label="BSH EXTENSION PLATFORM  /  AN OPEN CANVAS FOR INFINITE POSSIBILITIES",labelloc=t,fontsize=24,fontcolor="#F3F6FC"];
- node [shape=box,style="rounded,filled",fontname="DejaVu Sans",fontsize=12,margin="0.28,0.22",color="#405575",fillcolor="#17243A",fontcolor="#F3F6FC",penwidth=1.5];
- edge [style=invis,weight=30];
- hero [label="MAKE BSH YOUR OWN\nA powerful, secure and multi-runtime extension ecosystem",fontsize=17,width=10.0,height=1.0,fillcolor="#241C3B",color="#B69CFF",penwidth=2.4];
- subgraph cluster_runtimes {label="CHOOSE YOUR RUNTIME  /  BUILD WITH THE TECHNOLOGY YOU PREFER";labelloc=t;fontsize=13;fontcolor="#B69CFF";color="#59477C";style="rounded";penwidth=1.7;margin=22;
- declarative [label="DECLARATIVE\nZero-process contributions",color="#6EA8FE",fillcolor="#192B48"];
- process [label="PROCESS\nExternal apps · JSON-RPC",color="#55D6E8",fillcolor="#17313A"];
- wasm [label="WASM COMPONENT\nPortable · WIT interface",color="#67D6A3",fillcolor="#17352F"];
- extism [label="EXTISM / MCP\nPlugin & server ecosystem",color="#FFBE78",fillcolor="#302719"];
- builtin [label="BUILT-IN RUST\nNative first-party extensions",color="#B69CFF",fillcolor="#29213E"];
- {rank=same;declarative;process;wasm;} {rank=same;extism;builtin;} declarative -> process -> wasm; extism -> builtin;
- }
- subgraph cluster_contributions {label="EXTEND EVERY PART OF THE WORKSPACE";labelloc=t;fontsize=13;fontcolor="#55D6E8";color="#34445F";style="rounded";penwidth=1.5;margin=20;
- tools [label="TOOLS & SKILLS\nNew agent capabilities",color="#55D6E8"];
- commands [label="COMMANDS & WORKFLOWS\nAutomate everyday work",color="#67D6A3"];
- panels [label="PANELS & VIEWS\nCustom workspace experiences",color="#B69CFF"];
- services [label="LANGUAGE & DATA SERVICES\nIntegrations · storage · hooks",color="#FFBE78"];
- {rank=same;tools;commands;panels;services;} tools -> commands -> panels -> services;
- }
- trust [label="SECURITY BY DESIGN\nManifest & compatibility checks  ·  Managed installation  ·  Capability authorization\nClear trust boundary between extension code and host capabilities",fillcolor="#302719",color="#FFBE78",penwidth=1.8,fontsize=12,width=10.0];
- hero -> declarative; declarative -> tools; tools -> trust;
+  graph [
+    bgcolor="#FFFFFF", pad="0.42", rankdir=TB, nodesep="0.24", ranksep="0.34",
+    splines=ortho, outputorder=edgesfirst, fontname="Arial",
+    label="BSH Extension Platform", labelloc=t, labeljust=l,
+    fontsize=28, fontcolor="#111111"
+  ];
+  node [
+    shape=box, style="rounded,filled", fontname="Arial",
+    fontsize=15, margin="0.30,0.22", color="#D9DDE2",
+    fillcolor="#FFFFFF", fontcolor="#111111", penwidth=1.2
+  ];
+  edge [color="#111111", penwidth=1.6, arrowsize=0.75, arrowhead=normal];
+
+  subgraph cluster_platform {
+    label=""; color="#D9DDE2"; penwidth=1.2; style="rounded"; margin=24;
+
+    api [
+      label=<<B>BSH Extension API</B><BR/><FONT POINT-SIZE="13" COLOR="#666666">Manifest  ·  Lifecycle  ·  Capability  ·  Contribution</FONT>>,
+      fillcolor="#E8F3FA", color="#DDEBF4", width=8.4, height=1.05
+    ];
+
+    runtime [
+      label=<<B>Runtime Abstraction Layer</B><BR/><FONT POINT-SIZE="13" COLOR="#666666">Unified lifecycle, invocation, errors, cancellation and diagnostics</FONT>>,
+      fillcolor="#F2F2F2", color="#E8E8E8", width=8.4, height=1.05
+    ];
+
+    native [
+      label=<<B>Native</B><BR/><FONT POINT-SIZE="22">▣</FONT><BR/><FONT POINT-SIZE="13" COLOR="#666666">Built-in Rust extensions</FONT>>,
+      width=2.55, height=1.75
+    ];
+    extism [
+      label=<<B>Extism</B><BR/><FONT POINT-SIZE="22">⌁</FONT><BR/><FONT POINT-SIZE="13" COLOR="#666666">Function plugins</FONT>>,
+      width=2.55, height=1.75
+    ];
+    wasmtime [
+      label=<<B>Wasmtime</B><BR/><FONT POINT-SIZE="22">■</FONT><BR/><FONT POINT-SIZE="13" COLOR="#666666">WIT Components</FONT>>,
+      width=2.55, height=1.75
+    ];
+
+    services [
+      label=<<B>BSH Services</B><BR/><FONT POINT-SIZE="13" COLOR="#666666">Agent  ·  GPUI  ·  Event Bus  ·  Storage  ·  Computer Use</FONT>>,
+      fillcolor="#E8F3FA", color="#DDEBF4", width=8.4, height=1.05
+    ];
+
+    {rank=same; native; extism; wasmtime;}
+    api -> runtime;
+    runtime -> native;
+    runtime -> extism;
+    runtime -> wasmtime;
+    native -> services;
+    extism -> services;
+    wasmtime -> services;
+  }
 }
