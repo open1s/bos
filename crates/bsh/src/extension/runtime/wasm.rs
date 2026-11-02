@@ -7,8 +7,8 @@
 //!
 //! Limits are enforced by the store: linear memory by StoreLimits, CPU by fuel,
 //! wall clock by epoch interruption, and output bytes by the host wrapper.
-//! Cancellation sets the epoch deadline to the current tick so a running guest
-//! traps at its next epoch check.
+//! Cancellation advances the engine epoch; each Store's deadline callback
+//! decides whether that runtime should interrupt or continue.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -19,7 +19,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use serde_json::Value;
 use wasmtime::component::{bindgen, Component, HasSelf, Linker};
-use wasmtime::{Config, Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder, UpdateDeadline};
+use wasmtime::{
+    Config, Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder, UpdateDeadline,
+};
 
 use super::{CallContext, Runtime, ToolDescriptor, ToolResult};
 use crate::extension::capability::{CallScope, Capability, PolicyEngine};
