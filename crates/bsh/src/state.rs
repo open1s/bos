@@ -8141,4 +8141,53 @@ mod tests {
             "the snapshot records that the live turn was stopped"
         );
     }
+
+    /// If the recycle-bin path cannot be created, deletion refuses without
+    /// losing the source history or queued steering. A running turn is stopped,
+    /// but the session remains available for a later retry.
+    #[test]
+    fn failed_session_parking_keeps_the_session_history_and_queue() {
+        let (mut state, id) = goal_state("delete-trash-failure");
+        let session_dir = state.store.dir_for_id(&id);
+        let history = crate::history::History::dir_for(&session_dir, &id);
+        std::fs::create_dir_all(&history).expect("history directory");
+        let marker = history.join("preserve-me");
+        std::fs::write(&marker, b"history").expect("history marker");
+
+        state.streams.insert(id.clone(), super::now());
+        state.inbox.insert(
+            id.clone(),
+            vec![super::Queued {
+                seq: 1,
+                text: "already queued".to_string(),
+                attachments: Vec::new(),
+            }],
+        );
+        state.steering.insert(
+            11,
+            super::Steering {
+                session: id.clone(),
+                queued: super::Queued {
+                    seq: 2,
+                    text: "undelivered steer".to_string(),
+                    attachments: Vec::new(),
+                },
+            },
+        );
+
+        // A regular file at the bin path makes create_dir_all fail on every
+        // platform, without relying on permission behavior or running as root.
+        let trash_dir = state.settings.trash_dir();
+        std::fs::write(&trash_dir, b"not a directory").expect("block trash directory");
+
+        assert!(!state.delete_session(&id));
+        assert!(state.store.session(&id).is_some());
+        assert!(!state.streams.contains_key(&id));
+        assert!(marker.is_file(), "failed parking must leave history in place");
+        let queued = state.inbox.get(&id).expect("queued messages survive");
+        assert_eq!(queued.len(), 2, "both queued and undelivered rows survive");
+        assert!(queued.iter().any(|item| item.text == "already queued"));
+        assert!(queued.iter().any(|item| item.text == "undelivered steer"));
+    }
+
 }
