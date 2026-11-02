@@ -1,6 +1,6 @@
 digraph ExtensionPlatform {
   graph [
-    bgcolor="#FFFFFF", pad="0.42", rankdir=TB, nodesep="0.24", ranksep="0.34",
+    bgcolor="#FFFFFF", pad="0.42", rankdir=TB, nodesep="0.20", ranksep="0.48",
     splines=ortho, outputorder=edgesfirst, fontname="Arial",
     label="BSH Extension Platform", labelloc=t, labeljust=l,
     fontsize=28, fontcolor="#111111"
@@ -26,16 +26,16 @@ digraph ExtensionPlatform {
     ];
 
     native [
-      label=<<B>Native</B><BR/><FONT POINT-SIZE="22">▣</FONT><BR/><FONT POINT-SIZE="13" COLOR="#666666">Built-in Rust extensions</FONT>>,
-      width=2.55, height=1.75
+      label=<<B>Native</B><BR/><FONT POINT-SIZE="13" COLOR="#666666">Built-in Rust extensions</FONT>>,
+      width=2.55, height=1.55
     ];
     extism [
-      label=<<B>Extism</B><BR/><FONT POINT-SIZE="22">⌁</FONT><BR/><FONT POINT-SIZE="13" COLOR="#666666">Function plugins</FONT>>,
-      width=2.55, height=1.75
+      label=<<B>Extism</B><BR/><FONT POINT-SIZE="13" COLOR="#666666">Function plugins</FONT>>,
+      width=2.55, height=1.55
     ];
     wasmtime [
-      label=<<B>Wasmtime</B><BR/><FONT POINT-SIZE="22">■</FONT><BR/><FONT POINT-SIZE="13" COLOR="#666666">WIT Components</FONT>>,
-      width=2.55, height=1.75
+      label=<<B>Wasmtime</B><BR/><FONT POINT-SIZE="13" COLOR="#666666">WIT Components</FONT>>,
+      width=2.55, height=1.55
     ];
 
     services [

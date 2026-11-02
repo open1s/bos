@@ -20,7 +20,7 @@ digraph AgentExecution {
       fillcolor="#E8F3FA", color="#DDEBF4", width=8.8, height=0.95
     ];
     understand [
-      label=<<B>Understand & Plan</B><BR/><FONT POINT-SIZE="13" COLOR="#666666">Interpret intent  ·  Build plan  ·  Select model and capabilities</FONT>>,
+      label=<<B>Understand &amp; Plan</B><BR/><FONT POINT-SIZE="13" COLOR="#666666">Interpret intent  ·  Build plan  ·  Select model and capabilities</FONT>>,
       fillcolor="#F2F2F2", color="#E8E8E8", width=8.8, height=0.95
     ];
 
@@ -29,7 +29,7 @@ digraph AgentExecution {
     execute [label=<<B>Execute</B><BR/><FONT POINT-SIZE="12" COLOR="#666666">Tools  ·  Skills  ·  MCP  ·  Extensions</FONT>>, width=2.65];
 
     result [
-      label=<<B>Observe & Adapt</B><BR/><FONT POINT-SIZE="13" COLOR="#666666">Tool results  ·  Events  ·  Context updates  ·  Next action</FONT>>,
+      label=<<B>Observe &amp; Adapt</B><BR/><FONT POINT-SIZE="13" COLOR="#666666">Tool results  ·  Events  ·  Context updates  ·  Next action</FONT>>,
       fillcolor="#F2F2F2", color="#E8E8E8", width=8.8, height=0.95
     ];
     response [
