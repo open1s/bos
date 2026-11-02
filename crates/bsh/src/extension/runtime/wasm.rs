@@ -19,7 +19,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use serde_json::Value;
 use wasmtime::component::{bindgen, Component, HasSelf, Linker};
-use wasmtime::{Config, Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{Config, Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder, UpdateDeadline};
 
 use super::{CallContext, Runtime, ToolDescriptor, ToolResult};
 use crate::extension::capability::{CallScope, Capability, PolicyEngine};
@@ -719,9 +719,19 @@ impl WasmRuntime {
                 extension: self.extension.to_string(),
                 message: error.to_string(),
             })?;
-        store.epoch_deadline_trap();
-        let initial_ticks = self.resources.execution_ms().max(1).div_ceil(EPOCH_TICK_MS);
-        store.set_epoch_deadline(initial_ticks);
+        // Check cancellation and the wall-clock budget in a Store-local callback.
+        // The callback is evaluated on the guest thread, so cancellation never
+        // needs to acquire the Store mutex held by a running component.
+        store.epoch_deadline_callback(|state| {
+            if state.data().cancelled.load(Ordering::SeqCst)
+                || Instant::now() >= state.data().deadline
+            {
+                Ok(UpdateDeadline::Interrupt)
+            } else {
+                Ok(UpdateDeadline::Continue(1))
+            }
+        });
+        store.set_epoch_deadline(1);
         let mut linker = Linker::new(engine);
         BshExtension::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state).map_err(
             |error| ExtensionError::Runtime {
@@ -749,8 +759,9 @@ impl WasmRuntime {
     }
 
     fn prepare_call(&self, instance: &mut Instance, timeout_ms: u64) -> Result<(), ExtensionError> {
-        let ticks = timeout_ms.max(1).div_ceil(EPOCH_TICK_MS);
-        instance.store.set_epoch_deadline(ticks);
+        instance.store.data_mut().deadline =
+            Instant::now() + Duration::from_millis(timeout_ms.max(1));
+        instance.store.set_epoch_deadline(1);
         let fuel = timeout_ms.saturating_mul(10_000);
         self.fuel_budget.store(fuel, Ordering::Relaxed);
         self.fuel_used.store(0, Ordering::Relaxed);
@@ -929,15 +940,10 @@ impl Runtime for WasmRuntime {
 
     async fn cancel(&self) -> Result<(), ExtensionError> {
         self.cancelled.store(true, Ordering::SeqCst);
-        // Never block on the instance lock: a running guest holds it for the
-        // whole call. Host functions trap on the flag below, and the epoch /
-        // fuel cut is best-effort for a guest between calls.
-        if let Ok(mut guard) = self.instance.try_lock() {
-            if let Some(instance) = guard.as_mut() {
-                instance.store.set_epoch_deadline(0);
-                let _ = instance.store.set_fuel(0);
-            }
-        }
+        // Epochs are engine-global, but the callback above checks this Store's
+        // own cancellation flag. Other Stores that observe the same tick keep
+        // running by extending their own deadlines.
+        engine().increment_epoch();
         Ok(())
     }
 
@@ -957,13 +963,14 @@ impl Runtime for WasmRuntime {
                 message: "runtime is shut down".to_string(),
             });
         }
-        // A cancelled call must not poison the next one: the flag is per call.
-        self.cancelled.store(false, Ordering::Relaxed);
         self.ensure_instance()?;
         let mut guard = self.instance.lock().map_err(|_| ExtensionError::Corrupt {
             path: self.component.clone(),
             message: "wasm instance lock is poisoned".to_string(),
         })?;
+        // Reset only after acquiring the per-instance lock. A queued call must
+        // never clear the cancellation flag while the previous guest is running.
+        self.cancelled.store(false, Ordering::SeqCst);
         let instance = guard.as_mut().expect("instance");
         self.prepare_call(
             instance,
