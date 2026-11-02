@@ -45,18 +45,55 @@ pub(crate) struct ServiceToken {
     generation: u64,
 }
 
+/// A service availability transition published by the registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ServiceChangeKind {
+    Available,
+    Replaced,
+    Unavailable,
+}
+
+/// A service availability transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ServiceChange {
+    pub(crate) name: String,
+    pub(crate) scope: Scope,
+    pub(crate) generation: u64,
+    pub(crate) kind: ServiceChangeKind,
+}
+
 /// A typed service registry. Replacing a service invalidates the old token, so
 /// cleanup from an older provider cannot accidentally remove its replacement.
-#[derive(Default)]
+/// Subscribers receive bounded availability notifications and can re-query the
+/// registry for the current provider.
 pub(crate) struct ServiceRegistry {
     entries: RwLock<HashMap<ServiceKey, (u64, Arc<dyn Any + Send + Sync>)>>,
     next_generation: AtomicU64,
+    changes: tokio::sync::broadcast::Sender<ServiceChange>,
+}
+
+impl Default for ServiceRegistry {
+    fn default() -> Self {
+        let (changes, _) = tokio::sync::broadcast::channel(128);
+        Self {
+            entries: RwLock::new(HashMap::new()),
+            next_generation: AtomicU64::new(0),
+            changes,
+        }
+    }
 }
 
 impl ServiceRegistry {
     /// Create an empty registry.
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// Subscribe to service availability transitions.
+    pub(crate) fn subscribe_changes(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<ServiceChange> {
+        self.changes.subscribe()
     }
 
     /// Provide or replace a typed service in a scope.
@@ -75,10 +112,21 @@ impl ServiceRegistry {
             type_id: TypeId::of::<T>(),
         };
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
-        self.entries
+        let previous = self
+            .entries
             .write()
             .expect("service registry lock poisoned")
             .insert(key.clone(), (generation, service));
+        let _ = self.changes.send(ServiceChange {
+            name: key.name.clone(),
+            scope: key.scope.clone(),
+            generation,
+            kind: if previous.is_some() {
+                ServiceChangeKind::Replaced
+            } else {
+                ServiceChangeKind::Available
+            },
+        });
         ServiceToken { key, generation }
     }
 
@@ -138,6 +186,13 @@ impl ServiceRegistry {
             .is_some_and(|(generation, _)| *generation == token.generation)
         {
             entries.remove(&token.key);
+            drop(entries);
+            let _ = self.changes.send(ServiceChange {
+                name: token.key.name.clone(),
+                scope: token.key.scope.clone(),
+                generation: token.generation,
+                kind: ServiceChangeKind::Unavailable,
+            });
             true
         } else {
             false
@@ -419,6 +474,30 @@ mod tests {
         assert_eq!(*registry.get::<u64>(&scope, "clock").unwrap(), 2);
         assert!(registry.revoke(&new));
         assert!(!registry.contains::<u64>(&scope, "clock"));
+    }
+
+    #[test]
+    fn service_registry_publishes_availability_and_replacement() {
+        let registry = ServiceRegistry::new();
+        let mut changes = registry.subscribe_changes();
+        let scope = Scope::Workspace("w1".into());
+
+        let first = registry.provide(scope.clone(), "index", Arc::new(1_u64));
+        let available = changes.try_recv().expect("availability event");
+        assert_eq!(available.kind, ServiceChangeKind::Available);
+        assert_eq!(available.generation, first.generation);
+
+        let second = registry.provide(scope.clone(), "index", Arc::new(2_u64));
+        let replaced = changes.try_recv().expect("replacement event");
+        assert_eq!(replaced.kind, ServiceChangeKind::Replaced);
+        assert_eq!(replaced.generation, second.generation);
+
+        assert!(!registry.revoke(&first), "stale token cannot revoke the replacement");
+        assert!(changes.try_recv().is_err(), "stale cleanup emits no unavailable event");
+        assert!(registry.revoke(&second));
+        let unavailable = changes.try_recv().expect("unavailable event");
+        assert_eq!(unavailable.kind, ServiceChangeKind::Unavailable);
+        assert_eq!(unavailable.generation, second.generation);
     }
 
     #[test]
