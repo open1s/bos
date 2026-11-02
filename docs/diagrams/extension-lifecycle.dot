@@ -1,50 +1,23 @@
-digraph ExtensionLifecycle {
-  graph [
-    bgcolor="#0B1020", pad="0.48", rankdir=TB,
-    nodesep="0.48", ranksep="0.64", splines=curved,
-    newrank=true, outputorder=edgesfirst,
-    fontname="DejaVu Sans", label="BSH EXTENSION PLATFORM  /  MAKE THE WORKSPACE YOURS",
-    labelloc=t, fontsize=24, fontcolor="#F3F6FC"
-  ];
-  node [shape=box, style="rounded,filled", fontname="DejaVu Sans",
-    fontsize=12, margin="0.25,0.18", color="#405575",
-    fillcolor="#17243A", fontcolor="#F3F6FC", penwidth=1.6];
-  edge [color="#7186A5", penwidth=1.8, arrowsize=0.8];
-
-  manifest [label="DESCRIBE\nextension.toml · identity · version · contributions", color="#6EA8FE", width=5.2];
-  verify [label="VERIFY\nSchema · package integrity · compatibility", color="#55D6E8", width=5.2];
-  resolve [label="RESOLVE\nDependencies · runtime · permissions", color="#B69CFF", width=5.2];
-  install [label="INSTALL & MANAGE\nVerified package · managed versions · rollback", color="#67D6A3", width=5.2];
-  activate [label="ACTIVATE\nRegister contributions · start extension runtime", color="#FFBE78", width=5.2];
-  manifest -> verify -> resolve -> install -> activate;
-
-  subgraph cluster_runtimes {
-    label="MEET DEVELOPERS WHERE THEY ARE  /  MULTIPLE EXTENSION RUNTIMES";
-    labelloc=t; labeljust=l; fontsize=13; fontcolor="#B69CFF";
-    color="#59477C"; style="rounded"; penwidth=1.7; margin=22;
-    declarative [label="DECLARATIVE\nJSON-defined contributions", color="#6EA8FE"];
-    process [label="PROCESS\nExternal programs · JSON-RPC", color="#55D6E8"];
-    wasm [label="WASM COMPONENT\nPortable components · WIT", color="#67D6A3"];
-    extism [label="EXTISM / MCP\nPlugin and server reuse", color="#FFBE78"];
-    builtin [label="BUILT-IN RUST\nFirst-party native extensions", color="#B69CFF"];
-    {rank=same; declarative; process; wasm;}
-    {rank=same; extism; builtin;}
-  }
-  activate -> declarative;
-  activate -> process;
-  activate -> wasm;
-  activate -> extism;
-  activate -> builtin;
-
-  host [label="HOST INTEGRATION SURFACE\nTools · commands · panels · prompts · skills · themes\nWorkflows · language services · storage · hooks",
-    fillcolor="#241C3B", color="#B69CFF", penwidth=2.1, fontsize=12, width=7.4];
-  declarative -> host;
-  process -> host;
-  wasm -> host;
-  extism -> host;
-  builtin -> host;
-
-  security [label="TRUST BOUNDARY\nCapability request → policy decision → host API\nAuthorization is distinct from OS-level isolation",
-    fillcolor="#302719", color="#FFBE78", penwidth=1.7, fontsize=11, width=6.4];
-  host -> security;
+digraph ExtensionPlatform {
+ graph [bgcolor="#0B1020",pad="0.55",rankdir=TB,nodesep="0.38",ranksep="0.52",splines=none,newrank=true,outputorder=edgesfirst,fontname="DejaVu Sans",label="BSH EXTENSION PLATFORM  /  AN OPEN CANVAS FOR INFINITE POSSIBILITIES",labelloc=t,fontsize=24,fontcolor="#F3F6FC"];
+ node [shape=box,style="rounded,filled",fontname="DejaVu Sans",fontsize=12,margin="0.28,0.22",color="#405575",fillcolor="#17243A",fontcolor="#F3F6FC",penwidth=1.5];
+ edge [style=invis,weight=30];
+ hero [label="MAKE BSH YOUR OWN\nA powerful, secure and multi-runtime extension ecosystem",fontsize=17,width=10.0,height=1.0,fillcolor="#241C3B",color="#B69CFF",penwidth=2.4];
+ subgraph cluster_runtimes {label="CHOOSE YOUR RUNTIME  /  BUILD WITH THE TECHNOLOGY YOU PREFER";labelloc=t;fontsize=13;fontcolor="#B69CFF";color="#59477C";style="rounded";penwidth=1.7;margin=22;
+ declarative [label="DECLARATIVE\nZero-process contributions",color="#6EA8FE",fillcolor="#192B48"];
+ process [label="PROCESS\nExternal apps · JSON-RPC",color="#55D6E8",fillcolor="#17313A"];
+ wasm [label="WASM COMPONENT\nPortable · WIT interface",color="#67D6A3",fillcolor="#17352F"];
+ extism [label="EXTISM / MCP\nPlugin & server ecosystem",color="#FFBE78",fillcolor="#302719"];
+ builtin [label="BUILT-IN RUST\nNative first-party extensions",color="#B69CFF",fillcolor="#29213E"];
+ {rank=same;declarative;process;wasm;} {rank=same;extism;builtin;} declarative -> process -> wasm; extism -> builtin;
+ }
+ subgraph cluster_contributions {label="EXTEND EVERY PART OF THE WORKSPACE";labelloc=t;fontsize=13;fontcolor="#55D6E8";color="#34445F";style="rounded";penwidth=1.5;margin=20;
+ tools [label="TOOLS & SKILLS\nNew agent capabilities",color="#55D6E8"];
+ commands [label="COMMANDS & WORKFLOWS\nAutomate everyday work",color="#67D6A3"];
+ panels [label="PANELS & VIEWS\nCustom workspace experiences",color="#B69CFF"];
+ services [label="LANGUAGE & DATA SERVICES\nIntegrations · storage · hooks",color="#FFBE78"];
+ {rank=same;tools;commands;panels;services;} tools -> commands -> panels -> services;
+ }
+ trust [label="SECURITY BY DESIGN\nManifest & compatibility checks  ·  Managed installation  ·  Capability authorization\nClear trust boundary between extension code and host capabilities",fillcolor="#302719",color="#FFBE78",penwidth=1.8,fontsize=12,width=10.0];
+ hero -> declarative; declarative -> tools; tools -> trust;
 }
