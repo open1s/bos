@@ -347,7 +347,7 @@ pub(super) fn linux_bwrap_plan(
 /// This is a filesystem profile, not a network sandbox: the process protocol
 /// has no host network bridge, so network policy for a process package remains
 /// the capability decision that authorized spawning it.
-fn sandbox_profile(root: &Path, workspace: Option<&Path>, data_root: Option<&Path>) -> String {
+pub(super) fn sandbox_profile(root: &Path, workspace: Option<&Path>, data_root: Option<&Path>) -> String {
     let mut profile = "(version 1)(allow default)(deny file-write*)(allow file-write*".to_string();
     let mut paths: Vec<PathBuf> = vec![
         root.canonicalize().unwrap_or_else(|_| root.to_path_buf()),
@@ -1108,6 +1108,14 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn the_macos_profile_denies_writes_outside_declared_roots() {
+        let profile = sandbox_profile(Path::new("/pkg"), None, None);
+        assert!(profile.contains("(deny file-write*)"));
+        assert!(profile.contains("(subpath \"/pkg\")"));
+        assert!(profile.contains("(subpath \"/tmp\")"));
+    }
 
     #[test]
     fn the_linux_plan_creates_tmpfs_targets_before_binding_temp_roots() {
