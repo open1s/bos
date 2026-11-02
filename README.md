@@ -52,47 +52,21 @@ JavaScript interfaces, or work with agents in BSH—the native GPUI desktop work
 
 ## Architecture
 
-The product is organised into three layers: a shared runtime, developer
-interfaces, and the BSH workspace. The Extension Platform extends BSH; it is
-not a separate runtime or a replacement for the BOS Runtime.
+BOS separates the shared execution core from its developer interfaces and desktop workspace. Rust applications, NBOS and JSBOS use the same native runtime; BSH is a native GPUI application built directly on BOS crates. The Extension Platform extends BSH—it is not a second agent runtime.
 
-```mermaid
-flowchart TB
-    BOS["BOS · Rust-Native AI Agent Platform"]
+<p align="center">
+  <img src="docs/assets/diagrams/bos-architecture.png" alt="BOS architecture: Rust, Python and JavaScript interfaces plus BSH share the BOS Runtime; the BSH Extension Platform extends the desktop workspace." width="100%">
+</p>
 
-    subgraph Interfaces["Developer interfaces"]
-        RUST["Native Rust"]
-        PY["NBOS · Python"]
-        JS["JSBOS · JavaScript / Node.js"]
-    end
+The runtime brings together agent orchestration, tool and skill dispatch, messaging, model adapters and resilience. Configuration, telemetry, memory, capability controls and external integrations provide the supporting foundation.
 
-    subgraph Workspace["Agent workspace"]
-        BSH["BSH · Native GPUI desktop workspace"]
-        EXT["BSH Extension Platform"]
-        EXT --> BSH
-    end
+### Agent execution
 
-    CORE["BOS Runtime · Shared Rust execution core"]
+The ReAct execution loop combines model reasoning with policy-aware tool execution. Tool results are fed back into the session context until the agent returns a final response or reaches its configured execution boundary.
 
-    BOS --> Interfaces
-    BOS --> Workspace
-    RUST --> CORE
-    PY --> CORE
-    JS --> CORE
-    BSH --> CORE
-
-    classDef platform fill:#172554,stroke:#60a5fa,color:#fff
-    classDef runtime fill:#064e3b,stroke:#34d399,color:#fff
-    classDef interface fill:#1f2937,stroke:#9ca3af,color:#fff
-    classDef extension fill:#4a1d64,stroke:#c084fc,color:#fff
-    class BOS platform
-    class CORE runtime
-    class RUST,PY,JS,BSH interface
-    class EXT extension
-```
-
-NBOS and JSBOS expose the shared native implementation through language
-bindings. BSH is a native application that consumes BOS crates directly.
+<p align="center">
+  <img src="docs/assets/diagrams/agent-execution-flow.png" alt="BOS agent execution flow: input, reasoning, decision, tool execution, observation and final response." width="100%">
+</p>
 
 ## Why BOS?
 
@@ -266,6 +240,14 @@ Start here:
 isolation are separate controls. Enforcement differs by operating system and
 runtime. Consult the [extension standard](docs/bsh-extension-standard.md) and
 [security policy](SECURITY.md) for the current contract and limitations.
+
+### Extension package lifecycle
+
+The diagram shows the package path from manifest validation through dependency resolution, immutable installation and runtime activation. Host capability authorization is a separate boundary; operating-system isolation depends on the runtime and platform.
+
+<p align="center">
+  <img src="docs/assets/diagrams/extension-lifecycle.png" alt="BSH extension lifecycle: package, validate, resolve, install, activate, runtime adapters and host capability boundary." width="100%">
+</p>
 
 ## Model configuration
 

@@ -53,46 +53,25 @@
 
 ## 总体架构
 
-BOS 分为共享 Runtime、开发者接口和 BSH 工作空间三个部分。
-Extension Platform 扩展的是 BSH，而不是另建一套 BOS Runtime。
+BOS 将共享执行核心与开发者接口、桌面工作空间分离。Rust 应用、NBOS 和 JSBOS
+使用同一套原生 Runtime；BSH 是直接基于 BOS Crate 构建的 GPUI 原生应用。
+Extension Platform 扩展的是 BSH，而不是另建一套 Agent Runtime。
 
-```mermaid
-flowchart TB
-    BOS["BOS · Rust 原生 AI Agent 平台"]
+<p align="center">
+  <img src="docs/assets/diagrams/bos-architecture.png" alt="BOS 总体架构：Rust、Python、JavaScript 接口和 BSH 共用 BOS Runtime，BSH Extension Platform 扩展桌面工作空间。" width="100%">
+</p>
 
-    subgraph Interfaces["开发者接口"]
-        RUST["Native Rust"]
-        PY["NBOS · Python"]
-        JS["JSBOS · JavaScript / Node.js"]
-    end
+Runtime 集成 Agent 编排、工具与技能分发、消息通信、模型适配和弹性治理。
+配置、遥测、记忆、能力控制及外部集成提供基础支撑。
 
-    subgraph Workspace["Agent 工作空间"]
-        BSH["BSH · 原生 GPUI 桌面工作空间"]
-        EXT["BSH Extension Platform"]
-        EXT --> BSH
-    end
+### Agent 执行流程
 
-    CORE["BOS Runtime · 共享 Rust 执行核心"]
+ReAct 执行循环将模型推理与受策略约束的工具执行结合起来。工具结果会回到会话上下文，
+Agent 持续迭代，直到生成最终响应或达到配置的执行边界。
 
-    BOS --> Interfaces
-    BOS --> Workspace
-    RUST --> CORE
-    PY --> CORE
-    JS --> CORE
-    BSH --> CORE
-
-    classDef platform fill:#172554,stroke:#60a5fa,color:#fff
-    classDef runtime fill:#064e3b,stroke:#34d399,color:#fff
-    classDef interface fill:#1f2937,stroke:#9ca3af,color:#fff
-    classDef extension fill:#4a1d64,stroke:#c084fc,color:#fff
-    class BOS platform
-    class CORE runtime
-    class RUST,PY,JS,BSH interface
-    class EXT extension
-```
-
-NBOS 和 JSBOS 通过语言绑定暴露同一套原生实现；BSH 是直接使用 BOS
-Crate 构建的原生桌面应用。
+<p align="center">
+  <img src="docs/assets/diagrams/agent-execution-flow.png" alt="BOS Agent 执行流程：输入、推理、决策、工具执行、观察反馈和最终响应。" width="100%">
+</p>
 
 ## 为什么选择 BOS？
 
@@ -257,6 +236,15 @@ bsh ext doctor
 **安全说明：**扩展能力授权与操作系统级隔离是不同的控制层。
 实际执行能力因操作系统和扩展运行时而异。当前契约与限制请参阅
 [扩展标准](docs/bsh-extension-standard.md) 和 [安全策略](SECURITY.md)。
+
+### 扩展包生命周期
+
+扩展包从 Manifest 校验开始，经过依赖解析、不可变版本安装和运行时激活。
+宿主能力授权是独立的安全边界；操作系统级隔离能力取决于具体运行时和平台。
+
+<p align="center">
+  <img src="docs/assets/diagrams/extension-lifecycle.png" alt="BSH 扩展生命周期：扩展包、校验、依赖解析、安装、激活、运行时适配器与宿主能力边界。" width="100%">
+</p>
 
 ## 模型配置
 
