@@ -159,7 +159,7 @@ impl Session {
 
     fn close(&mut self) {
         if let Ok(mut child) = self.child.lock() {
-            let _ = child.kill();
+            terminate_child_process_tree(&mut child);
             let _ = child.wait();
         }
     }
@@ -168,10 +168,19 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         if let Ok(mut child) = self.child.lock() {
-            let _ = child.kill();
+            terminate_child_process_tree(&mut child);
             let _ = child.wait();
         }
     }
+}
+
+/// Terminate a child process and the descendants in its dedicated Unix group.
+fn terminate_child_process_tree(child: &mut Child) {
+    #[cfg(unix)]
+    if super::process::terminate_process_group(child.id()) {
+        return;
+    }
+    let _ = child.kill();
 }
 
 /// Terminate one child through the standard-library process handle.
@@ -182,7 +191,7 @@ fn terminate_child_handle(child: &Arc<Mutex<Child>>) {
     let mut child = child
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _ = child.kill();
+    terminate_child_process_tree(&mut child);
 }
 
 /// The state one MCP server package owns.
