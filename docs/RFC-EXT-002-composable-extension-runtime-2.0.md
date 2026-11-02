@@ -148,8 +148,9 @@ The host adapter now has an opt-in Fiber-managed activation path:
 - `PluginRegistry::remove_owner` removes only the contributions whose authoritative owner entry matches the requested extension.
 - `ToolRegistry::remove_async` removes the async tool, schema cache entry and MCP marker together.
 - `Agent::remove_async_tools` invalidates the cached engine/context after revocation.
-- `ContributionLease` records the tool names and extension owner for one Agent build.
-- A lease can attach its liveness guard to a Fiber. Disposing the Fiber blocks new calls even if an older tool handle was retained by a cached caller.
+- `ContributionLease` records tool names, prompt sections, exact skill manifest paths and the extension owner for one Agent build.
+- A lease attaches its liveness guard to a Fiber. Disposing the Fiber blocks new calls even if an older tool handle was retained by a cached caller.
+- Revocation removes async tools and their schema/MCP metadata, owner-scoped commands/panels, exact prompt sections and skills by manifest path; engine/context caches are invalidated when Agent state changes.
 - `ExtensionHost::apply_with_fibers` returns explicit activation handles; callers must retain them and call `AppliedExtension::unload`.
 
-Prompt/context text and skills are currently immutable Agent-build snapshot contributions. They are not independently removed by a lease; the owning Agent build must be discarded after unload if those contribution types were installed. The legacy `apply` method remains for compatibility and does not yet expose activation handles. Wiring every production Agent construction path to `apply_with_fibers` is a separate integration step and must be verified against the current call sites before the legacy path is retired.
+The legacy `apply` method remains for compatibility and does not expose activation handles. The production Agent construction path still calls that legacy method; migration to retain `AppliedExtension` handles is a separate integration step. In-flight calls are not drained or forcibly cancelled by revocation: unload blocks new calls, while calls already admitted may finish.
