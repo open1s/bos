@@ -195,32 +195,42 @@ impl EventDispatcher {
         Ok(self.on(name, DispatchMode::Waterfall, order, handler))
     }
 
-    /// Dispatch in observe mode.
+    /// Dispatch only listeners registered for observe mode.
     pub(crate) fn emit(&self, name: &str, payload: Value) {
-        for listener in self.snapshot(name) {
+        for listener in self.snapshot(name, DispatchMode::Emit) {
             let chain = self.chain_for(&listener, 1);
             let _ = (listener.handler)(payload.clone(), chain);
         }
     }
 
-    /// Dispatch in parallel-observer mode (synchronous fan-out).
+    /// Dispatch only parallel-observer listeners.
+    ///
+    /// This in-process adapter currently performs synchronous fan-out because
+    /// handlers are synchronous Rust closures; it does not provide async
+    /// concurrency. The mode remains isolated from ordinary emit listeners.
     pub(crate) fn parallel(&self, name: &str, payload: Value) {
-        self.emit(name, payload);
+        for listener in self.snapshot(name, DispatchMode::Parallel) {
+            let chain = self.chain_for(&listener, 1);
+            let _ = (listener.handler)(payload.clone(), chain);
+        }
     }
 
-    /// Dispatch in order, stopping at the first non-None result.
+    /// Dispatch serial listeners in registration order until one bails.
+    ///
+    /// Async waiting is not available in this synchronous Rust adapter, so
+    /// serial currently has the same execution timing as bail.
     pub(crate) fn serial(&self, name: &str, payload: Value) -> Option<Value> {
-        self.first_value(name, payload)
+        self.first_value(name, DispatchMode::Serial, payload)
     }
 
-    /// Dispatch in order, stopping at the first non-None result.
+    /// Dispatch synchronous bail listeners in registration order.
     pub(crate) fn bail(&self, name: &str, payload: Value) -> Option<Value> {
-        self.first_value(name, payload)
+        self.first_value(name, DispatchMode::Bail, payload)
     }
 
     /// Dispatch as an around-middleware chain.
     pub(crate) fn waterfall(&self, name: &str, payload: Value) -> Option<Value> {
-        let listeners = self.snapshot(name);
+        let listeners = self.snapshot(name, DispatchMode::Waterfall);
         let chain = Chain {
             listeners: Arc::new(listeners),
             index: 0,
@@ -229,11 +239,18 @@ impl EventDispatcher {
         chain.next(payload)
     }
 
-    fn first_value(&self, name: &str, payload: Value) -> Option<Value> {
-        for listener in self.snapshot(name) {
+    fn first_value(
+        &self,
+        name: &str,
+        mode: DispatchMode,
+        payload: Value,
+    ) -> Option<Value> {
+        for listener in self.snapshot(name, mode) {
             let chain = self.chain_for(&listener, 1);
             if let Some(value) = (listener.handler)(payload.clone(), chain) {
-                return Some(value);
+                if is_bail_value(&value) {
+                    return Some(value);
+                }
             }
         }
         None
@@ -247,13 +264,16 @@ impl EventDispatcher {
         }
     }
 
-    fn snapshot(&self, name: &str) -> Vec<RegisteredListener> {
+    fn snapshot(&self, name: &str, mode: DispatchMode) -> Vec<RegisteredListener> {
         self.inner
             .listeners
             .read()
             .ok()
             .and_then(|listeners| listeners.get(name).cloned())
             .unwrap_or_default()
+            .into_iter()
+            .filter(|listener| listener.mode == mode)
+            .collect()
     }
 
     /// Number of listeners for one event.
@@ -265,6 +285,11 @@ impl EventDispatcher {
             .and_then(|listeners| listeners.get(name).map(Vec::len))
             .unwrap_or(0)
     }
+}
+
+/// Cordis treats null, false and undefined as "continue" values.
+fn is_bail_value(value: &Value) -> bool {
+    !value.is_null() && value != &Value::Bool(false)
 }
 
 /// Dropping a subscription removes its listener.
@@ -335,6 +360,89 @@ mod tests {
             })
             .expect("allowed");
         assert_eq!(allowed.listener_count("tool.before"), 1);
+    }
+
+    #[test]
+    fn dispatch_methods_only_invoke_their_registered_mode() {
+        let dispatcher = EventDispatcher::new();
+        let calls = Arc::new(RwLock::new(Vec::new()));
+        let mut subscriptions = Vec::new();
+
+        for (mode, label) in [
+            (DispatchMode::Emit, "emit"),
+            (DispatchMode::Parallel, "parallel"),
+            (DispatchMode::Serial, "serial"),
+            (DispatchMode::Bail, "bail"),
+            (DispatchMode::Waterfall, "waterfall"),
+        ] {
+            let calls = Arc::clone(&calls);
+            subscriptions.push(dispatcher.on(
+                "modes",
+                mode,
+                0,
+                move |value, next| {
+                    calls.write().unwrap().push(label);
+                    if mode == DispatchMode::Waterfall {
+                        next.next(value)
+                    } else if mode == DispatchMode::Serial || mode == DispatchMode::Bail {
+                        Some(Value::Null)
+                    } else {
+                        None
+                    }
+                },
+            ));
+        }
+
+        dispatcher.emit("modes", json!({}));
+        assert_eq!(*calls.read().unwrap(), vec!["emit"]);
+        calls.write().unwrap().clear();
+
+        dispatcher.parallel("modes", json!({}));
+        assert_eq!(*calls.read().unwrap(), vec!["parallel"]);
+        calls.write().unwrap().clear();
+
+        dispatcher.serial("modes", json!({}));
+        assert_eq!(*calls.read().unwrap(), vec!["serial"]);
+        calls.write().unwrap().clear();
+
+        dispatcher.bail("modes", json!({}));
+        assert_eq!(*calls.read().unwrap(), vec!["bail"]);
+        calls.write().unwrap().clear();
+
+        dispatcher.waterfall("modes", json!({}));
+        assert_eq!(*calls.read().unwrap(), vec!["waterfall"]);
+    }
+
+    #[test]
+    fn bail_and_serial_continue_after_null_or_false() {
+        for mode in [DispatchMode::Serial, DispatchMode::Bail] {
+            let dispatcher = EventDispatcher::new();
+            let calls = Arc::new(AtomicU64::new(0));
+
+            let first = Arc::clone(&calls);
+            let _a = dispatcher.on("decision", mode, 0, move |_value, _chain| {
+                first.fetch_add(1, Ordering::SeqCst);
+                Some(json!(false))
+            });
+            let second = Arc::clone(&calls);
+            let _b = dispatcher.on("decision", mode, 1, move |_value, _chain| {
+                second.fetch_add(1, Ordering::SeqCst);
+                Some(json!(null))
+            });
+            let third = Arc::clone(&calls);
+            let _c = dispatcher.on("decision", mode, 2, move |_value, _chain| {
+                third.fetch_add(1, Ordering::SeqCst);
+                Some(json!("accepted"))
+            });
+
+            let result = if mode == DispatchMode::Serial {
+                dispatcher.serial("decision", json!({}))
+            } else {
+                dispatcher.bail("decision", json!({}))
+            };
+            assert_eq!(result, Some(json!("accepted")));
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
+        }
     }
 
     #[test]
