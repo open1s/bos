@@ -1,0 +1,16 @@
+digraph ExtensionLifecycle {
+  graph [bgcolor="#0B1020", pad="0.35", rankdir=TB, nodesep="0.3", ranksep="0.42", splines=polyline, fontname="DejaVu Sans", label="BSH EXTENSION PLATFORM  /  PACKAGE LIFECYCLE", labelloc=t, fontsize=25, fontcolor="#F3F6FC"];
+  node [shape=box, style="rounded,filled", fontname="DejaVu Sans", fontsize=13, margin="0.2,0.15", color="#3B506F", fillcolor="#17243A", fontcolor="#F3F6FC", penwidth=1.7];
+  edge [color="#536987", penwidth=1.8, arrowsize=0.8];
+  package [label="PACKAGE\nextension.toml\nfiles + runtime type", color="#6EA8FE"];
+  validate [label="VALIDATE\nschema + content\nhash + compatibility", color="#55D6E8"];
+  resolve [label="RESOLVE\ndependencies\nversion constraints", color="#B69CFF"];
+  install [label="INSTALL\nstaging → managed\nimmutable version", color="#67D6A3"];
+  activate [label="ACTIVATE\nruntime adapter\nregister contributions", color="#FFBE78"];
+  package -> validate -> resolve -> install -> activate;
+  runtimes [shape=box, label="RUNTIME ADAPTERS\nDeclarative  ·  Process / JSON-RPC\nWASM Component  ·  Extism  ·  MCP  ·  Built-in Rust", fillcolor="#121B2E", color="#536987", fontsize=12];
+  host [shape=box, label="HOST BOUNDARY\nCapability request → policy decision → host API\nAudit decisions · isolate where supported", fillcolor="#241C3B", color="#B69CFF", fontsize=12, penwidth=2.1];
+  activate -> runtimes -> host;
+  note [shape=note, label="SECURITY IS LAYERED\nCapability authorization and OS-level isolation are separate controls.\nEnforcement varies by runtime and operating system.", fillcolor="#121B2E", color="#536987", fontsize=11];
+  host -> note [style=dashed, arrowhead=none];
+}
