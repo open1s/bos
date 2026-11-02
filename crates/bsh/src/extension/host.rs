@@ -389,6 +389,14 @@ impl AppliedExtension {
     where
         T: std::any::Any + Send + Sync,
     {
+        // AppliedExtension is owned by one Agent build. Its Fiber cannot own a
+        // Host-, Workspace- or Session-lifetime registration: dropping this
+        // build would revoke a service still used by other builds. Until those
+        // scopes have dedicated lifecycle owners, fail closed and permit only
+        // this extension's private scope.
+        if !service_scope_is_activation_owned(&scope, &self.extension_id) {
+            return None;
+        }
         if !self.service_provides.iter().any(|declaration| {
             declaration.name == name
                 && service_scope_matches(
@@ -453,9 +461,30 @@ impl AppliedExtension {
 
 #[cfg(test)]
 mod service_scope_tests {
-    use super::service_scope_matches;
+    use super::{service_scope_is_activation_owned, service_scope_matches};
     use super::super::composable::Scope;
     use super::super::manifest::ServiceScope;
+
+    #[test]
+    fn build_activation_can_own_only_its_private_extension_scope() {
+        assert!(service_scope_is_activation_owned(
+            &Scope::Extension("ext".into()),
+            "ext",
+        ));
+        assert!(!service_scope_is_activation_owned(
+            &Scope::Extension("other".into()),
+            "ext",
+        ));
+        assert!(!service_scope_is_activation_owned(&Scope::Host, "ext"));
+        assert!(!service_scope_is_activation_owned(
+            &Scope::Workspace("/repo".into()),
+            "ext",
+        ));
+        assert!(!service_scope_is_activation_owned(
+            &Scope::Session("session-1".into()),
+            "ext",
+        ));
+    }
 
     #[test]
     fn declared_service_scope_is_enforced() {
@@ -492,6 +521,17 @@ mod service_scope_tests {
         ));
         assert!(!service_scope_matches(&ServiceScope::Host, &Scope::Session("s".into()), "ext", "/repo"));
     }
+}
+
+/// Whether a scope's lifetime is no longer than one AppliedExtension Fiber.
+fn service_scope_is_activation_owned(
+    requested: &super::composable::Scope,
+    extension_id: &str,
+) -> bool {
+    matches!(
+        requested,
+        super::composable::Scope::Extension(id) if id == extension_id
+    )
 }
 
 fn service_scope_matches(
