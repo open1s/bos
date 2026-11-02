@@ -1902,8 +1902,8 @@ impl AppState {
         // it never answered for are put back here: an aborted turn never
         // delivered them, and the next turn is seeded from the store.
         self.steer_mailboxes.remove(id);
-        self.turn_agents.remove(id);
         self.turn_extension_activations.remove(id);
+        self.turn_agents.remove(id);
         self.restore_orphan_steers(id);
         let stopped = now_ms();
         if let Some(session) = self.store.session_mut(id) {
@@ -3399,8 +3399,8 @@ impl AppState {
             // The turn is over: nothing may steer it any more, and a steering
             // row it never answered for goes back to the queue.
             self.steer_mailboxes.remove(id);
-            self.turn_agents.remove(id);
             self.turn_extension_activations.remove(id);
+            self.turn_agents.remove(id);
             self.restore_orphan_steers(id);
             self.turn_started = None;
             self.refresh_policy_audit();
@@ -3478,6 +3478,7 @@ impl AppState {
         self.runner.stop(id);
         self.streams.remove(id);
         self.steer_mailboxes.remove(id);
+        self.turn_extension_activations.remove(id);
         self.turn_agents.remove(id);
         self.restore_orphan_steers(id);
         if let Some(session) = self.store.session_mut(id) {
