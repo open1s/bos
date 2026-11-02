@@ -943,6 +943,7 @@ fn build_agent_for_session_inner(
         settings,
         root.as_deref(),
         eff.preset_extensions.as_deref(),
+        session,
     );
     plugins.extend(
         extension_activations
