@@ -789,6 +789,29 @@ mod tests {
         assert!(!registry.contains::<u64>(&scope, "clock"));
     }
 
+    #[test]
+    fn concurrent_provider_replacements_publish_monotonic_generations() {
+        let registry = Arc::new(ServiceRegistry::new());
+        let mut workers = Vec::new();
+        for value in 0..8_u64 {
+            let registry = Arc::clone(&registry);
+            workers.push(std::thread::spawn(move || {
+                registry.provide(Scope::Host, "clock", Arc::new(value))
+            }));
+        }
+        let tokens: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("provider thread"))
+            .collect();
+        let newest = tokens
+            .iter()
+            .map(|token| token.generation)
+            .max()
+            .expect("at least one provider");
+        let current = registry.acquire::<u64>(&Scope::Host, "clock").unwrap();
+        assert_eq!(current.generation(), newest);
+    }
+
     #[tokio::test]
     async fn replacement_keeps_old_generation_alive_until_leases_drain() {
         let registry = ServiceRegistry::new();
