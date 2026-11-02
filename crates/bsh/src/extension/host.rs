@@ -381,7 +381,7 @@ impl AppliedExtension {
     /// Publish a typed value only when this extension declared the matching
     /// service name and visibility scope in its manifest.
     pub(crate) fn provide_service<T>(
-        &self,
+        &mut self,
         scope: super::composable::Scope,
         name: &str,
         service: Arc<T>,
