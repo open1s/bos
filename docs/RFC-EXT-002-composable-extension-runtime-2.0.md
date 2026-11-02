@@ -150,6 +150,7 @@ A failed plan is rejected before activation. Patch application must be transacti
 - Agent cache invalidation is part of tool, prompt and skill removal.
 - The production host rebuild now runs `plan_service_dependencies()` on the concrete package set selected by the SemVer resolver, before capability authorization and activation. Required service contracts add provider-before-consumer edges; missing providers, duplicate shared-scope providers, incompatible required versions and cycles prevent the resolved activation set from starting.
 - Extension-scoped service declarations are private to their declaring extension in the contract planner. Optional requirements tolerate both missing and version-incompatible providers; they do not create activation edges.
+- `AppliedExtension` now exposes manifest-gated typed `provide_service()` and `acquire_service()` adapters. Providers register through `provide_owned()` on their Fiber; consumers receive a `ServiceLease<T>` only for a declared name/scope requirement. Service-only extensions are retained as activations so their service contracts are not silently skipped.
 
 ### Not yet complete / not yet verified
 
