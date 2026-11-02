@@ -111,7 +111,7 @@ A failed plan is rejected before activation. Patch application must be transacti
 | Slice | Deliverable | Exit criteria |
 |---|---|---|
 | 2.0-A | Scoped service registry, dependency graph, Fiber, EffectSet | Unit tests for scope isolation, replacement safety, missing/cyclic dependencies, legal transitions, reverse/idempotent cleanup |
-| 2.0-B | Host adapter and effect ownership | Async tools, commands and panels have owner-scoped revocation; Fiber disposal disables retained tool handles |
+| 2.0-B | Host adapter and effect ownership | Tools, commands, panels, prompt sections and skills have owner-scoped revocation; Fiber disposal disables retained tool handles |
 | 2.0-C | Service availability and dependency reconciliation | Provider replacement/unavailability safely suspends or reloads dependents; in-flight generation is stable |
 | 2.0-D | Event engine | Parallel/serial/waterfall semantics, ordering, timeout and cancellation tests |
 | 2.0-E | Profile/bundle/patch composition | Deterministic, transactional composition with conflict diagnostics |
