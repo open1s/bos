@@ -28,6 +28,7 @@ mod agent;
 pub(crate) mod capability;
 mod cli;
 mod config;
+pub(crate) mod composable;
 #[cfg(test)]
 mod e2e;
 mod events;
