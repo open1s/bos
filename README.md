@@ -221,11 +221,11 @@ desktop workspace.** It is built with GPUI and the BOS Runtime.
 
 | Main workspace | Agent session |
 |---|---|
-| ![BSH workspace placeholder](docs/assets/bsh-showcase/workspace.svg) | ![BSH agent session placeholder](docs/assets/bsh-showcase/agent-session.svg) |
+| ![BSH workspace placeholder](docs/assets/bsh-showcase/workspace.png) | ![BSH agent session placeholder](docs/assets/bsh-showcase/agent-session.png) |
 
 | Extension manager | Model and settings |
 |---|---|
-| ![BSH extension manager placeholder](docs/assets/bsh-showcase/extensions.svg) | ![BSH settings placeholder](docs/assets/bsh-showcase/settings.svg) |
+| ![BSH extension manager placeholder](docs/assets/bsh-showcase/extensions.png) | ![BSH settings placeholder](docs/assets/bsh-showcase/settings.png) |
 
 Replacement instructions: [BSH screenshot guide](docs/assets/bsh-showcase/README.md).
 

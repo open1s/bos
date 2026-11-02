@@ -214,11 +214,11 @@ Linux 构建依赖见 [Rust workflow](.github/workflows/rust.yml)。
 
 | 主工作空间 | Agent 会话 |
 |---|---|
-| ![BSH 工作空间占位图](docs/assets/bsh-showcase/workspace.svg) | ![BSH Agent 会话占位图](docs/assets/bsh-showcase/agent-session.svg) |
+| ![BSH 工作空间占位图](docs/assets/bsh-showcase/workspace.png) | ![BSH Agent 会话占位图](docs/assets/bsh-showcase/agent-session.png) |
 
 | 扩展管理器 | 模型与设置 |
 |---|---|
-| ![BSH 扩展管理器占位图](docs/assets/bsh-showcase/extensions.svg) | ![BSH 设置占位图](docs/assets/bsh-showcase/settings.svg) |
+| ![BSH 扩展管理器占位图](docs/assets/bsh-showcase/extensions.png) | ![BSH 设置占位图](docs/assets/bsh-showcase/settings.png) |
 
 替换要求：[BSH 截图替换指南](docs/assets/bsh-showcase/README.md)。
 
