@@ -643,13 +643,40 @@ impl Agent {
             return;
         }
         if !self.config.system_prompt.is_empty() {
-            self.config.system_prompt.push_str(
-                "
-
-",
-            );
+            self.config.system_prompt.push_str("\n\n");
         }
         self.config.system_prompt.push_str(section);
+    }
+
+    /// Remove one exact section previously appended to the system prompt.
+    /// This is used by extension contribution leases.
+    pub fn remove_system_prompt_section(&mut self, section: &str) -> bool {
+        let section = section.trim();
+        if section.is_empty() {
+            return false;
+        }
+        let prompt = &self.config.system_prompt;
+        let Some(start) = prompt.find(section) else {
+            return false;
+        };
+        let end = start + section.len();
+        let before = &prompt[..start];
+        let after = &prompt[end..];
+        if !before.is_empty() && !before.ends_with("\n\n") {
+            return false;
+        }
+        if !after.is_empty() && !after.starts_with("\n\n") {
+            return false;
+        }
+        let (remove_start, remove_end) = if before.is_empty() {
+            (start, end + if after.starts_with("\n\n") { 2 } else { 0 })
+        } else {
+            (start - 2, end)
+        };
+        self.config.system_prompt.replace_range(remove_start..remove_end, "");
+        self.engine_cache.lock().unwrap().take();
+        self.context_cache.lock().unwrap().take();
+        true
     }
 
     /// Get tool registry.
@@ -973,6 +1000,21 @@ impl Agent {
     /// catalogue.
     pub fn skills(&self) -> &[crate::skills::SkillContent] {
         &self.skills
+    }
+
+    /// Remove skills by their exact manifest paths.
+    pub fn remove_skills_by_paths(&mut self, paths: &[std::path::PathBuf]) -> usize {
+        if paths.is_empty() {
+            return 0;
+        }
+        let before = self.skills.len();
+        self.skills.retain(|skill| !paths.contains(&skill.metadata.path));
+        let removed = before - self.skills.len();
+        if removed > 0 {
+            self.engine_cache.lock().unwrap().take();
+            self.context_cache.lock().unwrap().take();
+        }
+        removed
     }
 
     /// Register one skill that is already loaded.
