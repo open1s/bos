@@ -384,44 +384,71 @@ pub(super) fn sandbox_profile(
 
 /// The child-side hook that installs the manifest's resource ceilings.
 ///
-/// RLIMIT_AS bounds the address space, RLIMIT_CPU is the wall-independent CPU
-/// backstop behind the host's own wall-clock timeout, and RLIMIT_NOFILE keeps a
-/// package from exhausting the process's descriptor table. Failures are
-/// ignored: a platform that refuses a limit still gets the host-side timeout.
+/// RLIMIT_AS bounds virtual address space (not RSS), RLIMIT_CPU is the
+/// wall-independent CPU backstop behind the host's wall-clock timeout, and
+/// RLIMIT_NOFILE limits descriptor exhaustion. Every requested limit and the
+/// process-group setup are mandatory: a failure aborts exec rather than
+/// launching a child with weaker-than-requested restrictions.
 ///
 /// The host builds two kinds of command - tokio's for the process runtime and
 /// the standard library's for the MCP client - and `pre_exec` is spelled the
 /// same on both but they are unrelated types. The closures therefore live here
 /// once, and each caller registers one on its own command.
 #[cfg(unix)]
+type SetRlimit = unsafe extern "C" fn(libc::c_int, *const libc::rlimit) -> libc::c_int;
+
+#[cfg(unix)]
+type SetPgid = unsafe extern "C" fn(libc::pid_t, libc::pid_t) -> libc::c_int;
+
+#[cfg(unix)]
+unsafe fn apply_unix_limits(
+    memory: u64,
+    cpu: u64,
+    setrlimit: SetRlimit,
+    setpgid: SetPgid,
+) -> std::io::Result<()> {
+    let memory = memory.max(16 * 1024 * 1024) as libc::rlim_t;
+    let address = libc::rlimit {
+        rlim_cur: memory,
+        rlim_max: memory,
+    };
+    if unsafe { setrlimit(libc::RLIMIT_AS, &address) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let cpu = cpu.max(1) as libc::rlim_t;
+    let cpu_limit = libc::rlimit {
+        rlim_cur: cpu,
+        rlim_max: cpu,
+    };
+    if unsafe { setrlimit(libc::RLIMIT_CPU, &cpu_limit) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let descriptors = libc::rlimit {
+        rlim_cur: 256,
+        rlim_max: 256,
+    };
+    if unsafe { setrlimit(libc::RLIMIT_NOFILE, &descriptors) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    if unsafe { setpgid(0, 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
 fn rlimit_hook(
     memory: u64,
     cpu: u64,
 ) -> impl FnMut() -> std::io::Result<()> + Send + Sync + 'static {
     move || {
-        // SAFETY: pre_exec runs in the forked child before exec. The closure
+        // SAFETY: pre_exec runs in the forked child before exec. The helper
         // only calls async-signal-safe setrlimit/setpgid and captures integers.
-        unsafe {
-            let memory = memory.max(16 * 1024 * 1024) as libc::rlim_t;
-            let address = libc::rlimit {
-                rlim_cur: memory,
-                rlim_max: memory,
-            };
-            let _ = libc::setrlimit(libc::RLIMIT_AS, &address);
-            let cpu = cpu.max(1) as libc::rlim_t;
-            let cpu_limit = libc::rlimit {
-                rlim_cur: cpu,
-                rlim_max: cpu,
-            };
-            let _ = libc::setrlimit(libc::RLIMIT_CPU, &cpu_limit);
-            let descriptors = libc::rlimit {
-                rlim_cur: 256,
-                rlim_max: 256,
-            };
-            let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &descriptors);
-            let _ = libc::setpgid(0, 0);
-        }
-        Ok(())
+        unsafe { apply_unix_limits(memory, cpu, libc::setrlimit, libc::setpgid) }
     }
 }
 
@@ -1112,6 +1139,88 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+    #[cfg(unix)]
+    unsafe extern "C" fn test_setrlimit_ok(
+        _resource: libc::c_int,
+        _limit: *const libc::rlimit,
+    ) -> libc::c_int {
+        0
+    }
+
+    #[cfg(unix)]
+    unsafe extern "C" fn test_setrlimit_fail(
+        _resource: libc::c_int,
+        _limit: *const libc::rlimit,
+    ) -> libc::c_int {
+        -1
+    }
+    #[cfg(unix)]
+    unsafe extern "C" fn test_setrlimit_fail_cpu(
+        resource: libc::c_int,
+        _limit: *const libc::rlimit,
+    ) -> libc::c_int {
+        if resource == libc::RLIMIT_CPU { -1 } else { 0 }
+    }
+
+    #[cfg(unix)]
+    unsafe extern "C" fn test_setrlimit_fail_nofile(
+        resource: libc::c_int,
+        _limit: *const libc::rlimit,
+    ) -> libc::c_int {
+        if resource == libc::RLIMIT_NOFILE { -1 } else { 0 }
+    }
+
+    #[cfg(unix)]
+    unsafe extern "C" fn test_setpgid_ok(
+        _pid: libc::pid_t,
+        _pgid: libc::pid_t,
+    ) -> libc::c_int {
+        0
+    }
+
+    #[cfg(unix)]
+    unsafe extern "C" fn test_setpgid_fail(
+        _pid: libc::pid_t,
+        _pgid: libc::pid_t,
+    ) -> libc::c_int {
+        -1
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_resource_limit_setup_fails_closed() {
+        let limit_failure = unsafe {
+            apply_unix_limits(64 * 1024 * 1024, 10, test_setrlimit_fail, test_setpgid_ok)
+        };
+        assert!(limit_failure.is_err(), "failed setrlimit must abort spawn");
+
+        let cpu_failure = unsafe {
+            apply_unix_limits(64 * 1024 * 1024, 10, test_setrlimit_fail_cpu, test_setpgid_ok)
+        };
+        assert!(cpu_failure.is_err(), "failed RLIMIT_CPU must abort spawn");
+
+        let nofile_failure = unsafe {
+            apply_unix_limits(64 * 1024 * 1024, 10, test_setrlimit_fail_nofile, test_setpgid_ok)
+        };
+        assert!(
+            nofile_failure.is_err(),
+            "failed RLIMIT_NOFILE must abort spawn"
+        );
+
+        let process_group_failure = unsafe {
+            apply_unix_limits(64 * 1024 * 1024, 10, test_setrlimit_ok, test_setpgid_fail)
+        };
+        assert!(
+            process_group_failure.is_err(),
+            "failed process-group setup must abort spawn"
+        );
+
+        let success = unsafe {
+            apply_unix_limits(64 * 1024 * 1024, 10, test_setrlimit_ok, test_setpgid_ok)
+        };
+        assert!(success.is_ok());
+    }
 
     #[test]
     fn the_macos_profile_denies_writes_outside_declared_roots() {
