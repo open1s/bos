@@ -1,0 +1,46 @@
+name: Render documentation diagrams
+
+on:
+  push:
+    paths:
+      - "docs/diagrams/*.dot"
+      - ".github/workflows/render-doc-diagrams.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: render-doc-diagrams-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Graphviz
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes graphviz
+
+      - name: Render PNG assets
+        run: |
+          mkdir -p docs/assets/diagrams
+          for source in docs/diagrams/*.dot; do
+            name="$(basename "${source%.dot}")"
+            dot -Tpng -Gdpi=130 "$source" -o "docs/assets/diagrams/$name.png"
+          done
+
+      - name: Commit generated images
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/assets/diagrams/*.png
+          if ! git diff --cached --quiet; then
+            git commit -m "docs: render architecture diagrams"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
