@@ -213,11 +213,14 @@ struct McpCore {
     /// synchronous session exchange mutex. Child::kill is portable across OSes.
     child: Mutex<Option<Arc<Mutex<Child>>>>,
     cancelled: AtomicBool,
+    stopped: AtomicBool,
 }
 
 /// The MCP runtime for one server package.
 pub(crate) struct McpRuntime {
     core: Arc<McpCore>,
+    /// Serializes calls so one invocation cannot reset another's cancellation.
+    call_gate: tokio::sync::Mutex<()>,
 }
 
 struct Catalog {
@@ -253,6 +256,7 @@ impl McpRuntime {
                 events,
                 subscription,
             )?),
+            call_gate: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -270,6 +274,14 @@ impl McpRuntime {
     pub(crate) fn stop(&self) {
         self.core.cancelled.store(true, Ordering::SeqCst);
         self.core.kill_child();
+    }
+
+    fn ensure_running(&self) -> Result<(), ExtensionError> {
+        if self.stopped.load(Ordering::SeqCst) {
+            Err(self.cancellation_error())
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -322,6 +334,7 @@ impl McpCore {
             session: Mutex::new(None),
             child: Mutex::new(None),
             cancelled: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
         })
     }
 
@@ -347,6 +360,7 @@ impl McpCore {
     }
 
     fn catalog(&self) -> Result<std::sync::MutexGuard<'_, Option<Catalog>>, ExtensionError> {
+        self.ensure_running()?;
         let mut catalog = self.catalog.lock().map_err(|_| ExtensionError::Corrupt {
             path: self.root.clone(),
             message: "MCP catalog lock is poisoned".to_string(),
@@ -394,6 +408,7 @@ impl McpCore {
     }
 
     fn start(&self) -> Result<Session, ExtensionError> {
+        self.ensure_running()?;
         let program = if is_allowlisted_command(&self.entry) {
             PathBuf::from(&self.entry)
         } else {
@@ -758,7 +773,7 @@ impl McpCore {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             *slot = Some(Arc::clone(&child));
         }
-        if self.cancelled.load(Ordering::SeqCst) {
+        if self.stopped.load(Ordering::SeqCst) || self.cancelled.load(Ordering::SeqCst) {
             terminate_child_handle(&child);
             if let Ok(mut process) = child.lock() {
                 let _ = process.wait();
@@ -938,6 +953,11 @@ impl Runtime for McpRuntime {
     }
 
     async fn shutdown(&self) -> Result<(), ExtensionError> {
+        self.core.stopped.store(true, Ordering::SeqCst);
+        self.stop();
+        // Wait for an active blocking exchange to observe cancellation before
+        // closing and clearing its session. New calls fail after taking this gate.
+        let _gate = self.call_gate.lock().await;
         self.deactivate().await
     }
 
@@ -1005,9 +1025,11 @@ impl McpRuntime {
         context: &CallContext,
         progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
     ) -> Result<Value, ExtensionError> {
+        let _gate = self.call_gate.lock().await;
+        self.core.ensure_running()?;
         let deadline = context.timeout_ms.max(1).min(self.core.max_execution_ms);
-        // Reset synchronously before the worker is queued. A Stop arriving
-        // after this point must remain visible to the worker and spawn path.
+        // Reset only after this invocation owns the gate. A queued call can
+        // therefore never clear cancellation for the active invocation.
         self.core.cancelled.store(false, Ordering::SeqCst);
         let core = Arc::clone(&self.core);
         let name = name.to_string();
