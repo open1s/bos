@@ -440,8 +440,17 @@ impl InterceptorPolicy for PolicyInterceptor {
             path: self.workspace.clone(),
             ..CallScope::default()
         };
+        // A host-wide policy has no activation-bound owner. In that case,
+        // authorize and audit the principal supplied by the registration path.
+        // An activation-bound policy continues to use its pinned owner after
+        // the equality check above.
+        let principal = if self.owner.is_empty() {
+            owner
+        } else {
+            self.owner.as_str()
+        };
         self.policy
-            .authorize_call(&self.owner, self.trust, Capability::AgentIntercept, &scope)
+            .authorize_call(principal, self.trust, Capability::AgentIntercept, &scope)
             .map(|_| ())
             .map_err(|error| error.to_string())
     }
@@ -3697,6 +3706,47 @@ tools = ["echo"]
         assert!(interceptor
             .authorize("com.example.interceptor", "tool.before")
             .is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn global_interceptor_policy_uses_the_requesting_owner() {
+        let root = scratch("global-interceptor-owner");
+        let policy = Arc::new(
+            PolicyEngine::open(
+                root.join("grants.toml"),
+                root.join("audit.jsonl"),
+                PolicyMode::Enforce,
+            )
+            .expect("policy"),
+        );
+        let interceptor = PolicyInterceptor {
+            policy: Arc::clone(&policy),
+            owner: String::new(),
+            trust: TrustLevel::Community,
+            workspace: Some(root.clone()),
+        };
+
+        assert!(interceptor
+            .authorize("com.example.requester", "tool.before")
+            .is_err());
+        policy
+            .grant(
+                "com.example.requester",
+                Capability::AgentIntercept,
+                GrantScope::Any,
+                None,
+            )
+            .expect("grant");
+        assert!(interceptor
+            .authorize("com.example.requester", "tool.before")
+            .is_ok());
+
+        let audit = std::fs::read_to_string(root.join("audit.jsonl")).unwrap_or_default();
+        assert!(
+            audit.contains("com.example.requester"),
+            "audit must attribute the request to its actual owner: {audit}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
