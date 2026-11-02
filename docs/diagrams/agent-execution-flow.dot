@@ -1,25 +1,50 @@
-digraph AgentCapabilities {
- graph [bgcolor="#0B1020",pad="0.55",rankdir=TB,nodesep="0.38",ranksep="0.52",splines=none,newrank=true,outputorder=edgesfirst,fontname="DejaVu Sans",label="BOS AGENT ENGINE  /  INTELLIGENCE THAT GETS THINGS DONE",labelloc=t,fontsize=25,fontcolor="#F3F6FC"];
- node [shape=box,style="rounded,filled",fontname="DejaVu Sans",fontsize=12,margin="0.28,0.22",color="#405575",fillcolor="#17243A",fontcolor="#F3F6FC",penwidth=1.5];
- edge [style=invis,weight=30];
- hero [label="FROM NATURAL LANGUAGE TO REAL-WORLD ACTION\nUnderstand  ·  Reason  ·  Coordinate  ·  Execute  ·  Learn",fontsize=17,width=10.0,height=1.0,fillcolor="#172F46",color="#55D6E8",penwidth=2.4];
- subgraph cluster_intelligence {label="INTELLIGENCE";labelloc=t;fontsize=13;fontcolor="#B69CFF";color="#59477C";style="rounded";penwidth=1.5;margin=20;
- reasoning [label="REASONING & PLANNING\nReAct · multi-step decisions",color="#B69CFF",fillcolor="#29213E"];
- context [label="CONTEXT AWARENESS\nSessions · memory · skills",color="#6EA8FE",fillcolor="#192B48"];
- coordination [label="AGENT COORDINATION\nDelegation · collaboration",color="#55D6E8",fillcolor="#17313A"];
- {rank=same;reasoning;context;coordination;} reasoning -> context -> coordination;
- }
- subgraph cluster_execution {label="EXECUTION";labelloc=t;fontsize=13;fontcolor="#67D6A3";color="#398B7B";style="rounded";penwidth=1.5;margin=20;
- models [label="MODEL CONNECTIVITY\nProviders · streaming · fallback",color="#B69CFF"];
- tools [label="TOOL & SKILL ECOSYSTEM\nNative tools · MCP · extensions",color="#55D6E8"];
- events [label="EVENT-DRIVEN RUNTIME\nPub/Sub · query · RPC",color="#FFBE78"];
- {rank=same;models;tools;events;} models -> tools -> events;
- }
- subgraph cluster_control {label="TRUST  ·  RELIABILITY  ·  VISIBILITY";labelloc=t;fontsize=13;fontcolor="#FFBE78";color="#66543A";style="rounded";penwidth=1.5;margin=20;
- security [label="CAPABILITY GOVERNANCE\nPolicy-controlled host access",color="#FFBE78",fillcolor="#302719"];
- resilience [label="RESILIENT EXECUTION\nDeadlines · retries · limits",color="#67D6A3",fillcolor="#17352F"];
- observability [label="FULL OBSERVABILITY\nLogs · metrics · execution state",color="#6EA8FE",fillcolor="#192B48"];
- {rank=same;security;resilience;observability;} security -> resilience -> observability;
- }
- hero -> reasoning; reasoning -> models; models -> security;
+digraph AgentExecution {
+  graph [
+    bgcolor="#FFFFFF", pad="0.42", rankdir=TB, nodesep="0.28", ranksep="0.38",
+    splines=ortho, outputorder=edgesfirst, fontname="Arial",
+    label="BOS Agent Execution Model", labelloc=t, labeljust=l,
+    fontsize=28, fontcolor="#111111"
+  ];
+  node [
+    shape=box, style="rounded,filled", fontname="Arial",
+    fontsize=14, margin="0.28,0.20", color="#D9DDE2",
+    fillcolor="#FFFFFF", fontcolor="#111111", penwidth=1.2
+  ];
+  edge [color="#111111", penwidth=1.4, arrowsize=0.7];
+
+  subgraph cluster_execution {
+    label=""; color="#D9DDE2"; penwidth=1.2; style="rounded"; margin=22;
+
+    request [
+      label=<<B>Agent Request</B><BR/><FONT POINT-SIZE="13" COLOR="#666666">User intent  ·  Conversation context  ·  Available capabilities</FONT>>,
+      fillcolor="#E8F3FA", color="#DDEBF4", width=8.8, height=0.95
+    ];
+    understand [
+      label=<<B>Understand & Plan</B><BR/><FONT POINT-SIZE="13" COLOR="#666666">Interpret intent  ·  Build plan  ·  Select model and capabilities</FONT>>,
+      fillcolor="#F2F2F2", color="#E8E8E8", width=8.8, height=0.95
+    ];
+
+    reason [label=<<B>Reason</B><BR/><FONT POINT-SIZE="12" COLOR="#666666">ReAct  ·  Multi-step decisions</FONT>>, width=2.65];
+    coordinate [label=<<B>Coordinate</B><BR/><FONT POINT-SIZE="12" COLOR="#666666">Delegation  ·  Agent collaboration</FONT>>, width=2.65];
+    execute [label=<<B>Execute</B><BR/><FONT POINT-SIZE="12" COLOR="#666666">Tools  ·  Skills  ·  MCP  ·  Extensions</FONT>>, width=2.65];
+
+    result [
+      label=<<B>Observe & Adapt</B><BR/><FONT POINT-SIZE="13" COLOR="#666666">Tool results  ·  Events  ·  Context updates  ·  Next action</FONT>>,
+      fillcolor="#F2F2F2", color="#E8E8E8", width=8.8, height=0.95
+    ];
+    response [
+      label=<<B>Agent Response</B><BR/><FONT POINT-SIZE="13" COLOR="#666666">Structured output  ·  User-facing result  ·  Execution trace</FONT>>,
+      fillcolor="#E8F3FA", color="#DDEBF4", width=8.8, height=0.95
+    ];
+
+    {rank=same; reason; coordinate; execute;}
+    request -> understand;
+    understand -> reason;
+    understand -> coordinate;
+    understand -> execute;
+    reason -> result;
+    coordinate -> result;
+    execute -> result;
+    result -> response;
+  }
 }
