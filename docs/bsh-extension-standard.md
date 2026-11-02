@@ -335,9 +335,13 @@ requires = [
   resulting topological order is the order used by the host activation pass.
 - A declaration is not a capability grant. Service discovery never bypasses
   the extension's existing capability and policy checks. The manifest planner
-  currently validates and orders contracts; runtime transport/binding of
-  manifest contracts to typed service values is a subsequent implementation
-  step.
+  validates and orders contracts; runtime transport/binding of manifest
+  contracts to typed service values is a subsequent implementation step.
+- Runtime consumers that need safe replacement must acquire a call-scoped
+  service lease and hold it for the complete operation. Replacement atomically
+  publishes the new generation and stops admission to the old one; the host
+  receives a retirement handle and may wait for its in-flight leases to drain.
+  The legacy untracked lookup is not sufficient for drain-sensitive calls.
 
 ## 5. Tool descriptors
 
