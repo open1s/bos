@@ -373,6 +373,7 @@ pub(crate) struct AppliedExtension {
     services: Arc<super::composable::ServiceRegistry>,
     extension_id: String,
     workspace: String,
+    session_id: String,
     service_provides: Vec<super::manifest::ServiceProvideSpec>,
     service_requires: Vec<super::manifest::ServiceRequireSpec>,
 }
@@ -404,6 +405,7 @@ impl AppliedExtension {
                     &scope,
                     &self.extension_id,
                     &self.workspace,
+                    &self.session_id,
                 )
         }) {
             return None;
@@ -437,6 +439,7 @@ impl AppliedExtension {
                         scope,
                         &self.extension_id,
                         &self.workspace,
+                        &self.session_id,
                     )
             })
             .then(|| self.services.acquire(scope, name))
@@ -539,13 +542,14 @@ fn service_scope_matches(
     requested: &super::composable::Scope,
     extension_id: &str,
     workspace: &str,
+    session_id: &str,
 ) -> bool {
     use super::composable::Scope;
     use super::manifest::ServiceScope;
     match (declared, requested) {
         (ServiceScope::Host, Scope::Host) => true,
         (ServiceScope::Workspace, Scope::Workspace(id)) => id == workspace,
-        (ServiceScope::Session, Scope::Session(_)) => true,
+        (ServiceScope::Session, Scope::Session(id)) => id == session_id,
         (ServiceScope::Extension, Scope::Extension(id)) => id == extension_id,
         _ => false,
     }
@@ -1357,6 +1361,7 @@ impl ExtensionHost {
         agent: &mut ::agent::Agent,
         registry: &mut ::agent::plugins::PluginRegistry,
         preset_allowed: Option<&BTreeSet<String>>,
+        session_id: &str,
     ) -> Vec<AppliedExtension> {
         let mut applied = Vec::new();
         for entry in self.loaded.values() {
@@ -1426,6 +1431,7 @@ impl ExtensionHost {
                 services: Arc::clone(&self.services),
                 extension_id: entry.package.id().as_str().to_owned(),
                 workspace: self.config.workspace.clone(),
+                session_id: session_id.to_owned(),
                 service_provides: entry.package.manifest.services.provides.clone(),
                 service_requires: entry.package.manifest.services.requires.clone(),
             });
@@ -2248,6 +2254,7 @@ pub(crate) fn install_with_fibers(
     settings: &crate::settings::Settings,
     workspace: Option<&Path>,
     preset_allowed: Option<&[String]>,
+    session_id: &str,
 ) -> Vec<AppliedExtension> {
     let config =
         HostConfig::from_settings(settings, workspace.map(Path::to_path_buf), preset_allowed);
@@ -2277,7 +2284,7 @@ pub(crate) fn install_with_fibers(
         preset_allowed.map(|ids| ids.iter().cloned().collect::<BTreeSet<_>>());
     guard
         .as_ref()
-        .map(|host| host.apply_with_fibers(agent, registry, allowed.as_ref()))
+        .map(|host| host.apply_with_fibers(agent, registry, allowed.as_ref(), session_id))
         .unwrap_or_default()
 }
 
