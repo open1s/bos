@@ -101,6 +101,32 @@ impl ServiceRegistry {
         Arc::downcast::<T>(service).ok()
     }
 
+    /// Provide a service whose registration is revoked with its owning Fiber.
+    ///
+    /// The registry is weakly captured by the cleanup effect: a Fiber may
+    /// outlive the host registry, but it must never keep the registry alive.
+    /// Generation checking ensures an older Fiber cannot remove a replacement.
+    pub(crate) fn provide_owned<T>(
+        self: &Arc<Self>,
+        scope: Scope,
+        name: impl Into<String>,
+        service: Arc<T>,
+        fiber: &mut Fiber,
+    ) -> ServiceToken
+    where
+        T: Any + Send + Sync,
+    {
+        let token = self.provide(scope, name, service);
+        let registry = Arc::downgrade(self);
+        let cleanup_token = token.clone();
+        fiber.own(move || {
+            if let Some(registry) = registry.upgrade() {
+                registry.revoke(&cleanup_token);
+            }
+        });
+        token
+    }
+
     /// Remove a service only if the token still owns the current generation.
     /// Returns false for stale tokens and already-removed entries.
     pub(crate) fn revoke(&self, token: &ServiceToken) -> bool {
@@ -393,6 +419,30 @@ mod tests {
         assert_eq!(*registry.get::<u64>(&scope, "clock").unwrap(), 2);
         assert!(registry.revoke(&new));
         assert!(!registry.contains::<u64>(&scope, "clock"));
+    }
+
+    #[test]
+    fn fiber_owned_service_cleanup_cannot_remove_a_replacement() {
+        let registry = Arc::new(ServiceRegistry::new());
+        let scope = Scope::Session("s1".into());
+        let mut fiber = Fiber::new("extension-a");
+        fiber.transition(FiberState::Loading).unwrap();
+        fiber.transition(FiberState::Active).unwrap();
+
+        registry.provide_owned(
+            scope.clone(),
+            "clock",
+            Arc::new(1_u64),
+            &mut fiber,
+        );
+        registry.provide(scope.clone(), "clock", Arc::new(2_u64));
+
+        fiber.unload().unwrap();
+        assert_eq!(
+            *registry.get::<u64>(&scope, "clock").unwrap(),
+            2,
+            "stale Fiber cleanup must not revoke the replacement provider"
+        );
     }
 
     #[test]
