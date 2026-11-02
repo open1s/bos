@@ -1,55 +1,38 @@
 digraph ExtensionPlatform {
   graph [
-    bgcolor="#FFFFFF", pad="0.42", rankdir=TB, nodesep="0.20", ranksep="0.48",
+    bgcolor="#FFFFFF", pad="0.42", rankdir=TB, nodesep="0.24", ranksep="0.42",
     splines=ortho, outputorder=edgesfirst, fontname="Arial",
     label="BSH Extension Platform", labelloc=t, labeljust=l,
     fontsize=28, fontcolor="#111111"
   ];
   node [
     shape=box, style="rounded,filled", fontname="Arial",
-    fontsize=15, margin="0.30,0.22", color="#D9DDE2",
+    fontsize=16, margin="0.32,0.24", color="#D9DDE2",
     fillcolor="#FFFFFF", fontcolor="#111111", penwidth=1.2
   ];
-  edge [color="#111111", penwidth=1.6, arrowsize=0.75, arrowhead=normal];
+  edge [color="#111111", penwidth=1.5, arrowsize=0.75];
 
   subgraph cluster_platform {
     label=""; color="#D9DDE2"; penwidth=1.2; style="rounded"; margin=24;
 
     api [
-      label=<<B>BSH Extension API</B><BR/><FONT POINT-SIZE="13" COLOR="#666666">Manifest  ·  Lifecycle  ·  Capability  ·  Contribution</FONT>>,
-      fillcolor="#E8F3FA", color="#DDEBF4", width=8.4, height=1.05
+      label=<<B>BSH Extension API</B><BR/><FONT POINT-SIZE="14" COLOR="#666666">Manifest  ·  Lifecycle  ·  Capability  ·  Contribution</FONT>>,
+      fillcolor="#E8F3FA", color="#DDEBF4", width=8.6, height=1.0
     ];
-
     runtime [
-      label=<<B>Runtime Abstraction Layer</B><BR/><FONT POINT-SIZE="13" COLOR="#666666">Unified lifecycle, invocation, errors, cancellation and diagnostics</FONT>>,
-      fillcolor="#F2F2F2", color="#E8E8E8", width=8.4, height=1.05
+      label=<<B>Runtime Abstraction Layer</B><BR/><FONT POINT-SIZE="14" COLOR="#666666">Unified extension runtime</FONT>>,
+      fillcolor="#F2F2F2", color="#E8E8E8", width=8.6, height=1.0
     ];
 
-    native [
-      label=<<B>Native</B><BR/><FONT POINT-SIZE="13" COLOR="#666666">Built-in Rust extensions</FONT>>,
-      width=2.55, height=1.55
+    implementations [
+      label=<<B>Extension Runtimes</B><BR/><FONT POINT-SIZE="14" COLOR="#666666">Native Rust  ·  Extism  ·  Wasmtime / WIT</FONT>>,
+      width=8.6, height=1.0
     ];
-    extism [
-      label=<<B>Extism</B><BR/><FONT POINT-SIZE="13" COLOR="#666666">Function plugins</FONT>>,
-      width=2.55, height=1.55
-    ];
-    wasmtime [
-      label=<<B>Wasmtime</B><BR/><FONT POINT-SIZE="13" COLOR="#666666">WIT Components</FONT>>,
-      width=2.55, height=1.55
-    ];
-
     services [
-      label=<<B>BSH Services</B><BR/><FONT POINT-SIZE="13" COLOR="#666666">Agent  ·  GPUI  ·  Event Bus  ·  Storage  ·  Computer Use</FONT>>,
-      fillcolor="#E8F3FA", color="#DDEBF4", width=8.4, height=1.05
+      label=<<B>BSH Services</B><BR/><FONT POINT-SIZE="14" COLOR="#666666">Agent  ·  UI  ·  Events  ·  Storage  ·  Computer Use</FONT>>,
+      fillcolor="#E8F3FA", color="#DDEBF4", width=8.6, height=1.0
     ];
 
-    {rank=same; native; extism; wasmtime;}
-    api -> runtime;
-    runtime -> native;
-    runtime -> extism;
-    runtime -> wasmtime;
-    native -> services;
-    extism -> services;
-    wasmtime -> services;
+    api -> runtime -> implementations -> services;
   }
 }
