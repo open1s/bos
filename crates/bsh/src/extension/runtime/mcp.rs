@@ -1033,14 +1033,22 @@ impl McpRuntime {
         self.core.cancelled.store(false, Ordering::SeqCst);
         let core = Arc::clone(&self.core);
         let name = name.to_string();
-        let handle = tokio::task::spawn_blocking(move || {
+        let mut handle = tokio::task::spawn_blocking(move || {
             core.call_tool_blocking(&name, arguments, progress, deadline)
         });
-        match tokio::time::timeout(Duration::from_millis(deadline.saturating_add(100)), handle)
-            .await
+        match tokio::time::timeout(
+            Duration::from_millis(deadline.saturating_add(100)),
+            &mut handle,
+        )
+        .await
         {
             Err(_) => {
                 self.stop();
+                // Timing out while awaiting a JoinHandle only stops waiting; it does not
+                // stop the blocking task. Keep call_gate held until the killed-child
+                // exchange has actually exited, or the next call could reset cancelled
+                // while this invocation is still running.
+                let _ = handle.await;
                 Err(ExtensionError::Timeout {
                     extension: self.core.extension.to_string(),
                     operation: "mcp tools/call".to_string(),
