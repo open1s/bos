@@ -1005,6 +1005,11 @@ impl Runtime for McpRuntime {
     }
 
     async fn pump(&self) -> Result<(), ExtensionError> {
+        // Share the lifecycle gate with calls and shutdown: do not drain queued
+        // events while shutdown is terminalizing the session, and do not let a
+        // pump start after shutdown has acquired the gate.
+        let _gate = self.call_gate.lock().await;
+        self.core.ensure_running()?;
         self.core.pump();
         Ok(())
     }
