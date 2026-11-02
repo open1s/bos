@@ -389,7 +389,7 @@ impl AppliedExtension {
     where
         T: std::any::Any + Send + Sync,
     {
-        let declaration = self.service_provides.iter().find(|declaration| {
+        if !self.service_provides.iter().any(|declaration| {
             declaration.name == name
                 && service_scope_matches(
                     &declaration.scope,
@@ -397,8 +397,9 @@ impl AppliedExtension {
                     &self.extension_id,
                     &self.workspace,
                 )
-        })?;
-        let _ = declaration;
+        }) {
+            return None;
+        }
         Some(self.services.provide_owned(
             scope,
             name.to_owned(),
