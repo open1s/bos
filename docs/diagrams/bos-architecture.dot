@@ -1,28 +1,65 @@
 digraph BOS {
-  graph [bgcolor="#0B1020", pad="0.35", rankdir=TB, nodesep="0.32", ranksep="0.42", splines=polyline, compound=true, fontname="DejaVu Sans", label="BOS  /  ONE RUNTIME · MULTIPLE INTERFACES", labelloc=t, fontsize=25, fontcolor="#F3F6FC"];
-  node [shape=box, style="rounded,filled", fontname="DejaVu Sans", fontsize=14, margin="0.22,0.14", color="#3B506F", fillcolor="#17243A", fontcolor="#F3F6FC", penwidth=1.6];
-  edge [color="#536987", penwidth=1.7, arrowsize=0.75];
-  subgraph cluster_surface { label="DEVELOPER & PRODUCT SURFACES"; color="#34445F"; fontcolor="#55D6E8"; fontsize=15; style="rounded"; penwidth=1.4;
+  graph [
+    bgcolor="#0B1020", pad="0.42", rankdir=TB,
+    nodesep="0.42", ranksep="0.62", splines=ortho,
+    compound=true, newrank=true, outputorder=edgesfirst,
+    fontname="DejaVu Sans", label="BOS  /  ONE RUNTIME · MULTIPLE INTERFACES",
+    labelloc=t, fontsize=23, fontcolor="#F3F6FC"
+  ];
+  node [
+    shape=box, style="rounded,filled", fontname="DejaVu Sans",
+    fontsize=12, margin="0.24,0.16", color="#3B506F",
+    fillcolor="#17243A", fontcolor="#F3F6FC", penwidth=1.5
+  ];
+  edge [color="#647A99", penwidth=1.5, arrowsize=0.7];
+
+  subgraph cluster_surfaces {
+    label="DEVELOPER & PRODUCT SURFACES";
+    labelloc=t; labeljust=l; fontsize=13; fontcolor="#55D6E8";
+    color="#34445F"; style="rounded"; penwidth=1.3; margin=20;
     rust [label="RUST API\nNative crates", color="#6EA8FE"];
     nbos [label="NBOS\nPython bindings", color="#FFBE78"];
     jsbos [label="JSBOS\nJavaScript / Node.js", color="#67D6A3"];
     bsh [label="BSH\nNative GPUI workspace", color="#B69CFF"];
-    {rank=same; rust; nbos;}
-    {rank=same; jsbos; bsh;}
-    rust -> jsbos [style=invis, weight=10]; nbos -> bsh [style=invis, weight=10];
+    {rank=same; rust; nbos; jsbos; bsh;}
   }
-  subgraph cluster_runtime { label="BOS RUNTIME  /  SHARED RUST EXECUTION CORE"; color="#67D6A3"; fontcolor="#67D6A3"; fontsize=17; style="rounded"; penwidth=2.2;
+
+  subgraph cluster_runtime {
+    label="BOS RUNTIME  /  SHARED RUST EXECUTION CORE";
+    labelloc=t; labeljust=l; fontsize=15; fontcolor="#67D6A3";
+    color="#398B7B"; style="rounded"; penwidth=2; margin=22;
     agent [label="AGENT + REACT\nReason · act · observe", fillcolor="#123C3A", color="#3A9D88"];
     tools [label="TOOLS + SKILLS\nRegistry · dispatch · MCP", fillcolor="#123C3A", color="#3A9D88"];
     bus [label="MESSAGE BUS\nPub/Sub · query · RPC", fillcolor="#123C3A", color="#3A9D88"];
     llm [label="LLM ADAPTERS\nProviders · streaming", fillcolor="#123C3A", color="#3A9D88"];
     resilience [label="RESILIENCE\nRetry · limits · breaker", fillcolor="#123C3A", color="#3A9D88"];
+    context [label="CONTEXT & MEMORY\nSession · skills · memory", fillcolor="#123C3A", color="#3A9D88"];
     {rank=same; agent; tools; bus;}
-    {rank=same; llm; resilience;}
-    agent -> llm [style=invis, weight=10]; tools -> resilience [style=invis, weight=10];
+    {rank=same; llm; resilience; context;}
+    agent -> llm [style=invis, weight=12];
+    tools -> resilience [style=invis, weight=12];
+    bus -> context [style=invis, weight=12];
   }
-  foundation [label="FOUNDATION & INTEGRATIONS\nConfig  ·  Logging / Telemetry  ·  Memory  ·  Security / Capabilities  ·  External LLMs  ·  MCP Servers", fillcolor="#121B2E", color="#536987", fontsize=13];
-  ext [label="BSH EXTENSION PLATFORM\nExtends BSH — not another runtime", fillcolor="#241C3B", color="#B69CFF", fontsize=13];
-  rust -> agent; nbos -> agent; jsbos -> agent; bsh -> agent;
-  resilience -> foundation [color="#67D6A3", penwidth=2]; bsh -> ext [style=dashed, color="#B69CFF", constraint=false];
+
+  foundation [
+    label="FOUNDATION & INTEGRATIONS\nConfiguration  ·  Logging / Telemetry  ·  Security / Capabilities  ·  External LLMs  ·  MCP Servers",
+    fillcolor="#121B2E", color="#536987", fontsize=11, penwidth=1.5,
+    width=8.8
+  ];
+
+  extension [
+    label="BSH EXTENSION PLATFORM\nWorkspace contributions · tools · commands · panels",
+    fillcolor="#241C3B", color="#B69CFF", fontsize=11, penwidth=1.7,
+    width=5.4
+  ];
+
+  rust -> agent;
+  nbos -> agent;
+  jsbos -> agent;
+  bsh -> agent;
+  llm -> foundation [color="#67D6A3"];
+  resilience -> foundation [color="#67D6A3"];
+  context -> foundation [color="#67D6A3"];
+  bsh -> extension [style=dashed, color="#B69CFF", penwidth=1.8, constraint=false];
+  {rank=same; foundation; extension;}
 }
