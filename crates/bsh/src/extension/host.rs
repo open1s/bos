@@ -2815,6 +2815,40 @@ tools = ["echo"]
     }
 
     #[test]
+    fn required_service_contract_is_enforced_before_activation() {
+        let root = scratch("missing-service-provider");
+        let source = root.join("source");
+        write_package(&source);
+        use std::io::Write as _;
+        let mut manifest = std::fs::OpenOptions::new()
+            .append(true)
+            .open(source.join("extension.toml"))
+            .expect("open manifest");
+        manifest
+            .write_all(
+                br#"
+[services]
+requires = [{ name = "com.example.search", contract = "com.example.search-api", version = "^1.0", scope = "host" }]
+"#,
+            )
+            .expect("append service requirement");
+        let store = ExtensionStore::open(root.join("extensions")).expect("store");
+        store.install(&source).expect("install");
+        let host = ExtensionHost::open(config(&root.join("extensions"))).expect("host");
+        let status = host
+            .statuses()
+            .into_iter()
+            .find(|status| status.id == "com.example.hosted")
+            .expect("hosted extension remains visible");
+        assert!(!status.applied, "a missing required service must block activation");
+        assert!(
+            status.error.as_deref().is_some_and(|error| error.contains("service dependency planning")),
+            "{status:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_disabled_package_is_listed_but_not_applied() {
         let root = scratch("disabled");
         let source = root.join("source");
