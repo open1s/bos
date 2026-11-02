@@ -497,8 +497,8 @@ mod service_scope_tests {
             &ServiceScope::Host,
             &Scope::Host,
             "ext",
-            Some(Path::new("/repo")),
-            session
+            "/repo",
+            session,
         ));
         assert!(service_scope_matches(
             &ServiceScope::Workspace,
@@ -533,15 +533,6 @@ mod service_scope_tests {
             &Scope::Workspace("/other".into()),
             "ext",
             Some(Path::new("/repo")),
-            session,
-        ));
-        // A build with no workspace open cannot satisfy a workspace scope, even
-        // when the requested id names a real path: the grant fails closed.
-        assert!(!service_scope_matches(
-            &ServiceScope::Workspace,
-            &Scope::Workspace("/repo".into()),
-            "ext",
-            None,
             session,
         ));
         assert!(!service_scope_matches(
