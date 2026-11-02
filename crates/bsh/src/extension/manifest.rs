@@ -1021,6 +1021,30 @@ max_concurrent_calls = 4
     }
 
     #[test]
+    fn service_contracts_parse_and_validate() {
+        let text = sample().replace(
+            "[resources]",
+            "[services]\\nprovides = [{ name = \\"com.example.search\\", contract = \\"com.example.search-api\\", version = \\"1.2.0\\", scope = \\"workspace\\" }]\\nrequires = [{ name = \\"com.example.cache\\", contract = \\"com.example.cache-api\\", version = \\"^2.0\\", scope = \\"session\\", optional = true }]\\n\\n[resources]",
+        );
+        let manifest = parse(&text);
+        assert_eq!(manifest.services.provides.len(), 1);
+        assert_eq!(manifest.services.requires.len(), 1);
+        assert!(manifest.validate().is_valid(), "{:?}", manifest.validate());
+    }
+
+    #[test]
+    fn invalid_and_duplicate_service_contracts_are_refused() {
+        let text = sample().replace(
+            "[resources]",
+            "[services]\\nprovides = [\\n  { name = \\"Bad Service\\", contract = \\"com.example.api\\", version = \\"1.0.0\\", scope = \\"host\\" },\\n  { name = \\"com.example.search\\", contract = \\"com.example.api\\", version = \\"1.0.0\\", scope = \\"host\\" },\\n  { name = \\"com.example.search\\", contract = \\"com.example.api\\", version = \\"2.0.0\\", scope = \\"host\\" }\\n]\\n\\n[resources]",
+        );
+        let report = parse(&text).validate();
+        assert!(!report.is_valid(), "{report:?}");
+        assert!(report.errors.iter().any(|issue| issue.field == "services.provides[0].name"));
+        assert!(report.errors.iter().any(|issue| issue.field == "services.provides[2]"));
+    }
+
+    #[test]
     fn unknown_fields_are_refused() {
         let text = sample().replace(
             "schema_version = \"1.0\"",
