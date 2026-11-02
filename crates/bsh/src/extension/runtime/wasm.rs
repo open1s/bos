@@ -759,6 +759,8 @@ impl WasmRuntime {
     }
 
     fn prepare_call(&self, instance: &mut Instance, timeout_ms: u64) -> Result<(), ExtensionError> {
+        // Every serialized guest entry point starts a fresh cancellation scope.
+        self.cancelled.store(false, Ordering::SeqCst);
         instance.store.data_mut().deadline =
             Instant::now() + Duration::from_millis(timeout_ms.max(1));
         instance.store.set_epoch_deadline(1);
@@ -922,7 +924,9 @@ impl Runtime for WasmRuntime {
 
     async fn shutdown(&self) -> Result<(), ExtensionError> {
         self.stopped.store(true, Ordering::SeqCst);
-        self.cancelled.store(true, Ordering::Relaxed);
+        self.cancelled.store(true, Ordering::SeqCst);
+        // Interrupt a currently running guest before waiting for its Store lock.
+        engine().increment_epoch();
         self.deactivate().await?;
         let mut guard = self.instance.lock().map_err(|_| ExtensionError::Corrupt {
             path: self.component.clone(),
@@ -968,9 +972,13 @@ impl Runtime for WasmRuntime {
             path: self.component.clone(),
             message: "wasm instance lock is poisoned".to_string(),
         })?;
-        // Reset only after acquiring the per-instance lock. A queued call must
-        // never clear the cancellation flag while the previous guest is running.
-        self.cancelled.store(false, Ordering::SeqCst);
+        // A queued call must not revive a runtime shut down while it waited.
+        if self.stopped.load(Ordering::SeqCst) {
+            return Err(ExtensionError::Runtime {
+                extension: self.extension.to_string(),
+                message: "runtime is shut down".to_string(),
+            });
+        }
         let instance = guard.as_mut().expect("instance");
         self.prepare_call(
             instance,
@@ -1068,6 +1076,7 @@ impl Runtime for WasmRuntime {
             message: "wasm instance lock is poisoned".to_string(),
         })?;
         let instance = guard.as_mut().expect("instance");
+        self.prepare_call(instance, self.resources.execution_ms())?;
         let text = instance
             .bindings
             .bsh_extension_extension()
