@@ -49,13 +49,7 @@ impl Drop for CallStateGuard<'_> {
             Ordering::SeqCst,
             Ordering::SeqCst,
         );
-        let _ = self.0.compare_exchange(
-            CALL_CANCELLED,
-            CALL_IDLE,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        );
-    }
+     }
 }
 
 /// The Extism host bridge shared by one plugin.
@@ -462,8 +456,7 @@ pub(crate) struct ExtismRuntime {
     memory_mb: u64,
     output_bytes: u64,
     fuel_used: AtomicU64,
-    cancelled: Arc<std::sync::atomic::AtomicBool>,
-    /// Set by shutdown only; cancel is a per-call state the next call clears.
+     /// Set by shutdown only; cancel is a per-call state the next call clears.
     stopped: std::sync::atomic::AtomicBool,
 }
 
@@ -538,8 +531,7 @@ impl ExtismRuntime {
             memory_mb: manifest.resources.memory_mb(),
             output_bytes: manifest.resources.output_bytes(),
             fuel_used: AtomicU64::new(0),
-            cancelled,
-            stopped: std::sync::atomic::AtomicBool::new(false),
+             stopped: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -769,7 +761,17 @@ impl Runtime for ExtismRuntime {
         ).is_err() {
             return Ok(());
         }
-        self.interrupt_active_call()
+        let result = self.interrupt_active_call();
+        // Keep the runtime unavailable to queued callers until the native
+        // cancellation request completes, so a late cancel cannot leak into
+        // the next guest invocation.
+        let _ = self.call_state.compare_exchange(
+            CALL_CANCELLED,
+            CALL_IDLE,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+        result
     }
 
     async fn tools(&self) -> Result<Vec<ToolDescriptor>, ExtensionError> {
@@ -885,6 +887,25 @@ mod tests {
             .join("../../examples/extensions/extism-echo")
             .canonicalize()
             .expect("the Extism example exists")
+    }
+
+    #[test]
+    fn call_state_guard_releases_a_completed_call() {
+        let state = AtomicU8::new(CALL_RUNNING);
+        {
+            let _guard = CallStateGuard(&state);
+            assert_eq!(state.load(Ordering::SeqCst), CALL_RUNNING);
+        }
+        assert_eq!(state.load(Ordering::SeqCst), CALL_IDLE);
+    }
+
+    #[test]
+    fn call_state_guard_never_reopens_a_stopped_runtime() {
+        let state = AtomicU8::new(CALL_RUNNING);
+        let guard = CallStateGuard(&state);
+        state.store(CALL_STOPPED, Ordering::SeqCst);
+        drop(guard);
+        assert_eq!(state.load(Ordering::SeqCst), CALL_STOPPED);
     }
 
     #[tokio::test]
