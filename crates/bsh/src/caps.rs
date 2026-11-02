@@ -4125,6 +4125,23 @@ mod tests {
             built.plugins.iter().any(|plugin| plugin.name == "dsh-echo"),
             "the settings inventory lists the extension under the id its toggle writes"
         );
+        assert_eq!(
+            built.extension_activations.len(),
+            1,
+            "the production build must retain one Fiber handle for the package"
+        );
+        assert_eq!(
+            built.extension_activations[0].state(),
+            crate::extension::composable::FiberState::Active
+        );
+
+        // The tool may be held by another Arc after the Agent build is dropped.
+        // Its Fiber-owned liveness gate must still reject a new invocation.
+        drop(built);
+        assert!(
+            tool.run(&serde_json::json!({ "value": "after-unload" })).is_err(),
+            "dropping the build must close the extension tool's liveness gate"
+        );
     }
 
     /// The choice the credential fixtures name: the `work` provider's leaf.
