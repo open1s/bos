@@ -440,14 +440,20 @@ impl McpCore {
             )?;
         }
         // MCP is also an arbitrary package-controlled child process. Reuse
-        // the same Linux bubblewrap boundary as the process runtime; a missing
-        // bwrap binary or failed namespace setup must never fall back to direct
-        // execution.
+        // the platform sandbox used by ProcessRuntime; a missing sandbox binary
+        // or failed profile must never fall back to direct execution.
         let mut command = if cfg!(target_os = "linux") {
             let mut command = Command::new("bwrap");
             command.args(super::process::linux_bwrap_plan(
                 &self.root, None, None, &program, &self.args,
             ));
+            command
+        } else if cfg!(target_os = "macos") {
+            let mut command = Command::new("/usr/bin/sandbox-exec");
+            command
+                .arg("-p")
+                .arg(super::process::sandbox_profile(&self.root, None, None))
+                .arg(&program);
             command
         } else {
             let mut command = Command::new(&program);
