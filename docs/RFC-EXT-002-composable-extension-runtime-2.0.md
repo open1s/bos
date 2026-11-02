@@ -140,4 +140,19 @@ A failed plan is rejected before activation. Patch application must be transacti
 
 ## 11. Current implementation boundary
 
-The first 2.0 foundation commit adds the in-process primitives and their unit tests. It does not yet claim that the existing host uses Fiber-owned effects, that service changes trigger reloads, or that DSH bundle patches mount. Those are subsequent integration slices and remain explicit gaps until verified.
+### Implemented
+
+- The in-process scoped service registry, generation-safe provider tokens, deterministic dependency planner, Fiber state machine and reverse-order effect cleanup are implemented with unit tests.
+- The host exposes `apply_with_fibers()`, returning one `AppliedExtension` handle per activation.
+- A contribution lease tracks installed async tools, exact prompt sections and newly registered skill manifest paths. Fiber cleanup first closes the shared tool-liveness gate; explicit unload then removes tools, prompt sections, skills and owner-scoped PluginRegistry entries.
+- Agent cache invalidation is part of tool, prompt and skill removal.
+
+### Not yet complete / not yet verified
+
+- The production Agent construction path still calls the compatibility `apply()` API. It does not yet retain `AppliedExtension` handles or invoke deterministic unload during Agent rebuild/teardown. Therefore Fiber-owned revocation is available as a host API but is not yet the production lifecycle.
+- Calls admitted before revocation are not drained or forcibly cancelled. The liveness gate prevents new invocations; already-running work may finish.
+- The new host adapter and Agent removal paths still require targeted Cargo tests, formatting and CI validation. A merged PR is not evidence that these checks passed.
+- Service availability notifications, provider replacement reconciliation and dependency-driven activation remain future work.
+- DSH bundle patches remain unsupported until the composition engine is wired and covered by fixtures.
+
+Do not mark 2.0-B complete until production construction retains activation handles and unloads them against the same Agent/PluginRegistry pair, and tests prove prompt/skill/tool/command/panel cleanup on both normal teardown and partial activation failure.
