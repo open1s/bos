@@ -1238,6 +1238,38 @@ required = ["process.execute"]
             "a child registered after cancellation must be reaped and cleared"
         );
 
+        // Terminal shutdown is distinct from a recoverable cancellation:
+        // even when the transient cancellation flag is clear, a late child
+        // registration must be rejected and reaped.
+        cancelled_runtime
+            .core
+            .cancelled
+            .store(false, Ordering::SeqCst);
+        cancelled_runtime.core.stopped.store(true, Ordering::SeqCst);
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = Command::new("sleep");
+            command.arg("30");
+            command
+        };
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("powershell.exe");
+            command.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"]);
+            command
+        };
+        let child = command.spawn().expect("late child");
+        assert!(cancelled_runtime.core.register_child(child).is_err());
+        assert!(
+            cancelled_runtime
+                .core
+                .child
+                .lock()
+                .expect("child slot")
+                .is_none(),
+            "a child registered after terminal shutdown must be reaped and cleared"
+        );
+
         let runtime = McpRuntime::new(
             &manifest,
             &root,
@@ -1343,5 +1375,16 @@ required = ["process.execute"]
         let progress = receiver.recv().await.expect("one progress notification");
         assert_eq!(progress["progress"], 1);
         runtime.shutdown().await.expect("shutdown");
+
+        // Shutdown is terminal: no public discovery or invocation surface may
+        // lazily recreate the MCP server after its child and session are gone.
+        assert!(runtime.descriptors().is_err());
+        assert!(runtime.contributions().is_err());
+        assert!(runtime.activate().await.is_err());
+        assert!(runtime
+            .call_tool("echo", serde_json::json!({"x": 2}), &context)
+            .await
+            .is_err());
+        runtime.shutdown().await.expect("repeated shutdown is idempotent");
     }
 }
