@@ -1403,13 +1403,6 @@ impl AppState {
             self.turn_started = None;
         }
 
-        // stop() restores undelivered steering rows for an ordinary stop. A
-        // deleted session has nowhere to receive them, so discard those rows
-        // rather than leaving unreachable inbox state behind.
-        self.inbox.remove(id);
-        self.steering
-            .retain(|_, steering| steering.session != id);
-
         // The snapshot must include the stopped turn's final transcript state.
         // If parking fails, the session remains in the store (but a live turn
         // has already been stopped); preserving data takes priority over
@@ -1431,6 +1424,14 @@ impl AppState {
         if !self.store.remove(id) {
             return false;
         }
+
+        // stop() restores undelivered steering rows for an ordinary stop. A
+        // deleted session has nowhere to receive them, so discard those rows
+        // only AFTER parking and removing the session. If parking fails, the
+        // still-live session keeps its queued messages.
+        self.inbox.remove(id);
+        self.steering
+            .retain(|_, steering| steering.session != id);
 
         self.plans.remove(id);
         self.goals.remove(id);
