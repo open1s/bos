@@ -26,9 +26,9 @@ digraph BOS {
 
     models [label=<<B>Model Runtime</B><BR/><FONT POINT-SIZE="12" COLOR="#666666">Providers  ·  Streaming  ·  Tool calling</FONT>>, width=2.7];
     tools [label=<<B>Action Runtime</B><BR/><FONT POINT-SIZE="12" COLOR="#666666">Tools  ·  Skills  ·  MCP</FONT>>, width=2.7];
-    context [label=<<B>Context & Memory</B><BR/><FONT POINT-SIZE="12" COLOR="#666666">Sessions  ·  Knowledge</FONT>>, width=2.7];
+    context [label=<<B>Context &amp; Memory</B><BR/><FONT POINT-SIZE="12" COLOR="#666666">Sessions  ·  Knowledge</FONT>>, width=2.7];
     events [label=<<B>Agent Communication</B><BR/><FONT POINT-SIZE="12" COLOR="#666666">Pub/Sub  ·  Query  ·  RPC</FONT>>, width=2.7];
-    trust [label=<<B>Trust & Reliability</B><BR/><FONT POINT-SIZE="12" COLOR="#666666">Policies  ·  Limits  ·  Telemetry</FONT>>, width=2.7];
+    trust [label=<<B>Trust &amp; Reliability</B><BR/><FONT POINT-SIZE="12" COLOR="#666666">Policies  ·  Limits  ·  Telemetry</FONT>>, width=2.7];
 
     foundation [
       label=<<B>Shared Rust Foundation</B><BR/><FONT POINT-SIZE="13" COLOR="#666666">Async Runtime  ·  Configuration  ·  Logging  ·  Security  ·  Storage</FONT>>,
