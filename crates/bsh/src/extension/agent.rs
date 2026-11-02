@@ -69,9 +69,6 @@ pub(crate) struct Contributed {
 pub(crate) struct ContributionLease {
     owner: String,
     tools: Vec<String>,
-    prompt_sections: Vec<String>,
-    skill_paths: Vec<PathBuf>,
-    active: Arc<AtomicBool>,
 }
 
 impl ContributionLease {
@@ -82,23 +79,9 @@ impl ContributionLease {
         agent: &mut agent::Agent,
         registry: &mut agent::plugins::PluginRegistry,
     ) -> usize {
-        self.active.store(false, Ordering::SeqCst);
         let tools = agent.remove_async_tools(&self.tools);
-        let prompts = self
-            .prompt_sections
-            .iter()
-            .filter(|section| agent.remove_system_prompt_section(section))
-            .count();
-        let skills = agent.remove_skills_by_paths(&self.skill_paths);
         let items = registry.remove_owner(&self.owner);
-        tools + prompts + skills + items
-    }
-
-    /// Bind this lease's liveness to a Fiber. Disposing the Fiber prevents
-    /// any retained tool handle from starting another invocation.
-    pub(crate) fn attach_to_fiber(&self, fiber: &mut super::composable::Fiber) {
-        let active = Arc::clone(&self.active);
-        fiber.own(move || active.store(false, Ordering::SeqCst));
+        tools + items
     }
 
     /// Names of the async tools owned by this lease.
@@ -574,9 +557,6 @@ pub(crate) fn install_with_lease(
     let lease = ContributionLease {
         owner: contributed.extension.as_str().to_string(),
         tools: installed_tools.clone(),
-        prompt_sections,
-        skill_paths,
-        active,
     };
     (
         PluginInfo {

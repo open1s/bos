@@ -64,10 +64,12 @@ impl ToolRegistry {
     /// The caller is responsible for invalidating any cached execution engine
     /// that captured a prior registry snapshot.
     pub fn remove_async(&mut self, name: &str) -> bool {
-        let removed_tool = self.async_tools.remove(name).is_some();
-        let removed_schema = self.schema_cache.remove(name).is_some();
-        let removed_mcp_marker = self.mcp_tool_names.remove(name);
-        removed_tool || removed_schema || removed_mcp_marker
+        let removed = self.async_tools.remove(name).is_some();
+        if removed {
+            self.schema_cache.remove(name);
+            self.mcp_tool_names.remove(name);
+        }
+        removed
     }
 
     /// Look up a synchronous tool by name.

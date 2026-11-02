@@ -111,7 +111,7 @@ A failed plan is rejected before activation. Patch application must be transacti
 | Slice | Deliverable | Exit criteria |
 |---|---|---|
 | 2.0-A | Scoped service registry, dependency graph, Fiber, EffectSet | Unit tests for scope isolation, replacement safety, missing/cyclic dependencies, legal transitions, reverse/idempotent cleanup |
-| 2.0-B | Host adapter and effect ownership | Tools, commands, panels, prompt sections and skills have owner-scoped revocation; Fiber disposal disables retained tool handles |
+| 2.0-B | Host adapter and effect ownership | Existing host registrations are owned by a Fiber and fully removed on unload |
 | 2.0-C | Service availability and dependency reconciliation | Provider replacement/unavailability safely suspends or reloads dependents; in-flight generation is stable |
 | 2.0-D | Event engine | Parallel/serial/waterfall semantics, ordering, timeout and cancellation tests |
 | 2.0-E | Profile/bundle/patch composition | Deterministic, transactional composition with conflict diagnostics |
@@ -141,16 +141,3 @@ A failed plan is rejected before activation. Patch application must be transacti
 ## 11. Current implementation boundary
 
 The first 2.0 foundation commit adds the in-process primitives and their unit tests. It does not yet claim that the existing host uses Fiber-owned effects, that service changes trigger reloads, or that DSH bundle patches mount. Those are subsequent integration slices and remain explicit gaps until verified.
-
-## 12. 2.0-B implementation note
-
-The host adapter now has an opt-in Fiber-managed activation path:
-- `PluginRegistry::remove_owner` removes only the contributions whose authoritative owner entry matches the requested extension.
-- `ToolRegistry::remove_async` removes the async tool, schema cache entry and MCP marker together.
-- `Agent::remove_async_tools` invalidates the cached engine/context after revocation.
-- `ContributionLease` records tool names, prompt sections, exact skill manifest paths and the extension owner for one Agent build.
-- A lease attaches its liveness guard to a Fiber. Disposing the Fiber blocks new calls even if an older tool handle was retained by a cached caller.
-- Revocation removes async tools and their schema/MCP metadata, owner-scoped commands/panels, exact prompt sections and skills by manifest path; engine/context caches are invalidated when Agent state changes.
-- `ExtensionHost::apply_with_fibers` returns explicit activation handles; callers must retain them and call `AppliedExtension::unload`.
-
-The legacy `apply` method remains for compatibility and does not expose activation handles. The production Agent construction path still calls that legacy method; migration to retain `AppliedExtension` handles is a separate integration step. In-flight calls are not drained or forcibly cancelled by revocation: unload blocks new calls, while calls already admitted may finish.
