@@ -252,7 +252,8 @@ impl ServiceRegistry {
                 owner,
             }
         });
-        drop(entries);
+        // Publish while holding the write lock so concurrent changes cannot
+        // reorder their generation notifications.
         let _ = self.changes.send(ServiceChange {
             name: key.name.clone(),
             scope: key.scope.clone(),
@@ -263,6 +264,7 @@ impl ServiceRegistry {
                 ServiceChangeKind::Available
             },
         });
+        drop(entries);
         (ServiceToken { key, generation }, retirement)
     }
 
@@ -367,13 +369,13 @@ impl ServiceRegistry {
         }
         let (generation, owner) = entries.remove(&token.key)?;
         owner.retire();
-        drop(entries);
         let _ = self.changes.send(ServiceChange {
             name: token.key.name.clone(),
             scope: token.key.scope.clone(),
             generation,
             kind: ServiceChangeKind::Unavailable,
         });
+        drop(entries);
         Some(ServiceRetirement { generation, owner })
     }
 
