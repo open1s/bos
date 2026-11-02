@@ -142,7 +142,8 @@ A failed plan is rejected before activation. Patch application must be transacti
 
 ### Implemented
 
-- The in-process scoped service registry, generation-safe provider tokens, deterministic dependency planner, Fiber state machine and reverse-order effect cleanup are implemented with unit tests. `ServiceRegistry::provide_owned()` now binds a provider token to a Fiber through a weak registry reference, so stale Fiber cleanup cannot remove a newer provider generation.
+- The in-process scoped service registry, generation-safe provider tokens, deterministic dependency planner, Fiber state machine and reverse-order effect cleanup are implemented with unit tests. `ServiceRegistry::provide_owned()` binds a provider token to a Fiber through a weak registry reference, so stale Fiber cleanup cannot remove a newer provider generation.
+- The host now owns one host-scoped `ServiceRegistry`. Registry changes publish bounded `Available`, `Replaced` and `Unavailable` notifications; consumers must re-query the registry after receiving a notification.
 - The host exposes `apply_with_fibers()`, returning one `AppliedExtension` handle per activation.
 - A contribution lease tracks installed async tools, exact prompt sections and newly registered skill manifest paths. Fiber cleanup first closes the shared tool-liveness gate; explicit unload then removes tools, prompt sections, skills and owner-scoped PluginRegistry entries.
 - Agent cache invalidation is part of tool, prompt and skill removal.
@@ -153,7 +154,7 @@ A failed plan is rejected before activation. Patch application must be transacti
 - Production teardown disposes the whole build rather than mutating a live Agent in place. Dropping the Fiber's effect set closes the shared tool-liveness gate; the Agent and its tool registry are then released with the build. The explicit `AppliedExtension::unload(agent, registry)` path remains available for future in-place replacement where the same registries survive.
 - Calls admitted before revocation are not drained or forcibly cancelled. The liveness gate prevents new invocations; already-running work may finish.
 - The production integration and new lifecycle test still require targeted Cargo tests, formatting and CI validation. A merged commit is not evidence that these checks passed.
-- Service availability notifications, provider replacement reconciliation and dependency-driven activation remain future work.
+- Service notifications exist at the registry layer, but extension manifest contributions are not yet mapped onto typed services. Provider replacement reconciliation, dependent Fiber reload and in-flight drain remain future work.
 - DSH bundle patches remain unsupported until the composition engine is wired and covered by fixtures.
 
 Do not mark 2.0-B complete until tests prove that production turn ownership retains Fiber handles through the live turn, closes tool liveness on every teardown path, and cleans prompt/skill/tool/command/panel contributions on explicit unload and partial activation failure.
