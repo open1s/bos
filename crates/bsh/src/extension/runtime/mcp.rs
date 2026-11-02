@@ -1381,6 +1381,7 @@ required = ["process.execute"]
         assert!(runtime.descriptors().is_err());
         assert!(runtime.contributions().is_err());
         assert!(runtime.activate().await.is_err());
+        assert!(runtime.pump().await.is_err());
         assert!(runtime
             .call_tool("echo", serde_json::json!({"x": 2}), &context)
             .await
