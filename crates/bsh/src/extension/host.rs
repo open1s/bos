@@ -16,8 +16,8 @@ use std::time::SystemTime;
 use serde::Serialize;
 
 use super::agent as contribution;
-use super::composable::{Fiber, FiberState};
 use super::capability::{CallScope, Capability, Decision, GrantScope, PolicyEngine, PolicyMode};
+use super::composable::{Fiber, FiberState};
 use super::events::{lifecycle_event, topics, EventBus, ExtensionEvent};
 use super::lifecycle::{Health, LifecycleManager};
 use super::package::{write_atomic, ExtensionStore, Package};
@@ -372,7 +372,7 @@ pub(crate) struct AppliedExtension {
     lease: contribution::ContributionLease,
     services: Arc<super::composable::ServiceRegistry>,
     extension_id: String,
-    workspace: String,
+    workspace: Option<PathBuf>,
     session_id: String,
     service_provides: Vec<super::manifest::ServiceProvideSpec>,
     service_requires: Vec<super::manifest::ServiceRequireSpec>,
@@ -404,7 +404,7 @@ impl AppliedExtension {
                     &declaration.scope,
                     &scope,
                     &self.extension_id,
-                    &self.workspace,
+                    self.workspace.as_deref(),
                     &self.session_id,
                 )
         }) {
@@ -438,7 +438,7 @@ impl AppliedExtension {
                         &requirement.scope,
                         scope,
                         &self.extension_id,
-                        &self.workspace,
+                        self.workspace.as_deref(),
                         &self.session_id,
                     )
             })
@@ -464,9 +464,10 @@ impl AppliedExtension {
 
 #[cfg(test)]
 mod service_scope_tests {
-    use super::{service_scope_is_activation_owned, service_scope_matches};
     use super::super::composable::Scope;
     use super::super::manifest::ServiceScope;
+    use super::{service_scope_is_activation_owned, service_scope_matches};
+    use std::path::Path;
 
     #[test]
     fn build_activation_can_own_only_its_private_extension_scope() {
@@ -492,54 +493,60 @@ mod service_scope_tests {
     #[test]
     fn declared_service_scope_is_enforced_and_session_isolation_is_exact() {
         let session = "session-1";
-        assert!(service_scope_matches(&ServiceScope::Host, &Scope::Host, "ext", "/repo", session));
+        assert!(service_scope_matches(
+            &ServiceScope::Host,
+            &Scope::Host,
+            "ext",
+            Some(Path::new("/repo")),
+            session
+        ));
         assert!(service_scope_matches(
             &ServiceScope::Workspace,
             &Scope::Workspace("/repo".into()),
             "ext",
-            "/repo",
+            Some(Path::new("/repo")),
             session,
         ));
         assert!(service_scope_matches(
             &ServiceScope::Session,
             &Scope::Session(session.into()),
             "ext",
-            "/repo",
+            Some(Path::new("/repo")),
             session,
         ));
         assert!(service_scope_matches(
             &ServiceScope::Extension,
             &Scope::Extension("ext".into()),
             "ext",
-            "/repo",
+            Some(Path::new("/repo")),
             session,
         ));
         assert!(!service_scope_matches(
             &ServiceScope::Session,
             &Scope::Session("session-2".into()),
             "ext",
-            "/repo",
+            Some(Path::new("/repo")),
             session,
         ));
         assert!(!service_scope_matches(
             &ServiceScope::Workspace,
             &Scope::Workspace("/other".into()),
             "ext",
-            "/repo",
+            Some(Path::new("/repo")),
             session,
         ));
         assert!(!service_scope_matches(
             &ServiceScope::Extension,
             &Scope::Extension("other".into()),
             "ext",
-            "/repo",
+            Some(Path::new("/repo")),
             session,
         ));
         assert!(!service_scope_matches(
             &ServiceScope::Host,
             &Scope::Session("session-1".into()),
             "ext",
-            "/repo",
+            Some(Path::new("/repo")),
             session,
         ));
     }
@@ -560,14 +567,16 @@ fn service_scope_matches(
     declared: &super::manifest::ServiceScope,
     requested: &super::composable::Scope,
     extension_id: &str,
-    workspace: &str,
+    workspace: Option<&Path>,
     session_id: &str,
 ) -> bool {
     use super::composable::Scope;
     use super::manifest::ServiceScope;
     match (declared, requested) {
         (ServiceScope::Host, Scope::Host) => true,
-        (ServiceScope::Workspace, Scope::Workspace(id)) => id == workspace,
+        (ServiceScope::Workspace, Scope::Workspace(id)) => {
+            workspace.is_some_and(|workspace| Path::new(id) == workspace)
+        }
         (ServiceScope::Session, Scope::Session(id)) => id == session_id,
         (ServiceScope::Extension, Scope::Extension(id)) => id == extension_id,
         _ => false,
@@ -1387,7 +1396,8 @@ impl ExtensionHost {
             if !entry.applied || entry.error.is_some() {
                 continue;
             }
-            if preset_allowed.is_some_and(|allowed| !allowed.contains(entry.package.id().as_str())) {
+            if preset_allowed.is_some_and(|allowed| !allowed.contains(entry.package.id().as_str()))
+            {
                 continue;
             }
             let Some(runtime) = &entry.runtime else {
@@ -1432,13 +1442,19 @@ impl ExtensionHost {
             );
             let mut fiber = Fiber::new(entry.package.id().as_str());
             if let Err(error) = fiber.transition(FiberState::Loading) {
-                log::error!("extension {}: Fiber could not start: {error}", entry.package.id());
+                log::error!(
+                    "extension {}: Fiber could not start: {error}",
+                    entry.package.id()
+                );
                 let _ = lease.revoke(agent, registry);
                 continue;
             }
             lease.attach_to_fiber(&mut fiber);
             if let Err(error) = fiber.transition(FiberState::Active) {
-                log::error!("extension {}: Fiber could not activate: {error}", entry.package.id());
+                log::error!(
+                    "extension {}: Fiber could not activate: {error}",
+                    entry.package.id()
+                );
                 let _ = fiber.unload();
                 let _ = lease.revoke(agent, registry);
                 continue;
@@ -3043,9 +3059,15 @@ requires = [{ name = "com.example.search", contract = "com.example.search-api", 
             .into_iter()
             .find(|status| status.id == "com.example.hosted")
             .expect("hosted extension remains visible");
-        assert!(!status.applied, "a missing required service must block activation");
         assert!(
-            status.error.as_deref().is_some_and(|error| error.contains("service dependency planning")),
+            !status.applied,
+            "a missing required service must block activation"
+        );
+        assert!(
+            status
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("service dependency planning")),
             "{status:?}"
         );
         let _ = std::fs::remove_dir_all(&root);

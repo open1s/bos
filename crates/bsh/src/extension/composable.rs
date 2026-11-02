@@ -17,7 +17,7 @@ use std::fmt;
 use std::ops::Deref;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use super::manifest::{Manifest, ServiceScope};
@@ -115,7 +115,6 @@ impl<T> ServiceLease<T> {
     pub(crate) fn generation(&self) -> u64 {
         self.generation
     }
-
 }
 
 impl<T> Deref for ServiceLease<T> {
@@ -197,9 +196,7 @@ impl ServiceRegistry {
     }
 
     /// Subscribe to service availability transitions.
-    pub(crate) fn subscribe_changes(
-        &self,
-    ) -> tokio::sync::broadcast::Receiver<ServiceChange> {
+    pub(crate) fn subscribe_changes(&self) -> tokio::sync::broadcast::Receiver<ServiceChange> {
         self.changes.subscribe()
     }
 
@@ -272,11 +269,7 @@ impl ServiceRegistry {
     ///
     /// This compatibility lookup does not participate in in-flight draining;
     /// callers that perform work through the service must use acquire().
-    pub(crate) fn get<T>(
-        &self,
-        scope: &Scope,
-        name: &str,
-    ) -> Option<Arc<T>>
+    pub(crate) fn get<T>(&self, scope: &Scope, name: &str) -> Option<Arc<T>>
     where
         T: Any + Send + Sync,
     {
@@ -356,10 +349,7 @@ impl ServiceRegistry {
     }
 
     /// Revoke the current generation and return a handle for draining its calls.
-    pub(crate) fn revoke_with_retirement(
-        &self,
-        token: &ServiceToken,
-    ) -> Option<ServiceRetirement> {
+    pub(crate) fn revoke_with_retirement(&self, token: &ServiceToken) -> Option<ServiceRetirement> {
         let mut entries = self.entries.write().ok()?;
         if !entries
             .get(&token.key)
@@ -397,14 +387,22 @@ pub(crate) struct DependencyPlan {
 /// Why a dependency graph cannot be activated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DependencyError {
-    Missing { extension: String, dependency: String },
-    Cycle { members: Vec<String> },
+    Missing {
+        extension: String,
+        dependency: String,
+    },
+    Cycle {
+        members: Vec<String>,
+    },
 }
 
 impl fmt::Display for DependencyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Missing { extension, dependency } => {
+            Self::Missing {
+                extension,
+                dependency,
+            } => {
                 write!(f, "{extension} requires missing extension {dependency}")
             }
             Self::Cycle { members } => {
@@ -497,8 +495,15 @@ struct ServiceProvider {
 /// Why service declarations cannot produce an activation graph.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ServiceContractError {
-    DuplicateProvider { service: String, first: String, second: String },
-    MissingProvider { extension: String, service: String },
+    DuplicateProvider {
+        service: String,
+        first: String,
+        second: String,
+    },
+    MissingProvider {
+        extension: String,
+        service: String,
+    },
     VersionMismatch {
         extension: String,
         service: String,
@@ -511,14 +516,23 @@ pub(crate) enum ServiceContractError {
 impl fmt::Display for ServiceContractError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::DuplicateProvider { service, first, second } => write!(
+            Self::DuplicateProvider {
+                service,
+                first,
+                second,
+            } => write!(
                 f,
                 "service {service} has multiple providers: {first} and {second}"
             ),
             Self::MissingProvider { extension, service } => {
                 write!(f, "{extension} requires missing service {service}")
             }
-            Self::VersionMismatch { extension, service, required, provided } => write!(
+            Self::VersionMismatch {
+                extension,
+                service,
+                required,
+                provided,
+            } => write!(
                 f,
                 "{extension} requires {service} {required}, but provider exposes {provided}"
             ),
@@ -561,10 +575,7 @@ pub(crate) fn plan_service_dependencies(
             };
             if let Some(previous) = providers.insert(key, provider.clone()) {
                 return Err(ServiceContractError::DuplicateProvider {
-                    service: format!(
-                        "{}@{}",
-                        service.name, service.contract
-                    ),
+                    service: format!("{}@{}", service.name, service.contract),
                     first: previous.extension,
                     second: provider.extension,
                 });
@@ -642,7 +653,11 @@ pub(crate) struct FiberTransitionError {
 
 impl fmt::Display for FiberTransitionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "invalid Fiber transition: {:?} -> {:?}", self.from, self.to)
+        write!(
+            f,
+            "invalid Fiber transition: {:?} -> {:?}",
+            self.from, self.to
+        )
     }
 }
 
@@ -732,10 +747,7 @@ impl Fiber {
     }
 
     /// Move to the next state if the transition is legal.
-    pub(crate) fn transition(
-        &mut self,
-        to: FiberState,
-    ) -> Result<(), FiberTransitionError> {
+    pub(crate) fn transition(&mut self, to: FiberState) -> Result<(), FiberTransitionError> {
         let valid = matches!(
             (self.state, to),
             (FiberState::Pending, FiberState::Loading)
@@ -749,7 +761,10 @@ impl Fiber {
                 | (FiberState::Unloading, FiberState::Disposed)
         );
         if !valid {
-            return Err(FiberTransitionError { from: self.state, to });
+            return Err(FiberTransitionError {
+                from: self.state,
+                to,
+            });
         }
         self.state = to;
         if to == FiberState::Disposed {
@@ -776,6 +791,7 @@ impl Fiber {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     #[test]
     fn service_replacement_is_generation_safe() {
@@ -785,7 +801,10 @@ mod tests {
         let new = registry.provide(scope.clone(), "clock", Arc::new(2_u64));
 
         assert_eq!(*registry.get::<u64>(&scope, "clock").unwrap(), 2);
-        assert!(!registry.revoke(&old), "stale cleanup must not revoke replacement");
+        assert!(
+            !registry.revoke(&old),
+            "stale cleanup must not revoke replacement"
+        );
         assert_eq!(*registry.get::<u64>(&scope, "clock").unwrap(), 2);
         assert!(registry.revoke(&new));
         assert!(!registry.contains::<u64>(&scope, "clock"));
@@ -815,7 +834,12 @@ mod tests {
         assert_eq!(current.generation(), newest);
 
         let generations: Vec<_> = (0..8)
-            .map(|_| changes.try_recv().expect("provider change event").generation)
+            .map(|_| {
+                changes
+                    .try_recv()
+                    .expect("provider change event")
+                    .generation
+            })
             .collect();
         assert!(
             generations.windows(2).all(|pair| pair[0] < pair[1]),
@@ -831,11 +855,8 @@ mod tests {
 
         let old_lease = registry.acquire::<String>(&scope, "index").unwrap();
         let old_generation = old_lease.generation();
-        let (new_token, retirement) = registry.provide_with_retirement(
-            scope.clone(),
-            "index",
-            Arc::new("new".to_string()),
-        );
+        let (new_token, retirement) =
+            registry.provide_with_retirement(scope.clone(), "index", Arc::new("new".to_string()));
         let retirement = retirement.expect("replaced generation");
         assert_eq!(retirement.generation(), old_generation);
         assert_eq!(retirement.in_flight(), 1);
@@ -890,8 +911,14 @@ mod tests {
         assert_eq!(replaced.kind, ServiceChangeKind::Replaced);
         assert_eq!(replaced.generation, second.generation);
 
-        assert!(!registry.revoke(&first), "stale token cannot revoke the replacement");
-        assert!(changes.try_recv().is_err(), "stale cleanup emits no unavailable event");
+        assert!(
+            !registry.revoke(&first),
+            "stale token cannot revoke the replacement"
+        );
+        assert!(
+            changes.try_recv().is_err(),
+            "stale cleanup emits no unavailable event"
+        );
         assert!(registry.revoke(&second));
         let unavailable = changes.try_recv().expect("unavailable event");
         assert_eq!(unavailable.kind, ServiceChangeKind::Unavailable);
@@ -906,12 +933,7 @@ mod tests {
         fiber.transition(FiberState::Loading).unwrap();
         fiber.transition(FiberState::Active).unwrap();
 
-        registry.provide_owned(
-            scope.clone(),
-            "clock",
-            Arc::new(1_u64),
-            &mut fiber,
-        );
+        registry.provide_owned(scope.clone(), "clock", Arc::new(1_u64), &mut fiber);
         registry.provide(scope.clone(), "clock", Arc::new(2_u64));
 
         fiber.unload().unwrap();
@@ -926,16 +948,16 @@ mod tests {
     fn service_scope_isolation_is_strict() {
         let registry = ServiceRegistry::new();
         registry.provide(Scope::Workspace("w1".into()), "index", Arc::new(7_u32));
-        assert!(registry.get::<u32>(&Scope::Workspace("w1".into()), "index").is_some());
-        assert!(registry.get::<u32>(&Scope::Workspace("w2".into()), "index").is_none());
+        assert!(registry
+            .get::<u32>(&Scope::Workspace("w1".into()), "index")
+            .is_some());
+        assert!(registry
+            .get::<u32>(&Scope::Workspace("w2".into()), "index")
+            .is_none());
         assert!(registry.get::<u32>(&Scope::Host, "index").is_none());
     }
 
-    fn manifest_with_service_contract(
-        id: &str,
-        provides: &str,
-        requires: &str,
-    ) -> Manifest {
+    fn manifest_with_service_contract(id: &str, provides: &str, requires: &str) -> Manifest {
         let base = include_str!("manifest.rs");
         let start = base.find("fn sample() -> String").expect("sample helper");
         let source = &base[start..];
@@ -1036,7 +1058,9 @@ mod tests {
         );
         assert!(matches!(
             plan_service_dependencies(&[first, second]),
-            Err(ServiceContractError::Dependency(DependencyError::Cycle { .. }))
+            Err(ServiceContractError::Dependency(
+                DependencyError::Cycle { .. }
+            ))
         ));
     }
 
@@ -1095,7 +1119,10 @@ mod tests {
             "",
         );
         let plan = plan_service_dependencies(&[consumer, provider]).unwrap();
-        assert_eq!(plan.order, vec!["com.example.consumer", "com.example.provider"]);
+        assert_eq!(
+            plan.order,
+            vec!["com.example.consumer", "com.example.provider"]
+        );
     }
 
     #[test]
@@ -1113,7 +1140,10 @@ mod tests {
     fn dependency_graph_reports_missing_nodes_and_cycles() {
         let mut missing = DependencyGraph::default();
         missing.insert("app", ["database".into()]);
-        assert!(matches!(missing.plan(), Err(DependencyError::Missing { .. })));
+        assert!(matches!(
+            missing.plan(),
+            Err(DependencyError::Missing { .. })
+        ));
 
         let mut cyclic = DependencyGraph::default();
         cyclic.insert("a", ["b".into()]);
@@ -1143,10 +1173,14 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let mut effects = EffectSet::new();
         let first = count.clone();
-        effects.push(move || { first.fetch_add(1, Ordering::SeqCst); });
+        effects.push(move || {
+            first.fetch_add(1, Ordering::SeqCst);
+        });
         effects.push(|| panic!("cleanup failure"));
         let last = count.clone();
-        effects.push(move || { last.fetch_add(1, Ordering::SeqCst); });
+        effects.push(move || {
+            last.fetch_add(1, Ordering::SeqCst);
+        });
 
         assert_eq!(effects.rollback(), 3);
         assert_eq!(count.load(Ordering::SeqCst), 2);

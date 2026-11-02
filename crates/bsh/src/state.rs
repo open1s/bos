@@ -505,8 +505,7 @@ pub(crate) struct AppState {
     ///
     /// Dropping these handles runs Fiber effect cleanup and closes each
     /// extension tool's liveness gate before the turn's Agent is released.
-    turn_extension_activations:
-        HashMap<String, Vec<crate::extension::host::AppliedExtension>>,
+    turn_extension_activations: HashMap<String, Vec<crate::extension::host::AppliedExtension>>,
     /// Messages taken off a queue to steer, by ticket.
     ///
     /// A message is removed from the queue the moment the reader asks for it

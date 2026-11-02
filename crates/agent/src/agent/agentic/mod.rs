@@ -673,7 +673,9 @@ impl Agent {
         } else {
             (start - 2, end)
         };
-        self.config.system_prompt.replace_range(remove_start..remove_end, "");
+        self.config
+            .system_prompt
+            .replace_range(remove_start..remove_end, "");
         self.engine_cache.lock().unwrap().take();
         self.context_cache.lock().unwrap().take();
         true
@@ -1008,7 +1010,8 @@ impl Agent {
             return 0;
         }
         let before = self.skills.len();
-        self.skills.retain(|skill| !paths.contains(&skill.metadata.path));
+        self.skills
+            .retain(|skill| !paths.contains(&skill.metadata.path));
         let removed = before - self.skills.len();
         if removed > 0 {
             self.engine_cache.lock().unwrap().take();
