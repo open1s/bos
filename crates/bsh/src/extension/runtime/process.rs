@@ -1143,6 +1143,50 @@ mod tests {
 
     static TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminating_a_process_group_also_stops_its_descendants() {
+        use std::io::BufRead;
+        use std::time::Instant;
+
+        let mut command = std::process::Command::new("sh");
+        command
+            .args(["-c", "sleep 30 & echo $!; wait"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        configure_std_process_limits(&mut command, 256 * 1024 * 1024, 10);
+        let mut child = command.spawn().expect("spawn process-group fixture");
+
+        let mut descendant = String::new();
+        std::io::BufReader::new(child.stdout.take().expect("stdout"))
+            .read_line(&mut descendant)
+            .expect("read descendant pid");
+        let descendant_pid: u32 = descendant.trim().parse().expect("numeric descendant pid");
+
+        assert!(
+            terminate_process_group(child.id()),
+            "the dedicated process group must be signalled"
+        );
+        let _ = child.wait();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let stat = std::fs::read_to_string(format!("/proc/{descendant_pid}/stat"));
+            let is_running = stat
+                .ok()
+                .and_then(|stat| stat.rsplit_once(") ").map(|(_, state)| state.starts_with(|c: char| c != 'Z')))
+                .unwrap_or(false);
+            if !is_running || Instant::now() >= deadline {
+                assert!(
+                    !is_running,
+                    "descendant {descendant_pid} remained running after group termination"
+                );
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     #[test]
     fn the_macos_profile_denies_writes_outside_declared_roots() {
         let profile = sandbox_profile(Path::new("/pkg"), None, None);
