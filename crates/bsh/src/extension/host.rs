@@ -1861,10 +1861,69 @@ impl ExtensionHost {
 
     /// Every known extension as a status row.
     pub(crate) fn statuses(&self) -> Vec<ExtensionStatus> {
-        self.loaded
+        let mut statuses: Vec<ExtensionStatus> = self
+            .loaded
             .values()
             .map(|entry| self.status_of(entry))
-            .collect()
+            .collect();
+        let known: std::collections::BTreeSet<String> =
+            statuses.iter().map(|status| status.id.clone()).collect();
+        if let Ok(manager) = self.framework_manager() {
+            if let Ok(installed) = manager.installed() {
+                for extension in installed {
+                    if known.contains(&extension.id) {
+                        continue;
+                    }
+                    let package_root = manager.package_root(&extension.id, &extension.version).ok();
+                    let manifest = package_root.as_deref().and_then(|root| {
+                        bos_ext_core::manifest_v2::load_package_manifest(root).ok()
+                    });
+                    let error = package_root.as_deref().and_then(|root| {
+                        bos_ext_core::manifest_v2::load_package_manifest(root)
+                            .err()
+                            .map(|error| error.to_string())
+                    });
+                    let root = package_root
+                        .map(|root| root.display().to_string())
+                        .unwrap_or_default();
+                    statuses.push(ExtensionStatus {
+                        id: extension.id.clone(),
+                        name: manifest
+                            .as_ref()
+                            .map(|manifest| manifest.extension.name.clone())
+                            .unwrap_or_else(|| extension.id.clone()),
+                        version: extension.version,
+                        runtime: manifest
+                            .as_ref()
+                            .map(|manifest| manifest.runtime.kind.to_string())
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        program: None,
+                        trust: "unknown".to_string(),
+                        source: "installed".to_string(),
+                        root,
+                        hash: String::new(),
+                        state: LifecycleState::Installed,
+                        health: Health::Unknown,
+                        configured: true,
+                        applied: false,
+                        tools: Vec::new(),
+                        commands: Vec::new(),
+                        panels: Vec::new(),
+                        skills: Vec::new(),
+                        languages: Vec::new(),
+                        integrations: Vec::new(),
+                        capabilities: Vec::new(),
+                        error,
+                        startup_ms: 0,
+                        installed_at: 0,
+                        dependencies: Vec::new(),
+                        signature: "unsigned".to_string(),
+                        publisher: None,
+                    });
+                }
+            }
+        }
+        statuses
     }
 
     /// The composition graph as declared by the loaded packages.
@@ -3607,12 +3666,12 @@ tools = ["echo"]
                 .any(|status| status.id == "com.example.hosted"),
             "the good package is still listed"
         );
-        assert!(
-            !statuses
-                .iter()
-                .any(|status| status.id == "com.example.broken"),
-            "the broken package is isolated from the good one"
-        );
+        let broken = statuses
+            .iter()
+            .find(|status| status.id == "com.example.broken")
+            .expect("the broken package is still listed as installed");
+        assert!(!broken.applied, "the broken package is not applied");
+        assert!(broken.error.is_some(), "the broken manifest is reported");
     }
     #[test]
     fn the_builtin_inspector_is_registered_and_applied() {
@@ -3675,6 +3734,22 @@ tools = ["echo"]
             .why("com.bos.bsh.diagnostics")
             .is_some_and(|why| why.contains("disabled")));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn statuses_include_manager_installed_packages() {
+        let root = scratch("status-manager");
+        let host = ExtensionHost::open(config(&root)).expect("host");
+        let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/extensions/hello");
+        host.store.install(&source).expect("install");
+        let status = host
+            .statuses()
+            .into_iter()
+            .find(|status| status.id == "com.example.hello")
+            .expect("installed status");
+        assert_eq!(status.state, LifecycleState::Installed);
+        assert!(!status.applied);
     }
 
     #[test]

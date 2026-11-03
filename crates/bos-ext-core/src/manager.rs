@@ -68,6 +68,16 @@ impl ExtensionManager {
         self.store.root().to_path_buf()
     }
 
+    /// The canonical package root for one installed version.
+    pub fn package_root(&self, id: &str, version: &str) -> Result<PathBuf, ExtError> {
+        let id = ExtensionId::parse(id.to_string()).map_err(|error| ExtError {
+            code: ErrorCode::Manifest,
+            message: error.to_string(),
+            details: serde_json::Value::Null,
+        })?;
+        Ok(self.store.version_root(&id, version))
+    }
+
     /// Installed id/version pairs, sorted by id and version.
     pub fn installed(&self) -> Result<Vec<InstalledExtension>, ExtError> {
         let registry = self.store.read_registry().map_err(|error| ExtError {
@@ -157,11 +167,12 @@ impl ExtensionManager {
         })?;
         let version = self.version_of(id)?;
         let root = self.store.version_root(&extension_id, &version);
-        let manifest = crate::manifest_v2::load_package_manifest(&root).map_err(|error| ExtError {
-            code: ErrorCode::Manifest,
-            message: error.to_string(),
-            details: serde_json::Value::Null,
-        })?;
+        let manifest =
+            crate::manifest_v2::load_package_manifest(&root).map_err(|error| ExtError {
+                code: ErrorCode::Manifest,
+                message: error.to_string(),
+                details: serde_json::Value::Null,
+            })?;
         let data_root = self.store.data_dir(&extension_id);
         let runtime = runtimes.create(&manifest, &root, &data_root)?;
         let listed = runtime
@@ -204,7 +215,6 @@ impl ExtensionManager {
             })
     }
 
-
     /// Resolve installed packages into an activation order.
     #[cfg(feature = "tokio")]
     pub fn plan(&self) -> Result<ManagerPlan, ExtError> {
@@ -231,20 +241,20 @@ impl ExtensionManager {
                     details: serde_json::Value::Null,
                 })?;
             let root = self.store.version_root(&id, &version);
-            let manifest = crate::manifest_v2::load_package_manifest(&root).map_err(|error| ExtError {
-                code: ErrorCode::Manifest,
-                message: error.to_string(),
-                details: serde_json::Value::Null,
-            })?;
+            let manifest =
+                crate::manifest_v2::load_package_manifest(&root).map_err(|error| ExtError {
+                    code: ErrorCode::Manifest,
+                    message: error.to_string(),
+                    details: serde_json::Value::Null,
+                })?;
             manifests.push(manifest);
         }
-        let plan = crate::composable::plan_service_dependencies(&manifests).map_err(|error| {
-            ExtError {
+        let plan =
+            crate::composable::plan_service_dependencies(&manifests).map_err(|error| ExtError {
                 code: ErrorCode::Service,
                 message: error.to_string(),
                 details: serde_json::Value::Null,
-            }
-        })?;
+            })?;
         Ok(ManagerPlan { order: plan.order })
     }
 }
@@ -352,7 +362,6 @@ mod tests {
         assert!(manager.installed().expect("installed").is_empty());
     }
 
-
     struct MockRuntime;
     struct MockLease(Arc<std::sync::atomic::AtomicUsize>);
     struct MockSink(Arc<std::sync::atomic::AtomicUsize>);
@@ -427,12 +436,10 @@ mod tests {
             contracts: ServiceContractRegistry::default(),
         });
         let revoked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let manager = ExtensionManager::open(host)
-            .expect("manager")
-            .with_ports(
-                Arc::new(MockResolver),
-                Arc::new(MockSink(Arc::clone(&revoked))),
-            );
+        let manager = ExtensionManager::open(host).expect("manager").with_ports(
+            Arc::new(MockResolver),
+            Arc::new(MockSink(Arc::clone(&revoked))),
+        );
         let example =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/extensions/hello");
         manager.install(&example).expect("install");
@@ -443,7 +450,6 @@ mod tests {
         assert_eq!(revoked.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-
     #[tokio::test]
     async fn reload_keeps_unchanged_activations() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -453,12 +459,10 @@ mod tests {
             contracts: ServiceContractRegistry::default(),
         });
         let revoked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let manager = ExtensionManager::open(host)
-            .expect("manager")
-            .with_ports(
-                Arc::new(MockResolver),
-                Arc::new(MockSink(Arc::clone(&revoked))),
-            );
+        let manager = ExtensionManager::open(host).expect("manager").with_ports(
+            Arc::new(MockResolver),
+            Arc::new(MockSink(Arc::clone(&revoked))),
+        );
         let example =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/extensions/hello");
         manager.install(&example).expect("install");
