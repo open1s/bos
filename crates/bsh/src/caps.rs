@@ -5949,6 +5949,7 @@ mod tests {
                 "glob".to_string(),
                 "grep".to_string(),
                 "list_dir".to_string(),
+                "apply_patch".to_string(),
                 "read_files".to_string(),
                 "write_file".to_string(),
             ]
@@ -7659,6 +7660,95 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             directory.to_string().contains("is a directory"),
             "{directory}"
         );
+    }
+
+    #[test]
+    fn apply_patch_updates_multiple_files_with_one_atomic_write_each() {
+        let root = scratch("apply-patch-multi");
+        std::fs::write(root.join("a.rs"), "fn old_a() {}\n").expect("a");
+        std::fs::write(root.join("b.rs"), "fn old_b() {}\n").expect("b");
+        let built = build(&confined(&root));
+        let result = built
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "apply_patch",
+                &serde_json::json!({
+                    "changes": [
+                        {
+                            "path": "a.rs",
+                            "edits": [
+                                {"old_string": "old_a", "new_string": "new_a"},
+                                {"old_string": "fn new_a()", "new_string": "pub fn new_a()"}
+                            ]
+                        },
+                        {
+                            "path": "b.rs",
+                            "edits": [
+                                {"old_string": "old_b", "new_string": "new_b"}
+                            ]
+                        }
+                    ]
+                }),
+            )
+            .expect("patch call");
+        assert_eq!(result["changed_files"], 2);
+        assert_eq!(std::fs::read_to_string(root.join("a.rs")).expect("a"), "pub fn new_a() {}\n");
+        assert_eq!(std::fs::read_to_string(root.join("b.rs")).expect("b"), "fn new_b() {}\n");
+        assert_eq!(result["files"][0]["replacements"], 2);
+    }
+
+    #[test]
+    fn apply_patch_leaves_a_file_unchanged_when_any_edit_fails() {
+        let root = scratch("apply-patch-failure");
+        let file = root.join("src.rs");
+        std::fs::write(&file, "let value = 1;\n").expect("seed");
+        let built = build(&confined(&root));
+        let result = built
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "apply_patch",
+                &serde_json::json!({
+                    "changes": [{
+                        "path": "src.rs",
+                        "edits": [
+                            {"old_string": "value = 1", "new_string": "value = 2"},
+                            {"old_string": "missing", "new_string": "present"}
+                        ]
+                    }]
+                }),
+            )
+            .expect("per-file error is reported in the result");
+        assert!(result["files"][0]["error"].as_str().is_some());
+        assert_eq!(std::fs::read_to_string(file).expect("unchanged"), "let value = 1;\n");
+        assert_eq!(result["changed_files"], 0);
+    }
+
+    #[test]
+    fn apply_patch_rejects_duplicate_paths_and_empty_search_text() {
+        let root = scratch("apply-patch-invalid");
+        std::fs::write(root.join("src.rs"), "value").expect("seed");
+        let registry = build(&confined(&root)).agent.registry().expect("registry");
+        let duplicate = registry.execute(
+            "apply_patch",
+            &serde_json::json!({"changes": [
+                {"path": "src.rs", "edits": [{"old_string": "value", "new_string": "one"}]},
+                {"path": "./src.rs", "edits": [{"old_string": "value", "new_string": "two"}]}
+            ]}),
+        ).expect("per-file errors are reported");
+        assert!(duplicate["files"][1]["error"].as_str().is_some());
+
+        let empty = registry.execute(
+            "apply_patch",
+            &serde_json::json!({"changes": [
+                {"path": "src.rs", "edits": [{"old_string": "", "new_string": "x"}]}
+            ]}),
+        ).expect("per-file errors are reported");
+        assert!(empty["files"][0]["error"].as_str().is_some());
+        assert_eq!(std::fs::read_to_string(root.join("src.rs")).expect("unchanged"), "value");
     }
 
     /// A byte-identical write does not touch the file: its mtime stays put, so
