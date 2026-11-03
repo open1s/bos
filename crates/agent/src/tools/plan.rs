@@ -146,13 +146,16 @@ impl Tool for PlanTool {
             "properties": {
                 "items": {
                     "type": "array",
-                    "description": "The complete plan: every step with its status.",
+                    "description": "The complete replacement plan. Use an empty array to clear it; include at most 100 steps.",
+                    "maxItems": 100,
                     "items": {
                         "type": "object",
                         "properties": {
                             "text": {
                                 "type": "string",
-                                "description": "One concise step description."
+                                "minLength": 1,
+                                "maxLength": 500,
+                                "description": "One concise, non-empty step description of at most 500 characters."
                             },
                             "status": {
                                 "type": "string",
