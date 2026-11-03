@@ -3704,15 +3704,15 @@ fn read_files_tool(
                         "paths entries must not be empty".to_string(),
                     ));
                 }
-                if !seen.insert(raw) {
-                    return Err(ToolError::InvalidInput(format!(
-                        "duplicate path in read_files: {raw}"
-                    )));
-                }
-
                 let result = (|| -> Result<serde_json::Value, ToolError> {
                     let target = resolve_path(root.as_deref(), raw, enforce)
                         .map_err(ToolError::InvalidInput)?;
+                    if !seen.insert(target.clone()) {
+                        return Err(ToolError::InvalidInput(format!(
+                            "duplicate target path in read_files: {}",
+                            target.display()
+                        )));
+                    }
                     check_path(
                         &policy,
                         &session,
