@@ -14,7 +14,7 @@ declarative = []
 process = []
 workflow = []
 wasm = []
-extism = []
+extism = ["dep:extism"]
 mcp = []
 cordis = []
 
@@ -27,3 +27,6 @@ tokio.workspace = true
 uuid.workspace = true
 libc = "0.2"
 log = "0.4"
+base64 = "0.23.1"
+reqwest = { workspace = true, features = ["blocking"] }
+extism = { version = "1.41.0", default-features = false, optional = true }

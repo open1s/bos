@@ -14,6 +14,8 @@ pub mod declarative;
 pub mod process;
 #[cfg(feature = "mcp")]
 pub mod mcp;
+#[cfg(feature = "extism")]
+pub mod extism;
 #[cfg(feature = "workflow")]
 pub mod workflow;
 
