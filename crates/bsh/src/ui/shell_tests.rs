@@ -29980,6 +29980,35 @@ fn the_extensions_pane_keeps_mcp_and_skills(cx: &mut TestAppContext) {
         cx.debug_bounds("extension-theme-card-kit").is_some(),
         "the Kit theme is the first card"
     );
+    // The card's click handler used to re-enter `Shell::update` through an
+    // `Entity<Shell>` it had captured from `cx.entity()`, which panics with
+    // "cannot update Shell while it is already being updated" because the
+    // listener already runs inside that update.
+    cx.update(|_, cx| {
+        shell.update(cx, |shell, _| {
+            shell.state.draft_mut().global.general.extension_theme = Some("stale".to_string());
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let kit = cx
+        .debug_bounds("extension-theme-card-kit")
+        .expect("Kit card");
+    cx.simulate_click(kit.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(
+        cx.update(|_, cx| {
+            shell
+                .read(cx)
+                .state
+                .draft()
+                .global
+                .general
+                .extension_theme
+                .clone()
+        }),
+        None,
+        "clicking the Kit card returns the draft to the built-in theme"
+    );
     let market = cx
         .debug_bounds("extensions-tab-market")
         .expect("Market tab");

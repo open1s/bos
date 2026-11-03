@@ -7042,7 +7042,6 @@ impl Shell {
         });
         let theme_surfaces = self.extension_themes.clone().unwrap_or_default();
         let selected_theme = self.state.draft().global.general.extension_theme.clone();
-        let theme_view = cx.entity();
         let kit_label = tr(self.state.lang, "settings.themeKit").to_string();
         let mut cards: Vec<(Option<String>, String, Vec<u32>)> = vec![(
             None,
@@ -7090,7 +7089,6 @@ impl Shell {
             let active = selected_theme == choice;
             let id = choice.clone().unwrap_or_else(|| "kit".to_string());
             let selector = format!("extension-theme-card-{id}");
-            let pick = theme_view.clone();
             let click_choice = choice.clone();
             let colors = choice
                 .as_ref()
@@ -7127,7 +7125,6 @@ impl Shell {
                             Some(colors) => theme::set_extension_tokens(&colors),
                             None => theme::clear_extension_tokens(),
                         }
-                        pick.update(cx, |_, cx| cx.notify());
                         cx.notify();
                     }))
                     .child(
