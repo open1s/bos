@@ -7384,7 +7384,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
 
         for paths in [
             serde_json::json!([]),
-            serde_json::json!(["a"; 11]),
+            serde_json::json!((0..11).map(|_| "a").collect::<Vec<_>>()),
             serde_json::json!(["a", "a"]),
         ] {
             assert!(
