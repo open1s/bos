@@ -1,7 +1,8 @@
 # BOS Extension Framework (bos-ext)
 
 Status: Phase 5 in progress — manifest 2.0 envelope, migration and dual-version
-loading are live. BSH imports core primitives and standard runtimes directly;
+loading are live; migration preserves runtime entry, args, env, protocol and
+startup policy in `runtime.config`. BSH imports core primitives and standard runtimes directly;
 the Phase-1 composable/runtime/core re-export modules are deleted (only the
 terminal/hooks adapters and the `topics` convenience alias remain). Phase 3 host
 wiring is partial: BSH has a `BosHostSpec` adapter and `framework_manager()`, and

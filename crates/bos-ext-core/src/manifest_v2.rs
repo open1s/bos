@@ -43,6 +43,49 @@ fn empty_table() -> toml::Value {
     toml::Value::Table(toml::map::Map::new())
 }
 
+fn runtime_config(legacy: &Manifest) -> toml::Value {
+    let mut table = toml::map::Map::new();
+    if let Some(entry) = &legacy.runtime.entry {
+        table.insert("entry".to_string(), toml::Value::String(entry.clone()));
+    }
+    if !legacy.runtime.args.is_empty() {
+        table.insert(
+            "args".to_string(),
+            toml::Value::Array(
+                legacy
+                    .runtime
+                    .args
+                    .iter()
+                    .cloned()
+                    .map(toml::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    if !legacy.runtime.env.is_empty() {
+        let mut env = toml::map::Map::new();
+        for (key, value) in &legacy.runtime.env {
+            env.insert(key.clone(), toml::Value::String(value.clone()));
+        }
+        table.insert("env".to_string(), toml::Value::Table(env));
+    }
+    if let Some(protocol) = &legacy.runtime.protocol {
+        table.insert("protocol".to_string(), toml::Value::String(protocol.clone()));
+    }
+    let startup = match legacy.runtime.startup {
+        crate::types::StartupPolicy::OnStartup => "on-startup",
+        crate::types::StartupPolicy::OnDemand => "on-demand",
+        crate::types::StartupPolicy::OnWorkspaceOpen => "on-workspace-open",
+        crate::types::StartupPolicy::Manual => "manual",
+    };
+    table.insert(
+        "startup".to_string(),
+        toml::Value::String(startup.to_string()),
+    );
+    toml::Value::Table(table)
+}
+
+
 /// The required-only capability list.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -211,7 +254,7 @@ impl ManifestV2 {
             },
             runtime: RuntimeSpecV2 {
                 kind: legacy.runtime.kind.as_str().to_string(),
-                config: empty_table(),
+                config: runtime_config(legacy),
             },
             capabilities: CapabilitiesV2 {
                 required: legacy
@@ -284,6 +327,24 @@ impl ManifestV2 {
                     .collect()
             })
             .unwrap_or_default();
+        let env = config
+            .get("env")
+            .and_then(toml::Value::as_table)
+            .map(|table| {
+                table
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        value.as_str().map(|value| (key.clone(), value.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let startup = match config.get("startup").and_then(toml::Value::as_str) {
+            Some("on-startup") => crate::types::StartupPolicy::OnStartup,
+            Some("on-workspace-open") => crate::types::StartupPolicy::OnWorkspaceOpen,
+            Some("manual") => crate::types::StartupPolicy::Manual,
+            _ => crate::types::StartupPolicy::OnDemand,
+        };
         Ok(Manifest {
             schema_version: "1.1".to_string(),
             extension: self.extension,
@@ -296,8 +357,8 @@ impl ManifestV2 {
                 kind: RuntimeKind::parse(&self.runtime.kind)?,
                 entry,
                 args,
-                env: Default::default(),
-                startup: Default::default(),
+                env,
+                startup,
                 protocol,
             },
             capabilities,
@@ -460,5 +521,22 @@ id = "echo"
             .tools
             .iter()
             .any(|id| id.as_str() == "echo"));
+    }
+
+    #[test]
+    fn process_runtime_config_survives_migration() {
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/extensions/process-echo");
+        let temp = tempfile::tempdir().expect("tempdir");
+        crate::package::copy_tree(&source, temp.path()).expect("copy");
+        write_migrated_package(temp.path()).expect("migrate");
+        let v2 = ManifestV2::load(temp.path()).expect("v2");
+        assert_eq!(
+            v2.runtime.config.get("entry").and_then(toml::Value::as_str),
+            Some("python3")
+        );
+        let legacy = load_package_manifest(temp.path()).expect("load");
+        assert_eq!(legacy.runtime.entry.as_deref(), Some("python3"));
+        assert_eq!(legacy.runtime.args, vec!["server.py".to_string()]);
     }
 }
