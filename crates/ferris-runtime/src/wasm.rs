@@ -24,12 +24,12 @@ use wasmtime::{
 };
 
 use crate::contract::{CallContext, Runtime, ToolDescriptor, ToolResult};
-use bos_ext_core::capability::{CallScope, Capability, PolicyEngine};
-use bos_ext_core::events::{EventBus, EventFilter, ExtensionEvent, TopicPattern};
-use bos_ext_core::manifest::{validate_relative_path, Manifest, ResourcesSpec};
-use bos_ext_core::package::write_atomic;
-use bos_ext_core::storage::ExtensionStorage;
-use bos_ext_core::types::{
+use ferris_core::capability::{CallScope, Capability, PolicyEngine};
+use ferris_core::events::{EventBus, EventFilter, ExtensionEvent, TopicPattern};
+use ferris_core::manifest::{validate_relative_path, Manifest, ResourcesSpec};
+use ferris_core::package::write_atomic;
+use ferris_core::storage::ExtensionStorage;
+use ferris_core::types::{
     ContributionId, ExtensionError, ExtensionId, RuntimeKind, TrustLevel, HOST_VERSION,
 };
 
@@ -127,7 +127,7 @@ struct HostState {
     subscribes: Vec<String>,
     config: String,
     limits: TrackingLimiter,
-    subscriptions: BTreeMap<u64, bos_ext_core::events::Subscription>,
+    subscriptions: BTreeMap<u64, ferris_core::events::Subscription>,
     next_subscription: u64,
     deadline: Instant,
     cancelled: Arc<AtomicBool>,
@@ -1124,8 +1124,8 @@ impl Runtime for WasmRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bos_ext_core::capability::PolicyMode;
-    use bos_ext_core::types::TrustLevel as TestTrust;
+    use ferris_core::capability::PolicyMode;
+    use ferris_core::types::TrustLevel as TestTrust;
 
     fn scratch(label: &str) -> PathBuf {
         let path =

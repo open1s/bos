@@ -1340,71 +1340,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bos-ext-core"
-version = "0.1.0"
-dependencies = [
- "async-channel",
- "async-trait",
- "base64 0.23.1",
- "ed25519-dalek",
- "flate2",
- "futures",
- "rand 0.10.3",
- "reqwest",
- "semver",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2 0.11.1",
- "tar",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "toml 1.1.8+spec-1.1.0",
- "uuid",
- "walkdir",
-]
-
-[[package]]
-name = "bos-ext-runtime"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64 0.23.1",
- "bos-ext-core",
- "extism",
- "libc",
- "log",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "uuid",
- "wasmtime 50.0.1",
-]
-
-[[package]]
-name = "bos-ext-sdk"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bos-ext-core",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "bos-ext-smoke"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bos-ext-core",
- "bos-ext-sdk",
- "serde_json",
-]
-
-[[package]]
 name = "brotli"
 version = "9.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1445,13 +1380,13 @@ dependencies = [
  "async-channel",
  "async-trait",
  "base64 0.23.1",
- "bos-ext-core",
- "bos-ext-runtime",
  "chacha20poly1305",
  "config",
  "dirs 7.0.0",
  "ed25519-dalek",
  "extism",
+ "ferris-core",
+ "ferris-runtime",
  "flate2",
  "futures",
  "glob",
@@ -3502,6 +3437,71 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e6853b52649d4ac5c0bd02320cddc5ba956bdb407c4b75a2c6b75bf51500f8c"
 dependencies = [
  "simd-adler32",
+]
+
+[[package]]
+name = "ferris-core"
+version = "0.1.0"
+dependencies = [
+ "async-channel",
+ "async-trait",
+ "base64 0.23.1",
+ "ed25519-dalek",
+ "flate2",
+ "futures",
+ "rand 0.10.3",
+ "reqwest",
+ "semver",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2 0.11.1",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "toml 1.1.8+spec-1.1.0",
+ "uuid",
+ "walkdir",
+]
+
+[[package]]
+name = "ferris-runtime"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "extism",
+ "ferris-core",
+ "libc",
+ "log",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+ "wasmtime 50.0.1",
+]
+
+[[package]]
+name = "ferris-sdk"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "ferris-core",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "ferris-smoke"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "ferris-core",
+ "ferris-sdk",
+ "serde_json",
 ]
 
 [[package]]

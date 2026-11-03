@@ -22,11 +22,11 @@ use serde_json::{json, Value};
 
 use crate::contract::{load_tool_descriptors, CallContext, Runtime, ToolDescriptor, ToolResult};
 use crate::declarative::DeclarativeContributions;
-use bos_ext_core::capability::{CallScope, Capability, PolicyEngine};
-use bos_ext_core::events::{EventBus, EventFilter, ExtensionEvent, Subscription, TopicPattern};
-use bos_ext_core::manifest::{validate_relative_path, Manifest};
-use bos_ext_core::storage::ExtensionStorage;
-use bos_ext_core::types::{ContributionId, ExtensionError, ExtensionId, RuntimeKind, TrustLevel};
+use ferris_core::capability::{CallScope, Capability, PolicyEngine};
+use ferris_core::events::{EventBus, EventFilter, ExtensionEvent, Subscription, TopicPattern};
+use ferris_core::manifest::{validate_relative_path, Manifest};
+use ferris_core::storage::ExtensionStorage;
+use ferris_core::types::{ContributionId, ExtensionError, ExtensionId, RuntimeKind, TrustLevel};
 
 /// The largest request or result body the bridge accepts.
 const MAX_BRIDGE_BODY: usize = 8 * 1024 * 1024;
@@ -993,7 +993,7 @@ mod tests {
             PolicyEngine::open(
                 scratch.join("grants.toml"),
                 scratch.join("audit.jsonl"),
-                bos_ext_core::capability::PolicyMode::Enforce,
+                ferris_core::capability::PolicyMode::Enforce,
             )
             .expect("policy"),
         );
@@ -1048,7 +1048,7 @@ mod tests {
             PolicyEngine::open(
                 scratch.join("grants.toml"),
                 scratch.join("audit.jsonl"),
-                bos_ext_core::capability::PolicyMode::Enforce,
+                ferris_core::capability::PolicyMode::Enforce,
             )
             .expect("policy"),
         );
@@ -1062,7 +1062,7 @@ mod tests {
                 .grant(
                     "com.example.extism-hook",
                     capability,
-                    bos_ext_core::capability::GrantScope::Any,
+                    ferris_core::capability::GrantScope::Any,
                     None,
                 )
                 .expect("grant");
@@ -1121,7 +1121,7 @@ mod tests {
                 PolicyEngine::open(
                     root.join("grants.toml"),
                     root.join("audit.jsonl"),
-                    bos_ext_core::capability::PolicyMode::Enforce,
+                    ferris_core::capability::PolicyMode::Enforce,
                 )
                 .expect("policy"),
             ),

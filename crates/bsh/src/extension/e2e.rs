@@ -8,9 +8,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::host::{ExtensionHost, HostConfig};
 use super::market::GitMarket;
-use bos_ext_core::capability::{GrantScope, PolicyEngine, PolicyMode};
-use bos_ext_core::package::ExtensionStore;
-use bos_ext_core::types::ExtensionId;
+use ferris_core::capability::{GrantScope, PolicyEngine, PolicyMode};
+use ferris_core::package::ExtensionStore;
+use ferris_core::types::ExtensionId;
 
 static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
@@ -41,7 +41,7 @@ fn config(root: &Path) -> HostConfig {
 fn grant_all(
     store: &ExtensionStore,
     id: &ExtensionId,
-    required: &[bos_ext_core::capability::Capability],
+    required: &[ferris_core::capability::Capability],
 ) {
     let policy = PolicyEngine::open(store.grants_path(), store.audit_path(), PolicyMode::Enforce)
         .expect("policy");
@@ -137,9 +137,9 @@ async fn the_hook_demo_language_integration_and_hooks_are_live() {
         .expect("language check");
     assert_eq!(diagnostics["arguments"]["language"], "hookdemo");
 
-    let event = bos_ext_core::events::ExtensionEvent::new(
+    let event = ferris_core::events::ExtensionEvent::new(
         "bsh",
-        bos_ext_core::events::topics::SESSION_CREATED,
+        ferris_core::events::topics::SESSION_CREATED,
         serde_json::json!({"session": "e2e"}),
     )
     .expect("event");
@@ -362,7 +362,7 @@ async fn disabling_the_annotations_package_disables_the_notes_store() {
     let root = scratch("annotations-provider");
     std::fs::create_dir_all(root.join("workspace")).expect("workspace");
     let mut host = ExtensionHost::open(config(&root)).expect("host");
-    let id = bos_ext_core::types::ExtensionId::parse("com.bos.bsh.annotations").expect("id");
+    let id = ferris_core::types::ExtensionId::parse("com.bos.bsh.annotations").expect("id");
     let status = host
         .statuses()
         .into_iter()

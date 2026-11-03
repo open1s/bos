@@ -80,7 +80,7 @@ jobs:
   windows:
 
       - name: BOS extension SDK independence
-        run: bash scripts/ci/check-bos-ext-independence.sh
+        run: bash scripts/ci/check-ferris-independence.sh
     name: Windows extension tests
     runs-on: windows-latest
     steps:

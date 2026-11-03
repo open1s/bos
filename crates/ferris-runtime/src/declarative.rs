@@ -19,9 +19,9 @@ use serde_json::Value;
 use crate::contract::{
     load_tool_descriptors, CallContext, Implementation, Runtime, ToolDescriptor, ToolFile,
 };
-use bos_ext_core::manifest::{validate_relative_path, Manifest};
-use bos_ext_core::types::{ContributionId, ExtensionError, ExtensionId, RuntimeKind};
-use bos_ext_core::ui::{PanelLocation, PanelVisibility, UiDocument, UiSession};
+use ferris_core::manifest::{validate_relative_path, Manifest};
+use ferris_core::types::{ContributionId, ExtensionError, ExtensionId, RuntimeKind};
+use ferris_core::ui::{PanelLocation, PanelVisibility, UiDocument, UiSession};
 
 /// The largest declarative contribution file.
 pub const MAX_CONTRIBUTION_BYTES: u64 = 256 * 1024;
@@ -640,7 +640,7 @@ struct IntegrationFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bos_ext_core::ui::UI_SCHEMA_VERSION;
+    use ferris_core::ui::UI_SCHEMA_VERSION;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
@@ -773,7 +773,7 @@ max_output_bytes = 4096
             contributions.panels[0].view.root,
             UiDocument {
                 schema_version: UI_SCHEMA_VERSION.to_string(),
-                root: bos_ext_core::ui::UiNode::Text {
+                root: ferris_core::ui::UiNode::Text {
                     text: "Ready".to_string()
                 },
             }

@@ -664,7 +664,7 @@ fn scratch_copy(name: &str) -> PathBuf {
     let source = fixture(name);
     assert_clean_fixture(&source);
     let root = std::env::temp_dir().join(format!(
-        "bos-ext-{name}-{}-{:?}",
+        "ferris-{name}-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));

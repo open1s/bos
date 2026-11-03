@@ -20,10 +20,10 @@ use serde_json::{json, Value};
 
 use crate::contract::{CallContext, Runtime, ToolDescriptor, ToolResult};
 use crate::declarative::{DeclarativeContributions, TextContribution};
-use bos_ext_core::capability::{CallScope, Capability, PolicyEngine};
-use bos_ext_core::events::{EventBus, EventFilter, Subscription};
-use bos_ext_core::manifest::{is_allowlisted_command, validate_relative_path, Manifest};
-use bos_ext_core::types::{
+use ferris_core::capability::{CallScope, Capability, PolicyEngine};
+use ferris_core::events::{EventBus, EventFilter, Subscription};
+use ferris_core::manifest::{is_allowlisted_command, validate_relative_path, Manifest};
+use ferris_core::types::{
     ContributionId, ExtensionError, ExtensionId, RuntimeKind, TrustLevel, HOST_VERSION,
 };
 
@@ -1095,7 +1095,7 @@ async fn wait_for_blocking_call<T: Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bos_ext_core::manifest::Manifest;
+    use ferris_core::manifest::Manifest;
 
     #[tokio::test]
     async fn timed_out_worker_keeps_call_gate_held_until_worker_exits() {
@@ -1240,7 +1240,7 @@ required = ["process.execute"]
             PolicyEngine::open(
                 root.join("grants.toml"),
                 root.join("audit.jsonl"),
-                bos_ext_core::capability::PolicyMode::Enforce,
+                ferris_core::capability::PolicyMode::Enforce,
             )
             .expect("policy"),
         );
@@ -1248,7 +1248,7 @@ required = ["process.execute"]
             .grant(
                 manifest.id().as_str(),
                 Capability::ProcessExecute,
-                bos_ext_core::capability::GrantScope::Program("python3".to_string()),
+                ferris_core::capability::GrantScope::Program("python3".to_string()),
                 None,
             )
             .expect("grant");
@@ -1404,7 +1404,7 @@ required = ["process.execute"]
             PolicyEngine::open(
                 scratch.join("grants.toml"),
                 scratch.join("audit.jsonl"),
-                bos_ext_core::capability::PolicyMode::Enforce,
+                ferris_core::capability::PolicyMode::Enforce,
             )
             .expect("policy"),
         );
@@ -1412,7 +1412,7 @@ required = ["process.execute"]
             .grant(
                 "com.example.mcp-echo",
                 Capability::ProcessExecute,
-                bos_ext_core::capability::GrantScope::Program("python3".to_string()),
+                ferris_core::capability::GrantScope::Program("python3".to_string()),
                 None,
             )
             .expect("grant");

@@ -3,8 +3,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use bos_ext_core::types::ExtensionId;
-use bos_ext_core::{Contribution, ContributionRef, ExtError, InvokeContext};
+use ferris_core::types::ExtensionId;
+use ferris_core::{Contribution, ContributionRef, ExtError, InvokeContext};
 
 use crate::contract::{CallContext, Runtime as LegacyRuntime};
 
@@ -35,21 +35,21 @@ impl LegacyAdapter {
 
 fn runtime_error(error: impl std::fmt::Display) -> ExtError {
     ExtError {
-        code: bos_ext_core::ErrorCode::Runtime,
+        code: ferris_core::ErrorCode::Runtime,
         message: error.to_string(),
         details: serde_json::Value::Null,
     }
 }
 
 #[async_trait::async_trait]
-impl bos_ext_core::Runtime for LegacyAdapter {
+impl ferris_core::Runtime for LegacyAdapter {
     fn kind(&self) -> &str {
         self.inner.kind().as_str()
     }
 
     async fn start(
         &self,
-        _ctx: &bos_ext_core::RuntimeContext,
+        _ctx: &ferris_core::RuntimeContext,
     ) -> Result<Vec<Contribution>, ExtError> {
         self.inner.activate().await.map_err(runtime_error)?;
         let tools = self.inner.tools().await.map_err(runtime_error)?;
@@ -114,13 +114,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl LegacyRuntime for Echo {
-        fn kind(&self) -> bos_ext_core::types::RuntimeKind {
-            bos_ext_core::types::RuntimeKind::Declarative
+        fn kind(&self) -> ferris_core::types::RuntimeKind {
+            ferris_core::types::RuntimeKind::Declarative
         }
 
-        async fn tools(&self) -> Result<Vec<ToolDescriptor>, bos_ext_core::types::ExtensionError> {
+        async fn tools(&self) -> Result<Vec<ToolDescriptor>, ferris_core::types::ExtensionError> {
             Ok(vec![ToolDescriptor {
-                id: bos_ext_core::types::ContributionId::parse("echo").expect("id"),
+                id: ferris_core::types::ContributionId::parse("echo").expect("id"),
                 description: "Echo".to_string(),
                 input_schema: serde_json::json!({"type": "object"}),
                 capabilities: Vec::new(),
@@ -132,7 +132,7 @@ mod tests {
             _tool: &str,
             input: serde_json::Value,
             _context: &CallContext,
-        ) -> Result<serde_json::Value, bos_ext_core::types::ExtensionError> {
+        ) -> Result<serde_json::Value, ferris_core::types::ExtensionError> {
             Ok(input)
         }
     }
@@ -145,16 +145,16 @@ mod tests {
             None,
             Arc::new(Echo),
         );
-        let starter = bos_ext_core::RuntimeContext {
+        let starter = ferris_core::RuntimeContext {
             extension: "com.example.echo".to_string(),
             root: std::path::PathBuf::from("/tmp"),
             data_root: std::path::PathBuf::from("/tmp/data"),
         };
-        let contributions = bos_ext_core::Runtime::start(&adapter, &starter)
+        let contributions = ferris_core::Runtime::start(&adapter, &starter)
             .await
             .expect("start");
         assert_eq!(contributions.len(), 1);
-        let value = bos_ext_core::Runtime::invoke(
+        let value = ferris_core::Runtime::invoke(
             &adapter,
             &ContributionRef {
                 kind: "tool".to_string(),

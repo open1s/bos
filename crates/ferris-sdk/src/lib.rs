@@ -4,7 +4,7 @@
 //! An extension implements the Extension trait and ships a 2.0 manifest.
 //! There is no macro DSL: the manifest stays the single author entry point.
 
-use bos_ext_core::{
+use ferris_core::{
     Contribution, ContributionRef, ExtError, InvokeContext, Runtime, RuntimeContext,
 };
 use serde_json::Value;
@@ -104,7 +104,7 @@ impl<E: Extension> Runtime for ExtensionRuntime<E> {
     async fn start(&self, ctx: &RuntimeContext) -> Result<Vec<Contribution>, ExtError> {
         if ctx.root != self.root {
             return Err(ExtError {
-                code: bos_ext_core::ErrorCode::Runtime,
+                code: ferris_core::ErrorCode::Runtime,
                 message: "extension runtime root does not match its context".to_string(),
                 details: Value::Null,
             });
@@ -141,7 +141,7 @@ impl<E: Extension> Runtime for ExtensionRuntime<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bos_ext_core::types::ExtensionId;
+    use ferris_core::types::ExtensionId;
 
     struct Echo;
 

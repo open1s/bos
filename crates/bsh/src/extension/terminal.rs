@@ -1,5 +1,5 @@
-//! Host terminal adapter; the contract lives in bos-ext-core.
-pub(crate) use bos_ext_core::terminal::*;
+//! Host terminal adapter; the contract lives in ferris-core.
+pub(crate) use ferris_core::terminal::*;
 
 use std::path::PathBuf;
 

@@ -1,5 +1,5 @@
 [package]
-name = "bos-ext-core"
+name = "ferris-core"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true

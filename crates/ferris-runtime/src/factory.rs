@@ -7,11 +7,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use bos_ext_core::capability::PolicyEngine;
-use bos_ext_core::events::EventBus;
-use bos_ext_core::manifest::Manifest;
-use bos_ext_core::terminal::TerminalService;
-use bos_ext_core::types::{ExtensionError, RuntimeKind, TrustLevel};
+use ferris_core::capability::PolicyEngine;
+use ferris_core::events::EventBus;
+use ferris_core::manifest::Manifest;
+use ferris_core::terminal::TerminalService;
+use ferris_core::types::{ExtensionError, RuntimeKind, TrustLevel};
 
 use crate::declarative::{self, DeclarativeContributions};
 use crate::workflow::WorkflowRuntime;

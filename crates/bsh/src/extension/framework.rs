@@ -3,9 +3,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use bos_ext_core::capability::Capability;
-use bos_ext_core::manager::ExtensionManager;
-use bos_ext_core::{
+use ferris_core::capability::Capability;
+use ferris_core::manager::ExtensionManager;
+use ferris_core::{
     CapabilityRegistry, CapabilitySpec, ExtError, HostSpec, Risk, Scope, ScopePath,
     ServiceContractRegistry,
 };
@@ -38,8 +38,8 @@ impl BosHostSpec {
     }
 }
 
-fn risk(risk: bos_ext_core::capability::Risk) -> Risk {
-    use bos_ext_core::capability::Risk as CapabilityRisk;
+fn risk(risk: ferris_core::capability::Risk) -> Risk {
+    use ferris_core::capability::Risk as CapabilityRisk;
     match risk {
         CapabilityRisk::Low => Risk::Low,
         CapabilityRisk::Medium => Risk::Medium,
@@ -85,10 +85,10 @@ pub(crate) fn manager_for(
 /// BSH runtime resolver: wraps the standard runtimes in the generic adapter.
 pub(crate) struct BosRuntimeResolver {
     workspace: Option<PathBuf>,
-    policy: Option<Arc<bos_ext_core::capability::PolicyEngine>>,
-    events: Option<Arc<bos_ext_core::events::EventBus>>,
-    trust: bos_ext_core::types::TrustLevel,
-    builtins: std::collections::BTreeMap<String, Arc<dyn bos_ext_runtime::Runtime>>,
+    policy: Option<Arc<ferris_core::capability::PolicyEngine>>,
+    events: Option<Arc<ferris_core::events::EventBus>>,
+    trust: ferris_core::types::TrustLevel,
+    builtins: std::collections::BTreeMap<String, Arc<dyn ferris_runtime::Runtime>>,
 }
 
 impl BosRuntimeResolver {
@@ -98,7 +98,7 @@ impl BosRuntimeResolver {
             workspace,
             policy: None,
             events: None,
-            trust: bos_ext_core::types::TrustLevel::Community,
+            trust: ferris_core::types::TrustLevel::Community,
             builtins: std::collections::BTreeMap::new(),
         }
     }
@@ -108,7 +108,7 @@ impl BosRuntimeResolver {
     pub(crate) fn with_builtin(
         mut self,
         id: &str,
-        runtime: Arc<dyn bos_ext_runtime::Runtime>,
+        runtime: Arc<dyn ferris_runtime::Runtime>,
     ) -> Self {
         self.builtins.insert(id.to_string(), runtime);
         self
@@ -118,9 +118,9 @@ impl BosRuntimeResolver {
     #[must_use]
     pub(crate) fn with_ports(
         mut self,
-        policy: Arc<bos_ext_core::capability::PolicyEngine>,
-        events: Arc<bos_ext_core::events::EventBus>,
-        trust: bos_ext_core::types::TrustLevel,
+        policy: Arc<ferris_core::capability::PolicyEngine>,
+        events: Arc<ferris_core::events::EventBus>,
+        trust: ferris_core::types::TrustLevel,
     ) -> Self {
         self.policy = Some(policy);
         self.events = Some(events);
@@ -129,24 +129,24 @@ impl BosRuntimeResolver {
     }
 }
 
-impl bos_ext_core::RuntimeResolver for BosRuntimeResolver {
+impl ferris_core::RuntimeResolver for BosRuntimeResolver {
     fn create(
         &self,
-        manifest: &bos_ext_core::manifest::Manifest,
+        manifest: &ferris_core::manifest::Manifest,
         root: &std::path::Path,
         data_root: &std::path::Path,
-    ) -> Result<Arc<dyn bos_ext_core::Runtime>, ExtError> {
-        if manifest.runtime.kind == bos_ext_core::types::RuntimeKind::Builtin {
+    ) -> Result<Arc<dyn ferris_core::Runtime>, ExtError> {
+        if manifest.runtime.kind == ferris_core::types::RuntimeKind::Builtin {
             let runtime = self
                 .builtins
                 .get(manifest.id().as_str())
                 .cloned()
                 .ok_or_else(|| ExtError {
-                    code: bos_ext_core::ErrorCode::Runtime,
+                    code: ferris_core::ErrorCode::Runtime,
                     message: format!("builtin {} is not registered", manifest.id()),
                     details: serde_json::Value::Null,
                 })?;
-            return Ok(Arc::new(bos_ext_runtime::adapter::LegacyAdapter::new(
+            return Ok(Arc::new(ferris_runtime::adapter::LegacyAdapter::new(
                 manifest.id().clone(),
                 root.to_path_buf(),
                 self.workspace.clone(),
@@ -154,30 +154,30 @@ impl bos_ext_core::RuntimeResolver for BosRuntimeResolver {
             )));
         }
         let runtime = match manifest.runtime.kind {
-            bos_ext_core::types::RuntimeKind::Declarative => {
-                let inner = bos_ext_runtime::declarative::DeclarativeRuntime::new(root, manifest)
+            ferris_core::types::RuntimeKind::Declarative => {
+                let inner = ferris_runtime::declarative::DeclarativeRuntime::new(root, manifest)
                     .map_err(runtime_error)?;
-                Arc::new(inner) as Arc<dyn bos_ext_runtime::Runtime>
+                Arc::new(inner) as Arc<dyn ferris_runtime::Runtime>
             }
-            bos_ext_core::types::RuntimeKind::Process => {
-                let inner = bos_ext_runtime::process::ProcessRuntime::new(manifest, root)
+            ferris_core::types::RuntimeKind::Process => {
+                let inner = ferris_runtime::process::ProcessRuntime::new(manifest, root)
                     .map_err(runtime_error)?;
-                Arc::new(inner) as Arc<dyn bos_ext_runtime::Runtime>
+                Arc::new(inner) as Arc<dyn ferris_runtime::Runtime>
             }
-            bos_ext_core::types::RuntimeKind::Cordis => {
-                let inner = bos_ext_runtime::cordis::CordisRuntime::new(
+            ferris_core::types::RuntimeKind::Cordis => {
+                let inner = ferris_runtime::cordis::CordisRuntime::new(
                     manifest,
                     root,
                     data_root,
                     Arc::new(super::terminal::HostTerminal),
                 )
                 .map_err(runtime_error)?;
-                Arc::new(inner) as Arc<dyn bos_ext_runtime::Runtime>
+                Arc::new(inner) as Arc<dyn ferris_runtime::Runtime>
             }
-            bos_ext_core::types::RuntimeKind::Extism => {
+            ferris_core::types::RuntimeKind::Extism => {
                 let policy = self.policy.clone().ok_or_else(|| missing_port("policy"))?;
                 let events = self.events.clone().ok_or_else(|| missing_port("events"))?;
-                let inner = bos_ext_runtime::extism::ExtismRuntime::new(
+                let inner = ferris_runtime::extism::ExtismRuntime::new(
                     manifest,
                     root,
                     data_root,
@@ -188,12 +188,12 @@ impl bos_ext_core::RuntimeResolver for BosRuntimeResolver {
                     self.trust,
                 )
                 .map_err(runtime_error)?;
-                Arc::new(inner) as Arc<dyn bos_ext_runtime::Runtime>
+                Arc::new(inner) as Arc<dyn ferris_runtime::Runtime>
             }
-            bos_ext_core::types::RuntimeKind::WasmComponent => {
+            ferris_core::types::RuntimeKind::WasmComponent => {
                 let policy = self.policy.clone().ok_or_else(|| missing_port("policy"))?;
                 let events = self.events.clone().ok_or_else(|| missing_port("events"))?;
-                let inner = bos_ext_runtime::wasm::WasmRuntime::new(
+                let inner = ferris_runtime::wasm::WasmRuntime::new(
                     manifest,
                     root,
                     data_root,
@@ -204,12 +204,12 @@ impl bos_ext_core::RuntimeResolver for BosRuntimeResolver {
                     self.trust,
                 )
                 .map_err(runtime_error)?;
-                Arc::new(inner) as Arc<dyn bos_ext_runtime::Runtime>
+                Arc::new(inner) as Arc<dyn ferris_runtime::Runtime>
             }
-            bos_ext_core::types::RuntimeKind::Mcp => {
+            ferris_core::types::RuntimeKind::Mcp => {
                 let policy = self.policy.clone().ok_or_else(|| missing_port("policy"))?;
                 let events = self.events.clone().ok_or_else(|| missing_port("events"))?;
-                let inner = bos_ext_runtime::mcp::McpRuntime::new(
+                let inner = ferris_runtime::mcp::McpRuntime::new(
                     manifest,
                     root,
                     "{}".to_string(),
@@ -218,17 +218,17 @@ impl bos_ext_core::RuntimeResolver for BosRuntimeResolver {
                     events,
                 )
                 .map_err(runtime_error)?;
-                Arc::new(inner) as Arc<dyn bos_ext_runtime::Runtime>
+                Arc::new(inner) as Arc<dyn ferris_runtime::Runtime>
             }
             other => {
                 return Err(ExtError {
-                    code: bos_ext_core::ErrorCode::Runtime,
+                    code: ferris_core::ErrorCode::Runtime,
                     message: format!("runtime {other} is not wired through the manager yet"),
                     details: serde_json::Value::Null,
                 })
             }
         };
-        Ok(Arc::new(bos_ext_runtime::adapter::LegacyAdapter::new(
+        Ok(Arc::new(ferris_runtime::adapter::LegacyAdapter::new(
             manifest.id().clone(),
             root.to_path_buf(),
             self.workspace.clone(),
@@ -239,7 +239,7 @@ impl bos_ext_core::RuntimeResolver for BosRuntimeResolver {
 
 fn missing_port(name: &str) -> ExtError {
     ExtError {
-        code: bos_ext_core::ErrorCode::Runtime,
+        code: ferris_core::ErrorCode::Runtime,
         message: format!("runtime resolver has no {name} port"),
         details: serde_json::Value::Null,
     }
@@ -247,7 +247,7 @@ fn missing_port(name: &str) -> ExtError {
 
 fn runtime_error(error: impl std::fmt::Display) -> ExtError {
     ExtError {
-        code: bos_ext_core::ErrorCode::Runtime,
+        code: ferris_core::ErrorCode::Runtime,
         message: error.to_string(),
         details: serde_json::Value::Null,
     }
@@ -261,7 +261,7 @@ struct NoopLease;
 
 #[cfg(test)]
 #[async_trait::async_trait]
-impl bos_ext_core::ContributionLease for NoopLease {
+impl ferris_core::ContributionLease for NoopLease {
     async fn revoke(&self) -> Result<(), ExtError> {
         Ok(())
     }
@@ -269,11 +269,11 @@ impl bos_ext_core::ContributionLease for NoopLease {
 
 #[cfg(test)]
 #[async_trait::async_trait]
-impl bos_ext_core::ContributionSink for CollectSink {
+impl ferris_core::ContributionSink for CollectSink {
     async fn apply(
         &self,
-        _contribution: bos_ext_core::Contribution,
-    ) -> Result<Box<dyn bos_ext_core::ContributionLease>, ExtError> {
+        _contribution: ferris_core::Contribution,
+    ) -> Result<Box<dyn ferris_core::ContributionLease>, ExtError> {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(Box::new(NoopLease))
     }
@@ -323,7 +323,7 @@ mod manager_tests {
 
     #[tokio::test]
     async fn the_manager_applies_a_cordis_package() {
-        if bos_ext_runtime::bridge::find_interpreter().is_none() {
+        if ferris_runtime::bridge::find_interpreter().is_none() {
             return;
         }
         let source =
@@ -352,17 +352,17 @@ mod manager_tests {
         manager.install(&source).expect("install");
         let plan = manager.plan().expect("plan");
         let policy = Arc::new(
-            bos_ext_core::capability::PolicyEngine::open(
+            ferris_core::capability::PolicyEngine::open(
                 temp.path().join("grants.toml"),
                 temp.path().join("audit.log"),
-                bos_ext_core::capability::PolicyMode::Enforce,
+                ferris_core::capability::PolicyMode::Enforce,
             )
             .expect("policy"),
         );
         let resolver = BosRuntimeResolver::new(None).with_ports(
             policy,
-            bos_ext_core::events::EventBus::new(),
-            bos_ext_core::types::TrustLevel::Community,
+            ferris_core::events::EventBus::new(),
+            ferris_core::types::TrustLevel::Community,
         );
         let applied = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let manager = manager.with_ports(

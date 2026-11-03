@@ -23,10 +23,10 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
 use crate::contract::{load_tool_descriptors, CallContext, Runtime, ToolDescriptor, ToolResult};
-use bos_ext_core::capability::{CallScope, Capability, PolicyEngine};
-use bos_ext_core::events::{EventBus, EventFilter, ExtensionEvent, Subscription};
-use bos_ext_core::manifest::{is_allowlisted_command, validate_relative_path, Manifest};
-use bos_ext_core::types::{
+use ferris_core::capability::{CallScope, Capability, PolicyEngine};
+use ferris_core::events::{EventBus, EventFilter, ExtensionEvent, Subscription};
+use ferris_core::manifest::{is_allowlisted_command, validate_relative_path, Manifest};
+use ferris_core::types::{
     ContributionId, ExtensionError, ExtensionId, RuntimeKind, TrustLevel, HOST_VERSION,
 };
 

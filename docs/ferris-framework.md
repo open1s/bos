@@ -1,14 +1,14 @@
-# BOS Extension Framework (bos-ext)
+# Ferris Extension Framework
 
 Status: Phase 5 in progress — manifest 2.0 envelope, migration and dual-version
 loading are live; migration preserves runtime entry, args, env, protocol,
 startup policy and event subscribe/publish contributions, migrated packages
 validate, and
-`bsh ext validate` reports `schema: 2.0` plus the generic contribution count; the independent `bos-ext-smoke` binary
+`bsh ext validate` reports `schema: 2.0` plus the generic contribution count; the independent `ferris-smoke` binary
 parses and validates a 2.0 manifest with no BSH dependency, and the SDK carries
 unit tests for its author runtime adapter. BSH imports core primitives and standard runtimes directly;
 the Phase-1 composable/runtime/core re-export modules are deleted, and the
-lifecycle state machine now lives in bos-ext-core (only the terminal/hooks
+lifecycle state machine now lives in ferris-core (only the terminal/hooks
 adapters and the `topics` convenience alias remain in BSH). Phase 3 host
 wiring is partial: BSH has a `BosHostSpec` adapter and `framework_manager()`, and
 `statuses()` merges packages the neutral manager sees with the host's loaded set
@@ -22,10 +22,10 @@ start declarative, process, Cordis, Extism, WASM and MCP packages end to end
 (the sandboxed runtimes take policy/events ports), and linked-in builtins can be
 registered on the resolver by id. The production
 `ExtensionHost::rebuild` takes its package order from the manager plan, and
-`ExtensionHost::build_runtime` now calls `bos_ext_runtime::factory::build` with
+`ExtensionHost::build_runtime` now calls `ferris_runtime::factory::build` with
 a `RuntimePorts` bundle; the host no longer names any concrete runtime
 constructor. `framework_resolver()` exposes the same policy/events to the
-neutral resolver. Activation itself is still host-owned. bos-ext-core exposes HostSpec, the Host bundle and an
+neutral resolver. Activation itself is still host-owned. ferris-core exposes HostSpec, the Host bundle and an
 ExtensionManager with open/install/plan/apply/reload.
 
 ## Goal
@@ -33,19 +33,19 @@ ExtensionManager with open/install/plan/apply/reload.
 Extract BSH's extension platform into an independent Rust framework and SDK:
 
 ~~~text
-crates/bos-ext-core     0.1.0
-crates/bos-ext-runtime  0.1.0
-crates/bos-ext-sdk      0.1.0
-crates/bos-ext-smoke    0.1.0
+crates/ferris-core     0.1.0
+crates/ferris-runtime  0.1.0
+crates/ferris-sdk      0.1.0
+crates/ferris-smoke    0.1.0
 crates/bsh              host adapter only
 ~~~
 
 Dependency direction:
 
 ~~~text
-bos-ext-core
+ferris-core
   ↑
-bos-ext-runtime   # standard runtimes + Node bridge (Phase 2)
+ferris-runtime   # standard runtimes + Node bridge (Phase 2)
   ↑
 agent             # uses the bridge, does not own the framework
   ↑
@@ -53,7 +53,7 @@ bsh               # Host adapter
 ~~~
 
 Core, runtime and SDK must not depend on bsh, agent or GPUI. CI enforces this with
-scripts/ci/check-bos-ext-independence.sh plus the smoke crate.
+scripts/ci/check-ferris-independence.sh plus the smoke crate.
 
 ## Frozen decisions
 
@@ -95,9 +95,9 @@ scripts/ci/check-bos-ext-independence.sh plus the smoke crate.
 
 ~~~text
 Phase 0  new crates + public types/traits + independence gate
-Phase 1  core primitives move to bos-ext-core; BSH re-exports
-Phase 2  runtime + bridge move to bos-ext-runtime; agent uses bridge
+Phase 1  core primitives move to ferris-core; BSH re-exports
+Phase 2  runtime + bridge move to ferris-runtime; agent uses bridge
 Phase 3  Host trait and ExtensionManager wired into BSH
 Phase 4  manifest 2.0, migrate command, remove 1.x parser
-Phase 5  remove re-exports, BSH imports bos_ext_*; CI gate final
+Phase 5  remove re-exports, BSH imports ferris_*; CI gate final
 ~~~

@@ -1,8 +1,8 @@
 //! Compiles the SDK without BSH, agent or GPUI in the dependency graph.
 
-use bos_ext_core::manifest_v2::ManifestV2;
-use bos_ext_core::{Contribution, ExtError, InvokeContext};
-use bos_ext_sdk::{Call, ContributionBuilder, Extension, ExtensionContext};
+use ferris_core::manifest_v2::ManifestV2;
+use ferris_core::{Contribution, ExtError, InvokeContext};
+use ferris_sdk::{Call, ContributionBuilder, Extension, ExtensionContext};
 use serde_json::Value;
 
 const MANIFEST: &str = r#"

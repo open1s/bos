@@ -14,9 +14,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use bos_ext_core::capability::Capability;
-use bos_ext_core::manifest::{validate_relative_path, Manifest};
-use bos_ext_core::types::{ContributionId, ExtensionError, ExtensionId, RuntimeKind};
+use ferris_core::capability::Capability;
+use ferris_core::manifest::{validate_relative_path, Manifest};
+use ferris_core::types::{ContributionId, ExtensionError, ExtensionId, RuntimeKind};
 
 /// The largest tool descriptor file.
 pub const MAX_TOOL_FILE_BYTES: u64 = 256 * 1024;

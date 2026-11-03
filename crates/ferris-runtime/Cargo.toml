@@ -1,5 +1,5 @@
 [package]
-name = "bos-ext-runtime"
+name = "ferris-runtime"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
@@ -19,7 +19,7 @@ mcp = []
 cordis = []
 
 [dependencies]
-bos-ext-core = { path = "../bos-ext-core" }
+ferris-core = { path = "../ferris-core" }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true

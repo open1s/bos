@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::contract::{CallContext, Runtime, ToolDescriptor};
-use bos_ext_core::manifest::Manifest;
-use bos_ext_core::types::{ExtensionError, ExtensionId, RuntimeKind};
+use ferris_core::manifest::Manifest;
+use ferris_core::types::{ExtensionError, ExtensionId, RuntimeKind};
 
 /// A first-party extension implemented in Rust.
 #[async_trait]
@@ -206,7 +206,7 @@ impl BuiltinExtension for ClosureExtension {
 mod tests {
     use super::*;
     use crate::contract::empty_schema;
-    use bos_ext_core::types::ContributionId;
+    use ferris_core::types::ContributionId;
 
     const MANIFEST: &str = r#"
 schema_version = "1.0"

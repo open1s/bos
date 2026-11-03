@@ -13,12 +13,12 @@ use gpui_kit::*;
 
 use crate::extension::host::PanelSurface;
 use crate::theme;
-use bos_ext_core::types::ExtensionError;
-use bos_ext_core::ui::{
+use ferris_core::types::ExtensionError;
+use ferris_core::ui::{
     ButtonStyle, NotificationLevel, PanelLocation, ThemePalette, UiActionRequest, UiDocument,
     UiNode, UiSession,
 };
-use bos_ext_runtime::CallContext;
+use ferris_runtime::CallContext;
 
 use super::{icon, txt, IconName};
 
@@ -104,9 +104,7 @@ impl ExtensionPanelView {
     pub(crate) fn new(panels: Vec<PanelSurface>) -> Self {
         let selected = panels
             .iter()
-            .position(|panel| {
-                matches!(panel.visibility, bos_ext_core::ui::PanelVisibility::Visible)
-            })
+            .position(|panel| matches!(panel.visibility, ferris_core::ui::PanelVisibility::Visible))
             .unwrap_or(0);
         let palette = panels
             .get(selected)
@@ -231,8 +229,8 @@ impl ExtensionPanelView {
             .iter()
             .find(|descriptor| descriptor.id.as_str() == action)
         {
-            let scope = bos_ext_core::capability::call_scope(&payload, panel.workspace.as_deref());
-            if let Err(error) = bos_ext_core::capability::authorize_each(
+            let scope = ferris_core::capability::call_scope(&payload, panel.workspace.as_deref());
+            if let Err(error) = ferris_core::capability::authorize_each(
                 &panel.policy,
                 panel.owner.as_str(),
                 panel.trust,
@@ -693,7 +691,7 @@ impl ExtensionPanelView {
 
     fn render_tree(
         &self,
-        node: &bos_ext_core::ui::UiTreeNode,
+        node: &ferris_core::ui::UiTreeNode,
         path: &str,
         depth: usize,
     ) -> AnyElement {
@@ -821,9 +819,9 @@ mod tests {
     use crate::extension::host::PanelSurface;
     use crate::theme;
     use async_trait::async_trait;
-    use bos_ext_core::types::{ExtensionError, ExtensionId, RuntimeKind};
-    use bos_ext_core::ui::{PanelLocation, ThemePalette, UiDocument};
-    use bos_ext_runtime::{CallContext, Runtime, ToolDescriptor};
+    use ferris_core::types::{ExtensionError, ExtensionId, RuntimeKind};
+    use ferris_core::ui::{PanelLocation, ThemePalette, UiDocument};
+    use ferris_runtime::{CallContext, Runtime, ToolDescriptor};
     use serde_json::Value;
     use std::sync::Arc;
 
@@ -854,20 +852,20 @@ mod tests {
             title: "Greeting".to_string(),
             icon: None,
             location: PanelLocation::Right,
-            visibility: bos_ext_core::ui::PanelVisibility::Visible,
+            visibility: ferris_core::ui::PanelVisibility::Visible,
             runtime: Arc::new(Noop),
             owner: ExtensionId::parse("com.example.ui").expect("id"),
             theme: None,
             initial: Some(document),
             policy: Arc::new(
-                bos_ext_core::capability::PolicyEngine::open(
+                ferris_core::capability::PolicyEngine::open(
                     std::env::temp_dir().join(format!("bsh-panel-grants-{}", std::process::id())),
                     std::env::temp_dir().join(format!("bsh-panel-audit-{}", std::process::id())),
-                    bos_ext_core::capability::PolicyMode::Advisory,
+                    ferris_core::capability::PolicyMode::Advisory,
                 )
                 .expect("policy"),
             ),
-            trust: bos_ext_core::types::TrustLevel::Local,
+            trust: ferris_core::types::TrustLevel::Local,
             tools: Arc::new(Vec::new()),
             workspace: None,
             root: std::path::PathBuf::from("/nonexistent-panel-root"),

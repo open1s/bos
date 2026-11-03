@@ -16,8 +16,8 @@ use crate::bridge::{
 };
 
 use crate::contract::{empty_schema, CallContext, Runtime, ToolDescriptor};
-use bos_ext_core::manifest::Manifest;
-use bos_ext_core::types::{ContributionId, ExtensionError, RuntimeKind};
+use ferris_core::manifest::Manifest;
+use ferris_core::types::{ContributionId, ExtensionError, RuntimeKind};
 
 /// A live Cordis plugin process and the registrations it announced.
 pub struct CordisRuntime {
@@ -28,7 +28,7 @@ pub struct CordisRuntime {
     session: Mutex<Option<BridgeSession>>,
     registrations: Mutex<Vec<BridgeRegistration>>,
     tools: Mutex<Vec<ToolDescriptor>>,
-    terminal: Arc<dyn bos_ext_core::terminal::TerminalService>,
+    terminal: Arc<dyn ferris_core::terminal::TerminalService>,
 }
 
 impl CordisRuntime {
@@ -38,7 +38,7 @@ impl CordisRuntime {
         manifest: &Manifest,
         root: &Path,
         data_root: &Path,
-        terminal: Arc<dyn bos_ext_core::terminal::TerminalService>,
+        terminal: Arc<dyn ferris_core::terminal::TerminalService>,
     ) -> Result<Self, ExtensionError> {
         let extension = manifest.extension.id.as_str().to_owned();
         let interpreter = find_interpreter().ok_or_else(|| ExtensionError::UnsupportedRuntime {
@@ -253,23 +253,23 @@ impl Runtime for CordisRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bos_ext_core::manifest::Manifest;
+    use ferris_core::manifest::Manifest;
     use std::path::PathBuf;
 
     struct TestTerminal;
 
-    impl bos_ext_core::terminal::TerminalService for TestTerminal {
+    impl ferris_core::terminal::TerminalService for TestTerminal {
         fn run(
             &self,
             command: &str,
             _cwd: Option<std::path::PathBuf>,
-        ) -> Result<bos_ext_core::terminal::TerminalOutput, String> {
+        ) -> Result<ferris_core::terminal::TerminalOutput, String> {
             let output = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(command)
                 .output()
                 .map_err(|error| error.to_string())?;
-            Ok(bos_ext_core::terminal::TerminalOutput {
+            Ok(ferris_core::terminal::TerminalOutput {
                 stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
                 stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
                 code: output.status.code().unwrap_or(-1),

@@ -15,8 +15,8 @@ use serde_json::{json, Value};
 
 use crate::contract::{CallContext, Runtime, ToolDescriptor, ToolResult};
 use crate::declarative::RawContribution;
-use bos_ext_core::capability::{authorize_each, call_scope, PolicyEngine};
-use bos_ext_core::types::{ExtensionError, RuntimeKind, TrustLevel};
+use ferris_core::capability::{authorize_each, call_scope, PolicyEngine};
+use ferris_core::types::{ExtensionError, RuntimeKind, TrustLevel};
 
 /// One step in a workflow.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -325,8 +325,8 @@ impl Runtime for WorkflowRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bos_ext_core::capability::{Capability, GrantScope};
-    use bos_ext_core::types::ContributionId;
+    use ferris_core::capability::{Capability, GrantScope};
+    use ferris_core::types::ContributionId;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct Counting {
@@ -400,7 +400,7 @@ mod tests {
             PolicyEngine::open(
                 scratch.join("grants.toml"),
                 scratch.join("audit.jsonl"),
-                bos_ext_core::capability::PolicyMode::Enforce,
+                ferris_core::capability::PolicyMode::Enforce,
             )
             .expect("policy"),
         );
@@ -435,7 +435,7 @@ mod tests {
             "the workflow wrapper must not authorize an aggregate scope"
         );
         let context = CallContext::new(
-            bos_ext_core::types::ExtensionId::parse(extension).expect("id"),
+            ferris_core::types::ExtensionId::parse(extension).expect("id"),
             "test",
             None,
             5000,
@@ -499,7 +499,7 @@ mod tests {
             PolicyEngine::open(
                 scratch.join("grants.toml"),
                 scratch.join("audit.jsonl"),
-                bos_ext_core::capability::PolicyMode::Enforce,
+                ferris_core::capability::PolicyMode::Enforce,
             )
             .expect("policy"),
         );
@@ -515,7 +515,7 @@ mod tests {
         )
         .expect("runtime");
         let context = CallContext::new(
-            bos_ext_core::types::ExtensionId::parse("com.example.workflow").expect("id"),
+            ferris_core::types::ExtensionId::parse("com.example.workflow").expect("id"),
             "test",
             None,
             5000,

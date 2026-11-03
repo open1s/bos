@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
-for crate in bos-ext-core bos-ext-runtime bos-ext-sdk; do
+for crate in ferris-core ferris-runtime ferris-sdk; do
   deps="$(cargo tree -p "$crate" -e normal --prefix none | awk '{print $1}' | sort -u)"
   for forbidden in bsh agent gpui gpui-kit react; do
     if grep -qx "$forbidden" <<<"$deps"; then
@@ -15,5 +15,5 @@ for crate in bos-ext-core bos-ext-runtime bos-ext-sdk; do
   done
 done
 
-cargo run -q -p bos-ext-smoke
-echo "bos-ext independence: ok"
+cargo run -q -p ferris-smoke
+echo "ferris independence: ok"

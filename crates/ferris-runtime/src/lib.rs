@@ -31,7 +31,7 @@ pub mod workflow;
 
 use std::collections::BTreeMap;
 
-use bos_ext_core::{ExtError, RuntimeKindSpec};
+use ferris_core::{ExtError, RuntimeKindSpec};
 
 /// Runtime kinds compiled into this crate with default features.
 pub const STANDARD_KINDS: &[&str] = &["builtin", "declarative", "process"];
@@ -76,9 +76,9 @@ impl RuntimeCatalog {
         &self,
         kind: &str,
         root: &std::path::Path,
-    ) -> Result<std::sync::Arc<dyn bos_ext_core::Runtime>, ExtError> {
+    ) -> Result<std::sync::Arc<dyn ferris_core::Runtime>, ExtError> {
         let spec = self.get(kind).ok_or_else(|| ExtError {
-            code: bos_ext_core::ErrorCode::Runtime,
+            code: ferris_core::ErrorCode::Runtime,
             message: format!("runtime kind {kind} is not registered"),
             details: serde_json::Value::Null,
         })?;

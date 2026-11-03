@@ -19,16 +19,16 @@ echo "==> extension suite"
 cargo test -p bsh --lib extension::
 
 echo "==> framework runtime conformance"
-cargo test -p bos-ext-runtime --features "wasm extism cordis"
+cargo test -p ferris-runtime --features "wasm extism cordis"
 
 echo "==> SDK conformance"
-cargo test -p bos-ext-sdk
+cargo test -p ferris-sdk
 
 echo "==> composition conformance"
-cargo test -p bos-ext-core --features tokio --lib composable::
+cargo test -p ferris-core --features tokio --lib composable::
 
 echo "==> budget smoke"
-cargo test -p bos-ext-core --features tokio --lib composable::tests::gold_standard
+cargo test -p ferris-core --features tokio --lib composable::tests::gold_standard
 
 echo "==> all-in-one contribution coverage"
 cargo test -p bsh --lib extension::e2e::the_allinone_example -- --nocapture

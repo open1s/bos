@@ -866,7 +866,7 @@ pub(crate) struct Shell {
     /// Extension themes, resolved with the panels so a render does not re-open
     /// the host on every frame.
     pub(crate) extension_themes:
-        Option<std::collections::BTreeMap<String, bos_ext_core::ui::ThemePalette>>,
+        Option<std::collections::BTreeMap<String, ferris_core::ui::ThemePalette>>,
     /// Extension status rows, resolved with the panels.
     pub(crate) extension_statuses: Option<Vec<crate::extension::host::ExtensionStatus>>,
     /// The Extensions pane's active sub-tab: installed, MCP, skills, market.
@@ -1133,7 +1133,7 @@ impl Shell {
             let panels: Vec<_> =
                 crate::extension::panels(&state.settings, workspace.as_deref(), None)
                     .into_iter()
-                    .filter(|panel| panel.location == bos_ext_core::ui::PanelLocation::Center)
+                    .filter(|panel| panel.location == ferris_core::ui::PanelLocation::Center)
                     .collect();
             (!panels.is_empty())
                 .then(|| cx.new(|_| crate::ui::extension_panel::ExtensionPanelView::new(panels)))
@@ -1144,7 +1144,7 @@ impl Shell {
             let panels: Vec<_> =
                 crate::extension::panels(&state.settings, workspace.as_deref(), None)
                     .into_iter()
-                    .filter(|panel| panel.location == bos_ext_core::ui::PanelLocation::Left)
+                    .filter(|panel| panel.location == ferris_core::ui::PanelLocation::Left)
                     .collect();
             (!panels.is_empty())
                 .then(|| cx.new(|_| crate::ui::extension_panel::ExtensionPanelView::new(panels)))
@@ -1155,7 +1155,7 @@ impl Shell {
             let panels: Vec<_> =
                 crate::extension::panels(&state.settings, workspace.as_deref(), None)
                     .into_iter()
-                    .filter(|panel| panel.location == bos_ext_core::ui::PanelLocation::Right)
+                    .filter(|panel| panel.location == ferris_core::ui::PanelLocation::Right)
                     .collect();
             (!panels.is_empty())
                 .then(|| cx.new(|_| crate::ui::extension_panel::ExtensionPanelView::new(panels)))
@@ -1166,7 +1166,7 @@ impl Shell {
             let panels: Vec<_> =
                 crate::extension::panels(&state.settings, workspace.as_deref(), None)
                     .into_iter()
-                    .filter(|panel| panel.location == bos_ext_core::ui::PanelLocation::Bottom)
+                    .filter(|panel| panel.location == ferris_core::ui::PanelLocation::Bottom)
                     .collect();
             (!panels.is_empty())
                 .then(|| cx.new(|_| crate::ui::extension_panel::ExtensionPanelView::new(panels)))
@@ -2486,7 +2486,7 @@ impl Shell {
     /// palette and the mounted panels were captured once in `Shell::new`, so a
     /// package installed from the Market needed a relaunch to appear in them.
     pub(crate) fn refresh_extension_surfaces(&mut self, cx: &mut Context<Self>) {
-        use bos_ext_core::ui::PanelLocation;
+        use ferris_core::ui::PanelLocation;
         let root = self.state.settings.active_workspace_root();
         let workspace = (!root.is_empty()).then(|| std::path::PathBuf::from(root));
         self.extension_statuses = Some(crate::extension::statuses(
