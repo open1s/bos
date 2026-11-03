@@ -108,7 +108,9 @@ impl ExtensionManager {
         source: &Path,
         origin: crate::types::ExtensionSource,
     ) -> Result<crate::package::Package, ExtError> {
-        self.store.install_with(source, origin).map_err(package_error)
+        self.store
+            .install_with(source, origin)
+            .map_err(package_error)
     }
 
     /// Remove one installed extension, optionally purging its data.
@@ -118,9 +120,7 @@ impl ExtensionManager {
             message: error.to_string(),
             details: serde_json::Value::Null,
         })?;
-        self.store
-            .uninstall(&id, purge_data)
-            .map_err(package_error)
+        self.store.uninstall(&id, purge_data).map_err(package_error)
     }
 
     /// Enable or disable one installed extension.
@@ -134,6 +134,60 @@ impl ExtensionManager {
             .set_enabled(&id, enabled)
             .map(|_| ())
             .map_err(package_error)
+    }
+
+    /// Every installed version of one extension, ascending.
+    pub fn versions(&self, id: &str) -> Result<Vec<String>, ExtError> {
+        let id = ExtensionId::parse(id.to_string()).map_err(|error| ExtError {
+            code: ErrorCode::Manifest,
+            message: error.to_string(),
+            details: serde_json::Value::Null,
+        })?;
+        self.store.versions(&id).map_err(package_error)
+    }
+
+    /// The active version of one extension, when one is installed.
+    pub fn active_version(&self, id: &str) -> Result<Option<String>, ExtError> {
+        let id = ExtensionId::parse(id.to_string()).map_err(|error| ExtError {
+            code: ErrorCode::Manifest,
+            message: error.to_string(),
+            details: serde_json::Value::Null,
+        })?;
+        Ok(self.store.active_version(&id))
+    }
+
+    /// Activate one installed version.
+    pub fn activate(&self, id: &str, version: &str) -> Result<(), ExtError> {
+        let id = ExtensionId::parse(id.to_string()).map_err(|error| ExtError {
+            code: ErrorCode::Manifest,
+            message: error.to_string(),
+            details: serde_json::Value::Null,
+        })?;
+        self.store
+            .set_active(&id, version)
+            .map(|_| ())
+            .map_err(package_error)
+    }
+
+    /// Activate the version before the current one.
+    pub fn rollback(&self, id: &str) -> Result<String, ExtError> {
+        let versions = self.versions(id)?;
+        let active = self.active_version(id)?;
+        let target = match active
+            .as_deref()
+            .and_then(|active| versions.iter().position(|version| version == active))
+        {
+            Some(0) => None,
+            Some(position) => Some(versions[position - 1].clone()),
+            None => versions.last().cloned(),
+        }
+        .ok_or_else(|| ExtError {
+            code: ErrorCode::Package,
+            message: "no earlier version to roll back to".to_string(),
+            details: serde_json::Value::Null,
+        })?;
+        self.activate(id, &target)?;
+        Ok(target)
     }
 
     /// Install one local package tree and return its identity.

@@ -1145,9 +1145,14 @@ fn command_publishers(root: Option<PathBuf>) -> Result<i32, String> {
 fn command_versions(args: &[String], root: Option<PathBuf>) -> Result<i32, String> {
     let id = ExtensionId::parse(one_argument(args, "bsh ext versions <id>")?)
         .map_err(|error| error.to_string())?;
-    let store = ExtensionStore::open(config(root).root).map_err(|error| error.to_string())?;
-    let versions = store.versions(&id).map_err(|error| error.to_string())?;
-    let active = store.active_version(&id);
+    let manager = crate::extension::framework::manager_for(config(root).root, None)
+        .map_err(|error| error.to_string())?;
+    let versions = manager
+        .versions(id.as_str())
+        .map_err(|error| error.to_string())?;
+    let active = manager
+        .active_version(id.as_str())
+        .map_err(|error| error.to_string())?;
     for version in versions {
         println!(
             "{version}{}",
@@ -1164,22 +1169,10 @@ fn command_versions(args: &[String], root: Option<PathBuf>) -> Result<i32, Strin
 fn command_rollback(args: &[String], root: Option<PathBuf>) -> Result<i32, String> {
     let id = ExtensionId::parse(one_argument(args, "bsh ext rollback <id>")?)
         .map_err(|error| error.to_string())?;
-    let store = ExtensionStore::open(config(root).root).map_err(|error| error.to_string())?;
-    let versions = store.versions(&id).map_err(|error| error.to_string())?;
-    let active = store.active_version(&id);
-    let target = match active
-        .as_deref()
-        .and_then(|active| versions.iter().position(|version| version == active))
-    {
-        Some(0) => None,
-        Some(position) => Some(versions[position - 1].clone()),
-        None => versions.last().cloned(),
-    };
-    let Some(target) = target else {
-        return Err("no earlier version to roll back to".to_string());
-    };
-    store
-        .set_active(&id, &target)
+    let manager = crate::extension::framework::manager_for(config(root).root, None)
+        .map_err(|error| error.to_string())?;
+    let target = manager
+        .rollback(id.as_str())
         .map_err(|error| error.to_string())?;
     println!("activated {id} {target}");
     Ok(0)
