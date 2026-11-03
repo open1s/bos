@@ -42,8 +42,8 @@ impl Extension for Demo {
 }
 
 fn main() {
-    let manifest =
-        ManifestV2::parse(Demo.manifest(), std::path::Path::new("extension.toml")).expect("manifest");
+    let manifest = ManifestV2::parse(Demo.manifest(), std::path::Path::new("extension.toml"))
+        .expect("manifest");
     assert_eq!(manifest.extension.id.as_str(), "com.example.demo");
     assert_eq!(manifest.runtime.kind, "builtin");
     assert_eq!(manifest.contributions.len(), 1);

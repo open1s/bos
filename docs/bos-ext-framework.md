@@ -13,7 +13,8 @@ through `ExtensionManager::install_package`; uninstall, enable/disable,
 versions, rollback, retry and quarantine go through the manager too.
 `LegacyAdapter` bridges the old tool-shaped runtime contract to the generic
 Runtime trait; BSH's `BosRuntimeResolver` now lets `ExtensionManager::apply`
-start declarative, process and Cordis packages end to end. ExtensionHost still owns the
+start declarative, process, Cordis, Extism, WASM and MCP packages end to end
+(the sandboxed runtimes take policy/events ports). ExtensionHost still owns the
 production activation path. bos-ext-core exposes HostSpec, the Host bundle and an
 ExtensionManager with open/install/plan/apply/reload.
 

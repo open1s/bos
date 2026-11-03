@@ -85,12 +85,34 @@ pub(crate) fn manager_for(
 /// BSH runtime resolver: wraps the standard runtimes in the generic adapter.
 pub(crate) struct BosRuntimeResolver {
     workspace: Option<PathBuf>,
+    policy: Option<Arc<bos_ext_core::capability::PolicyEngine>>,
+    events: Option<Arc<bos_ext_core::events::EventBus>>,
+    trust: bos_ext_core::types::TrustLevel,
 }
 
 impl BosRuntimeResolver {
     /// Build a resolver for one workspace.
     pub(crate) fn new(workspace: Option<PathBuf>) -> Self {
-        Self { workspace }
+        Self {
+            workspace,
+            policy: None,
+            events: None,
+            trust: bos_ext_core::types::TrustLevel::Community,
+        }
+    }
+
+    /// Attach the policy and event bus used by sandboxed runtimes.
+    #[must_use]
+    pub(crate) fn with_ports(
+        mut self,
+        policy: Arc<bos_ext_core::capability::PolicyEngine>,
+        events: Arc<bos_ext_core::events::EventBus>,
+        trust: bos_ext_core::types::TrustLevel,
+    ) -> Self {
+        self.policy = Some(policy);
+        self.events = Some(events);
+        self.trust = trust;
+        self
     }
 }
 
@@ -122,6 +144,52 @@ impl bos_ext_core::RuntimeResolver for BosRuntimeResolver {
                 .map_err(runtime_error)?;
                 Arc::new(inner) as Arc<dyn bos_ext_runtime::Runtime>
             }
+            bos_ext_core::types::RuntimeKind::Extism => {
+                let policy = self.policy.clone().ok_or_else(|| missing_port("policy"))?;
+                let events = self.events.clone().ok_or_else(|| missing_port("events"))?;
+                let inner = bos_ext_runtime::extism::ExtismRuntime::new(
+                    manifest,
+                    root,
+                    data_root,
+                    policy,
+                    events,
+                    self.workspace.clone(),
+                    "{}".to_string(),
+                    self.trust,
+                )
+                .map_err(runtime_error)?;
+                Arc::new(inner) as Arc<dyn bos_ext_runtime::Runtime>
+            }
+            bos_ext_core::types::RuntimeKind::WasmComponent => {
+                let policy = self.policy.clone().ok_or_else(|| missing_port("policy"))?;
+                let events = self.events.clone().ok_or_else(|| missing_port("events"))?;
+                let inner = bos_ext_runtime::wasm::WasmRuntime::new(
+                    manifest,
+                    root,
+                    data_root,
+                    policy,
+                    events,
+                    self.workspace.clone(),
+                    "{}".to_string(),
+                    self.trust,
+                )
+                .map_err(runtime_error)?;
+                Arc::new(inner) as Arc<dyn bos_ext_runtime::Runtime>
+            }
+            bos_ext_core::types::RuntimeKind::Mcp => {
+                let policy = self.policy.clone().ok_or_else(|| missing_port("policy"))?;
+                let events = self.events.clone().ok_or_else(|| missing_port("events"))?;
+                let inner = bos_ext_runtime::mcp::McpRuntime::new(
+                    manifest,
+                    root,
+                    "{}".to_string(),
+                    policy,
+                    self.trust,
+                    events,
+                )
+                .map_err(runtime_error)?;
+                Arc::new(inner) as Arc<dyn bos_ext_runtime::Runtime>
+            }
             other => {
                 return Err(ExtError {
                     code: bos_ext_core::ErrorCode::Runtime,
@@ -136,6 +204,14 @@ impl bos_ext_core::RuntimeResolver for BosRuntimeResolver {
             self.workspace.clone(),
             runtime,
         )))
+    }
+}
+
+fn missing_port(name: &str) -> ExtError {
+    ExtError {
+        code: bos_ext_core::ErrorCode::Runtime,
+        message: format!("runtime resolver has no {name} port"),
+        details: serde_json::Value::Null,
     }
 }
 
@@ -229,6 +305,38 @@ mod manager_tests {
         let applied = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let manager = manager.with_ports(
             Arc::new(BosRuntimeResolver::new(None)),
+            Arc::new(CollectSink(Arc::clone(&applied))),
+        );
+        let active = manager.apply(&plan).await.expect("apply");
+        assert_eq!(active.len(), 1);
+        assert!(applied.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+        active.unload().await.expect("unload");
+    }
+
+    #[tokio::test]
+    async fn the_manager_applies_an_extism_package() {
+        let source =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/extensions/extism-echo");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let manager = manager_for(temp.path().to_path_buf(), None).expect("manager");
+        manager.install(&source).expect("install");
+        let plan = manager.plan().expect("plan");
+        let policy = Arc::new(
+            bos_ext_core::capability::PolicyEngine::open(
+                temp.path().join("grants.toml"),
+                temp.path().join("audit.log"),
+                bos_ext_core::capability::PolicyMode::Enforce,
+            )
+            .expect("policy"),
+        );
+        let resolver = BosRuntimeResolver::new(None).with_ports(
+            policy,
+            bos_ext_core::events::EventBus::new(),
+            bos_ext_core::types::TrustLevel::Community,
+        );
+        let applied = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let manager = manager.with_ports(
+            Arc::new(resolver),
             Arc::new(CollectSink(Arc::clone(&applied))),
         );
         let active = manager.apply(&plan).await.expect("apply");
