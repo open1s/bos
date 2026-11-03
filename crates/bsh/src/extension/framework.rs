@@ -99,7 +99,7 @@ impl bos_ext_core::RuntimeResolver for BosRuntimeResolver {
         &self,
         manifest: &bos_ext_core::manifest::Manifest,
         root: &std::path::Path,
-        _data_root: &std::path::Path,
+        data_root: &std::path::Path,
     ) -> Result<Arc<dyn bos_ext_core::Runtime>, ExtError> {
         let runtime = match manifest.runtime.kind {
             bos_ext_core::types::RuntimeKind::Declarative => {
@@ -110,6 +110,16 @@ impl bos_ext_core::RuntimeResolver for BosRuntimeResolver {
             bos_ext_core::types::RuntimeKind::Process => {
                 let inner = bos_ext_runtime::process::ProcessRuntime::new(manifest, root)
                     .map_err(runtime_error)?;
+                Arc::new(inner) as Arc<dyn bos_ext_runtime::Runtime>
+            }
+            bos_ext_core::types::RuntimeKind::Cordis => {
+                let inner = bos_ext_runtime::cordis::CordisRuntime::new(
+                    manifest,
+                    root,
+                    data_root,
+                    Arc::new(super::terminal::HostTerminal),
+                )
+                .map_err(runtime_error)?;
                 Arc::new(inner) as Arc<dyn bos_ext_runtime::Runtime>
             }
             other => {
@@ -202,6 +212,28 @@ mod manager_tests {
         let active = manager.apply(&plan).await.expect("apply");
         assert_eq!(active.len(), 1);
         assert_eq!(applied.load(std::sync::atomic::Ordering::SeqCst), 1);
+        active.unload().await.expect("unload");
+    }
+
+    #[tokio::test]
+    async fn the_manager_applies_a_cordis_package() {
+        if bos_ext_runtime::bridge::find_interpreter().is_none() {
+            return;
+        }
+        let source =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/extensions/cordis-echo");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let manager = manager_for(temp.path().to_path_buf(), None).expect("manager");
+        manager.install(&source).expect("install");
+        let plan = manager.plan().expect("plan");
+        let applied = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let manager = manager.with_ports(
+            Arc::new(BosRuntimeResolver::new(None)),
+            Arc::new(CollectSink(Arc::clone(&applied))),
+        );
+        let active = manager.apply(&plan).await.expect("apply");
+        assert_eq!(active.len(), 1);
+        assert!(applied.load(std::sync::atomic::Ordering::SeqCst) >= 1);
         active.unload().await.expect("unload");
     }
 }
