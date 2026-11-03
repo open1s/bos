@@ -3,10 +3,12 @@
 //! Phase 3 starts with the canonical store boundary. Installation, plan/apply
 //! and reload are layered on top of this manager in later commits.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::manifest::Manifest;
 use crate::package::ExtensionStore;
+use crate::types::ExtensionId;
 use crate::{ErrorCode, ExtError, HostSpec};
 
 /// One installed extension version.
@@ -68,6 +70,73 @@ impl ExtensionManager {
         });
         Ok(installed)
     }
+
+    /// Install one local package tree and return its identity.
+    pub fn install(&self, source: &Path) -> Result<InstalledExtension, ExtError> {
+        let package = self.store.install(source).map_err(package_error)?;
+        Ok(InstalledExtension {
+            id: package.id().as_str().to_string(),
+            version: package.version(),
+        })
+    }
+
+    /// Resolve installed packages into an activation order.
+    #[cfg(feature = "tokio")]
+    pub fn plan(&self) -> Result<ManagerPlan, ExtError> {
+        let registry = self.store.read_registry().map_err(package_error)?;
+        let mut manifests = Vec::new();
+        for raw in registry.extensions.keys() {
+            let id = ExtensionId::parse(raw.clone()).map_err(|error| ExtError {
+                code: ErrorCode::Manifest,
+                message: error.to_string(),
+                details: serde_json::Value::Null,
+            })?;
+            let version = self
+                .store
+                .active_version(&id)
+                .or_else(|| {
+                    self.store
+                        .versions(&id)
+                        .ok()
+                        .and_then(|versions| versions.last().cloned())
+                })
+                .ok_or_else(|| ExtError {
+                    code: ErrorCode::Package,
+                    message: format!("{id} has no installed version"),
+                    details: serde_json::Value::Null,
+                })?;
+            let root = self.store.version_root(&id, &version);
+            let manifest = Manifest::load(&root).map_err(|error| ExtError {
+                code: ErrorCode::Manifest,
+                message: error.to_string(),
+                details: serde_json::Value::Null,
+            })?;
+            manifests.push(manifest);
+        }
+        let plan = crate::composable::plan_service_dependencies(&manifests).map_err(|error| {
+            ExtError {
+                code: ErrorCode::Service,
+                message: error.to_string(),
+                details: serde_json::Value::Null,
+            }
+        })?;
+        Ok(ManagerPlan { order: plan.order })
+    }
+}
+
+/// One resolved activation order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagerPlan {
+    /// Extension ids in dependency-first order.
+    pub order: Vec<String>,
+}
+
+fn package_error(error: crate::types::ExtensionError) -> ExtError {
+    ExtError {
+        code: ErrorCode::Package,
+        message: error.to_string(),
+        details: serde_json::Value::Null,
+    }
 }
 
 #[cfg(test)]
@@ -110,5 +179,22 @@ mod tests {
         let manager = ExtensionManager::open(host).expect("manager");
         assert_eq!(manager.root(), root.path());
         assert!(manager.installed().expect("installed").is_empty());
+    }
+
+    #[test]
+    fn install_then_plan_orders_the_package() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let host = Arc::new(DemoHost {
+            root: root.path().to_path_buf(),
+            capabilities: CapabilityRegistry::default(),
+            contracts: ServiceContractRegistry::default(),
+        });
+        let manager = ExtensionManager::open(host).expect("manager");
+        let example =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/extensions/hello");
+        let installed = manager.install(&example).expect("install");
+        assert_eq!(installed.id, "com.example.hello");
+        let plan = manager.plan().expect("plan");
+        assert!(plan.order.iter().any(|id| id == "com.example.hello"));
     }
 }

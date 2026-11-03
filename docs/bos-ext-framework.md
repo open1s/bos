@@ -4,8 +4,8 @@ Status: Phase 2 in progress — core primitives are in bos-ext-core; runtime
 contract, builtin, declarative and process runtimes are in bos-ext-runtime.
 Status: Phase 3 in progress — every standard runtime and the Node bridge live
 in bos-ext-runtime; bos-ext-core now exposes the HostSpec boundary and an
-ExtensionManager that opens the canonical store. BSH is still the only host
-implementation.
+ExtensionManager that opens the canonical store, installs a local package and
+resolves an activation order. BSH is still the only host implementation.
 
 ## Goal
 
