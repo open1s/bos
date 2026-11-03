@@ -7380,6 +7380,11 @@ impl Shell {
                                     div().into_any_element()
                                 } else {
                                     let id = status.id.clone();
+                                    let settings = self.state.settings.clone();
+                                    let workspace = {
+                                        let root = settings.active_workspace_root();
+                                        (!root.is_empty()).then(|| std::path::PathBuf::from(root))
+                                    };
                                     let selector = format!("extension-uninstall-{id}");
                                     div()
                                         .id(SharedString::from(selector.clone()))
@@ -7398,17 +7403,24 @@ impl Shell {
                                             theme::error(),
                                         ))
                                         .on_click(cx.listener(move |this, _event, _window, cx| {
-                                            if this.state.uninstall_extension(&id) {
-                                                this.persist_market_change(cx);
-                                                this.refresh_extension_surfaces(cx);
-                                            } else {
-                                                this.state.notice(
+                                            match crate::extension::uninstall(
+                                                &settings,
+                                                workspace.as_deref(),
+                                                &id,
+                                                false,
+                                            ) {
+                                                Ok(()) => {
+                                                    this.state.uninstall_extension(&id);
+                                                    this.persist_market_change(cx);
+                                                    this.refresh_extension_surfaces(cx);
+                                                }
+                                                Err(error) => this.state.notice(format!(
+                                                    "{} {error}",
                                                     tr(
                                                         this.state.lang,
                                                         "settings.extensionUninstallFailed",
                                                     )
-                                                    .to_string(),
-                                                );
+                                                )),
                                             }
                                             cx.notify();
                                         }))

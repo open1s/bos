@@ -3165,6 +3165,21 @@ pub(crate) fn themes(
         .unwrap_or_default()
 }
 
+/// Uninstall one package from the managed store.
+pub(crate) fn uninstall(
+    settings: &crate::settings::Settings,
+    workspace: Option<&Path>,
+    id: &str,
+    purge_data: bool,
+) -> Result<(), String> {
+    let manager =
+        super::framework::manager_for(extension_root(settings), workspace.map(Path::to_path_buf))
+            .map_err(|error| error.to_string())?;
+    manager
+        .uninstall(id, purge_data)
+        .map_err(|error| error.to_string())
+}
+
 /// The status rows the current configuration offers, for the settings pane.
 pub(crate) fn statuses(
     settings: &crate::settings::Settings,
