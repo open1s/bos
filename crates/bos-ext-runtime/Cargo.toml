@@ -8,7 +8,7 @@ license.workspace = true
 description = "Standard runtimes for the BOS extension framework"
 
 [features]
-default = ["builtin", "declarative", "process", "workflow"]
+default = ["builtin", "declarative", "process", "workflow", "mcp"]
 builtin = []
 declarative = []
 process = []

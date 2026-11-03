@@ -10,6 +10,8 @@ pub mod contract;
 pub mod declarative;
 #[cfg(feature = "process")]
 pub mod process;
+#[cfg(feature = "mcp")]
+pub mod mcp;
 #[cfg(feature = "workflow")]
 pub mod workflow;
 
