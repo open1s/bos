@@ -7349,6 +7349,76 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         assert_eq!(past["truncated"], false);
     }
 
+    #[test]
+    fn read_files_batches_reads_and_reports_per_file_failures() {
+        let root = scratch("read-files-batch");
+        std::fs::write(root.join("a.rs"), "fn a() {}").expect("a");
+        std::fs::write(root.join("b.rs"), "fn b() {}").expect("b");
+        let outside = scratch("read-files-outside");
+        std::fs::write(outside.join("secret.txt"), "outside-secret").expect("secret");
+
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+        let result = registry
+            .execute(
+                "read_files",
+                &serde_json::json!({
+                    "paths": ["a.rs", "b.rs", outside.join("secret.txt").to_string_lossy()]
+                }),
+            )
+            .expect("batch call returns per-file outcomes");
+
+        assert_eq!(result["count"], 3);
+        assert_eq!(result["files"][0]["content"], "fn a() {}");
+        assert_eq!(result["files"][1]["content"], "fn b() {}");
+        assert!(result["files"][2]["error"].as_str().is_some());
+        assert!(!result.to_string().contains("outside-secret"));
+        assert_eq!(result["truncated"], false);
+    }
+
+    #[test]
+    fn read_files_rejects_empty_oversized_and_duplicate_path_lists() {
+        let root = scratch("read-files-invalid");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        for paths in [
+            serde_json::json!([]),
+            serde_json::json!(["a"; 11]),
+            serde_json::json!(["a", "a"]),
+        ] {
+            assert!(
+                registry.execute("read_files", &serde_json::json!({"paths": paths})).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn read_files_obeys_the_combined_output_budget() {
+        let root = scratch("read-files-budget");
+        let body = "x".repeat(MAX_BATCH_READ_BYTES / 2 + 128);
+        std::fs::write(root.join("a.txt"), &body).expect("a");
+        std::fs::write(root.join("b.txt"), &body).expect("b");
+        let built = build(&confined(&root));
+        let result = built
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "read_files",
+                &serde_json::json!({"paths": ["a.txt", "b.txt"]}),
+            )
+            .expect("bounded batch read");
+        assert_eq!(result["bytes"], MAX_BATCH_READ_BYTES);
+        assert_eq!(result["truncated"], true);
+        assert_eq!(
+            result["files"][0]["bytes"].as_u64().unwrap()
+                + result["files"][1]["bytes"].as_u64().unwrap(),
+            MAX_BATCH_READ_BYTES as u64
+        );
+        assert!(result["files"][1]["truncated"].as_bool().unwrap());
+    }
+
     /// A binary file and a directory are refused by name instead of being
     /// pasted into the transcript as mojibake or an IO error.
     #[test]
