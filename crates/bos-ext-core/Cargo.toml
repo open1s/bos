@@ -34,3 +34,4 @@ tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio.workspace = true
+tempfile = "3"

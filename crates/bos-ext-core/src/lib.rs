@@ -21,6 +21,7 @@ pub mod terminal;
 #[allow(dead_code, missing_docs)] // Phase 1 move; docs and consumers land with the manager API.
 pub mod composable;
 pub mod dispatch;
+pub mod manager;
 pub mod manifest;
 pub mod package;
 pub mod resolver;

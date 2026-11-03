@@ -2,9 +2,10 @@
 
 Status: Phase 2 in progress — core primitives are in bos-ext-core; runtime
 contract, builtin, declarative and process runtimes are in bos-ext-runtime.
-Status: Phase 2 complete — every standard runtime (builtin/declarative/process/
-workflow/mcp/extism/wasm/cordis) and the Node bridge live in
-bos-ext-runtime; BSH re-exports them.
+Status: Phase 3 in progress — every standard runtime and the Node bridge live
+in bos-ext-runtime; bos-ext-core now exposes the HostSpec boundary and an
+ExtensionManager that opens the canonical store. BSH is still the only host
+implementation.
 
 ## Goal
 
