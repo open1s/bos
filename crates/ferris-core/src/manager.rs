@@ -223,11 +223,13 @@ impl ExtensionManager {
     pub async fn apply(
         &self,
         plan: &ManagerPlan,
+        agent: &mut (dyn std::any::Any + Send),
+        registry: &mut (dyn std::any::Any + Send),
         host: &mut dyn LeaseHost,
     ) -> Result<ActivationSet, ExtError> {
         let mut activations = Vec::new();
         for id in &plan.order {
-            match self.build_activation(id).await {
+            match self.build_activation(id, agent, registry).await {
                 Ok(activation) => activations.push(activation),
                 Err(error) => {
                     shutdown_all(activations, host).await;
@@ -243,6 +245,8 @@ impl ExtensionManager {
         &self,
         current: ActivationSet,
         plan: &ManagerPlan,
+        agent: &mut (dyn std::any::Any + Send),
+        registry: &mut (dyn std::any::Any + Send),
         host: &mut dyn LeaseHost,
     ) -> Result<ActivationSet, ExtError> {
         let mut old: std::collections::BTreeMap<String, Activation> = current
@@ -260,7 +264,7 @@ impl ExtensionManager {
                 }
                 existing.shutdown(host).await?;
             }
-            match self.build_activation(id).await {
+            match self.build_activation(id, agent, registry).await {
                 Ok(activation) => activations.push(activation),
                 Err(error) => {
                     shutdown_all(activations, host).await;
@@ -275,7 +279,12 @@ impl ExtensionManager {
         Ok(ActivationSet { activations })
     }
 
-    async fn build_activation(&self, id: &str) -> Result<Activation, ExtError> {
+    async fn build_activation(
+        &self,
+        id: &str,
+        agent: &mut (dyn std::any::Any + Send),
+        registry: &mut (dyn std::any::Any + Send),
+    ) -> Result<Activation, ExtError> {
         let runtimes = self.runtimes.as_ref().ok_or_else(|| ExtError {
             code: ErrorCode::Runtime,
             message: "no runtime resolver is attached".to_string(),
@@ -308,10 +317,8 @@ impl ExtensionManager {
                 data_root,
             })
             .await?;
-        let mut leases: Vec<Box<dyn ContributionLease>> = Vec::new();
-        for contribution in listed {
-            leases.push(contributions.apply(contribution).await?);
-        }
+        let lease = contributions.apply(id, listed, agent, registry).await?;
+        let leases: Vec<Box<dyn ContributionLease>> = vec![lease];
         Ok(Activation {
             extension: id.to_string(),
             version,
@@ -603,7 +610,10 @@ mod tests {
     impl crate::ContributionSink for MockSink {
         async fn apply(
             &self,
-            _contribution: crate::Contribution,
+            _extension: &str,
+            _contributions: Vec<crate::Contribution>,
+            _agent: &mut (dyn std::any::Any + Send),
+            _registry: &mut (dyn std::any::Any + Send),
         ) -> Result<Box<dyn crate::ContributionLease>, ExtError> {
             Ok(Box::new(MockLease(Arc::clone(&self.0))))
         }
@@ -638,7 +648,10 @@ mod tests {
         manager.install(&example).expect("install");
         let plan = manager.plan().expect("plan");
         let mut host = TestHost;
-        let active = manager.apply(&plan, &mut host).await.expect("apply");
+        let active = manager
+            .apply(&plan, &mut (), &mut (), &mut host)
+            .await
+            .expect("apply");
         assert_eq!(active.len(), 1);
         active.unload(&mut host).await.expect("unload");
         assert_eq!(revoked.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -662,9 +675,12 @@ mod tests {
         manager.install(&example).expect("install");
         let plan = manager.plan().expect("plan");
         let mut host = TestHost;
-        let active = manager.apply(&plan, &mut host).await.expect("apply");
         let active = manager
-            .reload(active, &plan, &mut host)
+            .apply(&plan, &mut (), &mut (), &mut host)
+            .await
+            .expect("apply");
+        let active = manager
+            .reload(active, &plan, &mut (), &mut (), &mut host)
             .await
             .expect("reload");
         assert_eq!(active.len(), 1);

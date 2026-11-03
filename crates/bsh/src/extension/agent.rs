@@ -34,6 +34,7 @@ const MAX_PROMPT_SECTION: usize = 8 * 1024;
 const MAX_TOTAL_PROMPT: usize = 64 * 1024;
 
 /// One extension's registered contributions.
+#[derive(Clone)]
 pub(crate) struct Contributed {
     /// Extension id.
     pub(crate) extension: ExtensionId,
@@ -149,9 +150,7 @@ impl ferris_core::ContributionLease for ContributionLease {
         &self,
         host: &mut dyn ferris_core::LeaseHost,
     ) -> Result<(), ferris_core::ExtError> {
-        if !self.active.swap(false, Ordering::SeqCst) {
-            return Ok(());
-        }
+        self.active.store(false, Ordering::SeqCst);
         host.remove_tools(&self.owner, &self.tools);
         host.remove_prompts(&self.owner, &self.prompt_sections);
         host.remove_skills(&self.owner, &self.skill_paths);

@@ -906,7 +906,7 @@ impl ExtensionHost {
         let plan = manager.plan().ok()?;
         super::block_on_tokio(async move {
             manager
-                .apply(&plan, &mut super::framework::HostNoopHost)
+                .apply(&plan, &mut (), &mut (), &mut super::framework::HostNoopHost)
                 .await
         })
         .ok()
@@ -1751,7 +1751,6 @@ impl ExtensionHost {
         session_id: &str,
     ) -> Vec<AppliedExtension> {
         let mut applied = Vec::new();
-        let mut activations = self.build_framework_activations();
         let service_capabilities = self.service_capability_map();
         for entry in self.loaded.values() {
             if !entry.applied || entry.error.is_some() {
@@ -1795,14 +1794,54 @@ impl ExtensionHost {
                 themes: contributions.themes.clone(),
                 timeout_ms: entry.package.manifest.resources.execution_ms(),
             };
-            let (info, lease) = contribution::install_with_lease(
-                agent,
-                registry,
-                &contributed,
+            let sink = Arc::new(super::framework::HostContributionSink::new(
                 Arc::clone(&self.policy),
                 Arc::clone(&self.events),
                 self.config.workspace.clone(),
-            );
+            ));
+            sink.insert(entry.package.id().as_str(), contributed.clone());
+            let mut manager_activation = None;
+            if let Ok(manager) = self.framework_manager() {
+                let manager = manager.with_ports(
+                    Arc::new(self.build_framework_resolver()),
+                    Arc::clone(&sink) as Arc<dyn ferris_core::ContributionSink>,
+                );
+                if let Ok(mut plan) = manager.plan() {
+                    plan.order
+                        .retain(|candidate| candidate == entry.package.id().as_str());
+                    if !plan.order.is_empty() {
+                        if let Ok(mut set) = super::block_on_tokio_scoped(manager.apply(
+                            &plan,
+                            agent,
+                            registry,
+                            &mut super::framework::HostNoopHost,
+                        )) {
+                            manager_activation = Some((set.take(entry.package.id().as_str()), set));
+                        }
+                    }
+                }
+            }
+            let (info, lease, activation) = match manager_activation {
+                Some((activation, _set)) => {
+                    let info = sink.take_info(entry.package.id().as_str());
+                    let lease = sink.lease(entry.package.id().as_str());
+                    match (info, lease) {
+                        (Some(info), Some(lease)) => (info, lease, activation),
+                        _ => continue,
+                    }
+                }
+                None => {
+                    let (info, lease) = contribution::install_with_lease(
+                        agent,
+                        registry,
+                        &contributed,
+                        Arc::clone(&self.policy),
+                        Arc::clone(&self.events),
+                        self.config.workspace.clone(),
+                    );
+                    (info, lease, None)
+                }
+            };
             let extension_id = entry.package.id().as_str().to_owned();
             let authorizer = Arc::new(ServicePolicyAuthorizer {
                 policy: Arc::clone(&self.policy),
@@ -1836,11 +1875,6 @@ impl ExtensionHost {
                 let _ = lease.revoke(agent, registry);
                 continue;
             }
-            let activation = activations.as_mut().and_then(|set| {
-                set.attach(entry.package.id().as_str(), Box::new(lease.clone()))
-                    .ok();
-                set.take(entry.package.id().as_str())
-            });
             applied.push(AppliedExtension {
                 info,
                 activation,

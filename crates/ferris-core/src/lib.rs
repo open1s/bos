@@ -78,13 +78,20 @@ pub trait ContributionLease: Send + Sync {
     async fn revoke(&self, host: &mut dyn LeaseHost) -> Result<(), ExtError>;
 }
 
-/// Host-owned sink that applies a contribution and returns its lease.
+/// Host-owned sink that applies contributions and returns one lease.
 #[async_trait::async_trait]
 pub trait ContributionSink: Send + Sync {
-    /// Apply one contribution.
+    /// Apply the contributions a runtime started for one extension.
+    ///
+    /// The agent and registry are passed as type-erased host contexts so the
+    /// sink can install host-native contributions without core knowing the
+    /// host's types.
     async fn apply(
         &self,
-        contribution: Contribution,
+        extension: &str,
+        contributions: Vec<Contribution>,
+        agent: &mut (dyn std::any::Any + Send),
+        registry: &mut (dyn std::any::Any + Send),
     ) -> Result<Box<dyn ContributionLease>, ExtError>;
 }
 

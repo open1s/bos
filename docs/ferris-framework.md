@@ -25,9 +25,10 @@ from `ExtensionManager::plan`, builds every runtime through
 `ferris_runtime::factory::build` with a `RuntimePorts` bundle, and activates the
 applied set through `ExtensionManager::apply` with the host's own runtimes
 registered on the resolver. The host no longer names a concrete runtime
-constructor and no longer owns activation order. Agent contribution leases are
-attached to the manager's `Activation` and revoked through `BshLeaseHost` when
-the build unloads, so the manager owns both runtime and contribution leases. A
+constructor and no longer owns activation order. The manager calls `HostContributionSink` (a `ContributionSink`) to install the
+agent tools/commands/panels/prompts/skills, and the returned leases are held by
+the manager's `Activation` and revoked through `BshLeaseHost` when the build
+unloads, so the manager owns both runtime and contribution leases. A
 failed activation rolls back the already-started set instead of leaking runtimes
 or leases.
 

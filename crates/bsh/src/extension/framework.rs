@@ -266,6 +266,108 @@ fn missing_port(name: &str) -> ExtError {
     }
 }
 
+/// Host sink that installs agent contributions for the manager.
+pub(crate) struct HostContributionSink {
+    bundles: std::sync::Mutex<std::collections::HashMap<String, super::agent::Contributed>>,
+    leases: std::sync::Mutex<std::collections::HashMap<String, super::agent::ContributionLease>>,
+    infos: std::sync::Mutex<std::collections::HashMap<String, crate::plugins::PluginInfo>>,
+    policy: Arc<ferris_core::capability::PolicyEngine>,
+    events: Arc<ferris_core::events::EventBus>,
+    workspace: Option<PathBuf>,
+}
+
+impl HostContributionSink {
+    /// Build the sink for one agent build.
+    pub(crate) fn new(
+        policy: Arc<ferris_core::capability::PolicyEngine>,
+        events: Arc<ferris_core::events::EventBus>,
+        workspace: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            bundles: std::sync::Mutex::new(std::collections::HashMap::new()),
+            leases: std::sync::Mutex::new(std::collections::HashMap::new()),
+            infos: std::sync::Mutex::new(std::collections::HashMap::new()),
+            policy,
+            events,
+            workspace,
+        }
+    }
+
+    /// Register one extension's host bundle before manager apply.
+    pub(crate) fn insert(&self, extension: &str, contributed: super::agent::Contributed) {
+        if let Ok(mut bundles) = self.bundles.lock() {
+            bundles.insert(extension.to_string(), contributed);
+        }
+    }
+
+    /// Take the installed info for one extension.
+    pub(crate) fn take_info(&self, extension: &str) -> Option<crate::plugins::PluginInfo> {
+        self.infos
+            .lock()
+            .ok()
+            .and_then(|mut infos| infos.remove(extension))
+    }
+
+    /// Clone the host lease for suspend/resume bookkeeping.
+    pub(crate) fn lease(&self, extension: &str) -> Option<super::agent::ContributionLease> {
+        self.leases
+            .lock()
+            .ok()
+            .and_then(|leases| leases.get(extension).cloned())
+    }
+}
+
+#[async_trait::async_trait]
+impl ferris_core::ContributionSink for HostContributionSink {
+    async fn apply(
+        &self,
+        extension: &str,
+        _contributions: Vec<ferris_core::Contribution>,
+        agent: &mut (dyn std::any::Any + Send),
+        registry: &mut (dyn std::any::Any + Send),
+    ) -> Result<Box<dyn ferris_core::ContributionLease>, ExtError> {
+        let agent = agent
+            .downcast_mut::<::agent::Agent>()
+            .ok_or_else(|| ExtError {
+                code: ferris_core::ErrorCode::Contribution,
+                message: "host sink expected an agent".to_string(),
+                details: serde_json::Value::Null,
+            })?;
+        let registry = registry
+            .downcast_mut::<::agent::plugins::PluginRegistry>()
+            .ok_or_else(|| ExtError {
+                code: ferris_core::ErrorCode::Contribution,
+                message: "host sink expected a plugin registry".to_string(),
+                details: serde_json::Value::Null,
+            })?;
+        let bundle = self
+            .bundles
+            .lock()
+            .ok()
+            .and_then(|mut bundles| bundles.remove(extension))
+            .ok_or_else(|| ExtError {
+                code: ferris_core::ErrorCode::Contribution,
+                message: format!("no host bundle for {extension}"),
+                details: serde_json::Value::Null,
+            })?;
+        let (info, lease) = super::agent::install_with_lease(
+            agent,
+            registry,
+            &bundle,
+            Arc::clone(&self.policy),
+            Arc::clone(&self.events),
+            self.workspace.clone(),
+        );
+        if let Ok(mut infos) = self.infos.lock() {
+            infos.insert(extension.to_string(), info);
+        }
+        if let Ok(mut leases) = self.leases.lock() {
+            leases.insert(extension.to_string(), lease.clone());
+        }
+        Ok(Box::new(lease))
+    }
+}
+
 /// Sink used when the host applies its own agent contributions separately.
 pub(crate) struct HostNoopSink;
 
@@ -300,7 +402,10 @@ impl ferris_core::ContributionLease for HostNoopLease {
 impl ferris_core::ContributionSink for HostNoopSink {
     async fn apply(
         &self,
-        _contribution: ferris_core::Contribution,
+        _extension: &str,
+        _contributions: Vec<ferris_core::Contribution>,
+        _agent: &mut (dyn std::any::Any + Send),
+        _registry: &mut (dyn std::any::Any + Send),
     ) -> Result<Box<dyn ferris_core::ContributionLease>, ExtError> {
         Ok(Box::new(HostNoopLease))
     }
@@ -333,7 +438,10 @@ impl ferris_core::ContributionLease for NoopLease {
 impl ferris_core::ContributionSink for CollectSink {
     async fn apply(
         &self,
-        _contribution: ferris_core::Contribution,
+        _extension: &str,
+        _contributions: Vec<ferris_core::Contribution>,
+        _agent: &mut (dyn std::any::Any + Send),
+        _registry: &mut (dyn std::any::Any + Send),
     ) -> Result<Box<dyn ferris_core::ContributionLease>, ExtError> {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(Box::new(NoopLease))
@@ -358,7 +466,7 @@ mod manager_tests {
             Arc::new(CollectSink(Arc::clone(&applied))),
         );
         let active = manager
-            .apply(&plan, &mut HostNoopHost)
+            .apply(&plan, &mut (), &mut (), &mut HostNoopHost)
             .await
             .expect("apply");
         assert_eq!(active.len(), 1);
@@ -380,7 +488,7 @@ mod manager_tests {
             Arc::new(CollectSink(Arc::clone(&applied))),
         );
         let active = manager
-            .apply(&plan, &mut HostNoopHost)
+            .apply(&plan, &mut (), &mut (), &mut HostNoopHost)
             .await
             .expect("apply");
         assert_eq!(active.len(), 1);
@@ -405,7 +513,7 @@ mod manager_tests {
             Arc::new(CollectSink(Arc::clone(&applied))),
         );
         let active = manager
-            .apply(&plan, &mut HostNoopHost)
+            .apply(&plan, &mut (), &mut (), &mut HostNoopHost)
             .await
             .expect("apply");
         assert_eq!(active.len(), 1);
@@ -440,7 +548,7 @@ mod manager_tests {
             Arc::new(CollectSink(Arc::clone(&applied))),
         );
         let active = manager
-            .apply(&plan, &mut HostNoopHost)
+            .apply(&plan, &mut (), &mut (), &mut HostNoopHost)
             .await
             .expect("apply");
         assert_eq!(active.len(), 1);
