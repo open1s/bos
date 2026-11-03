@@ -111,6 +111,31 @@ impl ExtensionManager {
         self.store.install_with(source, origin).map_err(package_error)
     }
 
+    /// Remove one installed extension, optionally purging its data.
+    pub fn uninstall(&self, id: &str, purge_data: bool) -> Result<(), ExtError> {
+        let id = ExtensionId::parse(id.to_string()).map_err(|error| ExtError {
+            code: ErrorCode::Manifest,
+            message: error.to_string(),
+            details: serde_json::Value::Null,
+        })?;
+        self.store
+            .uninstall(&id, purge_data)
+            .map_err(package_error)
+    }
+
+    /// Enable or disable one installed extension.
+    pub fn set_enabled(&self, id: &str, enabled: bool) -> Result<(), ExtError> {
+        let id = ExtensionId::parse(id.to_string()).map_err(|error| ExtError {
+            code: ErrorCode::Manifest,
+            message: error.to_string(),
+            details: serde_json::Value::Null,
+        })?;
+        self.store
+            .set_enabled(&id, enabled)
+            .map(|_| ())
+            .map_err(package_error)
+    }
+
     /// Install one local package tree and return its identity.
     pub fn install(&self, source: &Path) -> Result<InstalledExtension, ExtError> {
         let package = self.store.install(source).map_err(package_error)?;

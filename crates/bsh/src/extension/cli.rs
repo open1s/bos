@@ -566,9 +566,10 @@ fn command_uninstall(args: &[String], root: Option<PathBuf>) -> Result<i32, Stri
     let id = ExtensionId::parse(one_argument(args, "bsh ext uninstall <id> [--purge-data]")?)
         .map_err(|error| error.to_string())?;
     let purge = args.iter().any(|arg| arg == "--purge-data");
-    let store = ExtensionStore::open(config(root).root).map_err(|error| error.to_string())?;
-    store
-        .uninstall(&id, purge)
+    let manager = crate::extension::framework::manager_for(config(root).root, None)
+        .map_err(|error| error.to_string())?;
+    manager
+        .uninstall(id.as_str(), purge)
         .map_err(|error| error.to_string())?;
     println!(
         "uninstalled {id}{}",
@@ -788,10 +789,11 @@ fn print_status(status: &ExtensionStatus) {
 fn command_toggle(command: &str, args: &[String], root: Option<PathBuf>) -> Result<i32, String> {
     let id = ExtensionId::parse(one_argument(args, "bsh ext enable|disable <id>")?)
         .map_err(|error| error.to_string())?;
-    let store = ExtensionStore::open(config(root).root).map_err(|error| error.to_string())?;
+    let manager = crate::extension::framework::manager_for(config(root).root, None)
+        .map_err(|error| error.to_string())?;
     let enabled = command == "enable";
-    store
-        .set_enabled(&id, enabled)
+    manager
+        .set_enabled(id.as_str(), enabled)
         .map_err(|error| error.to_string())?;
     println!("{command}d {id}");
     Ok(0)
