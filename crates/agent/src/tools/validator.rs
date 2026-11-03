@@ -38,7 +38,18 @@ fn validate_object(schema: &serde_json::Value, args: &serde_json::Value) -> Resu
         }
     }
 
-    if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
+    let properties = schema.get("properties").and_then(|p| p.as_object());
+    if schema.get("additionalProperties") == Some(&serde_json::Value::Bool(false)) {
+        for field_name in args_obj.keys() {
+            if !properties.is_some_and(|props| props.contains_key(field_name)) {
+                return Err(ToolError::SchemaMismatch {
+                    message: format!("unknown field: {field_name}"),
+                });
+            }
+        }
+    }
+
+    if let Some(props) = properties {
         for (field_name, field_schema) in props {
             if let Some(value) = args_obj.get(field_name) {
                 validate_field(field_name, field_schema, value)?;
@@ -58,9 +69,8 @@ fn validate_field(
 
     let matches = match expected_type {
         "string" => value.is_string(),
-        "number" | "integer" => {
-            value.is_number() || (value.is_string() && can_parse_as_number(value))
-        }
+        "number" => numeric_value(value).is_some(),
+        "integer" => numeric_value(value).is_some_and(|number| number.fract() == 0.0),
         "boolean" => value.is_boolean(),
         "array" => value.is_array(),
         "object" => value.is_object(),
@@ -80,29 +90,86 @@ fn validate_field(
         });
     }
 
-    if expected_type == "object" {
-        validate_object(schema, value)?;
+    if let Some(values) = schema.get("enum").and_then(|v| v.as_array()) {
+        if !values.contains(value) {
+            return Err(ToolError::SchemaMismatch {
+                message: format!("field '{name}' must be one of the declared enum values"),
+            });
+        }
     }
 
-    if expected_type == "array" {
-        if let Some(items_schema) = schema.get("items") {
-            if let Some(arr) = value.as_array() {
-                for (i, item) in arr.iter().enumerate() {
-                    validate_field(&format!("{}[{}]", name, i), items_schema, item)?;
-                }
+    if let Some(text) = value.as_str() {
+        let length = text.chars().count();
+        if let Some(minimum) = schema.get("minLength").and_then(|v| v.as_u64()) {
+            if length < minimum as usize {
+                return Err(ToolError::SchemaMismatch {
+                    message: format!("field '{name}' must contain at least {minimum} characters"),
+                });
             }
         }
+        if let Some(maximum) = schema.get("maxLength").and_then(|v| v.as_u64()) {
+            if length > maximum as usize {
+                return Err(ToolError::SchemaMismatch {
+                    message: format!("field '{name}' must contain at most {maximum} characters"),
+                });
+            }
+        }
+    }
+
+    if let Some(number) = numeric_value(value) {
+        if let Some(minimum) = schema.get("minimum").and_then(|v| v.as_f64()) {
+            if number < minimum {
+                return Err(ToolError::SchemaMismatch {
+                    message: format!("field '{name}' must be at least {minimum}"),
+                });
+            }
+        }
+        if let Some(maximum) = schema.get("maximum").and_then(|v| v.as_f64()) {
+            if number > maximum {
+                return Err(ToolError::SchemaMismatch {
+                    message: format!("field '{name}' must be at most {maximum}"),
+                });
+            }
+        }
+    }
+
+    if let Some(array) = value.as_array() {
+        if let Some(minimum) = schema.get("minItems").and_then(|v| v.as_u64()) {
+            if array.len() < minimum as usize {
+                return Err(ToolError::SchemaMismatch {
+                    message: format!("field '{name}' must contain at least {minimum} items"),
+                });
+            }
+        }
+        if let Some(maximum) = schema.get("maxItems").and_then(|v| v.as_u64()) {
+            if array.len() > maximum as usize {
+                return Err(ToolError::SchemaMismatch {
+                    message: format!("field '{name}' must contain at most {maximum} items"),
+                });
+            }
+        }
+        if let Some(items_schema) = schema.get("items") {
+            for (i, item) in array.iter().enumerate() {
+                validate_field(&format!("{name}[{i}]"), items_schema, item)?;
+            }
+        }
+    }
+
+    if expected_type == "object" {
+        validate_object(schema, value)?;
     }
 
     Ok(())
 }
 
+fn numeric_value(value: &serde_json::Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|text| text.parse::<f64>().ok()))
+}
+
 fn can_parse_as_number(value: &serde_json::Value) -> bool {
-    if let Some(s) = value.as_str() {
-        s.parse::<f64>().is_ok()
-    } else {
-        false
-    }
+    numeric_value(value).is_some()
 }
 
 fn value_type(value: &serde_json::Value) -> &'static str {
