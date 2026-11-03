@@ -1,0 +1,531 @@
+//! Declarative workflow contributions.
+//!
+//! A workflow is a bounded sequence of calls to the SAME extension's tools. The
+//! wrapper advertises one tool per workflow. Each step is authorized against
+//! its own resolved arguments immediately before dispatch, so scoped grants are
+//! evaluated against the resource the step will actually access. The wrapper
+//! never reaches another package.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use crate::declarative::RawContribution;
+use crate::contract::{CallContext, Runtime, ToolDescriptor, ToolResult};
+use bos_ext_core::capability::{authorize_each, call_scope, PolicyEngine};
+use bos_ext_core::types::{ExtensionError, RuntimeKind, TrustLevel};
+
+/// One step in a workflow.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowStep {
+    /// Step name, used in the output map and in templates.
+    pub name: String,
+    /// The internal tool to call.
+    pub tool: String,
+    /// Arguments, with {{input.x}} and {{steps.name.x}} placeholders.
+    #[serde(default)]
+    pub arguments: Value,
+}
+
+/// One declared workflow.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowFile {
+    /// Display description.
+    #[serde(default)]
+    pub description: String,
+    /// JSON Schema for the workflow input.
+    #[serde(default, rename = "input_schema")]
+    pub input_schema: Option<Value>,
+    /// Ordered steps.
+    #[serde(default)]
+    pub steps: Vec<WorkflowStep>,
+}
+
+/// A runtime that adds workflow tools in front of another runtime.
+pub struct WorkflowRuntime {
+    inner: Arc<dyn Runtime>,
+    workflows: BTreeMap<String, WorkflowFile>,
+    inner_tools: BTreeMap<String, ToolDescriptor>,
+    policy: Arc<PolicyEngine>,
+    trust: TrustLevel,
+    tools: Vec<ToolDescriptor>,
+}
+
+impl WorkflowRuntime {
+    /// Wrap a runtime with the workflows its package declared.
+    pub fn new(
+        inner: Arc<dyn Runtime>,
+        contributions: &[RawContribution],
+        inner_tools: &[ToolDescriptor],
+        policy: Arc<PolicyEngine>,
+        trust: TrustLevel,
+    ) -> Result<Self, ExtensionError> {
+        let mut workflows = BTreeMap::new();
+        let step_tools: BTreeMap<String, ToolDescriptor> = inner_tools
+            .iter()
+            .cloned()
+            .map(|tool| (tool.id.as_str().to_string(), tool))
+            .collect();
+        let mut tools = inner_tools.to_vec();
+        for contribution in contributions {
+            let text = std::fs::read_to_string(&contribution.path).map_err(|source| {
+                ExtensionError::Io {
+                    path: contribution.path.clone(),
+                    source,
+                }
+            })?;
+            let workflow: WorkflowFile =
+                serde_json::from_str(&text).map_err(|error| ExtensionError::Json {
+                    path: contribution.path.clone(),
+                    message: error.to_string(),
+                })?;
+            // Validate step references while the package is being loaded.
+            for step in &workflow.steps {
+                if !step_tools.contains_key(&step.tool) {
+                    return Err(ExtensionError::NotFound {
+                        id: format!(
+                            "workflow {} references missing tool {}",
+                            contribution.id, step.tool
+                        ),
+                    });
+                }
+            }
+            tools.push(ToolDescriptor {
+                id: contribution.id.clone(),
+                description: if workflow.description.is_empty() {
+                    format!("Run the {} workflow", contribution.id)
+                } else {
+                    workflow.description.clone()
+                },
+                input_schema: workflow
+                    .input_schema
+                    .clone()
+                    .unwrap_or_else(|| json!({"type":"object","properties":{}})),
+                // Workflow capabilities are authorized per step against the
+                // resolved arguments in execute(); an aggregate list checked
+                // against outer workflow input would authorize the wrong scope.
+                capabilities: Vec::new(),
+            });
+            workflows.insert(contribution.id.as_str().to_string(), workflow);
+        }
+        Ok(Self {
+            inner,
+            workflows,
+            inner_tools: step_tools,
+            policy,
+            trust,
+            tools,
+        })
+    }
+
+    /// The combined descriptors.
+    pub fn descriptors(&self) -> Vec<ToolDescriptor> {
+        self.tools.clone()
+    }
+
+    async fn execute(
+        &self,
+        workflow: &WorkflowFile,
+        input: Value,
+        context: &CallContext,
+        progress: Option<&tokio::sync::mpsc::UnboundedSender<Value>>,
+    ) -> Result<Value, ExtensionError> {
+        let mut outputs = serde_json::Map::new();
+        for step in &workflow.steps {
+            let arguments = resolve(&step.arguments, &input, &outputs);
+            let descriptor =
+                self.inner_tools
+                    .get(&step.tool)
+                    .ok_or_else(|| ExtensionError::NotFound {
+                        id: format!("{}::{}", context.extension, step.tool),
+                    })?;
+            let scope = call_scope(&arguments, context.workspace.as_deref());
+            authorize_each(
+                &self.policy,
+                context.extension.as_str(),
+                self.trust,
+                &descriptor.capabilities,
+                &scope,
+            )?;
+            // Progress and cancellation belong to the step actually running,
+            // not to the wrapper: threading the sender keeps a workflow's
+            // child calls streamable like any other tool call.
+            let value = match progress {
+                Some(sender) => self
+                    .inner
+                    .call_tool_progress(&step.tool, arguments, context, Some(sender.clone()))
+                    .await?
+                    .to_value(),
+                None => self.inner.call_tool(&step.tool, arguments, context).await?,
+            };
+            outputs.insert(step.name.clone(), value);
+        }
+        Ok(json!({ "steps": outputs }))
+    }
+}
+
+fn resolve(template: &Value, input: &Value, steps: &serde_json::Map<String, Value>) -> Value {
+    match template {
+        Value::String(text) => Value::String(expand(text, input, steps)),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| resolve(item, input, steps))
+                .collect(),
+        ),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| (key.clone(), resolve(value, input, steps)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn expand(text: &str, input: &Value, steps: &serde_json::Map<String, Value>) -> String {
+    let mut result = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("{{") {
+        result.push_str(&rest[..start]);
+        let Some(end) = rest[start + 2..].find("}}") else {
+            result.push_str(&rest[start..]);
+            return result;
+        };
+        let path = rest[start + 2..start + 2 + end].trim();
+        let replacement = lookup(path, input, steps)
+            .map(|value| match value {
+                Value::String(text) => text.clone(),
+                other => other.to_string(),
+            })
+            .unwrap_or_default();
+        result.push_str(&replacement);
+        rest = &rest[start + 2 + end + 2..];
+    }
+    result.push_str(rest);
+    result
+}
+
+fn lookup<'a>(
+    path: &str,
+    input: &'a Value,
+    steps: &'a serde_json::Map<String, Value>,
+) -> Option<&'a Value> {
+    let mut parts = path.split('.');
+    let root = parts.next()?;
+    let mut current = match root {
+        "input" => input,
+        "steps" => steps.get(parts.next()?)?,
+        _ => return None,
+    };
+    for part in parts {
+        current = current.get(part)?;
+    }
+    Some(current)
+}
+
+#[async_trait]
+impl Runtime for WorkflowRuntime {
+    fn kind(&self) -> RuntimeKind {
+        self.inner.kind()
+    }
+
+    async fn activate(&self) -> Result<(), ExtensionError> {
+        self.inner.activate().await
+    }
+
+    async fn deactivate(&self) -> Result<(), ExtensionError> {
+        self.inner.deactivate().await
+    }
+
+    async fn shutdown(&self) -> Result<(), ExtensionError> {
+        self.inner.shutdown().await
+    }
+
+    async fn tools(&self) -> Result<Vec<ToolDescriptor>, ExtensionError> {
+        Ok(self.tools.clone())
+    }
+
+    async fn call_tool(
+        &self,
+        name: &str,
+        arguments: Value,
+        context: &CallContext,
+    ) -> Result<Value, ExtensionError> {
+        if let Some(workflow) = self.workflows.get(name) {
+            return self.execute(workflow, arguments, context, None).await;
+        }
+        self.inner.call_tool(name, arguments, context).await
+    }
+
+    async fn call_tool_result(
+        &self,
+        name: &str,
+        arguments: Value,
+        context: &CallContext,
+    ) -> Result<ToolResult, ExtensionError> {
+        if let Some(workflow) = self.workflows.get(name) {
+            return self
+                .execute(workflow, arguments, context, None)
+                .await
+                .map(ToolResult::from_value);
+        }
+        self.inner.call_tool_result(name, arguments, context).await
+    }
+
+    async fn call_tool_progress(
+        &self,
+        name: &str,
+        arguments: Value,
+        context: &CallContext,
+        progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+    ) -> Result<ToolResult, ExtensionError> {
+        if let Some(workflow) = self.workflows.get(name) {
+            return self
+                .execute(workflow, arguments, context, progress.as_ref())
+                .await
+                .map(ToolResult::from_value);
+        }
+        self.inner
+            .call_tool_progress(name, arguments, context, progress)
+            .await
+    }
+
+    async fn cancel(&self) -> Result<(), ExtensionError> {
+        self.inner.cancel().await
+    }
+
+    fn fuel_used(&self) -> Option<u64> {
+        self.inner.fuel_used()
+    }
+
+    fn memory_limit(&self) -> Option<u64> {
+        self.inner.memory_limit()
+    }
+
+    fn memory_used(&self) -> Option<u64> {
+        self.inner.memory_used()
+    }
+
+    async fn command(&self, id: &str, arguments: Value) -> Result<Value, ExtensionError> {
+        self.inner.command(id, arguments).await
+    }
+
+    async fn panel(&self, id: &str) -> Result<Value, ExtensionError> {
+        self.inner.panel(id).await
+    }
+
+    async fn pump(&self) -> Result<(), ExtensionError> {
+        self.inner.pump().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bos_ext_core::capability::{Capability, GrantScope};
+    use bos_ext_core::types::ContributionId;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Counting {
+        calls: AtomicUsize,
+        capabilities: Vec<Capability>,
+    }
+
+    #[async_trait]
+    impl Runtime for Counting {
+        fn kind(&self) -> RuntimeKind {
+            RuntimeKind::Declarative
+        }
+        async fn tools(&self) -> Result<Vec<ToolDescriptor>, ExtensionError> {
+            Ok(vec![ToolDescriptor {
+                id: ContributionId::parse("echo").expect("id"),
+                description: "echo".to_string(),
+                input_schema: json!({"type":"object"}),
+                capabilities: self.capabilities.clone(),
+            }])
+        }
+        async fn call_tool(
+            &self,
+            _name: &str,
+            arguments: Value,
+            _context: &CallContext,
+        ) -> Result<Value, ExtensionError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(arguments)
+        }
+    }
+
+    #[test]
+    fn templates_resolve_input_and_previous_steps() {
+        let input = json!({"name": "bos"});
+        let mut steps = serde_json::Map::new();
+        steps.insert("first".to_string(), json!({"value": 7}));
+        assert_eq!(
+            expand("hello {{input.name}} {{steps.first.value}}", &input, &steps),
+            "hello bos 7"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_workflow_authorizes_each_step_against_resolved_arguments() {
+        let scratch =
+            std::env::temp_dir().join(format!("bsh-workflow-policy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&scratch).expect("scratch");
+        let path = scratch.join("fetch.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string(&json!({
+                "description": "fetch",
+                "input_schema": {"type":"object"},
+                "steps": [{
+                    "name":"fetch",
+                    "tool":"echo",
+                    "arguments":{"url":"{{input.step_url}}"}
+                }]
+            }))
+            .expect("json"),
+        )
+        .expect("workflow");
+
+        let extension = "com.example.workflow";
+        let inner = Arc::new(Counting {
+            calls: AtomicUsize::new(0),
+            capabilities: vec![Capability::NetworkHttp],
+        });
+        let tools = inner.tools().await.expect("tools");
+        let policy = Arc::new(
+            PolicyEngine::open(
+                scratch.join("grants.toml"),
+                scratch.join("audit.jsonl"),
+                bos_ext_core::capability::PolicyMode::Enforce,
+            )
+            .expect("policy"),
+        );
+        policy
+            .grant(
+                extension,
+                Capability::NetworkHttp,
+                GrantScope::Domain("allowed.example".to_string()),
+                None,
+            )
+            .expect("scoped network grant");
+        let runtime = WorkflowRuntime::new(
+            inner.clone(),
+            &[RawContribution {
+                id: ContributionId::parse("fetch").expect("id"),
+                path,
+            }],
+            &tools,
+            policy,
+            TrustLevel::Community,
+        )
+        .expect("runtime");
+        let workflow_descriptor = runtime
+            .tools()
+            .await
+            .expect("workflow tools")
+            .into_iter()
+            .find(|tool| tool.id.as_str() == "fetch")
+            .expect("workflow descriptor");
+        assert!(
+            workflow_descriptor.capabilities.is_empty(),
+            "the workflow wrapper must not authorize an aggregate scope"
+        );
+        let context = CallContext::new(
+            bos_ext_core::types::ExtensionId::parse(extension).expect("id"),
+            "test",
+            None,
+            5000,
+        );
+
+        let denied = runtime
+            .call_tool(
+                "fetch",
+                json!({
+                    "url":"https://allowed.example/data",
+                    "step_url":"https://evil.example/data"
+                }),
+                &context,
+            )
+            .await;
+        assert!(denied.is_err(), "the resolved step target must be denied");
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 0);
+
+        let allowed = runtime
+            .call_tool(
+                "fetch",
+                json!({
+                    "url":"https://allowed.example/data",
+                    "step_url":"https://allowed.example/data"
+                }),
+                &context,
+            )
+            .await
+            .expect("the granted domain is allowed");
+        assert_eq!(
+            allowed["steps"]["fetch"]["url"],
+            "https://allowed.example/data"
+        );
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[tokio::test]
+    async fn a_workflow_runs_its_steps_in_order() {
+        let scratch = std::env::temp_dir().join(format!("bsh-workflow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).expect("scratch");
+        let path = scratch.join("greet.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string(&json!({
+                "description": "greet",
+                "input_schema": {"type":"object"},
+                "steps": [{"name":"echo","tool":"echo","arguments":{"who":"{{input.who}}"}}]
+            }))
+            .expect("json"),
+        )
+        .expect("workflow");
+        let inner = Arc::new(Counting {
+            calls: AtomicUsize::new(0),
+            capabilities: Vec::new(),
+        });
+        let tools = inner.tools().await.expect("tools");
+        let policy = Arc::new(
+            PolicyEngine::open(
+                scratch.join("grants.toml"),
+                scratch.join("audit.jsonl"),
+                bos_ext_core::capability::PolicyMode::Enforce,
+            )
+            .expect("policy"),
+        );
+        let runtime = WorkflowRuntime::new(
+            inner.clone(),
+            &[RawContribution {
+                id: ContributionId::parse("greet").expect("id"),
+                path,
+            }],
+            &tools,
+            policy,
+            TrustLevel::Local,
+        )
+        .expect("runtime");
+        let context = CallContext::new(
+            bos_ext_core::types::ExtensionId::parse("com.example.workflow").expect("id"),
+            "test",
+            None,
+            5000,
+        );
+        let result = runtime
+            .call_tool("greet", json!({"who":"bos"}), &context)
+            .await
+            .expect("workflow");
+        assert_eq!(result["steps"]["echo"]["who"], "bos");
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+}

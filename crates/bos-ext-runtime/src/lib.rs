@@ -10,6 +10,8 @@ pub mod contract;
 pub mod declarative;
 #[cfg(feature = "process")]
 pub mod process;
+#[cfg(feature = "workflow")]
+pub mod workflow;
 
 use std::collections::BTreeMap;
 
