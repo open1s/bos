@@ -2,8 +2,8 @@
 //!
 //! The shared identity, persona slot and workflow guidance live in
 //! [`agent::prompts`]; this module owns the guidance for the tools BSH registers
-//! itself (`glob`, `grep`, `read_file`, `read_files`, `write_file`, `edit_file`, `list_dir`,
-//! `web_search`), the
+//! itself (`glob`, `grep`, `read_file`, `read_files`, `write_file`, `edit_file`,
+//! `apply_patch`, `list_dir`, `web_search`), the
 //! standing subagent rule, the shipped preset personas, and the plan-mode
 //! directive. Every constant is pinned by a test and documented against the
 //! shipped DeepSeek Harness wording in `docs/bsh-prompts.md`.
