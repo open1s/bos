@@ -835,6 +835,36 @@ impl Agent {
         removed
     }
 
+    /// Remove skills by name from the whole set: the build's own list and the
+    /// live overlay.
+    ///
+    /// The workspace's skill switches are keyed by name. The settings scan
+    /// already honors them for the skills it finds, but a package's skills are
+    /// registered after that scan - the extension platform through the live
+    /// overlay, the legacy shim through the build's own list - so the switch has
+    /// to be applied to the finished set or the menu and the model would
+    /// disagree about which skills are on.
+    pub fn remove_skills_by_names(&mut self, names: &[String]) -> usize {
+        if names.is_empty() {
+            return 0;
+        }
+        let before = self.skills.len();
+        self.skills
+            .retain(|skill| !names.iter().any(|name| name == &skill.metadata.name));
+        let mut removed = before - self.skills.len();
+        {
+            let mut live = self.live_skills.write().expect("live skill registry");
+            let before = live.len();
+            live.retain(|skill| !names.iter().any(|name| name == &skill.metadata.name));
+            removed += before - live.len();
+        }
+        if removed > 0 {
+            self.engine_cache.lock().unwrap().take();
+            self.context_cache.lock().unwrap().take();
+        }
+        removed
+    }
+
     /// Load skills from a directory into the live overlay.
     pub fn add_live_skills_from_dir(
         &self,

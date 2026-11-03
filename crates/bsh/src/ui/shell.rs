@@ -1199,6 +1199,9 @@ impl Shell {
         let built = crate::caps::build_agent(&state.settings, &state.vault, &choice, &state.mcp);
         state.set_tools_schema(built.tools_schema_chars);
         state.set_policy(built.policy.clone());
+        // The menu is read before any turn exists, so the launch build is what
+        // seeds the package skills it offers.
+        state.record_agent_skills_from(&built.agent);
         // The tree order the sidebar last chose, from the settings file.
         state.sort =
             crate::store::SessionSort::from_persisted(&state.settings.global.general.session_sort);
@@ -3571,6 +3574,9 @@ impl Shell {
         }
         self.state.set_tools_schema(built.tools_schema_chars);
         self.state.set_policy(built.policy.clone());
+        // The turn's build is the authoritative skill set: an extension that
+        // was switched on since the last turn lands in the menu here.
+        self.state.record_agent_skills_from(&built.agent);
         // The turn's context facts come from the build's OWN resolution, so the
         // facts the model reads are the facts the tools enforce. The snapshot
         // is cheap and pure; the runner renders it (and runs instruction

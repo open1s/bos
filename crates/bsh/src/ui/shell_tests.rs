@@ -21960,6 +21960,176 @@ fn the_slash_view_model_filters_every_source_and_the_trigger_is_the_leading_slas
     );
 }
 
+/// The build itself feeds the menu: an installed extension's skill is offered
+/// once a real build has recorded it, with no hand-made row.
+///
+/// This closes the chain the reader sees - package installed, extension active,
+/// `/greet` typed - without a GPUI window: the build activates the package, the
+/// state records the agent's skill set, and the menu's own derivation reads it.
+#[test]
+fn a_builds_extension_skill_reaches_the_menu() {
+    use super::slash_palette::slash_skills;
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../agent/tests/fixtures/extensions/dsh-echo");
+    let mut settings = crate::settings::Settings::default();
+    settings
+        .global
+        .extensions
+        .push(crate::settings::global::InstalledExtension {
+            id: "dsh-echo".to_string(),
+            path: Some(fixture.to_string_lossy().to_string()),
+            ..Default::default()
+        });
+    let built = crate::caps::build_agent(
+        &settings,
+        &crate::vault::Vault::disabled(),
+        &crate::settings::resolve::SessionChoice::default(),
+        &crate::mcp::McpPool::default(),
+    );
+    let mut state = AppState::with_store(scratch_store("slash-build-skill"));
+    state.record_agent_skills_from(&built.agent);
+
+    let names: Vec<String> = slash_skills(&state)
+        .into_iter()
+        .map(|skill| skill.name)
+        .collect();
+    assert!(
+        names.iter().any(|name| name == "greet"),
+        "the build's extension skill reaches the menu: {names:?}"
+    );
+    assert!(
+        state.agent_skills().iter().any(|row| row.name == "greet"),
+        "and the state it merged from carries it"
+    );
+
+    // The workspace's own switch is name-keyed and must reach the overlay too:
+    // a switched-off package skill cannot stay in the request while the menu
+    // drops it.
+    settings.workspace.disabled.skills = vec!["greet".to_string()];
+    let built = crate::caps::build_agent(
+        &settings,
+        &crate::vault::Vault::disabled(),
+        &crate::settings::resolve::SessionChoice::default(),
+        &crate::mcp::McpPool::default(),
+    );
+    assert!(
+        !built
+            .agent
+            .all_skills()
+            .iter()
+            .any(|skill| skill.metadata.name == "greet"),
+        "a switched-off package skill leaves the agent"
+    );
+    let mut state = AppState::with_store(scratch_store("slash-build-skill-off"));
+    state.record_agent_skills_from(&built.agent);
+    assert!(
+        !slash_skills(&state)
+            .iter()
+            .any(|skill| skill.name == "greet"),
+        "and the menu agrees"
+    );
+}
+
+/// A package's SKILL.md is loaded after the build, so the scanned catalogue
+/// never contained it; the menu must still offer it.
+///
+/// The build records the agent's whole skill set on the state and the menu
+/// merges it, which is what turns a skill the reader could only type by hand
+/// into a row they can pick. The same test pins the two rules that keep the
+/// merge honest - a name the scan already knows is listed once, and a skill the
+/// workspace switched off is not offered - and proves the cached rows follow the
+/// build, not only the settings scan.
+#[gpui::test]
+fn the_slash_menu_offers_a_packages_skill(cx: &mut TestAppContext) {
+    let root = skills_scratch("slash-package-skill");
+    skills_write(&root, "scanned");
+    let (harness, cx) = slash_shell(cx, "slash-package-skill", root, 4);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let open = |shell: &Entity<Shell>, cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            shell.update(cx, |this, cx| {
+                this.slash.sync("/", &this.state, &[]);
+                cx.notify();
+            })
+        });
+    };
+    open(&shell, cx);
+    let before: Vec<String> = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .slash
+            .rows()
+            .map(|row| row.id.clone())
+            .collect()
+    });
+    assert!(
+        before.iter().any(|id| id == "skill-scanned"),
+        "the premise: the scan's own skill is offered: {before:?}"
+    );
+    assert!(
+        !before.iter().any(|id| id == "skill-package-skill"),
+        "the premise: a package skill is not in the settings scan: {before:?}"
+    );
+
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.state.record_agent_skills(vec![
+                crate::state::AgentSkillRow {
+                    name: "package-skill".to_string(),
+                    description: "a package's guided tour".to_string(),
+                    user_only: false,
+                },
+                crate::state::AgentSkillRow {
+                    name: "scanned".to_string(),
+                    description: "the package's copy of a scanned name".to_string(),
+                    user_only: false,
+                },
+                crate::state::AgentSkillRow {
+                    name: "off-switch".to_string(),
+                    description: "switched off in this workspace".to_string(),
+                    user_only: false,
+                },
+            ]);
+            this.state.settings.workspace.disabled.skills = vec!["off-switch".to_string()];
+        })
+    });
+    open(&shell, cx);
+    let rows: Vec<String> = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .slash
+            .rows()
+            .map(|row| row.id.clone())
+            .collect()
+    });
+    assert!(
+        rows.iter().any(|id| id == "skill-package-skill"),
+        "the package's skill reaches the menu: {rows:?}"
+    );
+    assert_eq!(
+        rows.iter().filter(|id| *id == "skill-scanned").count(),
+        1,
+        "one row per name, and the scan's own wins: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|id| id == "skill-off-switch"),
+        "a switched-off skill stays out: {rows:?}"
+    );
+    let description = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .slash
+            .rows()
+            .find(|row| row.id == "skill-package-skill")
+            .map(|row| row.description.clone())
+    });
+    assert_eq!(
+        description.as_deref(),
+        Some("a package's guided tour"),
+        "the row carries the package's own description"
+    );
+}
+
 /// Every row the palette lists as a Command maps to a handler that exists, and
 /// each handler's effect is read back from the state it changed.
 #[gpui::test]

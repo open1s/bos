@@ -1376,6 +1376,16 @@ fn build_agent_for_session_inner(
         );
     }
 
+    // The workspace's skill switches are name-keyed, and the settings scan
+    // already honors them for its own skills. A package's skills arrive after
+    // that scan - the extension platform in the live overlay, the legacy shim
+    // straight into the build's own list - so the switch is applied to the
+    // finished set here: without it a switched-off package skill stayed in the
+    // request while a switched-off scanned skill left, and the menu could not
+    // state what the model actually carried.
+    if !settings.workspace.disabled.skills.is_empty() {
+        agent.remove_skills_by_names(&settings.workspace.disabled.skills);
+    }
     // The prompt names a tool only when the request actually carries it. This
     // runs after every attachment (bundles, MCP, extensions, browser, search,
     // subagent) and before the meter prices the request, so the two cannot

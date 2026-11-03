@@ -391,8 +391,8 @@ pub(crate) fn slash_palette_query(text: &str) -> Option<&str> {
 
 /// The discovered skills the card offers, name-ordered, enabled only.
 pub(crate) fn slash_skills(state: &crate::state::AppState) -> Vec<SlashSkill> {
-    let mut skills: Vec<SlashSkill> = state
-        .effective()
+    let effective = state.effective();
+    let mut skills: Vec<SlashSkill> = effective
         .skills
         .iter()
         .filter(|skill| skill.enabled)
@@ -402,6 +402,33 @@ pub(crate) fn slash_skills(state: &crate::state::AppState) -> Vec<SlashSkill> {
             user_only: skill.user_only,
         })
         .collect();
+    // A package's SKILL.md files load after the build, so the settings scan
+    // above cannot see them. The build records them on the state; merging them
+    // here is what makes an active extension's skill appear in the menu it is
+    // typed into, instead of only answering a hand-typed `/name`.
+    let scanned: std::collections::HashSet<&str> = effective
+        .skills
+        .iter()
+        .map(|skill| skill.name.as_str())
+        .collect();
+    for row in state.agent_skills() {
+        if scanned.contains(row.name.as_str())
+            || state
+                .settings
+                .workspace
+                .disabled
+                .skills
+                .iter()
+                .any(|off| off == &row.name)
+        {
+            continue;
+        }
+        skills.push(SlashSkill {
+            name: row.name.clone(),
+            description: row.description.clone(),
+            user_only: row.user_only,
+        });
+    }
     skills.sort_by(|left, right| {
         left.name
             .to_lowercase()
@@ -600,6 +627,9 @@ pub(crate) struct SlashPalette {
     catalogue_generation: Option<u64>,
     /// The language that catalogue was built in (row labels are translated).
     catalogue_lang: Option<Lang>,
+    /// The agent-skill generation that catalogue was built from, so a package
+    /// switched on since the last build rebuilds the rows.
+    catalogue_skills_generation: Option<u64>,
     /// The extension-command signature the catalogue was built from.
     catalogue_commands: Vec<String>,
     /// The rows a child list shows, addressed by the same indices as the root.
@@ -638,6 +668,9 @@ impl SlashPalette {
         // first is a fingerprint compare inside the settings cache - no
         // filesystem work, no catalogue copy.
         let generation = state.settings.skill_generation();
+        // The build's own skill set moves independently of the settings scan:
+        // an extension switched on does not rescan sources, it rebuilds.
+        let agent_skills_generation = state.agent_skills_generation();
         let command_signature: Vec<String> = commands
             .iter()
             .map(|command| {
@@ -650,6 +683,7 @@ impl SlashPalette {
         let mut catalogue_moved = false;
         if self.catalogue_generation != Some(generation)
             || self.catalogue_lang != Some(lang)
+            || self.catalogue_skills_generation != Some(agent_skills_generation)
             || self.catalogue_commands != command_signature
         {
             let skills = slash_skills(state);
@@ -660,6 +694,7 @@ impl SlashPalette {
             // keystroke.
             self.catalogue_generation = Some(state.settings.skill_generation());
             self.catalogue_lang = Some(lang);
+            self.catalogue_skills_generation = Some(agent_skills_generation);
             catalogue_moved = true;
         }
         if !self.open || self.query != query || self.lang != Some(lang) || catalogue_moved {

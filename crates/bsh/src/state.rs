@@ -430,6 +430,21 @@ fn restore_subagents(
     persisted
 }
 
+/// One skill the built agent carries that the settings scan did not find.
+///
+/// Extension packages load their `SKILL.md` files after the build, so the
+/// scanned catalogue is not the whole set the reader can invoke. The build
+/// records these rows on the state and the slash menu merges them by name.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct AgentSkillRow {
+    /// Skill name, as the `/name` gesture types it.
+    pub(crate) name: String,
+    /// One-line description the menu draws.
+    pub(crate) description: String,
+    /// Whether the manifest reserves the skill for the reader.
+    pub(crate) user_only: bool,
+}
+
 /// Everything the shell renders from.
 pub(crate) struct AppState {
     /// Persisted sessions.
@@ -3668,6 +3683,46 @@ impl AppState {
     /// Record the serialized length of the tool schemas a built agent carries.
     pub(crate) fn set_tools_schema(&mut self, chars: usize) {
         self.tools_schema_chars = chars;
+    }
+
+    /// Record the skills a built agent carries beyond the settings scan.
+    ///
+    /// Idempotent on purpose: a turn builds an agent every time, and an
+    /// unchanged set must not invalidate the slash menu's cached rows. The
+    /// generation moves only when the set actually differs.
+    pub(crate) fn record_agent_skills(&mut self, rows: Vec<AgentSkillRow>) {
+        if self.agent_skills != rows {
+            self.agent_skills = rows;
+            self.agent_skills_generation = self.agent_skills_generation.wrapping_add(1);
+        }
+    }
+
+    /// Record the whole skill set of one built agent, in the menu's own shape.
+    ///
+    /// The scanned skills are in here too; the menu de-duplicates by name, so
+    /// the difference that matters - a package's skills - lands with its own
+    /// description instead of a bare name.
+    pub(crate) fn record_agent_skills_from(&mut self, agent: &agent::Agent) {
+        let rows = agent
+            .all_skills()
+            .into_iter()
+            .map(|skill| AgentSkillRow {
+                name: skill.metadata.name,
+                description: skill.metadata.description,
+                user_only: skill.metadata.user_only,
+            })
+            .collect();
+        self.record_agent_skills(rows);
+    }
+
+    /// Skills the last build carried beyond the settings scan.
+    pub(crate) fn agent_skills(&self) -> &[AgentSkillRow] {
+        &self.agent_skills
+    }
+
+    /// How many times that set has changed, for a cached menu's key.
+    pub(crate) fn agent_skills_generation(&self) -> u64 {
+        self.agent_skills_generation
     }
 
     /// Keep the latest turn's policy and refresh the pane's audit snapshot.
