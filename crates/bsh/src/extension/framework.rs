@@ -3,9 +3,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use ferris_core::capability::Capability;
-use ferris_core::manager::ExtensionManager;
-use ferris_core::{
+use ferris_sdk::capability::Capability;
+use ferris_sdk::manager::ExtensionManager;
+use ferris_sdk::{
     CapabilityRegistry, CapabilitySpec, ExtError, HostSpec, Risk, Scope, ScopePath,
     ServiceContractRegistry,
 };
@@ -38,8 +38,8 @@ impl FerrisHostSpec {
     }
 }
 
-fn risk(risk: ferris_core::capability::Risk) -> Risk {
-    use ferris_core::capability::Risk as CapabilityRisk;
+fn risk(risk: ferris_sdk::capability::Risk) -> Risk {
+    use ferris_sdk::capability::Risk as CapabilityRisk;
     match risk {
         CapabilityRisk::Low => Risk::Low,
         CapabilityRisk::Medium => Risk::Medium,
@@ -85,11 +85,11 @@ pub(crate) fn manager_for(
 /// BSH runtime resolver: wraps the standard runtimes in the generic adapter.
 pub(crate) struct FerrisRuntimeResolver {
     workspace: Option<PathBuf>,
-    policy: Option<Arc<ferris_core::capability::PolicyEngine>>,
-    events: Option<Arc<ferris_core::events::EventBus>>,
-    trust: ferris_core::types::TrustLevel,
-    builtins: std::collections::BTreeMap<String, Arc<dyn ferris_runtime::Runtime>>,
-    legacy: std::collections::BTreeMap<String, Arc<dyn ferris_runtime::Runtime>>,
+    policy: Option<Arc<ferris_sdk::capability::PolicyEngine>>,
+    events: Option<Arc<ferris_sdk::events::EventBus>>,
+    trust: ferris_sdk::types::TrustLevel,
+    builtins: std::collections::BTreeMap<String, Arc<dyn ferris_sdk::host_runtime::Runtime>>,
+    legacy: std::collections::BTreeMap<String, Arc<dyn ferris_sdk::host_runtime::Runtime>>,
 }
 
 impl FerrisRuntimeResolver {
@@ -99,7 +99,7 @@ impl FerrisRuntimeResolver {
             workspace,
             policy: None,
             events: None,
-            trust: ferris_core::types::TrustLevel::Community,
+            trust: ferris_sdk::types::TrustLevel::Community,
             builtins: std::collections::BTreeMap::new(),
             legacy: std::collections::BTreeMap::new(),
         }
@@ -110,7 +110,7 @@ impl FerrisRuntimeResolver {
     pub(crate) fn with_legacy(
         mut self,
         id: &str,
-        runtime: Arc<dyn ferris_runtime::Runtime>,
+        runtime: Arc<dyn ferris_sdk::host_runtime::Runtime>,
     ) -> Self {
         self.legacy.insert(id.to_string(), runtime);
         self
@@ -121,7 +121,7 @@ impl FerrisRuntimeResolver {
     pub(crate) fn with_builtin(
         mut self,
         id: &str,
-        runtime: Arc<dyn ferris_runtime::Runtime>,
+        runtime: Arc<dyn ferris_sdk::host_runtime::Runtime>,
     ) -> Self {
         self.builtins.insert(id.to_string(), runtime);
         self
@@ -131,9 +131,9 @@ impl FerrisRuntimeResolver {
     #[must_use]
     pub(crate) fn with_ports(
         mut self,
-        policy: Arc<ferris_core::capability::PolicyEngine>,
-        events: Arc<ferris_core::events::EventBus>,
-        trust: ferris_core::types::TrustLevel,
+        policy: Arc<ferris_sdk::capability::PolicyEngine>,
+        events: Arc<ferris_sdk::events::EventBus>,
+        trust: ferris_sdk::types::TrustLevel,
     ) -> Self {
         self.policy = Some(policy);
         self.events = Some(events);
@@ -142,63 +142,68 @@ impl FerrisRuntimeResolver {
     }
 }
 
-impl ferris_core::RuntimeResolver for FerrisRuntimeResolver {
+impl ferris_sdk::RuntimeResolver for FerrisRuntimeResolver {
     fn create(
         &self,
-        manifest: &ferris_core::manifest::Manifest,
+        manifest: &ferris_sdk::core_manifest::Manifest,
         root: &std::path::Path,
         data_root: &std::path::Path,
-    ) -> Result<Arc<dyn ferris_core::Runtime>, ExtError> {
+    ) -> Result<Arc<dyn ferris_sdk::Runtime>, ExtError> {
         if let Some(runtime) = self.legacy.get(manifest.id().as_str()).cloned() {
-            return Ok(Arc::new(ferris_runtime::adapter::LegacyAdapter::new(
-                manifest.id().clone(),
-                root.to_path_buf(),
-                self.workspace.clone(),
-                runtime,
-            )));
+            return Ok(Arc::new(
+                ferris_sdk::host_runtime::adapter::LegacyAdapter::new(
+                    manifest.id().clone(),
+                    root.to_path_buf(),
+                    self.workspace.clone(),
+                    runtime,
+                ),
+            ));
         }
-        if manifest.runtime.kind == ferris_core::types::RuntimeKind::Builtin {
+        if manifest.runtime.kind == ferris_sdk::types::RuntimeKind::Builtin {
             let runtime = self
                 .builtins
                 .get(manifest.id().as_str())
                 .cloned()
                 .ok_or_else(|| ExtError {
-                    code: ferris_core::ErrorCode::Runtime,
+                    code: ferris_sdk::ErrorCode::Runtime,
                     message: format!("builtin {} is not registered", manifest.id()),
                     details: serde_json::Value::Null,
                 })?;
-            return Ok(Arc::new(ferris_runtime::adapter::LegacyAdapter::new(
-                manifest.id().clone(),
-                root.to_path_buf(),
-                self.workspace.clone(),
-                runtime,
-            )));
+            return Ok(Arc::new(
+                ferris_sdk::host_runtime::adapter::LegacyAdapter::new(
+                    manifest.id().clone(),
+                    root.to_path_buf(),
+                    self.workspace.clone(),
+                    runtime,
+                ),
+            ));
         }
         let runtime = match manifest.runtime.kind {
-            ferris_core::types::RuntimeKind::Declarative => {
-                let inner = ferris_runtime::declarative::DeclarativeRuntime::new(root, manifest)
-                    .map_err(runtime_error)?;
-                Arc::new(inner) as Arc<dyn ferris_runtime::Runtime>
+            ferris_sdk::types::RuntimeKind::Declarative => {
+                let inner =
+                    ferris_sdk::host_runtime::declarative::DeclarativeRuntime::new(root, manifest)
+                        .map_err(runtime_error)?;
+                Arc::new(inner) as Arc<dyn ferris_sdk::host_runtime::Runtime>
             }
-            ferris_core::types::RuntimeKind::Process => {
-                let inner = ferris_runtime::process::ProcessRuntime::new(manifest, root)
+            ferris_sdk::types::RuntimeKind::Process => {
+                let inner = ferris_sdk::host_runtime::process::ProcessRuntime::new(manifest, root)
                     .map_err(runtime_error)?;
-                Arc::new(inner) as Arc<dyn ferris_runtime::Runtime>
+                Arc::new(inner) as Arc<dyn ferris_sdk::host_runtime::Runtime>
             }
-            ferris_core::types::RuntimeKind::Cordis => {
-                let inner = ferris_runtime::cordis::CordisRuntime::new(
+            ferris_sdk::types::RuntimeKind::Cordis => {
+                let inner = ferris_sdk::host_runtime::cordis::CordisRuntime::new(
                     manifest,
                     root,
                     data_root,
                     Arc::new(super::terminal::HostTerminal),
                 )
                 .map_err(runtime_error)?;
-                Arc::new(inner) as Arc<dyn ferris_runtime::Runtime>
+                Arc::new(inner) as Arc<dyn ferris_sdk::host_runtime::Runtime>
             }
-            ferris_core::types::RuntimeKind::Extism => {
+            ferris_sdk::types::RuntimeKind::Extism => {
                 let policy = self.policy.clone().ok_or_else(|| missing_port("policy"))?;
                 let events = self.events.clone().ok_or_else(|| missing_port("events"))?;
-                let inner = ferris_runtime::extism::ExtismRuntime::new(
+                let inner = ferris_sdk::host_runtime::extism::ExtismRuntime::new(
                     manifest,
                     root,
                     data_root,
@@ -209,12 +214,12 @@ impl ferris_core::RuntimeResolver for FerrisRuntimeResolver {
                     self.trust,
                 )
                 .map_err(runtime_error)?;
-                Arc::new(inner) as Arc<dyn ferris_runtime::Runtime>
+                Arc::new(inner) as Arc<dyn ferris_sdk::host_runtime::Runtime>
             }
-            ferris_core::types::RuntimeKind::WasmComponent => {
+            ferris_sdk::types::RuntimeKind::WasmComponent => {
                 let policy = self.policy.clone().ok_or_else(|| missing_port("policy"))?;
                 let events = self.events.clone().ok_or_else(|| missing_port("events"))?;
-                let inner = ferris_runtime::wasm::WasmRuntime::new(
+                let inner = ferris_sdk::host_runtime::wasm::WasmRuntime::new(
                     manifest,
                     root,
                     data_root,
@@ -225,12 +230,12 @@ impl ferris_core::RuntimeResolver for FerrisRuntimeResolver {
                     self.trust,
                 )
                 .map_err(runtime_error)?;
-                Arc::new(inner) as Arc<dyn ferris_runtime::Runtime>
+                Arc::new(inner) as Arc<dyn ferris_sdk::host_runtime::Runtime>
             }
-            ferris_core::types::RuntimeKind::Mcp => {
+            ferris_sdk::types::RuntimeKind::Mcp => {
                 let policy = self.policy.clone().ok_or_else(|| missing_port("policy"))?;
                 let events = self.events.clone().ok_or_else(|| missing_port("events"))?;
-                let inner = ferris_runtime::mcp::McpRuntime::new(
+                let inner = ferris_sdk::host_runtime::mcp::McpRuntime::new(
                     manifest,
                     root,
                     "{}".to_string(),
@@ -239,28 +244,30 @@ impl ferris_core::RuntimeResolver for FerrisRuntimeResolver {
                     events,
                 )
                 .map_err(runtime_error)?;
-                Arc::new(inner) as Arc<dyn ferris_runtime::Runtime>
+                Arc::new(inner) as Arc<dyn ferris_sdk::host_runtime::Runtime>
             }
             other => {
                 return Err(ExtError {
-                    code: ferris_core::ErrorCode::Runtime,
+                    code: ferris_sdk::ErrorCode::Runtime,
                     message: format!("runtime {other} is not wired through the manager yet"),
                     details: serde_json::Value::Null,
                 })
             }
         };
-        Ok(Arc::new(ferris_runtime::adapter::LegacyAdapter::new(
-            manifest.id().clone(),
-            root.to_path_buf(),
-            self.workspace.clone(),
-            runtime,
-        )))
+        Ok(Arc::new(
+            ferris_sdk::host_runtime::adapter::LegacyAdapter::new(
+                manifest.id().clone(),
+                root.to_path_buf(),
+                self.workspace.clone(),
+                runtime,
+            ),
+        ))
     }
 }
 
 fn missing_port(name: &str) -> ExtError {
     ExtError {
-        code: ferris_core::ErrorCode::Runtime,
+        code: ferris_sdk::ErrorCode::Runtime,
         message: format!("runtime resolver has no {name} port"),
         details: serde_json::Value::Null,
     }
@@ -271,16 +278,16 @@ pub(crate) struct HostContributionSink {
     bundles: std::sync::Mutex<std::collections::HashMap<String, super::agent::Contributed>>,
     leases: std::sync::Mutex<std::collections::HashMap<String, super::agent::ContributionLease>>,
     infos: std::sync::Mutex<std::collections::HashMap<String, crate::plugins::PluginInfo>>,
-    policy: Arc<ferris_core::capability::PolicyEngine>,
-    events: Arc<ferris_core::events::EventBus>,
+    policy: Arc<ferris_sdk::capability::PolicyEngine>,
+    events: Arc<ferris_sdk::events::EventBus>,
     workspace: Option<PathBuf>,
 }
 
 impl HostContributionSink {
     /// Build the sink for one agent build.
     pub(crate) fn new(
-        policy: Arc<ferris_core::capability::PolicyEngine>,
-        events: Arc<ferris_core::events::EventBus>,
+        policy: Arc<ferris_sdk::capability::PolicyEngine>,
+        events: Arc<ferris_sdk::events::EventBus>,
         workspace: Option<PathBuf>,
     ) -> Self {
         Self {
@@ -318,25 +325,25 @@ impl HostContributionSink {
 }
 
 #[async_trait::async_trait]
-impl ferris_core::ContributionSink for HostContributionSink {
+impl ferris_sdk::ContributionSink for HostContributionSink {
     async fn apply(
         &self,
         extension: &str,
-        _contributions: Vec<ferris_core::Contribution>,
+        _contributions: Vec<ferris_sdk::Contribution>,
         agent: &mut (dyn std::any::Any + Send),
         registry: &mut (dyn std::any::Any + Send),
-    ) -> Result<Box<dyn ferris_core::ContributionLease>, ExtError> {
+    ) -> Result<Box<dyn ferris_sdk::ContributionLease>, ExtError> {
         let agent = agent
             .downcast_mut::<::agent::Agent>()
             .ok_or_else(|| ExtError {
-                code: ferris_core::ErrorCode::Contribution,
+                code: ferris_sdk::ErrorCode::Contribution,
                 message: "host sink expected an agent".to_string(),
                 details: serde_json::Value::Null,
             })?;
         let registry = registry
             .downcast_mut::<::agent::plugins::PluginRegistry>()
             .ok_or_else(|| ExtError {
-                code: ferris_core::ErrorCode::Contribution,
+                code: ferris_sdk::ErrorCode::Contribution,
                 message: "host sink expected a plugin registry".to_string(),
                 details: serde_json::Value::Null,
             })?;
@@ -346,7 +353,7 @@ impl ferris_core::ContributionSink for HostContributionSink {
             .ok()
             .and_then(|mut bundles| bundles.remove(extension))
             .ok_or_else(|| ExtError {
-                code: ferris_core::ErrorCode::Contribution,
+                code: ferris_sdk::ErrorCode::Contribution,
                 message: format!("no host bundle for {extension}"),
                 details: serde_json::Value::Null,
             })?;
@@ -376,7 +383,7 @@ pub(crate) struct HostNoopLease;
 
 pub(crate) struct HostNoopHost;
 
-impl ferris_core::LeaseHost for HostNoopHost {
+impl ferris_sdk::LeaseHost for HostNoopHost {
     fn remove_tools(&mut self, _owner: &str, _tools: &[String]) -> usize {
         0
     }
@@ -392,28 +399,28 @@ impl ferris_core::LeaseHost for HostNoopHost {
 }
 
 #[async_trait::async_trait]
-impl ferris_core::ContributionLease for HostNoopLease {
-    async fn revoke(&self, _host: &mut dyn ferris_core::LeaseHost) -> Result<(), ExtError> {
+impl ferris_sdk::ContributionLease for HostNoopLease {
+    async fn revoke(&self, _host: &mut dyn ferris_sdk::LeaseHost) -> Result<(), ExtError> {
         Ok(())
     }
 }
 
 #[async_trait::async_trait]
-impl ferris_core::ContributionSink for HostNoopSink {
+impl ferris_sdk::ContributionSink for HostNoopSink {
     async fn apply(
         &self,
         _extension: &str,
-        _contributions: Vec<ferris_core::Contribution>,
+        _contributions: Vec<ferris_sdk::Contribution>,
         _agent: &mut (dyn std::any::Any + Send),
         _registry: &mut (dyn std::any::Any + Send),
-    ) -> Result<Box<dyn ferris_core::ContributionLease>, ExtError> {
+    ) -> Result<Box<dyn ferris_sdk::ContributionLease>, ExtError> {
         Ok(Box::new(HostNoopLease))
     }
 }
 
 fn runtime_error(error: impl std::fmt::Display) -> ExtError {
     ExtError {
-        code: ferris_core::ErrorCode::Runtime,
+        code: ferris_sdk::ErrorCode::Runtime,
         message: error.to_string(),
         details: serde_json::Value::Null,
     }
@@ -427,22 +434,22 @@ struct NoopLease;
 
 #[cfg(test)]
 #[async_trait::async_trait]
-impl ferris_core::ContributionLease for NoopLease {
-    async fn revoke(&self, _host: &mut dyn ferris_core::LeaseHost) -> Result<(), ExtError> {
+impl ferris_sdk::ContributionLease for NoopLease {
+    async fn revoke(&self, _host: &mut dyn ferris_sdk::LeaseHost) -> Result<(), ExtError> {
         Ok(())
     }
 }
 
 #[cfg(test)]
 #[async_trait::async_trait]
-impl ferris_core::ContributionSink for CollectSink {
+impl ferris_sdk::ContributionSink for CollectSink {
     async fn apply(
         &self,
         _extension: &str,
-        _contributions: Vec<ferris_core::Contribution>,
+        _contributions: Vec<ferris_sdk::Contribution>,
         _agent: &mut (dyn std::any::Any + Send),
         _registry: &mut (dyn std::any::Any + Send),
-    ) -> Result<Box<dyn ferris_core::ContributionLease>, ExtError> {
+    ) -> Result<Box<dyn ferris_sdk::ContributionLease>, ExtError> {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(Box::new(NoopLease))
     }
@@ -498,7 +505,7 @@ mod manager_tests {
 
     #[tokio::test]
     async fn the_manager_applies_a_cordis_package() {
-        if ferris_runtime::bridge::find_interpreter().is_none() {
+        if ferris_sdk::host_runtime::bridge::find_interpreter().is_none() {
             return;
         }
         let source =
@@ -530,17 +537,17 @@ mod manager_tests {
         manager.install(&source).expect("install");
         let plan = manager.plan().expect("plan");
         let policy = Arc::new(
-            ferris_core::capability::PolicyEngine::open(
+            ferris_sdk::capability::PolicyEngine::open(
                 temp.path().join("grants.toml"),
                 temp.path().join("audit.log"),
-                ferris_core::capability::PolicyMode::Enforce,
+                ferris_sdk::capability::PolicyMode::Enforce,
             )
             .expect("policy"),
         );
         let resolver = FerrisRuntimeResolver::new(None).with_ports(
             policy,
-            ferris_core::events::EventBus::new(),
-            ferris_core::types::TrustLevel::Community,
+            ferris_sdk::events::EventBus::new(),
+            ferris_sdk::types::TrustLevel::Community,
         );
         let applied = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let manager = manager.with_ports(

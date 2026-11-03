@@ -19,11 +19,11 @@ use serde_json::Value;
 
 use crate::plugins::PluginInfo;
 
-use ferris_core::capability::{CallScope, Capability, PolicyEngine};
-use ferris_core::composable::Fiber;
-use ferris_core::events::{topics, EventBus, ExtensionEvent};
-use ferris_core::types::{ExtensionError, ExtensionId, TrustLevel};
-use ferris_runtime::{CallContext, Runtime, ToolDescriptor};
+use ferris_sdk::capability::{CallScope, Capability, PolicyEngine};
+use ferris_sdk::composable::Fiber;
+use ferris_sdk::events::{topics, EventBus, ExtensionEvent};
+use ferris_sdk::host_runtime::{CallContext, Runtime, ToolDescriptor};
+use ferris_sdk::types::{ExtensionError, ExtensionId, TrustLevel};
 
 use super::errors::ToToolError;
 
@@ -47,21 +47,21 @@ pub(crate) struct Contributed {
     /// Tool descriptors.
     pub(crate) tools: Vec<ToolDescriptor>,
     /// Commands.
-    pub(crate) commands: Vec<ferris_runtime::declarative::CommandContribution>,
+    pub(crate) commands: Vec<ferris_sdk::host_runtime::declarative::CommandContribution>,
     /// Panels.
-    pub(crate) panels: Vec<ferris_runtime::declarative::PanelContribution>,
+    pub(crate) panels: Vec<ferris_sdk::host_runtime::declarative::PanelContribution>,
     /// Prompts.
-    pub(crate) prompts: Vec<ferris_runtime::declarative::TextContribution>,
+    pub(crate) prompts: Vec<ferris_sdk::host_runtime::declarative::TextContribution>,
     /// Contexts.
-    pub(crate) contexts: Vec<ferris_runtime::declarative::TextContribution>,
+    pub(crate) contexts: Vec<ferris_sdk::host_runtime::declarative::TextContribution>,
     /// Workspace open for this build, used to scope contexts.
     pub(crate) workspace: Option<std::path::PathBuf>,
     /// Package skills directory, when the manifest declares skills.
     pub(crate) skills_dir: Option<std::path::PathBuf>,
     /// Workflows, recorded only.
-    pub(crate) workflows: Vec<ferris_runtime::declarative::RawContribution>,
+    pub(crate) workflows: Vec<ferris_sdk::host_runtime::declarative::RawContribution>,
     /// Themes, recorded only.
-    pub(crate) themes: Vec<ferris_runtime::declarative::RawContribution>,
+    pub(crate) themes: Vec<ferris_sdk::host_runtime::declarative::RawContribution>,
     /// One-call wall-clock ceiling.
     pub(crate) timeout_ms: u64,
 }
@@ -145,11 +145,11 @@ impl ContributionLease {
 }
 
 #[async_trait::async_trait]
-impl ferris_core::ContributionLease for ContributionLease {
+impl ferris_sdk::ContributionLease for ContributionLease {
     async fn revoke(
         &self,
-        host: &mut dyn ferris_core::LeaseHost,
-    ) -> Result<(), ferris_core::ExtError> {
+        host: &mut dyn ferris_sdk::LeaseHost,
+    ) -> Result<(), ferris_sdk::ExtError> {
         self.active.store(false, Ordering::SeqCst);
         host.remove_tools(&self.owner, &self.tools);
         host.remove_prompts(&self.owner, &self.prompt_sections);
@@ -256,7 +256,7 @@ impl ExtensionTool {
     }
 
     fn scope(&self, arguments: &Value) -> CallScope {
-        ferris_core::capability::call_scope(arguments, self.workspace.as_deref())
+        ferris_sdk::capability::call_scope(arguments, self.workspace.as_deref())
     }
 
     fn emit(&self, topic: &str, payload: Value, correlation: &str) {
@@ -369,7 +369,7 @@ impl ExtensionTool {
             .waterfall("tool.before", arguments.clone())
             .unwrap_or_else(|| arguments.clone());
         let scope = self.scope(&arguments);
-        if let Err(error) = ferris_core::capability::authorize_each(
+        if let Err(error) = ferris_sdk::capability::authorize_each(
             &self.policy,
             self.owner.as_str(),
             self.trust,
@@ -494,7 +494,7 @@ fn truncate(text: &str, limit: usize) -> String {
 /// An empty scope is unscoped and always matches; a scoped context with no open
 /// workspace never matches, because there is no path tree to test.
 fn context_matches(
-    context: &ferris_runtime::declarative::TextContribution,
+    context: &ferris_sdk::host_runtime::declarative::TextContribution,
     workspace: Option<&std::path::Path>,
 ) -> bool {
     if context.scope.is_empty() {
@@ -655,7 +655,7 @@ fn append_prompt(
     trust: TrustLevel,
     policy: &PolicyEngine,
     heading: &str,
-    contribution: &ferris_runtime::declarative::TextContribution,
+    contribution: &ferris_sdk::host_runtime::declarative::TextContribution,
     budget: &mut usize,
 ) -> Option<String> {
     let capability = if heading == "Extension prompt" {
@@ -691,9 +691,9 @@ fn append_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferris_core::capability::PolicyMode;
-    use ferris_core::types::RuntimeKind;
-    use ferris_runtime::empty_schema;
+    use ferris_sdk::capability::PolicyMode;
+    use ferris_sdk::host_runtime::empty_schema;
+    use ferris_sdk::types::RuntimeKind;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
@@ -714,8 +714,8 @@ mod tests {
         let scratch = Scratch::new("context-scope");
         std::fs::create_dir_all(scratch.0.join("src")).expect("src");
         std::fs::write(scratch.0.join("src/lib.rs"), "fn main() {}").expect("file");
-        let mut context = ferris_runtime::declarative::TextContribution {
-            id: ferris_core::types::ContributionId::parse("scoped").expect("id"),
+        let mut context = ferris_sdk::host_runtime::declarative::TextContribution {
+            id: ferris_sdk::types::ContributionId::parse("scoped").expect("id"),
             description: "Scoped".to_string(),
             text: "Text".to_string(),
             scope: vec!["src/**/*.rs".to_string()],
@@ -797,11 +797,11 @@ mod tests {
             _arguments: Value,
             _context: &CallContext,
             progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
-        ) -> Result<ferris_runtime::ToolResult, ExtensionError> {
+        ) -> Result<ferris_sdk::host_runtime::ToolResult, ExtensionError> {
             if let Some(sender) = progress {
                 let _ = sender.send(serde_json::json!({"message": "half"}));
             }
-            Ok(ferris_runtime::ToolResult::text("done"))
+            Ok(ferris_sdk::host_runtime::ToolResult::text("done"))
         }
     }
     fn policy(scratch: &Scratch) -> Arc<PolicyEngine> {
@@ -823,7 +823,7 @@ mod tests {
             runtime: Arc::new(EchoRuntime),
             trust,
             tools: vec![ToolDescriptor {
-                id: ferris_core::types::ContributionId::parse("echo").expect("tool id"),
+                id: ferris_sdk::types::ContributionId::parse("echo").expect("tool id"),
                 description: "Echo".to_string(),
                 input_schema: empty_schema(),
                 capabilities,
@@ -930,7 +930,7 @@ mod tests {
             .grant(
                 "com.example.tool",
                 Capability::WorkspaceWrite,
-                ferris_core::capability::GrantScope::Workspace,
+                ferris_sdk::capability::GrantScope::Workspace,
                 None,
             )
             .expect("grant");

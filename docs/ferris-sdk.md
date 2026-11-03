@@ -153,6 +153,22 @@ cargo run -p ferris-sdk --example echo
 cargo run -p ferris-sdk --example toolkit
 ~~~
 
+## Host facade
+
+ferris-sdk is also the single Ferris dependency for a host such as BSH. Enable
+the host-runtime feature:
+
+~~~toml
+[dependencies]
+ferris-sdk = { path = "../ferris-sdk", features = ["host-runtime"] }
+~~~
+
+The facade re-exports the core modules (capability, composable, config, events,
+lifecycle, manager, manifest, manifest_v2, package, resolver, signing, sources,
+terminal, types, ui), the manager and package/store types, and the standard
+runtime crate as ferris_sdk::host_runtime. BSH uses no direct ferris-core or
+ferris-runtime dependency.
+
 ## Design rules
 
 - No macro DSL. The manifest is the single author entry point.

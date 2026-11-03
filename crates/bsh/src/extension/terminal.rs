@@ -1,5 +1,5 @@
 //! Host terminal adapter; the contract lives in ferris-core.
-pub(crate) use ferris_core::terminal::*;
+pub(crate) use ferris_sdk::terminal::*;
 
 use std::path::PathBuf;
 

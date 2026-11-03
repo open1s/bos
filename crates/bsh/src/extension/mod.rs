@@ -40,13 +40,13 @@ pub(crate) mod terminal;
 pub(crate) use host::shutdown;
 
 /// The process-wide event dispatcher for extension tool seams.
-static DISPATCHER: std::sync::OnceLock<Arc<ferris_core::composable::dispatch::EventDispatcher>> =
+static DISPATCHER: std::sync::OnceLock<Arc<ferris_sdk::composable::dispatch::EventDispatcher>> =
     std::sync::OnceLock::new();
 
-pub(crate) fn dispatcher() -> Arc<ferris_core::composable::dispatch::EventDispatcher> {
+pub(crate) fn dispatcher() -> Arc<ferris_sdk::composable::dispatch::EventDispatcher> {
     Arc::clone(
         DISPATCHER
-            .get_or_init(|| Arc::new(ferris_core::composable::dispatch::EventDispatcher::new())),
+            .get_or_init(|| Arc::new(ferris_sdk::composable::dispatch::EventDispatcher::new())),
     )
 }
 
@@ -116,7 +116,7 @@ pub(crate) fn store_root(settings: &crate::settings::Settings) -> std::path::Pat
 }
 pub(crate) mod market;
 
-pub(crate) use ferris_core::events::topics;
+pub(crate) use ferris_sdk::events::topics;
 pub(crate) use host::{
     approve_process, cached_commands, cached_model_providers, cached_presets, grant_required,
     install_with_fibers, panels, publish, statuses, themes, CommandSurface,

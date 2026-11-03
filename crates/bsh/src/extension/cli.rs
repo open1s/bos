@@ -10,18 +10,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::extension::host::{DiagnosticsReport, ExtensionHost, ExtensionStatus, HostConfig};
-use ferris_core::capability::{Capability, GrantScope};
-use ferris_core::manifest::MANIFEST_FILE;
-use ferris_core::package::{package_hash, ExtensionStore, Package};
-use ferris_core::resolver;
-use ferris_core::signing::{
+use ferris_sdk::capability::{Capability, GrantScope};
+use ferris_sdk::core_manifest::MANIFEST_FILE;
+use ferris_sdk::host_runtime::declarative::{load_contributions, DeclarativeRuntime};
+use ferris_sdk::host_runtime::mcp::McpRuntime;
+use ferris_sdk::host_runtime::process::ProcessRuntime;
+use ferris_sdk::package::{package_hash, ExtensionStore, Package};
+use ferris_sdk::resolver;
+use ferris_sdk::signing::{
     generate_key, sign_package, verify_package, SignatureVerification, TrustStore,
 };
-use ferris_core::sources::{self, RegistryList};
-use ferris_core::types::{ExtensionId, ExtensionSource, RuntimeKind, TrustLevel};
-use ferris_runtime::declarative::{load_contributions, DeclarativeRuntime};
-use ferris_runtime::mcp::McpRuntime;
-use ferris_runtime::process::ProcessRuntime;
+use ferris_sdk::sources::{self, RegistryList};
+use ferris_sdk::types::{ExtensionId, ExtensionSource, RuntimeKind, TrustLevel};
 
 const USAGE: &str = "bsh ext <command> [options]
 
@@ -331,12 +331,12 @@ fn command_migrate(args: &[String]) -> Result<i32, String> {
     };
     let path = PathBuf::from(raw.as_str());
     if write {
-        let manifest = ferris_core::manifest_v2::write_migrated_package(&path)
+        let manifest = ferris_sdk::manifest_v2::write_migrated_package(&path)
             .map_err(|error| error.to_string())?;
         println!("migrated: {}", manifest.display());
         println!("backup:   {}", path.join("extension.toml.v1").display());
     } else {
-        let manifest = ferris_core::manifest_v2::migrate_package_manifest(&path)
+        let manifest = ferris_sdk::manifest_v2::migrate_package_manifest(&path)
             .map_err(|error| error.to_string())?;
         print!("{}", manifest.to_toml().map_err(|error| error.to_string())?);
     }
@@ -350,7 +350,7 @@ fn command_validate(args: &[String]) -> Result<i32, String> {
     println!("id:      {}", package.manifest.extension.id);
     println!("version: {}", package.manifest.extension.version);
     println!("runtime: {}", package.manifest.runtime.kind);
-    if let Ok(v2) = ferris_core::manifest_v2::ManifestV2::load(&path) {
+    if let Ok(v2) = ferris_sdk::manifest_v2::ManifestV2::load(&path) {
         println!("schema:  {}", v2.schema_version);
         println!("contributions: {}", v2.contributions.len());
     }
@@ -386,14 +386,14 @@ fn command_validate(args: &[String]) -> Result<i32, String> {
 /// Validation constructs runtimes but never spawns or calls them, so the engine
 /// only has to exist; advisory mode means a future call path cannot turn a
 /// validation into a denial.
-fn validation_policy() -> std::sync::Arc<ferris_core::capability::PolicyEngine> {
+fn validation_policy() -> std::sync::Arc<ferris_sdk::capability::PolicyEngine> {
     let dir = std::env::temp_dir().join(format!("bsh-ext-validate-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     std::sync::Arc::new(
-        ferris_core::capability::PolicyEngine::open(
+        ferris_sdk::capability::PolicyEngine::open(
             dir.join("grants.toml"),
             dir.join("audit.jsonl"),
-            ferris_core::capability::PolicyMode::Advisory,
+            ferris_sdk::capability::PolicyMode::Advisory,
         )
         .expect("a validation policy opens"),
     )
@@ -422,7 +422,7 @@ fn validate_runtime(package: &Package) -> Result<(), String> {
             "{}".to_string(),
             validation_policy(),
             TrustLevel::Local,
-            ferris_core::events::EventBus::new(),
+            ferris_sdk::events::EventBus::new(),
         )
         .map(|_| ())
         .map_err(|error| error.to_string()),
@@ -436,7 +436,7 @@ fn validate_runtime(package: &Package) -> Result<(), String> {
             if !package.root.join(entry).is_file() {
                 return Err(format!("runtime.entry {entry} is missing"));
             }
-            ferris_runtime::load_tool_descriptors(&package.root, &package.manifest)
+            ferris_sdk::host_runtime::load_tool_descriptors(&package.root, &package.manifest)
                 .map_err(|error| error.to_string())?;
             load_contributions(&package.root, &package.manifest)
                 .map(|_| ())
@@ -836,7 +836,7 @@ fn command_grant(args: &[String], root: Option<PathBuf>) -> Result<i32, String> 
         .get(1)
         .ok_or_else(|| "usage: bsh ext grant <id> <capability> [--scope s] [--note n]".to_string())?
         .parse()
-        .map_err(|error: ferris_core::types::ExtensionError| error.to_string())?;
+        .map_err(|error: ferris_sdk::types::ExtensionError| error.to_string())?;
     let mut scope = default_scope(capability);
     let mut note = None;
     let mut index = 2;
@@ -887,7 +887,7 @@ fn command_revoke(args: &[String], root: Option<PathBuf>) -> Result<i32, String>
         .get(1)
         .ok_or_else(|| "usage: bsh ext revoke <id> <capability>".to_string())?
         .parse()
-        .map_err(|error: ferris_core::types::ExtensionError| error.to_string())?;
+        .map_err(|error: ferris_sdk::types::ExtensionError| error.to_string())?;
     let host = open_host(root).map_err(|error| error.to_string())?;
     let removed = host
         .policy()
@@ -1093,7 +1093,7 @@ fn command_sign(args: &[String]) -> Result<i32, String> {
 fn command_verify(args: &[String], root: Option<PathBuf>) -> Result<i32, String> {
     let path = PathBuf::from(one_argument(args, "bsh ext verify <path>")?);
     let manifest =
-        ferris_core::manifest::Manifest::load(&path).map_err(|error| error.to_string())?;
+        ferris_sdk::core_manifest::Manifest::load(&path).map_err(|error| error.to_string())?;
     let hash = package_hash(&path).map_err(|error| error.to_string())?;
     let store = ExtensionStore::open(config(root).root).map_err(|error| error.to_string())?;
     let trust = TrustStore::load(store.trust_path()).map_err(|error| error.to_string())?;
@@ -1451,10 +1451,10 @@ fn command_mock(args: &[String]) -> Result<i32, String> {
     let data_root = root.join("data");
     std::fs::create_dir_all(&data_root).map_err(|error| error.to_string())?;
     let policy = std::sync::Arc::new(
-        ferris_core::capability::PolicyEngine::open(
+        ferris_sdk::capability::PolicyEngine::open(
             root.join("grants.toml"),
             root.join("audit.jsonl"),
-            ferris_core::capability::PolicyMode::Enforce,
+            ferris_sdk::capability::PolicyMode::Enforce,
         )
         .map_err(|error| error.to_string())?,
     );
@@ -1463,72 +1463,74 @@ fn command_mock(args: &[String]) -> Result<i32, String> {
             .grant(package.id().as_str(), capability, GrantScope::Any, None)
             .map_err(|error| error.to_string())?;
     }
-    let events = std::sync::Arc::new(ferris_core::events::EventBus::new());
+    let events = std::sync::Arc::new(ferris_sdk::events::EventBus::new());
     let id = package.id().clone();
     let config = serde_json::json!({ "mock": true }).to_string();
-    let runtime: std::sync::Arc<dyn ferris_runtime::Runtime> = match package.manifest.runtime.kind {
-        RuntimeKind::Declarative => std::sync::Arc::new(
-            DeclarativeRuntime::new(&path, &package.manifest).map_err(|error| error.to_string())?,
-        ),
-        RuntimeKind::Process => std::sync::Arc::new(
-            ProcessRuntime::new(&package.manifest, &path)
-                .map_err(|error| error.to_string())?
-                .with_config(config.clone())
-                .with_events(
+    let runtime: std::sync::Arc<dyn ferris_sdk::host_runtime::Runtime> =
+        match package.manifest.runtime.kind {
+            RuntimeKind::Declarative => std::sync::Arc::new(
+                DeclarativeRuntime::new(&path, &package.manifest)
+                    .map_err(|error| error.to_string())?,
+            ),
+            RuntimeKind::Process => std::sync::Arc::new(
+                ProcessRuntime::new(&package.manifest, &path)
+                    .map_err(|error| error.to_string())?
+                    .with_config(config.clone())
+                    .with_events(
+                        std::sync::Arc::clone(&events),
+                        &package.manifest.contributes.events,
+                    ),
+            ),
+            RuntimeKind::Mcp => std::sync::Arc::new(
+                McpRuntime::new(
+                    &package.manifest,
+                    &path,
+                    config.clone(),
+                    std::sync::Arc::clone(&policy),
+                    TrustLevel::Local,
                     std::sync::Arc::clone(&events),
-                    &package.manifest.contributes.events,
-                ),
-        ),
-        RuntimeKind::Mcp => std::sync::Arc::new(
-            McpRuntime::new(
-                &package.manifest,
-                &path,
-                config.clone(),
-                std::sync::Arc::clone(&policy),
-                TrustLevel::Local,
-                std::sync::Arc::clone(&events),
-            )
-            .map_err(|error| error.to_string())?,
-        ),
-        RuntimeKind::WasmComponent => std::sync::Arc::new(
-            ferris_runtime::wasm::WasmRuntime::new(
-                &package.manifest,
-                &path,
-                &data_root,
-                std::sync::Arc::clone(&policy),
-                std::sync::Arc::clone(&events),
-                None,
-                config.clone(),
-                TrustLevel::Local,
-            )
-            .map_err(|error| error.to_string())?,
-        ),
-        RuntimeKind::Extism => std::sync::Arc::new(
-            ferris_runtime::extism::ExtismRuntime::new(
-                &package.manifest,
-                &path,
-                &data_root,
-                std::sync::Arc::clone(&policy),
-                std::sync::Arc::clone(&events),
-                None,
-                config,
-                TrustLevel::Local,
-            )
-            .map_err(|error| error.to_string())?,
-        ),
-        RuntimeKind::Cordis => std::sync::Arc::new(
-            ferris_runtime::cordis::CordisRuntime::new(
-                &package.manifest,
-                &path,
-                &data_root,
-                Arc::new(crate::extension::terminal::HostTerminal),
-            )
-            .map_err(|error| error.to_string())?,
-        ),
-        RuntimeKind::Builtin => {
-            return Err("the built-in runtime has no development mock".to_string());
-        }
-    };
+                )
+                .map_err(|error| error.to_string())?,
+            ),
+            RuntimeKind::WasmComponent => std::sync::Arc::new(
+                ferris_sdk::host_runtime::wasm::WasmRuntime::new(
+                    &package.manifest,
+                    &path,
+                    &data_root,
+                    std::sync::Arc::clone(&policy),
+                    std::sync::Arc::clone(&events),
+                    None,
+                    config.clone(),
+                    TrustLevel::Local,
+                )
+                .map_err(|error| error.to_string())?,
+            ),
+            RuntimeKind::Extism => std::sync::Arc::new(
+                ferris_sdk::host_runtime::extism::ExtismRuntime::new(
+                    &package.manifest,
+                    &path,
+                    &data_root,
+                    std::sync::Arc::clone(&policy),
+                    std::sync::Arc::clone(&events),
+                    None,
+                    config,
+                    TrustLevel::Local,
+                )
+                .map_err(|error| error.to_string())?,
+            ),
+            RuntimeKind::Cordis => std::sync::Arc::new(
+                ferris_sdk::host_runtime::cordis::CordisRuntime::new(
+                    &package.manifest,
+                    &path,
+                    &data_root,
+                    Arc::new(crate::extension::terminal::HostTerminal),
+                )
+                .map_err(|error| error.to_string())?,
+            ),
+            RuntimeKind::Builtin => {
+                return Err("the built-in runtime has no development mock".to_string());
+            }
+        };
     let runtime_for_call = std::sync::Arc::clone(&runtime);
     let result = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1553,7 +1555,8 @@ fn command_mock(args: &[String]) -> Result<i32, String> {
             if !tools.iter().any(|tool| tool.id.as_str() == tool_id) {
                 return Err(format!("{id} has no tool {tool_id}"));
             }
-            let context = ferris_runtime::CallContext::new(id.clone(), "mock", None, 30_000);
+            let context =
+                ferris_sdk::host_runtime::CallContext::new(id.clone(), "mock", None, 30_000);
             let (progress_tx, mut progress_rx) =
                 tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
             let printer = tokio::spawn(async move {
@@ -1596,8 +1599,8 @@ fn command_config(args: &[String], root: Option<PathBuf>) -> Result<i32, String>
         })
         .ok_or_else(|| format!("{id} is not installed"))?;
     let package_root = store.installed_root().join(id.as_str()).join(&version);
-    let manifest =
-        ferris_core::manifest::Manifest::load(&package_root).map_err(|error| error.to_string())?;
+    let manifest = ferris_sdk::core_manifest::Manifest::load(&package_root)
+        .map_err(|error| error.to_string())?;
     let data_root = store.data_dir(&id);
     let action = args.get(1).map(String::as_str);
     match action {
@@ -1624,7 +1627,7 @@ fn command_config(args: &[String], root: Option<PathBuf>) -> Result<i32, String>
             };
             let value: serde_json::Value =
                 serde_json::from_str(&text).map_err(|error| error.to_string())?;
-            let saved = ferris_core::config::save(&manifest, &package_root, &data_root, value)
+            let saved = ferris_sdk::config::save(&manifest, &package_root, &data_root, value)
                 .map_err(|error| error.to_string())?;
             crate::extension::publish(
                 crate::extension::topics::CONFIG_CHANGED,
@@ -1637,7 +1640,7 @@ fn command_config(args: &[String], root: Option<PathBuf>) -> Result<i32, String>
         }
         Some(other) => return Err(format!("unknown config action {other:?}")),
         None => {
-            let loaded = ferris_core::config::load(&manifest, &package_root, &data_root)
+            let loaded = ferris_sdk::config::load(&manifest, &package_root, &data_root)
                 .map_err(|error| error.to_string())?;
             println!(
                 "{}",
@@ -1829,13 +1832,13 @@ fn command_market(args: &[String], root: Option<PathBuf>) -> Result<i32, String>
 fn command_reproduce(args: &[String], root: Option<PathBuf>) -> Result<i32, String> {
     let lock_path = PathBuf::from(one_argument(args, "bsh ext reproduce <lock>")?);
     let text = std::fs::read_to_string(&lock_path).map_err(|error| error.to_string())?;
-    let lock: ferris_core::resolver::LockFile =
+    let lock: ferris_sdk::resolver::LockFile =
         toml::from_str(&text).map_err(|error| error.to_string())?;
     let store = ExtensionStore::open(config(root).root).map_err(|error| error.to_string())?;
     for locked in &lock.packages {
         let installed = store
             .versions(
-                &ferris_core::types::ExtensionId::parse(locked.id.clone())
+                &ferris_sdk::types::ExtensionId::parse(locked.id.clone())
                     .map_err(|error| error.to_string())?,
             )
             .ok()
@@ -1843,7 +1846,7 @@ fn command_reproduce(args: &[String], root: Option<PathBuf>) -> Result<i32, Stri
         if installed {
             // "present" is only true if the bytes are the locked bytes: the
             // lockfile's whole point is reproducibility, not a directory name.
-            let id = ferris_core::types::ExtensionId::parse(locked.id.clone())
+            let id = ferris_sdk::types::ExtensionId::parse(locked.id.clone())
                 .map_err(|error| error.to_string())?;
             let installed_root = store.version_root(&id, &locked.version);
             let package = Package::load(
@@ -1861,7 +1864,7 @@ fn command_reproduce(args: &[String], root: Option<PathBuf>) -> Result<i32, Stri
             println!("present {} {}", locked.id, locked.version);
             continue;
         }
-        let id = ferris_core::types::ExtensionId::parse(locked.id.clone())
+        let id = ferris_sdk::types::ExtensionId::parse(locked.id.clone())
             .map_err(|error| error.to_string())?;
         let fetched = match &locked.source {
             ExtensionSource::Git {
@@ -1972,7 +1975,7 @@ id = "echo"
             r#"{"description":"Echo","implementation":{"kind":"echo_arguments"}}"#,
         )
         .expect("tool");
-        let hash = ferris_core::package::package_hash(&source).expect("hash");
+        let hash = ferris_sdk::package::package_hash(&source).expect("hash");
         // TOML basic strings need Windows separators escaped; the real lock
         // writer does this through serde, and this fixture writes the document
         // by hand.

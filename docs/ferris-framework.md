@@ -11,11 +11,15 @@ binary parses a 2.0 manifest with no BSH dependency, and the SDK carries unit
 tests for its author runtime adapter. The author guide is
 [ferris-sdk.md](ferris-sdk.md).
 
-BSH imports core primitives and standard runtimes directly; the Phase-1
-composable/runtime/core re-export modules are deleted, and the lifecycle state
-machine now lives in ferris-core (only the terminal/hooks adapters and the
-`topics` convenience alias remain in BSH). `FerrisHostSpec` and
-`FerrisRuntimeResolver` are the host adapters. `statuses()` merges packages the
+BSH imports Ferris through `ferris-sdk` only: `crates/bsh/Cargo.toml` has one
+Ferris dependency, `ferris-sdk` with the `host-runtime` feature, and BSH source
+uses `ferris_sdk::*` and `ferris_sdk::host_runtime::*`. The SDK host facade
+re-exports the core modules, manager, package/store, capability, manifest, UI,
+terminal and standard runtime crates. The Phase-1 composable/runtime/core
+re-export modules are deleted, and the lifecycle state machine now lives in
+ferris-core (only the terminal/hooks adapters and the `topics` convenience alias
+remain in BSH). `FerrisHostSpec` and `FerrisRuntimeResolver` are the host
+adapters. `statuses()` merges packages the
 neutral manager sees with the host's loaded set, and install, uninstall,
 enable/disable, versions, rollback, retry, quarantine and `bsh ext plan` go
 through the manager.

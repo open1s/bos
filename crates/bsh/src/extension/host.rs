@@ -16,25 +16,25 @@ use std::time::SystemTime;
 use serde::Serialize;
 
 use super::agent as contribution;
-use ferris_core::capability::{
+use ferris_sdk::capability::{
     CallScope, Capability, Decision, GrantScope, PolicyEngine, PolicyMode,
 };
-use ferris_core::composable::dispatch::InterceptorPolicy;
-use ferris_core::composable::{
+use ferris_sdk::composable::dispatch::InterceptorPolicy;
+use ferris_sdk::composable::{
     Context, DisposalReport, Fiber, FiberState, Scope, ServiceAuthorizer, ServiceToken,
 };
-use ferris_core::events::{lifecycle_event, topics, EventBus, ExtensionEvent};
-use ferris_core::lifecycle::{Health, LifecycleManager};
-use ferris_core::package::{write_atomic, ExtensionStore, Package};
-use ferris_core::resolver;
-use ferris_core::types::{
+use ferris_sdk::events::{lifecycle_event, topics, EventBus, ExtensionEvent};
+use ferris_sdk::host_runtime::builtin::{BuiltinRuntime, ClosureExtension};
+use ferris_sdk::host_runtime::declarative::DeclarativeContributions;
+use ferris_sdk::host_runtime::{empty_schema, CallContext, LazyRuntime, Runtime, ToolDescriptor};
+use ferris_sdk::lifecycle::{Health, LifecycleManager};
+use ferris_sdk::package::{write_atomic, ExtensionStore, Package};
+use ferris_sdk::resolver;
+use ferris_sdk::types::{
     ContributionId, ExtensionError, ExtensionId, ExtensionSource, LifecycleState, RuntimeKind,
     StartupPolicy, TrustLevel, ValidationReport, EXTENSION_API_VERSION, HOST_VERSION,
 };
-use ferris_core::ui::{PanelLocation, PanelVisibility, ThemePalette, UiDocument};
-use ferris_runtime::builtin::{BuiltinRuntime, ClosureExtension};
-use ferris_runtime::declarative::DeclarativeContributions;
-use ferris_runtime::{empty_schema, CallContext, LazyRuntime, Runtime, ToolDescriptor};
+use ferris_sdk::ui::{PanelLocation, PanelVisibility, ThemePalette, UiDocument};
 use serde_json::Value;
 
 /// The configuration that decides which store and which packages a host owns.
@@ -499,13 +499,13 @@ pub(crate) struct AppliedExtension {
     pub(crate) info: crate::plugins::PluginInfo,
     fiber: Fiber,
     lease: contribution::ContributionLease,
-    activation: Option<ferris_core::manager::Activation>,
-    services: Arc<ferris_core::composable::ServiceRegistry>,
+    activation: Option<ferris_sdk::manager::Activation>,
+    services: Arc<ferris_sdk::composable::ServiceRegistry>,
     extension_id: String,
     workspace: Option<PathBuf>,
     session_id: String,
-    service_provides: Vec<ferris_core::manifest::ServiceProvideSpec>,
-    service_requires: Vec<ferris_core::manifest::ServiceRequireSpec>,
+    service_provides: Vec<ferris_sdk::core_manifest::ServiceProvideSpec>,
+    service_requires: Vec<ferris_sdk::core_manifest::ServiceRequireSpec>,
 }
 
 /// Host context handed to manager-owned leases at revoke time.
@@ -514,7 +514,7 @@ pub(crate) struct BshLeaseHost<'a> {
     pub(crate) registry: &'a mut ::agent::plugins::PluginRegistry,
 }
 
-impl ferris_core::LeaseHost for BshLeaseHost<'_> {
+impl ferris_sdk::LeaseHost for BshLeaseHost<'_> {
     fn remove_tools(&mut self, _owner: &str, tools: &[String]) -> usize {
         self.agent.remove_live_async_tools(tools)
     }
@@ -540,10 +540,10 @@ impl AppliedExtension {
     /// service name and visibility scope in its manifest.
     pub(crate) fn provide_service<T>(
         &mut self,
-        scope: ferris_core::composable::Scope,
+        scope: ferris_sdk::composable::Scope,
         name: &str,
         service: Arc<T>,
-    ) -> Option<ferris_core::composable::ServiceToken>
+    ) -> Option<ferris_sdk::composable::ServiceToken>
     where
         T: std::any::Any + Send + Sync,
     {
@@ -581,9 +581,9 @@ impl AppliedExtension {
     /// requirement. The returned lease must be held for the full call.
     pub(crate) fn acquire_service<T>(
         &self,
-        scope: &ferris_core::composable::Scope,
+        scope: &ferris_sdk::composable::Scope,
         name: &str,
-    ) -> Option<ferris_core::composable::ServiceLease<T>>
+    ) -> Option<ferris_sdk::composable::ServiceLease<T>>
     where
         T: std::any::Any + Send + Sync,
     {
@@ -623,7 +623,7 @@ impl AppliedExtension {
         mut self,
         agent: &mut ::agent::Agent,
         registry: &mut ::agent::plugins::PluginRegistry,
-    ) -> Result<usize, ferris_core::composable::FiberTransitionError> {
+    ) -> Result<usize, ferris_sdk::composable::FiberTransitionError> {
         self.fiber.unload()?;
         if let Some(activation) = self.activation.take() {
             let mut host = BshLeaseHost { agent, registry };
@@ -638,7 +638,7 @@ impl AppliedExtension {
         mut self,
         agent: &mut ::agent::Agent,
         registry: &mut ::agent::plugins::PluginRegistry,
-    ) -> Result<DisposalReport, ferris_core::composable::FiberTransitionError> {
+    ) -> Result<DisposalReport, ferris_sdk::composable::FiberTransitionError> {
         let report = self.fiber.dispose_async().await?;
         if let Some(activation) = self.activation.take() {
             let mut host = BshLeaseHost { agent, registry };
@@ -655,7 +655,7 @@ impl AppliedExtension {
     }
 
     /// The service registry this activation resolves against.
-    pub(crate) fn services(&self) -> Arc<ferris_core::composable::ServiceRegistry> {
+    pub(crate) fn services(&self) -> Arc<ferris_sdk::composable::ServiceRegistry> {
         Arc::clone(&self.services)
     }
 
@@ -665,7 +665,7 @@ impl AppliedExtension {
     }
 
     /// Declared service requirements, for the reload driver.
-    pub(crate) fn service_requirements(&self) -> &[ferris_core::manifest::ServiceRequireSpec] {
+    pub(crate) fn service_requirements(&self) -> &[ferris_sdk::core_manifest::ServiceRequireSpec] {
         &self.service_requires
     }
 
@@ -692,8 +692,8 @@ impl AppliedExtension {
 #[cfg(test)]
 mod service_scope_tests {
     use super::{service_scope_is_activation_owned, service_scope_matches};
-    use ferris_core::composable::Scope;
-    use ferris_core::manifest::ServiceScope;
+    use ferris_sdk::composable::Scope;
+    use ferris_sdk::core_manifest::ServiceScope;
     use std::path::Path;
 
     #[test]
@@ -790,24 +790,24 @@ mod service_scope_tests {
 
 /// Whether a scope's lifetime is no longer than one AppliedExtension Fiber.
 fn service_scope_is_activation_owned(
-    requested: &ferris_core::composable::Scope,
+    requested: &ferris_sdk::composable::Scope,
     extension_id: &str,
 ) -> bool {
     matches!(
         requested,
-        ferris_core::composable::Scope::Extension(id) if id == extension_id
+        ferris_sdk::composable::Scope::Extension(id) if id == extension_id
     )
 }
 
 fn service_scope_matches(
-    declared: &ferris_core::manifest::ServiceScope,
-    requested: &ferris_core::composable::Scope,
+    declared: &ferris_sdk::core_manifest::ServiceScope,
+    requested: &ferris_sdk::composable::Scope,
     extension_id: &str,
     workspace: Option<&Path>,
     session_id: &str,
 ) -> bool {
-    use ferris_core::composable::Scope;
-    use ferris_core::manifest::ServiceScope;
+    use ferris_sdk::composable::Scope;
+    use ferris_sdk::core_manifest::ServiceScope;
     match (declared, requested) {
         (ServiceScope::Host, Scope::Host) => true,
         (ServiceScope::Workspace, Scope::Workspace(id)) => {
@@ -843,7 +843,7 @@ pub(crate) struct ExtensionHost {
     store: ExtensionStore,
     policy: Arc<PolicyEngine>,
     events: Arc<EventBus>,
-    services: Arc<ferris_core::composable::ServiceRegistry>,
+    services: Arc<ferris_sdk::composable::ServiceRegistry>,
     terminal_token: Option<ServiceToken>,
     manager: LifecycleManager,
     loaded: BTreeMap<String, LoadedExtension>,
@@ -865,7 +865,7 @@ pub(crate) struct LanguageEntry {
     /// Package that owns the descriptor.
     pub(crate) owner: ExtensionId,
     /// Descriptor.
-    pub(crate) contribution: ferris_runtime::declarative::LanguageContribution,
+    pub(crate) contribution: ferris_sdk::host_runtime::declarative::LanguageContribution,
 }
 
 /// One external-system integration contributed by an applied extension.
@@ -874,7 +874,7 @@ pub(crate) struct IntegrationEntry {
     /// Package that owns the descriptor.
     pub(crate) owner: ExtensionId,
     /// Descriptor.
-    pub(crate) contribution: ferris_runtime::declarative::IntegrationContribution,
+    pub(crate) contribution: ferris_sdk::host_runtime::declarative::IntegrationContribution,
 }
 
 impl ExtensionHost {
@@ -883,7 +883,7 @@ impl ExtensionHost {
             super::framework::FerrisRuntimeResolver::new(self.config.workspace.clone()).with_ports(
                 Arc::clone(&self.policy),
                 Arc::clone(&self.events),
-                ferris_core::types::TrustLevel::Community,
+                ferris_sdk::types::TrustLevel::Community,
             );
         for builtin in &self.builtins {
             resolver =
@@ -897,7 +897,7 @@ impl ExtensionHost {
         resolver
     }
 
-    fn build_framework_activations(&self) -> Option<ferris_core::manager::ActivationSet> {
+    fn build_framework_activations(&self) -> Option<ferris_sdk::manager::ActivationSet> {
         let resolver = self.build_framework_resolver();
         let manager = self
             .framework_manager()
@@ -920,7 +920,7 @@ impl ExtensionHost {
             super::framework::FerrisRuntimeResolver::new(self.config.workspace.clone()).with_ports(
                 std::sync::Arc::clone(&self.policy),
                 std::sync::Arc::clone(&self.events),
-                ferris_core::types::TrustLevel::Community,
+                ferris_sdk::types::TrustLevel::Community,
             );
         for builtin in &self.builtins {
             resolver = resolver.with_builtin(
@@ -934,12 +934,12 @@ impl ExtensionHost {
     /// Open the host-neutral manager against this host's root.
     pub(crate) fn framework_manager(
         &self,
-    ) -> Result<ferris_core::manager::ExtensionManager, ferris_core::ExtError> {
+    ) -> Result<ferris_sdk::manager::ExtensionManager, ferris_sdk::ExtError> {
         super::framework::manager_for(self.config.root.clone(), self.config.workspace.clone())
     }
 
     /// The host-scoped service registry shared by its extension activations.
-    pub(crate) fn services(&self) -> Arc<ferris_core::composable::ServiceRegistry> {
+    pub(crate) fn services(&self) -> Arc<ferris_sdk::composable::ServiceRegistry> {
         Arc::clone(&self.services)
     }
 
@@ -971,7 +971,7 @@ impl ExtensionHost {
             store,
             policy,
             events,
-            services: Arc::new(ferris_core::composable::ServiceRegistry::new()),
+            services: Arc::new(ferris_sdk::composable::ServiceRegistry::new()),
             terminal_token: None,
             manager: LifecycleManager::new(),
             loaded: BTreeMap::new(),
@@ -1081,7 +1081,7 @@ impl ExtensionHost {
                     hash: String::new(),
                     installed_at: 0,
                     signature: None,
-                    verification: ferris_core::signing::SignatureVerification::Missing,
+                    verification: ferris_sdk::signing::SignatureVerification::Missing,
                     source_path: None,
                 };
                 let tools = runtime.descriptors();
@@ -1165,7 +1165,7 @@ impl ExtensionHost {
                     hash: String::new(),
                     installed_at: 0,
                     signature: None,
-                    verification: ferris_core::signing::SignatureVerification::Missing,
+                    verification: ferris_sdk::signing::SignatureVerification::Missing,
                     source_path: None,
                 };
                 let tools = runtime.descriptors();
@@ -1193,7 +1193,7 @@ impl ExtensionHost {
                     hash: String::new(),
                     installed_at: 0,
                     signature: None,
-                    verification: ferris_core::signing::SignatureVerification::Missing,
+                    verification: ferris_sdk::signing::SignatureVerification::Missing,
                     source_path: None,
                 };
                 let tools = runtime.descriptors();
@@ -1349,7 +1349,7 @@ impl ExtensionHost {
                     .iter()
                     .map(|package| package.manifest.clone())
                     .collect();
-                match ferris_core::composable::plan_service_dependencies(&manifests) {
+                match ferris_sdk::composable::plan_service_dependencies(&manifests) {
                     Ok(plan) => {
                         ordered = plan.order;
                     }
@@ -1562,7 +1562,7 @@ impl ExtensionHost {
         }
         let data_root = self.store.data_dir(id);
         if let Some(version) =
-            ferris_core::config::migrate(&package.manifest, &package.root, &data_root, &from, &to)?
+            ferris_sdk::config::migrate(&package.manifest, &package.root, &data_root, &from, &to)?
         {
             self.store.set_data_version(id, &version)?;
         }
@@ -1618,11 +1618,11 @@ impl ExtensionHost {
 
     fn build_runtime(&self, package: &Package) -> Result<BuiltRuntime, ExtensionError> {
         let data_root = self.store.data_dir(package.id());
-        let config = ferris_core::config::load(&package.manifest, &package.root, &data_root)?;
-        let built = ferris_runtime::factory::build(
+        let config = ferris_sdk::config::load(&package.manifest, &package.root, &data_root)?;
+        let built = ferris_sdk::host_runtime::factory::build(
             &package.manifest,
             &package.root,
-            ferris_runtime::factory::RuntimePorts {
+            ferris_sdk::host_runtime::factory::RuntimePorts {
                 policy: Arc::clone(&self.policy),
                 events: Arc::clone(&self.events),
                 workspace: self.config.workspace.clone(),
@@ -1804,7 +1804,7 @@ impl ExtensionHost {
             if let Ok(manager) = self.framework_manager() {
                 let manager = manager.with_ports(
                     Arc::new(self.build_framework_resolver()),
-                    Arc::clone(&sink) as Arc<dyn ferris_core::ContributionSink>,
+                    Arc::clone(&sink) as Arc<dyn ferris_sdk::ContributionSink>,
                 );
                 if let Ok(mut plan) = manager.plan() {
                     plan.order
@@ -1907,11 +1907,11 @@ impl ExtensionHost {
                         continue;
                     }
                     let package_root = manager.package_root(&extension.id, &extension.version).ok();
-                    let manifest = package_root.as_deref().and_then(|root| {
-                        ferris_core::manifest_v2::load_package_manifest(root).ok()
-                    });
+                    let manifest = package_root
+                        .as_deref()
+                        .and_then(|root| ferris_sdk::manifest_v2::load_package_manifest(root).ok());
                     let error = package_root.as_deref().and_then(|root| {
-                        ferris_core::manifest_v2::load_package_manifest(root)
+                        ferris_sdk::manifest_v2::load_package_manifest(root)
                             .err()
                             .map(|error| error.to_string())
                     });
@@ -1987,7 +1987,7 @@ impl ExtensionHost {
                     })
                     .collect();
                 let mut effects = Vec::new();
-                if let Ok(v2) = ferris_core::manifest_v2::ManifestV2::load(&entry.package.root) {
+                if let Ok(v2) = ferris_sdk::manifest_v2::ManifestV2::load(&entry.package.root) {
                     for contribution in &v2.contributions {
                         let kind = match contribution.kind.as_str() {
                             "event.subscribe" => "event",
@@ -2175,8 +2175,8 @@ impl ExtensionHost {
                 id: format!("{owner}::{tool}"),
             })?;
         let scope =
-            ferris_core::capability::call_scope(&arguments, self.config.workspace.as_deref());
-        ferris_core::capability::authorize_each(
+            ferris_sdk::capability::call_scope(&arguments, self.config.workspace.as_deref());
+        ferris_sdk::capability::authorize_each(
             &self.policy,
             owner,
             loaded.package.trust,
@@ -2229,8 +2229,8 @@ impl ExtensionHost {
             .find(|descriptor| descriptor.id.as_str() == action)
         {
             let scope =
-                ferris_core::capability::call_scope(&arguments, self.config.workspace.as_deref());
-            ferris_core::capability::authorize_each(
+                ferris_sdk::capability::call_scope(&arguments, self.config.workspace.as_deref());
+            ferris_sdk::capability::authorize_each(
                 &self.policy,
                 owner,
                 loaded.package.trust,
@@ -2281,7 +2281,7 @@ impl ExtensionHost {
     /// so lowering a patch row is an actual mount, not only a plan.
     pub(crate) fn mount_profile(&mut self, path: &Path) -> Result<Vec<String>, ExtensionError> {
         let entries =
-            ferris_core::composable::plan::load_cordis_patch(path, "profile").map_err(|error| {
+            ferris_sdk::composable::plan::load_cordis_patch(path, "profile").map_err(|error| {
                 ExtensionError::Runtime {
                     extension: "profile".to_string(),
                     message: error.to_string(),
@@ -2314,8 +2314,8 @@ impl ExtensionHost {
         let mut mounted = Vec::new();
         for (id, manifest, root, config) in candidates {
             if let Some(config) = config {
-                let id = ferris_core::types::ExtensionId::parse(id.clone())?;
-                ferris_core::config::save(&manifest, &root, &self.store.data_dir(&id), config)?;
+                let id = ferris_sdk::types::ExtensionId::parse(id.clone())?;
+                ferris_sdk::config::save(&manifest, &root, &self.store.data_dir(&id), config)?;
             }
             self.retry(&id)?;
             mounted.push(id);
@@ -2324,7 +2324,7 @@ impl ExtensionHost {
     }
 
     pub(crate) fn retry(&mut self, id: &str) -> Result<(), ExtensionError> {
-        let id = ferris_core::types::ExtensionId::parse(id.to_string())?;
+        let id = ferris_sdk::types::ExtensionId::parse(id.to_string())?;
         self.store.clear_failure(&id)?;
         self.rebuild()
     }
@@ -2337,8 +2337,8 @@ impl ExtensionHost {
     ) -> Result<(), ExtensionError> {
         self.policy.grant(
             id,
-            ferris_core::capability::Capability::ProcessExecute,
-            ferris_core::capability::GrantScope::Program(program.to_string()),
+            ferris_sdk::capability::Capability::ProcessExecute,
+            ferris_sdk::capability::GrantScope::Program(program.to_string()),
             Some("approved from the extensions pane".to_string()),
         )?;
         self.rebuild()
@@ -2457,7 +2457,7 @@ impl ExtensionHost {
     }
 
     /// Every theme a package contributes, keyed by a host-owned id.
-    pub(crate) fn theme_surfaces(&self) -> BTreeMap<String, ferris_core::ui::ThemePalette> {
+    pub(crate) fn theme_surfaces(&self) -> BTreeMap<String, ferris_sdk::ui::ThemePalette> {
         let mut themes = BTreeMap::new();
         for entry in self.loaded.values() {
             if !entry.applied || entry.error.is_some() {
@@ -2467,7 +2467,7 @@ impl ExtensionHost {
                 let Ok(text) = std::fs::read_to_string(&theme.path) else {
                     continue;
                 };
-                if let Ok(palette) = serde_json::from_str::<ferris_core::ui::ThemePalette>(&text) {
+                if let Ok(palette) = serde_json::from_str::<ferris_sdk::ui::ThemePalette>(&text) {
                     themes.insert(
                         format!("ext.{}.{}", entry.package.id().as_str(), theme.id.as_str()),
                         palette,
@@ -2797,14 +2797,14 @@ impl ExtensionHost {
                         ));
                     }
                     match &entry.package.verification {
-                        ferris_core::signing::SignatureVerification::Verified { publisher } => {
+                        ferris_sdk::signing::SignatureVerification::Verified { publisher } => {
                             issues.push(DiagnosticIssue::new(
                                 "info",
                                 Some(id),
                                 format!("package signature verified for publisher {publisher}"),
                             ));
                         }
-                        ferris_core::signing::SignatureVerification::Untrusted {
+                        ferris_sdk::signing::SignatureVerification::Untrusted {
                             publisher,
                             reason,
                         } => issues.push(DiagnosticIssue::new(
@@ -2812,14 +2812,14 @@ impl ExtensionHost {
                             Some(id),
                             format!("signature by {publisher} is untrusted: {reason}"),
                         )),
-                        ferris_core::signing::SignatureVerification::Invalid { reason } => {
+                        ferris_sdk::signing::SignatureVerification::Invalid { reason } => {
                             issues.push(DiagnosticIssue::new(
                                 "error",
                                 Some(id),
                                 format!("package signature is invalid: {reason}"),
                             ));
                         }
-                        ferris_core::signing::SignatureVerification::Missing => {
+                        ferris_sdk::signing::SignatureVerification::Missing => {
                             if entry.package.signature.is_some() {
                                 issues.push(DiagnosticIssue::new(
                                     "warning",
@@ -3138,7 +3138,7 @@ pub(crate) fn panels(
 pub(crate) fn themes(
     settings: &crate::settings::Settings,
     workspace: Option<&Path>,
-) -> BTreeMap<String, ferris_core::ui::ThemePalette> {
+) -> BTreeMap<String, ferris_sdk::ui::ThemePalette> {
     let config = HostConfig::from_settings(settings, workspace.map(Path::to_path_buf), None);
     let slot = HOST.get_or_init(|| Mutex::new(None));
     let mut guard = match slot.lock() {
@@ -3327,7 +3327,7 @@ tools = ["graph", "why"]
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferris_core::capability::GrantScope;
+    use ferris_sdk::capability::GrantScope;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
@@ -3353,9 +3353,10 @@ mod tests {
     }
 
     fn write_manifest(root: &Path, legacy: &str) {
-        let manifest = ferris_core::manifest::Manifest::parse(legacy, &root.join("extension.toml"))
-            .expect("legacy manifest");
-        let v2 = ferris_core::manifest_v2::ManifestV2::from_legacy(&manifest);
+        let manifest =
+            ferris_sdk::core_manifest::Manifest::parse(legacy, &root.join("extension.toml"))
+                .expect("legacy manifest");
+        let v2 = ferris_sdk::manifest_v2::ManifestV2::from_legacy(&manifest);
         std::fs::write(
             root.join("extension.toml"),
             v2.to_toml().expect("2.0 manifest"),

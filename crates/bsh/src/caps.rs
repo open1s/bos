@@ -4292,7 +4292,7 @@ mod tests {
         assert!(built
             .extension_activations
             .iter()
-            .all(|activation| activation.state() == ferris_core::composable::FiberState::Active));
+            .all(|activation| activation.state() == ferris_sdk::composable::FiberState::Active));
 
         // The path-installed package above is served by the legacy DSH shim,
         // whose synchronous tool carries no gate. The Fiber-owned gate belongs

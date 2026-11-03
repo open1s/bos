@@ -1,15 +1,15 @@
 //! Re-exported from ferris-runtime; BSH installs its agent hook adapter here.
 use std::sync::Arc;
 
-pub(crate) use ferris_runtime::hooks::*;
+pub(crate) use ferris_sdk::host_runtime::hooks::*;
 
 struct HostHookProvider;
 
-impl ferris_runtime::hook::HookProvider for HostHookProvider {
-    fn targets(&self, point: &str) -> Vec<ferris_runtime::hook::HookTarget> {
+impl ferris_sdk::host_runtime::hook::HookProvider for HostHookProvider {
+    fn targets(&self, point: &str) -> Vec<ferris_sdk::host_runtime::hook::HookTarget> {
         super::host::hook_targets(point)
             .into_iter()
-            .map(|target| ferris_runtime::hook::HookTarget {
+            .map(|target| ferris_sdk::host_runtime::hook::HookTarget {
                 id: target.id,
                 runtime: target.runtime,
             })
@@ -25,7 +25,7 @@ impl ferris_runtime::hook::HookProvider for HostHookProvider {
 pub(crate) fn install_host_provider() {
     static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     INSTALLED.get_or_init(|| {
-        ferris_runtime::hook::install(Arc::new(HostHookProvider));
+        ferris_sdk::host_runtime::hook::install(Arc::new(HostHookProvider));
     });
 }
 
@@ -35,10 +35,10 @@ pub(crate) fn install_http_tap() {
     INSTALLED.get_or_init(|| {
         react::llm::vendor::set_http_tap(Some(Arc::new(
             |exchange: react::llm::vendor::HttpExchange| {
-                if !ferris_runtime::hook::attached() {
+                if !ferris_sdk::host_runtime::hook::attached() {
                     return;
                 }
-                let mut event = ferris_runtime::hooks::http_exchange(
+                let mut event = ferris_sdk::host_runtime::hooks::http_exchange(
                     exchange.label,
                     &exchange.method,
                     &exchange.url,
@@ -53,7 +53,7 @@ pub(crate) fn install_http_tap() {
                 if let Some(request_id) = exchange.request_id.as_deref() {
                     event["request_id"] = serde_json::Value::String(request_id.to_string());
                 }
-                ferris_runtime::hooks::observe("http.exchange", event);
+                ferris_sdk::host_runtime::hooks::observe("http.exchange", event);
             },
         )));
     });
@@ -61,7 +61,7 @@ pub(crate) fn install_http_tap() {
 
 /// Register the agent hooks that forward BOS hooks into extension hooks.
 pub(crate) fn install_agent_hooks(agent: &mut agent::Agent) {
-    if !ferris_runtime::hook::attached() {
+    if !ferris_sdk::host_runtime::hook::attached() {
         return;
     }
     let hook = Arc::new(ExtensionAgentHook);
@@ -91,7 +91,7 @@ impl agent::AgentHook for ExtensionAgentHook {
         for (key, value) in &context.data {
             data.insert(
                 key.clone(),
-                serde_json::Value::String(ferris_runtime::hooks::redact(value)),
+                serde_json::Value::String(ferris_sdk::host_runtime::hooks::redact(value)),
             );
         }
         observe(

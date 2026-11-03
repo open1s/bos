@@ -7,8 +7,16 @@ authors.workspace = true
 license.workspace = true
 description = "Author API and test harness for BOS extensions"
 
+[features]
+default = []
+# Host facade feature used by BSH; author-only builds stay Tokio-free.
+tokio = ["ferris-core/tokio"]
+# Host runtime facade used by BSH: includes every standard runtime.
+host-runtime = ["tokio", "dep:ferris-runtime", "ferris-runtime/extism", "ferris-runtime/wasm"]
+
 [dependencies]
 ferris-core = { path = "../ferris-core" }
+ferris-runtime = { path = "../ferris-runtime", optional = true }
 async-trait.workspace = true
 serde_json.workspace = true
 semver.workspace = true

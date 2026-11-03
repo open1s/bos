@@ -16,8 +16,7 @@ name = "bsh"
 path = "src/main.rs"
 
 [dependencies]
-ferris-core = { path = "../ferris-core", features = ["tokio"] }
-ferris-runtime = { path = "../ferris-runtime", features = ["extism", "wasm"] }
+ferris-sdk = { path = "../ferris-sdk", features = ["host-runtime"] }
 arrow =  { version = "60.0.0"}
 parquet = { version = "60.0.0", features = ["arrow"] }
 # One UI dependency: gpui-kit re-exports gpui, gpui-base, gpui-component and the

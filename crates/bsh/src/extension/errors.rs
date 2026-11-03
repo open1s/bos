@@ -1,6 +1,6 @@
 //! BSH adapter: map framework errors to agent tool errors.
 
-use ferris_core::types::ExtensionError;
+use ferris_sdk::types::ExtensionError;
 
 /// Map a framework error to the agent tool error the model sees.
 pub(crate) trait ToToolError {

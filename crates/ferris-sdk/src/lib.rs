@@ -11,6 +11,22 @@ pub mod error;
 pub mod manifest;
 pub mod runtime;
 
+// Host-side facade: BSH and other hosts consume Ferris through the SDK.
+#[cfg(feature = "tokio")]
+pub use ferris_core::manifest as core_manifest;
+#[cfg(feature = "tokio")]
+pub use ferris_core::{
+    capability, composable, config, events, lifecycle, manager, manifest_v2, package, resolver,
+    signing, sources, terminal, types, ui,
+};
+#[cfg(feature = "tokio")]
+pub use ferris_core::{
+    CapabilityRegistry, CapabilitySpec, ContributionLease, ContributionSink, HostSpec, LeaseHost,
+    Risk, Runtime, RuntimeResolver, Scope, ScopePath, ServiceContractRegistry,
+};
+#[cfg(feature = "host-runtime")]
+pub use ferris_runtime as host_runtime;
+
 pub use ferris_core::manifest::{
     ConfigurationSpec, ResourcesSpec, ServiceProvideSpec, ServiceRequireSpec, ServiceScope,
     ServicesSpec,

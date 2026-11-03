@@ -11,8 +11,8 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
-use ferris_core::package::{ExtensionStore, Package};
-use ferris_core::types::{ExtensionError, ExtensionSource, TrustLevel};
+use ferris_sdk::package::{ExtensionStore, Package};
+use ferris_sdk::types::{ExtensionError, ExtensionSource, TrustLevel};
 
 /// The official provider repository.
 pub(crate) const DEFAULT_GIT_MARKET: &str = "https://github.com/open1s/bsh_extensions";
@@ -116,7 +116,7 @@ impl MarketIndex {
 }
 
 fn validate_entry(entry: &MarketEntry, path: &Path) -> Result<(), ExtensionError> {
-    ferris_core::types::ExtensionId::parse(entry.id.clone()).map_err(|error| {
+    ferris_sdk::types::ExtensionId::parse(entry.id.clone()).map_err(|error| {
         ExtensionError::Manifest {
             path: path.to_path_buf(),
             message: format!("market entry {}: {error}", entry.id),
@@ -129,7 +129,7 @@ fn validate_entry(entry: &MarketEntry, path: &Path) -> Result<(), ExtensionError
     // The same grammar every other package-relative path must satisfy: it
     // rejects absolute paths, "." / ".." components and backslashes (which a
     // split-on-'/' check let through on Windows).
-    ferris_core::manifest::validate_relative_path(&entry.path).map_err(|reason| {
+    ferris_sdk::core_manifest::validate_relative_path(&entry.path).map_err(|reason| {
         ExtensionError::Manifest {
             path: path.to_path_buf(),
             message: format!(
@@ -240,7 +240,7 @@ impl GitMarket {
         &self,
         store: &ExtensionStore,
         entry: &MarketEntry,
-    ) -> Result<ferris_core::package::Package, ExtensionError> {
+    ) -> Result<ferris_sdk::package::Package, ExtensionError> {
         validate_entry(entry, &self.cache.join("index.json"))?;
         let source = self.cache.join(&entry.path);
         if !source.join("extension.toml").is_file() {
