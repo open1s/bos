@@ -7042,78 +7042,127 @@ impl Shell {
         });
         let theme_surfaces = self.extension_themes.clone().unwrap_or_default();
         let selected_theme = self.state.draft().global.general.extension_theme.clone();
-        let selected_label = selected_theme
-            .as_ref()
-            .and_then(|id| theme_surfaces.get(id))
-            .map(|theme| {
-                if theme.name.is_empty() {
-                    selected_theme.clone().unwrap_or_default()
-                } else {
-                    theme.name.clone()
-                }
-            })
-            .unwrap_or_else(|| tr(self.state.lang, "settings.themeKit").to_string());
         let theme_view = cx.entity();
-        let theme_options: Vec<(Option<String>, String)> =
-            std::iter::once((None, tr(self.state.lang, "settings.themeKit").to_string()))
-                .chain(theme_surfaces.iter().map(|(id, theme)| {
-                    let label = if theme.name.is_empty() {
-                        id.clone()
-                    } else {
-                        theme.name.clone()
-                    };
-                    (Some(id.clone()), label)
-                }))
-                .collect();
-        let theme_choices = theme_surfaces.clone();
-        let theme_menu = Button::new("extension-global-theme")
-            .ghost()
-            .debug_selector(|| "extension-global-theme".to_string())
-            .h(px(32.0))
-            .px(px(12.0))
+        let kit_label = tr(self.state.lang, "settings.themeKit").to_string();
+        let mut cards: Vec<(Option<String>, String, Vec<u32>)> = vec![(
+            None,
+            kit_label,
+            vec![
+                theme::page(),
+                theme::sidebar_bg(),
+                theme::accent(),
+                theme::text(),
+                theme::border(),
+                theme::new_session_fill(),
+            ],
+        )];
+        for (id, palette) in &theme_surfaces {
+            let mut swatches = Vec::new();
+            for token in [
+                "background",
+                "sidebar",
+                "primary",
+                "foreground",
+                "border",
+                "secondary",
+            ] {
+                if let Some(color) = palette.color(token) {
+                    swatches.push(color);
+                }
+            }
+            if swatches.is_empty() {
+                swatches.push(theme::new_session_fill());
+            }
+            let label = if palette.name.is_empty() {
+                id.clone()
+            } else {
+                palette.name.clone()
+            };
+            cards.push((Some(id.clone()), label, swatches));
+        }
+        let mut theme_cards = div()
+            .debug_selector(|| "extension-theme-cards".to_string())
             .flex()
             .flex_row()
-            .items_center()
-            .gap(px(6.0))
-            .rounded(px(9.0))
-            .bg(rgb(theme::new_session_fill()))
-            .cursor_pointer()
-            .child(icon(IconName::Sun, 13.0, theme::muted()))
-            .child(txt(selected_label, 12.0, theme::text()))
-            .child(icon(IconName::ChevronDown, 12.0, theme::faint()))
-            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
-                let mut menu = menu.min_w(px(240.0));
-                let selected = selected_theme.clone();
-                for (id, label) in theme_options.iter() {
-                    let pick = theme_view.clone();
-                    let choice = id.clone();
-                    let colors = choice
-                        .as_ref()
-                        .and_then(|id| theme_choices.get(id))
-                        .map(|theme| theme.colors.clone());
-                    let active = selected.as_deref() == choice.as_deref();
-                    menu = menu.item(PopupMenuItem::new(label.clone()).checked(active).on_click(
-                        move |_, _, cx| {
-                            let choice = choice.clone();
-                            let colors = colors.clone();
-                            pick.update(cx, |this, cx| {
-                                this.state.draft_mut().global.general.extension_theme = choice;
-                                match colors {
-                                    Some(colors) => theme::set_extension_tokens(&colors),
-                                    None => theme::clear_extension_tokens(),
-                                }
-                                cx.notify();
-                            });
-                        },
-                    ));
-                }
-                menu
-            });
+            .flex_wrap()
+            .gap(px(10.0));
+        for (choice, label, swatches) in cards {
+            let active = selected_theme == choice;
+            let id = choice.clone().unwrap_or_else(|| "kit".to_string());
+            let selector = format!("extension-theme-card-{id}");
+            let pick = theme_view.clone();
+            let click_choice = choice.clone();
+            let colors = choice
+                .as_ref()
+                .and_then(|id| theme_surfaces.get(id))
+                .map(|theme| theme.colors.clone());
+            let mut strip = div().flex().flex_row().gap(px(4.0)).h(px(30.0));
+            for color in &swatches {
+                strip = strip.child(div().flex_1().h(px(30.0)).rounded(px(4.0)).bg(rgb(*color)));
+            }
+            theme_cards = theme_cards.child(
+                div()
+                    .id(SharedString::from(selector.clone()))
+                    .debug_selector(move || selector.clone())
+                    .w(px(230.0))
+                    .p(px(12.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .rounded(px(12.0))
+                    .border_1()
+                    .border_color(rgb(if active {
+                        theme::accent()
+                    } else {
+                        theme::border_soft()
+                    }))
+                    .bg(rgb(theme::page()))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(theme::hover())))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        let choice = click_choice.clone();
+                        let colors = colors.clone();
+                        this.state.draft_mut().global.general.extension_theme = choice;
+                        match colors {
+                            Some(colors) => theme::set_extension_tokens(&colors),
+                            None => theme::clear_extension_tokens(),
+                        }
+                        pick.update(cx, |_, cx| cx.notify());
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(icon(
+                                if choice.is_some() {
+                                    IconName::Sparkles
+                                } else {
+                                    IconName::Sun
+                                },
+                                13.0,
+                                theme::muted(),
+                            ))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(txt(label, 12.0, theme::text())),
+                            )
+                            .when(active, |row| {
+                                row.child(icon(IconName::Check, 13.0, theme::accent()))
+                            }),
+                    )
+                    .child(strip),
+            );
+        }
         if self.extensions_tab == 3 {
             return (
                 "settings.extensions",
                 "settings.extensionsThemeHint",
-                vec![div().child(theme_menu).into_any_element()],
+                vec![theme_cards.into_any_element()],
             );
         }
         let refresh = div()

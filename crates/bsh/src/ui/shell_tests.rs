@@ -29973,8 +29973,12 @@ fn the_extensions_pane_keeps_mcp_and_skills(cx: &mut TestAppContext) {
     cx.simulate_click(theme.center(), Modifiers::default());
     cx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(
-        cx.debug_bounds("extension-global-theme").is_some(),
-        "the Theme tab holds the extension theme picker"
+        cx.debug_bounds("extension-theme-cards").is_some(),
+        "the Theme tab holds the extension theme cards"
+    );
+    assert!(
+        cx.debug_bounds("extension-theme-card-kit").is_some(),
+        "the Kit theme is the first card"
     );
     let market = cx
         .debug_bounds("extensions-tab-market")
