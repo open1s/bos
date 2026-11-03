@@ -11,6 +11,15 @@ pub mod error;
 pub mod manifest;
 pub mod runtime;
 
+pub use ferris_core::manifest::{
+    ConfigurationSpec, ResourcesSpec, ServiceProvideSpec, ServiceRequireSpec, ServiceScope,
+    ServicesSpec,
+};
+pub use ferris_core::types::{ExtensionId, Requirement, StartupPolicy, TrustLevel};
+pub use ferris_core::{Contribution, ContributionRef, InvokeContext, RuntimeContext};
+pub use semver::Version;
+pub use toml;
+
 pub use contribution::{kinds, ContributionSpec};
 pub use error::{ErrorCode, ExtError, Result};
 pub use manifest::{ExtensionManifest, ManifestBuilder};
@@ -22,8 +31,14 @@ pub mod prelude {
     pub use crate::error::{ErrorCode, ExtError, Result};
     pub use crate::manifest::{ExtensionManifest, ManifestBuilder};
     pub use crate::runtime::{Call, Extension, ExtensionContext, ExtensionRuntime, TestHarness};
+    pub use crate::{
+        ConfigurationSpec, Contribution, ContributionRef, ExtensionId, InvokeContext, Requirement,
+        ResourcesSpec, RuntimeContext, ServiceProvideSpec, ServiceRequireSpec, ServiceScope,
+        ServicesSpec, StartupPolicy, TrustLevel, Version,
+    };
     pub use async_trait::async_trait;
     pub use serde_json::{json, Value};
+    pub use toml;
 }
 
 #[cfg(test)]
@@ -44,13 +59,13 @@ mod tests {
                 .expect("manifest")
         }
 
-        async fn start(&self, _ctx: &ExtensionContext) -> Result<Vec<ferris_core::Contribution>> {
+        async fn start(&self, _ctx: &ExtensionContext) -> Result<Vec<Contribution>> {
             Ok(vec![ContributionSpec::tool("echo").into_contribution(
                 serde_json::json!({"description": "Echo"}),
             )])
         }
 
-        async fn invoke(&self, call: &Call, _ctx: &ferris_core::InvokeContext) -> Result<Value> {
+        async fn invoke(&self, call: &Call, _ctx: &InvokeContext) -> Result<Value> {
             Ok(call.input.clone())
         }
     }
@@ -93,6 +108,26 @@ mod tests {
         assert_eq!(specs[0].kind, kinds::TOOL);
         assert_eq!(specs[13].kind, kinds::EVENT_SUBSCRIBE);
         assert_eq!(specs[15].kind, kinds::HOOK);
+    }
+
+    #[test]
+    fn the_manifest_builder_covers_resources_config_and_dependencies() {
+        let manifest = ManifestBuilder::new("com.example.full", "Full", "1.2.3", "full")
+            .dependency("com.example.base", "^1.0")
+            .max_memory_mb(128)
+            .max_execution_ms(5_000)
+            .max_concurrent_calls(2)
+            .max_output_bytes(65_536)
+            .configuration_schema("schemas/config.schema.json")
+            .configuration_defaults(toml::toml! { enabled = true }.into())
+            .startup(StartupPolicy::OnStartup)
+            .build()
+            .expect("manifest");
+        let text = manifest.to_toml();
+        assert!(text.contains("com.example.base"));
+        assert!(text.contains("max_memory_mb = 128"));
+        assert!(text.contains("schemas/config.schema.json"));
+        assert!(text.contains("on-startup"));
     }
 
     #[test]

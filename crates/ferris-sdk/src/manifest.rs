@@ -2,7 +2,11 @@
 
 use std::path::Path;
 
+use ferris_core::manifest::{
+    ConfigurationSpec, ResourcesSpec, ServiceProvideSpec, ServiceRequireSpec,
+};
 use ferris_core::manifest_v2::ManifestV2;
+use ferris_core::types::StartupPolicy;
 
 use crate::contribution::ContributionSpec;
 use crate::error::{invalid_input, Result};
@@ -63,6 +67,11 @@ pub struct ManifestBuilder {
     runtime_config: toml::map::Map<String, toml::Value>,
     capabilities: Vec<String>,
     contributions: Vec<ContributionSpec>,
+    dependencies: std::collections::BTreeMap<String, String>,
+    provides: Vec<ServiceProvideSpec>,
+    requires: Vec<ServiceRequireSpec>,
+    resources: ResourcesSpec,
+    configuration: Option<ConfigurationSpec>,
 }
 
 impl ManifestBuilder {
@@ -88,6 +97,11 @@ impl ManifestBuilder {
             runtime_config: toml::map::Map::new(),
             capabilities: Vec::new(),
             contributions: Vec::new(),
+            dependencies: std::collections::BTreeMap::new(),
+            provides: Vec::new(),
+            requires: Vec::new(),
+            resources: ResourcesSpec::default(),
+            configuration: None,
         }
     }
 
@@ -161,6 +175,89 @@ impl ManifestBuilder {
         self
     }
 
+    /// Add one dependency range.
+    #[must_use]
+    pub fn dependency(mut self, id: impl Into<String>, requirement: impl Into<String>) -> Self {
+        self.dependencies.insert(id.into(), requirement.into());
+        self
+    }
+
+    /// Add one provided service contract.
+    #[must_use]
+    pub fn provide(mut self, service: ServiceProvideSpec) -> Self {
+        self.provides.push(service);
+        self
+    }
+
+    /// Add one required service contract.
+    #[must_use]
+    pub fn require(mut self, service: ServiceRequireSpec) -> Self {
+        self.requires.push(service);
+        self
+    }
+
+    /// Set the memory ceiling in MiB.
+    #[must_use]
+    pub fn max_memory_mb(mut self, value: u64) -> Self {
+        self.resources.max_memory_mb = Some(value);
+        self
+    }
+
+    /// Set the execution ceiling in milliseconds.
+    #[must_use]
+    pub fn max_execution_ms(mut self, value: u64) -> Self {
+        self.resources.max_execution_ms = Some(value);
+        self
+    }
+
+    /// Set the concurrency ceiling.
+    #[must_use]
+    pub fn max_concurrent_calls(mut self, value: u32) -> Self {
+        self.resources.max_concurrent_calls = Some(value);
+        self
+    }
+
+    /// Set the output ceiling in bytes.
+    #[must_use]
+    pub fn max_output_bytes(mut self, value: u64) -> Self {
+        self.resources.max_output_bytes = Some(value);
+        self
+    }
+
+    /// Set the package-relative JSON Schema path.
+    #[must_use]
+    pub fn configuration_schema(mut self, path: impl Into<String>) -> Self {
+        self.configuration
+            .get_or_insert_with(Default::default)
+            .schema = Some(path.into());
+        self
+    }
+
+    /// Set configuration defaults.
+    #[must_use]
+    pub fn configuration_defaults(mut self, defaults: toml::Value) -> Self {
+        self.configuration
+            .get_or_insert_with(Default::default)
+            .defaults = Some(defaults);
+        self
+    }
+
+    /// Set the activation policy stored in the manifest's runtime config.
+    #[must_use]
+    pub fn startup(mut self, startup: StartupPolicy) -> Self {
+        let value = match startup {
+            StartupPolicy::OnStartup => "on-startup",
+            StartupPolicy::OnDemand => "on-demand",
+            StartupPolicy::OnWorkspaceOpen => "on-workspace-open",
+            StartupPolicy::Manual => "manual",
+        };
+        self.runtime_config.insert(
+            "startup".to_string(),
+            toml::Value::String(value.to_string()),
+        );
+        self
+    }
+
     /// Render and validate the manifest.
     pub fn build(self) -> Result<ExtensionManifest> {
         let mut extension = toml::map::Map::new();
@@ -196,8 +293,11 @@ impl ManifestBuilder {
 
         let mut runtime = toml::map::Map::new();
         runtime.insert("kind".to_string(), toml::Value::String(self.runtime));
-        for (key, value) in self.runtime_config {
-            runtime.insert(key, value);
+        if !self.runtime_config.is_empty() {
+            runtime.insert(
+                "config".to_string(),
+                toml::Value::Table(self.runtime_config),
+            );
         }
 
         let mut capabilities = toml::map::Map::new();
@@ -223,6 +323,58 @@ impl ManifestBuilder {
         );
         root.insert("runtime".to_string(), toml::Value::Table(runtime));
         root.insert("capabilities".to_string(), toml::Value::Table(capabilities));
+
+        if !self.dependencies.is_empty() {
+            let mut dependencies = toml::map::Map::new();
+            for (id, requirement) in self.dependencies {
+                dependencies.insert(id, toml::Value::String(requirement));
+            }
+            root.insert("dependencies".to_string(), toml::Value::Table(dependencies));
+        }
+        if !self.provides.is_empty() || !self.requires.is_empty() {
+            let mut services = toml::map::Map::new();
+            if !self.provides.is_empty() {
+                services.insert(
+                    "provides".to_string(),
+                    toml::Value::Array(
+                        self.provides
+                            .into_iter()
+                            .map(|service| {
+                                toml::Value::try_from(service)
+                                    .map_err(|error| invalid_input(error.to_string()))
+                            })
+                            .collect::<Result<Vec<_>>>()?,
+                    ),
+                );
+            }
+            if !self.requires.is_empty() {
+                services.insert(
+                    "requires".to_string(),
+                    toml::Value::Array(
+                        self.requires
+                            .into_iter()
+                            .map(|service| {
+                                toml::Value::try_from(service)
+                                    .map_err(|error| invalid_input(error.to_string()))
+                            })
+                            .collect::<Result<Vec<_>>>()?,
+                    ),
+                );
+            }
+            root.insert("services".to_string(), toml::Value::Table(services));
+        }
+        let resources = toml::Value::try_from(self.resources)
+            .map_err(|error| invalid_input(error.to_string()))?;
+        if let toml::Value::Table(resources) = resources {
+            if !resources.is_empty() {
+                root.insert("resources".to_string(), toml::Value::Table(resources));
+            }
+        }
+        if let Some(configuration) = self.configuration {
+            let configuration = toml::Value::try_from(configuration)
+                .map_err(|error| invalid_input(error.to_string()))?;
+            root.insert("configuration".to_string(), configuration);
+        }
         root.insert(
             "contribution".to_string(),
             toml::Value::Array(

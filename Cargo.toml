@@ -22,6 +22,7 @@ resolver = "2"
 tokio = { version = "1.52", features = ["full"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+semver = "1"
 # Cargo ignores semver build metadata, so `+spec-1.1.0` only produced a
 # manifest warning on every build.
 toml = "1.1.8"

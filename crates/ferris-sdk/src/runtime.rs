@@ -2,7 +2,9 @@
 
 use std::path::PathBuf;
 
-use ferris_core::{Contribution, ContributionRef, InvokeContext, Runtime, RuntimeContext};
+use ferris_core::Runtime;
+
+use crate::{Contribution, ContributionRef, InvokeContext, RuntimeContext};
 use serde_json::Value;
 
 use crate::error::{runtime as runtime_error, Result};
@@ -36,6 +38,23 @@ pub struct ExtensionContext {
     pub runtime: RuntimeContext,
     /// The validated manifest.
     pub manifest: ExtensionManifest,
+}
+
+impl ExtensionContext {
+    /// Package root.
+    pub fn root(&self) -> &std::path::Path {
+        &self.runtime.root
+    }
+
+    /// Writable data directory for this extension.
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.runtime.data_root
+    }
+
+    /// Extension id.
+    pub fn id(&self) -> &str {
+        &self.runtime.extension
+    }
 }
 
 /// Author-facing extension interface.
@@ -97,12 +116,17 @@ impl<E: Extension> ExtensionRuntime<E> {
         <Self as Runtime>::start(self, &ctx).await
     }
 
-    /// Invoke one contribution id.
+    /// Invoke one contribution id as a tool.
     pub async fn invoke_id(&self, id: &str, input: Value) -> Result<Value> {
+        self.invoke_contribution("tool", id, input).await
+    }
+
+    /// Invoke one contribution with an explicit kind.
+    pub async fn invoke_contribution(&self, kind: &str, id: &str, input: Value) -> Result<Value> {
         <Self as Runtime>::invoke(
             self,
             &ContributionRef {
-                kind: "tool".to_string(),
+                kind: kind.to_string(),
                 id: id.to_string(),
             },
             input,
@@ -188,6 +212,11 @@ impl<E: Extension> TestHarness<E> {
     /// Invoke a tool by contribution id.
     pub async fn invoke(&self, id: &str, input: Value) -> Result<Value> {
         self.runtime.invoke_id(id, input).await
+    }
+
+    /// Invoke a contribution with an explicit kind.
+    pub async fn invoke_contribution(&self, kind: &str, id: &str, input: Value) -> Result<Value> {
+        self.runtime.invoke_contribution(kind, id, input).await
     }
 
     /// Shut the extension down.

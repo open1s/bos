@@ -1,6 +1,5 @@
 //! Compiles the SDK without BSH, agent or GPUI in the dependency graph.
 
-use ferris_core::{Contribution, InvokeContext};
 use ferris_sdk::prelude::*;
 
 struct Demo;

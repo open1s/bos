@@ -12,7 +12,6 @@ name = "ferris-smoke"
 path = "src/main.rs"
 
 [dependencies]
-ferris-core = { path = "../ferris-core" }
 ferris-sdk = { path = "../ferris-sdk" }
 tokio.workspace = true
 async-trait.workspace = true
