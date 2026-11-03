@@ -22,6 +22,8 @@ sha2 = "0.11.1"
 toml.workspace = true
 thiserror.workspace = true
 walkdir = "2.5"
+uuid.workspace = true
+async-channel.workspace = true
 flate2 = "1"
 tar = "0.4"
 reqwest = { workspace = true, features = ["blocking"] }

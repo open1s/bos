@@ -12,6 +12,8 @@ use std::sync::Arc;
 
 pub mod capability;
 pub mod config;
+pub mod events;
+pub mod ui;
 pub mod sources;
 pub mod storage;
 #[cfg(feature = "tokio")]

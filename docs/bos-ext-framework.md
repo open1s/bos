@@ -1,8 +1,8 @@
 # BOS Extension Framework (bos-ext)
 
-Status: Phase 2 in progress — Phase 1 primitives are in bos-ext-core; the
-runtime contract and builtin runtime moved to bos-ext-runtime; BSH re-exports
-them. Declarative/process/Cordis runtimes and the Node bridge remain in BSH.
+Status: Phase 2 in progress — Phase 1 primitives plus UI/events are in
+bos-ext-core; the runtime contract and builtin runtime are in bos-ext-runtime.
+Declarative/process/Cordis runtimes and the Node bridge remain in BSH.
 
 ## Goal
 
