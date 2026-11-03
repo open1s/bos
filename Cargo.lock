@@ -1391,6 +1391,7 @@ dependencies = [
  "async-trait",
  "bos-ext-core",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

@@ -3,7 +3,8 @@
 Status: Phase 5 in progress — manifest 2.0 envelope, migration and dual-version
 loading are live; migration preserves runtime entry, args, env, protocol and
 startup policy in `runtime.config`; the independent `bos-ext-smoke` binary
-parses and validates a 2.0 manifest with no BSH dependency. BSH imports core primitives and standard runtimes directly;
+parses and validates a 2.0 manifest with no BSH dependency, and the SDK carries
+unit tests for its author runtime adapter. BSH imports core primitives and standard runtimes directly;
 the Phase-1 composable/runtime/core re-export modules are deleted (only the
 terminal/hooks adapters and the `topics` convenience alias remain). Phase 3 host
 wiring is partial: BSH has a `BosHostSpec` adapter and `framework_manager()`, and

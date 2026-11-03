@@ -11,3 +11,6 @@ description = "Author API and test harness for BOS extensions"
 bos-ext-core = { path = "../bos-ext-core" }
 async-trait.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

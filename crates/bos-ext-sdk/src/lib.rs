@@ -137,3 +137,67 @@ impl<E: Extension> Runtime for ExtensionRuntime<E> {
         self.extension.shutdown().await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bos_ext_core::types::ExtensionId;
+
+    struct Echo;
+
+    #[async_trait::async_trait]
+    impl Extension for Echo {
+        fn manifest(&self) -> &'static str {
+            "schema_version = \"2.0\""
+        }
+
+        async fn start(&self, _ctx: &ExtensionContext) -> Result<Vec<Contribution>, ExtError> {
+            Ok(vec![ContributionBuilder::new("demo.echo", "echo").build()])
+        }
+
+        async fn invoke(&self, call: &Call, _ctx: &InvokeContext) -> Result<Value, ExtError> {
+            Ok(call.input.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_runtime_adapter_starts_and_invokes() {
+        let root = std::path::PathBuf::from("/tmp/demo");
+        let runtime = ExtensionRuntime::new(Echo, "builtin", root.clone());
+        let contributions = runtime
+            .start(&RuntimeContext {
+                extension: "com.example.demo".to_string(),
+                root: root.clone(),
+                data_root: root.join("data"),
+            })
+            .await
+            .expect("start");
+        assert_eq!(contributions.len(), 1);
+        let value = runtime
+            .invoke(
+                &ContributionRef {
+                    kind: "demo.echo".to_string(),
+                    id: "echo".to_string(),
+                },
+                serde_json::json!({"ok": true}),
+                &InvokeContext {
+                    correlation: "c".to_string(),
+                    timeout_ms: 100,
+                },
+            )
+            .await
+            .expect("invoke");
+        assert_eq!(value, serde_json::json!({"ok": true}));
+    }
+
+    #[test]
+    fn the_contribution_builder_is_typed() {
+        let contribution = ContributionBuilder::new("demo.echo", "echo")
+            .payload(serde_json::json!({"a": 1}))
+            .build();
+        assert_eq!(contribution.kind, "demo.echo");
+        assert_eq!(contribution.id, "echo");
+        let _ = ExtensionId::parse("com.example.demo").expect("id");
+    }
+}
+
