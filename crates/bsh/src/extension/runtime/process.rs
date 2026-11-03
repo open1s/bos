@@ -337,7 +337,7 @@ pub(super) fn linux_bwrap_plan(
         // files from the host user's home directory.
         if let Some(hidden_root) = hidden_roots
             .iter()
-            .find(|hidden_root| path.starts_with(*hidden_root) && path.as_path() != *hidden_root)
+            .find(|hidden_root| path.starts_with(*hidden_root) && path.as_path() != **hidden_root)
         {
             if let Ok(relative) = path.strip_prefix(*hidden_root) {
                 let mut destination = hidden_root.to_path_buf();
