@@ -77,10 +77,10 @@ jobs:
       - name: Extension gold standard
         run: GOLD_STANDARD_RELEASE=1 bash scripts/ci/check-extension-gold-standard.sh
 
-  windows:
-
       - name: BOS extension SDK independence
         run: bash scripts/ci/check-ferris-independence.sh
+
+  windows:
     name: Windows extension tests
     runs-on: windows-latest
     steps:
@@ -109,6 +109,42 @@ jobs:
         run: >-
           cargo test -p bsh --lib extension::
           -- --skip ui::shell_tests
+
+      # The release packages this exact binary. Building it here, not only the
+      # lib, catches a Windows link or entry-point break before a release tag.
+      - name: Build the BSH binary
+        run: cargo build -p bsh --bin bsh
+
+      - name: Smoke-test the binary
+        shell: pwsh
+        run: |
+          $help = & .\target\debug\bsh.exe --help
+          if (-not $help) { throw "bsh.exe --help printed nothing" }
+          $help | Select-Object -First 1
+
+      - name: Ensure the WiX Toolset
+        shell: pwsh
+        run: |
+          $candle = Join-Path ${env:ProgramFiles(x86)} 'WiX Toolset v3.14\bin\candle.exe'
+          if (-not ((Get-Command candle.exe -ErrorAction SilentlyContinue) -or (Test-Path $candle))) {
+            choco install wixtoolset --no-progress -y
+          }
+
+      # Package a stand-in binary with the real WiX toolchain so the PowerShell
+      # packager, the .wxs source and the artifact checks are exercised on every
+      # change, not first at a release tag.
+      - name: Build the Windows installer from a stand-in binary
+        shell: pwsh
+        run: |
+          $stub = Join-Path $env:RUNNER_TEMP 'bsh-stub.exe'
+          [IO.File]::WriteAllBytes($stub, [byte[]]::new(2097152))
+          ./scripts/ci/package-windows.ps1 -Version 1.0.0-ci -Binary $stub -OutDir target\ci-package
+          Get-ChildItem target\ci-package |
+            Where-Object { $_.Extension -in '.msi', '.zip' } |
+            ForEach-Object {
+              if ($_.Length -lt 1MB) { throw "$($_.Name) is suspiciously small" }
+              Write-Host "packaged $($_.Name) ($($_.Length) bytes)"
+            }
 
   msrv:
     name: Build at the declared MSRV
@@ -149,6 +185,63 @@ jobs:
       # quietly going stale. --locked also keeps Cargo.lock in sync.
       - name: Check the workspace at 1.97
         run: cargo check --workspace --exclude jsbos --exclude nbos --locked
+
+  packaging:
+    name: Validate the release pipeline
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # A workflow that stops parsing is silent until it is needed, and the
+      # packagers only run on a release tag. Check their structure on every
+      # change: YAML parses, shell syntax, assets, and the artifact names the
+      # release job verifies.
+      - name: Check the release workflow and packagers
+        run: bash scripts/ci/check-release-pipeline.sh
+
+      - name: Install the packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm
+
+      # Run the real dpkg-deb/rpmbuild path with a stand-in binary. The release
+      # job supplies the built bsh; here the packaging logic, control files and
+      # RPM spec are under test, on every change.
+      - name: Build the Linux packages from a stand-in binary
+        run: |
+          bash scripts/ci/package-linux.sh \
+            --version 0.0.0-ci \
+            --binary "$(command -v true)" \
+            --out target/ci-package
+
+      - name: Inspect the Linux packages
+        run: |
+          dpkg-deb --info target/ci-package/*.deb
+          rpm -qip target/ci-package/*.rpm
+          rpm -qp --requires target/ci-package/*.rpm
+          tar -tzf target/ci-package/*.tar.gz | sed -n '1,5p'
+
+  packaging-macos:
+    name: Validate the macOS packager
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+
+      # /usr/bin/true is a real Mach-O, so ad-hoc signing and the bundle checks
+      # run against a valid executable; the release job swaps in the built bsh.
+      - name: Build a dmg from a stand-in binary
+        run: |
+          stub="$RUNNER_TEMP/bsh-stub"
+          cp /usr/bin/true "$stub"
+          bash scripts/ci/package-macos.sh \
+            --version 0.0.0-ci \
+            --binary "$stub" \
+            --out target/ci-package
+
+      - name: Verify the macOS artifacts
+        run: |
+          hdiutil verify target/ci-package/*.dmg
+          unzip -l target/ci-package/*.app.zip | sed -n '1,8p'
 
   bindings:
     name: Lint the binding crates

@@ -12,6 +12,14 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 app="$root/target/debug/BSH.app"
 icns="$root/crates/bsh/src/assets/bos-harness-icon.icns"
+# The bundle reports the workspace version, so a dev app cannot claim a release
+# number different from the one the binary prints in About.
+version="$(
+  sed -n '/^\[workspace\.package\]/,/^\[/p' "$root/Cargo.toml" \
+    | sed -n 's/^version = "\(.*\)"$/\1/p' \
+    | head -n 1
+)"
+[[ -n "$version" ]] || { echo "no workspace.package.version in Cargo.toml" >&2; exit 1; }
 
 cargo build -p bsh
 
@@ -20,7 +28,7 @@ mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$root/target/debug/bsh" "$app/Contents/MacOS/bsh"
 cp "$icns" "$app/Contents/Resources/bos-harness-icon.icns"
 
-cat > "$app/Contents/Info.plist" <<'PLIST'
+cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -31,7 +39,7 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
   <key>CFBundleIdentifier</key><string>com.bos.bsh</string>
   <key>CFBundleIconFile</key><string>bos-harness-icon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>3.0.2</string>
+  <key>CFBundleShortVersionString</key><string>$version</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>NSHighResolutionCapable</key><true/>
 </dict>

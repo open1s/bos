@@ -577,6 +577,18 @@ impl Runtime for LazyRuntime {
         self.inner.memory_used()
     }
 
+    /// Forward the runtime's materialized skills directory.
+    ///
+    /// A runtime that materializes skills at activation (Cordis does: the
+    /// package registers them from `apply(ctx)` and the runtime writes each as a
+    /// `SKILL.md`) advertises the directory here. Dropping the forward made
+    /// `skills_dir()` answer the trait default `None` for every package the
+    /// factory wraps, so the host fell back to the file-based `skills/` form and
+    /// a runtime-registered skill never reached the agent.
+    fn skills_dir(&self) -> Option<PathBuf> {
+        self.inner.skills_dir()
+    }
+
     async fn activate(&self) -> Result<(), ExtensionError> {
         self.ensure().await
     }

@@ -208,11 +208,6 @@ impl Agent {
         // named them and no tool that could open them.
         let model_skills = self.model_skills();
         if !model_skills.is_empty() {
-            let skill_names: Vec<String> = model_skills
-                .iter()
-                .map(|skill| skill.name.clone())
-                .collect();
-
             // One tool for every skill is not an option: it puts a no-op entry
             // in the request's tool array for each skill installed, which the
             // model then has to read and choose between on every step. The
@@ -234,13 +229,21 @@ impl Agent {
                     "required": ["name"]
                 }),
                 {
-                    let skills = self.all_skills();
+                    // The live half is read on every call, not captured here:
+                    // an extension can be activated or suspended while this
+                    // engine runs, and a loader built from a snapshot would
+                    // report a skill the agent has just gained as missing - or
+                    // keep opening one whose package was switched off.
+                    let base = self.skills.clone();
+                    let live = Arc::clone(&self.live_skills);
                     move |args: &serde_json::Value| {
                         let name = args
                             .get("name")
                             .and_then(|v| v.as_str())
                             .unwrap_or("unknown");
-                        match crate::skills::lookup_for_model(&skills, name) {
+                        let live = live.read().ok();
+                        let live = live.as_deref().map(Vec::as_slice).unwrap_or(&[]);
+                        match crate::skills::lookup_for_model_in(&base, live, name) {
                             crate::skills::ModelSkillLookup::Found(skill) => {
                                 Ok(serde_json::json!({
                                     "name": skill.metadata.name,
@@ -254,9 +257,18 @@ impl Agent {
                             crate::skills::ModelSkillLookup::UserOnly(_) => Ok(serde_json::json!({
                                 "error": format!("Skill '{name}' is not available for model invocation")
                             })),
-                            crate::skills::ModelSkillLookup::Unknown => Ok(serde_json::json!({
-                                "error": format!("Skill '{}' not found. Available: {}", name, skill_names.join(", "))
-                            })),
+                            crate::skills::ModelSkillLookup::Unknown => {
+                                let mut available: Vec<String> = base
+                                    .iter()
+                                    .chain(live.iter())
+                                    .map(|skill| skill.metadata.name.clone())
+                                    .collect();
+                                available.sort();
+                                available.dedup();
+                                Ok(serde_json::json!({
+                                    "error": format!("Skill '{}' not found. Available: {}", name, available.join(", "))
+                                }))
+                            }
                         }
                     }
                 },

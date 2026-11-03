@@ -264,6 +264,16 @@ operating the reader's shell is a different grant. A package that wants the mode
 to run the same effect declares a `tool` too and shares the handler, so one
 effect has two front doors and the extension author decides which ones exist.
 
+A skill reaches the model in one of two forms, and both feed the same set the
+catalogue and the `load_skill` tool read:
+
+- a declared file, `skills/<id>/SKILL.md`, which the host loads at build time;
+- a runtime registration. A Cordis package calls `ctx.skills.register(..)` from
+  `apply(ctx)`; the runtime materializes each registration under its data
+  directory and advertises that directory to the host. The runtime's set wins
+  when it holds a skill, and an empty directory falls back to the declared files
+  so a package is never worse off for having declared them.
+
 ### 3.7 Services
 
 ~~~toml

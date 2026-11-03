@@ -891,6 +891,20 @@ impl Agent {
             .unwrap_or_default()
     }
 
+    /// Every skill in the live overlay, in registration order.
+    ///
+    /// A host that suspends and resumes a package owns its contributions: the
+    /// content it installed is what it must be able to put back, and re-reading
+    /// the package directory would race a package that was uninstalled in
+    /// between. The returned values are owned because the overlay lives behind a
+    /// lock.
+    pub fn live_skills(&self) -> Vec<crate::skills::SkillContent> {
+        self.live_skills
+            .read()
+            .map(|skills| skills.clone())
+            .unwrap_or_default()
+    }
+
     /// Base skills plus the live extension overlay.
     ///
     /// The overlay is where a package's `SKILL.md` files land: the extension

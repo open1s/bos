@@ -101,11 +101,7 @@ fn cap_tool_result(text: &str, cap: usize) -> String {
 
     // Keep both ends, but include the omission marker INSIDE the byte budget.
     // Very small caps use a short marker; larger caps also report the byte gap.
-    let marker_budget = if cap < 128 {
-        SHORT_MARKER.len()
-    } else {
-        64
-    };
+    let marker_budget = if cap < 128 { SHORT_MARKER.len() } else { 64 };
     let mut head_budget = (cap - marker_budget) / 2;
     let mut tail_budget = cap - marker_budget - head_budget;
     loop {

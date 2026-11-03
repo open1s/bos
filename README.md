@@ -177,6 +177,17 @@ On macOS, a development app can also be packaged with
 `./crates/bsh/make-dev-app.sh`. See the
 [Rust workflow](.github/workflows/rust.yml) for Linux build dependencies.
 
+### Install BSH
+
+Prebuilt installers are published on the
+[releases page](https://github.com/open1s/bos/releases): a dmg for macOS
+(Apple silicon and Intel), `.deb`, `.rpm` and portable tarballs for Linux
+x86_64 and arm64, and a per-user MSI and portable zip for Windows x64. Each
+release carries `SHA256SUMS`.
+
+The tag-driven build, signing and notarization setup is documented in
+[docs/bsh-release.md](docs/bsh-release.md).
+
 ## BSH agent workspace
 
 **BSH brings agent execution and everyday development tools into one native
@@ -282,6 +293,7 @@ sensitive credentials in its encrypted vault.
 | [BSH Built-in Tools 2.0](docs/bsh-built-in-tools-2.0.md) | LLM-oriented tool contracts, batch file operations, output budgets and benchmark plan |
 | [Contributor onboarding](ONBOARDING.md) | Set up a development environment |
 | [Settings](docs/bsh-settings-spec.md) · [Terminal policy](docs/bsh-terminal-policy.md) · [Hooks](docs/bsh-hook-system.md) | Subsystem specifications |
+| [BSH release pipeline](docs/bsh-release.md) | Installer artifacts, signing and the tag-driven release workflow |
 | [REX guide](docs/rex-user-guide.md) · [Diagnostics](docs/diagnostics.md) | Resource tooling and troubleshooting |
 | [Wiki](https://github.com/open1s/bos/wiki) · [Changelog](CHANGELOG.md) | Guides and release history |
 

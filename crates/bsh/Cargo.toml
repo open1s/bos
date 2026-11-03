@@ -171,6 +171,13 @@ tempfile = "3"
 gpui = { package = "gpui-pre", version = "=0.3.10", features = ["test-support"] }
 # The runner's automatic-compaction test drives a local `LlmClient` mock; the
 
+# Explorer, the taskbar and Add/Remove Programs read the executable's own
+# resources, not the installer's icon table. Without a compiled resource the
+# packaged bsh.exe shows a generic blank icon even though the MSI carries the
+# .ico.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1.34"
+
 # A bare `bsh` binary has no bundle, so macOS would draw a generic Dock tile;
 # assets::install_dock_icon hands AppKit the .icns compiled into the binary
 # instead. Versions match what gpui-pre-macos already pulls in, so they unify.

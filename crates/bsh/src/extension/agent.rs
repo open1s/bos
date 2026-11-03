@@ -77,6 +77,11 @@ pub(crate) struct ContributionLease {
     tool_handles: Vec<Arc<dyn react::tool::registry::AsyncTool>>,
     prompt_sections: Vec<String>,
     skill_paths: Vec<PathBuf>,
+    /// The skill content this activation installed, kept for a resume.
+    ///
+    /// `skill_paths` is what a suspend removes; a resume cannot re-read the
+    /// package (it may be gone), so the parsed content travels with the lease.
+    skills: Vec<agent::skills::SkillContent>,
     active: Arc<AtomicBool>,
 }
 
@@ -113,6 +118,11 @@ impl ContributionLease {
     }
 
     /// Re-install the live overlay pieces after a suspend.
+    ///
+    /// Skills are part of the overlay a suspend removes, so they are part of
+    /// what a resume owes back: without them the model keeps the catalogue
+    /// entry but `load_skill` answers "not found" for a package that is active
+    /// again.
     pub(crate) fn resume_live(&self, agent: &agent::Agent) -> usize {
         let mut restored = 0;
         for tool in &self.tool_handles {
@@ -122,6 +132,10 @@ impl ContributionLease {
         }
         for section in &self.prompt_sections {
             agent.add_live_prompt_section(section.clone());
+            restored += 1;
+        }
+        for skill in &self.skills {
+            agent.add_live_skill(skill.clone());
             restored += 1;
         }
         restored
@@ -612,22 +626,28 @@ pub(crate) fn install_with_lease(
         }
     }
     let mut skill_paths = Vec::new();
-    if let Some(skills) = &contributed.skills_dir {
-        if skills.is_dir() {
+    let mut skills = Vec::new();
+    if let Some(dir) = &contributed.skills_dir {
+        if dir.is_dir() {
             let before: std::collections::HashSet<PathBuf> =
                 agent.live_skill_paths().into_iter().collect();
-            if let Err(error) = agent.add_live_skills_from_dir(skills.clone()) {
+            if let Err(error) = agent.add_live_skills_from_dir(dir.clone()) {
                 log::warn!(
                     target: "bsh::extension",
                     "{}: skills were declared but could not be read: {error}",
                     contributed.extension
                 );
             } else {
-                skill_paths = agent
-                    .live_skill_paths()
-                    .into_iter()
-                    .filter(|path| !before.contains(path))
-                    .collect();
+                // Record both the paths a suspend removes and the content a
+                // resume puts back; the overlay is the only place the parsed
+                // form lives.
+                for skill in agent.live_skills() {
+                    if before.contains(&skill.skill_dir) {
+                        continue;
+                    }
+                    skill_paths.push(skill.skill_dir.clone());
+                    skills.push(skill);
+                }
             }
         }
     }
@@ -637,6 +657,7 @@ pub(crate) fn install_with_lease(
         tool_handles: installed_handles,
         prompt_sections,
         skill_paths,
+        skills,
         active,
     };
     (

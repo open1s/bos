@@ -497,6 +497,215 @@ async fn the_grant_button_path_activates_a_denied_community_package() {
     host.shutdown().await;
 }
 
+/// A Cordis package registers its skill at ACTIVATION, not on disk. The
+/// runtime materializes it into its data directory, and the host has to read
+/// that directory: the file-based `skills/<id>/SKILL.md` form is only one way a
+/// package can contribute a skill.
+#[tokio::test]
+async fn a_runtime_registered_skill_reaches_the_agent() {
+    let root = scratch("cordis-runtime-skill");
+    std::fs::create_dir_all(root.join("workspace")).expect("workspace");
+    let source = root.join("source");
+    std::fs::create_dir_all(&source).expect("source");
+    std::fs::write(
+        source.join("extension.toml"),
+        r#"
+schema_version = "2.0"
+[extension]
+id = "com.example.runtime-skill"
+name = "Runtime Skill"
+version = "1.0.0"
+description = "registers its skill at activation"
+[compatibility]
+host = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+[runtime]
+kind = "cordis"
+[runtime.config]
+entry = "index.js"
+startup = "on-demand"
+[capabilities]
+required = ["process.execute", "agent.tools.register", "agent.skills.provide"]
+[[contribution]]
+kind = "tool"
+id = "echo"
+[contribution.payload]
+"#,
+    )
+    .expect("manifest");
+    std::fs::write(
+        source.join("index.js"),
+        r##"
+module.exports = {
+  apply(ctx) {
+    ctx.tools.register({
+      name: "echo",
+      description: "Echo a value.",
+      parameters: { type: "object", properties: { value: { type: "string" } } },
+      output: { schema: {}, render: () => null },
+      async execute(args) { return { echoed: args.value }; },
+    });
+    ctx.skills.register({
+      name: "runtime-tour",
+      description: "a tour registered at activation",
+      content: "# Runtime Tour\n\nRUNTIME TOUR BODY",
+    });
+  },
+};
+"##,
+    )
+    .expect("entry");
+
+    let store = ExtensionStore::open(&root).expect("store");
+    let package = store.install(&source).expect("install");
+    grant_all(
+        &store,
+        package.id(),
+        &package.manifest.capabilities.required,
+    );
+    let mut host = ExtensionHost::open(config(&root)).expect("host");
+    let status = host
+        .statuses()
+        .into_iter()
+        .find(|status| status.id == "com.example.runtime-skill")
+        .expect("status");
+    assert!(status.applied, "the package activates: {:?}", status.error);
+    assert!(
+        status.skills.iter().any(|skill| skill == "runtime-tour"),
+        "the status row names the runtime-registered skill: {:?}",
+        status.skills
+    );
+
+    let saw = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut provider = ::agent::agent::agentic::LlmProvider::new();
+    provider.register_vendor(
+        "mock".to_string(),
+        Box::new(SkillLoader {
+            skill: "runtime-tour",
+            body: "RUNTIME TOUR BODY",
+            calls: AtomicUsize::new(0),
+            saw: std::sync::Arc::clone(&saw),
+        }),
+    );
+    let mut agent = ::agent::Agent::new(
+        ::agent::AgentConfig {
+            model: "mock-model".to_string(),
+            ..Default::default()
+        },
+        std::sync::Arc::new(provider),
+    );
+    let mut registry = ::agent::plugins::PluginRegistry::default();
+    let applied = host.apply_with_fibers(&mut agent, &mut registry, None, "session");
+    let activation = applied
+        .iter()
+        .find(|activation| activation.extension_id() == "com.example.runtime-skill")
+        .expect("the package applied");
+    let names: Vec<String> = agent
+        .all_skills()
+        .into_iter()
+        .map(|skill| skill.metadata.name)
+        .collect();
+    assert!(
+        names.iter().any(|name| name == "runtime-tour"),
+        "a skill the runtime registers at activation reaches the agent: {names:?}"
+    );
+
+    let _ = agent.react("do the tour".to_string()).await;
+    assert!(
+        saw.load(Ordering::Relaxed),
+        "the model's load_skill must open the runtime-registered skill"
+    );
+
+    // The activation owns the skill: suspending it takes the skill out, and
+    // resuming must put it back, or the model keeps a stale catalogue entry it
+    // cannot load.
+    assert!(
+        activation.suspend_live(&agent) > 0,
+        "the activation suspends"
+    );
+    assert!(
+        !agent
+            .all_skills()
+            .iter()
+            .any(|skill| skill.metadata.name == "runtime-tour"),
+        "a suspended activation's skill leaves the agent"
+    );
+    activation.resume_live(&agent);
+    assert!(
+        agent
+            .all_skills()
+            .iter()
+            .any(|skill| skill.metadata.name == "runtime-tour"),
+        "resuming the activation restores its runtime-registered skill"
+    );
+    host.shutdown().await;
+}
+
+/// The real Cordis example declares its skill as a file AND registers it from
+/// `apply(ctx)`; either form must reach the agent, and the runtime's
+/// materialized copy must not shadow it into an empty directory.
+#[tokio::test]
+async fn a_cordis_packages_skill_reaches_the_agent() {
+    let root = scratch("cordis-skill");
+    std::fs::create_dir_all(root.join("workspace")).expect("workspace");
+    let store = ExtensionStore::open(&root).expect("store");
+    let package = store
+        .install(&examples().join("cordis-echo"))
+        .expect("install");
+    grant_all(
+        &store,
+        package.id(),
+        &package.manifest.capabilities.required,
+    );
+    let mut host = ExtensionHost::open(config(&root)).expect("host");
+    let status = host
+        .statuses()
+        .into_iter()
+        .find(|status| status.id == "com.example.cordis-echo")
+        .expect("status");
+    assert!(status.applied, "the package activates: {:?}", status.error);
+
+    let mut agent = ::agent::Agent::from_config(::agent::AgentConfig::default());
+    let mut registry = ::agent::plugins::PluginRegistry::default();
+    let applied = host.apply_with_fibers(&mut agent, &mut registry, None, "session");
+    let activation = applied
+        .iter()
+        .find(|activation| activation.extension_id() == "com.example.cordis-echo")
+        .expect("the package applied");
+    let names: Vec<String> = agent
+        .all_skills()
+        .into_iter()
+        .map(|skill| skill.metadata.name)
+        .collect();
+    assert!(
+        names.iter().any(|name| name == "greet"),
+        "the cordis package's skill reaches the agent: {names:?}"
+    );
+
+    // The activation owns the skill: suspending it takes the skill out, and
+    // resuming puts back the same content without re-reading the package.
+    assert!(
+        activation.suspend_live(&agent) > 0,
+        "the activation suspends"
+    );
+    assert!(
+        !agent
+            .all_skills()
+            .iter()
+            .any(|skill| skill.metadata.name == "greet"),
+        "a suspended activation's skill leaves the agent"
+    );
+    activation.resume_live(&agent);
+    assert!(
+        agent
+            .all_skills()
+            .iter()
+            .any(|skill| skill.metadata.name == "greet"),
+        "a resumed activation keeps its skill"
+    );
+    host.shutdown().await;
+}
+
 fn copy_dir(source: &Path, target: &Path) {
     std::fs::create_dir_all(target).expect("target");
     for entry in std::fs::read_dir(source).expect("source") {
@@ -509,4 +718,216 @@ fn copy_dir(source: &Path, target: &Path) {
             std::fs::copy(&path, &destination).expect("copy");
         }
     }
+}
+
+/// A package that contributes ONLY a skill must land in the agent's skill set:
+/// the model's catalogue and its `load_skill` tool both read `Agent::all_skills`.
+#[tokio::test]
+async fn a_skill_only_package_reaches_the_agent_skill_set() {
+    let root = scratch("skills-only");
+    std::fs::create_dir_all(root.join("workspace")).expect("workspace");
+    let source = root.join("source");
+    std::fs::create_dir_all(source.join("skills/tour")).expect("skill dir");
+    std::fs::write(
+        source.join("extension.toml"),
+        r#"
+schema_version = "2.0"
+[extension]
+id = "com.example.tour"
+name = "Tour"
+version = "1.0.0"
+description = "a skill-only package"
+[compatibility]
+host = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+[runtime]
+kind = "declarative"
+[capabilities]
+required = ["agent.skills.provide"]
+[[contribution]]
+kind = "skill"
+id = "tour"
+[contribution.payload]
+"#,
+    )
+    .expect("manifest");
+    std::fs::write(
+        source.join("skills/tour/SKILL.md"),
+        "---\nname: tour\ndescription: a package-driven tour\n---\n\nPACKAGE TOUR BODY\n",
+    )
+    .expect("skill");
+
+    let store = ExtensionStore::open(&root).expect("store");
+    let package = store.install(&source).expect("install");
+    grant_all(
+        &store,
+        package.id(),
+        &package.manifest.capabilities.required,
+    );
+    let mut host = ExtensionHost::open(config(&root)).expect("host");
+    let status = host
+        .statuses()
+        .into_iter()
+        .find(|status| status.id == "com.example.tour")
+        .expect("status");
+    assert!(status.applied, "the package activates: {:?}", status.error);
+    assert!(!status.skills.is_empty(), "skills: {:?}", status.skills);
+
+    let saw = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut provider = ::agent::agent::agentic::LlmProvider::new();
+    provider.register_vendor(
+        "mock".to_string(),
+        Box::new(SkillLoader {
+            skill: "tour",
+            body: "PACKAGE TOUR BODY",
+            calls: AtomicUsize::new(0),
+            saw: std::sync::Arc::clone(&saw),
+        }),
+    );
+    let mut agent = ::agent::Agent::new(
+        ::agent::AgentConfig {
+            model: "mock-model".to_string(),
+            ..Default::default()
+        },
+        std::sync::Arc::new(provider),
+    );
+    let mut registry = ::agent::plugins::PluginRegistry::default();
+    let applied = host.apply_with_fibers(&mut agent, &mut registry, None, "session");
+    assert!(!applied.is_empty(), "the package applies to the agent");
+    let catalogue: Vec<String> = agent
+        .model_skills()
+        .into_iter()
+        .map(|skill| skill.name)
+        .collect();
+    assert!(
+        catalogue.iter().any(|name| name == "tour"),
+        "the package's skill reaches the model catalogue: {catalogue:?}"
+    );
+    assert!(
+        agent
+            .all_skills()
+            .iter()
+            .any(|skill| skill.metadata.name == "tour"),
+        "and the loader can open it"
+    );
+
+    let _ = agent.react("do the tour".to_string()).await;
+    assert!(
+        saw.load(std::sync::atomic::Ordering::Relaxed),
+        "the model's load_skill must return the package's instructions"
+    );
+    host.shutdown().await;
+}
+
+/// A model that asks for `load_skill` once, then reports whether the tool
+/// result carried the requested package's instructions.
+struct SkillLoader {
+    skill: &'static str,
+    body: &'static str,
+    calls: AtomicUsize,
+    saw: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl agent::LlmClient<agent::agent::AgentSession, agent::agent::AgentReactContext> for SkillLoader {
+    async fn complete(
+        &self,
+        _persona: Option<String>,
+        _req: react::llm::LlmRequest,
+        session: &mut agent::agent::AgentSession,
+        _context: &mut agent::agent::AgentReactContext,
+    ) -> react::llm::LlmResponseResult {
+        if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+            return Ok(e2e_tool_call(
+                "load_skill",
+                &format!(r#"{{"name":"{}"}}"#, self.skill),
+            ));
+        }
+        let seen = session.messages().iter().any(|message| {
+            matches!(
+                message,
+                react::llm::LlmMessage::ToolResult { content, .. }
+                    if content.contains(self.body)
+            )
+        });
+        self.saw.store(seen, Ordering::Relaxed);
+        Ok(e2e_text("done"))
+    }
+
+    async fn stream_complete(
+        &self,
+        _persona: Option<String>,
+        _req: react::llm::LlmRequest,
+        _session: &mut agent::agent::AgentSession,
+        _context: &mut agent::agent::AgentReactContext,
+    ) -> Result<react::llm::TokenStream, react::llm::LlmError> {
+        Ok(Box::pin(futures::stream::iter(vec![Ok(
+            react::llm::StreamToken::Done,
+        )])))
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "skill-loader"
+    }
+}
+
+fn e2e_tool_call(name: &str, arguments: &str) -> react::llm::LlmResponse {
+    use react::llm::vendor::{ChatCompletionResponse, ChatMessage, Choice, FunctionCall, ToolCall};
+    react::llm::LlmResponse::OpenAI(ChatCompletionResponse {
+        id: "mock".to_string(),
+        object: "chat.completion".to_string(),
+        created: 0,
+        model: "mock".to_string(),
+        choices: vec![Choice {
+            index: 0,
+            message: ChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call-1".to_string(),
+                    r#type: "function".to_string(),
+                    function: FunctionCall {
+                        name: Some(name.to_string()),
+                        arguments: Some(arguments.to_string()),
+                    },
+                }]),
+                function_call: None,
+                reasoning_content: None,
+                extra: serde_json::Value::Object(serde_json::Map::new()),
+            },
+            finish_reason: Some("tool_calls".to_string()),
+            stop_reason: None,
+            logprobs: None,
+        }],
+        usage: None,
+        system_fingerprint: None,
+        nvext: None,
+    })
+}
+
+fn e2e_text(content: &str) -> react::llm::LlmResponse {
+    use react::llm::vendor::{ChatCompletionResponse, ChatMessage, Choice};
+    react::llm::LlmResponse::OpenAI(ChatCompletionResponse {
+        id: "mock".to_string(),
+        object: "chat.completion".to_string(),
+        created: 0,
+        model: "mock".to_string(),
+        choices: vec![Choice {
+            index: 0,
+            message: ChatMessage {
+                role: "assistant".to_string(),
+                content: Some(content.to_string()),
+                tool_calls: None,
+                function_call: None,
+                reasoning_content: None,
+                extra: serde_json::Value::Object(serde_json::Map::new()),
+            },
+            finish_reason: Some("stop".to_string()),
+            stop_reason: None,
+            logprobs: None,
+        }],
+        usage: None,
+        system_fingerprint: None,
+        nvext: None,
+    })
 }

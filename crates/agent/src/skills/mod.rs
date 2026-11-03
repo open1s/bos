@@ -291,7 +291,28 @@ pub enum ModelSkillLookup<'a> {
 /// advertised to the model nor opened by its `load_skill` tool. Keeping the
 /// decision here means the catalogue and the tool answer from one rule.
 pub fn lookup_for_model<'a>(skills: &'a [SkillContent], name: &str) -> ModelSkillLookup<'a> {
-    match skills.iter().find(|skill| skill.metadata.name == name) {
+    lookup_for_model_in(skills, &[], name)
+}
+
+/// Resolve one model-requested skill name across the build's own set and the
+/// live extension overlay.
+///
+/// The two sets are separate because they move at different times: a package
+/// can be activated or suspended while an agent is already running, and the
+/// loader must read the overlay as it is when the model asks, not as it was
+/// when the engine was built. The base entry wins a collision, which is the
+/// same precedence the catalogue uses. The policy is unchanged: a skill whose
+/// manifest reserves it for the reader is refused, never reported missing.
+pub fn lookup_for_model_in<'a>(
+    base: &'a [SkillContent],
+    live: &'a [SkillContent],
+    name: &str,
+) -> ModelSkillLookup<'a> {
+    match base
+        .iter()
+        .chain(live.iter())
+        .find(|skill| skill.metadata.name == name)
+    {
         Some(skill) if skill.metadata.user_only => ModelSkillLookup::UserOnly(skill),
         Some(skill) => ModelSkillLookup::Found(skill),
         None => ModelSkillLookup::Unknown,
@@ -320,7 +341,9 @@ pub enum SkillError {
 
 #[cfg(test)]
 mod tests {
-    use super::{lookup_for_model, ModelSkillLookup, SkillContent, SkillMetadata};
+    use super::{
+        lookup_for_model, lookup_for_model_in, ModelSkillLookup, SkillContent, SkillMetadata,
+    };
     use std::path::PathBuf;
 
     fn skill(name: &str, user_only: bool) -> SkillContent {
@@ -357,6 +380,34 @@ mod tests {
         assert!(
             matches!(lookup_for_model(&skills, "nope"), ModelSkillLookup::Unknown),
             "an unregistered name is unknown"
+        );
+    }
+
+    /// The live overlay is a second namespace that moves while an engine runs:
+    /// a package activated after the engine was built must answer, and the base
+    /// entry wins a collision.
+    #[test]
+    fn the_live_overlay_answers_a_name_the_base_set_does_not() {
+        let base = vec![skill("builtin", false)];
+        let live = vec![skill("package", false), skill("builtin", true)];
+
+        match lookup_for_model_in(&base, &live, "package") {
+            ModelSkillLookup::Found(skill) => assert_eq!(skill.metadata.name, "package"),
+            other => panic!("a package's skill answers from the overlay: {other:?}"),
+        }
+        match lookup_for_model_in(&base, &live, "builtin") {
+            ModelSkillLookup::Found(skill) => assert!(
+                !skill.metadata.user_only,
+                "the base entry wins the collision, so its policy wins with it"
+            ),
+            other => panic!("the base set answers first: {other:?}"),
+        }
+        assert!(
+            matches!(
+                lookup_for_model_in(&base, &live, "gone"),
+                ModelSkillLookup::Unknown
+            ),
+            "a suspended package's name is unknown, not served stale"
         );
     }
 }

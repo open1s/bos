@@ -837,6 +837,58 @@ struct LoadedExtension {
     error: Option<String>,
 }
 
+/// The directory one package's skills actually come from.
+///
+/// Two forms coexist. A runtime can materialize skills when the extension
+/// activates - a Cordis package calls `ctx.skills.register(..)` and the runtime
+/// writes each registration to `<data>/skills/<name>/SKILL.md` - while a
+/// declarative package ships `skills/<id>/SKILL.md` files its manifest declares.
+///
+/// The runtime's directory is authoritative when it HOLDS a skill: it is the
+/// set the extension itself registered. An absent or empty directory must not
+/// hide the declared files, so it falls back rather than winning by being
+/// present. Loading both would register the same name twice, and the skill
+/// catalogue and the `/name` menu would then draw a duplicate row.
+fn contributed_skills_dir(entry: &LoadedExtension) -> Option<PathBuf> {
+    if let Some(dir) = entry
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.skills_dir())
+    {
+        if holds_skills(&dir) {
+            return Some(dir);
+        }
+    }
+    (!entry.package.manifest.contributes.skills.is_empty())
+        .then(|| entry.package.root.join("skills"))
+}
+
+/// The skill names a directory holds, read from its `<name>/SKILL.md`
+/// children.
+///
+/// This is the shape `agent::skills::SkillLoader` reads, so the host can choose
+/// between a runtime's directory and the package's declared one, and describe
+/// the set on a status row, without registering a skill to find out.
+fn skill_names_in(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter_map(|entry| {
+                    let path = entry.path();
+                    (path.is_dir() && path.join("SKILL.md").is_file())
+                        .then(|| entry.file_name().to_string_lossy().into_owned())
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether `dir` holds at least one skill.
+fn holds_skills(dir: &Path) -> bool {
+    !skill_names_in(dir).is_empty()
+}
+
 /// The extension host.
 pub(crate) struct ExtensionHost {
     config: HostConfig,
@@ -1692,14 +1744,18 @@ impl ExtensionHost {
                 continue;
             };
             let contributions = &entry.contributions;
+            // A package may contribute only skills; skipping it here silently
+            // dropped every skill it declared. The directory is resolved once so
+            // the gate and the install cannot disagree about which form the
+            // package uses: a runtime-registered skill has no manifest
+            // declaration, only a materialized directory.
+            let skills_dir = contributed_skills_dir(entry);
             let has_agent_contribution = !entry.tools.is_empty()
                 || !contributions.commands.is_empty()
                 || !contributions.panels.is_empty()
                 || !contributions.prompts.is_empty()
                 || !contributions.contexts.is_empty()
-                // A package may contribute only skills; skipping it here
-                // silently dropped every skill it declared.
-                || !entry.package.manifest.contributes.skills.is_empty()
+                || skills_dir.is_some()
                 || !entry.package.manifest.services.provides.is_empty()
                 || !entry.package.manifest.services.requires.is_empty();
             if !has_agent_contribution {
@@ -1716,10 +1772,7 @@ impl ExtensionHost {
                 prompts: contributions.prompts.clone(),
                 contexts: contributions.contexts.clone(),
                 workspace: self.config.workspace.clone(),
-                skills_dir: runtime.skills_dir().or_else(|| {
-                    (!entry.package.manifest.contributes.skills.is_empty())
-                        .then(|| entry.package.root.join("skills"))
-                }),
+                skills_dir,
                 workflows: contributions.workflows.clone(),
                 themes: contributions.themes.clone(),
                 timeout_ms: entry.package.manifest.resources.execution_ms(),
@@ -1764,12 +1817,16 @@ impl ExtensionHost {
                 continue;
             };
             let contributions = &entry.contributions;
+            // Same gate as the compatibility path: a package may contribute
+            // only a skill, and a runtime-registered skill has no manifest
+            // declaration - only the directory the runtime materialized.
+            let skills_dir = contributed_skills_dir(entry);
             let has_agent_contribution = !entry.tools.is_empty()
                 || !contributions.commands.is_empty()
                 || !contributions.panels.is_empty()
                 || !contributions.prompts.is_empty()
                 || !contributions.contexts.is_empty()
-                || !entry.package.manifest.contributes.skills.is_empty()
+                || skills_dir.is_some()
                 || !entry.package.manifest.services.provides.is_empty()
                 || !entry.package.manifest.services.requires.is_empty();
             if !has_agent_contribution {
@@ -1786,10 +1843,7 @@ impl ExtensionHost {
                 prompts: contributions.prompts.clone(),
                 contexts: contributions.contexts.clone(),
                 workspace: self.config.workspace.clone(),
-                skills_dir: runtime.skills_dir().or_else(|| {
-                    (!entry.package.manifest.contributes.skills.is_empty())
-                        .then(|| entry.package.root.join("skills"))
-                }),
+                skills_dir,
                 workflows: contributions.workflows.clone(),
                 themes: contributions.themes.clone(),
                 timeout_ms: entry.package.manifest.resources.execution_ms(),
@@ -2730,14 +2784,28 @@ impl ExtensionHost {
                 .iter()
                 .map(|panel| id.qualify(&panel.id))
                 .collect(),
-            skills: entry
-                .package
-                .manifest
-                .contributes
-                .skills
-                .iter()
-                .map(|skill| skill.as_str().to_string())
-                .collect(),
+            // The declared file ids, plus the names a runtime materialized at
+            // activation. The runtime form is invisible to the manifest, so a
+            // row built from the declaration alone would tell the reader a
+            // Cordis package has no skills while the model can load them.
+            skills: {
+                let mut names: BTreeSet<String> = entry
+                    .package
+                    .manifest
+                    .contributes
+                    .skills
+                    .iter()
+                    .map(|skill| skill.as_str().to_string())
+                    .collect();
+                if let Some(dir) = entry
+                    .runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.skills_dir())
+                {
+                    names.extend(skill_names_in(&dir));
+                }
+                names.into_iter().collect()
+            },
             languages: entry
                 .contributions
                 .languages
