@@ -11,8 +11,8 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
-use super::package::{ExtensionStore, Package};
-use super::types::{ExtensionError, ExtensionSource, TrustLevel};
+use bos_ext_core::package::{ExtensionStore, Package};
+use bos_ext_core::types::{ExtensionError, ExtensionSource, TrustLevel};
 
 /// The official provider repository.
 pub(crate) const DEFAULT_GIT_MARKET: &str = "https://github.com/open1s/bsh_extensions";
@@ -116,7 +116,7 @@ impl MarketIndex {
 }
 
 fn validate_entry(entry: &MarketEntry, path: &Path) -> Result<(), ExtensionError> {
-    super::types::ExtensionId::parse(entry.id.clone()).map_err(|error| {
+    bos_ext_core::types::ExtensionId::parse(entry.id.clone()).map_err(|error| {
         ExtensionError::Manifest {
             path: path.to_path_buf(),
             message: format!("market entry {}: {error}", entry.id),
@@ -129,7 +129,7 @@ fn validate_entry(entry: &MarketEntry, path: &Path) -> Result<(), ExtensionError
     // The same grammar every other package-relative path must satisfy: it
     // rejects absolute paths, "." / ".." components and backslashes (which a
     // split-on-'/' check let through on Windows).
-    super::manifest::validate_relative_path(&entry.path).map_err(|reason| {
+    bos_ext_core::manifest::validate_relative_path(&entry.path).map_err(|reason| {
         ExtensionError::Manifest {
             path: path.to_path_buf(),
             message: format!(
@@ -240,7 +240,7 @@ impl GitMarket {
         &self,
         store: &ExtensionStore,
         entry: &MarketEntry,
-    ) -> Result<super::package::Package, ExtensionError> {
+    ) -> Result<bos_ext_core::package::Package, ExtensionError> {
         validate_entry(entry, &self.cache.join("index.json"))?;
         let source = self.cache.join(&entry.path);
         if !source.join("extension.toml").is_file() {

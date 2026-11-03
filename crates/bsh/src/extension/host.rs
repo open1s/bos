@@ -16,15 +16,11 @@ use std::time::SystemTime;
 use serde::Serialize;
 
 use super::agent as contribution;
-use super::capability::{CallScope, Capability, Decision, GrantScope, PolicyEngine, PolicyMode};
 use super::composable::dispatch::InterceptorPolicy;
 use super::composable::{
     Context, DisposalReport, Fiber, FiberState, Scope, ServiceAuthorizer, ServiceToken,
 };
-use super::events::{lifecycle_event, topics, EventBus, ExtensionEvent};
 use super::lifecycle::{Health, LifecycleManager};
-use super::package::{write_atomic, ExtensionStore, Package};
-use super::resolver;
 use super::runtime::builtin::{BuiltinRuntime, ClosureExtension};
 use super::runtime::declarative::{self, DeclarativeContributions};
 use super::runtime::extism::ExtismRuntime;
@@ -33,11 +29,17 @@ use super::runtime::process::ProcessRuntime;
 use super::runtime::wasm::WasmRuntime;
 use super::runtime::workflow::WorkflowRuntime;
 use super::runtime::{empty_schema, CallContext, LazyRuntime, Runtime, ToolDescriptor};
-use super::types::{
+use bos_ext_core::capability::{
+    CallScope, Capability, Decision, GrantScope, PolicyEngine, PolicyMode,
+};
+use bos_ext_core::events::{lifecycle_event, topics, EventBus, ExtensionEvent};
+use bos_ext_core::package::{write_atomic, ExtensionStore, Package};
+use bos_ext_core::resolver;
+use bos_ext_core::types::{
     ContributionId, ExtensionError, ExtensionId, ExtensionSource, LifecycleState, RuntimeKind,
     StartupPolicy, TrustLevel, ValidationReport, EXTENSION_API_VERSION, HOST_VERSION,
 };
-use super::ui::{PanelLocation, PanelVisibility, ThemePalette, UiDocument};
+use bos_ext_core::ui::{PanelLocation, PanelVisibility, ThemePalette, UiDocument};
 use serde_json::Value;
 
 /// The configuration that decides which store and which packages a host owns.
@@ -506,8 +508,8 @@ pub(crate) struct AppliedExtension {
     extension_id: String,
     workspace: Option<PathBuf>,
     session_id: String,
-    service_provides: Vec<super::manifest::ServiceProvideSpec>,
-    service_requires: Vec<super::manifest::ServiceRequireSpec>,
+    service_provides: Vec<bos_ext_core::manifest::ServiceProvideSpec>,
+    service_requires: Vec<bos_ext_core::manifest::ServiceRequireSpec>,
 }
 
 impl AppliedExtension {
@@ -630,7 +632,7 @@ impl AppliedExtension {
     }
 
     /// Declared service requirements, for the reload driver.
-    pub(crate) fn service_requirements(&self) -> &[super::manifest::ServiceRequireSpec] {
+    pub(crate) fn service_requirements(&self) -> &[bos_ext_core::manifest::ServiceRequireSpec] {
         &self.service_requires
     }
 
@@ -657,8 +659,8 @@ impl AppliedExtension {
 #[cfg(test)]
 mod service_scope_tests {
     use super::super::composable::Scope;
-    use super::super::manifest::ServiceScope;
     use super::{service_scope_is_activation_owned, service_scope_matches};
+    use bos_ext_core::manifest::ServiceScope;
     use std::path::Path;
 
     #[test]
@@ -765,14 +767,14 @@ fn service_scope_is_activation_owned(
 }
 
 fn service_scope_matches(
-    declared: &super::manifest::ServiceScope,
+    declared: &bos_ext_core::manifest::ServiceScope,
     requested: &super::composable::Scope,
     extension_id: &str,
     workspace: Option<&Path>,
     session_id: &str,
 ) -> bool {
     use super::composable::Scope;
-    use super::manifest::ServiceScope;
+    use bos_ext_core::manifest::ServiceScope;
     match (declared, requested) {
         (ServiceScope::Host, Scope::Host) => true,
         (ServiceScope::Workspace, Scope::Workspace(id)) => {
@@ -986,7 +988,7 @@ impl ExtensionHost {
                     hash: String::new(),
                     installed_at: 0,
                     signature: None,
-                    verification: crate::extension::signing::SignatureVerification::Missing,
+                    verification: bos_ext_core::signing::SignatureVerification::Missing,
                     source_path: None,
                 };
                 let tools = runtime.descriptors();
@@ -1070,7 +1072,7 @@ impl ExtensionHost {
                     hash: String::new(),
                     installed_at: 0,
                     signature: None,
-                    verification: crate::extension::signing::SignatureVerification::Missing,
+                    verification: bos_ext_core::signing::SignatureVerification::Missing,
                     source_path: None,
                 };
                 let tools = runtime.descriptors();
@@ -1098,7 +1100,7 @@ impl ExtensionHost {
                     hash: String::new(),
                     installed_at: 0,
                     signature: None,
-                    verification: crate::extension::signing::SignatureVerification::Missing,
+                    verification: bos_ext_core::signing::SignatureVerification::Missing,
                     source_path: None,
                 };
                 let tools = runtime.descriptors();
@@ -1462,7 +1464,7 @@ impl ExtensionHost {
         }
         let data_root = self.store.data_dir(id);
         if let Some(version) =
-            super::config::migrate(&package.manifest, &package.root, &data_root, &from, &to)?
+            bos_ext_core::config::migrate(&package.manifest, &package.root, &data_root, &from, &to)?
         {
             self.store.set_data_version(id, &version)?;
         }
@@ -1518,7 +1520,7 @@ impl ExtensionHost {
 
     fn build_runtime(&self, package: &Package) -> Result<BuiltRuntime, ExtensionError> {
         let data_root = self.store.data_dir(package.id());
-        let config = super::config::load(&package.manifest, &package.root, &data_root)?;
+        let config = bos_ext_core::config::load(&package.manifest, &package.root, &data_root)?;
         match package.manifest.runtime.kind {
             RuntimeKind::Declarative => {
                 let runtime =
@@ -2061,8 +2063,9 @@ impl ExtensionHost {
             .ok_or_else(|| ExtensionError::NotFound {
                 id: format!("{owner}::{tool}"),
             })?;
-        let scope = super::capability::call_scope(&arguments, self.config.workspace.as_deref());
-        super::capability::authorize_each(
+        let scope =
+            bos_ext_core::capability::call_scope(&arguments, self.config.workspace.as_deref());
+        bos_ext_core::capability::authorize_each(
             &self.policy,
             owner,
             loaded.package.trust,
@@ -2114,8 +2117,9 @@ impl ExtensionHost {
             .iter()
             .find(|descriptor| descriptor.id.as_str() == action)
         {
-            let scope = super::capability::call_scope(&arguments, self.config.workspace.as_deref());
-            super::capability::authorize_each(
+            let scope =
+                bos_ext_core::capability::call_scope(&arguments, self.config.workspace.as_deref());
+            bos_ext_core::capability::authorize_each(
                 &self.policy,
                 owner,
                 loaded.package.trust,
@@ -2199,8 +2203,8 @@ impl ExtensionHost {
         let mut mounted = Vec::new();
         for (id, manifest, root, config) in candidates {
             if let Some(config) = config {
-                let id = crate::extension::types::ExtensionId::parse(id.clone())?;
-                super::config::save(&manifest, &root, &self.store.data_dir(&id), config)?;
+                let id = bos_ext_core::types::ExtensionId::parse(id.clone())?;
+                bos_ext_core::config::save(&manifest, &root, &self.store.data_dir(&id), config)?;
             }
             self.retry(&id)?;
             mounted.push(id);
@@ -2209,7 +2213,7 @@ impl ExtensionHost {
     }
 
     pub(crate) fn retry(&mut self, id: &str) -> Result<(), ExtensionError> {
-        let id = crate::extension::types::ExtensionId::parse(id.to_string())?;
+        let id = bos_ext_core::types::ExtensionId::parse(id.to_string())?;
         self.store.clear_failure(&id)?;
         self.rebuild()
     }
@@ -2222,8 +2226,8 @@ impl ExtensionHost {
     ) -> Result<(), ExtensionError> {
         self.policy.grant(
             id,
-            crate::extension::capability::Capability::ProcessExecute,
-            crate::extension::capability::GrantScope::Program(program.to_string()),
+            bos_ext_core::capability::Capability::ProcessExecute,
+            bos_ext_core::capability::GrantScope::Program(program.to_string()),
             Some("approved from the extensions pane".to_string()),
         )?;
         self.rebuild()
@@ -2342,7 +2346,7 @@ impl ExtensionHost {
     }
 
     /// Every theme a package contributes, keyed by a host-owned id.
-    pub(crate) fn theme_surfaces(&self) -> BTreeMap<String, crate::extension::ui::ThemePalette> {
+    pub(crate) fn theme_surfaces(&self) -> BTreeMap<String, bos_ext_core::ui::ThemePalette> {
         let mut themes = BTreeMap::new();
         for entry in self.loaded.values() {
             if !entry.applied || entry.error.is_some() {
@@ -2352,9 +2356,7 @@ impl ExtensionHost {
                 let Ok(text) = std::fs::read_to_string(&theme.path) else {
                     continue;
                 };
-                if let Ok(palette) =
-                    serde_json::from_str::<crate::extension::ui::ThemePalette>(&text)
-                {
+                if let Ok(palette) = serde_json::from_str::<bos_ext_core::ui::ThemePalette>(&text) {
                     themes.insert(
                         format!("ext.{}.{}", entry.package.id().as_str(), theme.id.as_str()),
                         palette,
@@ -2684,16 +2686,14 @@ impl ExtensionHost {
                         ));
                     }
                     match &entry.package.verification {
-                        crate::extension::signing::SignatureVerification::Verified {
-                            publisher,
-                        } => {
+                        bos_ext_core::signing::SignatureVerification::Verified { publisher } => {
                             issues.push(DiagnosticIssue::new(
                                 "info",
                                 Some(id),
                                 format!("package signature verified for publisher {publisher}"),
                             ));
                         }
-                        crate::extension::signing::SignatureVerification::Untrusted {
+                        bos_ext_core::signing::SignatureVerification::Untrusted {
                             publisher,
                             reason,
                         } => issues.push(DiagnosticIssue::new(
@@ -2701,14 +2701,14 @@ impl ExtensionHost {
                             Some(id),
                             format!("signature by {publisher} is untrusted: {reason}"),
                         )),
-                        crate::extension::signing::SignatureVerification::Invalid { reason } => {
+                        bos_ext_core::signing::SignatureVerification::Invalid { reason } => {
                             issues.push(DiagnosticIssue::new(
                                 "error",
                                 Some(id),
                                 format!("package signature is invalid: {reason}"),
                             ));
                         }
-                        crate::extension::signing::SignatureVerification::Missing => {
+                        bos_ext_core::signing::SignatureVerification::Missing => {
                             if entry.package.signature.is_some() {
                                 issues.push(DiagnosticIssue::new(
                                     "warning",
@@ -3027,7 +3027,7 @@ pub(crate) fn panels(
 pub(crate) fn themes(
     settings: &crate::settings::Settings,
     workspace: Option<&Path>,
-) -> BTreeMap<String, crate::extension::ui::ThemePalette> {
+) -> BTreeMap<String, bos_ext_core::ui::ThemePalette> {
     let config = HostConfig::from_settings(settings, workspace.map(Path::to_path_buf), None);
     let slot = HOST.get_or_init(|| Mutex::new(None));
     let mut guard = match slot.lock() {
@@ -3216,7 +3216,7 @@ tools = ["graph", "why"]
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extension::capability::GrantScope;
+    use bos_ext_core::capability::GrantScope;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);

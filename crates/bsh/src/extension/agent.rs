@@ -19,11 +19,13 @@ use serde_json::Value;
 
 use crate::plugins::PluginInfo;
 
-use super::capability::{CallScope, Capability, PolicyEngine};
 use super::composable::Fiber;
-use super::events::{topics, EventBus, ExtensionEvent};
 use super::runtime::{CallContext, Runtime, ToolDescriptor};
-use super::types::{ExtensionError, ExtensionId, ToToolError, TrustLevel};
+use bos_ext_core::capability::{CallScope, Capability, PolicyEngine};
+use bos_ext_core::events::{topics, EventBus, ExtensionEvent};
+use bos_ext_core::types::{ExtensionError, ExtensionId, TrustLevel};
+
+use super::errors::ToToolError;
 
 /// The largest prompt or context section one call may append.
 const MAX_PROMPT_SECTION: usize = 8 * 1024;
@@ -238,7 +240,7 @@ impl ExtensionTool {
     }
 
     fn scope(&self, arguments: &Value) -> CallScope {
-        super::capability::call_scope(arguments, self.workspace.as_deref())
+        bos_ext_core::capability::call_scope(arguments, self.workspace.as_deref())
     }
 
     fn emit(&self, topic: &str, payload: Value, correlation: &str) {
@@ -351,7 +353,7 @@ impl ExtensionTool {
             .waterfall("tool.before", arguments.clone())
             .unwrap_or_else(|| arguments.clone());
         let scope = self.scope(&arguments);
-        if let Err(error) = super::capability::authorize_each(
+        if let Err(error) = bos_ext_core::capability::authorize_each(
             &self.policy,
             self.owner.as_str(),
             self.trust,
@@ -673,9 +675,9 @@ fn append_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extension::capability::PolicyMode;
     use crate::extension::runtime::empty_schema;
-    use crate::extension::types::RuntimeKind;
+    use bos_ext_core::capability::PolicyMode;
+    use bos_ext_core::types::RuntimeKind;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
@@ -697,7 +699,7 @@ mod tests {
         std::fs::create_dir_all(scratch.0.join("src")).expect("src");
         std::fs::write(scratch.0.join("src/lib.rs"), "fn main() {}").expect("file");
         let mut context = super::super::runtime::declarative::TextContribution {
-            id: crate::extension::types::ContributionId::parse("scoped").expect("id"),
+            id: bos_ext_core::types::ContributionId::parse("scoped").expect("id"),
             description: "Scoped".to_string(),
             text: "Text".to_string(),
             scope: vec!["src/**/*.rs".to_string()],
@@ -805,7 +807,7 @@ mod tests {
             runtime: Arc::new(EchoRuntime),
             trust,
             tools: vec![ToolDescriptor {
-                id: super::super::types::ContributionId::parse("echo").expect("tool id"),
+                id: bos_ext_core::types::ContributionId::parse("echo").expect("tool id"),
                 description: "Echo".to_string(),
                 input_schema: empty_schema(),
                 capabilities,
@@ -912,7 +914,7 @@ mod tests {
             .grant(
                 "com.example.tool",
                 Capability::WorkspaceWrite,
-                crate::extension::capability::GrantScope::Workspace,
+                bos_ext_core::capability::GrantScope::Workspace,
                 None,
             )
             .expect("grant");

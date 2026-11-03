@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::capability::unix_now;
-use super::types::{ExtensionError, LifecycleState};
+use bos_ext_core::capability::unix_now;
+use bos_ext_core::types::{ExtensionError, LifecycleState};
 
 /// Health derived from the lifecycle state and recent failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

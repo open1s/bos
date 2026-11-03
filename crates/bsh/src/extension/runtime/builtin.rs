@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use super::{CallContext, Runtime, ToolDescriptor};
-use crate::extension::manifest::Manifest;
-use crate::extension::types::{ExtensionError, ExtensionId, RuntimeKind};
+use bos_ext_core::manifest::Manifest;
+use bos_ext_core::types::{ExtensionError, ExtensionId, RuntimeKind};
 
 /// A first-party extension implemented in Rust.
 #[async_trait]
@@ -206,7 +206,7 @@ impl BuiltinExtension for ClosureExtension {
 mod tests {
     use super::*;
     use crate::extension::runtime::empty_schema;
-    use crate::extension::types::ContributionId;
+    use bos_ext_core::types::ContributionId;
 
     const MANIFEST: &str = r#"
 schema_version = "1.0"

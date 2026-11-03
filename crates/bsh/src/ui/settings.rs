@@ -6697,7 +6697,7 @@ impl Shell {
         let url = crate::extension::market::configured_url(&self.state.settings);
         let (tx, rx) = async_channel::bounded(1);
         self.state.runner.rt().spawn_blocking(move || {
-            let store = crate::extension::package::ExtensionStore::open(&root);
+            let store = bos_ext_core::package::ExtensionStore::open(&root);
             let result = store.map_err(|error| error.to_string()).and_then(|store| {
                 let market = crate::extension::market::GitMarket::open(&root, &url);
                 let index = market.cached().map_err(|error| error.to_string())?;

@@ -2155,7 +2155,7 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::{
-        action_of, collapse_turns, duration_label, events_for, project_lane, verdict_for,
+        action_of, collapse_turns, duration_label, events, events_for, project_lane, verdict_for,
         BlockWidth, Kind, PolicyVerdict, Projection, MINIMUM_BLOCK_MS,
     };
     use crate::i18n::Lang;
@@ -2765,7 +2765,7 @@ mod tests {
 
         // The scroller's geometry is the whole log's, and the rows it builds
         // keep the exact 30px stride the spacers stand in at.
-        let rows = cx.update(|_, cx| super::events(shell.read(cx)).len());
+        let rows = cx.update(|_, cx| events(shell.read(cx)).len());
         let last = rows - 1;
         let offset = cx.update(|_, cx| {
             shell

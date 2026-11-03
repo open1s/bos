@@ -1,7 +1,8 @@
-//! Re-exported from bos-ext-core; ownership moved in Phase 1.
-pub(crate) use bos_ext_core::types::*;
+//! BSH adapter: map framework errors to agent tool errors.
 
-/// BSH adapter: map a framework error to the agent tool error the model sees.
+use bos_ext_core::types::ExtensionError;
+
+/// Map a framework error to the agent tool error the model sees.
 pub(crate) trait ToToolError {
     /// Map to the agent tool error.
     fn to_tool_error(&self) -> agent::tools::ToolError;

@@ -13,12 +13,12 @@ use gpui_kit::*;
 
 use crate::extension::host::PanelSurface;
 use crate::extension::runtime::CallContext;
-use crate::extension::types::ExtensionError;
-use crate::extension::ui::{
+use crate::theme;
+use bos_ext_core::types::ExtensionError;
+use bos_ext_core::ui::{
     ButtonStyle, NotificationLevel, PanelLocation, ThemePalette, UiActionRequest, UiDocument,
     UiNode, UiSession,
 };
-use crate::theme;
 
 use super::{icon, txt, IconName};
 
@@ -105,10 +105,7 @@ impl ExtensionPanelView {
         let selected = panels
             .iter()
             .position(|panel| {
-                matches!(
-                    panel.visibility,
-                    crate::extension::ui::PanelVisibility::Visible
-                )
+                matches!(panel.visibility, bos_ext_core::ui::PanelVisibility::Visible)
             })
             .unwrap_or(0);
         let palette = panels
@@ -234,9 +231,8 @@ impl ExtensionPanelView {
             .iter()
             .find(|descriptor| descriptor.id.as_str() == action)
         {
-            let scope =
-                crate::extension::capability::call_scope(&payload, panel.workspace.as_deref());
-            if let Err(error) = crate::extension::capability::authorize_each(
+            let scope = bos_ext_core::capability::call_scope(&payload, panel.workspace.as_deref());
+            if let Err(error) = bos_ext_core::capability::authorize_each(
                 &panel.policy,
                 panel.owner.as_str(),
                 panel.trust,
@@ -697,7 +693,7 @@ impl ExtensionPanelView {
 
     fn render_tree(
         &self,
-        node: &crate::extension::ui::UiTreeNode,
+        node: &bos_ext_core::ui::UiTreeNode,
         path: &str,
         depth: usize,
     ) -> AnyElement {
@@ -824,10 +820,10 @@ mod tests {
     use super::ExtensionPanelView;
     use crate::extension::host::PanelSurface;
     use crate::extension::runtime::{CallContext, Runtime, ToolDescriptor};
-    use crate::extension::types::{ExtensionError, ExtensionId, RuntimeKind};
-    use crate::extension::ui::{PanelLocation, ThemePalette, UiDocument};
     use crate::theme;
     use async_trait::async_trait;
+    use bos_ext_core::types::{ExtensionError, ExtensionId, RuntimeKind};
+    use bos_ext_core::ui::{PanelLocation, ThemePalette, UiDocument};
     use serde_json::Value;
     use std::sync::Arc;
 
@@ -858,20 +854,20 @@ mod tests {
             title: "Greeting".to_string(),
             icon: None,
             location: PanelLocation::Right,
-            visibility: crate::extension::ui::PanelVisibility::Visible,
+            visibility: bos_ext_core::ui::PanelVisibility::Visible,
             runtime: Arc::new(Noop),
             owner: ExtensionId::parse("com.example.ui").expect("id"),
             theme: None,
             initial: Some(document),
             policy: Arc::new(
-                crate::extension::capability::PolicyEngine::open(
+                bos_ext_core::capability::PolicyEngine::open(
                     std::env::temp_dir().join(format!("bsh-panel-grants-{}", std::process::id())),
                     std::env::temp_dir().join(format!("bsh-panel-audit-{}", std::process::id())),
-                    crate::extension::capability::PolicyMode::Advisory,
+                    bos_ext_core::capability::PolicyMode::Advisory,
                 )
                 .expect("policy"),
             ),
-            trust: crate::extension::types::TrustLevel::Local,
+            trust: bos_ext_core::types::TrustLevel::Local,
             tools: Arc::new(Vec::new()),
             workspace: None,
             root: std::path::PathBuf::from("/nonexistent-panel-root"),

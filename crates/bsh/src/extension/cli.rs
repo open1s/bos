@@ -9,19 +9,19 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::extension::capability::{Capability, GrantScope};
 use crate::extension::host::{DiagnosticsReport, ExtensionHost, ExtensionStatus, HostConfig};
-use crate::extension::manifest::MANIFEST_FILE;
-use crate::extension::package::{package_hash, ExtensionStore, Package};
-use crate::extension::resolver;
 use crate::extension::runtime::declarative::{load_contributions, DeclarativeRuntime};
 use crate::extension::runtime::mcp::McpRuntime;
 use crate::extension::runtime::process::ProcessRuntime;
-use crate::extension::signing::{
+use bos_ext_core::capability::{Capability, GrantScope};
+use bos_ext_core::manifest::MANIFEST_FILE;
+use bos_ext_core::package::{package_hash, ExtensionStore, Package};
+use bos_ext_core::resolver;
+use bos_ext_core::signing::{
     generate_key, sign_package, verify_package, SignatureVerification, TrustStore,
 };
-use crate::extension::sources::{self, RegistryList};
-use crate::extension::types::{ExtensionId, ExtensionSource, RuntimeKind, TrustLevel};
+use bos_ext_core::sources::{self, RegistryList};
+use bos_ext_core::types::{ExtensionId, ExtensionSource, RuntimeKind, TrustLevel};
 
 const USAGE: &str = "bsh ext <command> [options]
 
@@ -378,14 +378,14 @@ fn command_validate(args: &[String]) -> Result<i32, String> {
 /// Validation constructs runtimes but never spawns or calls them, so the engine
 /// only has to exist; advisory mode means a future call path cannot turn a
 /// validation into a denial.
-fn validation_policy() -> std::sync::Arc<crate::extension::capability::PolicyEngine> {
+fn validation_policy() -> std::sync::Arc<bos_ext_core::capability::PolicyEngine> {
     let dir = std::env::temp_dir().join(format!("bsh-ext-validate-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     std::sync::Arc::new(
-        crate::extension::capability::PolicyEngine::open(
+        bos_ext_core::capability::PolicyEngine::open(
             dir.join("grants.toml"),
             dir.join("audit.jsonl"),
-            crate::extension::capability::PolicyMode::Advisory,
+            bos_ext_core::capability::PolicyMode::Advisory,
         )
         .expect("a validation policy opens"),
     )
@@ -414,7 +414,7 @@ fn validate_runtime(package: &Package) -> Result<(), String> {
             "{}".to_string(),
             validation_policy(),
             TrustLevel::Local,
-            crate::extension::events::EventBus::new(),
+            bos_ext_core::events::EventBus::new(),
         )
         .map(|_| ())
         .map_err(|error| error.to_string()),
@@ -802,7 +802,7 @@ fn command_grant(args: &[String], root: Option<PathBuf>) -> Result<i32, String> 
         .get(1)
         .ok_or_else(|| "usage: bsh ext grant <id> <capability> [--scope s] [--note n]".to_string())?
         .parse()
-        .map_err(|error: crate::extension::types::ExtensionError| error.to_string())?;
+        .map_err(|error: bos_ext_core::types::ExtensionError| error.to_string())?;
     let mut scope = default_scope(capability);
     let mut note = None;
     let mut index = 2;
@@ -853,7 +853,7 @@ fn command_revoke(args: &[String], root: Option<PathBuf>) -> Result<i32, String>
         .get(1)
         .ok_or_else(|| "usage: bsh ext revoke <id> <capability>".to_string())?
         .parse()
-        .map_err(|error: crate::extension::types::ExtensionError| error.to_string())?;
+        .map_err(|error: bos_ext_core::types::ExtensionError| error.to_string())?;
     let host = open_host(root).map_err(|error| error.to_string())?;
     let removed = host
         .policy()
@@ -1059,7 +1059,7 @@ fn command_sign(args: &[String]) -> Result<i32, String> {
 fn command_verify(args: &[String], root: Option<PathBuf>) -> Result<i32, String> {
     let path = PathBuf::from(one_argument(args, "bsh ext verify <path>")?);
     let manifest =
-        crate::extension::manifest::Manifest::load(&path).map_err(|error| error.to_string())?;
+        bos_ext_core::manifest::Manifest::load(&path).map_err(|error| error.to_string())?;
     let hash = package_hash(&path).map_err(|error| error.to_string())?;
     let store = ExtensionStore::open(config(root).root).map_err(|error| error.to_string())?;
     let trust = TrustStore::load(store.trust_path()).map_err(|error| error.to_string())?;
@@ -1422,10 +1422,10 @@ fn command_mock(args: &[String]) -> Result<i32, String> {
     let data_root = root.join("data");
     std::fs::create_dir_all(&data_root).map_err(|error| error.to_string())?;
     let policy = std::sync::Arc::new(
-        crate::extension::capability::PolicyEngine::open(
+        bos_ext_core::capability::PolicyEngine::open(
             root.join("grants.toml"),
             root.join("audit.jsonl"),
-            crate::extension::capability::PolicyMode::Enforce,
+            bos_ext_core::capability::PolicyMode::Enforce,
         )
         .map_err(|error| error.to_string())?,
     );
@@ -1434,7 +1434,7 @@ fn command_mock(args: &[String]) -> Result<i32, String> {
             .grant(package.id().as_str(), capability, GrantScope::Any, None)
             .map_err(|error| error.to_string())?;
     }
-    let events = std::sync::Arc::new(crate::extension::events::EventBus::new());
+    let events = std::sync::Arc::new(bos_ext_core::events::EventBus::new());
     let id = package.id().clone();
     let config = serde_json::json!({ "mock": true }).to_string();
     let runtime: std::sync::Arc<dyn crate::extension::runtime::Runtime> =
@@ -1570,8 +1570,8 @@ fn command_config(args: &[String], root: Option<PathBuf>) -> Result<i32, String>
         })
         .ok_or_else(|| format!("{id} is not installed"))?;
     let package_root = store.installed_root().join(id.as_str()).join(&version);
-    let manifest = crate::extension::manifest::Manifest::load(&package_root)
-        .map_err(|error| error.to_string())?;
+    let manifest =
+        bos_ext_core::manifest::Manifest::load(&package_root).map_err(|error| error.to_string())?;
     let data_root = store.data_dir(&id);
     let action = args.get(1).map(String::as_str);
     match action {
@@ -1598,7 +1598,7 @@ fn command_config(args: &[String], root: Option<PathBuf>) -> Result<i32, String>
             };
             let value: serde_json::Value =
                 serde_json::from_str(&text).map_err(|error| error.to_string())?;
-            let saved = crate::extension::config::save(&manifest, &package_root, &data_root, value)
+            let saved = bos_ext_core::config::save(&manifest, &package_root, &data_root, value)
                 .map_err(|error| error.to_string())?;
             crate::extension::publish(
                 crate::extension::topics::CONFIG_CHANGED,
@@ -1611,7 +1611,7 @@ fn command_config(args: &[String], root: Option<PathBuf>) -> Result<i32, String>
         }
         Some(other) => return Err(format!("unknown config action {other:?}")),
         None => {
-            let loaded = crate::extension::config::load(&manifest, &package_root, &data_root)
+            let loaded = bos_ext_core::config::load(&manifest, &package_root, &data_root)
                 .map_err(|error| error.to_string())?;
             println!(
                 "{}",
@@ -1803,13 +1803,13 @@ fn command_market(args: &[String], root: Option<PathBuf>) -> Result<i32, String>
 fn command_reproduce(args: &[String], root: Option<PathBuf>) -> Result<i32, String> {
     let lock_path = PathBuf::from(one_argument(args, "bsh ext reproduce <lock>")?);
     let text = std::fs::read_to_string(&lock_path).map_err(|error| error.to_string())?;
-    let lock: crate::extension::resolver::LockFile =
+    let lock: bos_ext_core::resolver::LockFile =
         toml::from_str(&text).map_err(|error| error.to_string())?;
     let store = ExtensionStore::open(config(root).root).map_err(|error| error.to_string())?;
     for locked in &lock.packages {
         let installed = store
             .versions(
-                &crate::extension::types::ExtensionId::parse(locked.id.clone())
+                &bos_ext_core::types::ExtensionId::parse(locked.id.clone())
                     .map_err(|error| error.to_string())?,
             )
             .ok()
@@ -1817,7 +1817,7 @@ fn command_reproduce(args: &[String], root: Option<PathBuf>) -> Result<i32, Stri
         if installed {
             // "present" is only true if the bytes are the locked bytes: the
             // lockfile's whole point is reproducibility, not a directory name.
-            let id = crate::extension::types::ExtensionId::parse(locked.id.clone())
+            let id = bos_ext_core::types::ExtensionId::parse(locked.id.clone())
                 .map_err(|error| error.to_string())?;
             let installed_root = store.version_root(&id, &locked.version);
             let package = Package::load(
@@ -1835,7 +1835,7 @@ fn command_reproduce(args: &[String], root: Option<PathBuf>) -> Result<i32, Stri
             println!("present {} {}", locked.id, locked.version);
             continue;
         }
-        let id = crate::extension::types::ExtensionId::parse(locked.id.clone())
+        let id = bos_ext_core::types::ExtensionId::parse(locked.id.clone())
             .map_err(|error| error.to_string())?;
         let fetched = match &locked.source {
             ExtensionSource::Git {
@@ -1942,7 +1942,7 @@ tools = ["echo"]
             r#"{"description":"Echo","implementation":{"kind":"echo_arguments"}}"#,
         )
         .expect("tool");
-        let hash = super::package_hash(&source).expect("hash");
+        let hash = bos_ext_core::package::package_hash(&source).expect("hash");
         // TOML basic strings need Windows separators escaped; the real lock
         // writer does this through serde, and this fixture writes the document
         // by hand.

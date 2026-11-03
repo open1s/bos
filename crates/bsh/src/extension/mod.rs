@@ -27,13 +27,11 @@
 mod agent;
 use std::sync::Arc;
 
-pub(crate) mod capability;
 mod cli;
 pub(crate) mod composable;
-mod config;
 #[cfg(test)]
 mod e2e;
-mod events;
+mod errors;
 pub(crate) mod hooks;
 pub(crate) mod host;
 pub(crate) mod live;
@@ -80,17 +78,10 @@ pub(crate) fn store_root(settings: &crate::settings::Settings) -> std::path::Pat
     host::extension_root(settings)
 }
 mod lifecycle;
-mod manifest;
 pub(crate) mod market;
-pub(crate) mod package;
-mod resolver;
 pub(crate) mod runtime;
-mod signing;
-mod sources;
-pub(crate) mod types;
-pub(crate) mod ui;
 
-pub(crate) use events::topics;
+pub(crate) use bos_ext_core::events::topics;
 pub(crate) use host::{
     approve_process, cached_commands, cached_model_providers, cached_presets, grant_required,
     install_with_fibers, panels, publish, statuses, themes, CommandSurface,
