@@ -7806,14 +7806,15 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             "value"
         );
 
-        let empty = registry.execute(
-            "apply_patch",
-            &serde_json::json!({"changes": [
-                {"path": "src.rs", "edits": [{"old_string": "", "new_string": "x"}]}
-            ]}),
-        )
-        .expect("per-file errors are reported");
-        assert!(empty["files"][0]["error"].as_str().is_some());
+        let empty = registry
+            .execute(
+                "apply_patch",
+                &serde_json::json!({"changes": [
+                    {"path": "src.rs", "edits": [{"old_string": "", "new_string": "x"}]}
+                ]}),
+            )
+            .expect_err("the schema rejects an empty old_string");
+        assert!(empty.to_string().contains("old_string"));
         assert_eq!(std::fs::read_to_string(root.join("src.rs")).expect("unchanged"), "value");
     }
 
