@@ -16,6 +16,7 @@ pub mod events;
 pub mod ui;
 pub mod sources;
 pub mod storage;
+pub mod terminal;
 #[cfg(feature = "tokio")]
 #[allow(dead_code, missing_docs)] // Phase 1 move; docs and consumers land with the manager API.
 pub mod composable;
