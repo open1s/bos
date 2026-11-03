@@ -7336,10 +7336,11 @@ impl Shell {
                                         .id(SharedString::from(selector.clone()))
                                         .debug_selector(move || selector.clone())
                                         .h(px(24.0))
-                                        .px(px(6.0))
+                                        .px(px(9.0))
                                         .flex()
                                         .items_center()
                                         .rounded(px(7.0))
+                                        .bg(rgb(theme::new_session_fill()))
                                         .cursor_pointer()
                                         .hover(|style| style.bg(rgb(theme::hover())))
                                         .child(txt(
