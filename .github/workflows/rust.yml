@@ -51,26 +51,23 @@ jobs:
         with:
           version: 0.16.0
 
-      # Warm the Ghostty native build with bounded retries: its Zig build
-      # lazily fetches a few packages, and a reset from
-      # deps.files.ghostty.org otherwise fails lint/test before they start.
-      - name: Pre-build with retry
-        shell: bash
-        run: |
-          for attempt in 1 2 3; do
-            if cargo build --workspace --exclude jsbos --exclude nbos; then
-              exit 0
-            fi
-            if [ "$attempt" -eq 3 ]; then exit 1; fi
-            echo "::warning::build attempt $attempt failed; retrying in 20s"
-            sleep 20
-          done
-
       - name: Format
         run: cargo fmt --all -- --check
 
+      # Clippy is the first heavy build, so it is also where the Ghostty native
+      # fetch happens; retry a transient reset rather than fail the job. A real
+      # warning still fails after the second attempt.
       - name: Lint
-        run: cargo clippy --workspace --exclude jsbos --exclude nbos --all-targets -- -D warnings
+        shell: bash
+        run: |
+          for attempt in 1 2; do
+            if cargo clippy --workspace --exclude jsbos --exclude nbos --all-targets -- -D warnings; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 2 ]; then exit 1; fi
+            echo "::warning::lint attempt $attempt failed; retrying in 20s"
+            sleep 20
+          done
 
       - name: Docs
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps

@@ -100,28 +100,22 @@ jobs:
             libfontconfig1-dev libfreetype6-dev libssl-dev libasound2-dev libxdo-dev \
             libc++-dev libc++abi-dev libxml2-dev xvfb bubblewrap
 
-      # Build first, with the same network retry the package jobs use: the
-      # Ghostty Zig fetch is the one download in this graph that can reset.
-      - name: Build the workspace
-        shell: bash
-        run: |
-          for attempt in 1 2 3; do
-            if cargo build --workspace --exclude jsbos --exclude nbos; then
-              exit 0
-            fi
-            if [ "$attempt" -eq 3 ]; then exit 1; fi
-            echo "::warning::build attempt $attempt failed; retrying in 20s"
-            sleep 20
-          done
-
       # The same gate the main branch runs. A release is a tagged commit, so
       # the tagged tree must pass the suite before any artifact is published;
       # the browser engine tests are skipped for the same load-flakiness
-      # reason rust.yml skips them.
+      # reason rust.yml skips them. One retry covers the Ghostty native fetch
+      # resetting; a real test failure still fails on the second attempt.
       - name: Test
-        run: >-
-          xvfb-run -a cargo test --workspace --exclude jsbos --exclude nbos
-          -- --skip browser::engine::tests
+        shell: bash
+        run: |
+          for attempt in 1 2; do
+            if xvfb-run -a cargo test --workspace --exclude jsbos --exclude nbos -- --skip browser::engine::tests; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 2 ]; then exit 1; fi
+            echo "::warning::test attempt $attempt failed; retrying in 30s"
+            sleep 30
+          done
 
   build:
     name: Package ${{ matrix.platform }}
