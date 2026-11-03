@@ -3287,7 +3287,7 @@ fn glob_empty_hint(pattern: &str, root: &Path, include_ignored: bool) -> String 
         && !pattern.contains('{');
     let mut hint = if literal {
         format!(
-            "no file is named exactly {pattern:?} under {}; glob matches file paths, not file contents. Try \"*{pattern}*\" for part of a name, or search contents with bash (rg -n) or read_file.",
+            "no file is named exactly {pattern:?} under {}; glob matches file paths, not file contents. Try \"*{pattern}*\" for part of a name, or search contents with grep or inspect a known file with read_file.",
             root.display()
         )
     } else {
@@ -3318,12 +3318,13 @@ fn glob_tool(
         serde_json::json!({
             "type": "object",
             "properties": {
-                "pattern": { "type": "string" },
-                "path": { "type": "string" },
-                "limit": { "type": "integer", "minimum": 1, "maximum": 1000 },
-                "include_ignored": { "type": "boolean" }
+                "pattern": { "type": "string", "minLength": 1, "description": "Glob pattern matched against workspace-relative file paths, not file contents. A pattern without '/' matches basenames at any depth." },
+                "path": { "type": "string", "description": "Directory to search, relative to the workspace or absolute inside the allowed workspace. Defaults to the workspace root." },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Maximum number of paths to return. The result reports whether more matches were omitted." },
+                "include_ignored": { "type": "boolean", "description": "Include hidden, ignored, dependency and build paths normally skipped. Use only when the default search is insufficient." }
             },
-            "required": ["pattern"]
+            "required": ["pattern"],
+            "additionalProperties": false
         }),
         move |args| {
             let pattern = arg_str(args, "pattern")?;
@@ -3405,18 +3406,19 @@ fn grep_tool(
         serde_json::json!({
             "type": "object",
             "properties": {
-                "pattern": { "type": "string" },
-                "path": { "type": "string" },
-                "case_insensitive": { "type": "boolean" },
-                "include_ignored": { "type": "boolean" },
-                "limit": { "type": "integer", "minimum": 1, "maximum": 500 },
-                "invert": { "type": "boolean" },
-                "context": { "type": "integer", "minimum": 0, "maximum": 20 },
-                "files_without_match": { "type": "boolean" },
-                "include": { "type": "string" },
-                "text": { "type": "boolean" }
+                "pattern": { "type": "string", "minLength": 1, "description": "Ripgrep-compatible regular expression to match against file contents. Escape regex metacharacters when searching for them literally." },
+                "path": { "type": "string", "description": "File or directory to search. Directories are searched recursively; a named file is searched directly. Defaults to the workspace root." },
+                "case_insensitive": { "type": "boolean", "description": "Match without case sensitivity. Defaults to false." },
+                "include_ignored": { "type": "boolean", "description": "Include hidden, ignored, dependency and build paths normally skipped. Use only when the default search is insufficient." },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Maximum number of matching result rows. Check truncated before assuming the search is complete." },
+                "invert": { "type": "boolean", "description": "Return lines that do not match the pattern instead of lines that match." },
+                "context": { "type": "integer", "minimum": 0, "maximum": 20, "description": "Number of surrounding lines to include before and after each matching line; maximum 20." },
+                "files_without_match": { "type": "boolean", "description": "Return paths of searched files that contain no match instead of matching rows." },
+                "include": { "type": "string", "description": "One glob filter limiting which files are searched, such as '*.rs'. Negated filters are unsupported." },
+                "text": { "type": "boolean", "description": "Treat binary files as text. Leave false unless binary content must be searched." }
             },
-            "required": ["pattern"]
+            "required": ["pattern"],
+            "additionalProperties": false
         }),
         move |args| {
             let pattern = arg_str(args, "pattern")?;
@@ -3563,11 +3565,12 @@ fn read_file_tool(
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string" },
-                "offset": { "type": "integer", "minimum": 1 },
-                "limit": { "type": "integer", "minimum": 1 }
+                "path": { "type": "string", "description": "Path of the UTF-8 text file to read, relative to the workspace or absolute inside the allowed workspace." },
+                "offset": { "type": "integer", "minimum": 1, "description": "1-based starting line. Omit to start at the beginning." },
+                "limit": { "type": "integer", "minimum": 1, "description": "Maximum number of lines to return from offset. Use this to page through large files." }
             },
-            "required": ["path"]
+            "required": ["path"],
+            "additionalProperties": false
         }),
         move |args| {
             let raw = arg_str(args, "path")?;
@@ -3615,10 +3618,11 @@ fn write_file_tool(
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string" },
-                "content": { "type": "string" }
+                "path": { "type": "string", "description": "Destination path, relative to the workspace or absolute inside the allowed workspace." },
+                "content": { "type": "string", "description": "Complete UTF-8 file contents to write. This replaces the existing file; prefer edit_file for a targeted change." }
             },
-            "required": ["path", "content"]
+            "required": ["path", "content"],
+            "additionalProperties": false
         }),
         move |args| {
             let raw = arg_str(args, "path")?;
@@ -3670,12 +3674,13 @@ fn edit_file_tool(
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string" },
-                "old_string": { "type": "string" },
-                "new_string": { "type": "string" },
-                "replace_all": { "type": "boolean" }
+                "path": { "type": "string", "description": "Path of the existing UTF-8 file to edit, relative to the workspace or absolute inside the allowed workspace." },
+                "old_string": { "type": "string", "minLength": 1, "description": "Exact non-empty text to find. By default it must occur exactly once; include enough surrounding context to make it unique." },
+                "new_string": { "type": "string", "description": "Replacement text. Use an empty string to delete the matched text." },
+                "replace_all": { "type": "boolean", "description": "Set true only when every occurrence of old_string should be replaced." }
             },
-            "required": ["path", "old_string", "new_string"]
+            "required": ["path", "old_string", "new_string"],
+            "additionalProperties": false
         }),
         move |args| {
             let raw = arg_str(args, "path")?;
@@ -3751,8 +3756,9 @@ fn list_dir_tool(
         "List a directory's entries (name and kind), sorted by name. Up to 2000 entries are returned; truncated reports a larger directory.",
         serde_json::json!({
             "type": "object",
-            "properties": { "path": { "type": "string" } },
-            "required": ["path"]
+            "properties": { "path": { "type": "string", "description": "Directory to list, relative to the workspace or absolute inside the allowed workspace." } },
+            "required": ["path"],
+            "additionalProperties": false
         }),
         move |args| {
             let raw = arg_str(args, "path")?;
