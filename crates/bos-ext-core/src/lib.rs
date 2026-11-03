@@ -19,6 +19,7 @@ pub mod dispatch;
 pub mod effects;
 pub mod events;
 pub mod host;
+pub mod lifecycle;
 pub mod manager;
 pub mod manifest;
 pub mod manifest_v2;

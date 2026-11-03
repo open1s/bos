@@ -16,7 +16,6 @@ use std::time::SystemTime;
 use serde::Serialize;
 
 use super::agent as contribution;
-use super::lifecycle::{Health, LifecycleManager};
 use bos_ext_core::capability::{
     CallScope, Capability, Decision, GrantScope, PolicyEngine, PolicyMode,
 };
@@ -25,6 +24,7 @@ use bos_ext_core::composable::{
     Context, DisposalReport, Fiber, FiberState, Scope, ServiceAuthorizer, ServiceToken,
 };
 use bos_ext_core::events::{lifecycle_event, topics, EventBus, ExtensionEvent};
+use bos_ext_core::lifecycle::{Health, LifecycleManager};
 use bos_ext_core::package::{write_atomic, ExtensionStore, Package};
 use bos_ext_core::resolver;
 use bos_ext_core::types::{

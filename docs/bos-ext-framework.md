@@ -6,8 +6,9 @@ startup policy in `runtime.config`, migrated packages validate, and
 `bsh ext validate` reports `schema: 2.0` plus the generic contribution count; the independent `bos-ext-smoke` binary
 parses and validates a 2.0 manifest with no BSH dependency, and the SDK carries
 unit tests for its author runtime adapter. BSH imports core primitives and standard runtimes directly;
-the Phase-1 composable/runtime/core re-export modules are deleted (only the
-terminal/hooks adapters and the `topics` convenience alias remain). Phase 3 host
+the Phase-1 composable/runtime/core re-export modules are deleted, and the
+lifecycle state machine now lives in bos-ext-core (only the terminal/hooks
+adapters and the `topics` convenience alias remain in BSH). Phase 3 host
 wiring is partial: BSH has a `BosHostSpec` adapter and `framework_manager()`, and
 `statuses()` merges packages the neutral manager sees with the host's loaded set
 (invalid manifests are listed with an error), and `bsh ext install` writes

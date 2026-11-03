@@ -80,7 +80,6 @@ where
 pub(crate) fn store_root(settings: &crate::settings::Settings) -> std::path::PathBuf {
     host::extension_root(settings)
 }
-mod lifecycle;
 pub(crate) mod market;
 
 pub(crate) use bos_ext_core::events::topics;

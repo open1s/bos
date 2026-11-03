@@ -8,13 +8,13 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use bos_ext_core::capability::unix_now;
-use bos_ext_core::types::{ExtensionError, LifecycleState};
+use crate::capability::unix_now;
+use crate::types::{ExtensionError, LifecycleState};
 
 /// Health derived from the lifecycle state and recent failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum Health {
+pub enum Health {
     /// Active and no recorded failure since the last start.
     Healthy,
     /// Active but a call failed recently.
@@ -27,7 +27,7 @@ pub(crate) enum Health {
 
 impl Health {
     /// A label for status output.
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Healthy => "healthy",
             Self::Degraded => "degraded",
@@ -39,35 +39,35 @@ impl Health {
 
 /// One extension's live lifecycle record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct LifecycleRecord {
+pub struct LifecycleRecord {
     /// Extension id.
-    pub(crate) id: String,
+    pub id: String,
     /// Current state.
-    pub(crate) state: LifecycleState,
+    pub state: LifecycleState,
     /// Whether the reader left it enabled.
-    pub(crate) enabled: bool,
+    pub enabled: bool,
     /// The last failure, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) last_error: Option<String>,
+    pub last_error: Option<String>,
     /// Unix seconds of the last transition.
-    pub(crate) updated_at: u64,
+    pub updated_at: u64,
     /// Unix seconds of the last successful activation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) activated_at: Option<u64>,
+    pub activated_at: Option<u64>,
     /// How long the last activation took.
     #[serde(default)]
-    pub(crate) startup_ms: u64,
+    pub startup_ms: u64,
     /// Calls accepted since activation.
     #[serde(default)]
-    pub(crate) tool_calls: u64,
+    pub tool_calls: u64,
     /// Calls that failed since activation.
     #[serde(default)]
-    pub(crate) tool_failures: u64,
+    pub tool_failures: u64,
 }
 
 impl LifecycleRecord {
     /// A fresh record for a discovered package.
-    pub(crate) fn new(id: &str, enabled: bool) -> Self {
+    pub fn new(id: &str, enabled: bool) -> Self {
         Self {
             id: id.to_string(),
             state: LifecycleState::Discovered,
@@ -82,7 +82,7 @@ impl LifecycleRecord {
     }
 
     /// Health derived from the current facts.
-    pub(crate) fn health(&self) -> Health {
+    pub fn health(&self) -> Health {
         match self.state {
             LifecycleState::Active if self.tool_failures == 0 => Health::Healthy,
             LifecycleState::Active => Health::Degraded,
@@ -95,19 +95,19 @@ impl LifecycleRecord {
 
 /// The lifecycle manager: one record per extension id.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct LifecycleManager {
+pub struct LifecycleManager {
     records: BTreeMap<String, LifecycleRecord>,
 }
 
 impl LifecycleManager {
     /// An empty manager.
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
     /// Register a discovered package. Registering the same id twice keeps the
     /// existing record but refreshes the enabled flag.
-    pub(crate) fn register(&mut self, id: &str, enabled: bool) {
+    pub fn register(&mut self, id: &str, enabled: bool) {
         match self.records.get_mut(id) {
             Some(record) => record.enabled = enabled,
             None => {
@@ -118,23 +118,23 @@ impl LifecycleManager {
     }
 
     /// Remove an uninstalled package.
-    pub(crate) fn unregister(&mut self, id: &str) -> Option<LifecycleRecord> {
+    pub fn unregister(&mut self, id: &str) -> Option<LifecycleRecord> {
         self.records.remove(id)
     }
 
     /// One record.
-    pub(crate) fn get(&self, id: &str) -> Option<&LifecycleRecord> {
+    pub fn get(&self, id: &str) -> Option<&LifecycleRecord> {
         self.records.get(id)
     }
 
     /// Every record, sorted by id.
-    pub(crate) fn records(&self) -> Vec<&LifecycleRecord> {
+    pub fn records(&self) -> Vec<&LifecycleRecord> {
         self.records.values().collect()
     }
 
     /// Move an extension to `to`, refusing transitions the machine does not
     /// define.
-    pub(crate) fn transition(
+    pub fn transition(
         &mut self,
         id: &str,
         to: LifecycleState,
@@ -163,7 +163,7 @@ impl LifecycleManager {
     /// Mark an extension failed, recording the reason. A failure is always a
     /// legal move: the point is to stop the package, not to police the state it
     /// was in when it broke.
-    pub(crate) fn fail(&mut self, id: &str, error: impl Into<String>) -> LifecycleRecord {
+    pub fn fail(&mut self, id: &str, error: impl Into<String>) -> LifecycleRecord {
         let message = error.into();
         let record = self
             .records
@@ -176,7 +176,7 @@ impl LifecycleManager {
     }
 
     /// Record a successful activation and how long it took.
-    pub(crate) fn activated(
+    pub fn activated(
         &mut self,
         id: &str,
         startup_ms: u64,
@@ -201,7 +201,7 @@ impl LifecycleManager {
     }
 
     /// Change the enabled flag without moving the lifecycle state.
-    pub(crate) fn set_enabled(&mut self, id: &str, enabled: bool) {
+    pub fn set_enabled(&mut self, id: &str, enabled: bool) {
         if let Some(record) = self.records.get_mut(id) {
             record.enabled = enabled;
             record.updated_at = unix_now();
@@ -209,14 +209,14 @@ impl LifecycleManager {
     }
 
     /// Count one accepted tool call.
-    pub(crate) fn record_call(&mut self, id: &str) {
+    pub fn record_call(&mut self, id: &str) {
         if let Some(record) = self.records.get_mut(id) {
             record.tool_calls = record.tool_calls.saturating_add(1);
         }
     }
 
     /// Count one failed tool call.
-    pub(crate) fn record_failure(&mut self, id: &str) {
+    pub fn record_failure(&mut self, id: &str) {
         if let Some(record) = self.records.get_mut(id) {
             record.tool_failures = record.tool_failures.saturating_add(1);
             record.updated_at = unix_now();
@@ -225,7 +225,7 @@ impl LifecycleManager {
 }
 
 /// Whether the state machine defines this edge.
-pub(crate) fn allowed_transition(from: LifecycleState, to: LifecycleState) -> bool {
+pub fn allowed_transition(from: LifecycleState, to: LifecycleState) -> bool {
     if to == LifecycleState::Failed {
         return !matches!(from, LifecycleState::Unloaded);
     }
