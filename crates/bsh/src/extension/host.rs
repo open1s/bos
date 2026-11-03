@@ -1155,7 +1155,28 @@ impl ExtensionHost {
         for failure in failures {
             issues.push(format!("{}: {}", failure.path.display(), failure.error));
         }
-        for package in select_active_versions(packages, &self.store) {
+        let mut packages = select_active_versions(packages, &self.store);
+        // The neutral manager owns dependency-first ordering; fall back to id
+        // order when it cannot produce a plan (a broken manifest is reported
+        // separately below).
+        let order: std::collections::BTreeMap<String, usize> = self
+            .framework_manager()
+            .and_then(|manager| manager.plan())
+            .map(|plan| {
+                plan.order
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, id)| (id, index))
+                    .collect()
+            })
+            .unwrap_or_default();
+        packages.sort_by_key(|package| {
+            order
+                .get(package.id().as_str())
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
+        for package in packages {
             let id = package.id().clone();
             if loaded.contains_key(id.as_str()) {
                 issues.push(format!(
