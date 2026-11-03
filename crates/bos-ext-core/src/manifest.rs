@@ -144,16 +144,16 @@ pub struct ContributesSpec {
     /// Reusable workflows.
     #[serde(default)]
     pub workflows: Vec<ContributionId>,
-    /// Language service descriptors (languages/<id>.json).
+    /// Language service descriptors `languages/<id>.json`.
     #[serde(default)]
     pub languages: Vec<ContributionId>,
-    /// External-system integration descriptors (integrations/<id>.json).
+    /// External-system integration descriptors `integrations/<id>.json`.
     #[serde(default)]
     pub integrations: Vec<ContributionId>,
-    /// Model provider descriptors (providers/models/<id>.json).
+    /// Model provider descriptors `providers/models/<id>.json`.
     #[serde(default)]
     pub model_providers: Vec<ContributionId>,
-    /// Agent role descriptors (providers/agents/<id>.json).
+    /// Agent role descriptors `providers/agents/<id>.json`.
     #[serde(default)]
     pub agent_providers: Vec<ContributionId>,
     /// Visual themes.

@@ -427,7 +427,7 @@ fn package_error(error: crate::types::ExtensionError) -> ExtError {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tokio"))]
 mod tests {
     use super::*;
     use crate::manifest::Manifest;

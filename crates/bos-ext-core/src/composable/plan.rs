@@ -347,7 +347,7 @@ pub fn load_cordis_patch(path: &Path, package: &str) -> Result<Vec<PlanEntry>, P
 ///
 /// The accepted shape is the one DSH ships: a sequence of operations, or one
 /// mapping with an insert sequence. Each inserted row becomes a PlanEntry whose
-/// source is cordis:<package>#<name>; unknown non-insert rows are ignored here
+/// source is `cordis:<package>#<name>`; unknown non-insert rows are ignored here
 /// and refused by the caller's plan validation if they are referenced.
 pub fn parse_cordis_patch(text: &str, package: &str) -> Result<Vec<PlanEntry>, PlanError> {
     let root: serde_yaml::Value =

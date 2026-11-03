@@ -3,7 +3,7 @@
 //! This module is the one adapter seam for an IMPERATIVE package entry. Both
 //! standards reach it: a DSH package host entry and any future imperative
 //! Codex surface run through the same [`BridgeManifest`] ->
-//! [`BridgeSession`] -> [`Contribution`] path. There is deliberately no
+//! `BridgeSession` -> contribution path. There is deliberately no
 //! second imperative path.
 //!
 //! # What runs
@@ -30,7 +30,7 @@
 //!
 //! 1. **The trust gate.** Only a package the reader has explicitly trusted is
 //!    executed. An untrusted package is parsed declaratively and its entry is
-//!    refused with a named [`Refusal`]; no process is started.
+//!    refused with a named refusal; no process is started.
 //! 2. **Path confinement.** The entry must resolve inside the package root, so
 //!    a manifest cannot point the loader at `/bin/sh`.
 //! 3. **Bounded resources.** The child output is capped ([`MAX_FRAME_BYTES`],
