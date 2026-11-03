@@ -2898,6 +2898,12 @@ const MAX_READ_BYTES: usize = 8 * 1024 * 1024;
 /// Maximum number of files accepted by one batch read.
 const MAX_BATCH_READ_FILES: usize = 10;
 
+/// Maximum number of files changed by one patch call.
+const MAX_PATCH_FILES: usize = 10;
+
+/// Maximum exact-text edits applied to one file by one patch call.
+const MAX_PATCH_EDITS: usize = 20;
+
 /// Maximum combined content returned by one batch read.
 const MAX_BATCH_READ_BYTES: usize = 1024 * 1024;
 
@@ -3791,7 +3797,7 @@ fn apply_patch_tool(
                 "changes": {
                     "type": "array",
                     "minItems": 1,
-                    "maxItems": 10,
+                    "maxItems": MAX_PATCH_FILES,
                     "description": "One to ten distinct file paths, each with an ordered list of exact-text edits.",
                     "items": {
                         "type": "object",
@@ -3804,7 +3810,7 @@ fn apply_patch_tool(
                             "edits": {
                                 "type": "array",
                                 "minItems": 1,
-                                "maxItems": 20,
+                                "maxItems": MAX_PATCH_EDITS,
                                 "description": "Ordered exact-text edits applied in memory before one atomic write.",
                                 "items": {
                                     "type": "object",
@@ -3841,9 +3847,9 @@ fn apply_patch_tool(
                 .get("changes")
                 .and_then(serde_json::Value::as_array)
                 .ok_or_else(|| ToolError::InvalidInput("changes must be an array".to_string()))?;
-            if changes.is_empty() || changes.len() > 10 {
+            if changes.is_empty() || changes.len() > MAX_PATCH_FILES {
                 return Err(ToolError::InvalidInput(
-                    "changes must contain between 1 and 10 files".to_string(),
+                    format!("changes must contain between 1 and {MAX_PATCH_FILES} files"),
                 ));
             }
 
@@ -3882,15 +3888,16 @@ fn apply_patch_tool(
                         .ok_or_else(|| ToolError::InvalidInput(
                             "edits must be an array".to_string()
                         ))?;
-                    if edits.is_empty() || edits.len() > 20 {
+                    if edits.is_empty() || edits.len() > MAX_PATCH_EDITS {
                         return Err(ToolError::InvalidInput(
-                            "edits must contain between 1 and 20 operations per file".to_string()
+                            format!("edits must contain between 1 and {MAX_PATCH_EDITS} operations per file")
                         ));
                     }
 
                     let lock = file_lock(&target);
                     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let mut content = read_editable(&target)?;
+                    let original = read_editable(&target)?;
+                    let mut content = original.clone();
                     let mut replacements = 0usize;
 
                     for edit in edits {
@@ -3937,7 +3944,6 @@ fn apply_patch_tool(
                         }
                     }
 
-                    let original = read_editable(&target)?;
                     let unchanged = original == content;
                     if !unchanged {
                         write_bytes(&target, content.as_bytes())?;
