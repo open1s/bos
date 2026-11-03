@@ -18,7 +18,8 @@ too.
 `LegacyAdapter` bridges the old tool-shaped runtime contract to the generic
 Runtime trait; BSH's `BosRuntimeResolver` now lets `ExtensionManager::apply`
 start declarative, process, Cordis, Extism, WASM and MCP packages end to end
-(the sandboxed runtimes take policy/events ports). The production
+(the sandboxed runtimes take policy/events ports), and linked-in builtins can be
+registered on the resolver by id. The production
 `ExtensionHost::rebuild` takes its package order from the manager plan, and
 `ExtensionHost::build_runtime` now calls `bos_ext_runtime::factory::build` with
 a `RuntimePorts` bundle; the host no longer names any concrete runtime

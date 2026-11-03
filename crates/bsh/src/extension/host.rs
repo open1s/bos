@@ -844,13 +844,19 @@ impl ExtensionHost {
     pub(crate) fn framework_resolver(
         &self,
     ) -> std::sync::Arc<super::framework::BosRuntimeResolver> {
-        std::sync::Arc::new(
-            super::framework::BosRuntimeResolver::new(self.config.workspace.clone()).with_ports(
+        let mut resolver = super::framework::BosRuntimeResolver::new(self.config.workspace.clone())
+            .with_ports(
                 std::sync::Arc::clone(&self.policy),
                 std::sync::Arc::clone(&self.events),
                 bos_ext_core::types::TrustLevel::Community,
-            ),
-        )
+            );
+        for builtin in &self.builtins {
+            resolver = resolver.with_builtin(
+                builtin.package.id().as_str(),
+                std::sync::Arc::clone(&builtin.runtime),
+            );
+        }
+        std::sync::Arc::new(resolver)
     }
 
     /// Open the host-neutral manager against this host's root.

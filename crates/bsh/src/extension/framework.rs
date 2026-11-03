@@ -88,6 +88,7 @@ pub(crate) struct BosRuntimeResolver {
     policy: Option<Arc<bos_ext_core::capability::PolicyEngine>>,
     events: Option<Arc<bos_ext_core::events::EventBus>>,
     trust: bos_ext_core::types::TrustLevel,
+    builtins: std::collections::BTreeMap<String, Arc<dyn bos_ext_runtime::Runtime>>,
 }
 
 impl BosRuntimeResolver {
@@ -98,7 +99,19 @@ impl BosRuntimeResolver {
             policy: None,
             events: None,
             trust: bos_ext_core::types::TrustLevel::Community,
+            builtins: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// Register one linked-in builtin runtime.
+    #[must_use]
+    pub(crate) fn with_builtin(
+        mut self,
+        id: &str,
+        runtime: Arc<dyn bos_ext_runtime::Runtime>,
+    ) -> Self {
+        self.builtins.insert(id.to_string(), runtime);
+        self
     }
 
     /// Attach the policy and event bus used by sandboxed runtimes.
@@ -123,6 +136,23 @@ impl bos_ext_core::RuntimeResolver for BosRuntimeResolver {
         root: &std::path::Path,
         data_root: &std::path::Path,
     ) -> Result<Arc<dyn bos_ext_core::Runtime>, ExtError> {
+        if manifest.runtime.kind == bos_ext_core::types::RuntimeKind::Builtin {
+            let runtime = self
+                .builtins
+                .get(manifest.id().as_str())
+                .cloned()
+                .ok_or_else(|| ExtError {
+                    code: bos_ext_core::ErrorCode::Runtime,
+                    message: format!("builtin {} is not registered", manifest.id()),
+                    details: serde_json::Value::Null,
+                })?;
+            return Ok(Arc::new(bos_ext_runtime::adapter::LegacyAdapter::new(
+                manifest.id().clone(),
+                root.to_path_buf(),
+                self.workspace.clone(),
+                runtime,
+            )));
+        }
         let runtime = match manifest.runtime.kind {
             bos_ext_core::types::RuntimeKind::Declarative => {
                 let inner = bos_ext_runtime::declarative::DeclarativeRuntime::new(root, manifest)
