@@ -282,18 +282,57 @@ mod tests {
     }
 
     #[test]
-    fn blank_items_are_dropped_and_the_list_is_capped() {
+    fn blank_items_are_dropped_without_breaking_the_plan() {
         let tool = tool();
-        let mut items: Vec<Value> = (0..MAX_ITEMS + 50)
-            .map(|i| serde_json::json!({"text": format!("step {i}"), "status": "pending"}))
-            .collect();
-        items.push(serde_json::json!({"text": "   ", "status": "pending"}));
-        tool.run(&serde_json::json!({"items": items})).expect("run");
-        let store_items = tool.store().items();
-        assert_eq!(store_items.len(), MAX_ITEMS);
-        assert!(store_items.iter().all(|i| !i.text.trim().is_empty()));
+        tool.run(&serde_json::json!({
+            "items": [
+                {"text": "   ", "status": "pending"},
+                {"text": "build", "status": "in_progress"},
+                {"text": "verify", "status": "pending"}
+            ]
+        }))
+        .expect("run");
+        let items = tool.store().items();
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|item| !item.text.trim().is_empty()));
+        assert_eq!(items.iter().filter(|item| item.status == PlanStatus::InProgress).count(), 1);
     }
 
+    #[test]
+    fn oversized_plan_is_rejected_without_truncation() {
+        let tool = tool();
+        let items: Vec<Value> = (0..MAX_ITEMS + 1)
+            .map(|i| serde_json::json!({
+                "text": format!("step {i}"),
+                "status": if i == 0 { "in_progress" } else { "pending" }
+            }))
+            .collect();
+        assert!(tool.run(&serde_json::json!({"items": items})).is_err());
+        assert!(tool.store().items().is_empty());
+    }
+
+    #[test]
+    fn oversized_step_text_is_rejected_without_truncation() {
+        let tool = tool();
+        let long = "x".repeat(MAX_TEXT + 1);
+        assert!(tool.run(&serde_json::json!({
+            "items": [{"text": long, "status": "in_progress"}]
+        })).is_err());
+        assert!(tool.store().items().is_empty());
+    }
+
+    #[test]
+    fn unfinished_plan_requires_one_active_step() {
+        let tool = tool();
+        let no_active = serde_json::json!({"items": [{"text": "a", "status": "pending"}]});
+        assert!(tool.run(&no_active).is_err());
+        let two_active = serde_json::json!({"items": [
+            {"text": "a", "status": "in_progress"},
+            {"text": "b", "status": "in_progress"}
+        ]});
+        assert!(tool.run(&two_active).is_err());
+        assert!(tool.store().items().is_empty());
+    }
     #[test]
     fn item_text_is_trimmed_and_truncated() {
         let tool = tool();
