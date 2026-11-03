@@ -7760,6 +7760,36 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
     }
 
     #[test]
+    fn apply_patch_preflights_every_target_before_mutating_any_file() {
+        let root = scratch("apply-patch-preflight");
+        let outside = scratch("apply-patch-preflight-outside");
+        std::fs::write(root.join("src.rs"), "value").expect("seed");
+        std::fs::write(outside.join("secret.rs"), "secret").expect("outside");
+        let registry = build(&confined(&root)).agent.registry().expect("registry");
+
+        let error = registry
+            .execute(
+                "apply_patch",
+                &serde_json::json!({"changes": [
+                    {"path": "src.rs", "edits": [{"old_string": "value", "new_string": "changed"}]},
+                    {"path": outside.join("secret.rs").to_string_lossy(), "edits": [
+                        {"old_string": "secret", "new_string": "exposed"}
+                    ]}
+                ]}),
+            )
+            .expect_err("an outside target rejects the whole request during preflight");
+        assert!(error.to_string().contains("workspace"));
+        assert_eq!(
+            std::fs::read_to_string(root.join("src.rs")).expect("unchanged"),
+            "value"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.join("secret.rs")).expect("outside unchanged"),
+            "secret"
+        );
+    }
+
+    #[test]
     fn apply_patch_leaves_a_file_unchanged_when_any_edit_fails() {
         let root = scratch("apply-patch-failure");
         let file = root.join("src.rs");
