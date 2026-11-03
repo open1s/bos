@@ -3855,26 +3855,45 @@ fn apply_patch_tool(
                 .and_then(serde_json::Value::as_array)
                 .ok_or_else(|| ToolError::InvalidInput("changes must be an array".to_string()))?;
             if changes.is_empty() || changes.len() > MAX_PATCH_FILES {
-                return Err(ToolError::InvalidInput(
-                    format!("changes must contain between 1 and {MAX_PATCH_FILES} files"),
-                ));
+                return Err(ToolError::InvalidInput(format!(
+                    "changes must contain between 1 and {MAX_PATCH_FILES} files"
+                )));
             }
 
+            // Preflight every path and the aggregate patch payload before any
+            // file is read or written. Duplicate aliases must not partially
+            // apply the first occurrence before the second is discovered.
             let mut input_bytes = 0usize;
+            let mut seen_targets = HashSet::with_capacity(changes.len());
+            let mut targets = Vec::with_capacity(changes.len());
             for change in changes {
-                let path = change
+                let raw = change
                     .get("path")
                     .and_then(serde_json::Value::as_str)
                     .ok_or_else(|| ToolError::InvalidInput(
                         "every change requires a string path".to_string()
                     ))?;
-                input_bytes = input_bytes.saturating_add(path.len());
+                input_bytes = input_bytes.saturating_add(raw.len());
+                let target = resolve_path(root.as_deref(), raw, enforce)
+                    .map_err(ToolError::InvalidInput)?;
+                if !seen_targets.insert(target.clone()) {
+                    return Err(ToolError::InvalidInput(format!(
+                        "duplicate target path in apply_patch: {}",
+                        target.display()
+                    )));
+                }
+
                 let edits = change
                     .get("edits")
                     .and_then(serde_json::Value::as_array)
                     .ok_or_else(|| ToolError::InvalidInput(
                         "edits must be an array".to_string()
                     ))?;
+                if edits.is_empty() || edits.len() > MAX_PATCH_EDITS {
+                    return Err(ToolError::InvalidInput(format!(
+                        "edits must contain between 1 and {MAX_PATCH_EDITS} operations per file"
+                    )));
+                }
                 for edit in edits {
                     let old = edit
                         .get("old_string")
@@ -3888,6 +3907,11 @@ fn apply_patch_tool(
                         .ok_or_else(|| ToolError::InvalidInput(
                             "each edit requires new_string".to_string()
                         ))?;
+                    if old.is_empty() || old == new {
+                        return Err(ToolError::InvalidInput(
+                            "old_string must be non-empty and different from new_string".to_string()
+                        ));
+                    }
                     input_bytes = input_bytes
                         .saturating_add(old.len())
                         .saturating_add(new.len());
@@ -3897,28 +3921,18 @@ fn apply_patch_tool(
                         )));
                     }
                 }
+                targets.push(target);
             }
 
-            let mut seen = HashSet::with_capacity(changes.len());
             let mut results = Vec::with_capacity(changes.len());
             let mut changed_files = 0usize;
 
-            for change in changes {
+            for (change, target) in changes.iter().zip(targets) {
                 let raw = change
                     .get("path")
                     .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| ToolError::InvalidInput(
-                        "every change requires a string path".to_string()
-                    ))?;
+                    .unwrap_or_default();
                 let result = (|| -> Result<serde_json::Value, ToolError> {
-                    let target = resolve_path(root.as_deref(), raw, enforce)
-                        .map_err(ToolError::InvalidInput)?;
-                    if !seen.insert(target.clone()) {
-                        return Err(ToolError::InvalidInput(format!(
-                            "duplicate target path in apply_patch: {}",
-                            target.display()
-                        )));
-                    }
                     check_path(
                         &policy,
                         &session,
@@ -3931,14 +3945,7 @@ fn apply_patch_tool(
                     let edits = change
                         .get("edits")
                         .and_then(serde_json::Value::as_array)
-                        .ok_or_else(|| ToolError::InvalidInput(
-                            "edits must be an array".to_string()
-                        ))?;
-                    if edits.is_empty() || edits.len() > MAX_PATCH_EDITS {
-                        return Err(ToolError::InvalidInput(
-                            format!("edits must contain between 1 and {MAX_PATCH_EDITS} operations per file")
-                        ));
-                    }
+                        .expect("edits were validated during preflight");
 
                     let lock = file_lock(&target);
                     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -3947,28 +3954,12 @@ fn apply_patch_tool(
                     let mut replacements = 0usize;
 
                     for edit in edits {
-                        let old = edit
-                            .get("old_string")
-                            .and_then(serde_json::Value::as_str)
-                            .ok_or_else(|| ToolError::InvalidInput(
-                                "each edit requires old_string".to_string()
-                            ))?;
-                        let new = edit
-                            .get("new_string")
-                            .and_then(serde_json::Value::as_str)
-                            .ok_or_else(|| ToolError::InvalidInput(
-                                "each edit requires new_string".to_string()
-                            ))?;
-                        if old.is_empty() {
-                            return Err(ToolError::InvalidInput(
-                                "old_string must not be empty".to_string()
-                            ));
-                        }
-                        if old == new {
-                            return Err(ToolError::InvalidInput(
-                                "old_string and new_string are identical".to_string()
-                            ));
-                        }
+                        let old = edit["old_string"]
+                            .as_str()
+                            .expect("old_string was validated during preflight");
+                        let new = edit["new_string"]
+                            .as_str()
+                            .expect("new_string was validated during preflight");
                         let replace_all = edit
                             .get("replace_all")
                             .and_then(serde_json::Value::as_bool)
