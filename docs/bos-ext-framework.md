@@ -1,6 +1,7 @@
 # BOS Extension Framework (bos-ext)
 
-Status: Phase 1 — effect scopes moved to bos-ext-core; BSH re-exports them.
+Status: Phase 1 in progress — effect scopes and event dispatch moved to
+bos-ext-core; BSH re-exports them.
 
 ## Goal
 

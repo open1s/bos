@@ -249,10 +249,16 @@ impl EffectScope {
                 }
                 Cleanup::Async(cleanup) => {
                     let future = AssertUnwindSafe(cleanup()).catch_unwind();
+                    #[cfg(feature = "tokio")]
                     match tokio::time::timeout(ASYNC_DISPOSE_TIMEOUT, future).await {
                         Ok(Ok(())) => {}
                         Ok(Err(payload)) => report.failed.push(failure(&slot, payload)),
                         Err(_) => report.timed_out.push(label_of(&slot)),
+                    }
+                    #[cfg(not(feature = "tokio"))]
+                    match future.await {
+                        Ok(()) => {}
+                        Err(payload) => report.failed.push(failure(&slot, payload)),
                     }
                 }
             }
@@ -350,7 +356,10 @@ async fn run_slot_async(slot: &Arc<Mutex<EffectSlot>>) -> bool {
             let _ = catch_unwind(AssertUnwindSafe(cleanup));
         }
         Cleanup::Async(cleanup) => {
+            #[cfg(feature = "tokio")]
             let _ = tokio::time::timeout(ASYNC_DISPOSE_TIMEOUT, cleanup()).await;
+            #[cfg(not(feature = "tokio"))]
+            cleanup().await;
         }
     }
     true
@@ -359,11 +368,12 @@ async fn run_slot_async(slot: &Arc<Mutex<EffectSlot>>) -> bool {
 /// Run an async cleanup from a synchronous context. Inside a Tokio runtime the
 /// task is spawned; outside one the future is driven to completion.
 fn run_late(future: BoxFuture) {
+    #[cfg(feature = "tokio")]
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle.spawn(future);
-    } else {
-        futures::executor::block_on(future);
+        return;
     }
+    futures::executor::block_on(future);
 }
 
 #[cfg(test)]

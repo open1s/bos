@@ -10,8 +10,10 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-#[cfg(feature = "tokio")]
+pub mod dispatch;
 pub mod effects;
+
+pub use dispatch::DispatchMode;
 
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
@@ -165,21 +167,6 @@ impl ServiceContractRegistry {
     pub fn contains(&self, id: &str) -> bool {
         self.contracts.contains_key(id)
     }
-}
-
-/// Event dispatch mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DispatchMode {
-    /// Observe, do not rewrite.
-    Emit,
-    /// Run all listeners concurrently.
-    Parallel,
-    /// Run listeners in order, ignoring results.
-    Serial,
-    /// Stop at the first listener that returns a value.
-    Bail,
-    /// Chain a value through listeners.
-    Waterfall,
 }
 
 /// Host-registered event metadata.
