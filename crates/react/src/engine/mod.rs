@@ -1293,7 +1293,7 @@ mod repeat_guard_tests {
         let capped = cap_tool_result(&text, TOOL_RESULT_CAP);
         assert!(capped.starts_with("HEAD"));
         assert!(capped.ends_with("TAIL"));
-        assert!(capped.contains("truncated"));
+        assert!(capped.contains("bytes omitted"));
         assert!(
             capped.len() < text.len(),
             "the cap actually drops bytes: {} vs {}",
@@ -1326,7 +1326,7 @@ mod repeat_guard_tests {
         assert!(capped.is_char_boundary(capped.len()));
         assert!(capped.starts_with("HEAD"));
         assert!(capped.ends_with("TAIL"));
-        assert!(capped.contains("bytes omitted"));
+        assert!(capped.contains("truncated"));
     }
 
     #[test]
