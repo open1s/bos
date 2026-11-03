@@ -2904,6 +2904,9 @@ const MAX_PATCH_FILES: usize = 10;
 /// Maximum exact-text edits applied to one file by one patch call.
 const MAX_PATCH_EDITS: usize = 20;
 
+/// Maximum combined old/new text accepted by one patch request.
+const MAX_PATCH_INPUT_BYTES: usize = 1024 * 1024;
+
 /// Maximum combined content returned by one batch read.
 const MAX_BATCH_READ_BYTES: usize = 1024 * 1024;
 
@@ -3655,6 +3658,7 @@ fn read_files_tool(
                     "items": {
                         "type": "string",
                         "minLength": 1,
+                        "maxLength": 4096,
                         "description": "A file path relative to the workspace or an absolute path inside the allowed workspace."
                     },
                     "description": "One to ten distinct UTF-8 text file paths. Results preserve this order."
@@ -3805,6 +3809,7 @@ fn apply_patch_tool(
                             "path": {
                                 "type": "string",
                                 "minLength": 1,
+                                "maxLength": 4096,
                                 "description": "Existing UTF-8 file path relative to the workspace or absolute inside the allowed workspace."
                             },
                             "edits": {
@@ -3818,10 +3823,12 @@ fn apply_patch_tool(
                                         "old_string": {
                                             "type": "string",
                                             "minLength": 1,
+                                            "maxLength": 262144,
                                             "description": "Exact non-empty text to find. It must occur exactly once unless replace_all is true."
                                         },
                                         "new_string": {
                                             "type": "string",
+                                            "maxLength": 262144,
                                             "description": "Replacement text; an empty string deletes the matched text."
                                         },
                                         "replace_all": {
@@ -3851,6 +3858,45 @@ fn apply_patch_tool(
                 return Err(ToolError::InvalidInput(
                     format!("changes must contain between 1 and {MAX_PATCH_FILES} files"),
                 ));
+            }
+
+            let mut input_bytes = 0usize;
+            for change in changes {
+                let path = change
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| ToolError::InvalidInput(
+                        "every change requires a string path".to_string()
+                    ))?;
+                input_bytes = input_bytes.saturating_add(path.len());
+                let edits = change
+                    .get("edits")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| ToolError::InvalidInput(
+                        "edits must be an array".to_string()
+                    ))?;
+                for edit in edits {
+                    let old = edit
+                        .get("old_string")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| ToolError::InvalidInput(
+                            "each edit requires old_string".to_string()
+                        ))?;
+                    let new = edit
+                        .get("new_string")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| ToolError::InvalidInput(
+                            "each edit requires new_string".to_string()
+                        ))?;
+                    input_bytes = input_bytes
+                        .saturating_add(old.len())
+                        .saturating_add(new.len());
+                    if input_bytes > MAX_PATCH_INPUT_BYTES {
+                        return Err(ToolError::InvalidInput(format!(
+                            "combined patch text must not exceed {MAX_PATCH_INPUT_BYTES} bytes"
+                        )));
+                    }
+                }
             }
 
             let mut seen = HashSet::with_capacity(changes.len());
@@ -3944,6 +3990,11 @@ fn apply_patch_tool(
                         }
                     }
 
+                    if content.len() as u64 > MAX_EDIT_BYTES {
+                        return Err(ToolError::InvalidInput(format!(
+                            "patched file would exceed the {MAX_EDIT_BYTES} byte edit ceiling"
+                        )));
+                    }
                     let unchanged = original == content;
                     if !unchanged {
                         write_bytes(&target, content.as_bytes())?;
