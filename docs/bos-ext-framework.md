@@ -1,9 +1,8 @@
 # BOS Extension Framework (bos-ext)
 
-Status: Phase 1 in progress — core types, capability/policy, manifest, package,
-signing, resolver, config, storage, sources, effect scopes, event dispatch,
-services, reactivity and the composition runtime moved to bos-ext-core; BSH
-re-exports them.
+Status: Phase 2 in progress — Phase 1 primitives are in bos-ext-core; the
+runtime contract and builtin runtime moved to bos-ext-runtime; BSH re-exports
+them. Declarative/process/Cordis runtimes and the Node bridge remain in BSH.
 
 ## Goal
 

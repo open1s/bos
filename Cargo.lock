@@ -1368,7 +1368,9 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bos-ext-core",
+ "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -1432,6 +1434,7 @@ dependencies = [
  "async-trait",
  "base64 0.23.1",
  "bos-ext-core",
+ "bos-ext-runtime",
  "chacha20poly1305",
  "config",
  "dirs 7.0.0",

@@ -4,6 +4,9 @@
 //! Phase 0 defines the runtime catalog and the feature boundary. Individual
 //! runtime implementations are migrated from BSH in Phase 2.
 
+pub mod builtin;
+pub mod contract;
+
 use std::collections::BTreeMap;
 
 use bos_ext_core::{ExtError, RuntimeKindSpec};

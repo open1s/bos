@@ -26,6 +26,7 @@ pub type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 /// The default ceiling for one async cleanup. A wedged cleanup must not hold
 /// the rest of the scope hostage.
+#[cfg_attr(not(feature = "tokio"), allow(dead_code))]
 const ASYNC_DISPOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 enum Cleanup {

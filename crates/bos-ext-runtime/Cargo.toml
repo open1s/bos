@@ -20,4 +20,6 @@ cordis = []
 [dependencies]
 bos-ext-core = { path = "../bos-ext-core" }
 async-trait.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
