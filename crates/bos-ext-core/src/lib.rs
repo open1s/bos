@@ -24,6 +24,7 @@ pub mod dispatch;
 pub mod manager;
 pub mod host;
 pub mod manifest;
+pub mod manifest_v2;
 pub mod package;
 pub mod resolver;
 pub mod signing;
