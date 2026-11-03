@@ -10,6 +10,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+pub mod capability;
 pub mod dispatch;
 pub mod types;
 pub mod effects;
