@@ -6,6 +6,10 @@
 
 pub mod builtin;
 pub mod contract;
+#[cfg(feature = "declarative")]
+pub mod declarative;
+#[cfg(feature = "process")]
+pub mod process;
 
 use std::collections::BTreeMap;
 

@@ -1370,9 +1370,12 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bos-ext-core",
+ "libc",
+ "log",
  "serde",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
