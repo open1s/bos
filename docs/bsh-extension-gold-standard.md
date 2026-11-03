@@ -196,12 +196,13 @@ The framework ships a conformance suite that runs in CI:
 - performance: the G6 budgets;
 - self-hosting: at least one real BSH feature is installed as a package.
 
-Current status: **met**. The conformance script runs the 231-test extension
-suite (64 composition tests, eight release budgets), all-in-one and Cordis
-packages install through the host, negative/failure cases are denied and
-audited, and the self-hosting gate installs first-party packages; the release benchmarks
-run automatically when GOLD_STANDARD_RELEASE=1 or CI=true, and rust.yml runs
-the whole script as a required step.
+Current status: **met**. The conformance script runs 61 BSH extension, 151
+core, 47 runtime and 2 SDK tests (including composition and eight release
+budgets), all-in-one and Cordis packages install through the host,
+negative/failure cases are denied and audited, and the self-hosting gate
+installs first-party packages; the release benchmarks run automatically when
+GOLD_STANDARD_RELEASE=1 or CI=true, and rust.yml runs the whole script as a
+required step.
 
 ### G10 -- Governance
 
@@ -273,6 +274,7 @@ It must run:
 - cargo fmt --check;
 - cargo clippy -p bsh --lib --tests -- -D warnings;
 - cargo test -p bsh --lib extension::;
+- the framework runtime and SDK conformance suites;
 - the composition conformance subset and budget smoke;
 - the all-in-one contribution coverage install;
 - the Cordis runtime and host e2e;

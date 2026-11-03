@@ -18,6 +18,12 @@ cargo clippy -p bsh --lib --tests -- -D warnings
 echo "==> extension suite"
 cargo test -p bsh --lib extension::
 
+echo "==> framework runtime conformance"
+cargo test -p bos-ext-runtime --features "wasm extism cordis"
+
+echo "==> SDK conformance"
+cargo test -p bos-ext-sdk
+
 echo "==> composition conformance"
 cargo test -p bos-ext-core --features tokio --lib composable::
 
