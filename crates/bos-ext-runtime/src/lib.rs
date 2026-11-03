@@ -8,6 +8,8 @@ pub mod adapter;
 pub mod bridge;
 pub mod builtin;
 pub mod contract;
+#[cfg(all(feature = "extism", feature = "wasm", feature = "cordis"))]
+pub mod factory;
 pub use contract::*;
 #[cfg(feature = "cordis")]
 pub mod cordis;

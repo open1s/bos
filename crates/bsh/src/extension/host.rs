@@ -33,12 +33,7 @@ use bos_ext_core::types::{
 };
 use bos_ext_core::ui::{PanelLocation, PanelVisibility, ThemePalette, UiDocument};
 use bos_ext_runtime::builtin::{BuiltinRuntime, ClosureExtension};
-use bos_ext_runtime::declarative::{self, DeclarativeContributions};
-use bos_ext_runtime::extism::ExtismRuntime;
-use bos_ext_runtime::mcp::McpRuntime;
-use bos_ext_runtime::process::ProcessRuntime;
-use bos_ext_runtime::wasm::WasmRuntime;
-use bos_ext_runtime::workflow::WorkflowRuntime;
+use bos_ext_runtime::declarative::DeclarativeContributions;
 use bos_ext_runtime::{empty_schema, CallContext, LazyRuntime, Runtime, ToolDescriptor};
 use serde_json::Value;
 
@@ -1226,23 +1221,6 @@ impl ExtensionHost {
             }
             match self.build_runtime(&package) {
                 Ok((runtime, tools, contributions)) => {
-                    let runtime: Arc<dyn Runtime> = runtime;
-                    let (runtime, tools) = if contributions.workflows.is_empty() {
-                        (runtime, tools)
-                    } else {
-                        let wrapped = WorkflowRuntime::new(
-                            runtime,
-                            &contributions.workflows,
-                            &tools,
-                            Arc::clone(&self.policy),
-                            package.trust,
-                        )?;
-                        let tools = wrapped.descriptors();
-                        (
-                            Arc::new(LazyRuntime::new(Arc::new(wrapped))) as Arc<dyn Runtime>,
-                            tools,
-                        )
-                    };
                     entry.runtime = Some(runtime);
                     entry.tools = tools;
                     entry.contributions = contributions;
@@ -1562,120 +1540,20 @@ impl ExtensionHost {
     fn build_runtime(&self, package: &Package) -> Result<BuiltRuntime, ExtensionError> {
         let data_root = self.store.data_dir(package.id());
         let config = bos_ext_core::config::load(&package.manifest, &package.root, &data_root)?;
-        match package.manifest.runtime.kind {
-            RuntimeKind::Declarative => {
-                let runtime =
-                    declarative::DeclarativeRuntime::new(&package.root, &package.manifest)?;
-                let tools = runtime.descriptors();
-                let contributions = runtime.contributions().clone();
-                Ok((
-                    Arc::new(LazyRuntime::new(Arc::new(runtime))),
-                    tools,
-                    contributions,
-                ))
-            }
-            RuntimeKind::Process => {
-                let runtime = ProcessRuntime::new(&package.manifest, &package.root)?
-                    .with_config(config.to_json())
-                    .with_policy(Arc::clone(&self.policy), package.trust)
-                    .with_workspace(self.config.workspace.clone())
-                    .with_data_root(Some(data_root.clone()))
-                    .with_events(
-                        Arc::clone(&self.events),
-                        &package.manifest.contributes.events,
-                    );
-                let tools = runtime.descriptors();
-                let contributions =
-                    declarative::load_contributions(&package.root, &package.manifest)?;
-                Ok((
-                    Arc::new(LazyRuntime::new(Arc::new(runtime))),
-                    tools,
-                    contributions,
-                ))
-            }
-            RuntimeKind::Extism => {
-                let runtime = ExtismRuntime::new(
-                    &package.manifest,
-                    &package.root,
-                    &data_root,
-                    Arc::clone(&self.policy),
-                    Arc::clone(&self.events),
-                    self.config.workspace.clone(),
-                    config.to_json(),
-                    package.trust,
-                )?;
-                let tools = runtime.descriptors()?;
-                let contributions =
-                    declarative::load_contributions(&package.root, &package.manifest)?;
-                Ok((
-                    Arc::new(LazyRuntime::new(Arc::new(runtime))),
-                    tools,
-                    contributions,
-                ))
-            }
-            RuntimeKind::Mcp => {
-                let runtime = McpRuntime::new(
-                    &package.manifest,
-                    &package.root,
-                    config.to_json(),
-                    Arc::clone(&self.policy),
-                    package.trust,
-                    Arc::clone(&self.events),
-                )?;
-                let tools = runtime.descriptors()?;
-                let contributions = runtime.contributions()?;
-                Ok((
-                    Arc::new(LazyRuntime::new(Arc::new(runtime))),
-                    tools,
-                    contributions,
-                ))
-            }
-            RuntimeKind::WasmComponent => {
-                let runtime = WasmRuntime::new(
-                    &package.manifest,
-                    &package.root,
-                    &data_root,
-                    Arc::clone(&self.policy),
-                    Arc::clone(&self.events),
-                    self.config.workspace.clone(),
-                    config.to_json(),
-                    package.trust,
-                )?;
-                let tools = runtime.descriptors()?;
-                // The component serves commands and panels through its own
-                // exports; prompts, contexts, languages and themes still come
-                // from the declared files. Loading them here is what keeps a
-                // declared contribution from silently disappearing.
-                let contributions =
-                    declarative::load_contributions(&package.root, &package.manifest)?;
-                Ok((
-                    Arc::new(LazyRuntime::new(Arc::new(runtime))),
-                    tools,
-                    contributions,
-                ))
-            }
-            RuntimeKind::Cordis => {
-                let runtime = bos_ext_runtime::cordis::CordisRuntime::new(
-                    &package.manifest,
-                    &package.root,
-                    &data_root,
-                    Arc::new(super::terminal::HostTerminal),
-                )?;
-                let tools = runtime.descriptors()?;
-                let contributions =
-                    declarative::load_contributions(&package.root, &package.manifest)?;
-                Ok((
-                    Arc::new(LazyRuntime::new(Arc::new(runtime))),
-                    tools,
-                    contributions,
-                ))
-            }
-            RuntimeKind::Builtin => Err(ExtensionError::Manifest {
-                path: package.root.join("extension.toml"),
-                message: "the builtin runtime is linked in; an installed package cannot claim it"
-                    .to_string(),
-            }),
-        }
+        let built = bos_ext_runtime::factory::build(
+            &package.manifest,
+            &package.root,
+            bos_ext_runtime::factory::RuntimePorts {
+                policy: Arc::clone(&self.policy),
+                events: Arc::clone(&self.events),
+                workspace: self.config.workspace.clone(),
+                data_root,
+                config: config.to_json(),
+                trust: package.trust,
+                terminal: Some(Arc::new(super::terminal::HostTerminal)),
+            },
+        )?;
+        Ok((built.runtime, built.tools, built.contributions))
     }
 
     fn host_scope(&self) -> CallScope {

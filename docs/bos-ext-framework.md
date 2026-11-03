@@ -18,9 +18,11 @@ too.
 Runtime trait; BSH's `BosRuntimeResolver` now lets `ExtensionManager::apply`
 start declarative, process, Cordis, Extism, WASM and MCP packages end to end
 (the sandboxed runtimes take policy/events ports). The production
-`ExtensionHost::rebuild` now takes its package order from the manager plan, and
-`framework_resolver()` exposes the host's policy/events to the neutral runtime
-resolver; activation itself is still host-owned. bos-ext-core exposes HostSpec, the Host bundle and an
+`ExtensionHost::rebuild` takes its package order from the manager plan, and
+`ExtensionHost::build_runtime` now calls `bos_ext_runtime::factory::build` with
+a `RuntimePorts` bundle; the host no longer names any concrete runtime
+constructor. `framework_resolver()` exposes the same policy/events to the
+neutral resolver. Activation itself is still host-owned. bos-ext-core exposes HostSpec, the Host bundle and an
 ExtensionManager with open/install/plan/apply/reload.
 
 ## Goal
