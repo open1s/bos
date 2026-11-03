@@ -6,7 +6,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::manifest::Manifest;
 use crate::package::ExtensionStore;
 use crate::types::ExtensionId;
 use crate::{
@@ -158,7 +157,7 @@ impl ExtensionManager {
         })?;
         let version = self.version_of(id)?;
         let root = self.store.version_root(&extension_id, &version);
-        let manifest = Manifest::load(&root).map_err(|error| ExtError {
+        let manifest = crate::manifest_v2::load_package_manifest(&root).map_err(|error| ExtError {
             code: ErrorCode::Manifest,
             message: error.to_string(),
             details: serde_json::Value::Null,
@@ -232,7 +231,7 @@ impl ExtensionManager {
                     details: serde_json::Value::Null,
                 })?;
             let root = self.store.version_root(&id, &version);
-            let manifest = Manifest::load(&root).map_err(|error| ExtError {
+            let manifest = crate::manifest_v2::load_package_manifest(&root).map_err(|error| ExtError {
                 code: ErrorCode::Manifest,
                 message: error.to_string(),
                 details: serde_json::Value::Null,
@@ -313,6 +312,7 @@ fn package_error(error: crate::types::ExtensionError) -> ExtError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::Manifest;
     use crate::{CapabilityRegistry, ScopePath, ServiceContractRegistry};
 
     struct DemoHost {

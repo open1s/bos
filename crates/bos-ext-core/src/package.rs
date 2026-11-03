@@ -66,7 +66,7 @@ impl Package {
         source: ExtensionSource,
         trust: TrustLevel,
     ) -> Result<Self, ExtensionError> {
-        let manifest = Manifest::load(root)?;
+        let manifest = crate::manifest_v2::load_package_manifest(root)?;
         let mut report = manifest.validate();
         if manifest.runtime.kind == crate::types::RuntimeKind::Builtin
             && source != ExtensionSource::Builtin

@@ -283,6 +283,23 @@ pub enum RuntimeKind {
 }
 
 impl RuntimeKind {
+    /// Parse a stable runtime kind name.
+    pub fn parse(raw: &str) -> Result<Self, ExtensionError> {
+        match raw {
+            "builtin" => Ok(Self::Builtin),
+            "declarative" => Ok(Self::Declarative),
+            "process" => Ok(Self::Process),
+            "mcp" => Ok(Self::Mcp),
+            "extism" => Ok(Self::Extism),
+            "wasm-component" => Ok(Self::WasmComponent),
+            "cordis" => Ok(Self::Cordis),
+            other => Err(ExtensionError::Manifest {
+                path: std::path::PathBuf::from("extension.toml"),
+                message: format!("unknown runtime kind {other:?}"),
+            }),
+        }
+    }
+
     /// Stable lowercase name used in logs and lockfiles.
     pub fn as_str(self) -> &'static str {
         match self {

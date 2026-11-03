@@ -228,6 +228,111 @@ impl ManifestV2 {
             services: legacy.services.clone(),
         }
     }
+
+    /// Convert a v2 manifest back into the internal 1.x shape.
+    ///
+    /// This is the transitional adapter: the host still runs the 1.x manifest
+    /// model until the runtime and store migrate to generic contributions.
+    pub fn into_legacy(self) -> Result<Manifest, ExtensionError> {
+        use crate::capability::Capability;
+        use crate::manifest::{CapabilitiesSpec, Compatibility, ContributesSpec, RuntimeSpec};
+        use crate::types::RuntimeKind;
+
+        let mut contributes = ContributesSpec::default();
+        for contribution in self.contributions {
+            let id = contribution.id;
+            match contribution.kind.as_str() {
+                "tool" => contributes.tools.push(id),
+                "command" => contributes.commands.push(id),
+                "panel" => contributes.panels.push(id),
+                "prompt" => contributes.prompts.push(id),
+                "context" => contributes.contexts.push(id),
+                "skill" => contributes.skills.push(id),
+                "workflow" => contributes.workflows.push(id),
+                "language" => contributes.languages.push(id),
+                "integration" => contributes.integrations.push(id),
+                "model-provider" => contributes.model_providers.push(id),
+                "agent-provider" => contributes.agent_providers.push(id),
+                "theme" => contributes.themes.push(id),
+                "preset" => contributes.presets.push(id),
+                other => {
+                    return Err(ExtensionError::Manifest {
+                        path: Path::new(MANIFEST_FILE).to_path_buf(),
+                        message: format!("unknown contribution kind {other:?}"),
+                    })
+                }
+            }
+        }
+        let mut capabilities = CapabilitiesSpec::default();
+        for capability in &self.capabilities.required {
+            capabilities.required.push(capability.parse::<Capability>()?);
+        }
+        let config = &self.runtime.config;
+        let entry = config.get("entry").and_then(toml::Value::as_str).map(str::to_string);
+        let protocol = config
+            .get("protocol")
+            .and_then(toml::Value::as_str)
+            .map(str::to_string);
+        let args = config
+            .get("args")
+            .and_then(toml::Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Manifest {
+            schema_version: "1.1".to_string(),
+            extension: self.extension,
+            compatibility: Compatibility {
+                bsh: self.compatibility.host,
+                extension_api: self.compatibility.extension_api,
+                ui_api: None,
+            },
+            runtime: RuntimeSpec {
+                kind: RuntimeKind::parse(&self.runtime.kind)?,
+                entry,
+                args,
+                env: Default::default(),
+                startup: Default::default(),
+                protocol,
+            },
+            capabilities,
+            contributes,
+            configuration: self.configuration,
+            resources: self.resources,
+            dependencies: self.dependencies,
+            services: self.services,
+        })
+    }
+}
+
+/// Load a package manifest in either 1.x or 2.0 form.
+///
+/// The 2.0 envelope is converted to the transitional host shape until the
+/// store and runtimes consume generic contributions directly.
+pub fn load_package_manifest(root: &Path) -> Result<Manifest, ExtensionError> {
+    let path = root.join(MANIFEST_FILE);
+    let text = std::fs::read_to_string(&path).map_err(|source| ExtensionError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    let value: toml::Value = toml::from_str(&text).map_err(|error| ExtensionError::Toml {
+        path: path.clone(),
+        message: error.to_string(),
+    })?;
+    let schema = value
+        .get("schema_version")
+        .and_then(toml::Value::as_str)
+        .unwrap_or("");
+    if schema == MANIFEST_V2_SCHEMA_VERSION {
+        ManifestV2::parse(&text, &path)?.into_legacy()
+    } else {
+        Manifest::parse(&text, &path)
+    }
 }
 
 /// Migrate the manifest of one package without writing it.
@@ -334,5 +439,26 @@ id = "echo"
         let v2 = ManifestV2::load(temp.path()).expect("v2");
         assert_eq!(v2.schema_version, MANIFEST_V2_SCHEMA_VERSION);
         assert_eq!(path, temp.path().join(MANIFEST_FILE));
+    }
+
+    #[test]
+    fn a_migrated_package_loads_through_the_host_shape() {
+        let source =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/extensions/hello");
+        let temp = tempfile::tempdir().expect("tempdir");
+        crate::package::copy_tree(&source, temp.path()).expect("copy");
+        write_migrated_package(temp.path()).expect("migrate");
+        let package = crate::package::Package::load(
+            temp.path(),
+            crate::types::ExtensionSource::Development,
+            crate::types::TrustLevel::Local,
+        )
+        .expect("package");
+        assert!(package
+            .manifest
+            .contributes
+            .tools
+            .iter()
+            .any(|id| id.as_str() == "echo"));
     }
 }

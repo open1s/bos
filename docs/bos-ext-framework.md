@@ -1,7 +1,8 @@
 # BOS Extension Framework (bos-ext)
 
 Status: Phase 4 in progress — the manifest 2.0 envelope and legacy migration
-landed in bos-ext-core, and `bsh ext migrate <path> [--write]` exercises it. Phase 3 host wiring is partial: every standard runtime
+landed in bos-ext-core, `bsh ext migrate <path> [--write]` exercises it, and
+package loading accepts either 1.x or 2.0. Phase 3 host wiring is partial: every standard runtime
 and the Node bridge live in bos-ext-runtime, and bos-ext-core exposes HostSpec,
 the Host bundle and an ExtensionManager with open/install/plan/apply/reload.
 BSH is still the only host implementation that fills the ports.
