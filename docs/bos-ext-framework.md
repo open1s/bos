@@ -8,8 +8,8 @@ wiring is partial: BSH has a `BosHostSpec` adapter and `framework_manager()`, an
 `statuses()` merges packages the neutral manager sees with the host's loaded set
 (invalid manifests are listed with an error), and `bsh ext install` writes
 through `ExtensionManager::install_package`; uninstall, enable/disable,
-versions and rollback go through the manager too. ExtensionHost still owns
-activation. bos-ext-core exposes HostSpec, the Host bundle and an
+versions, rollback, retry and quarantine go through the manager too.
+ExtensionHost still owns activation. bos-ext-core exposes HostSpec, the Host bundle and an
 ExtensionManager with open/install/plan/apply/reload.
 
 ## Goal

@@ -190,6 +190,26 @@ impl ExtensionManager {
         Ok(target)
     }
 
+    /// Clear a persisted failure for one extension.
+    pub fn clear_failure(&self, id: &str) -> Result<(), ExtError> {
+        let id = ExtensionId::parse(id.to_string()).map_err(|error| ExtError {
+            code: ErrorCode::Manifest,
+            message: error.to_string(),
+            details: serde_json::Value::Null,
+        })?;
+        self.store.clear_failure(&id).map_err(package_error)
+    }
+
+    /// Move one extension's code to quarantine.
+    pub fn quarantine(&self, id: &str, reason: &str) -> Result<PathBuf, ExtError> {
+        let id = ExtensionId::parse(id.to_string()).map_err(|error| ExtError {
+            code: ErrorCode::Manifest,
+            message: error.to_string(),
+            details: serde_json::Value::Null,
+        })?;
+        self.store.quarantine(&id, reason).map_err(package_error)
+    }
+
     /// Install one local package tree and return its identity.
     pub fn install(&self, source: &Path) -> Result<InstalledExtension, ExtError> {
         let package = self.store.install(source).map_err(package_error)?;

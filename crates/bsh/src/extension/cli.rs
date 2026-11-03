@@ -1182,9 +1182,10 @@ fn command_retry(args: &[String], root: Option<PathBuf>) -> Result<i32, String> 
     let id = ExtensionId::parse(one_argument(args, "bsh ext retry <id>")?)
         .map_err(|error| error.to_string())?;
     let config = config(root);
-    let store = ExtensionStore::open(config.root.clone()).map_err(|error| error.to_string())?;
-    store
-        .clear_failure(&id)
+    let manager = crate::extension::framework::manager_for(config.root.clone(), None)
+        .map_err(|error| error.to_string())?;
+    manager
+        .clear_failure(id.as_str())
         .map_err(|error| error.to_string())?;
     let mut host = ExtensionHost::open(config).map_err(|error| error.to_string())?;
     host.retry(id.as_str()).map_err(|error| error.to_string())?;
@@ -1208,9 +1209,10 @@ fn command_quarantine(args: &[String], root: Option<PathBuf>) -> Result<i32, Str
         .find(|pair| pair[0] == "--reason")
         .map(|pair| pair[1].clone())
         .unwrap_or_else(|| "reader requested".to_string());
-    let store = ExtensionStore::open(config(root).root).map_err(|error| error.to_string())?;
-    let destination = store
-        .quarantine(&id, &reason)
+    let manager = crate::extension::framework::manager_for(config(root).root, None)
+        .map_err(|error| error.to_string())?;
+    let destination = manager
+        .quarantine(id.as_str(), &reason)
         .map_err(|error| error.to_string())?;
     println!("quarantined {id} at {}", destination.display());
     Ok(0)
