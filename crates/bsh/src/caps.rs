@@ -7,7 +7,7 @@
 //! Write confines the shell and the file tools to the active workspace, and Full
 //! access releases both.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -1006,6 +1006,15 @@ fn build_agent_for_session_inner(
         }
         if !off_tool("read_file") {
             files.push(Arc::new(read_file_tool(
+                files_root.clone(),
+                enforce_escape,
+                policy.clone(),
+                session.to_string(),
+                preset.clone(),
+            )));
+        }
+        if !off_tool("read_files") {
+            files.push(Arc::new(read_files_tool(
                 files_root.clone(),
                 enforce_escape,
                 policy.clone(),
@@ -2877,6 +2886,12 @@ fn arg_positive(args: &serde_json::Value, key: &str) -> Result<Option<usize>, To
 /// refused with the way to read a window instead of being loaded whole.
 const MAX_READ_BYTES: usize = 8 * 1024 * 1024;
 
+/// Maximum number of files accepted by one batch read.
+const MAX_BATCH_READ_FILES: usize = 10;
+
+/// Maximum combined content returned by one batch read.
+const MAX_BATCH_READ_BYTES: usize = 1024 * 1024;
+
 /// The largest file `edit_file` rewrites, in bytes.
 ///
 /// An edit needs the whole file in memory to prove the match is unique; past
@@ -3599,6 +3614,152 @@ fn read_file_tool(
                 "content": content,
                 "bytes": bytes,
                 "truncated": truncated,
+            }))
+        },
+    )
+}
+
+/// read_files - read a bounded set of files with one model/tool round-trip.
+fn read_files_tool(
+    root: Option<PathBuf>,
+    enforce: bool,
+    policy: Arc<PolicySet>,
+    session: String,
+    preset: String,
+) -> FunctionTool {
+    FunctionTool::new(
+        "read_files",
+        "Read up to 10 UTF-8 text files in one call. Each file is independently checked against workspace and read permissions. The combined returned content is capped at 1 MiB; inspect each entry's truncated or error field before relying on the result.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": MAX_BATCH_READ_FILES,
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "A file path relative to the workspace or an absolute path inside the allowed workspace."
+                    },
+                    "description": "One to ten distinct UTF-8 text file paths. Results preserve this order."
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional 1-based starting line applied to every file."
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional maximum number of lines per file, applied to every file."
+                }
+            },
+            "required": ["paths"],
+            "additionalProperties": false
+        }),
+        move |args| {
+            let paths = args
+                .get("paths")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| ToolError::InvalidInput("paths must be an array".to_string()))?;
+            if paths.is_empty() || paths.len() > MAX_BATCH_READ_FILES {
+                return Err(ToolError::InvalidInput(format!(
+                    "paths must contain between 1 and {MAX_BATCH_READ_FILES} entries"
+                )));
+            }
+            let offset = arg_positive(args, "offset")?;
+            let limit = arg_positive(args, "limit")?;
+            let mut seen = HashSet::with_capacity(paths.len());
+            let mut results = Vec::with_capacity(paths.len());
+            let mut remaining = MAX_BATCH_READ_BYTES;
+            let mut total_bytes = 0usize;
+            let mut truncated = false;
+
+            for value in paths {
+                let raw = value.as_str().ok_or_else(|| {
+                    ToolError::InvalidInput("every paths entry must be a string".to_string())
+                })?;
+                if raw.trim().is_empty() {
+                    return Err(ToolError::InvalidInput(
+                        "paths entries must not be empty".to_string(),
+                    ));
+                }
+                if !seen.insert(raw) {
+                    return Err(ToolError::InvalidInput(format!(
+                        "duplicate path in read_files: {raw}"
+                    )));
+                }
+
+                let result = (|| -> Result<serde_json::Value, ToolError> {
+                    let target = resolve_path(root.as_deref(), raw, enforce)
+                        .map_err(ToolError::InvalidInput)?;
+                    check_path(
+                        &policy,
+                        &session,
+                        &preset,
+                        "read_files",
+                        Action::Read,
+                        &target,
+                    )?;
+
+                    if remaining == 0 {
+                        truncated = true;
+                        return Ok(serde_json::json!({
+                            "path": target.display().to_string(),
+                            "content": "",
+                            "bytes": 0,
+                            "truncated": true,
+                            "reason": "combined batch output budget reached"
+                        }));
+                    }
+
+                    let read = match (offset, limit) {
+                        (None, None) => read_whole(&target)?,
+                        (offset, limit) => read_window(
+                            &target,
+                            offset.unwrap_or(1),
+                            limit.unwrap_or(usize::MAX),
+                        )?,
+                    };
+                    let ReadOutcome { content, truncated: file_truncated } = read;
+                    let content_bytes = content.as_bytes();
+                    let keep = content_bytes.len().min(remaining);
+                    let mut boundary = keep;
+                    while !content.is_char_boundary(boundary) {
+                        boundary -= 1;
+                    }
+                    let returned = &content[..boundary];
+                    let was_truncated = file_truncated || boundary < content.len();
+                    if was_truncated {
+                        truncated = true;
+                    }
+                    let bytes = returned.len();
+                    remaining -= bytes;
+                    total_bytes += bytes;
+                    Ok(serde_json::json!({
+                        "path": target.display().to_string(),
+                        "content": returned,
+                        "bytes": bytes,
+                        "truncated": was_truncated
+                    }))
+                })();
+
+                match result {
+                    Ok(value) => results.push(value),
+                    Err(error) => results.push(serde_json::json!({
+                        "path": raw,
+                        "error": error.to_string()
+                    })),
+                }
+            }
+
+            Ok(serde_json::json!({
+                "files": results,
+                "count": paths.len(),
+                "bytes": total_bytes,
+                "truncated": truncated,
+                "max_bytes": MAX_BATCH_READ_BYTES
             }))
         },
     )
@@ -7415,7 +7576,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         let built = build(&confined(&root));
         let registry = built.agent.registry().expect("registry");
 
-        for name in ["glob", "grep", "read_file", "write_file", "edit_file", "list_dir"] {
+        for name in ["glob", "grep", "read_file", "read_files", "write_file", "edit_file", "list_dir"] {
             let tool = registry.get(name).unwrap_or_else(|| panic!("{name} is registered"));
             let schema = tool.json_schema();
             assert_eq!(schema["additionalProperties"], false, "{name}");
