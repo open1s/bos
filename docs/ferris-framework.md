@@ -28,7 +28,8 @@ registered on the resolver by id. The production
 a `RuntimePorts` bundle; the host no longer names any concrete runtime
 constructor. `framework_resolver()` exposes the same policy/events to the
 neutral resolver. Activation itself is still host-owned. ferris-core exposes HostSpec, the Host bundle and an
-ExtensionManager with open/install/plan/apply/reload.
+ExtensionManager with open/install/plan/apply/reload; a failed activation rolls
+back the already-started set instead of leaking runtimes or leases.
 
 ## Goal
 

@@ -223,7 +223,13 @@ impl ExtensionManager {
     pub async fn apply(&self, plan: &ManagerPlan) -> Result<ActivationSet, ExtError> {
         let mut activations = Vec::new();
         for id in &plan.order {
-            activations.push(self.build_activation(id).await?);
+            match self.build_activation(id).await {
+                Ok(activation) => activations.push(activation),
+                Err(error) => {
+                    shutdown_all(activations).await;
+                    return Err(error);
+                }
+            }
         }
         Ok(ActivationSet { activations })
     }
@@ -249,7 +255,14 @@ impl ExtensionManager {
                 }
                 existing.shutdown().await?;
             }
-            activations.push(self.build_activation(id).await?);
+            match self.build_activation(id).await {
+                Ok(activation) => activations.push(activation),
+                Err(error) => {
+                    shutdown_all(activations).await;
+                    shutdown_all(old.into_values().collect()).await;
+                    return Err(error);
+                }
+            }
         }
         for (_, activation) in old {
             activation.shutdown().await?;
@@ -376,6 +389,12 @@ pub struct Activation {
     /// Runtime holding the contributions.
     pub runtime: Arc<dyn Runtime>,
     leases: Vec<Box<dyn ContributionLease>>,
+}
+
+async fn shutdown_all(activations: Vec<Activation>) {
+    for activation in activations.into_iter().rev() {
+        let _ = activation.shutdown().await;
+    }
 }
 
 impl Activation {
