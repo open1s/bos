@@ -25,12 +25,12 @@ When a change trades one against the other, say which won and why.
 
 `src/extension/` is BSH's runtime-independent extension platform: manifest
 validation, a hashed package store, dependency resolution, scoped capability
-grants with an audit log, a lifecycle state machine, built-in/declarative/process
-runtimes, a bounded event bus, per-extension storage, a declarative UI contract,
+grants with an audit log, a lifecycle state machine, seven standard runtimes, a
+bounded event bus, per-extension storage, a declarative UI contract,
 agent tool registration, diagnostics and `bsh ext ...`.
 
-- The normative contract is `docs/bsh-extension-standard.md`; the walkthrough is
-  `docs/bsh-extension-dev-guide.md`; the WIT contract is `crates/bsh/wit/extension.wit`;
+- The unified contract and walkthrough is `docs/bsh-extension.md`; the WIT
+  contract is `crates/bsh/wit/extension.wit`;
   runtime contracts are in `runtime/{wasm,extism,mcp,workflow}.rs`; examples are
   `examples/extensions/{hello,process-echo,wasm-echo,mcp-echo,extism-echo,hook-demo,language-python,builtin-template}`.
 - It is wired into `caps::build_agent_for_session_inner` with one call to
@@ -41,7 +41,7 @@ agent tool registration, diagnostics and `bsh ext ...`.
   ships complete (storage, event subscriptions, UI actions) before every host
   consumer lands; tests cover the unused surface. Keep new accepts outside the
   module wired.
-- Tests: `cargo test -p bsh --lib extension::` (90+ tests). CLI smoke:
+- Tests: `cargo test -p bsh --lib extension::` (56 tests). CLI smoke:
   `cargo run -p bsh -- ext --root /tmp/bsh-ext list`, plus
   `build`, `keygen/sign/trust/verify`, `registry` and `metrics`.
 - The legacy Codex/DSH shim in `crates/agent/src/extensions` still backs the old
@@ -52,7 +52,7 @@ agent tool registration, diagnostics and `bsh ext ...`.
   effect path as a third-party package. A feature that needs a new host seam must
   expose that seam as a typed service or an event; adding a privileged in-core
   shortcut is an exception requiring an RFC and a migration plan. The acceptance
-  standard is `docs/bsh-extension-gold-standard.md`; do not call the framework
+  standard is `docs/bsh-extension.md`; do not call the framework
   complete while its conformance gates are unmet.
 
 ## Standing rule: every UI increment ends with a gap check

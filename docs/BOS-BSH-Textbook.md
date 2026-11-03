@@ -3,7 +3,7 @@
 **Second edition — the BSH 3.0 extension framework**
 
 This is a working book, not a specification. Most chapters include commands you
-can run, output you should see, and the failure modes that waste the most time. The normative contract is [bsh-extension-standard.md](bsh-extension-standard.md);
+can run, output you should see, and the failure modes that waste the most time. The normative contract is [bsh-extension.md](bsh-extension.md);
 when this book and the standard disagree, the standard wins and the book has a
 bug.
 
@@ -3451,10 +3451,10 @@ Controls:
 
 ## 34.5 Where to go next
 
-- [BSH Extension Standard 1.0](bsh-extension-standard.md) — the normative contract.
+- [BSH Extension Platform](bsh-extension.md) — the unified contract.
 - [Hook layer design](bsh-hook-system.md) — observe/intercept reasoning, phases.
 - [Observability capture](bsh-observability-capture.md) — capture planes and schemas.
-- [Peer review](bsh-extension-peer-review.md) — what was fixed and what remains.
+- [BSH Extension Platform](bsh-extension.md) — capabilities, runtimes and limits.
 - `examples/extensions/` — ten runnable packages, one per runtime and surface.
 
 ---

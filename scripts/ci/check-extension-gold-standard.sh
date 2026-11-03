@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # BSH Extension Framework gold-standard conformance gate.
 #
-# This is the CI entry point described by docs/bsh-extension-gold-standard.md.
+# This is the CI entry point described by docs/bsh-extension.md.
 # It proves the composition semantics and the host install path; the
 # performance and self-hosting gates are added as they land.
 set -euo pipefail

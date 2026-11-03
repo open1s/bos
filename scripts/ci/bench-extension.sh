@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Release-mode extension budgets from docs/bsh-extension-gold-standard.md.
+# Release-mode extension budgets from docs/bsh-extension.md.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"

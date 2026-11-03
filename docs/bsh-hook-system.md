@@ -225,7 +225,7 @@ Hard rules:
 | `crates/bsh/src/extension/capability.rs` | three capabilities, risk and defaults |
 | `crates/bsh/src/extension/host.rs` | registry of attached packages; observe/intercept entry points |
 | `crates/bsh/src/ui/shell.rs` + `caps.rs` | install the model hook; register the HTTP tap |
-| `docs/bsh-extension-standard.md` | §6 capability rows, §9 hook points |
+| `docs/bsh-extension.md` | Capabilities and hook points |
 
 ## 7. Extism side
 
@@ -374,5 +374,5 @@ the other transports; built-in uses the trait directly.
 
 - [LLM and traffic capture](bsh-observability-capture.md) — the data model and
   analysis recipes this layer feeds.
-- [Extension standard §6 capabilities](bsh-extension-standard.md#6-capability-model)
+- [BSH extension platform](bsh-extension.md)
 - [BSH by Example: runtimes](BOS-BSH-Textbook.md#architecture-and-runtimes-at-a-glance)

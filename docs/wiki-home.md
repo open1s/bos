@@ -18,7 +18,7 @@ BOS 将共享的 Agent 执行核心与多语言接口、桌面工作空间结合
 | 在 Node.js 项目中构建 Agent | 使用 [JSBOS](https://www.npmjs.com/package/@open1s/jsbos) |
 | 将 Agent Runtime 集成到 Rust 应用 | 使用 BOS Rust crates |
 | 在桌面环境中开发和运行 Agent | 使用 [BSH](https://github.com/open1s/bos) |
-| 为工作空间添加能力 | 开发 [BSH 扩展](https://github.com/open1s/bos/blob/main/docs/bsh-extension-dev-guide.md) |
+| 为工作空间添加能力 | 开发 [BSH 扩展](https://github.com/open1s/bos/blob/main/docs/bsh-extension.md) |
 
 ## 为什么选择 BOS？
 
@@ -67,7 +67,7 @@ async with BrainOS() as brain:
 - [Rust 使用指南](https://github.com/open1s/bos/blob/main/docs/rust-user-guide.md)
 - [Python 使用指南](https://github.com/open1s/bos/blob/main/docs/python-user-guide.md)
 - [JavaScript 使用指南](https://github.com/open1s/bos/blob/main/docs/javascript-user-guide.md)
-- [BSH 扩展开发指南](https://github.com/open1s/bos/blob/main/docs/bsh-extension-dev-guide.md)
+- [BSH 扩展平台](https://github.com/open1s/bos/blob/main/docs/bsh-extension.md)
 - [版本与更新](https://github.com/open1s/bos/releases)
 - [问题反馈](https://github.com/open1s/bos/issues) · [社区讨论](https://github.com/open1s/bos/discussions)
 

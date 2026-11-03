@@ -1,14 +1,13 @@
 //! The BSH extension platform.
 //!
-//! This module is the runtime-independent extension system described in
-//! docs/BSH_Extension_Framework_Design.md and specified by
-//! docs/bsh-extension-standard.md:
+//! This module is the runtime-independent extension system specified by
+//! docs/bsh-extension.md:
 //!
 //! - a versioned manifest and package format;
 //! - a managed store with hashing, staging, atomic install and a lockfile;
 //! - a capability policy with explicit grants, scopes and an audit trail;
 //! - a lifecycle state machine;
-//! - three runtimes - built-in Rust, declarative files and external processes;
+//! - seven runtimes - built-in, declarative, process, MCP, Extism, Wasm and Cordis;
 //! - a bounded event bus;
 //! - agent tools, commands, panels, prompts and contexts;
 //! - a versioned declarative UI contract;

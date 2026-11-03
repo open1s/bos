@@ -232,19 +232,17 @@ bsh ext doctor
 ```
 
 从以下资料开始：
-- [扩展开发指南](docs/bsh-extension-dev-guide.md)
-- [扩展标准](docs/bsh-extension-standard.md)
+- [BSH 扩展平台](docs/bsh-extension.md)
 - [WIT 接口](crates/bsh/wit/extension.wit)
 - [扩展示例](examples/extensions/)
 
 **安全说明：**扩展能力授权与操作系统级隔离是不同的控制层。
 实际执行能力因操作系统和扩展运行时而异。当前契约与限制请参阅
-[扩展标准](docs/bsh-extension-standard.md) 和 [安全策略](SECURITY.md)。
+[BSH 扩展平台](docs/bsh-extension.md) 和 [安全策略](SECURITY.md)。
 
 ### 扩展包生命周期
 
-扩展包从 Manifest 校验开始，经过依赖解析、不可变版本安装和运行时激活。
-宿主能力授权是独立的安全边界；操作系统级隔离能力取决于具体运行时和平台。
+参见[生命周期与激活](docs/bsh-extension.md#4-lifecycle-and-activation)了解从 Manifest 校验、依赖解析、不可变版本安装到运行时激活的包路径。
 
 ## 模型配置
 
@@ -276,8 +274,7 @@ model = "nvidia/your-model"
 | [Rust 使用指南](docs/rust-user-guide.md) | 在 Rust 中嵌入和使用 BOS |
 | [Python 使用指南](docs/python-user-guide.md) | 在 Python 中使用 BOS |
 | [JavaScript 使用指南](docs/javascript-user-guide.md) | 在 Node.js / JavaScript 中使用 BOS |
-| [扩展开发指南](docs/bsh-extension-dev-guide.md) | 创建和测试 BSH 扩展 |
-| [扩展标准](docs/bsh-extension-standard.md) | Manifest、运行时与能力授权契约 |
+| [BSH 扩展平台](docs/bsh-extension.md) | Manifest、运行时、能力、CLI、安全与开发 |
 | [贡献者上手指南](ONBOARDING.md) | 配置开发环境 |
 | [设置](docs/bsh-settings-spec.md) · [终端策略](docs/bsh-terminal-policy.md) · [Hooks](docs/bsh-hook-system.md) | 子系统规范 |
 | [REX 指南](docs/rex-user-guide.md) · [诊断](docs/diagnostics.md) | 资源工具与故障排查 |

@@ -235,19 +235,18 @@ bsh ext doctor
 ```
 
 Start here:
-- [Extension developer guide](docs/bsh-extension-dev-guide.md)
-- [Extension standard](docs/bsh-extension-standard.md)
+- [BSH extension platform](docs/bsh-extension.md)
 - [WIT interface](crates/bsh/wit/extension.wit)
 - [Extension examples](examples/extensions/)
 
 **Security note:** extension capability authorization and operating-system
 isolation are separate controls. Enforcement differs by operating system and
-runtime. Consult the [extension standard](docs/bsh-extension-standard.md) and
+runtime. Consult the [BSH extension platform](docs/bsh-extension.md) and
 [security policy](SECURITY.md) for the current contract and limitations.
 
 ### Extension package lifecycle
 
-The diagram shows the package path from manifest validation through dependency resolution, immutable installation and runtime activation. Host capability authorization is a separate boundary; operating-system isolation depends on the runtime and platform.
+See [lifecycle and activation](docs/bsh-extension.md#4-lifecycle-and-activation) for the package path from manifest validation through dependency resolution, immutable installation and runtime activation.
 
 ## Model configuration
 
@@ -279,8 +278,7 @@ sensitive credentials in its encrypted vault.
 | [Rust user guide](docs/rust-user-guide.md) | Embed and use BOS from Rust |
 | [Python user guide](docs/python-user-guide.md) | Use BOS from Python |
 | [JavaScript user guide](docs/javascript-user-guide.md) | Use BOS from Node.js and JavaScript |
-| [Extension developer guide](docs/bsh-extension-dev-guide.md) | Build and test BSH extensions |
-| [Extension standard](docs/bsh-extension-standard.md) | Manifest, runtime and capability contract |
+| [BSH extension platform](docs/bsh-extension.md) | Manifest, runtimes, capabilities, CLI, security and authoring |
 | [Contributor onboarding](ONBOARDING.md) | Set up a development environment |
 | [Settings](docs/bsh-settings-spec.md) · [Terminal policy](docs/bsh-terminal-policy.md) · [Hooks](docs/bsh-hook-system.md) | Subsystem specifications |
 | [REX guide](docs/rex-user-guide.md) · [Diagnostics](docs/diagnostics.md) | Resource tooling and troubleshooting |

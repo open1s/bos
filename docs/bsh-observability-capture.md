@@ -475,8 +475,8 @@ Phase 2, because it needs the body grant and the retention policy.
 
 ## See also
 
-- [Extension standard §6 capabilities](bsh-extension-standard.md#6-capability-model),
-  [§9 events](bsh-extension-standard.md#9-events)
-- [Design: runtime architecture](BSH_Extension_Framework_Design.md)
+- [BSH extension platform](bsh-extension.md),
+  [BSH extension platform](bsh-extension.md)
+- [BSH extension platform](bsh-extension.md)
 - [BSH by Example: the six runtimes](BOS-BSH-Textbook.md#architecture-and-runtimes-at-a-glance)
 - Current event payloads: `crates/bsh/src/ui/shell.rs` (model), `crates/bsh/src/extension/runtime/extism.rs` (network.request)

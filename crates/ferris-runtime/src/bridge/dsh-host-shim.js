@@ -15,7 +15,7 @@
  * contributing half a capability.
  *
  * Nothing here is a security boundary. The subprocess runs with the user's
- * privileges; see docs/extension-standards.md. What protects the user is the
+ * privileges; see docs/bsh-extension.md. What protects the user is the
  * trust gate in the host, which decides whether this file is started at all.
  *
  * Protocol (one JSON object per line, in both directions).
