@@ -17,6 +17,25 @@ use tokio::task::JoinHandle;
 
 use crate::model::{ChatMessage, Role};
 
+/// Cap the transcript-facing tool result by UTF-8 bytes, not Unicode scalar count.
+fn cap_display_tool_output(output: &str, cap_bytes: usize) -> String {
+    // A zero host cap delegates to the engine's documented default budget.
+    if cap_bytes == 0 || output.len() <= cap_bytes {
+        return output.to_string();
+    }
+
+    const MARKER: &str = "\n... [output truncated for display]";
+    if cap_bytes <= MARKER.len() {
+        return MARKER[..cap_bytes].to_string();
+    }
+
+    let mut end = cap_bytes - MARKER.len();
+    while end > 0 && !output.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{MARKER}", &output[..end])
+}
+
 /// One event the runner forwards to the shell.
 #[derive(Debug, Clone)]
 pub(crate) enum AgentEvent {
@@ -267,12 +286,7 @@ impl Runner {
                             args: args.to_string(),
                         },
                         Ok(StreamToken::ToolResult { name, output, ms }) => {
-                            let output = if output.chars().count() > tool_output_cap {
-                                let cut: String = output.chars().take(tool_output_cap).collect();
-                                format!("{cut}\n... [output truncated for display]")
-                            } else {
-                                output
-                            };
+                            let output = cap_display_tool_output(&output, tool_output_cap);
                             AgentEvent::ToolResult { name, output, ms }
                         }
                         Ok(StreamToken::Usage(usage)) => AgentEvent::Usage {
@@ -323,6 +337,21 @@ impl Runner {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn display_tool_output_cap_counts_bytes_and_preserves_utf8() {
+        let output = "界".repeat(100);
+        let capped = cap_display_tool_output(&output, 64);
+        assert!(capped.len() <= 64, "the cap is in bytes: {}", capped.len());
+        assert!(capped.is_char_boundary(capped.len()));
+        assert!(capped.contains("[output truncated for display]"));
+    }
+
+    #[test]
+    fn zero_display_cap_leaves_the_engine_default_result_untouched() {
+        let output = "界".repeat(100);
+        assert_eq!(cap_display_tool_output(&output, 0), output);
+    }
 
     /// A child turn awaits the engine's Tokio timeout; it must run on the
     /// runner's runtime rather than GPUI's non-Tokio executor.
