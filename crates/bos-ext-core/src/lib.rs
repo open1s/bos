@@ -38,12 +38,6 @@ use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Manifest schema accepted by this framework.
-pub const MANIFEST_SCHEMA_VERSION: &str = "2.0";
-
-/// Extension API version exposed to packages.
-pub const EXTENSION_API_VERSION: &str = "1.0";
-
 /// One contribution produced by a runtime or declared by a manifest.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Contribution {
