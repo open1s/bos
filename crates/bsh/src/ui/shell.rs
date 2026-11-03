@@ -455,6 +455,8 @@ pub(crate) struct Shell {
     pub(crate) picker_search: Entity<InputState>,
     /// The task-name filter on the Automation tasks pane.
     pub(crate) task_search: Entity<InputState>,
+    /// The name/id filter on the Installed extensions pane.
+    pub(crate) extension_search: Entity<InputState>,
     /// The new-task name field.
     pub(crate) task_name: Entity<InputState>,
     /// The new-task instruction field.
@@ -1291,6 +1293,10 @@ impl Shell {
         let task_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "task.searchPlaceholder"))
         });
+        let extension_search = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(crate::i18n::tr(lang, "settings.extensionsSearch"))
+        });
         let task_name = cx.new(|cx| InputState::new(window, cx));
         let task_prompt = cx.new(|cx| InputState::new(window, cx));
         let task_every = cx.new(|cx| InputState::new(window, cx));
@@ -1463,6 +1469,19 @@ impl Shell {
                     if matches!(event, InputEvent::Change) {
                         this.audit_query = this.audit_search.read(cx).value().to_string();
                         this.audit_page = 0;
+                        cx.notify();
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &extension_search,
+                window,
+                |_this: &mut Shell,
+                 _state: &Entity<InputState>,
+                 event: &InputEvent,
+                 _window: &mut Window,
+                 cx: &mut Context<Shell>| {
+                    if matches!(event, InputEvent::Change) {
                         cx.notify();
                     }
                 },
@@ -1739,6 +1758,7 @@ impl Shell {
             audit_call_limits: std::collections::BTreeMap::new(),
             picker_search,
             task_search,
+            extension_search,
             task_name,
             task_prompt,
             task_every,

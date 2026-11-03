@@ -29911,6 +29911,10 @@ fn the_extensions_pane_renders_its_inventory(cx: &mut TestAppContext) {
         cx.debug_bounds("extension-panels-refresh").is_some(),
         "the pane draws its refresh control"
     );
+    assert!(
+        cx.debug_bounds("extension-search").is_some(),
+        "the pane draws the installed-extension search field"
+    );
 }
 
 /// The Extensions rail cell opens the extension platform inventory, not the

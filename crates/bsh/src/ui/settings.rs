@@ -6939,7 +6939,27 @@ impl Shell {
             let root = self.state.settings.active_workspace_root();
             (!root.is_empty()).then(|| std::path::PathBuf::from(root))
         };
-        let statuses = self.extension_statuses.clone().unwrap_or_default();
+        let extension_query = self.extension_search.read(cx).value().to_string();
+        let all_statuses = self.extension_statuses.clone().unwrap_or_default();
+        let statuses: Vec<_> = all_statuses
+            .iter()
+            .filter(|status| {
+                let hit = |items: &[String]| {
+                    items
+                        .iter()
+                        .any(|item| crate::state::matches(&extension_query, item))
+                };
+                crate::state::matches(&extension_query, &status.name)
+                    || crate::state::matches(&extension_query, &status.id)
+                    || hit(&status.tools)
+                    || hit(&status.commands)
+                    || hit(&status.panels)
+                    || hit(&status.skills)
+                    || hit(&status.languages)
+                    || hit(&status.integrations)
+            })
+            .cloned()
+            .collect();
         let approvals: Vec<(String, String, String)> = statuses
             .iter()
             .filter_map(|status| {
@@ -7122,7 +7142,11 @@ impl Shell {
         let mut inventory = div().flex().flex_col().gap(px(6.0));
         if statuses.is_empty() {
             inventory = inventory.child(txt(
-                tr(self.state.lang, "settings.extensionsEmpty"),
+                if all_statuses.is_empty() {
+                    tr(self.state.lang, "settings.extensionsEmpty")
+                } else {
+                    tr(self.state.lang, "settings.extensionsNoMatches")
+                },
                 12.0,
                 theme::muted(),
             ));
@@ -7301,6 +7325,45 @@ impl Shell {
                                         this.refresh_extension_surfaces(cx);
                                         cx.notify();
                                     }))
+                            })
+                            .child({
+                                if status.source == "builtin" {
+                                    div().into_any_element()
+                                } else {
+                                    let id = status.id.clone();
+                                    let selector = format!("extension-uninstall-{id}");
+                                    div()
+                                        .id(SharedString::from(selector.clone()))
+                                        .debug_selector(move || selector.clone())
+                                        .h(px(24.0))
+                                        .px(px(6.0))
+                                        .flex()
+                                        .items_center()
+                                        .rounded(px(7.0))
+                                        .cursor_pointer()
+                                        .hover(|style| style.bg(rgb(theme::hover())))
+                                        .child(txt(
+                                            tr(self.state.lang, "settings.marketUninstall"),
+                                            11.0,
+                                            theme::error(),
+                                        ))
+                                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                                            if this.state.uninstall_extension(&id) {
+                                                this.persist_market_change(cx);
+                                                this.refresh_extension_surfaces(cx);
+                                            } else {
+                                                this.state.notice(
+                                                    tr(
+                                                        this.state.lang,
+                                                        "settings.extensionUninstallFailed",
+                                                    )
+                                                    .to_string(),
+                                                );
+                                            }
+                                            cx.notify();
+                                        }))
+                                        .into_any_element()
+                                }
                             }),
                     ),
             );
@@ -7310,11 +7373,31 @@ impl Shell {
             .flex()
             .flex_col()
             .gap(px(6.0))
-            .child(txt(
-                tr(self.state.lang, "settings.extensionsInstalled"),
-                11.0,
-                theme::muted(),
-            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.0))
+                    .child(txt(
+                        tr(self.state.lang, "settings.extensionsInstalled"),
+                        11.0,
+                        theme::muted(),
+                    ))
+                    .child(
+                        div()
+                            .w(px(320.0))
+                            .px(px(8.0))
+                            .py(px(4.0))
+                            .rounded(px(6.0))
+                            .bg(rgb(theme::new_session_fill()))
+                            .border_1()
+                            .border_color(rgb(theme::border_soft()))
+                            .debug_selector(|| "extension-search".to_string())
+                            .child(Input::new(&self.extension_search).appearance(false)),
+                    ),
+            )
             .child(inventory);
 
         let mut rows = Vec::new();
