@@ -11,7 +11,7 @@ set -euo pipefail
 
 version="${1:?usage: release-notes.sh <version>}"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-deb_version="${version/-/~}"
+deb_version="$(printf '%s' "$version" | sed 's/-/~/')"
 
 section="$(
   awk -v tag="v$version" '

@@ -73,7 +73,9 @@ esac
 
 # Debian compares a tilde below the empty string, so 3.0.3-rc.1 becomes
 # 3.0.3~rc.1 and sorts before 3.0.3 rather than after it.
-deb_version="${version/-/~}"
+# sed, not ${version/-/~}: bash on Ubuntu expands the tilde in the
+# substitution's replacement to $HOME (measured: 0.0.0/home/runnerci).
+deb_version="$(printf '%s' "$version" | sed 's/-/~/')"
 
 mkdir -p "$out"
 work="$(mktemp -d)"

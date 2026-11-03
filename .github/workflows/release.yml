@@ -310,7 +310,7 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
-          deb_version="${VERSION/-/~}"
+          deb_version="$(printf '%s' "$VERSION" | sed 's/-/~/')"
           expected=(
             "bsh-${VERSION}-macos-arm64.dmg"
             "bsh-${VERSION}-macos-arm64.app.zip"
