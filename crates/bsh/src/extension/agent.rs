@@ -19,11 +19,11 @@ use serde_json::Value;
 
 use crate::plugins::PluginInfo;
 
-use super::composable::Fiber;
-use super::runtime::{CallContext, Runtime, ToolDescriptor};
 use bos_ext_core::capability::{CallScope, Capability, PolicyEngine};
+use bos_ext_core::composable::Fiber;
 use bos_ext_core::events::{topics, EventBus, ExtensionEvent};
 use bos_ext_core::types::{ExtensionError, ExtensionId, TrustLevel};
+use bos_ext_runtime::{CallContext, Runtime, ToolDescriptor};
 
 use super::errors::ToToolError;
 
@@ -46,21 +46,21 @@ pub(crate) struct Contributed {
     /// Tool descriptors.
     pub(crate) tools: Vec<ToolDescriptor>,
     /// Commands.
-    pub(crate) commands: Vec<super::runtime::declarative::CommandContribution>,
+    pub(crate) commands: Vec<bos_ext_runtime::declarative::CommandContribution>,
     /// Panels.
-    pub(crate) panels: Vec<super::runtime::declarative::PanelContribution>,
+    pub(crate) panels: Vec<bos_ext_runtime::declarative::PanelContribution>,
     /// Prompts.
-    pub(crate) prompts: Vec<super::runtime::declarative::TextContribution>,
+    pub(crate) prompts: Vec<bos_ext_runtime::declarative::TextContribution>,
     /// Contexts.
-    pub(crate) contexts: Vec<super::runtime::declarative::TextContribution>,
+    pub(crate) contexts: Vec<bos_ext_runtime::declarative::TextContribution>,
     /// Workspace open for this build, used to scope contexts.
     pub(crate) workspace: Option<std::path::PathBuf>,
     /// Package skills directory, when the manifest declares skills.
     pub(crate) skills_dir: Option<std::path::PathBuf>,
     /// Workflows, recorded only.
-    pub(crate) workflows: Vec<super::runtime::declarative::RawContribution>,
+    pub(crate) workflows: Vec<bos_ext_runtime::declarative::RawContribution>,
     /// Themes, recorded only.
-    pub(crate) themes: Vec<super::runtime::declarative::RawContribution>,
+    pub(crate) themes: Vec<bos_ext_runtime::declarative::RawContribution>,
     /// One-call wall-clock ceiling.
     pub(crate) timeout_ms: u64,
 }
@@ -478,7 +478,7 @@ fn truncate(text: &str, limit: usize) -> String {
 /// An empty scope is unscoped and always matches; a scoped context with no open
 /// workspace never matches, because there is no path tree to test.
 fn context_matches(
-    context: &super::runtime::declarative::TextContribution,
+    context: &bos_ext_runtime::declarative::TextContribution,
     workspace: Option<&std::path::Path>,
 ) -> bool {
     if context.scope.is_empty() {
@@ -639,7 +639,7 @@ fn append_prompt(
     trust: TrustLevel,
     policy: &PolicyEngine,
     heading: &str,
-    contribution: &super::runtime::declarative::TextContribution,
+    contribution: &bos_ext_runtime::declarative::TextContribution,
     budget: &mut usize,
 ) -> Option<String> {
     let capability = if heading == "Extension prompt" {
@@ -675,9 +675,9 @@ fn append_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extension::runtime::empty_schema;
     use bos_ext_core::capability::PolicyMode;
     use bos_ext_core::types::RuntimeKind;
+    use bos_ext_runtime::empty_schema;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
@@ -698,7 +698,7 @@ mod tests {
         let scratch = Scratch::new("context-scope");
         std::fs::create_dir_all(scratch.0.join("src")).expect("src");
         std::fs::write(scratch.0.join("src/lib.rs"), "fn main() {}").expect("file");
-        let mut context = super::super::runtime::declarative::TextContribution {
+        let mut context = bos_ext_runtime::declarative::TextContribution {
             id: bos_ext_core::types::ContributionId::parse("scoped").expect("id"),
             description: "Scoped".to_string(),
             text: "Text".to_string(),
@@ -781,11 +781,11 @@ mod tests {
             _arguments: Value,
             _context: &CallContext,
             progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
-        ) -> Result<crate::extension::runtime::ToolResult, ExtensionError> {
+        ) -> Result<bos_ext_runtime::ToolResult, ExtensionError> {
             if let Some(sender) = progress {
                 let _ = sender.send(serde_json::json!({"message": "half"}));
             }
-            Ok(crate::extension::runtime::ToolResult::text("done"))
+            Ok(bos_ext_runtime::ToolResult::text("done"))
         }
     }
     fn policy(scratch: &Scratch) -> Arc<PolicyEngine> {

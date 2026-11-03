@@ -16,21 +16,13 @@ use std::time::SystemTime;
 use serde::Serialize;
 
 use super::agent as contribution;
-use super::composable::dispatch::InterceptorPolicy;
-use super::composable::{
-    Context, DisposalReport, Fiber, FiberState, Scope, ServiceAuthorizer, ServiceToken,
-};
 use super::lifecycle::{Health, LifecycleManager};
-use super::runtime::builtin::{BuiltinRuntime, ClosureExtension};
-use super::runtime::declarative::{self, DeclarativeContributions};
-use super::runtime::extism::ExtismRuntime;
-use super::runtime::mcp::McpRuntime;
-use super::runtime::process::ProcessRuntime;
-use super::runtime::wasm::WasmRuntime;
-use super::runtime::workflow::WorkflowRuntime;
-use super::runtime::{empty_schema, CallContext, LazyRuntime, Runtime, ToolDescriptor};
 use bos_ext_core::capability::{
     CallScope, Capability, Decision, GrantScope, PolicyEngine, PolicyMode,
+};
+use bos_ext_core::composable::dispatch::InterceptorPolicy;
+use bos_ext_core::composable::{
+    Context, DisposalReport, Fiber, FiberState, Scope, ServiceAuthorizer, ServiceToken,
 };
 use bos_ext_core::events::{lifecycle_event, topics, EventBus, ExtensionEvent};
 use bos_ext_core::package::{write_atomic, ExtensionStore, Package};
@@ -40,6 +32,14 @@ use bos_ext_core::types::{
     StartupPolicy, TrustLevel, ValidationReport, EXTENSION_API_VERSION, HOST_VERSION,
 };
 use bos_ext_core::ui::{PanelLocation, PanelVisibility, ThemePalette, UiDocument};
+use bos_ext_runtime::builtin::{BuiltinRuntime, ClosureExtension};
+use bos_ext_runtime::declarative::{self, DeclarativeContributions};
+use bos_ext_runtime::extism::ExtismRuntime;
+use bos_ext_runtime::mcp::McpRuntime;
+use bos_ext_runtime::process::ProcessRuntime;
+use bos_ext_runtime::wasm::WasmRuntime;
+use bos_ext_runtime::workflow::WorkflowRuntime;
+use bos_ext_runtime::{empty_schema, CallContext, LazyRuntime, Runtime, ToolDescriptor};
 use serde_json::Value;
 
 /// The configuration that decides which store and which packages a host owns.
@@ -504,7 +504,7 @@ pub(crate) struct AppliedExtension {
     pub(crate) info: crate::plugins::PluginInfo,
     fiber: Fiber,
     lease: contribution::ContributionLease,
-    services: Arc<super::composable::ServiceRegistry>,
+    services: Arc<bos_ext_core::composable::ServiceRegistry>,
     extension_id: String,
     workspace: Option<PathBuf>,
     session_id: String,
@@ -517,10 +517,10 @@ impl AppliedExtension {
     /// service name and visibility scope in its manifest.
     pub(crate) fn provide_service<T>(
         &mut self,
-        scope: super::composable::Scope,
+        scope: bos_ext_core::composable::Scope,
         name: &str,
         service: Arc<T>,
-    ) -> Option<super::composable::ServiceToken>
+    ) -> Option<bos_ext_core::composable::ServiceToken>
     where
         T: std::any::Any + Send + Sync,
     {
@@ -558,9 +558,9 @@ impl AppliedExtension {
     /// requirement. The returned lease must be held for the full call.
     pub(crate) fn acquire_service<T>(
         &self,
-        scope: &super::composable::Scope,
+        scope: &bos_ext_core::composable::Scope,
         name: &str,
-    ) -> Option<super::composable::ServiceLease<T>>
+    ) -> Option<bos_ext_core::composable::ServiceLease<T>>
     where
         T: std::any::Any + Send + Sync,
     {
@@ -600,7 +600,7 @@ impl AppliedExtension {
         mut self,
         agent: &mut ::agent::Agent,
         registry: &mut ::agent::plugins::PluginRegistry,
-    ) -> Result<usize, super::composable::FiberTransitionError> {
+    ) -> Result<usize, bos_ext_core::composable::FiberTransitionError> {
         self.fiber.unload()?;
         Ok(self.lease.revoke(agent, registry))
     }
@@ -610,7 +610,7 @@ impl AppliedExtension {
         mut self,
         agent: &mut ::agent::Agent,
         registry: &mut ::agent::plugins::PluginRegistry,
-    ) -> Result<DisposalReport, super::composable::FiberTransitionError> {
+    ) -> Result<DisposalReport, bos_ext_core::composable::FiberTransitionError> {
         let report = self.fiber.dispose_async().await?;
         let _ = self.lease.revoke(agent, registry);
         Ok(report)
@@ -622,7 +622,7 @@ impl AppliedExtension {
     }
 
     /// The service registry this activation resolves against.
-    pub(crate) fn services(&self) -> Arc<super::composable::ServiceRegistry> {
+    pub(crate) fn services(&self) -> Arc<bos_ext_core::composable::ServiceRegistry> {
         Arc::clone(&self.services)
     }
 
@@ -658,8 +658,8 @@ impl AppliedExtension {
 
 #[cfg(test)]
 mod service_scope_tests {
-    use super::super::composable::Scope;
     use super::{service_scope_is_activation_owned, service_scope_matches};
+    use bos_ext_core::composable::Scope;
     use bos_ext_core::manifest::ServiceScope;
     use std::path::Path;
 
@@ -757,23 +757,23 @@ mod service_scope_tests {
 
 /// Whether a scope's lifetime is no longer than one AppliedExtension Fiber.
 fn service_scope_is_activation_owned(
-    requested: &super::composable::Scope,
+    requested: &bos_ext_core::composable::Scope,
     extension_id: &str,
 ) -> bool {
     matches!(
         requested,
-        super::composable::Scope::Extension(id) if id == extension_id
+        bos_ext_core::composable::Scope::Extension(id) if id == extension_id
     )
 }
 
 fn service_scope_matches(
     declared: &bos_ext_core::manifest::ServiceScope,
-    requested: &super::composable::Scope,
+    requested: &bos_ext_core::composable::Scope,
     extension_id: &str,
     workspace: Option<&Path>,
     session_id: &str,
 ) -> bool {
-    use super::composable::Scope;
+    use bos_ext_core::composable::Scope;
     use bos_ext_core::manifest::ServiceScope;
     match (declared, requested) {
         (ServiceScope::Host, Scope::Host) => true,
@@ -810,7 +810,7 @@ pub(crate) struct ExtensionHost {
     store: ExtensionStore,
     policy: Arc<PolicyEngine>,
     events: Arc<EventBus>,
-    services: Arc<super::composable::ServiceRegistry>,
+    services: Arc<bos_ext_core::composable::ServiceRegistry>,
     terminal_token: Option<ServiceToken>,
     manager: LifecycleManager,
     loaded: BTreeMap<String, LoadedExtension>,
@@ -832,7 +832,7 @@ pub(crate) struct LanguageEntry {
     /// Package that owns the descriptor.
     pub(crate) owner: ExtensionId,
     /// Descriptor.
-    pub(crate) contribution: super::runtime::declarative::LanguageContribution,
+    pub(crate) contribution: bos_ext_runtime::declarative::LanguageContribution,
 }
 
 /// One external-system integration contributed by an applied extension.
@@ -841,12 +841,12 @@ pub(crate) struct IntegrationEntry {
     /// Package that owns the descriptor.
     pub(crate) owner: ExtensionId,
     /// Descriptor.
-    pub(crate) contribution: super::runtime::declarative::IntegrationContribution,
+    pub(crate) contribution: bos_ext_runtime::declarative::IntegrationContribution,
 }
 
 impl ExtensionHost {
     /// The host-scoped service registry shared by its extension activations.
-    pub(crate) fn services(&self) -> Arc<super::composable::ServiceRegistry> {
+    pub(crate) fn services(&self) -> Arc<bos_ext_core::composable::ServiceRegistry> {
         Arc::clone(&self.services)
     }
 
@@ -878,7 +878,7 @@ impl ExtensionHost {
             store,
             policy,
             events,
-            services: Arc::new(super::composable::ServiceRegistry::new()),
+            services: Arc::new(bos_ext_core::composable::ServiceRegistry::new()),
             terminal_token: None,
             manager: LifecycleManager::new(),
             loaded: BTreeMap::new(),
@@ -1252,7 +1252,7 @@ impl ExtensionHost {
                     .iter()
                     .map(|package| package.manifest.clone())
                     .collect();
-                match super::composable::plan_service_dependencies(&manifests) {
+                match bos_ext_core::composable::plan_service_dependencies(&manifests) {
                     Ok(plan) => {
                         ordered = plan.order;
                     }
@@ -1614,7 +1614,7 @@ impl ExtensionHost {
                 ))
             }
             RuntimeKind::Cordis => {
-                let runtime = super::runtime::cordis::CordisRuntime::new(
+                let runtime = bos_ext_runtime::cordis::CordisRuntime::new(
                     &package.manifest,
                     &package.root,
                     &data_root,
@@ -2169,13 +2169,12 @@ impl ExtensionHost {
     /// is written to that package's extension config before the host rebuilds,
     /// so lowering a patch row is an actual mount, not only a plan.
     pub(crate) fn mount_profile(&mut self, path: &Path) -> Result<Vec<String>, ExtensionError> {
-        let entries =
-            super::composable::plan::load_cordis_patch(path, "profile").map_err(|error| {
-                ExtensionError::Runtime {
-                    extension: "profile".to_string(),
-                    message: error.to_string(),
-                }
-            })?;
+        let entries = bos_ext_core::composable::plan::load_cordis_patch(path, "profile").map_err(
+            |error| ExtensionError::Runtime {
+                extension: "profile".to_string(),
+                message: error.to_string(),
+            },
+        )?;
         let candidates: Vec<_> = entries
             .iter()
             .filter(|entry| entry.enabled && !entry.group)

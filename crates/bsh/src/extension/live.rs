@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::agent::ContributionLease;
-use super::composable::ServiceRegistry;
+use bos_ext_core::composable::ServiceRegistry;
 
 /// One activation watched by the driver.
 pub(crate) struct LiveEntry {

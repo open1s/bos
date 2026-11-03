@@ -28,7 +28,6 @@ mod agent;
 use std::sync::Arc;
 
 mod cli;
-pub(crate) mod composable;
 #[cfg(test)]
 mod e2e;
 mod errors;
@@ -40,11 +39,14 @@ pub(crate) mod terminal;
 pub(crate) use host::shutdown;
 
 /// The process-wide event dispatcher for extension tool seams.
-static DISPATCHER: std::sync::OnceLock<Arc<composable::dispatch::EventDispatcher>> =
+static DISPATCHER: std::sync::OnceLock<Arc<bos_ext_core::composable::dispatch::EventDispatcher>> =
     std::sync::OnceLock::new();
 
-pub(crate) fn dispatcher() -> Arc<composable::dispatch::EventDispatcher> {
-    Arc::clone(DISPATCHER.get_or_init(|| Arc::new(composable::dispatch::EventDispatcher::new())))
+pub(crate) fn dispatcher() -> Arc<bos_ext_core::composable::dispatch::EventDispatcher> {
+    Arc::clone(
+        DISPATCHER
+            .get_or_init(|| Arc::new(bos_ext_core::composable::dispatch::EventDispatcher::new())),
+    )
 }
 
 /// A process-wide Tokio runtime for extension work that starts outside a Tokio
@@ -79,7 +81,6 @@ pub(crate) fn store_root(settings: &crate::settings::Settings) -> std::path::Pat
 }
 mod lifecycle;
 pub(crate) mod market;
-pub(crate) mod runtime;
 
 pub(crate) use bos_ext_core::events::topics;
 pub(crate) use host::{

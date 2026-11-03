@@ -7,6 +7,7 @@
 pub mod bridge;
 pub mod builtin;
 pub mod contract;
+pub use contract::*;
 pub mod hook;
 pub mod hooks;
 #[cfg(feature = "declarative")]

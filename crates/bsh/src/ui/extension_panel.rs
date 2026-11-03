@@ -12,13 +12,13 @@ use gpui_kit::component::button::Button;
 use gpui_kit::*;
 
 use crate::extension::host::PanelSurface;
-use crate::extension::runtime::CallContext;
 use crate::theme;
 use bos_ext_core::types::ExtensionError;
 use bos_ext_core::ui::{
     ButtonStyle, NotificationLevel, PanelLocation, ThemePalette, UiActionRequest, UiDocument,
     UiNode, UiSession,
 };
+use bos_ext_runtime::CallContext;
 
 use super::{icon, txt, IconName};
 
@@ -819,11 +819,11 @@ impl Render for ExtensionPanelView {
 mod tests {
     use super::ExtensionPanelView;
     use crate::extension::host::PanelSurface;
-    use crate::extension::runtime::{CallContext, Runtime, ToolDescriptor};
     use crate::theme;
     use async_trait::async_trait;
     use bos_ext_core::types::{ExtensionError, ExtensionId, RuntimeKind};
     use bos_ext_core::ui::{PanelLocation, ThemePalette, UiDocument};
+    use bos_ext_runtime::{CallContext, Runtime, ToolDescriptor};
     use serde_json::Value;
     use std::sync::Arc;
 

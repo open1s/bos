@@ -1,13 +1,12 @@
 # BOS Extension Framework (bos-ext)
 
 Status: Phase 5 in progress — manifest 2.0 envelope, migration and dual-version
-loading are live; BSH now imports types/capability/manifest/package/signing/
-resolver/config/sources/ui/events directly from bos-ext-core, and those Phase-1
-re-export modules are deleted. Phase 3 host wiring is still partial: every
-standard runtime and the Node bridge live in bos-ext-runtime, and bos-ext-core
-exposes HostSpec, the Host bundle and an ExtensionManager with
-open/install/plan/apply/reload. BSH is still the only host implementation that
-fills the ports.
+loading are live. BSH imports core primitives and standard runtimes directly;
+the Phase-1 composable/runtime/core re-export modules are deleted (only the
+terminal/hooks adapters and the `topics` convenience alias remain). Phase 3 host
+wiring is still partial: bos-ext-core exposes HostSpec, the Host bundle and an
+ExtensionManager with open/install/plan/apply/reload, but BSH's ExtensionHost is
+still its own implementation.
 
 ## Goal
 

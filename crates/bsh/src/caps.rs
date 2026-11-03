@@ -4289,9 +4289,10 @@ mod tests {
             !built.extension_activations.is_empty(),
             "the production build retains the package Fiber handle"
         );
-        assert!(built.extension_activations.iter().all(
-            |activation| activation.state() == crate::extension::composable::FiberState::Active
-        ));
+        assert!(built
+            .extension_activations
+            .iter()
+            .all(|activation| activation.state() == bos_ext_core::composable::FiberState::Active));
 
         // The path-installed package above is served by the legacy DSH shim,
         // whose synchronous tool carries no gate. The Fiber-owned gate belongs

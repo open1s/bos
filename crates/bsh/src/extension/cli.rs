@@ -10,9 +10,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::extension::host::{DiagnosticsReport, ExtensionHost, ExtensionStatus, HostConfig};
-use crate::extension::runtime::declarative::{load_contributions, DeclarativeRuntime};
-use crate::extension::runtime::mcp::McpRuntime;
-use crate::extension::runtime::process::ProcessRuntime;
 use bos_ext_core::capability::{Capability, GrantScope};
 use bos_ext_core::manifest::MANIFEST_FILE;
 use bos_ext_core::package::{package_hash, ExtensionStore, Package};
@@ -22,6 +19,9 @@ use bos_ext_core::signing::{
 };
 use bos_ext_core::sources::{self, RegistryList};
 use bos_ext_core::types::{ExtensionId, ExtensionSource, RuntimeKind, TrustLevel};
+use bos_ext_runtime::declarative::{load_contributions, DeclarativeRuntime};
+use bos_ext_runtime::mcp::McpRuntime;
+use bos_ext_runtime::process::ProcessRuntime;
 
 const USAGE: &str = "bsh ext <command> [options]
 
@@ -428,7 +428,7 @@ fn validate_runtime(package: &Package) -> Result<(), String> {
             if !package.root.join(entry).is_file() {
                 return Err(format!("runtime.entry {entry} is missing"));
             }
-            crate::extension::runtime::load_tool_descriptors(&package.root, &package.manifest)
+            bos_ext_runtime::load_tool_descriptors(&package.root, &package.manifest)
                 .map_err(|error| error.to_string())?;
             load_contributions(&package.root, &package.manifest)
                 .map(|_| ())
@@ -1437,71 +1437,70 @@ fn command_mock(args: &[String]) -> Result<i32, String> {
     let events = std::sync::Arc::new(bos_ext_core::events::EventBus::new());
     let id = package.id().clone();
     let config = serde_json::json!({ "mock": true }).to_string();
-    let runtime: std::sync::Arc<dyn crate::extension::runtime::Runtime> =
-        match package.manifest.runtime.kind {
-            RuntimeKind::Declarative => std::sync::Arc::new(
-                DeclarativeRuntime::new(&path, &package.manifest)
-                    .map_err(|error| error.to_string())?,
-            ),
-            RuntimeKind::Process => std::sync::Arc::new(
-                ProcessRuntime::new(&package.manifest, &path)
-                    .map_err(|error| error.to_string())?
-                    .with_config(config.clone())
-                    .with_events(
-                        std::sync::Arc::clone(&events),
-                        &package.manifest.contributes.events,
-                    ),
-            ),
-            RuntimeKind::Mcp => std::sync::Arc::new(
-                McpRuntime::new(
-                    &package.manifest,
-                    &path,
-                    config.clone(),
-                    std::sync::Arc::clone(&policy),
-                    TrustLevel::Local,
+    let runtime: std::sync::Arc<dyn bos_ext_runtime::Runtime> = match package.manifest.runtime.kind
+    {
+        RuntimeKind::Declarative => std::sync::Arc::new(
+            DeclarativeRuntime::new(&path, &package.manifest).map_err(|error| error.to_string())?,
+        ),
+        RuntimeKind::Process => std::sync::Arc::new(
+            ProcessRuntime::new(&package.manifest, &path)
+                .map_err(|error| error.to_string())?
+                .with_config(config.clone())
+                .with_events(
                     std::sync::Arc::clone(&events),
-                )
-                .map_err(|error| error.to_string())?,
-            ),
-            RuntimeKind::WasmComponent => std::sync::Arc::new(
-                crate::extension::runtime::wasm::WasmRuntime::new(
-                    &package.manifest,
-                    &path,
-                    &data_root,
-                    std::sync::Arc::clone(&policy),
-                    std::sync::Arc::clone(&events),
-                    None,
-                    config.clone(),
-                    TrustLevel::Local,
-                )
-                .map_err(|error| error.to_string())?,
-            ),
-            RuntimeKind::Extism => std::sync::Arc::new(
-                crate::extension::runtime::extism::ExtismRuntime::new(
-                    &package.manifest,
-                    &path,
-                    &data_root,
-                    std::sync::Arc::clone(&policy),
-                    std::sync::Arc::clone(&events),
-                    None,
-                    config,
-                    TrustLevel::Local,
-                )
-                .map_err(|error| error.to_string())?,
-            ),
-            RuntimeKind::Cordis => std::sync::Arc::new(
-                crate::extension::runtime::cordis::CordisRuntime::new(
-                    &package.manifest,
-                    &path,
-                    &data_root,
-                    Arc::new(crate::extension::terminal::HostTerminal),
-                )
-                .map_err(|error| error.to_string())?,
-            ),
-            RuntimeKind::Builtin => {
-                return Err("the built-in runtime has no development mock".to_string());
-            }
-        };
+                    &package.manifest.contributes.events,
+                ),
+        ),
+        RuntimeKind::Mcp => std::sync::Arc::new(
+            McpRuntime::new(
+                &package.manifest,
+                &path,
+                config.clone(),
+                std::sync::Arc::clone(&policy),
+                TrustLevel::Local,
+                std::sync::Arc::clone(&events),
+            )
+            .map_err(|error| error.to_string())?,
+        ),
+        RuntimeKind::WasmComponent => std::sync::Arc::new(
+            bos_ext_runtime::wasm::WasmRuntime::new(
+                &package.manifest,
+                &path,
+                &data_root,
+                std::sync::Arc::clone(&policy),
+                std::sync::Arc::clone(&events),
+                None,
+                config.clone(),
+                TrustLevel::Local,
+            )
+            .map_err(|error| error.to_string())?,
+        ),
+        RuntimeKind::Extism => std::sync::Arc::new(
+            bos_ext_runtime::extism::ExtismRuntime::new(
+                &package.manifest,
+                &path,
+                &data_root,
+                std::sync::Arc::clone(&policy),
+                std::sync::Arc::clone(&events),
+                None,
+                config,
+                TrustLevel::Local,
+            )
+            .map_err(|error| error.to_string())?,
+        ),
+        RuntimeKind::Cordis => std::sync::Arc::new(
+            bos_ext_runtime::cordis::CordisRuntime::new(
+                &package.manifest,
+                &path,
+                &data_root,
+                Arc::new(crate::extension::terminal::HostTerminal),
+            )
+            .map_err(|error| error.to_string())?,
+        ),
+        RuntimeKind::Builtin => {
+            return Err("the built-in runtime has no development mock".to_string());
+        }
+    };
     let runtime_for_call = std::sync::Arc::clone(&runtime);
     let result = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1526,8 +1525,7 @@ fn command_mock(args: &[String]) -> Result<i32, String> {
             if !tools.iter().any(|tool| tool.id.as_str() == tool_id) {
                 return Err(format!("{id} has no tool {tool_id}"));
             }
-            let context =
-                crate::extension::runtime::CallContext::new(id.clone(), "mock", None, 30_000);
+            let context = bos_ext_runtime::CallContext::new(id.clone(), "mock", None, 30_000);
             let (progress_tx, mut progress_rx) =
                 tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
             let printer = tokio::spawn(async move {
