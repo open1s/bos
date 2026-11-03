@@ -3722,6 +3722,18 @@ tools = ["echo"]
     }
 
     #[test]
+    fn the_manager_activates_an_applied_package() {
+        let root = scratch("manager-activation");
+        let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/extensions/hello");
+        let mut host = ExtensionHost::open(config(&root)).expect("host");
+        host.store.install(&source).expect("install");
+        host.rebuild().expect("rebuild");
+        host.activate_through_manager()
+            .expect("manager activation succeeds");
+    }
+
+    #[test]
     fn the_framework_manager_opens_the_host_root() {
         let root = scratch("framework-manager");
         let host = ExtensionHost::open(config(&root)).expect("host");
