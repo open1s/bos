@@ -275,6 +275,7 @@ model = "nvidia/your-model"
 | [Python 使用指南](docs/python-user-guide.md) | 在 Python 中使用 BOS |
 | [JavaScript 使用指南](docs/javascript-user-guide.md) | 在 Node.js / JavaScript 中使用 BOS |
 | [BSH 扩展平台](docs/bsh-extension.md) | Manifest、运行时、能力、CLI、安全与开发 |
+| [BSH 内置工具 2.0](docs/bsh-built-in-tools-2.0.md) | 面向 LLM 的工具契约、批量文件操作、输出预算与基准测试计划 |
 | [贡献者上手指南](ONBOARDING.md) | 配置开发环境 |
 | [设置](docs/bsh-settings-spec.md) · [终端策略](docs/bsh-terminal-policy.md) · [Hooks](docs/bsh-hook-system.md) | 子系统规范 |
 | [REX 指南](docs/rex-user-guide.md) · [诊断](docs/diagnostics.md) | 资源工具与故障排查 |
