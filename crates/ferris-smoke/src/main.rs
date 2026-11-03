@@ -1,56 +1,46 @@
 //! Compiles the SDK without BSH, agent or GPUI in the dependency graph.
 
-use ferris_core::manifest_v2::ManifestV2;
-use ferris_core::{Contribution, ExtError, InvokeContext};
-use ferris_sdk::{Call, ContributionBuilder, Extension, ExtensionContext};
-use serde_json::Value;
-
-const MANIFEST: &str = r#"
-schema_version = "2.0"
-[extension]
-id = "com.example.demo"
-name = "Demo"
-version = "1.0.0"
-description = "SDK smoke extension"
-[compatibility]
-host = ">=3.0.0"
-extension_api = ">=1.0.0"
-[runtime]
-kind = "builtin"
-[[contribution]]
-kind = "demo.echo"
-id = "echo"
-"#;
+use ferris_core::{Contribution, InvokeContext};
+use ferris_sdk::prelude::*;
 
 struct Demo;
 
-#[async_trait::async_trait]
+#[async_trait]
 impl Extension for Demo {
-    fn manifest(&self) -> &'static str {
-        MANIFEST
+    fn manifest(&self) -> ExtensionManifest {
+        ManifestBuilder::new("com.example.demo", "Demo", "1.0.0", "SDK smoke extension")
+            .runtime("builtin")
+            .capability("agent.tools.register")
+            .contribution(ContributionSpec::tool("echo"))
+            .build()
+            .expect("manifest")
     }
 
-    async fn start(&self, _ctx: &ExtensionContext) -> Result<Vec<Contribution>, ExtError> {
-        Ok(vec![ContributionBuilder::new("demo.echo", "echo")
-            .payload(serde_json::json!({}))
-            .build()])
+    async fn start(&self, _ctx: &ExtensionContext) -> Result<Vec<Contribution>> {
+        Ok(vec![
+            ContributionSpec::tool("echo").into_contribution(json!({ "description": "Echo" }))
+        ])
     }
 
-    async fn invoke(&self, _call: &Call, _ctx: &InvokeContext) -> Result<Value, ExtError> {
-        Ok(serde_json::json!({ "ok": true }))
+    async fn invoke(&self, call: &Call, _ctx: &InvokeContext) -> Result<Value> {
+        Ok(call.input.clone())
     }
 }
 
-fn main() {
-    let manifest = ManifestV2::parse(Demo.manifest(), std::path::Path::new("extension.toml"))
-        .expect("manifest");
-    assert_eq!(manifest.extension.id.as_str(), "com.example.demo");
-    assert_eq!(manifest.runtime.kind, "builtin");
-    assert_eq!(manifest.contributions.len(), 1);
-    let contribution = ContributionBuilder::new("demo.echo", "echo")
-        .payload(serde_json::json!({ "kind": "demo" }))
-        .build();
-    assert_eq!(contribution.kind, "demo.echo");
-    assert_eq!(contribution.id, "echo");
-    let _ = Demo;
+#[tokio::main]
+async fn main() {
+    let manifest = Demo.manifest();
+    assert_eq!(manifest.id().as_str(), "com.example.demo");
+    assert_eq!(manifest.runtime_kind(), "builtin");
+    assert!(manifest.to_toml().contains("[[contribution]]"));
+    let harness =
+        TestHarness::new(Demo, std::path::PathBuf::from("/tmp/ferris-demo")).expect("harness");
+    let contributions = harness.start().await.expect("start");
+    assert_eq!(contributions.len(), 1);
+    let value = harness
+        .invoke("echo", json!({ "ok": true }))
+        .await
+        .expect("invoke");
+    assert_eq!(value, json!({ "ok": true }));
+    harness.shutdown().await.expect("shutdown");
 }

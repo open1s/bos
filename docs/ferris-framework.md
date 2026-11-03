@@ -8,7 +8,8 @@ contributions; migrated packages validate, `bsh ext validate` reports
 `schema: 2.0` plus the generic contribution count, and `bsh ext graph` reads
 effects from the 2.0 generic contribution list. The independent `ferris-smoke`
 binary parses a 2.0 manifest with no BSH dependency, and the SDK carries unit
-tests for its author runtime adapter.
+tests for its author runtime adapter. The author guide is
+[ferris-sdk.md](ferris-sdk.md).
 
 BSH imports core primitives and standard runtimes directly; the Phase-1
 composable/runtime/core re-export modules are deleted, and the lifecycle state

@@ -1,202 +1,115 @@
 #![warn(missing_docs)]
-//! Author-facing SDK for the BOS extension framework.
+//! Author-facing SDK for the Ferris extension framework.
 //!
-//! An extension implements the Extension trait and ships a 2.0 manifest.
-//! There is no macro DSL: the manifest stays the single author entry point.
+//! An extension implements Extension and builds its manifest with
+//! ManifestBuilder. Contributions are typed by ContributionSpec, and
+//! ExtensionRuntime adapts the author interface to the framework runtime
+//! trait. There is no macro DSL: the manifest remains the single entry point.
 
-use ferris_core::{
-    Contribution, ContributionRef, ExtError, InvokeContext, Runtime, RuntimeContext,
-};
-use serde_json::Value;
+pub mod contribution;
+pub mod error;
+pub mod manifest;
+pub mod runtime;
 
-/// One invocation addressed to an extension.
-#[derive(Debug, Clone)]
-pub struct Call {
-    /// Contribution being invoked.
-    pub contribution: ContributionRef,
-    /// Opaque input.
-    pub input: Value,
-}
+pub use contribution::{kinds, ContributionSpec};
+pub use error::{ErrorCode, ExtError, Result};
+pub use manifest::{ExtensionManifest, ManifestBuilder};
+pub use runtime::{Call, Extension, ExtensionContext, ExtensionRuntime, TestHarness};
 
-/// Context available while an extension starts.
-#[derive(Debug, Clone)]
-pub struct ExtensionContext {
-    /// Framework runtime context.
-    pub runtime: RuntimeContext,
-}
-
-/// Author-facing extension interface.
-#[async_trait::async_trait]
-pub trait Extension: Send + Sync {
-    /// The extension manifest, schema 2.0.
-    fn manifest(&self) -> &'static str;
-
-    /// Start and return contributions.
-    async fn start(&self, ctx: &ExtensionContext) -> Result<Vec<Contribution>, ExtError>;
-
-    /// Invoke one contribution.
-    async fn invoke(&self, call: &Call, ctx: &InvokeContext) -> Result<Value, ExtError>;
-
-    /// Shut down.
-    async fn shutdown(&self) -> Result<(), ExtError> {
-        Ok(())
-    }
-}
-
-/// Typed builder for one contribution payload.
-#[derive(Debug, Clone)]
-pub struct ContributionBuilder {
-    kind: String,
-    id: String,
-    payload: Value,
-}
-
-impl ContributionBuilder {
-    /// Start a contribution of one host-registered kind.
-    pub fn new(kind: impl Into<String>, id: impl Into<String>) -> Self {
-        Self {
-            kind: kind.into(),
-            id: id.into(),
-            payload: Value::Null,
-        }
-    }
-
-    /// Set the opaque payload.
-    pub fn payload(mut self, payload: Value) -> Self {
-        self.payload = payload;
-        self
-    }
-
-    /// Build the contribution.
-    pub fn build(self) -> Contribution {
-        Contribution {
-            kind: self.kind,
-            id: self.id,
-            payload: self.payload,
-        }
-    }
-}
-
-/// Adapt an author Extension into the low-level Runtime interface.
-pub struct ExtensionRuntime<E> {
-    extension: E,
-    kind: String,
-    root: std::path::PathBuf,
-}
-
-impl<E: Extension> ExtensionRuntime<E> {
-    /// Wrap an extension as a runtime.
-    pub fn new(extension: E, kind: impl Into<String>, root: std::path::PathBuf) -> Self {
-        Self {
-            extension,
-            kind: kind.into(),
-            root,
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl<E: Extension> Runtime for ExtensionRuntime<E> {
-    fn kind(&self) -> &str {
-        &self.kind
-    }
-
-    async fn start(&self, ctx: &RuntimeContext) -> Result<Vec<Contribution>, ExtError> {
-        if ctx.root != self.root {
-            return Err(ExtError {
-                code: ferris_core::ErrorCode::Runtime,
-                message: "extension runtime root does not match its context".to_string(),
-                details: Value::Null,
-            });
-        }
-        self.extension
-            .start(&ExtensionContext {
-                runtime: ctx.clone(),
-            })
-            .await
-    }
-
-    async fn invoke(
-        &self,
-        contribution: &ContributionRef,
-        input: Value,
-        ctx: &InvokeContext,
-    ) -> Result<Value, ExtError> {
-        self.extension
-            .invoke(
-                &Call {
-                    contribution: contribution.clone(),
-                    input,
-                },
-                ctx,
-            )
-            .await
-    }
-
-    async fn shutdown(&self) -> Result<(), ExtError> {
-        self.extension.shutdown().await
-    }
+/// Common authoring imports.
+pub mod prelude {
+    pub use crate::contribution::{kinds, ContributionSpec};
+    pub use crate::error::{ErrorCode, ExtError, Result};
+    pub use crate::manifest::{ExtensionManifest, ManifestBuilder};
+    pub use crate::runtime::{Call, Extension, ExtensionContext, ExtensionRuntime, TestHarness};
+    pub use async_trait::async_trait;
+    pub use serde_json::{json, Value};
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferris_core::types::ExtensionId;
+    use crate::contribution::ContributionSpec;
+    use serde_json::Value;
 
     struct Echo;
 
     #[async_trait::async_trait]
     impl Extension for Echo {
-        fn manifest(&self) -> &'static str {
-            "schema_version = \"2.0\""
+        fn manifest(&self) -> ExtensionManifest {
+            ManifestBuilder::new("com.example.echo", "Echo", "1.0.0", "Echoes its input")
+                .capability("agent.tools.register")
+                .contribution(ContributionSpec::tool("echo"))
+                .build()
+                .expect("manifest")
         }
 
-        async fn start(&self, _ctx: &ExtensionContext) -> Result<Vec<Contribution>, ExtError> {
-            Ok(vec![ContributionBuilder::new("demo.echo", "echo").build()])
+        async fn start(&self, _ctx: &ExtensionContext) -> Result<Vec<ferris_core::Contribution>> {
+            Ok(vec![ContributionSpec::tool("echo").into_contribution(
+                serde_json::json!({"description": "Echo"}),
+            )])
         }
 
-        async fn invoke(&self, call: &Call, _ctx: &InvokeContext) -> Result<Value, ExtError> {
+        async fn invoke(&self, call: &Call, _ctx: &ferris_core::InvokeContext) -> Result<Value> {
             Ok(call.input.clone())
         }
     }
 
     #[tokio::test]
     async fn the_runtime_adapter_starts_and_invokes() {
-        let root = std::path::PathBuf::from("/tmp/demo");
-        let runtime = ExtensionRuntime::new(Echo, "builtin", root.clone());
-        let contributions = runtime
-            .start(&RuntimeContext {
-                extension: "com.example.demo".to_string(),
-                root: root.clone(),
-                data_root: root.join("data"),
-            })
-            .await
-            .expect("start");
+        let root = std::path::PathBuf::from("/tmp/echo");
+        let harness = TestHarness::new(Echo, root.clone()).expect("harness");
+        let contributions = harness.start().await.expect("start");
         assert_eq!(contributions.len(), 1);
-        let value = runtime
-            .invoke(
-                &ContributionRef {
-                    kind: "demo.echo".to_string(),
-                    id: "echo".to_string(),
-                },
-                serde_json::json!({"ok": true}),
-                &InvokeContext {
-                    correlation: "c".to_string(),
-                    timeout_ms: 100,
-                },
-            )
+        let value = harness
+            .invoke("echo", serde_json::json!({"ok": true}))
             .await
             .expect("invoke");
         assert_eq!(value, serde_json::json!({"ok": true}));
+        harness.shutdown().await.expect("shutdown");
     }
 
     #[test]
-    fn the_contribution_builder_is_typed() {
-        let contribution = ContributionBuilder::new("demo.echo", "echo")
-            .payload(serde_json::json!({"a": 1}))
-            .build();
-        assert_eq!(contribution.kind, "demo.echo");
-        assert_eq!(contribution.id, "echo");
-        let _ = ExtensionId::parse("com.example.demo").expect("id");
+    fn every_standard_contribution_kind_is_typed() {
+        let specs = [
+            ContributionSpec::tool("t"),
+            ContributionSpec::command("c"),
+            ContributionSpec::panel("p"),
+            ContributionSpec::prompt("pr"),
+            ContributionSpec::context("ctx"),
+            ContributionSpec::skill("s"),
+            ContributionSpec::workflow("w"),
+            ContributionSpec::theme("th"),
+            ContributionSpec::preset("ps"),
+            ContributionSpec::model_provider("mp"),
+            ContributionSpec::agent_provider("ap"),
+            ContributionSpec::language("lang"),
+            ContributionSpec::integration("int"),
+            ContributionSpec::subscribe("event.one"),
+            ContributionSpec::publish("event.two"),
+            ContributionSpec::hook("model.request"),
+        ];
+        assert_eq!(specs.len(), 16);
+        assert_eq!(specs[0].kind, kinds::TOOL);
+        assert_eq!(specs[13].kind, kinds::EVENT_SUBSCRIBE);
+        assert_eq!(specs[15].kind, kinds::HOOK);
+    }
+
+    #[test]
+    fn the_manifest_builder_renders_a_valid_2_0_manifest() {
+        let manifest = ManifestBuilder::new("com.example.demo", "Demo", "1.0.0", "demo")
+            .author("Ferris")
+            .license("MIT")
+            .host(">=3.0.0")
+            .extension_api(">=1.0.0")
+            .capability("agent.tools.register")
+            .contribution(ContributionSpec::tool("echo"))
+            .contribution(ContributionSpec::command("refresh"))
+            .build()
+            .expect("manifest");
+        assert_eq!(manifest.id().as_str(), "com.example.demo");
+        assert_eq!(manifest.runtime_kind(), "declarative");
+        assert!(manifest.to_toml().contains("schema_version = \"2.0\""));
+        assert!(manifest.to_toml().contains("[[contribution]]"));
     }
 }
