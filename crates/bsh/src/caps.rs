@@ -5739,6 +5739,7 @@ mod tests {
                 "glob".to_string(),
                 "grep".to_string(),
                 "list_dir".to_string(),
+                "read_files".to_string(),
                 "write_file".to_string(),
             ]
         );
