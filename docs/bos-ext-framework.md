@@ -6,8 +6,9 @@ Status: Phase 3 in progress — every standard runtime and the Node bridge live
 in bos-ext-runtime; bos-ext-core now exposes the HostSpec boundary and an
 ExtensionManager that opens the canonical store, installs a local package,
 resolves an activation order, applies it through a runtime resolver and
-contribution sink, and reloads by plan diff. BSH is still the only host
-implementation.
+contribution sink, and reloads by plan diff. The Host bundle now names the contribution/event/
+audit/spawner/sandbox/trust/registry ports; BSH is still the only host
+implementation that fills them.
 
 ## Goal
 

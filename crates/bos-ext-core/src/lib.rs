@@ -22,6 +22,7 @@ pub mod terminal;
 pub mod composable;
 pub mod dispatch;
 pub mod manager;
+pub mod host;
 pub mod manifest;
 pub mod package;
 pub mod resolver;
