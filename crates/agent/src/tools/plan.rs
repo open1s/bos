@@ -295,7 +295,10 @@ mod tests {
         let items = tool.store().items();
         assert_eq!(items.len(), 2);
         assert!(items.iter().all(|item| !item.text.trim().is_empty()));
-        assert_eq!(items.iter().filter(|item| item.status == PlanStatus::InProgress).count(), 1);
+        assert_eq!(
+            items.iter().filter(|item| item.status == PlanStatus::InProgress).count(),
+            1
+        );
     }
 
     #[test]
@@ -365,7 +368,10 @@ mod tests {
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["required"][0], "items");
         assert_eq!(schema["properties"]["items"]["maxItems"], MAX_ITEMS);
-        assert_eq!(schema["properties"]["items"]["items"]["properties"]["text"]["maxLength"], MAX_TEXT);
+        assert_eq!(
+            schema["properties"]["items"]["items"]["properties"]["text"]["maxLength"],
+            MAX_TEXT
+        );
         assert_eq!(schema["additionalProperties"], false);
         let status = &schema["properties"]["items"]["items"]["properties"]["status"];
         assert_eq!(status["enum"][1], "in_progress");
