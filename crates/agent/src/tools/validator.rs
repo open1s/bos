@@ -163,10 +163,7 @@ fn validate_field(
 }
 
 fn numeric_value(value: &serde_json::Value) -> Option<f64> {
-    value
-        .as_f64()
-        .or_else(|| value.as_str().and_then(|text| text.parse::<f64>().ok()))
-        .filter(|number| number.is_finite())
+    value.as_f64().filter(|number| number.is_finite())
 }
 
 fn value_type(value: &serde_json::Value) -> &'static str {
@@ -309,6 +306,7 @@ mod tests {
         assert!(validate_args(&schema, &json!({"limit": 6, "items": ["a"]})).is_err());
         assert!(validate_args(&schema, &json!({"limit": 2.5, "items": ["a"]})).is_err());
         assert!(validate_args(&schema, &json!({"limit": 2, "items": ["a", "b", "c"]})).is_err());
+        assert!(validate_args(&schema, &json!({"limit": "3", "items": ["a"]})).is_err());
     }
 
     #[test]
