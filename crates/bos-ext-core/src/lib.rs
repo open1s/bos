@@ -10,6 +10,9 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[cfg(feature = "tokio")]
+pub mod effects;
+
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

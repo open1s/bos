@@ -7,8 +7,16 @@ authors.workspace = true
 license.workspace = true
 description = "Host-neutral core types for the BOS extension framework"
 
+[features]
+default = []
+tokio = ["dep:tokio"]
+
 [dependencies]
 async-trait.workspace = true
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio.workspace = true

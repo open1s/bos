@@ -1,6 +1,6 @@
 # BOS Extension Framework (bos-ext)
 
-Status: Phase 0 — public types and crate boundaries.
+Status: Phase 1 — effect scopes moved to bos-ext-core; BSH re-exports them.
 
 ## Goal
 
