@@ -7780,8 +7780,9 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
                 {"path": "src.rs", "edits": [{"old_string": "value", "new_string": "one"}]},
                 {"path": "src.rs", "edits": [{"old_string": "value", "new_string": "two"}]}
             ]}),
-        ).expect("per-file errors are reported");
-        assert!(duplicate["files"][1]["error"].as_str().is_some());
+        ).expect_err("duplicate targets reject the complete patch request");
+        assert!(duplicate.to_string().contains("duplicate target"));
+        assert_eq!(std::fs::read_to_string(root.join("src.rs")).expect("unchanged"), "value");
 
         let empty = registry.execute(
             "apply_patch",
