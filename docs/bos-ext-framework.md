@@ -9,6 +9,8 @@ wiring is partial: BSH has a `BosHostSpec` adapter and `framework_manager()`, an
 (invalid manifests are listed with an error), and `bsh ext install` writes
 through `ExtensionManager::install_package`; uninstall, enable/disable,
 versions, rollback, retry and quarantine go through the manager too.
+`LegacyAdapter` bridges the old tool-shaped runtime contract to the generic
+Runtime trait, so generic contributions can invoke every existing runtime.
 ExtensionHost still owns activation. bos-ext-core exposes HostSpec, the Host bundle and an
 ExtensionManager with open/install/plan/apply/reload.
 

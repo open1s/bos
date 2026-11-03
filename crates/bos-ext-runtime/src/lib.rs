@@ -4,6 +4,7 @@
 //! Phase 0 defines the runtime catalog and the feature boundary. Individual
 //! runtime implementations are migrated from BSH in Phase 2.
 
+pub mod adapter;
 pub mod bridge;
 pub mod builtin;
 pub mod contract;
