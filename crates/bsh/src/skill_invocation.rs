@@ -196,7 +196,7 @@ pub(crate) fn expand(agent: &Agent, content: Content) -> (Content, Vec<SkillInvo
             if leading_name.as_deref() == Some(name.as_str()) {
                 drop_token = true;
             }
-            let block = render_skill_content(skill);
+            let block = render_skill_content(&skill);
             blocks.push(block.clone());
             invoked.push(SkillInvocation {
                 name: name.clone(),

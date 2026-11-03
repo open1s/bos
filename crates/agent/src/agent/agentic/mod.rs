@@ -862,11 +862,45 @@ impl Agent {
     }
 
     /// Base skills plus the live extension overlay.
-    fn all_skills(&self) -> Vec<crate::skills::SkillContent> {
+    ///
+    /// The overlay is where a package's `SKILL.md` files land: the extension
+    /// platform loads them after the build, so `skills` alone is the
+    /// pre-extension set. Anything that answers "which skills does this agent
+    /// have" - the model catalogue, the `load_skill` tool, the reader's own
+    /// `/name` gesture, subagent inheritance - reads this method, so a skill
+    /// cannot be loadable and unlisted at the same time.
+    pub fn all_skills(&self) -> Vec<crate::skills::SkillContent> {
         let mut skills = self.skills.clone();
         if let Ok(live) = self.live_skills.read() {
             skills.extend(live.iter().cloned());
         }
+        skills
+    }
+
+    /// The skill catalogue this agent offers the model.
+    ///
+    /// A projection of [`Agent::all_skills`] with the model-invocable half
+    /// only: a skill whose manifest reserves it for the reader stays out, and
+    /// the overlay's own entries are included because a package's skills are
+    /// exactly as model-visible as a built-in one.
+    ///
+    /// Sorted by name because the catalogue is rendered into the system prompt
+    /// and is therefore part of the provider's cached prefix; de-duplicated
+    /// because the overlay and the base set have separate namespaces, with the
+    /// base entry winning a collision.
+    pub fn model_skills(&self) -> Vec<react::llm::Skill> {
+        let mut skills: Vec<react::llm::Skill> = self
+            .all_skills()
+            .iter()
+            .filter(|skill| !skill.metadata.user_only)
+            .map(|skill| react::llm::Skill {
+                category: skill.metadata.category.as_str().to_string(),
+                name: skill.metadata.name.clone(),
+                description: skill.metadata.description.clone(),
+            })
+            .collect();
+        skills.sort_by(|a, b| a.name.cmp(&b.name));
+        skills.dedup_by(|a, b| a.name == b.name);
         skills
     }
 
@@ -1143,8 +1177,12 @@ impl Agent {
     }
 
     /// Get skills schemas for LLM.
+    ///
+    /// Read from [`Agent::all_skills`]: a package's skills are exactly as
+    /// model-visible as a built-in one, and a schema list that skipped the live
+    /// overlay would describe a catalogue the request does not carry.
     pub fn get_skills_schemas(&self) -> Vec<serde_json::Value> {
-        self.skills
+        self.all_skills()
             .iter()
             .map(|skill| {
                 serde_json::json!({
@@ -1174,16 +1212,29 @@ impl Agent {
     /// path. A skill switched off in the host's settings was never registered,
     /// so it is absent here too, which is what keeps this eager path and the
     /// load_skill tool answering from one set.
-    pub fn skill(&self, name: &str) -> Option<&crate::skills::SkillContent> {
-        self.skills.iter().find(|skill| skill.metadata.name == name)
+    ///
+    /// The set includes the live overlay, so a package's skill answers the
+    /// `/name` gesture exactly as the catalogue and the loader do. The result
+    /// is owned because the overlay lives behind a lock, and the content is a
+    /// parse the caller is about to render anyway.
+    pub fn skill(&self, name: &str) -> Option<crate::skills::SkillContent> {
+        if let Some(skill) = self.skills.iter().find(|skill| skill.metadata.name == name) {
+            return Some(skill.clone());
+        }
+        self.live_skills.read().ok().and_then(|live| {
+            live.iter()
+                .find(|skill| skill.metadata.name == name)
+                .cloned()
+        })
     }
 
-    /// Every registered skill, in registration order.
+    /// Every skill registered at build time, in registration order.
     ///
-    /// A host that builds a second agent from this one - the shell's child
-    /// turn is exactly that - hands the parsed set across instead of walking
-    /// the sources again, so the two agents answer from one parse of one
-    /// catalogue.
+    /// This is the pre-extension set: a package's `SKILL.md` files are loaded
+    /// into the live overlay after the build and are not here. A host that
+    /// mirrors, inherits or displays the agent's skills wants
+    /// [`Agent::all_skills`] instead; this accessor stays for callers that
+    /// really mean "what the directory scan produced".
     pub fn skills(&self) -> &[crate::skills::SkillContent] {
         &self.skills
     }

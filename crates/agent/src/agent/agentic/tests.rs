@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use react::llm::vendor::{
     ChatCompletionResponse, ChatMessage, Choice, FunctionCall, ToolCall, Usage,
 };
-use react::llm::{LlmClient, LlmError, LlmRequest, LlmResponse, StreamToken};
+use react::llm::{LlmClient, LlmError, LlmRequest, LlmResponse, ReactSession, StreamToken};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -993,6 +993,109 @@ fn prepare_context_advertises_a_live_tool_once() {
         .filter(|tool| tool.name == "echo")
         .count();
     assert_eq!(count, 1, "one name, one array entry");
+}
+
+/// A mock that asks for `load_skill` first and reports, on the second call,
+/// whether the engine answered with the package's instructions.
+struct LoaderLlm {
+    calls: std::sync::atomic::AtomicUsize,
+    saw_instructions: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl LlmClient<AgentSession, AgentReactContext> for LoaderLlm {
+    async fn complete(
+        &self,
+        _persona: Option<String>,
+        _req: LlmRequest,
+        session: &mut AgentSession,
+        _context: &mut AgentReactContext,
+    ) -> Result<LlmResponse, LlmError> {
+        if self
+            .calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            == 0
+        {
+            return Ok(make_tool_call_response(
+                "load_skill",
+                r#"{"name":"extension-skill"}"#,
+            ));
+        }
+        let seen = session.history().is_some_and(|history| {
+            history.iter().any(|message| {
+                matches!(
+                    message,
+                    react::llm::LlmMessage::ToolResult { content, .. }
+                        if content.contains("PACKAGE INSTRUCTIONS")
+                )
+            })
+        });
+        self.saw_instructions
+            .store(seen, std::sync::atomic::Ordering::Relaxed);
+        Ok(make_text_response("final".to_string()))
+    }
+
+    async fn stream_complete(
+        &self,
+        _persona: Option<String>,
+        _req: LlmRequest,
+        _session: &mut AgentSession,
+        _context: &mut AgentReactContext,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamToken, LlmError>> + Send>>, LlmError> {
+        Ok(Box::pin(futures::stream::iter(vec![Ok(StreamToken::Done)])))
+    }
+
+    fn supports_tools(&self) -> bool {
+        true
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "toolmock"
+    }
+}
+
+/// A build whose ONLY skill comes from a package still gets `load_skill`.
+///
+/// The catalogue names the package's skill, so a build with no base skills used
+/// to advertise one it could not open: the loader was gated on the pre-extension
+/// set and never registered. A catalogue entry the loader cannot resolve is
+/// worse than no entry - the model has been told the skill exists.
+#[tokio::test]
+async fn a_package_only_skill_is_loadable_by_the_model() {
+    let saw_instructions = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let provider = {
+        let mut provider = LlmProvider::new();
+        provider.register_vendor(
+            "toolmock".to_string(),
+            Box::new(LoaderLlm {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                saw_instructions: Arc::clone(&saw_instructions),
+            }),
+        );
+        provider
+    };
+    let agent = Agent::new(AgentConfig::default(), Arc::new(provider));
+    agent.add_live_skill(crate::skills::SkillContent {
+        metadata: crate::skills::SkillMetadata::new(
+            "extension-skill".to_string(),
+            "a skill from a package".to_string(),
+            std::path::PathBuf::from("/ext/skills/extension-skill/SKILL.md"),
+        ),
+        instructions: "PACKAGE INSTRUCTIONS".to_string(),
+        skill_dir: std::path::PathBuf::from("/ext/skills/extension-skill"),
+    });
+
+    assert!(
+        agent.skill("extension-skill").is_some(),
+        "the reader's /name gesture resolves the same set"
+    );
+
+    let _ = agent.react("do the thing".to_string()).await;
+
+    assert!(
+        saw_instructions.load(std::sync::atomic::Ordering::Relaxed),
+        "the model's load_skill call must return the package's instructions"
+    );
 }
 
 /// The skill catalogue in the system prompt is the model's only way to learn a

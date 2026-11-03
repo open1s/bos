@@ -556,6 +556,16 @@ pub(crate) struct AppState {
     /// The meter's breakdown prices the request's tool schemas from exactly this
     /// array, so its figure follows the agent the next turn will run.
     pub(crate) tools_schema_chars: usize,
+    /// Skills the last built agent carried beyond the settings scan.
+    ///
+    /// A package's SKILL.md files are loaded after the build, so the settings
+    /// catalogue - which is what the slash menu reads - cannot see them. The
+    /// build records them here and the menu merges them, which is what makes an
+    /// active package's skill reachable from the list a reader types into.
+    agent_skills: Vec<AgentSkillRow>,
+    /// Bumped when `agent_skills` changes, so the menu's cached rows follow the
+    /// build without comparing the whole list on a keystroke.
+    agent_skills_generation: u64,
     /// The policy of the most recent build, kept so the audit pane can read it.
     pub(crate) policy: Option<Arc<agent::policy::PolicySet>>,
     /// The audit snapshot the policy pane last read.
@@ -819,6 +829,8 @@ impl AppState {
             stat_open: false,
             meter_open: false,
             tools_schema_chars: 0,
+            agent_skills: Vec::new(),
+            agent_skills_generation: 0,
             policy: None,
             policy_audit: None,
             policy_generation: 0,

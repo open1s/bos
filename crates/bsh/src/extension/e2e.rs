@@ -434,6 +434,35 @@ async fn the_allinone_example_covers_every_declared_contribution_kind() {
         "integrations: {:?}",
         status.integrations
     );
+
+    // An active package's SKILL.md is only useful to the model when it reaches
+    // the model-facing surface: the catalogue is rendered from
+    // Agent::model_skills, and load_skill answers from Agent::all_skills. A
+    // host status row proves the package parses, not that the model can see it.
+    let mut agent = ::agent::Agent::from_config(::agent::AgentConfig::default());
+    let mut registry = ::agent::plugins::PluginRegistry::default();
+    let applied = host.apply_with_fibers(&mut agent, &mut registry, None, "session");
+    assert!(
+        !applied.is_empty(),
+        "the allinone package activates on a real agent build"
+    );
+    let catalogue: Vec<String> = agent
+        .model_skills()
+        .into_iter()
+        .map(|skill| skill.name)
+        .collect();
+    assert!(
+        catalogue.iter().any(|name| name == "allinone"),
+        "the package's skill reaches the model catalogue: {catalogue:?}"
+    );
+    assert!(
+        agent
+            .all_skills()
+            .iter()
+            .any(|skill| skill.metadata.name == "allinone"),
+        "and the loader can open the same skill"
+    );
+
     host.shutdown().await;
 }
 

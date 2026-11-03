@@ -106,33 +106,14 @@ impl Agent {
             context.tools.push(react::llm::LlmTool::web_search(None));
         }
 
-        // The catalogue is the MODEL-INVOCABLE half of the agent's skills. A
-        // skill whose manifest says `disable-model-invocation: true` is the
-        // reader's to invoke (the composer's `/name` gesture loads it), and
-        // advertising it here would invite a tool call the same policy refuses.
-        // The registered list keeps it, so the gesture still resolves it.
-        //
-        // The list is the merged set, for the same reason as the tool array:
-        // a package's skills are loaded into the live overlay after the build,
-        // and the catalogue is the only thing that tells the model they exist.
-        let all_skills = self.all_skills();
-        let mut skills: Vec<react::llm::Skill> = all_skills
-            .iter()
-            .filter(|s| !s.metadata.user_only)
-            .map(|s| react::llm::Skill {
-                category: s.metadata.category.as_str().to_string(),
-                name: s.metadata.name.clone(),
-                description: s.metadata.description.clone(),
-            })
-            .collect();
-        // Same prefix-cache rule as the tool array above: the catalogue is
-        // rendered into the system prompt, so its order must be a function of
-        // the catalogue, not of the registration path this turn happened to
-        // take. An overlay skill may repeat a built-in name; the stable sort
-        // keeps the built-in entry, and the model sees one row either way.
-        skills.sort_by(|a, b| a.name.cmp(&b.name));
-        skills.dedup_by(|a, b| a.name == b.name);
-        context.skills = skills;
+        // The catalogue is the model-facing projection of the agent's whole
+        // skill set: a package's `SKILL.md` files are loaded into the live
+        // overlay after the build, and the catalogue is the only thing that
+        // tells the model they exist. A skill whose manifest says
+        // `disable-model-invocation: true` stays out (the reader's `/name`
+        // gesture still loads it), which is why the projection, not the raw
+        // list, is what the request carries.
+        context.skills = self.model_skills();
 
         context
     }
@@ -220,15 +201,16 @@ impl Agent {
         // manifest reserves it for the reader is still registered (the `/name`
         // gesture loads it), but the tool must not open it. With none left, no
         // loader is registered at all rather than one that can only refuse.
-        let model_skills: Vec<&crate::skills::SkillContent> = self
-            .skills
-            .iter()
-            .filter(|s| !s.metadata.user_only)
-            .collect();
+        //
+        // The list is the catalogue's own projection, overlay included: a
+        // package's skills arrive after the build, and a base-only gate left a
+        // build whose only skills came from a package with a catalogue that
+        // named them and no tool that could open them.
+        let model_skills = self.model_skills();
         if !model_skills.is_empty() {
             let skill_names: Vec<String> = model_skills
                 .iter()
-                .map(|s| s.metadata.name.clone())
+                .map(|skill| skill.name.clone())
                 .collect();
 
             // One tool for every skill is not an option: it puts a no-op entry

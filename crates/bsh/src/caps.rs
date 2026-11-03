@@ -1401,7 +1401,7 @@ fn build_agent_for_session_inner(
         );
     }
 
-    for skill in agent.skills() {
+    for skill in agent.all_skills() {
         crate::extension::publish(
             crate::extension::topics::SKILL_LOADED,
             serde_json::json!({
@@ -1416,7 +1416,7 @@ fn build_agent_for_session_inner(
             "session": session,
             "preset": preset,
             "tools": tool_count,
-            "skills": agent.skills().len(),
+            "skills": agent.all_skills().len(),
             "schema_chars": tools_schema_chars,
         }),
     );
@@ -1907,7 +1907,9 @@ impl SubagentContext {
             root: root.into(),
             runtime,
             context_budget: agent.context_budget(),
-            skills: agent.skills().to_vec(),
+            // The model-facing set, not the pre-extension set: a child must
+            // inherit the package skills the parent turn actually carries.
+            skills: agent.all_skills(),
         }
     }
 
