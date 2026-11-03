@@ -415,8 +415,17 @@ pub fn sandbox_profile(root: &Path, workspace: Option<&Path>, data_root: Option<
 /// the standard library's for the MCP client - and `pre_exec` is spelled the
 /// same on both but they are unrelated types. The closures therefore live here
 /// once, and each caller registers one on its own command.
+/// The resource argument's integer type. glibc declares it as `unsigned int`
+/// and types the RLIMIT_* constants the same way, while macOS and musl use
+/// `int`. Naming the platform's type keeps the constants, the libc function
+/// pointer and the test hooks in agreement without a cast at every call.
+#[cfg(all(unix, target_env = "gnu"))]
+type RlimitResource = libc::c_uint;
+#[cfg(all(unix, not(target_env = "gnu")))]
+type RlimitResource = libc::c_int;
+
 #[cfg(unix)]
-type SetRlimit = unsafe extern "C" fn(libc::c_int, *const libc::rlimit) -> libc::c_int;
+type SetRlimit = unsafe extern "C" fn(RlimitResource, *const libc::rlimit) -> libc::c_int;
 
 #[cfg(unix)]
 type SetPgid = unsafe extern "C" fn(libc::pid_t, libc::pid_t) -> libc::c_int;
@@ -1164,7 +1173,7 @@ mod tests {
 
     #[cfg(unix)]
     unsafe extern "C" fn test_setrlimit_ok(
-        _resource: libc::c_int,
+        _resource: RlimitResource,
         _limit: *const libc::rlimit,
     ) -> libc::c_int {
         0
@@ -1172,14 +1181,14 @@ mod tests {
 
     #[cfg(unix)]
     unsafe extern "C" fn test_setrlimit_fail(
-        _resource: libc::c_int,
+        _resource: RlimitResource,
         _limit: *const libc::rlimit,
     ) -> libc::c_int {
         -1
     }
     #[cfg(unix)]
     unsafe extern "C" fn test_setrlimit_fail_cpu(
-        resource: libc::c_int,
+        resource: RlimitResource,
         _limit: *const libc::rlimit,
     ) -> libc::c_int {
         if resource == libc::RLIMIT_CPU {
@@ -1191,7 +1200,7 @@ mod tests {
 
     #[cfg(unix)]
     unsafe extern "C" fn test_setrlimit_fail_nofile(
-        resource: libc::c_int,
+        resource: RlimitResource,
         _limit: *const libc::rlimit,
     ) -> libc::c_int {
         if resource == libc::RLIMIT_NOFILE {

@@ -209,9 +209,11 @@ jobs:
       # RPM spec are under test, on every change.
       - name: Build the Linux packages from a stand-in binary
         run: |
+          # /usr/bin/true, not `command -v true`: true is a bash builtin, so
+          # command -v prints the bare word and the packager rejects it.
           bash scripts/ci/package-linux.sh \
             --version 0.0.0-ci \
-            --binary "$(command -v true)" \
+            --binary /usr/bin/true \
             --out target/ci-package
 
       - name: Inspect the Linux packages
