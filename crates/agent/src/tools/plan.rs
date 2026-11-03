@@ -264,7 +264,7 @@ mod tests {
     #[test]
     fn empty_list_clears_the_plan() {
         let tool = tool();
-        tool.run(&serde_json::json!({"items": [{"text": "a"}]}))
+        tool.run(&serde_json::json!({"items": [{"text": "a", "status": "in_progress"}]}))
             .expect("seed");
         tool.run(&serde_json::json!({"items": []})).expect("clear");
         assert!(tool.store().items().is_empty());
