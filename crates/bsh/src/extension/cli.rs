@@ -28,6 +28,7 @@ const USAGE: &str = "bsh ext <command> [options]
 Commands:
   new <id> [--dir <path>] [--force]   scaffold a declarative extension package
   validate <path>                     parse and validate a package
+  migrate <path> [--write]            print or write a manifest 2.0 migration
   hash <path>                         print the canonical package hash
   build <path> [--out <dir>]          validate and build a .tar.gz release
   package <path> [--out <dir>]        alias for build
@@ -122,6 +123,7 @@ pub(crate) fn run(args: &[String]) -> i32 {
         }
         "new" => command_new(&rest[1..]),
         "validate" => command_validate(&rest[1..]),
+        "migrate" => command_migrate(&rest[1..]),
         "hash" => command_hash(&rest[1..]),
         "build" | "package" => command_package(&rest[1..]),
         "test" => command_test(&rest[1..]),
@@ -312,6 +314,29 @@ fn title_case(raw: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn command_migrate(args: &[String]) -> Result<i32, String> {
+    let write = args.iter().any(|arg| arg == "--write");
+    let positional: Vec<&String> = args
+        .iter()
+        .filter(|arg| arg.as_str() != "--write")
+        .collect();
+    let Some(raw) = positional.first() else {
+        return Err("usage: bsh ext migrate <path> [--write]".to_string());
+    };
+    let path = PathBuf::from(raw.as_str());
+    if write {
+        let manifest = bos_ext_core::manifest_v2::write_migrated_package(&path)
+            .map_err(|error| error.to_string())?;
+        println!("migrated: {}", manifest.display());
+        println!("backup:   {}", path.join("extension.toml.v1").display());
+    } else {
+        let manifest = bos_ext_core::manifest_v2::migrate_package_manifest(&path)
+            .map_err(|error| error.to_string())?;
+        print!("{}", manifest.to_toml().map_err(|error| error.to_string())?);
+    }
+    Ok(0)
 }
 
 fn command_validate(args: &[String]) -> Result<i32, String> {

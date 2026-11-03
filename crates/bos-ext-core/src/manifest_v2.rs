@@ -230,6 +230,35 @@ impl ManifestV2 {
     }
 }
 
+/// Migrate the manifest of one package without writing it.
+pub fn migrate_package_manifest(root: &Path) -> Result<ManifestV2, ExtensionError> {
+    let path = root.join(MANIFEST_FILE);
+    let text = std::fs::read_to_string(&path).map_err(|source| ExtensionError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    let legacy = Manifest::parse(&text, &path)?;
+    Ok(ManifestV2::from_legacy(&legacy))
+}
+
+/// Rewrite extension.toml as 2.0, keeping the original as extension.toml.v1.
+///
+/// Returns the migrated manifest path.
+pub fn write_migrated_package(root: &Path) -> Result<std::path::PathBuf, ExtensionError> {
+    let migrated = migrate_package_manifest(root)?;
+    let text = migrated.to_toml()?;
+    let manifest = root.join(MANIFEST_FILE);
+    let backup = root.join("extension.toml.v1");
+    if !backup.exists() {
+        std::fs::copy(&manifest, &backup).map_err(|source| ExtensionError::Io {
+            path: backup.clone(),
+            source,
+        })?;
+    }
+    crate::package::write_atomic(&manifest, text.as_bytes())?;
+    Ok(manifest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,5 +321,18 @@ id = "echo"
         let text = v2.to_toml().expect("serialize");
         let reparsed = ManifestV2::parse(&text, Path::new("extension.toml")).expect("reparse");
         assert_eq!(reparsed.extension.id, legacy.extension.id);
+    }
+
+    #[test]
+    fn writes_a_migrated_manifest_and_keeps_a_backup() {
+        let source =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/extensions/hello");
+        let temp = tempfile::tempdir().expect("tempdir");
+        crate::package::copy_tree(&source, temp.path()).expect("copy");
+        let path = write_migrated_package(temp.path()).expect("migrate");
+        assert!(temp.path().join("extension.toml.v1").exists());
+        let v2 = ManifestV2::load(temp.path()).expect("v2");
+        assert_eq!(v2.schema_version, MANIFEST_V2_SCHEMA_VERSION);
+        assert_eq!(path, temp.path().join(MANIFEST_FILE));
     }
 }
