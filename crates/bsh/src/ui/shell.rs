@@ -1314,7 +1314,11 @@ impl Shell {
                         // The overlay follows the draft: a LEADING `/` opens the
                         // slash palette, a mid-draft `/` token shows the command
                         // source, and an `@` token the reference source.
-                        this.slash.sync(this.composer_value.as_str(), &this.state);
+                        this.slash.sync(
+                            this.composer_value.as_str(),
+                            &this.state,
+                            &this.extension_commands,
+                        );
                         this.command_menu.sync(this.composer_value.as_str());
                         cx.notify();
                     }

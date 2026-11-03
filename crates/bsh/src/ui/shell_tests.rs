@@ -21394,7 +21394,7 @@ fn set_slash_text(shell: &Entity<Shell>, cx: &mut VisualTestContext, text: &str)
     cx.update(|_, cx| {
         shell.update(cx, |shell, cx| {
             shell.composer_value = owned.clone();
-            shell.slash.sync(&owned, &shell.state);
+            shell.slash.sync(&owned, &shell.state, &[]);
             cx.notify();
         });
     });
@@ -21747,7 +21747,7 @@ fn the_menu_closes_when_nothing_matches(cx: &mut TestAppContext) {
     cx.update(|_, cx| {
         shell.update(cx, |this, cx| {
             this.composer_value = "/zzzz".to_string();
-            this.slash.sync("/zzzz", &this.state);
+            this.slash.sync("/zzzz", &this.state, &[]);
             cx.notify();
         });
     });
@@ -21872,7 +21872,7 @@ fn the_slash_view_model_filters_every_source_and_the_trigger_is_the_leading_slas
     ];
     // Rows are built ONCE; a query selects indices into them. Reading through
     // the catalogue is what every draw does, so the test exercises that path.
-    let catalogue = SlashCatalogue::build(&skills, Lang::En);
+    let catalogue = SlashCatalogue::build(&skills, &[], Lang::En);
     let groups = catalogue.groups("", Lang::En);
     assert_eq!(groups.len(), 3, "three sections");
     assert_eq!(groups[0].kind, SlashKind::Add);
@@ -21997,7 +21997,7 @@ fn every_listed_command_runs_a_real_handler(cx: &mut TestAppContext) {
         cx.update(|_, cx| {
             let state = &shell.read(cx).state;
             let skills = slash_skills(state);
-            let catalogue = SlashCatalogue::build(&skills, state.lang);
+            let catalogue = SlashCatalogue::build(&skills, &[], state.lang);
             let groups = catalogue.groups("", state.lang);
             let names = |kind: SlashKind| -> Vec<SlashCommand> {
                 groups
@@ -30053,6 +30053,35 @@ fn extension_commands_join_the_composer_palette(cx: &mut TestAppContext) {
     assert!(rows.iter().any(|row| matches!(
         &row.action,
         super::command_menu::CardAction::Insert(template)
+            if template == "Say hello to {{input.name}}."
+    )));
+
+    let slash = cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.slash
+                .sync("/hel", &this.state, &this.extension_commands);
+            this.slash
+                .rows()
+                .map(|row| {
+                    (
+                        row.label.clone(),
+                        row.description.clone(),
+                        row.action.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+    });
+    assert!(
+        slash
+            .iter()
+            .any(|(label, detail, _)| { label == "hello__greet" && detail == "Greet the reader" }),
+        "{:?}",
+        slash.iter().map(|(label, _, _)| label).collect::<Vec<_>>()
+    );
+    assert!(slash.iter().any(|(_, _, action)| matches!(
+        action,
+        super::slash_palette::SlashAction::Template(template)
             if template == "Say hello to {{input.name}}."
     )));
 }

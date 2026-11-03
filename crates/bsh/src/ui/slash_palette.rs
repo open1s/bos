@@ -39,6 +39,7 @@ use gpui_kit::*;
 
 use super::shell::Shell;
 use super::{icon, txt, DivExt, IconName};
+use crate::extension::CommandSurface;
 use crate::i18n::Lang;
 use crate::theme;
 
@@ -138,6 +139,8 @@ pub(crate) struct SlashItem {
 pub(crate) enum SlashAction {
     /// Run a command this build backs.
     Command(SlashCommand),
+    /// Put one extension command's template into the draft.
+    Template(String),
     /// Put the skill's name in the prompt, after its slash.
     ///
     /// The load itself belongs to the SEND: the runner's turn task resolves
@@ -422,17 +425,31 @@ pub(crate) struct SlashCatalogue {
     rows: Vec<SlashItem>,
     /// The lowercased (label, description) per row, the substring haystack.
     lowered: Vec<(String, String)>,
+    /// Number of extension rows between the built-in commands and the skills.
+    extension_rows: usize,
 }
 
 impl SlashCatalogue {
     /// Build every row these settings and this language describe.
-    pub(crate) fn build(skills: &[SlashSkill], lang: Lang) -> Self {
-        let mut rows: Vec<SlashItem> = Vec::with_capacity(8 + skills.len());
+    pub(crate) fn build(skills: &[SlashSkill], commands: &[CommandSurface], lang: Lang) -> Self {
+        let mut rows: Vec<SlashItem> = Vec::with_capacity(8 + commands.len() + skills.len());
         for command in SlashCommand::adds() {
             rows.push(command_item(SlashKind::Add, command, lang));
         }
         for command in SlashCommand::commands() {
             rows.push(command_item(SlashKind::Command, command, lang));
+        }
+        let extension_rows = commands.len();
+        for command in commands {
+            rows.push(SlashItem {
+                id: format!("ext-command-{}", command.name),
+                kind: SlashKind::Command,
+                icon: IconName::Puzzle,
+                label: command.name.clone(),
+                description: command.description.clone(),
+                user_only: false,
+                action: SlashAction::Template(command.template.clone()),
+            });
         }
         for skill in skills {
             rows.push(SlashItem {
@@ -449,7 +466,11 @@ impl SlashCatalogue {
             .iter()
             .map(|row| (row.label.to_lowercase(), row.description.to_lowercase()))
             .collect();
-        Self { rows, lowered }
+        Self {
+            rows,
+            lowered,
+            extension_rows,
+        }
     }
 
     /// The groups one query matches.
@@ -461,7 +482,7 @@ impl SlashCatalogue {
     pub(crate) fn groups(&self, query: &str, lang: Lang) -> Vec<SlashGroup> {
         let needle = query.trim().to_lowercase();
         let adds = SlashCommand::adds().len();
-        let commands = SlashCommand::commands().len();
+        let commands = SlashCommand::commands().len() + self.extension_rows;
         let sections = [
             (SlashKind::Add, 0, adds),
             (SlashKind::Command, adds, adds + commands),
@@ -579,6 +600,8 @@ pub(crate) struct SlashPalette {
     catalogue_generation: Option<u64>,
     /// The language that catalogue was built in (row labels are translated).
     catalogue_lang: Option<Lang>,
+    /// The extension-command signature the catalogue was built from.
+    catalogue_commands: Vec<String>,
     /// The rows a child list shows, addressed by the same indices as the root.
     choice: Vec<SlashItem>,
     /// The scroller's child index for each flat row (headers included).
@@ -598,21 +621,40 @@ impl SlashPalette {
     /// query that matches nothing CLOSES it, which is the reference's
     /// all-ready-and-empty rule, and leaves the typed text alone. The trigger is
     /// never touched here: Esc closes and leaves the slash exactly as typed.
-    pub(crate) fn sync(&mut self, text: &str, state: &crate::state::AppState) {
+    pub(crate) fn sync(
+        &mut self,
+        text: &str,
+        state: &crate::state::AppState,
+        commands: &[CommandSurface],
+    ) {
         let Some(query) = slash_palette_query(text) else {
             self.close();
             return;
         };
         let lang = state.lang;
         // The catalogue is the expensive half, so it is rebuilt only when the
-        // settings it was scanned from moved (their generation) or the language
-        // did. Reading the generation first is a fingerprint compare inside the
-        // settings cache - no filesystem work, no catalogue copy.
+        // settings it was scanned from moved (their generation), the language
+        // did, or the extension command list changed. Reading the generation
+        // first is a fingerprint compare inside the settings cache - no
+        // filesystem work, no catalogue copy.
         let generation = state.settings.skill_generation();
+        let command_signature: Vec<String> = commands
+            .iter()
+            .map(|command| {
+                format!(
+                    "{}\u{1f}{}\u{1f}{}",
+                    command.name, command.description, command.template
+                )
+            })
+            .collect();
         let mut catalogue_moved = false;
-        if self.catalogue_generation != Some(generation) || self.catalogue_lang != Some(lang) {
+        if self.catalogue_generation != Some(generation)
+            || self.catalogue_lang != Some(lang)
+            || self.catalogue_commands != command_signature
+        {
             let skills = slash_skills(state);
-            self.catalogue = SlashCatalogue::build(&skills, lang);
+            self.catalogue = SlashCatalogue::build(&skills, commands, lang);
+            self.catalogue_commands = command_signature;
             // Read the generation AFTER the build: the scan it may have run
             // bumps it, and storing the pre-scan value would rebuild on every
             // keystroke.
@@ -996,6 +1038,10 @@ impl Shell {
             // gesture against the skills that build registered and appends
             // the instructions (crate::skill_invocation), which is exactly
             // the reference's pre-step skill listener.
+            SlashAction::Template(template) => {
+                self.slash.close();
+                self.set_composer_text(&template, window, cx);
+            }
             SlashAction::Insert(name) => {
                 self.slash.close();
                 self.set_composer_text(&format!("/{name} "), window, cx);
@@ -1031,7 +1077,8 @@ impl Shell {
         // frame; the query moves NOW, so the rows the reader sees match what
         // they will be typing.
         self.slash.pending = Some(next.clone());
-        self.slash.sync(&next, &self.state);
+        self.slash
+            .sync(&next, &self.state, &self.extension_commands);
     }
 
     /// The menu's key contract: up and down move, Esc closes and leaves the
