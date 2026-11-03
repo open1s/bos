@@ -59,11 +59,23 @@ pub struct ContributionRef {
     pub id: String,
 }
 
+/// Host operations a manager-owned lease needs at revoke time.
+pub trait LeaseHost: Send {
+    /// Remove tools from one owner.
+    fn remove_tools(&mut self, owner: &str, tools: &[String]) -> usize;
+    /// Remove prompt sections from one owner.
+    fn remove_prompts(&mut self, owner: &str, sections: &[String]) -> usize;
+    /// Remove skills under the listed paths.
+    fn remove_skills(&mut self, owner: &str, paths: &[std::path::PathBuf]) -> usize;
+    /// Remove registry-owned commands and panels.
+    fn remove_registry_owner(&mut self, owner: &str) -> usize;
+}
+
 /// Host-owned lease for one applied contribution.
 #[async_trait::async_trait]
 pub trait ContributionLease: Send + Sync {
     /// Remove the contribution. Must be idempotent.
-    async fn revoke(&self) -> Result<(), ExtError>;
+    async fn revoke(&self, host: &mut dyn LeaseHost) -> Result<(), ExtError>;
 }
 
 /// Host-owned sink that applies a contribution and returns its lease.

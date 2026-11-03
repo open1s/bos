@@ -499,12 +499,40 @@ pub(crate) struct AppliedExtension {
     pub(crate) info: crate::plugins::PluginInfo,
     fiber: Fiber,
     lease: contribution::ContributionLease,
+    activation: Option<ferris_core::manager::Activation>,
     services: Arc<ferris_core::composable::ServiceRegistry>,
     extension_id: String,
     workspace: Option<PathBuf>,
     session_id: String,
     service_provides: Vec<ferris_core::manifest::ServiceProvideSpec>,
     service_requires: Vec<ferris_core::manifest::ServiceRequireSpec>,
+}
+
+/// Host context handed to manager-owned leases at revoke time.
+pub(crate) struct BshLeaseHost<'a> {
+    pub(crate) agent: &'a mut ::agent::Agent,
+    pub(crate) registry: &'a mut ::agent::plugins::PluginRegistry,
+}
+
+impl ferris_core::LeaseHost for BshLeaseHost<'_> {
+    fn remove_tools(&mut self, _owner: &str, tools: &[String]) -> usize {
+        self.agent.remove_live_async_tools(tools)
+    }
+
+    fn remove_prompts(&mut self, _owner: &str, sections: &[String]) -> usize {
+        sections
+            .iter()
+            .filter(|section| self.agent.remove_live_prompt_section(section))
+            .count()
+    }
+
+    fn remove_skills(&mut self, _owner: &str, paths: &[std::path::PathBuf]) -> usize {
+        self.agent.remove_live_skills_by_paths(paths)
+    }
+
+    fn remove_registry_owner(&mut self, owner: &str) -> usize {
+        self.registry.remove_owner(owner)
+    }
 }
 
 impl AppliedExtension {
@@ -597,6 +625,11 @@ impl AppliedExtension {
         registry: &mut ::agent::plugins::PluginRegistry,
     ) -> Result<usize, ferris_core::composable::FiberTransitionError> {
         self.fiber.unload()?;
+        if let Some(activation) = self.activation.take() {
+            let mut host = BshLeaseHost { agent, registry };
+            let _ = super::block_on_tokio_scoped(activation.unload_leases(&mut host));
+            return Ok(0);
+        }
         Ok(self.lease.revoke(agent, registry))
     }
 
@@ -607,6 +640,11 @@ impl AppliedExtension {
         registry: &mut ::agent::plugins::PluginRegistry,
     ) -> Result<DisposalReport, ferris_core::composable::FiberTransitionError> {
         let report = self.fiber.dispose_async().await?;
+        if let Some(activation) = self.activation.take() {
+            let mut host = BshLeaseHost { agent, registry };
+            let _ = super::block_on_tokio_scoped(activation.unload_leases(&mut host));
+            return Ok(report);
+        }
         let _ = self.lease.revoke(agent, registry);
         Ok(report)
     }
@@ -840,8 +878,7 @@ pub(crate) struct IntegrationEntry {
 }
 
 impl ExtensionHost {
-    /// Activate every applied installed package through the neutral manager.
-    fn activate_through_manager(&self) -> Result<(), ferris_core::ExtError> {
+    fn build_framework_resolver(&self) -> super::framework::FerrisRuntimeResolver {
         let mut resolver =
             super::framework::FerrisRuntimeResolver::new(self.config.workspace.clone()).with_ports(
                 Arc::clone(&self.policy),
@@ -857,12 +894,22 @@ impl ExtensionHost {
                 resolver = resolver.with_legacy(entry.package.id().as_str(), Arc::clone(runtime));
             }
         }
+        resolver
+    }
+
+    fn build_framework_activations(&self) -> Option<ferris_core::manager::ActivationSet> {
+        let resolver = self.build_framework_resolver();
         let manager = self
-            .framework_manager()?
+            .framework_manager()
+            .ok()?
             .with_ports(Arc::new(resolver), Arc::new(super::framework::HostNoopSink));
-        let plan = manager.plan()?;
-        let _active = super::block_on_tokio(async move { manager.apply(&plan).await })?;
-        Ok(())
+        let plan = manager.plan().ok()?;
+        super::block_on_tokio(async move {
+            manager
+                .apply(&plan, &mut super::framework::HostNoopHost)
+                .await
+        })
+        .ok()
     }
 
     /// Build the host-neutral runtime resolver with this host's policy/events.
@@ -1384,9 +1431,7 @@ impl ExtensionHost {
         self.manager = manager;
         self.loaded = loaded;
         self.issues = issues;
-        if let Err(error) = self.activate_through_manager() {
-            log::warn!("extension manager activation failed: {error}");
-        }
+
         for id in previous_applied {
             let still_applied = self
                 .loaded
@@ -1706,6 +1751,7 @@ impl ExtensionHost {
         session_id: &str,
     ) -> Vec<AppliedExtension> {
         let mut applied = Vec::new();
+        let mut activations = self.build_framework_activations();
         let service_capabilities = self.service_capability_map();
         for entry in self.loaded.values() {
             if !entry.applied || entry.error.is_some() {
@@ -1790,8 +1836,14 @@ impl ExtensionHost {
                 let _ = lease.revoke(agent, registry);
                 continue;
             }
+            let activation = activations.as_mut().and_then(|set| {
+                set.attach(entry.package.id().as_str(), Box::new(lease.clone()))
+                    .ok();
+                set.take(entry.package.id().as_str())
+            });
             applied.push(AppliedExtension {
                 info,
+                activation,
                 fiber,
                 lease,
                 services: Arc::clone(&self.services),
@@ -3721,16 +3773,21 @@ tools = ["echo"]
         assert!(!status.applied);
     }
 
-    #[test]
-    fn the_manager_activates_an_applied_package() {
+    #[tokio::test]
+    async fn the_manager_activates_an_applied_package() {
         let root = scratch("manager-activation");
         let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../examples/extensions/hello");
         let mut host = ExtensionHost::open(config(&root)).expect("host");
         host.store.install(&source).expect("install");
         host.rebuild().expect("rebuild");
-        host.activate_through_manager()
+        let activations = host
+            .build_framework_activations()
             .expect("manager activation succeeds");
+        activations
+            .unload(&mut crate::extension::framework::HostNoopHost)
+            .await
+            .expect("unload");
     }
 
     #[test]

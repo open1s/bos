@@ -83,6 +83,19 @@ where
 ///
 /// The call may already be inside a Tokio context, so the future always runs on
 /// the dedicated multi-thread runtime rather than the caller's executor.
+pub(crate) fn block_on_tokio_scoped<F, T>(future: F) -> T
+where
+    F: std::future::Future<Output = T> + Send,
+    T: Send,
+{
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| extension_runtime().block_on(future))
+            .join()
+            .expect("extension activation thread")
+    })
+}
+
 pub(crate) fn block_on_tokio<F, T>(future: F) -> T
 where
     F: std::future::Future<Output = T> + Send + 'static,

@@ -272,9 +272,26 @@ pub(crate) struct HostNoopSink;
 /// Lease for a contributed runtime the host already owns.
 pub(crate) struct HostNoopLease;
 
+pub(crate) struct HostNoopHost;
+
+impl ferris_core::LeaseHost for HostNoopHost {
+    fn remove_tools(&mut self, _owner: &str, _tools: &[String]) -> usize {
+        0
+    }
+    fn remove_prompts(&mut self, _owner: &str, _sections: &[String]) -> usize {
+        0
+    }
+    fn remove_skills(&mut self, _owner: &str, _paths: &[std::path::PathBuf]) -> usize {
+        0
+    }
+    fn remove_registry_owner(&mut self, _owner: &str) -> usize {
+        0
+    }
+}
+
 #[async_trait::async_trait]
 impl ferris_core::ContributionLease for HostNoopLease {
-    async fn revoke(&self) -> Result<(), ExtError> {
+    async fn revoke(&self, _host: &mut dyn ferris_core::LeaseHost) -> Result<(), ExtError> {
         Ok(())
     }
 }
@@ -306,7 +323,7 @@ struct NoopLease;
 #[cfg(test)]
 #[async_trait::async_trait]
 impl ferris_core::ContributionLease for NoopLease {
-    async fn revoke(&self) -> Result<(), ExtError> {
+    async fn revoke(&self, _host: &mut dyn ferris_core::LeaseHost) -> Result<(), ExtError> {
         Ok(())
     }
 }
@@ -340,10 +357,13 @@ mod manager_tests {
             Arc::new(FerrisRuntimeResolver::new(None)),
             Arc::new(CollectSink(Arc::clone(&applied))),
         );
-        let active = manager.apply(&plan).await.expect("apply");
+        let active = manager
+            .apply(&plan, &mut HostNoopHost)
+            .await
+            .expect("apply");
         assert_eq!(active.len(), 1);
         assert_eq!(applied.load(std::sync::atomic::Ordering::SeqCst), 1);
-        active.unload().await.expect("unload");
+        active.unload(&mut HostNoopHost).await.expect("unload");
     }
 
     #[tokio::test]
@@ -359,10 +379,13 @@ mod manager_tests {
             Arc::new(FerrisRuntimeResolver::new(None)),
             Arc::new(CollectSink(Arc::clone(&applied))),
         );
-        let active = manager.apply(&plan).await.expect("apply");
+        let active = manager
+            .apply(&plan, &mut HostNoopHost)
+            .await
+            .expect("apply");
         assert_eq!(active.len(), 1);
         assert_eq!(applied.load(std::sync::atomic::Ordering::SeqCst), 1);
-        active.unload().await.expect("unload");
+        active.unload(&mut HostNoopHost).await.expect("unload");
     }
 
     #[tokio::test]
@@ -381,10 +404,13 @@ mod manager_tests {
             Arc::new(FerrisRuntimeResolver::new(None)),
             Arc::new(CollectSink(Arc::clone(&applied))),
         );
-        let active = manager.apply(&plan).await.expect("apply");
+        let active = manager
+            .apply(&plan, &mut HostNoopHost)
+            .await
+            .expect("apply");
         assert_eq!(active.len(), 1);
         assert!(applied.load(std::sync::atomic::Ordering::SeqCst) >= 1);
-        active.unload().await.expect("unload");
+        active.unload(&mut HostNoopHost).await.expect("unload");
     }
 
     #[tokio::test]
@@ -413,10 +439,13 @@ mod manager_tests {
             Arc::new(resolver),
             Arc::new(CollectSink(Arc::clone(&applied))),
         );
-        let active = manager.apply(&plan).await.expect("apply");
+        let active = manager
+            .apply(&plan, &mut HostNoopHost)
+            .await
+            .expect("apply");
         assert_eq!(active.len(), 1);
         assert!(applied.load(std::sync::atomic::Ordering::SeqCst) >= 1);
-        active.unload().await.expect("unload");
+        active.unload(&mut HostNoopHost).await.expect("unload");
     }
 }
 

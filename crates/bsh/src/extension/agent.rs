@@ -143,6 +143,23 @@ impl ContributionLease {
     }
 }
 
+#[async_trait::async_trait]
+impl ferris_core::ContributionLease for ContributionLease {
+    async fn revoke(
+        &self,
+        host: &mut dyn ferris_core::LeaseHost,
+    ) -> Result<(), ferris_core::ExtError> {
+        if !self.active.swap(false, Ordering::SeqCst) {
+            return Ok(());
+        }
+        host.remove_tools(&self.owner, &self.tools);
+        host.remove_prompts(&self.owner, &self.prompt_sections);
+        host.remove_skills(&self.owner, &self.skill_paths);
+        host.remove_registry_owner(&self.owner);
+        Ok(())
+    }
+}
+
 /// One extension tool exposed to the agent.
 #[derive(Clone)]
 pub(crate) struct ExtensionTool {

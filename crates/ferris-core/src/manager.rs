@@ -9,8 +9,8 @@ use std::sync::Arc;
 use crate::package::ExtensionStore;
 use crate::types::ExtensionId;
 use crate::{
-    ContributionLease, ContributionSink, ErrorCode, ExtError, HostSpec, Runtime, RuntimeContext,
-    RuntimeResolver,
+    ContributionLease, ContributionSink, ErrorCode, ExtError, HostSpec, LeaseHost, Runtime,
+    RuntimeContext, RuntimeResolver,
 };
 
 /// One installed extension version.
@@ -220,13 +220,17 @@ impl ExtensionManager {
     }
 
     /// Apply one plan: start each runtime and apply its contributions.
-    pub async fn apply(&self, plan: &ManagerPlan) -> Result<ActivationSet, ExtError> {
+    pub async fn apply(
+        &self,
+        plan: &ManagerPlan,
+        host: &mut dyn LeaseHost,
+    ) -> Result<ActivationSet, ExtError> {
         let mut activations = Vec::new();
         for id in &plan.order {
             match self.build_activation(id).await {
                 Ok(activation) => activations.push(activation),
                 Err(error) => {
-                    shutdown_all(activations).await;
+                    shutdown_all(activations, host).await;
                     return Err(error);
                 }
             }
@@ -239,6 +243,7 @@ impl ExtensionManager {
         &self,
         current: ActivationSet,
         plan: &ManagerPlan,
+        host: &mut dyn LeaseHost,
     ) -> Result<ActivationSet, ExtError> {
         let mut old: std::collections::BTreeMap<String, Activation> = current
             .activations
@@ -253,19 +258,19 @@ impl ExtensionManager {
                     activations.push(existing);
                     continue;
                 }
-                existing.shutdown().await?;
+                existing.shutdown(host).await?;
             }
             match self.build_activation(id).await {
                 Ok(activation) => activations.push(activation),
                 Err(error) => {
-                    shutdown_all(activations).await;
-                    shutdown_all(old.into_values().collect()).await;
+                    shutdown_all(activations, host).await;
+                    shutdown_all(old.into_values().collect(), host).await;
                     return Err(error);
                 }
             }
         }
         for (_, activation) in old {
-            activation.shutdown().await?;
+            activation.shutdown(host).await?;
         }
         Ok(ActivationSet { activations })
     }
@@ -391,16 +396,32 @@ pub struct Activation {
     leases: Vec<Box<dyn ContributionLease>>,
 }
 
-async fn shutdown_all(activations: Vec<Activation>) {
+async fn shutdown_all(activations: Vec<Activation>, host: &mut dyn LeaseHost) {
     for activation in activations.into_iter().rev() {
-        let _ = activation.shutdown().await;
+        let _ = activation.shutdown(host).await;
     }
 }
 
 impl Activation {
-    async fn shutdown(self) -> Result<(), ExtError> {
+    /// Revoke this activation outside the owning set.
+    /// Revoke this activation's leases without shutting down the runtime.
+    ///
+    /// Used when the host owns a shared runtime across several agent builds.
+    pub async fn unload_leases(self, host: &mut dyn LeaseHost) -> Result<(), ExtError> {
         for lease in self.leases.into_iter().rev() {
-            lease.revoke().await?;
+            lease.revoke(host).await?;
+        }
+        Ok(())
+    }
+
+    /// Revoke the leases and shut the runtime down.
+    pub async fn unload(self, host: &mut dyn LeaseHost) -> Result<(), ExtError> {
+        self.shutdown(host).await
+    }
+
+    async fn shutdown(self, host: &mut dyn LeaseHost) -> Result<(), ExtError> {
+        for lease in self.leases.into_iter().rev() {
+            lease.revoke(host).await?;
         }
         self.runtime.shutdown().await
     }
@@ -412,6 +433,34 @@ pub struct ActivationSet {
 }
 
 impl ActivationSet {
+    /// Attach one host lease to an extension already started by this set.
+    pub fn attach(
+        &mut self,
+        extension: &str,
+        lease: Box<dyn ContributionLease>,
+    ) -> Result<(), ExtError> {
+        let activation = self
+            .activations
+            .iter_mut()
+            .find(|activation| activation.extension == extension)
+            .ok_or_else(|| ExtError {
+                code: ErrorCode::Contribution,
+                message: format!("{extension} is not in this activation set"),
+                details: serde_json::Value::Null,
+            })?;
+        activation.leases.push(lease);
+        Ok(())
+    }
+
+    /// Remove one activation so its owner can unload it independently.
+    pub fn take(&mut self, extension: &str) -> Option<Activation> {
+        let index = self
+            .activations
+            .iter()
+            .position(|activation| activation.extension == extension)?;
+        Some(self.activations.remove(index))
+    }
+
     /// Number of started extensions.
     pub fn len(&self) -> usize {
         self.activations.len()
@@ -423,9 +472,9 @@ impl ActivationSet {
     }
 
     /// Shut down in reverse activation order, revoking every contribution.
-    pub async fn unload(mut self) -> Result<(), ExtError> {
+    pub async fn unload(mut self, host: &mut dyn LeaseHost) -> Result<(), ExtError> {
         while let Some(activation) = self.activations.pop() {
-            activation.shutdown().await?;
+            activation.shutdown(host).await?;
         }
         Ok(())
     }
@@ -525,9 +574,26 @@ mod tests {
         }
     }
 
+    struct TestHost;
+
+    impl crate::LeaseHost for TestHost {
+        fn remove_tools(&mut self, _owner: &str, _tools: &[String]) -> usize {
+            0
+        }
+        fn remove_prompts(&mut self, _owner: &str, _sections: &[String]) -> usize {
+            0
+        }
+        fn remove_skills(&mut self, _owner: &str, _paths: &[std::path::PathBuf]) -> usize {
+            0
+        }
+        fn remove_registry_owner(&mut self, _owner: &str) -> usize {
+            0
+        }
+    }
+
     #[async_trait::async_trait]
     impl crate::ContributionLease for MockLease {
-        async fn revoke(&self) -> Result<(), ExtError> {
+        async fn revoke(&self, _host: &mut dyn crate::LeaseHost) -> Result<(), ExtError> {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
@@ -571,9 +637,10 @@ mod tests {
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/extensions/hello");
         manager.install(&example).expect("install");
         let plan = manager.plan().expect("plan");
-        let active = manager.apply(&plan).await.expect("apply");
+        let mut host = TestHost;
+        let active = manager.apply(&plan, &mut host).await.expect("apply");
         assert_eq!(active.len(), 1);
-        active.unload().await.expect("unload");
+        active.unload(&mut host).await.expect("unload");
         assert_eq!(revoked.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
@@ -594,11 +661,15 @@ mod tests {
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/extensions/hello");
         manager.install(&example).expect("install");
         let plan = manager.plan().expect("plan");
-        let active = manager.apply(&plan).await.expect("apply");
-        let active = manager.reload(active, &plan).await.expect("reload");
+        let mut host = TestHost;
+        let active = manager.apply(&plan, &mut host).await.expect("apply");
+        let active = manager
+            .reload(active, &plan, &mut host)
+            .await
+            .expect("reload");
         assert_eq!(active.len(), 1);
         assert_eq!(revoked.load(std::sync::atomic::Ordering::SeqCst), 0);
-        active.unload().await.expect("unload");
+        active.unload(&mut host).await.expect("unload");
         assert_eq!(revoked.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
