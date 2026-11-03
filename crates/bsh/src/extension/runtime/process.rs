@@ -432,13 +432,18 @@ unsafe fn apply_unix_limits(
     setrlimit: SetRlimit,
     setpgid: SetPgid,
 ) -> std::io::Result<()> {
-    let memory = memory.max(16 * 1024 * 1024) as libc::rlim_t;
-    let address = libc::rlimit {
-        rlim_cur: memory,
-        rlim_max: memory,
-    };
-    if unsafe { setrlimit(libc::RLIMIT_AS, &address) } != 0 {
-        return Err(std::io::Error::last_os_error());
+    #[cfg(not(target_os = "linux"))]
+    let _ = memory;
+    #[cfg(target_os = "linux")]
+    if memory > 0 {
+        let memory = memory.max(16 * 1024 * 1024) as libc::rlim_t;
+        let address = libc::rlimit {
+            rlim_cur: memory,
+            rlim_max: memory,
+        };
+        if unsafe { setrlimit(libc::RLIMIT_AS, &address) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
     }
 
     let cpu = cpu.max(1) as libc::rlim_t;
@@ -1313,9 +1318,11 @@ mod tests {
             .position(|item| item == "--bind")
             .expect("package bind");
         assert!(dir < bind, "the package destination must exist before bind");
+        // The package root is bound writable; the nested workspace is covered
+        // by that bind, so one bind is the correct plan.
         assert_eq!(
             plan.iter().filter(|item| item.as_str() == "--bind").count(),
-            2
+            1
         );
     }
 
