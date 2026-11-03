@@ -166,10 +166,7 @@ fn numeric_value(value: &serde_json::Value) -> Option<f64> {
     value
         .as_f64()
         .or_else(|| value.as_str().and_then(|text| text.parse::<f64>().ok()))
-}
-
-fn can_parse_as_number(value: &serde_json::Value) -> bool {
-    numeric_value(value).is_some()
+        .filter(|number| number.is_finite())
 }
 
 fn value_type(value: &serde_json::Value) -> &'static str {
@@ -269,6 +266,66 @@ mod tests {
         });
         let args = json!({"items": ["a", "b", "c"]});
         assert!(validate_args(&schema, &args).is_ok());
+    }
+
+    #[test]
+    fn test_additional_properties_are_rejected_when_disabled() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "path": {"type": "string"} },
+            "required": ["path"],
+            "additionalProperties": false
+        });
+        assert!(validate_args(&schema, &json!({"path": "src/lib.rs"})).is_ok());
+        assert!(validate_args(&schema, &json!({"path": "src/lib.rs", "extra": true})).is_err());
+    }
+
+    #[test]
+    fn test_enum_and_string_length_constraints() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+                "name": {"type": "string", "minLength": 1, "maxLength": 4}
+            },
+            "required": ["status", "name"]
+        });
+        assert!(validate_args(&schema, &json!({"status": "pending", "name": "BOS"})).is_ok());
+        assert!(validate_args(&schema, &json!({"status": "done", "name": "BOS"})).is_err());
+        assert!(validate_args(&schema, &json!({"status": "pending", "name": "longer"})).is_err());
+    }
+
+    #[test]
+    fn test_numeric_and_array_bounds() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "minimum": 1, "maximum": 5},
+                "items": {"type": "array", "items": {"type": "string"}, "maxItems": 2}
+            },
+            "required": ["limit", "items"]
+        });
+        assert!(validate_args(&schema, &json!({"limit": 3, "items": ["a", "b"]})).is_ok());
+        assert!(validate_args(&schema, &json!({"limit": 6, "items": ["a"]})).is_err());
+        assert!(validate_args(&schema, &json!({"limit": 2.5, "items": ["a"]})).is_err());
+        assert!(validate_args(&schema, &json!({"limit": 2, "items": ["a", "b", "c"]})).is_err());
+    }
+
+    #[test]
+    fn test_nested_objects_apply_additional_property_rules() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "options": {
+                    "type": "object",
+                    "properties": {"enabled": {"type": "boolean"}},
+                    "additionalProperties": false
+                }
+            },
+            "required": ["options"]
+        });
+        assert!(validate_args(&schema, &json!({"options": {"enabled": true}})).is_ok());
+        assert!(validate_args(&schema, &json!({"options": {"enabled": true, "typo": true}})).is_err());
     }
 
     #[test]
