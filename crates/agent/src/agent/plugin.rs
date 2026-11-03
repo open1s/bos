@@ -547,7 +547,7 @@ mod tests {
         }
 
         async fn on_turn_start(&self, mut turn: TurnStartWrapper) -> Option<TurnStartWrapper> {
-            turn.input.push_str("!");
+            turn.input.push('!');
             Some(turn)
         }
 
