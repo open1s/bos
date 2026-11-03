@@ -107,6 +107,11 @@ impl bos_ext_core::RuntimeResolver for BosRuntimeResolver {
                     .map_err(runtime_error)?;
                 Arc::new(inner) as Arc<dyn bos_ext_runtime::Runtime>
             }
+            bos_ext_core::types::RuntimeKind::Process => {
+                let inner = bos_ext_runtime::process::ProcessRuntime::new(manifest, root)
+                    .map_err(runtime_error)?;
+                Arc::new(inner) as Arc<dyn bos_ext_runtime::Runtime>
+            }
             other => {
                 return Err(ExtError {
                     code: bos_ext_core::ErrorCode::Runtime,
@@ -166,6 +171,25 @@ mod manager_tests {
     async fn the_manager_applies_a_declarative_package() {
         let source =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/extensions/hello");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let manager = manager_for(temp.path().to_path_buf(), None).expect("manager");
+        manager.install(&source).expect("install");
+        let plan = manager.plan().expect("plan");
+        let applied = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let manager = manager.with_ports(
+            Arc::new(BosRuntimeResolver::new(None)),
+            Arc::new(CollectSink(Arc::clone(&applied))),
+        );
+        let active = manager.apply(&plan).await.expect("apply");
+        assert_eq!(active.len(), 1);
+        assert_eq!(applied.load(std::sync::atomic::Ordering::SeqCst), 1);
+        active.unload().await.expect("unload");
+    }
+
+    #[tokio::test]
+    async fn the_manager_applies_a_process_package() {
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/extensions/process-echo");
         let temp = tempfile::tempdir().expect("tempdir");
         let manager = manager_for(temp.path().to_path_buf(), None).expect("manager");
         manager.install(&source).expect("install");
