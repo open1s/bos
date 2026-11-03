@@ -1,8 +1,8 @@
 # BOS Extension Framework (bos-ext)
 
 Status: Phase 1 in progress — core types, capability/policy, manifest, package,
-signing, resolver, effect scopes and event dispatch moved to bos-ext-core; BSH
-re-exports them.
+signing, resolver, effect scopes, event dispatch, services, reactivity and the
+composition runtime moved to bos-ext-core; BSH re-exports them.
 
 ## Goal
 

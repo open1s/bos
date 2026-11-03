@@ -19,10 +19,10 @@ echo "==> extension suite"
 cargo test -p bsh --lib extension::
 
 echo "==> composition conformance"
-cargo test -p bsh --lib extension::composable
+cargo test -p bos-ext-core --features tokio --lib composable::
 
 echo "==> budget smoke"
-cargo test -p bsh --lib extension::composable::tests::gold_standard
+cargo test -p bos-ext-core --features tokio --lib composable::tests::gold_standard
 
 echo "==> all-in-one contribution coverage"
 cargo test -p bsh --lib extension::e2e::the_allinone_example -- --nocapture

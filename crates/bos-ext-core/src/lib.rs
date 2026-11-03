@@ -11,6 +11,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 pub mod capability;
+#[cfg(feature = "tokio")]
+#[allow(dead_code, missing_docs)] // Phase 1 move; docs and consumers land with the manager API.
+pub mod composable;
 pub mod dispatch;
 pub mod manifest;
 pub mod package;
