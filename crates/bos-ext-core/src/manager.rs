@@ -9,7 +9,10 @@ use std::sync::Arc;
 use crate::manifest::Manifest;
 use crate::package::ExtensionStore;
 use crate::types::ExtensionId;
-use crate::{ErrorCode, ExtError, HostSpec};
+use crate::{
+    ContributionLease, ContributionSink, ErrorCode, ExtError, HostSpec, Runtime, RuntimeContext,
+    RuntimeResolver,
+};
 
 /// One installed extension version.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +27,8 @@ pub struct InstalledExtension {
 pub struct ExtensionManager {
     host: Arc<dyn HostSpec>,
     store: ExtensionStore,
+    runtimes: Option<Arc<dyn RuntimeResolver>>,
+    contributions: Option<Arc<dyn ContributionSink>>,
 }
 
 impl ExtensionManager {
@@ -34,7 +39,24 @@ impl ExtensionManager {
             message: error.to_string(),
             details: serde_json::Value::Null,
         })?;
-        Ok(Self { host, store })
+        Ok(Self {
+            host,
+            store,
+            runtimes: None,
+            contributions: None,
+        })
+    }
+
+    /// Attach the runtime resolver and contribution sink used by apply.
+    #[must_use]
+    pub fn with_ports(
+        mut self,
+        runtimes: Arc<dyn RuntimeResolver>,
+        contributions: Arc<dyn ContributionSink>,
+    ) -> Self {
+        self.runtimes = Some(runtimes);
+        self.contributions = Some(contributions);
+        self
     }
 
     /// The host this manager serves.
@@ -80,6 +102,67 @@ impl ExtensionManager {
         })
     }
 
+    /// Apply one plan: start each runtime and apply its contributions.
+    pub async fn apply(&self, plan: &ManagerPlan) -> Result<ActivationSet, ExtError> {
+        let runtimes = self.runtimes.as_ref().ok_or_else(|| ExtError {
+            code: ErrorCode::Runtime,
+            message: "no runtime resolver is attached".to_string(),
+            details: serde_json::Value::Null,
+        })?;
+        let contributions = self.contributions.as_ref().ok_or_else(|| ExtError {
+            code: ErrorCode::Contribution,
+            message: "no contribution sink is attached".to_string(),
+            details: serde_json::Value::Null,
+        })?;
+        let mut activations = Vec::new();
+        for id in &plan.order {
+            let extension_id = ExtensionId::parse(id.clone()).map_err(|error| ExtError {
+                code: ErrorCode::Manifest,
+                message: error.to_string(),
+                details: serde_json::Value::Null,
+            })?;
+            let version = self
+                .store
+                .active_version(&extension_id)
+                .or_else(|| {
+                    self.store
+                        .versions(&extension_id)
+                        .ok()
+                        .and_then(|versions| versions.last().cloned())
+                })
+                .ok_or_else(|| ExtError {
+                    code: ErrorCode::Package,
+                    message: format!("{id} has no installed version"),
+                    details: serde_json::Value::Null,
+                })?;
+            let root = self.store.version_root(&extension_id, &version);
+            let manifest = Manifest::load(&root).map_err(|error| ExtError {
+                code: ErrorCode::Manifest,
+                message: error.to_string(),
+                details: serde_json::Value::Null,
+            })?;
+            let data_root = self.store.data_dir(&extension_id);
+            let runtime = runtimes.create(&manifest, &root, &data_root)?;
+            let listed = runtime
+                .start(&RuntimeContext {
+                    extension: id.clone(),
+                    root: root.clone(),
+                    data_root,
+                })
+                .await?;
+            let mut leases: Vec<Box<dyn ContributionLease>> = Vec::new();
+            for contribution in listed {
+                leases.push(contributions.apply(contribution).await?);
+            }
+            activations.push(Activation {
+                extension: id.clone(),
+                runtime,
+                leases,
+            });
+        }
+        Ok(ActivationSet { activations })
+    }
+
     /// Resolve installed packages into an activation order.
     #[cfg(feature = "tokio")]
     pub fn plan(&self) -> Result<ManagerPlan, ExtError> {
@@ -121,6 +204,43 @@ impl ExtensionManager {
             }
         })?;
         Ok(ManagerPlan { order: plan.order })
+    }
+}
+
+/// One started extension.
+pub struct Activation {
+    /// Extension id.
+    pub extension: String,
+    /// Runtime holding the contributions.
+    pub runtime: Arc<dyn Runtime>,
+    leases: Vec<Box<dyn ContributionLease>>,
+}
+
+/// The set of started extensions for one applied plan.
+pub struct ActivationSet {
+    activations: Vec<Activation>,
+}
+
+impl ActivationSet {
+    /// Number of started extensions.
+    pub fn len(&self) -> usize {
+        self.activations.len()
+    }
+
+    /// Whether no extension was started.
+    pub fn is_empty(&self) -> bool {
+        self.activations.is_empty()
+    }
+
+    /// Shut down in reverse activation order, revoking every contribution.
+    pub async fn unload(mut self) -> Result<(), ExtError> {
+        while let Some(activation) = self.activations.pop() {
+            for lease in activation.leases.into_iter().rev() {
+                lease.revoke().await?;
+            }
+            activation.runtime.shutdown().await?;
+        }
+        Ok(())
     }
 }
 
@@ -179,6 +299,97 @@ mod tests {
         let manager = ExtensionManager::open(host).expect("manager");
         assert_eq!(manager.root(), root.path());
         assert!(manager.installed().expect("installed").is_empty());
+    }
+
+
+    struct MockRuntime;
+    struct MockLease(Arc<std::sync::atomic::AtomicUsize>);
+    struct MockSink(Arc<std::sync::atomic::AtomicUsize>);
+    struct MockResolver;
+
+    #[async_trait::async_trait]
+    impl crate::Runtime for MockRuntime {
+        fn kind(&self) -> &str {
+            "mock"
+        }
+
+        async fn start(
+            &self,
+            _ctx: &crate::RuntimeContext,
+        ) -> Result<Vec<crate::Contribution>, ExtError> {
+            Ok(vec![crate::Contribution {
+                kind: "demo.echo".to_string(),
+                id: "echo".to_string(),
+                payload: serde_json::Value::Null,
+            }])
+        }
+
+        async fn invoke(
+            &self,
+            _contribution: &crate::ContributionRef,
+            _input: serde_json::Value,
+            _ctx: &crate::InvokeContext,
+        ) -> Result<serde_json::Value, ExtError> {
+            Ok(serde_json::Value::Null)
+        }
+
+        async fn shutdown(&self) -> Result<(), ExtError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ContributionLease for MockLease {
+        async fn revoke(&self) -> Result<(), ExtError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ContributionSink for MockSink {
+        async fn apply(
+            &self,
+            _contribution: crate::Contribution,
+        ) -> Result<Box<dyn crate::ContributionLease>, ExtError> {
+            Ok(Box::new(MockLease(Arc::clone(&self.0))))
+        }
+    }
+
+    impl crate::RuntimeResolver for MockResolver {
+        fn create(
+            &self,
+            _manifest: &Manifest,
+            _root: &Path,
+            _data_root: &Path,
+        ) -> Result<Arc<dyn crate::Runtime>, ExtError> {
+            Ok(Arc::new(MockRuntime))
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_starts_and_unloads_with_leases() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let host = Arc::new(DemoHost {
+            root: root.path().to_path_buf(),
+            capabilities: CapabilityRegistry::default(),
+            contracts: ServiceContractRegistry::default(),
+        });
+        let revoked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let manager = ExtensionManager::open(host)
+            .expect("manager")
+            .with_ports(
+                Arc::new(MockResolver),
+                Arc::new(MockSink(Arc::clone(&revoked))),
+            );
+        let example =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/extensions/hello");
+        manager.install(&example).expect("install");
+        let plan = manager.plan().expect("plan");
+        let active = manager.apply(&plan).await.expect("apply");
+        assert_eq!(active.len(), 1);
+        active.unload().await.expect("unload");
+        assert_eq!(revoked.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

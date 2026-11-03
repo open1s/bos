@@ -338,6 +338,17 @@ pub trait Runtime: Send + Sync {
     async fn shutdown(&self) -> Result<(), ExtError>;
 }
 
+/// Host-owned factory that builds a runtime for one installed package.
+pub trait RuntimeResolver: Send + Sync {
+    /// Build the runtime for one manifest and package root.
+    fn create(
+        &self,
+        manifest: &crate::manifest::Manifest,
+        root: &std::path::Path,
+        data_root: &std::path::Path,
+    ) -> Result<Arc<dyn Runtime>, ExtError>;
+}
+
 /// Host-registered runtime kind constructor.
 pub type RuntimeFactory = Arc<dyn Fn(&PathBuf) -> Result<Arc<dyn Runtime>, ExtError> + Send + Sync>;
 
