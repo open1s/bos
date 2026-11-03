@@ -2,7 +2,7 @@
 //!
 //! The shared identity, persona slot and workflow guidance live in
 //! [`agent::prompts`]; this module owns the guidance for the tools BSH registers
-//! itself (`read_file`, `write_file`, `edit_file`, `list_dir`, `web_search`), the
+//! itself (`glob`, `grep`, `read_file`, `write_file`, `edit_file`, `list_dir`, `web_search`), the
 //! standing subagent rule, the shipped preset personas, and the plan-mode
 //! directive. Every constant is pinned by a test and documented against the
 //! shipped DeepSeek Harness wording in `docs/bsh-prompts.md`.
@@ -15,7 +15,7 @@ use agent::Agent;
 /// and hidden entries unless `include_ignored` is set, so the guidance says so
 /// instead of promising a listing the tool will not produce.
 pub(crate) const GLOB: &str =
-    "Use the glob tool — not shell find — to discover files by path pattern. It matches paths, not file contents. A pattern with no \"/\" matches the basename at any depth, so \"*\" and \"*.ts\" both search the whole tree; include a separator to anchor the depth. Ignored and hidden files are skipped unless include_ignored is set.";
+    "Use the glob tool — not shell find — to discover files by path pattern. It matches paths, not file contents. Use grep for content searches. A pattern with no \"/\" matches the basename at any depth, so \"*\" and \"*.ts\" both search the whole tree; include a separator to anchor the depth. Ignored and hidden files are skipped unless include_ignored is set.";
 
 /// The reference's grep guidance, with BSH's tool name.
 ///
@@ -117,7 +117,6 @@ pub(crate) const KNOWN_TOOLS: &[&str] = &[
     "list_dir",
     "mcp",
     "read_file",
-    "run_in_background",
     "subagent",
     "subagent_result",
     "update_plan",

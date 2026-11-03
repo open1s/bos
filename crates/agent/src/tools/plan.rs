@@ -146,13 +146,16 @@ impl Tool for PlanTool {
             "properties": {
                 "items": {
                     "type": "array",
-                    "description": "The complete plan: every step with its status.",
+                    "description": "The complete replacement plan. Use an empty array to clear it; include at most 100 steps.",
+                    "maxItems": 100,
                     "items": {
                         "type": "object",
                         "properties": {
                             "text": {
                                 "type": "string",
-                                "description": "One concise step description."
+                                "minLength": 1,
+                                "maxLength": 500,
+                                "description": "One concise, non-empty step description of at most 500 characters."
                             },
                             "status": {
                                 "type": "string",
@@ -173,6 +176,34 @@ impl Tool for PlanTool {
     fn run(&self, input: &Value) -> Result<Value, ToolError> {
         let parsed: UpdatePlanInput = serde_json::from_value(input.clone())
             .map_err(|e| ToolError::Failed(format!("invalid update_plan input: {e}")))?;
+
+        if parsed.items.len() > MAX_ITEMS {
+            return Err(ToolError::InvalidInput(format!(
+                "items must contain at most {MAX_ITEMS} steps"
+            )));
+        }
+        for item in &parsed.items {
+            if item.text.trim().is_empty() {
+                continue;
+            }
+            if item.text.trim().chars().count() > MAX_TEXT {
+                return Err(ToolError::InvalidInput(format!(
+                    "each plan step must be at most {MAX_TEXT} characters"
+                )));
+            }
+        }
+        let active = parsed.items.iter().filter(|item| {
+            !item.text.trim().is_empty() && item.status == PlanStatus::InProgress
+        }).count();
+        let remaining = parsed.items.iter().filter(|item| {
+            !item.text.trim().is_empty() && item.status != PlanStatus::Completed
+        }).count();
+        if (remaining > 0 && active != 1) || active > 1 {
+            return Err(ToolError::InvalidInput(
+                "a plan with unfinished work must have exactly one in_progress step".to_string()
+            ));
+        }
+
         self.store.replace(parsed.items);
         let items = self.store.items();
         let pending = items
