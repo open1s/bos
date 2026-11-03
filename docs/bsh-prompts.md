@@ -263,7 +263,7 @@ Injection order for one turn:
 | edit_file | `crates/bsh/src/prompts.rs:49` | system, when registered | `Read a file before editing it, unless you just created or edited it in this session.` |
 | apply_patch | `crates/bsh/src/prompts.rs:52` | system, when registered | `For coordinated changes across several files, use apply_patch with grouped exact-text edits instead of separate edit_file calls. Each file is validated before its atomic write; a failed edit leaves that file unchanged. This is not a cross-file transaction, so inspect every per-file result.` |
 | list_dir | `crates/bsh/src/prompts.rs:59` | system, when registered | `Use list_dir to see what a directory holds before reading or creating files; it reports names and kinds, not contents.` |
-| web_search | `crates/bsh/src/prompts.rs:58` | system, when registered | DSH's no-fetch branch, verbatim |
+| web_search | `crates/bsh/src/prompts.rs:66` | system, when registered | DSH's no-fetch branch, verbatim |
 | mcp gateway | `crates/bsh/src/prompts.rs` | system, when the lazy `mcp` tool is registered | discover with `action=list`, then `action=call` with server/tool/arguments; do not guess a tool name |
 | subagent rule | `crates/bsh/src/prompts.rs:65` | system, when `subagent` registered | `## Delegating with subagents` + DSH's delegation sentence + BSH's background start, wave limit, `subagent_result` collection and child-prompt pattern |
 | shipped `ptc` persona | `crates/bsh/src/prompts.rs:149` | persona slot | `You execute work in batched steps: …` |
