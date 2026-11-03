@@ -11,8 +11,9 @@ terminal/hooks adapters and the `topics` convenience alias remain). Phase 3 host
 wiring is partial: BSH has a `BosHostSpec` adapter and `framework_manager()`, and
 `statuses()` merges packages the neutral manager sees with the host's loaded set
 (invalid manifests are listed with an error), and `bsh ext install` writes
-through `ExtensionManager::install_package`; uninstall, enable/disable,
-versions, rollback, retry and quarantine go through the manager too.
+through `ExtensionManager::install_package`; install, uninstall, enable/disable,
+versions, rollback, retry, quarantine and `bsh ext plan` go through the manager
+too.
 `LegacyAdapter` bridges the old tool-shaped runtime contract to the generic
 Runtime trait; BSH's `BosRuntimeResolver` now lets `ExtensionManager::apply`
 start declarative, process, Cordis, Extism, WASM and MCP packages end to end

@@ -38,6 +38,7 @@ Commands:
               [--registry <name|url> <id>[@version]]
   uninstall <id> [--purge-data]       remove a package; keep data by default
   list                                list installed and built-in extensions
+  plan [--json]                       print the manager's activation order
   graph [--json]                      print the declared service/dependency graph
   why <id>                            explain why an extension is or is not applied
   effects <id>                        list the declared effect surface of one extension
@@ -131,6 +132,7 @@ pub(crate) fn run(args: &[String]) -> i32 {
         "install" => command_install(&rest[1..], root.clone()),
         "uninstall" => command_uninstall(&rest[1..], root.clone()),
         "list" => command_list(root.clone(), json),
+        "plan" => command_plan(root.clone(), json),
         "graph" => command_graph(root.clone(), json),
         "why" => command_why(&rest[1..], root.clone(), json),
         "effects" => command_effects(&rest[1..], root.clone(), json),
@@ -607,6 +609,26 @@ fn command_list(root: Option<PathBuf>, json: bool) -> Result<i32, String> {
             if status.applied { "yes" } else { "no" },
             status.tools.join(", ")
         );
+    }
+    Ok(0)
+}
+
+fn command_plan(root: Option<PathBuf>, json: bool) -> Result<i32, String> {
+    let manager = crate::extension::framework::manager_for(config(root).root, None)
+        .map_err(|error| error.to_string())?;
+    let plan = manager.plan().map_err(|error| error.to_string())?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "order": plan.order }))
+                .unwrap_or_default()
+        );
+    } else if plan.order.is_empty() {
+        println!("no installed extensions");
+    } else {
+        for (index, id) in plan.order.iter().enumerate() {
+            println!("{}. {id}", index + 1);
+        }
     }
     Ok(0)
 }
