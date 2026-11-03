@@ -333,14 +333,15 @@ mod tests {
         assert!(tool.run(&two_active).is_err());
         assert!(tool.store().items().is_empty());
     }
+
     #[test]
-    fn item_text_is_trimmed_and_truncated() {
+    fn item_text_over_limit_is_rejected() {
         let tool = tool();
-        let long = "x".repeat(MAX_TEXT + 40);
-        tool.run(&serde_json::json!({"items": [{"text": format!("  {long}  ")}]}))
-            .expect("run");
-        let items = tool.store().items();
-        assert_eq!(items[0].text.len(), MAX_TEXT);
+        let long = "x".repeat(MAX_TEXT + 1);
+        assert!(tool.run(&serde_json::json!({
+            "items": [{"text": long, "status": "in_progress"}]
+        })).is_err());
+        assert!(tool.store().items().is_empty());
     }
 
     /// The description carries the reference todo guidance, with BSH's tool
@@ -363,6 +364,9 @@ mod tests {
         let schema = tool().json_schema();
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["required"][0], "items");
+        assert_eq!(schema["properties"]["items"]["maxItems"], MAX_ITEMS);
+        assert_eq!(schema["properties"]["items"]["items"]["properties"]["text"]["maxLength"], MAX_TEXT);
+        assert_eq!(schema["additionalProperties"], false);
         let status = &schema["properties"]["items"]["items"]["properties"]["status"];
         assert_eq!(status["enum"][1], "in_progress");
     }
