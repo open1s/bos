@@ -8878,21 +8878,22 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         std::fs::write(
             package.join("extension.toml"),
             r#"
-schema_version = "1.0"
+schema_version = "2.0"
 [extension]
 id = "com.example.keyless"
 name = "Keyless"
 version = "1.0.0"
 description = "keyless provider fixture"
 [compatibility]
-bsh = ">=3.0.0, <4.0.0"
+host = ">=3.0.0, <4.0.0"
 extension_api = "^1.0"
 [runtime]
 kind = "declarative"
 [capabilities]
 required = ["agent.tools.register"]
-[contributes]
-model_providers = ["zen"]
+[[contribution]]
+kind = "model-provider"
+id = "zen"
 "#,
         )
         .expect("manifest");

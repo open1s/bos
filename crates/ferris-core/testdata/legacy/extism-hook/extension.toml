@@ -1,0 +1,30 @@
+schema_version = "1.0"
+
+[extension]
+id = "com.example.extism-hook"
+name = "Extism Hook Observer"
+version = "1.0.0"
+description = "Consumes BSH observe hooks and counts them per point"
+authors = ["BSH Example"]
+license = "MIT"
+
+[compatibility]
+bsh = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+
+[runtime]
+kind = "extism"
+entry = "plugin.wasm"
+startup = "on-demand"
+
+[capabilities]
+required = ["hooks.observe", "extension.storage", "agent.tools.register", "ui.panels"]
+
+[contributes]
+tools = ["stats"]
+panels = ["inspector"]
+hooks = ["model.request", "model.response", "http.exchange"]
+
+[resources]
+max_memory_mb = 64
+max_execution_ms = 2000

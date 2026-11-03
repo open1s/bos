@@ -240,7 +240,7 @@ fn command_new(args: &[String]) -> Result<i32, String> {
     std::fs::create_dir_all(directory.join("commands")).map_err(|error| error.to_string())?;
     let name = title_case(id.namespace());
     let manifest = format!(
-        r#"schema_version = "1.0"
+        r#"schema_version = "2.0"
 
 [extension]
 id = "{id}"
@@ -249,20 +249,22 @@ version = "0.1.0"
 description = "A BSH extension"
 
 [compatibility]
-bsh = ">=3.0.0, <4.0.0"
+host = ">=3.0.0, <4.0.0"
 extension_api = "^1.0"
 
 [runtime]
 kind = "declarative"
-startup = "on-demand"
 
 [capabilities]
 required = ["agent.tools.register"]
-optional = ["workspace.read"]
 
-[contributes]
-tools = ["echo"]
-commands = ["refresh"]
+[[contribution]]
+kind = "tool"
+id = "echo"
+
+[[contribution]]
+kind = "command"
+id = "refresh"
 
 [resources]
 max_execution_ms = 5000
@@ -1944,7 +1946,7 @@ mod tests {
         std::fs::write(
             source.join("extension.toml"),
             r#"
-schema_version = "1.0"
+schema_version = "2.0"
 
 [extension]
 id = "com.example.reproduced"
@@ -1953,14 +1955,15 @@ version = "1.0.0"
 description = "A reproduced test package"
 
 [compatibility]
-bsh = ">=3.0.0, <4.0.0"
+host = ">=3.0.0, <4.0.0"
 extension_api = "^1.0"
 
 [runtime]
 kind = "declarative"
 
-[contributes]
-tools = ["echo"]
+[[contribution]]
+kind = "tool"
+id = "echo"
 "#,
         )
         .expect("manifest");
@@ -2006,7 +2009,7 @@ source_path = "{source_path}"
         std::fs::write(
             root.join("extension.toml"),
             r#"
-schema_version = "1.0"
+schema_version = "2.0"
 
 [extension]
 id = "com.example.built"
@@ -2015,14 +2018,15 @@ version = "1.0.0"
 description = "A built test package"
 
 [compatibility]
-bsh = ">=3.0.0, <4.0.0"
+host = ">=3.0.0, <4.0.0"
 extension_api = "^1.0"
 
 [runtime]
 kind = "declarative"
 
-[contributes]
-tools = ["echo"]
+[[contribution]]
+kind = "tool"
+id = "echo"
 "#,
         )
         .expect("manifest");

@@ -1,4 +1,4 @@
-schema_version = "1.0"
+schema_version = "2.0"
 
 [extension]
 id = "com.example.hook-demo"
@@ -9,68 +9,242 @@ authors = ["BSH Example"]
 license = "MIT"
 
 [compatibility]
-bsh = ">=3.0.0, <4.0.0"
+host = ">=3.0.0, <4.0.0"
 extension_api = "^1.0"
 
 [runtime]
 kind = "process"
-entry = "python3"
+
+[runtime.config]
 args = ["server.py"]
+entry = "python3"
 startup = "on-demand"
 
 [capabilities]
 required = [
-  "process.execute",
-  "agent.tools.register",
-  "agent.prompts.provide",
-  "agent.context.provide",
-  "agent.skills.provide",
-  "agent.models.provide",
-  "agent.agents.provide",
-  "agent.workflows.provide",
-  "ui.panels",
-  "ui.commands",
-  "ui.theme",
-  "events.subscribe",
+    "process.execute",
+    "agent.tools.register",
+    "agent.prompts.provide",
+    "agent.context.provide",
+    "agent.skills.provide",
+    "agent.models.provide",
+    "agent.agents.provide",
+    "agent.workflows.provide",
+    "ui.panels",
+    "ui.commands",
+    "ui.theme",
+    "events.subscribe",
 ]
 
-[contributes]
-tools = ["hook-log"]
-commands = ["events"]
-panels = ["status"]
-prompts = ["guide"]
-contexts = ["workspace"]
-skills = ["hook-demo"]
-languages = ["hookdemo"]
-integrations = ["github", "command"]
-themes = ["midnight"]
-presets = ["demo"]
-model_providers = ["example"]
-agent_providers = ["helper"]
-workflows = ["inspect"]
-events = [
-  "app.started",
-  "workspace.opened",
-  "session.created",
-  "session.updated",
-  "session.deleted",
-  "trajectory.recorded",
-  "agent.started",
-  "agent.completed",
-  "agent.failed",
-  "skill.loaded",
-  "instruction.build",
-  "model.requested",
-  "model.completed",
-  "mcp.connected",
-  "tool.invoked",
-  "tool.completed",
-  "tool.failed",
-  "network.request",
-  "audio.captured",
-  "extension.loaded",
-]
-publishes = ["tool.completed"]
+[[contribution]]
+kind = "tool"
+id = "hook-log"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "command"
+id = "events"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "panel"
+id = "status"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "prompt"
+id = "guide"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "context"
+id = "workspace"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "skill"
+id = "hook-demo"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "workflow"
+id = "inspect"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "language"
+id = "hookdemo"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "integration"
+id = "github"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "integration"
+id = "command"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "model-provider"
+id = "example"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "agent-provider"
+id = "helper"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "theme"
+id = "midnight"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "preset"
+id = "demo"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "app.started"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "workspace.opened"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "session.created"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "session.updated"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "session.deleted"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "trajectory.recorded"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "agent.started"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "agent.completed"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "agent.failed"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "skill.loaded"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "instruction.build"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "model.requested"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "model.completed"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "mcp.connected"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "tool.invoked"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "tool.completed"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "tool.failed"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "network.request"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "audio.captured"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "extension.loaded"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.publish"
+id = "tool.completed"
+
+[contribution.payload]
 
 [configuration]
 schema = "schemas/config.schema.json"
@@ -78,3 +252,9 @@ schema = "schemas/config.schema.json"
 [resources]
 max_memory_mb = 128
 max_execution_ms = 5000
+
+[dependencies]
+
+[services]
+provides = []
+requires = []

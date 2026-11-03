@@ -1,4 +1,4 @@
-schema_version = "1.0"
+schema_version = "2.0"
 
 [extension]
 id = "com.example.extism-echo"
@@ -9,29 +9,91 @@ authors = ["BSH Example"]
 license = "MIT"
 
 [compatibility]
-bsh = ">=3.0.0, <4.0.0"
+host = ">=3.0.0, <4.0.0"
 extension_api = "^1.0"
 
 [runtime]
 kind = "extism"
+
+[runtime.config]
 entry = "plugin.wasm"
 startup = "on-demand"
 
 [capabilities]
-required = ["agent.tools.register", "ui.panels", "ui.commands", "agent.prompts.provide", "agent.context.provide"]
+required = [
+    "agent.tools.register",
+    "ui.panels",
+    "ui.commands",
+    "agent.prompts.provide",
+    "agent.context.provide",
+]
 
-[contributes]
-tools = ["echo"]
-commands = ["greet"]
-panels = ["status"]
-prompts = ["hello"]
-contexts = ["guide"]
-themes = ["midnight"]
-presets = ["reader"]
-model_providers = ["example"]
-agent_providers = ["helper"]
-events = ["workspace.changed"]
+[[contribution]]
+kind = "tool"
+id = "echo"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "command"
+id = "greet"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "panel"
+id = "status"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "prompt"
+id = "hello"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "context"
+id = "guide"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "model-provider"
+id = "example"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "agent-provider"
+id = "helper"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "theme"
+id = "midnight"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "preset"
+id = "reader"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "workspace.changed"
+
+[contribution.payload]
 
 [resources]
 max_memory_mb = 64
 max_execution_ms = 2000
+
+[dependencies]
+
+[services]
+provides = []
+requires = []

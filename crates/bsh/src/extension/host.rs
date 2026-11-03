@@ -840,12 +840,37 @@ pub(crate) struct IntegrationEntry {
 }
 
 impl ExtensionHost {
+    /// Activate every applied installed package through the neutral manager.
+    fn activate_through_manager(&self) -> Result<(), ferris_core::ExtError> {
+        let mut resolver =
+            super::framework::FerrisRuntimeResolver::new(self.config.workspace.clone()).with_ports(
+                Arc::clone(&self.policy),
+                Arc::clone(&self.events),
+                ferris_core::types::TrustLevel::Community,
+            );
+        for builtin in &self.builtins {
+            resolver =
+                resolver.with_builtin(builtin.package.id().as_str(), Arc::clone(&builtin.runtime));
+        }
+        for entry in self.loaded.values().filter(|entry| entry.applied) {
+            if let Some(runtime) = &entry.runtime {
+                resolver = resolver.with_legacy(entry.package.id().as_str(), Arc::clone(runtime));
+            }
+        }
+        let manager = self
+            .framework_manager()?
+            .with_ports(Arc::new(resolver), Arc::new(super::framework::HostNoopSink));
+        let plan = manager.plan()?;
+        let _active = super::block_on_tokio(async move { manager.apply(&plan).await })?;
+        Ok(())
+    }
+
     /// Build the host-neutral runtime resolver with this host's policy/events.
     pub(crate) fn framework_resolver(
         &self,
-    ) -> std::sync::Arc<super::framework::BosRuntimeResolver> {
-        let mut resolver = super::framework::BosRuntimeResolver::new(self.config.workspace.clone())
-            .with_ports(
+    ) -> std::sync::Arc<super::framework::FerrisRuntimeResolver> {
+        let mut resolver =
+            super::framework::FerrisRuntimeResolver::new(self.config.workspace.clone()).with_ports(
                 std::sync::Arc::clone(&self.policy),
                 std::sync::Arc::clone(&self.events),
                 ferris_core::types::TrustLevel::Community,
@@ -1359,6 +1384,9 @@ impl ExtensionHost {
         self.manager = manager;
         self.loaded = loaded;
         self.issues = issues;
+        if let Err(error) = self.activate_through_manager() {
+            log::warn!("extension manager activation failed: {error}");
+        }
         for id in previous_applied {
             let still_applied = self
                 .loaded
@@ -3238,10 +3266,21 @@ mod tests {
         }
     }
 
-    fn write_package(root: &Path) {
-        std::fs::create_dir_all(root.join("tools")).expect("tools");
+    fn write_manifest(root: &Path, legacy: &str) {
+        let manifest = ferris_core::manifest::Manifest::parse(legacy, &root.join("extension.toml"))
+            .expect("legacy manifest");
+        let v2 = ferris_core::manifest_v2::ManifestV2::from_legacy(&manifest);
         std::fs::write(
             root.join("extension.toml"),
+            v2.to_toml().expect("2.0 manifest"),
+        )
+        .expect("manifest");
+    }
+
+    fn write_package(root: &Path) {
+        std::fs::create_dir_all(root.join("tools")).expect("tools");
+        write_manifest(
+            root,
             r#"
 schema_version = "1.0"
 
@@ -3264,8 +3303,7 @@ required = ["agent.tools.register"]
 [contributes]
 tools = ["echo"]
 "#,
-        )
-        .expect("manifest");
+        );
         std::fs::write(
             root.join("tools/echo.json"),
             r#"{"description":"Echo","implementation":{"kind":"echo_arguments"}}"#,
@@ -3277,8 +3315,8 @@ tools = ["echo"]
         for directory in ["tools", "languages", "integrations"] {
             std::fs::create_dir_all(root.join(directory)).expect(directory);
         }
-        std::fs::write(
-            root.join("extension.toml"),
+        write_manifest(
+            root,
             r#"
 schema_version = "1.0"
 
@@ -3303,8 +3341,7 @@ tools = ["check"]
 languages = ["rust"]
 integrations = ["github"]
 "#,
-        )
-        .expect("manifest");
+        );
         std::fs::write(
             root.join("tools/check.json"),
             r#"{"description":"Check","implementation":{"kind":"echo_arguments"}}"#,
@@ -3351,7 +3388,7 @@ tools = ["echo"]
 "{dependency}" = "^1.0"
 "#
         );
-        std::fs::write(root.join("extension.toml"), manifest).expect("manifest");
+        write_manifest(root, &manifest);
         std::fs::write(
             root.join("tools/echo.json"),
             r#"{"description":"Echo","implementation":{"kind":"echo_arguments"}}"#,
@@ -4022,8 +4059,8 @@ requires = [{ name = "com.example.search", contract = "com.example.search-api", 
         for directory in ["tools", "languages"] {
             std::fs::create_dir_all(root.join(directory)).expect(directory);
         }
-        std::fs::write(
-            root.join("extension.toml"),
+        write_manifest(
+            root,
             r#"
 schema_version = "1.0"
 
@@ -4047,8 +4084,7 @@ required = ["agent.tools.register"]
 tools = ["check"]
 languages = ["rust"]
 "#,
-        )
-        .expect("manifest");
+        );
         std::fs::write(
             root.join("tools/check.json"),
             r#"{"description":"Check","capabilities":["secrets.read"],"implementation":{"kind":"echo_arguments"}}"#,
@@ -4086,8 +4122,8 @@ languages = ["rust"]
         let root = scratch("grant-narrow");
         let source = root.join("source");
         std::fs::create_dir_all(source.join("tools")).expect("tools");
-        std::fs::write(
-            source.join("extension.toml"),
+        write_manifest(
+            &source,
             r#"
 schema_version = "1.0"
 
@@ -4110,8 +4146,7 @@ required = ["secrets.read", "network.http"]
 [contributes]
 tools = ["echo"]
 "#,
-        )
-        .expect("manifest");
+        );
         std::fs::write(
             source.join("tools/echo.json"),
             r#"{"description":"Echo","implementation":{"kind":"echo_arguments"}}"#,

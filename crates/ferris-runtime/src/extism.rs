@@ -984,7 +984,7 @@ mod tests {
     #[tokio::test]
     async fn an_extism_plugin_runs_tools_commands_and_panels() {
         let root = example_root();
-        let manifest = Manifest::load(&root).expect("manifest");
+        let manifest = ferris_core::manifest_v2::load_package_manifest(&root).expect("manifest");
         let scratch =
             std::env::temp_dir().join(format!("bsh-extism-runtime-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&scratch);
@@ -1040,7 +1040,7 @@ mod tests {
             .join("../../examples/extensions/extism-hook")
             .canonicalize()
             .expect("the hook example exists");
-        let manifest = Manifest::load(&root).expect("manifest");
+        let manifest = ferris_core::manifest_v2::load_package_manifest(&root).expect("manifest");
         let scratch = std::env::temp_dir().join(format!("bsh-extism-hook-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&scratch);
         std::fs::create_dir_all(scratch.join("data")).expect("data");

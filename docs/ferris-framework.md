@@ -1,35 +1,32 @@
 # Ferris Extension Framework
 
-Status: Phase 5 in progress — manifest 2.0 envelope, migration and dual-version
-loading are live; migration preserves runtime entry, args, env, protocol,
-startup policy, event subscribe/publish and hook contributions, migrated
-packages validate, and
-`bsh ext validate` reports `schema: 2.0` plus the generic contribution count,
-and `bsh ext graph` reads effects from the 2.0 generic contribution list when
-present; the independent `ferris-smoke` binary
-parses and validates a 2.0 manifest with no BSH dependency, and the SDK carries
-unit tests for its author runtime adapter. BSH imports core primitives and standard runtimes directly;
-the Phase-1 composable/runtime/core re-export modules are deleted, and the
-lifecycle state machine now lives in ferris-core (only the terminal/hooks
-adapters and the `topics` convenience alias remain in BSH). Phase 3 host
-wiring is partial: BSH has a `BosHostSpec` adapter and `framework_manager()`, and
-`statuses()` merges packages the neutral manager sees with the host's loaded set
-(invalid manifests are listed with an error), and `bsh ext install` writes
-through `ExtensionManager::install_package`; install, uninstall, enable/disable,
-versions, rollback, retry, quarantine and `bsh ext plan` go through the manager
-too.
+Status: Phase 5 complete — manifest 2.0 is the only accepted package schema;
+1.x packages must run `bsh ext migrate` first; every shipped example and the
+`bsh ext new` scaffold are already 2.0. Migration preserves runtime
+entry, args, env, protocol, startup policy, event subscribe/publish and hook
+contributions; migrated packages validate, `bsh ext validate` reports
+`schema: 2.0` plus the generic contribution count, and `bsh ext graph` reads
+effects from the 2.0 generic contribution list. The independent `ferris-smoke`
+binary parses a 2.0 manifest with no BSH dependency, and the SDK carries unit
+tests for its author runtime adapter.
+
+BSH imports core primitives and standard runtimes directly; the Phase-1
+composable/runtime/core re-export modules are deleted, and the lifecycle state
+machine now lives in ferris-core (only the terminal/hooks adapters and the
+`topics` convenience alias remain in BSH). `FerrisHostSpec` and
+`FerrisRuntimeResolver` are the host adapters. `statuses()` merges packages the
+neutral manager sees with the host's loaded set, and install, uninstall,
+enable/disable, versions, rollback, retry, quarantine and `bsh ext plan` go
+through the manager.
+
 `LegacyAdapter` bridges the old tool-shaped runtime contract to the generic
-Runtime trait; BSH's `BosRuntimeResolver` now lets `ExtensionManager::apply`
-start declarative, process, Cordis, Extism, WASM and MCP packages end to end
-(the sandboxed runtimes take policy/events ports), and linked-in builtins can be
-registered on the resolver by id. The production
-`ExtensionHost::rebuild` takes its package order from the manager plan, and
-`ExtensionHost::build_runtime` now calls `ferris_runtime::factory::build` with
-a `RuntimePorts` bundle; the host no longer names any concrete runtime
-constructor. `framework_resolver()` exposes the same policy/events to the
-neutral resolver. Activation itself is still host-owned. ferris-core exposes HostSpec, the Host bundle and an
-ExtensionManager with open/install/plan/apply/reload; a failed activation rolls
-back the already-started set instead of leaking runtimes or leases.
+Runtime trait. The production `ExtensionHost::rebuild` takes its package order
+from `ExtensionManager::plan`, builds every runtime through
+`ferris_runtime::factory::build` with a `RuntimePorts` bundle, and activates the
+applied set through `ExtensionManager::apply` with the host's own runtimes
+registered on the resolver. The host no longer names a concrete runtime
+constructor and no longer owns activation order. A failed activation rolls back
+the already-started set instead of leaking runtimes or leases.
 
 ## Goal
 

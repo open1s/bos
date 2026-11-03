@@ -1095,7 +1095,6 @@ async fn wait_for_blocking_call<T: Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferris_core::manifest::Manifest;
 
     #[tokio::test]
     async fn timed_out_worker_keeps_call_gate_held_until_worker_exits() {
@@ -1397,7 +1396,7 @@ required = ["process.execute"]
             .join("../../examples/extensions/mcp-echo")
             .canonicalize()
             .expect("the MCP example exists");
-        let manifest = Manifest::load(&root).expect("manifest");
+        let manifest = ferris_core::manifest_v2::load_package_manifest(&root).expect("manifest");
         let scratch = std::env::temp_dir().join(format!("bsh-mcp-test-{}", std::process::id()));
         std::fs::create_dir_all(&scratch).expect("scratch");
         let policy = Arc::new(

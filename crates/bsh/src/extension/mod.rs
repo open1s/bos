@@ -56,24 +56,45 @@ pub(crate) fn dispatcher() -> Arc<ferris_core::composable::dispatch::EventDispat
 /// panics with "there is no reactor running".
 ///
 /// The runtime is created once, on first use, and lives for the app.
-pub(crate) async fn run_on_tokio<F, T>(future: F) -> T
-where
-    F: std::future::Future<Output = T> + Send + 'static,
-    T: Send + 'static,
-{
+fn extension_runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-    let runtime = RUNTIME.get_or_init(|| {
+    RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .thread_name("bsh-extension-runtime")
             .build()
             .expect("extension Tokio runtime")
-    });
+    })
+}
+
+pub(crate) async fn run_on_tokio<F, T>(future: F) -> T
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
     let (tx, rx) = tokio::sync::oneshot::channel();
-    runtime.spawn(async move {
+    extension_runtime().spawn(async move {
         let _ = tx.send(future.await);
     });
     rx.await.expect("extension runtime task")
+}
+
+/// Block a synchronous host callback on the extension runtime.
+///
+/// The call may already be inside a Tokio context, so the future always runs on
+/// the dedicated multi-thread runtime rather than the caller's executor.
+pub(crate) fn block_on_tokio<F, T>(future: F) -> T
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::spawn(move || extension_runtime().block_on(future))
+            .join()
+            .expect("extension activation thread")
+    } else {
+        extension_runtime().block_on(future)
+    }
 }
 
 /// The managed extension root for a settings document.

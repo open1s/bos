@@ -1,4 +1,4 @@
-schema_version = "1.0"
+schema_version = "2.0"
 
 [extension]
 id = "com.example.hello"
@@ -9,23 +9,48 @@ authors = ["BSH Example"]
 license = "MIT"
 
 [compatibility]
-bsh = ">=3.0.0, <4.0.0"
+host = ">=3.0.0, <4.0.0"
 extension_api = "^1.0"
 
 [runtime]
 kind = "declarative"
+
+[runtime.config]
 startup = "on-demand"
 
 [capabilities]
 required = ["agent.tools.register"]
-optional = ["workspace.read", "ui.panels", "ui.commands"]
 
-[contributes]
-tools = ["echo"]
-commands = ["greet"]
-panels = ["status"]
-prompts = ["hello"]
+[[contribution]]
+kind = "tool"
+id = "echo"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "command"
+id = "greet"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "panel"
+id = "status"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "prompt"
+id = "hello"
+
+[contribution.payload]
 
 [resources]
 max_execution_ms = 2000
 max_output_bytes = 65536
+
+[dependencies]
+
+[services]
+provides = []
+requires = []

@@ -1,0 +1,31 @@
+schema_version = "1.0"
+
+[extension]
+id = "com.example.hello"
+name = "Hello"
+version = "1.0.0"
+description = "A minimal declarative extension: one echo tool, one command and one panel"
+authors = ["BSH Example"]
+license = "MIT"
+
+[compatibility]
+bsh = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+
+[runtime]
+kind = "declarative"
+startup = "on-demand"
+
+[capabilities]
+required = ["agent.tools.register"]
+optional = ["workspace.read", "ui.panels", "ui.commands"]
+
+[contributes]
+tools = ["echo"]
+commands = ["greet"]
+panels = ["status"]
+prompts = ["hello"]
+
+[resources]
+max_execution_ms = 2000
+max_output_bytes = 65536

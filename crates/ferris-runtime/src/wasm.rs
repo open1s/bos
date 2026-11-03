@@ -1145,7 +1145,7 @@ mod tests {
     #[tokio::test]
     async fn a_component_runs_tools_commands_and_panels() {
         let root = example_root();
-        let manifest = Manifest::load(&root).expect("manifest");
+        let manifest = ferris_core::manifest_v2::load_package_manifest(&root).expect("manifest");
         let scratch = scratch("echo");
         let policy = Arc::new(
             PolicyEngine::open(

@@ -43,6 +43,10 @@ fn empty_table() -> toml::Value {
     toml::Value::Table(toml::map::Map::new())
 }
 
+fn services_empty(services: &ServicesSpec) -> bool {
+    services.provides.is_empty() && services.requires.is_empty()
+}
+
 fn runtime_config(legacy: &Manifest) -> toml::Value {
     let mut table = toml::map::Map::new();
     if let Some(entry) = &legacy.runtime.entry {
@@ -138,7 +142,7 @@ pub struct ManifestV2 {
     #[serde(default)]
     pub dependencies: BTreeMap<ExtensionId, Requirement>,
     /// Service contracts.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "services_empty")]
     pub services: ServicesSpec,
 }
 
@@ -426,11 +430,15 @@ pub fn load_package_manifest(root: &Path) -> Result<Manifest, ExtensionError> {
         .get("schema_version")
         .and_then(toml::Value::as_str)
         .unwrap_or("");
-    if schema == MANIFEST_V2_SCHEMA_VERSION {
-        ManifestV2::parse(&text, &path)?.into_legacy()
-    } else {
-        Manifest::parse(&text, &path)
+    if schema != MANIFEST_V2_SCHEMA_VERSION {
+        return Err(ExtensionError::Manifest {
+            path,
+            message: format!(
+                "unsupported manifest schema {schema:?}; run 'bsh ext migrate' to write 2.0"
+            ),
+        });
     }
+    ManifestV2::parse(&text, &path)?.into_legacy()
 }
 
 /// Migrate the manifest of one package without writing it.
@@ -512,8 +520,7 @@ id = "echo"
 
     #[test]
     fn legacy_hello_migrates_to_generic_contributions() {
-        let root =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/extensions/hello");
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/legacy/hello");
         let legacy = Manifest::load(&root).expect("legacy");
         let v2 = ManifestV2::from_legacy(&legacy);
         assert_eq!(v2.schema_version, "2.0");
@@ -528,8 +535,7 @@ id = "echo"
 
     #[test]
     fn writes_a_migrated_manifest_and_keeps_a_backup() {
-        let source =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/extensions/hello");
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/legacy/hello");
         let temp = tempfile::tempdir().expect("tempdir");
         crate::package::copy_tree(&source, temp.path()).expect("copy");
         let path = write_migrated_package(temp.path()).expect("migrate");
@@ -541,8 +547,7 @@ id = "echo"
 
     #[test]
     fn a_migrated_package_loads_through_the_host_shape() {
-        let source =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/extensions/hello");
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/legacy/hello");
         let temp = tempfile::tempdir().expect("tempdir");
         crate::package::copy_tree(&source, temp.path()).expect("copy");
         write_migrated_package(temp.path()).expect("migrate");
@@ -563,8 +568,7 @@ id = "echo"
 
     #[test]
     fn process_runtime_config_survives_migration() {
-        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/extensions/process-echo");
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/legacy/process");
         let temp = tempfile::tempdir().expect("tempdir");
         crate::package::copy_tree(&source, temp.path()).expect("copy");
         write_migrated_package(temp.path()).expect("migrate");
@@ -580,8 +584,7 @@ id = "echo"
 
     #[test]
     fn event_contributions_survive_migration() {
-        let source =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/extensions/hook-demo");
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/legacy/hook-demo");
         let temp = tempfile::tempdir().expect("tempdir");
         crate::package::copy_tree(&source, temp.path()).expect("copy");
         write_migrated_package(temp.path()).expect("migrate");
@@ -603,8 +606,7 @@ id = "echo"
 
     #[test]
     fn hook_contributions_survive_migration() {
-        let source =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/extensions/extism-hook");
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/legacy/extism-hook");
         let temp = tempfile::tempdir().expect("tempdir");
         crate::package::copy_tree(&source, temp.path()).expect("copy");
         write_migrated_package(temp.path()).expect("migrate");

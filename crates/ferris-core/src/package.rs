@@ -1252,6 +1252,18 @@ mod tests {
 
     fn write_package(root: &Path, body: &str) {
         std::fs::create_dir_all(root.join("tools")).expect("tools");
+        let legacy = Manifest::parse(body, &root.join(MANIFEST_FILE)).expect("legacy");
+        let v2 = crate::manifest_v2::ManifestV2::from_legacy(&legacy);
+        std::fs::write(
+            root.join(MANIFEST_FILE),
+            v2.to_toml().expect("2.0 manifest"),
+        )
+        .expect("manifest");
+        std::fs::write(root.join("tools").join("echo.json"), "{}").expect("tool");
+    }
+
+    fn write_raw_package(root: &Path, body: &str) {
+        std::fs::create_dir_all(root.join("tools")).expect("tools");
         std::fs::write(root.join(MANIFEST_FILE), body).expect("manifest");
         std::fs::write(root.join("tools").join("echo.json"), "{}").expect("tool");
     }
@@ -1360,9 +1372,24 @@ max_execution_ms = 1000
     fn an_invalid_manifest_is_not_installed() {
         let scratch = Scratch::new("invalid");
         let source = scratch.0.join("source");
-        write_package(
+        write_raw_package(
             &source,
-            &manifest().replace("version = \"1.2.3\"", "version = \"nope\""),
+            r#"
+schema_version = "2.0"
+[extension]
+id = "com.example.echo"
+name = "Echo"
+version = "nope"
+description = "invalid"
+[compatibility]
+host = ">=3.0.0"
+extension_api = "^1.0"
+[runtime]
+kind = "declarative"
+[[contribution]]
+kind = "tool"
+id = "echo"
+"#,
         );
         let store = ExtensionStore::open(scratch.0.join("store")).expect("store");
         assert!(store.install(&source).is_err());

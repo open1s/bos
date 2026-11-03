@@ -11,14 +11,14 @@ use ferris_core::{
 };
 
 /// Host facts BSH passes to the framework manager.
-pub(crate) struct BosHostSpec {
+pub(crate) struct FerrisHostSpec {
     root: PathBuf,
     workspace: Option<PathBuf>,
     capabilities: CapabilityRegistry,
     contracts: ServiceContractRegistry,
 }
 
-impl BosHostSpec {
+impl FerrisHostSpec {
     /// Build the adapter for one managed root and workspace.
     pub(crate) fn new(root: PathBuf, workspace: Option<PathBuf>) -> Self {
         let mut capabilities = CapabilityRegistry::default();
@@ -48,7 +48,7 @@ fn risk(risk: ferris_core::capability::Risk) -> Risk {
     }
 }
 
-impl HostSpec for BosHostSpec {
+impl HostSpec for FerrisHostSpec {
     fn root(&self) -> PathBuf {
         self.root.clone()
     }
@@ -79,19 +79,20 @@ pub(crate) fn manager_for(
     root: PathBuf,
     workspace: Option<PathBuf>,
 ) -> Result<ExtensionManager, ExtError> {
-    ExtensionManager::open(Arc::new(BosHostSpec::new(root, workspace)))
+    ExtensionManager::open(Arc::new(FerrisHostSpec::new(root, workspace)))
 }
 
 /// BSH runtime resolver: wraps the standard runtimes in the generic adapter.
-pub(crate) struct BosRuntimeResolver {
+pub(crate) struct FerrisRuntimeResolver {
     workspace: Option<PathBuf>,
     policy: Option<Arc<ferris_core::capability::PolicyEngine>>,
     events: Option<Arc<ferris_core::events::EventBus>>,
     trust: ferris_core::types::TrustLevel,
     builtins: std::collections::BTreeMap<String, Arc<dyn ferris_runtime::Runtime>>,
+    legacy: std::collections::BTreeMap<String, Arc<dyn ferris_runtime::Runtime>>,
 }
 
-impl BosRuntimeResolver {
+impl FerrisRuntimeResolver {
     /// Build a resolver for one workspace.
     pub(crate) fn new(workspace: Option<PathBuf>) -> Self {
         Self {
@@ -100,7 +101,19 @@ impl BosRuntimeResolver {
             events: None,
             trust: ferris_core::types::TrustLevel::Community,
             builtins: std::collections::BTreeMap::new(),
+            legacy: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// Register one already-built host runtime for manager activation.
+    #[must_use]
+    pub(crate) fn with_legacy(
+        mut self,
+        id: &str,
+        runtime: Arc<dyn ferris_runtime::Runtime>,
+    ) -> Self {
+        self.legacy.insert(id.to_string(), runtime);
+        self
     }
 
     /// Register one linked-in builtin runtime.
@@ -129,13 +142,21 @@ impl BosRuntimeResolver {
     }
 }
 
-impl ferris_core::RuntimeResolver for BosRuntimeResolver {
+impl ferris_core::RuntimeResolver for FerrisRuntimeResolver {
     fn create(
         &self,
         manifest: &ferris_core::manifest::Manifest,
         root: &std::path::Path,
         data_root: &std::path::Path,
     ) -> Result<Arc<dyn ferris_core::Runtime>, ExtError> {
+        if let Some(runtime) = self.legacy.get(manifest.id().as_str()).cloned() {
+            return Ok(Arc::new(ferris_runtime::adapter::LegacyAdapter::new(
+                manifest.id().clone(),
+                root.to_path_buf(),
+                self.workspace.clone(),
+                runtime,
+            )));
+        }
         if manifest.runtime.kind == ferris_core::types::RuntimeKind::Builtin {
             let runtime = self
                 .builtins
@@ -245,6 +266,29 @@ fn missing_port(name: &str) -> ExtError {
     }
 }
 
+/// Sink used when the host applies its own agent contributions separately.
+pub(crate) struct HostNoopSink;
+
+/// Lease for a contributed runtime the host already owns.
+pub(crate) struct HostNoopLease;
+
+#[async_trait::async_trait]
+impl ferris_core::ContributionLease for HostNoopLease {
+    async fn revoke(&self) -> Result<(), ExtError> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl ferris_core::ContributionSink for HostNoopSink {
+    async fn apply(
+        &self,
+        _contribution: ferris_core::Contribution,
+    ) -> Result<Box<dyn ferris_core::ContributionLease>, ExtError> {
+        Ok(Box::new(HostNoopLease))
+    }
+}
+
 fn runtime_error(error: impl std::fmt::Display) -> ExtError {
     ExtError {
         code: ferris_core::ErrorCode::Runtime,
@@ -293,7 +337,7 @@ mod manager_tests {
         let plan = manager.plan().expect("plan");
         let applied = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let manager = manager.with_ports(
-            Arc::new(BosRuntimeResolver::new(None)),
+            Arc::new(FerrisRuntimeResolver::new(None)),
             Arc::new(CollectSink(Arc::clone(&applied))),
         );
         let active = manager.apply(&plan).await.expect("apply");
@@ -312,7 +356,7 @@ mod manager_tests {
         let plan = manager.plan().expect("plan");
         let applied = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let manager = manager.with_ports(
-            Arc::new(BosRuntimeResolver::new(None)),
+            Arc::new(FerrisRuntimeResolver::new(None)),
             Arc::new(CollectSink(Arc::clone(&applied))),
         );
         let active = manager.apply(&plan).await.expect("apply");
@@ -334,7 +378,7 @@ mod manager_tests {
         let plan = manager.plan().expect("plan");
         let applied = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let manager = manager.with_ports(
-            Arc::new(BosRuntimeResolver::new(None)),
+            Arc::new(FerrisRuntimeResolver::new(None)),
             Arc::new(CollectSink(Arc::clone(&applied))),
         );
         let active = manager.apply(&plan).await.expect("apply");
@@ -359,7 +403,7 @@ mod manager_tests {
             )
             .expect("policy"),
         );
-        let resolver = BosRuntimeResolver::new(None).with_ports(
+        let resolver = FerrisRuntimeResolver::new(None).with_ports(
             policy,
             ferris_core::events::EventBus::new(),
             ferris_core::types::TrustLevel::Community,
@@ -382,7 +426,7 @@ mod tests {
 
     #[test]
     fn the_adapter_registers_the_bsh_capability_vocabulary() {
-        let spec = BosHostSpec::new(PathBuf::from("/tmp/bsh-ext"), None);
+        let spec = FerrisHostSpec::new(PathBuf::from("/tmp/bsh-ext"), None);
         assert_eq!(
             spec.capabilities()
                 .get("agent.tools.register")

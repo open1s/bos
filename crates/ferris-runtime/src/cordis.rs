@@ -253,7 +253,6 @@ impl Runtime for CordisRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferris_core::manifest::Manifest;
     use std::path::PathBuf;
 
     struct TestTerminal;
@@ -284,7 +283,7 @@ mod tests {
         }
         let root =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/extensions/cordis-echo");
-        let manifest = Manifest::load(&root).expect("manifest");
+        let manifest = ferris_core::manifest_v2::load_package_manifest(&root).expect("manifest");
         let data_root =
             std::env::temp_dir().join(format!("bsh-cordis-test-{}-{}", std::process::id(), "echo"));
         let runtime = CordisRuntime::new(&manifest, &root, &data_root, Arc::new(TestTerminal))

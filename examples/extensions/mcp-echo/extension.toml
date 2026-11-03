@@ -1,4 +1,4 @@
-schema_version = "1.0"
+schema_version = "2.0"
 
 [extension]
 id = "com.example.mcp-echo"
@@ -9,22 +9,43 @@ authors = ["BSH Example"]
 license = "MIT"
 
 [compatibility]
-bsh = ">=3.0.0, <4.0.0"
+host = ">=3.0.0, <4.0.0"
 extension_api = "^1.0"
 
 [runtime]
 kind = "mcp"
-entry = "python3"
+
+[runtime.config]
 args = ["server.py"]
+entry = "python3"
 protocol = "mcp"
 startup = "on-demand"
 
 [capabilities]
-required = ["process.execute", "agent.tools.register", "agent.context.provide", "agent.prompts.provide"]
+required = [
+    "process.execute",
+    "agent.tools.register",
+    "agent.context.provide",
+    "agent.prompts.provide",
+]
 
-[contributes]
-contexts = ["guide"]
-prompts = ["greet"]
+[[contribution]]
+kind = "prompt"
+id = "greet"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "context"
+id = "guide"
+
+[contribution.payload]
 
 [resources]
 max_execution_ms = 5000
+
+[dependencies]
+
+[services]
+provides = []
+requires = []

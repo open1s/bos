@@ -194,7 +194,7 @@ mod tests {
     fn builds_a_declarative_runtime() {
         let root =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/extensions/hello");
-        let manifest = Manifest::load(&root).expect("manifest");
+        let manifest = ferris_core::manifest_v2::load_package_manifest(&root).expect("manifest");
         let built = build(&manifest, &root, ports(&root)).expect("factory");
         assert!(built.tools.iter().any(|tool| tool.id.as_str() == "echo"));
     }
@@ -203,7 +203,7 @@ mod tests {
     fn builds_a_process_runtime_without_spawning() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../examples/extensions/process-echo");
-        let manifest = Manifest::load(&root).expect("manifest");
+        let manifest = ferris_core::manifest_v2::load_package_manifest(&root).expect("manifest");
         let built = build(&manifest, &root, ports(&root)).expect("factory");
         assert!(built.tools.iter().any(|tool| tool.id.as_str() == "echo"));
     }

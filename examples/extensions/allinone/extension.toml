@@ -1,4 +1,4 @@
-schema_version = "1.0"
+schema_version = "2.0"
 
 [extension]
 id = "com.example.allinone"
@@ -11,69 +11,264 @@ repository = "https://github.com/open1s/bos"
 homepage = "https://github.com/open1s/bos/tree/main/examples/extensions/allinone"
 
 [compatibility]
-bsh = ">=3.0.0, <4.0.0"
+host = ">=3.0.0, <4.0.0"
 extension_api = "^1.0"
 
 [runtime]
 kind = "process"
+
+[runtime.config]
+args = [
+    "-B",
+    "server.py",
+]
 entry = "python3"
-args = ["-B", "server.py"]
 protocol = "jsonrpc-2.0"
 startup = "on-demand"
 
-[runtime.env]
-PYTHONDONTWRITEBYTECODE = "1"
+[runtime.config.env]
 DEMO_GREETING = "hello from the all-in-one demo"
+PYTHONDONTWRITEBYTECODE = "1"
 
 [capabilities]
-required = ["process.execute", "agent.tools.register"]
-optional = [
-  "agent.prompts.provide",
-  "agent.context.provide",
-  "agent.skills.provide",
-  "agent.models.provide",
-  "agent.agents.provide",
-  "agent.workflows.provide",
-  "ui.panels",
-  "ui.commands",
-  "ui.theme",
-  "events.subscribe",
+required = [
+    "process.execute",
+    "agent.tools.register",
 ]
 
-[contributes]
-tools = ["describe", "echo", "sum", "progress", "fail", "events", "config"]
-commands = ["hello", "refresh"]
-panels = ["dashboard"]
-prompts = ["guide"]
-contexts = ["workspace"]
-skills = ["allinone"]
-languages = ["demo-language"]
-integrations = ["github", "command"]
-themes = ["aurora"]
-presets = ["safe"]
-model_providers = ["demo"]
-agent_providers = ["helper"]
-workflows = ["inspect"]
-events = [
-  "app.started",
-  "app.shutdown",
-  "workspace.opened",
-  "workspace.changed",
-  "session.created",
-  "session.updated",
-  "trajectory.recorded",
-  "agent.started",
-  "agent.completed",
-  "agent.failed",
-  "skill.loaded",
-  "instruction.build",
-  "model.requested",
-  "model.completed",
-  "tool.invoked",
-  "tool.completed",
-  "tool.failed",
-  "extension.loaded",
-]
+[[contribution]]
+kind = "tool"
+id = "describe"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "tool"
+id = "echo"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "tool"
+id = "sum"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "tool"
+id = "progress"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "tool"
+id = "fail"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "tool"
+id = "events"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "tool"
+id = "config"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "command"
+id = "hello"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "command"
+id = "refresh"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "panel"
+id = "dashboard"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "prompt"
+id = "guide"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "context"
+id = "workspace"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "skill"
+id = "allinone"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "workflow"
+id = "inspect"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "language"
+id = "demo-language"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "integration"
+id = "github"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "integration"
+id = "command"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "model-provider"
+id = "demo"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "agent-provider"
+id = "helper"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "theme"
+id = "aurora"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "preset"
+id = "safe"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "app.started"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "app.shutdown"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "workspace.opened"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "workspace.changed"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "session.created"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "session.updated"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "trajectory.recorded"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "agent.started"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "agent.completed"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "agent.failed"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "skill.loaded"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "instruction.build"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "model.requested"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "model.completed"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "tool.invoked"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "tool.completed"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "tool.failed"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "extension.loaded"
+
+[contribution.payload]
 
 [configuration]
 schema = "schemas/config.schema.json"
@@ -86,3 +281,9 @@ verbose = true
 max_memory_mb = 128
 max_execution_ms = 5000
 max_output_bytes = 1048576
+
+[dependencies]
+
+[services]
+provides = []
+requires = []

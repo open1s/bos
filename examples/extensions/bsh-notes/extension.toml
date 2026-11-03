@@ -1,4 +1,4 @@
-schema_version = "1.0"
+schema_version = "2.0"
 
 [extension]
 id = "com.bos.bsh.notes"
@@ -9,22 +9,42 @@ authors = ["BrickOS Team"]
 license = "MIT"
 
 [compatibility]
-bsh = ">=3.0.0, <4.0.0"
+host = ">=3.0.0, <4.0.0"
 extension_api = "^1.0"
 
 [runtime]
 kind = "process"
-entry = "python3"
+
+[runtime.config]
 args = ["server.py"]
+entry = "python3"
 protocol = "jsonrpc-2.0"
 startup = "on-demand"
 
 [capabilities]
-required = ["process.execute", "agent.tools.register"]
+required = [
+    "process.execute",
+    "agent.tools.register",
+]
 
-[contributes]
-tools = ["save", "list"]
+[[contribution]]
+kind = "tool"
+id = "save"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "tool"
+id = "list"
+
+[contribution.payload]
 
 [resources]
 max_execution_ms = 5000
 max_output_bytes = 1048576
+
+[dependencies]
+
+[services]
+provides = []
+requires = []
