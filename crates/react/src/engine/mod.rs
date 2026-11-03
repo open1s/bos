@@ -89,25 +89,49 @@ const TOOL_RESULT_CAP: usize = 48 * 1024;
 
 /// Cap one tool result, preserving both ends and naming what was dropped.
 fn cap_tool_result(text: &str, cap: usize) -> String {
+    let cap = if cap == 0 { TOOL_RESULT_CAP } else { cap };
     if text.len() <= cap {
         return text.to_string();
     }
-    // Reserve room for the omission marker so the cap never grows a result.
-    let half = cap.saturating_sub(256) / 2;
-    let mut head_end = half;
-    while head_end > 0 && !text.is_char_boundary(head_end) {
-        head_end -= 1;
+
+    const SHORT_MARKER: &str = "[truncated]";
+    if cap <= SHORT_MARKER.len() {
+        return SHORT_MARKER[..cap].to_string();
     }
-    let mut tail_start = text.len() - half;
-    while tail_start < text.len() && !text.is_char_boundary(tail_start) {
-        tail_start += 1;
+
+    // Keep both ends, but include the omission marker INSIDE the byte budget.
+    // Its digit count depends on the final gap, so shrink the content budget
+    // until the complete marker and both UTF-8-safe slices fit.
+    let mut head_budget = (cap - SHORT_MARKER.len()) / 2;
+    let mut tail_budget = cap - SHORT_MARKER.len() - head_budget;
+    loop {
+        let mut head_end = head_budget.min(text.len());
+        while head_end > 0 && !text.is_char_boundary(head_end) {
+            head_end -= 1;
+        }
+        let mut tail_start = text.len().saturating_sub(tail_budget);
+        while tail_start < text.len() && !text.is_char_boundary(tail_start) {
+            tail_start += 1;
+        }
+
+        let omitted = tail_start.saturating_sub(head_end);
+        let marker = format!("\n\n[... {omitted} bytes omitted; ask for a narrower read or grep ...]\n\n");
+        let tail_len = text.len().saturating_sub(tail_start);
+        if head_end + marker.len() + tail_len <= cap {
+            return format!("{}{marker}{}", &text[..head_end], &text[tail_start..]);
+        }
+        if marker.len() > cap {
+            return SHORT_MARKER[..cap].to_string();
+        }
+
+        if head_budget >= tail_budget && head_budget > 0 {
+            head_budget -= 1;
+        } else if tail_budget > 0 {
+            tail_budget -= 1;
+        } else {
+            return SHORT_MARKER[..cap.min(SHORT_MARKER.len())].to_string();
+        }
     }
-    format!(
-        "{}\n\n[... {} bytes omitted; ask for a narrower read or grep ...]\n\n{}",
-        &text[..head_end],
-        tail_start.saturating_sub(head_end),
-        &text[tail_start..]
-    )
 }
 
 /// A normalized signature for a failed tool result, or none for a success.
@@ -1283,10 +1307,29 @@ mod repeat_guard_tests {
         assert!(capped.ends_with("TAIL"));
         assert!(capped.contains("bytes omitted"));
         assert!(
-            capped.len() < 2_048 + 256,
-            "the host cap bounds the result: {} chars",
+            capped.len() <= 2_048,
+            "the host cap bounds the result in bytes: {} vs 2048",
             capped.len()
         );
+    }
+
+    #[test]
+    fn a_small_host_cap_stays_within_bytes_and_preserves_utf8() {
+        let text = format!("HEAD{}TAIL", "界".repeat(100));
+        let capped = cap_tool_result(&text, 64);
+        assert!(capped.len() <= 64, "the cap is bytes: {}", capped.len());
+        assert!(capped.is_char_boundary(capped.len()));
+        assert!(capped.starts_with("HEAD"));
+        assert!(capped.ends_with("TAIL"));
+        assert!(capped.contains("bytes omitted"));
+    }
+
+    #[test]
+    fn a_zero_host_cap_uses_the_engine_default() {
+        let text = "x".repeat(TOOL_RESULT_CAP + 1);
+        let capped = cap_tool_result(&text, 0);
+        assert!(capped.len() <= TOOL_RESULT_CAP);
+        assert!(capped.contains("bytes omitted"));
     }
 
     #[test]
