@@ -4,9 +4,10 @@ Status: Phase 5 in progress — manifest 2.0 envelope, migration and dual-versio
 loading are live. BSH imports core primitives and standard runtimes directly;
 the Phase-1 composable/runtime/core re-export modules are deleted (only the
 terminal/hooks adapters and the `topics` convenience alias remain). Phase 3 host
-wiring is still partial: bos-ext-core exposes HostSpec, the Host bundle and an
-ExtensionManager with open/install/plan/apply/reload, but BSH's ExtensionHost is
-still its own implementation.
+wiring is partial: BSH now has a `BosHostSpec` adapter and `framework_manager()`
+that opens the host-neutral manager against the same root, but its ExtensionHost
+still owns activation. bos-ext-core exposes HostSpec, the Host bundle and an
+ExtensionManager with open/install/plan/apply/reload.
 
 ## Goal
 

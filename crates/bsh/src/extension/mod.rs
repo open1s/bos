@@ -31,6 +31,7 @@ mod cli;
 #[cfg(test)]
 mod e2e;
 mod errors;
+mod framework;
 pub(crate) mod hooks;
 pub(crate) mod host;
 pub(crate) mod live;

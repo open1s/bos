@@ -845,6 +845,13 @@ pub(crate) struct IntegrationEntry {
 }
 
 impl ExtensionHost {
+    /// Open the host-neutral manager against this host's root.
+    pub(crate) fn framework_manager(
+        &self,
+    ) -> Result<bos_ext_core::manager::ExtensionManager, bos_ext_core::ExtError> {
+        super::framework::manager_for(self.config.root.clone(), self.config.workspace.clone())
+    }
+
     /// The host-scoped service registry shared by its extension activations.
     pub(crate) fn services(&self) -> Arc<bos_ext_core::composable::ServiceRegistry> {
         Arc::clone(&self.services)
@@ -3668,6 +3675,15 @@ tools = ["echo"]
             .why("com.bos.bsh.diagnostics")
             .is_some_and(|why| why.contains("disabled")));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_framework_manager_opens_the_host_root() {
+        let root = scratch("framework-manager");
+        let host = ExtensionHost::open(config(&root)).expect("host");
+        let manager = host.framework_manager().expect("manager");
+        assert_eq!(manager.root(), root);
+        assert!(manager.installed().expect("installed").is_empty());
     }
 
     #[tokio::test]
