@@ -251,6 +251,19 @@ their declarative file conventions are:
 Contribution ids are unique within an extension and follow the dotted contribution id
 grammar.
 
+Which surface a kind reaches is part of the contract, not an implementation detail:
+
+| Surface | Kinds | Where it lands |
+|---|---|---|
+| Model-callable | tool | the request's tool array, as a namespaced live tool |
+| Model-readable | prompt, context, skill | the system prompt, or the skill catalogue |
+| Reader-only | command, panel, theme, workflow | the host's plugin registry and inventory |
+
+A command is never promoted to a tool: the reader invokes it, and the model
+operating the reader's shell is a different grant. A package that wants the model
+to run the same effect declares a `tool` too and shares the handler, so one
+effect has two front doors and the extension author decides which ones exist.
+
 ### 3.7 Services
 
 ~~~toml

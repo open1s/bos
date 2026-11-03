@@ -703,6 +703,54 @@ impl Agent {
         &self.live_tools
     }
 
+    /// The tool array this agent offers the model.
+    ///
+    /// The build registry and the live overlay are one list here because they
+    /// are one list to the model: an extension package applies after the build,
+    /// so its tools never pass through the registry, and a surface that read
+    /// only the registry hid every one of them.
+    ///
+    /// The overlay has its own namespace, so the same name can exist on both
+    /// sides; the registry is pushed first and the sort is stable, so the
+    /// built-in definition wins the de-duplication. Names are sorted because
+    /// the array is part of the provider's cached prompt prefix and must be a
+    /// function of the set, not of registration order. The hosted tools the
+    /// provider runs itself are not included: nothing here executes them.
+    pub fn model_tools(&self) -> Vec<react::llm::LlmTool> {
+        let mut tools: Vec<react::llm::LlmTool> = Vec::new();
+        if let Some(ref registry) = self.registry {
+            tools.extend(registry.iter().map(|(name, tool)| {
+                react::llm::LlmTool::function(name.clone(), tool.description(), tool.json_schema())
+            }));
+            for name in registry.async_tool_names() {
+                if let Some(async_tool) = registry.get_async(&name) {
+                    tools.push(react::llm::LlmTool::function(
+                        async_tool.name(),
+                        async_tool.description(),
+                        async_tool.json_schema(),
+                    ));
+                }
+            }
+        }
+        if let Ok(live) = self.live_tools.read() {
+            tools.extend(live.iter().map(|(_name, tool)| {
+                react::llm::LlmTool::function(tool.name(), tool.description(), tool.json_schema())
+            }));
+            for name in live.async_tool_names() {
+                if let Some(async_tool) = live.get_async(&name) {
+                    tools.push(react::llm::LlmTool::function(
+                        async_tool.name(),
+                        async_tool.description(),
+                        async_tool.json_schema(),
+                    ));
+                }
+            }
+        }
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
+        tools.dedup_by(|a, b| a.name == b.name);
+        tools
+    }
+
     /// Register an extension tool without requiring a mutable Agent.
     pub fn add_live_tool(&self, tool: Arc<dyn Tool>) -> Result<(), crate::ToolError> {
         self.live_tools

@@ -84,44 +84,20 @@ const COMPACT_MIN_SPAN_TOKENS: usize = 512;
 impl Agent {
     /// Prepare context with tools and skills populated from the agent's state.
     /// Shared by react() and stream() to avoid code duplication.
+    ///
+    /// The request's tool array and skill catalogue are the only place the
+    /// MODEL learns what it may call, so both are drawn from the agent's whole
+    /// surface: the build registry plus the live overlay that late
+    /// registrations - BSH extension packages among them - install into. The
+    /// engine executes a live tool either way, which is exactly why an overlay
+    /// entry missing here is silent: the tool exists, runs when called, and is
+    /// never called, because nothing told the model it exists.
     pub(super) fn prepare_context(&self) -> AgentReactContext {
         let mut context = AgentReactContext::new(self.config.name.clone());
 
-        if let Some(ref registry) = self.registry {
-            let mut tools: Vec<react::llm::LlmTool> = registry
-                .iter()
-                .map(|(name, tool)| react::llm::LlmTool {
-                    name: name.clone(),
-                    description: tool.description(),
-                    parameters: tool.json_schema(),
-                    kind: react::llm::LlmToolKind::Function,
-                    config: None,
-                })
-                .collect();
-
-            for name in registry.async_tool_names() {
-                if let Some(async_tool) = registry.get_async(&name) {
-                    tools.push(react::llm::LlmTool {
-                        name: async_tool.name().to_string(),
-                        description: async_tool.description(),
-                        parameters: async_tool.json_schema(),
-                        kind: react::llm::LlmToolKind::Function,
-                        config: None,
-                    });
-                }
-            }
-
-            // The tool array is part of the provider's cached prompt prefix, so
-            // its order must not depend on the registry's map iteration. A shell
-            // rebuilds the agent every turn, and a fresh map walks in a fresh
-            // order: the schemas then differ between two otherwise identical
-            // requests and the provider re-prefills the whole prompt. One sort
-            // makes the array a function of the registered set, which is what
-            // lets a turn-start request reuse the previous turn's cache.
-            tools.sort_by(|a, b| a.name.cmp(&b.name));
-
-            context.tools = tools;
-        }
+        // One derivation of the model-facing array, so the request and every
+        // surface that prices or lists it cannot drift: see Agent::model_tools.
+        context.tools = self.model_tools();
 
         // The hosted web-search tool is not in the registry, because nothing
         // here runs it: the provider does, and returns the results in its own
@@ -130,13 +106,17 @@ impl Agent {
             context.tools.push(react::llm::LlmTool::web_search(None));
         }
 
-        // The catalogue is the MODEL-INVOCABLE half of the registered set. A
+        // The catalogue is the MODEL-INVOCABLE half of the agent's skills. A
         // skill whose manifest says `disable-model-invocation: true` is the
         // reader's to invoke (the composer's `/name` gesture loads it), and
         // advertising it here would invite a tool call the same policy refuses.
         // The registered list keeps it, so the gesture still resolves it.
-        let mut skills: Vec<react::llm::Skill> = self
-            .skills
+        //
+        // The list is the merged set, for the same reason as the tool array:
+        // a package's skills are loaded into the live overlay after the build,
+        // and the catalogue is the only thing that tells the model they exist.
+        let all_skills = self.all_skills();
+        let mut skills: Vec<react::llm::Skill> = all_skills
             .iter()
             .filter(|s| !s.metadata.user_only)
             .map(|s| react::llm::Skill {
@@ -148,8 +128,10 @@ impl Agent {
         // Same prefix-cache rule as the tool array above: the catalogue is
         // rendered into the system prompt, so its order must be a function of
         // the catalogue, not of the registration path this turn happened to
-        // take.
+        // take. An overlay skill may repeat a built-in name; the stable sort
+        // keeps the built-in entry, and the model sees one row either way.
         skills.sort_by(|a, b| a.name.cmp(&b.name));
+        skills.dedup_by(|a, b| a.name == b.name);
         context.skills = skills;
 
         context

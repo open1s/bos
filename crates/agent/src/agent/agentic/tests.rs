@@ -906,6 +906,118 @@ fn prepare_context_lists_tools_in_name_order() {
     assert_eq!(names, sorted, "the tool array is name-sorted: {names:?}");
 }
 
+/// An async tool, the shape the extension platform installs: the host adds it
+/// to the agent's live overlay *after* the build.
+struct LiveEchoTool {
+    name: &'static str,
+    schema: serde_json::Value,
+}
+
+#[async_trait]
+impl react::tool::registry::AsyncTool for LiveEchoTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn description(&self) -> String {
+        "echo the arguments".to_string()
+    }
+
+    fn json_schema(&self) -> serde_json::Value {
+        self.schema.clone()
+    }
+
+    async fn run(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> Result<serde_json::Value, react::tool::ToolError> {
+        Ok(arguments.clone())
+    }
+}
+
+/// A package's tool reaches the model only through the request's tool array.
+///
+/// The live overlay is what BSH's extension platform registers into, and the
+/// engine executes those tools either way - so a missing array entry is silent:
+/// the tool exists, runs when called, and is never called, because the model
+/// was never told it exists. The array, not the engine registry, is the
+/// contract with the model.
+#[test]
+fn prepare_context_advertises_live_extension_tools() {
+    let agent = Agent::new(AgentConfig::default(), Arc::new(make_llm_provider()));
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {"text": {"type": "string"}},
+        "required": ["text"]
+    });
+    agent
+        .add_live_async_tool(Arc::new(LiveEchoTool {
+            name: "com.example.echo",
+            schema: schema.clone(),
+        }))
+        .expect("the live tool registers");
+
+    let tools = agent.prepare_context().tools;
+    let echo = tools
+        .iter()
+        .find(|tool| tool.name == "com.example.echo")
+        .expect("a live extension tool must be advertised to the model");
+    assert_eq!(
+        echo.parameters, schema,
+        "the model needs the tool's own schema, not an empty object"
+    );
+}
+
+/// Registry and live overlay share one model-facing namespace: a name owned by
+/// both is advertised once, so the provider is not handed a duplicate entry.
+#[test]
+fn prepare_context_advertises_a_live_tool_once() {
+    let mut agent = Agent::new(AgentConfig::default(), Arc::new(make_llm_provider()));
+    agent.add_tool(Arc::new(FunctionTool::new(
+        "echo",
+        "a registered tool",
+        serde_json::json!({"type":"object"}),
+        |_args| Ok(serde_json::json!("registered")),
+    )));
+    agent
+        .add_live_async_tool(Arc::new(LiveEchoTool {
+            name: "echo",
+            schema: serde_json::json!({"type":"object"}),
+        }))
+        .expect("the live tool registers");
+
+    let count = agent
+        .prepare_context()
+        .tools
+        .iter()
+        .filter(|tool| tool.name == "echo")
+        .count();
+    assert_eq!(count, 1, "one name, one array entry");
+}
+
+/// The skill catalogue in the system prompt is the model's only way to learn a
+/// skill exists; a package's skills live in the live overlay too, so the
+/// catalogue must be drawn from both sets.
+#[test]
+fn prepare_context_advertises_live_extension_skills() {
+    let agent = Agent::new(AgentConfig::default(), Arc::new(make_llm_provider()));
+    agent.add_live_skill(crate::skills::SkillContent {
+        metadata: crate::skills::SkillMetadata::new(
+            "extension-skill".to_string(),
+            "a skill from a package".to_string(),
+            std::path::PathBuf::from("/ext/skills/extension-skill/SKILL.md"),
+        ),
+        instructions: "do the thing".to_string(),
+        skill_dir: std::path::PathBuf::from("/ext/skills/extension-skill"),
+    });
+
+    let skills = agent.prepare_context().skills;
+    assert!(
+        skills.iter().any(|skill| skill.name == "extension-skill"),
+        "a live extension skill must reach the catalogue"
+    );
+}
+
 /// A lazily-created HTTP client: no network I/O happens until a request is
 /// made, which these registration tests never do.
 fn lazy_mcp_client() -> Arc<crate::mcp::McpClient> {

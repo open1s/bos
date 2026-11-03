@@ -1383,18 +1383,14 @@ fn build_agent_for_session_inner(
     crate::prompts::append_tool_guidance(&mut agent);
 
     // The meter's tools bucket follows the request's own tool array, so it is
-    // priced from the registry that request will serialize.
-    let tools_schema_chars = agent
-        .registry()
-        .map(|registry| tools_schema_chars(registry))
-        .unwrap_or(0);
+    // priced from exactly that array - the build registry AND the live overlay
+    // the extension platform installs into.
+    let model_tools = agent.model_tools();
+    let tools_schema_chars = tools_schema_chars(&model_tools);
     // A schema this large is re-sent on every step; name it at build time so a
     // connected MCP server or a wide preset can be seen in the log instead of
     // felt as latency.
-    let tool_count = agent
-        .registry()
-        .map(|registry| registry.list().len())
-        .unwrap_or(0);
+    let tool_count = model_tools.len();
     log::info!(
         "build session={session} tools={tool_count} schema_chars={tools_schema_chars} mcp_tools={}",
         mcp.tools().count()
@@ -1597,19 +1593,13 @@ pub(crate) fn credential_error(
 /// The serialized length of the tool definitions an agent sends.
 ///
 /// `contextBreakdown`'s tools bucket follows the latest request header, so this
-/// measures exactly what that request carries: every registered tool's OpenAI
-/// projection, sync and async alike, serialized as one array.
-pub(crate) fn tools_schema_chars(registry: &agent::tools::ToolRegistry) -> usize {
-    let mut definitions: Vec<react::tool::ToolDefinition> = Vec::new();
-    for (_, tool) in registry.iter() {
-        definitions.push(tool.to_openai_definition());
-    }
-    for name in registry.async_tool_names() {
-        if let Some(tool) = registry.get_async(&name) {
-            definitions.push(tool.to_openai_definition());
-        }
-    }
-    serde_json::to_string(&definitions)
+/// measures exactly what that request carries: the agent's model-facing tool
+/// array, registry and live extension overlay alike, serialized as one array.
+/// The argument is that array rather than a registry because the registry is no
+/// longer the whole answer - a package applies after the build - and a meter
+/// that priced only the registry under-reported every extension's schema.
+pub(crate) fn tools_schema_chars(tools: &[react::llm::LlmTool]) -> usize {
+    serde_json::to_string(tools)
         .map(|json| json.chars().count())
         .unwrap_or(0)
 }
@@ -1653,23 +1643,18 @@ pub(crate) fn web_search_config(settings: &Settings, vault: &Vault) -> crate::we
 }
 
 pub(crate) fn capabilities(agent: &Agent) -> Vec<CapInfo> {
-    let mut caps = Vec::new();
-    if let Some(registry) = agent.registry() {
-        for name in registry.list() {
-            // Async tools (MCP among them) live in their own map, so a
-            // sync-only lookup left every MCP row in the Tools pane blank.
-            let description = registry
-                .get(&name)
-                .map(|tool| tool.description().to_string())
-                .or_else(|| registry.get_async(&name).map(|tool| tool.description()))
-                .unwrap_or_default();
-            caps.push(CapInfo {
-                name,
-                description,
-                category: "tool".to_string(),
-            });
-        }
-    }
+    // The pane lists what the model can call, from the same derivation the
+    // request uses: a row read from the build registry alone left every
+    // extension package's tool out of the pane it was installed for.
+    let mut caps: Vec<CapInfo> = agent
+        .model_tools()
+        .into_iter()
+        .map(|tool| CapInfo {
+            name: tool.name,
+            description: tool.description,
+            category: "tool".to_string(),
+        })
+        .collect();
     for (name, instructions) in agent.all_skills_content() {
         let summary = instructions
             .lines()
@@ -4833,6 +4818,40 @@ mod tests {
             drop(live);
             tool
         };
+        // The model learns a tool from the request's tool array alone, so a
+        // platform tool that is executable but absent there is one the model
+        // never calls. The array and the Tools pane must both carry it, from
+        // the same derivation.
+        let platform_names: Vec<String> = built
+            .extension_activations
+            .iter()
+            .flat_map(|activation| activation.tool_names())
+            .cloned()
+            .collect();
+        assert!(
+            !platform_names.is_empty(),
+            "the platform activation installs at least one tool"
+        );
+        let model_names: Vec<String> = built
+            .agent
+            .model_tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        for name in &platform_names {
+            assert!(
+                model_names.contains(name),
+                "{name} must be advertised to the model, not only registered: {model_names:?}"
+            );
+        }
+        let pane = crate::caps::capabilities(&built.agent);
+        for name in &platform_names {
+            assert!(
+                pane.iter()
+                    .any(|cap| &cap.name == name && cap.category == "tool"),
+                "the Tools pane lists {name}"
+            );
+        }
         assert!(
             react::tool::registry::AsyncTool::run(&*platform_tool, &serde_json::json!({}))
                 .await
