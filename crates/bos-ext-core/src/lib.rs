@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 pub mod dispatch;
+pub mod types;
 pub mod effects;
 
 pub use dispatch::DispatchMode;

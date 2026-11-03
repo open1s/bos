@@ -23,7 +23,7 @@ use super::capability::{CallScope, Capability, PolicyEngine};
 use super::composable::Fiber;
 use super::events::{topics, EventBus, ExtensionEvent};
 use super::runtime::{CallContext, Runtime, ToolDescriptor};
-use super::types::{ExtensionError, ExtensionId, TrustLevel};
+use super::types::{ExtensionError, ExtensionId, ToToolError, TrustLevel};
 
 /// The largest prompt or context section one call may append.
 const MAX_PROMPT_SECTION: usize = 8 * 1024;
