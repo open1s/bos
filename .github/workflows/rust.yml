@@ -51,6 +51,21 @@ jobs:
         with:
           version: 0.16.0
 
+      # Warm the Ghostty native build with bounded retries: its Zig build
+      # lazily fetches a few packages, and a reset from
+      # deps.files.ghostty.org otherwise fails lint/test before they start.
+      - name: Pre-build with retry
+        shell: bash
+        run: |
+          for attempt in 1 2 3; do
+            if cargo build --workspace --exclude jsbos --exclude nbos; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then exit 1; fi
+            echo "::warning::build attempt $attempt failed; retrying in 20s"
+            sleep 20
+          done
+
       - name: Format
         run: cargo fmt --all -- --check
 
@@ -184,7 +199,16 @@ jobs:
       # starts needing a newer compiler, this job fails instead of the docs
       # quietly going stale. --locked also keeps Cargo.lock in sync.
       - name: Check the workspace at 1.97
-        run: cargo check --workspace --exclude jsbos --exclude nbos --locked
+        shell: bash
+        run: |
+          for attempt in 1 2 3; do
+            if cargo check --workspace --exclude jsbos --exclude nbos --locked; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then exit 1; fi
+            echo "::warning::check attempt $attempt failed; retrying in 20s"
+            sleep 20
+          done
 
   packaging:
     name: Validate the release pipeline

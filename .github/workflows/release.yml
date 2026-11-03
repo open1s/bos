@@ -100,6 +100,20 @@ jobs:
             libfontconfig1-dev libfreetype6-dev libssl-dev libasound2-dev libxdo-dev \
             libc++-dev libc++abi-dev libxml2-dev xvfb bubblewrap
 
+      # Build first, with the same network retry the package jobs use: the
+      # Ghostty Zig fetch is the one download in this graph that can reset.
+      - name: Build the workspace
+        shell: bash
+        run: |
+          for attempt in 1 2 3; do
+            if cargo build --workspace --exclude jsbos --exclude nbos; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then exit 1; fi
+            echo "::warning::build attempt $attempt failed; retrying in 20s"
+            sleep 20
+          done
+
       # The same gate the main branch runs. A release is a tagged commit, so
       # the tagged tree must pass the suite before any artifact is published;
       # the browser engine tests are skipped for the same load-flakiness
@@ -194,7 +208,19 @@ jobs:
           if [[ "${{ runner.os }}" != "Windows" ]]; then zig version; fi
 
       - name: Build BSH
-        run: cargo build --release --locked -p bsh --bin bsh
+        shell: bash
+        run: |
+          # Ghostty's Zig build lazily fetches a few packages; a reset from
+          # deps.files.ghostty.org is transient, so retry and let Zig reuse
+          # whatever it already fetched.
+          for attempt in 1 2 3; do
+            if cargo build --release --locked -p bsh --bin bsh; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then exit 1; fi
+            echo "::warning::build attempt $attempt failed; retrying in 20s"
+            sleep 20
+          done
 
       # --help is answered before a window is created, so this is a real
       # execution of the release binary even on a headless runner.
