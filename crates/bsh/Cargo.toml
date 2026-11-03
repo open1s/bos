@@ -166,6 +166,7 @@ rand = { workspace = true }
 extism = { version = "1.41.0", default-features = false }
 
 [dev-dependencies]
+tempfile = "3"
 # The same package the kit aliases as gpui, with GPUI test hooks enabled: the
 # shell is booted headlessly and its controls are clicked by debug selector.
 gpui = { package = "gpui-pre", version = "=0.3.10", features = ["test-support"] }

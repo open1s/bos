@@ -82,6 +82,106 @@ pub(crate) fn manager_for(
     ExtensionManager::open(Arc::new(BosHostSpec::new(root, workspace)))
 }
 
+/// BSH runtime resolver: wraps the standard runtimes in the generic adapter.
+pub(crate) struct BosRuntimeResolver {
+    workspace: Option<PathBuf>,
+}
+
+impl BosRuntimeResolver {
+    /// Build a resolver for one workspace.
+    pub(crate) fn new(workspace: Option<PathBuf>) -> Self {
+        Self { workspace }
+    }
+}
+
+impl bos_ext_core::RuntimeResolver for BosRuntimeResolver {
+    fn create(
+        &self,
+        manifest: &bos_ext_core::manifest::Manifest,
+        root: &std::path::Path,
+        _data_root: &std::path::Path,
+    ) -> Result<Arc<dyn bos_ext_core::Runtime>, ExtError> {
+        let runtime = match manifest.runtime.kind {
+            bos_ext_core::types::RuntimeKind::Declarative => {
+                let inner = bos_ext_runtime::declarative::DeclarativeRuntime::new(root, manifest)
+                    .map_err(runtime_error)?;
+                Arc::new(inner) as Arc<dyn bos_ext_runtime::Runtime>
+            }
+            other => {
+                return Err(ExtError {
+                    code: bos_ext_core::ErrorCode::Runtime,
+                    message: format!("runtime {other} is not wired through the manager yet"),
+                    details: serde_json::Value::Null,
+                })
+            }
+        };
+        Ok(Arc::new(bos_ext_runtime::adapter::LegacyAdapter::new(
+            manifest.id().clone(),
+            root.to_path_buf(),
+            self.workspace.clone(),
+            runtime,
+        )))
+    }
+}
+
+fn runtime_error(error: impl std::fmt::Display) -> ExtError {
+    ExtError {
+        code: bos_ext_core::ErrorCode::Runtime,
+        message: error.to_string(),
+        details: serde_json::Value::Null,
+    }
+}
+
+#[cfg(test)]
+struct CollectSink(Arc<std::sync::atomic::AtomicUsize>);
+
+#[cfg(test)]
+struct NoopLease;
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl bos_ext_core::ContributionLease for NoopLease {
+    async fn revoke(&self) -> Result<(), ExtError> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl bos_ext_core::ContributionSink for CollectSink {
+    async fn apply(
+        &self,
+        _contribution: bos_ext_core::Contribution,
+    ) -> Result<Box<dyn bos_ext_core::ContributionLease>, ExtError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Box::new(NoopLease))
+    }
+}
+
+#[cfg(test)]
+mod manager_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn the_manager_applies_a_declarative_package() {
+        let source =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/extensions/hello");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let manager = manager_for(temp.path().to_path_buf(), None).expect("manager");
+        manager.install(&source).expect("install");
+        let plan = manager.plan().expect("plan");
+        let applied = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let manager = manager.with_ports(
+            Arc::new(BosRuntimeResolver::new(None)),
+            Arc::new(CollectSink(Arc::clone(&applied))),
+        );
+        let active = manager.apply(&plan).await.expect("apply");
+        assert_eq!(active.len(), 1);
+        assert_eq!(applied.load(std::sync::atomic::Ordering::SeqCst), 1);
+        active.unload().await.expect("unload");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
