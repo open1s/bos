@@ -2,8 +2,8 @@
 
 Status: Phase 5 in progress — manifest 2.0 envelope, migration and dual-version
 loading are live; migration preserves runtime entry, args, env, protocol,
-startup policy and event subscribe/publish contributions, migrated packages
-validate, and
+startup policy, event subscribe/publish and hook contributions, migrated
+packages validate, and
 `bsh ext validate` reports `schema: 2.0` plus the generic contribution count,
 and `bsh ext graph` reads effects from the 2.0 generic contribution list when
 present; the independent `ferris-smoke` binary

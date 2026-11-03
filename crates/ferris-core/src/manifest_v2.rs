@@ -600,4 +600,23 @@ id = "echo"
             vec!["tool.completed".to_string()]
         );
     }
+
+    #[test]
+    fn hook_contributions_survive_migration() {
+        let source =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/extensions/extism-hook");
+        let temp = tempfile::tempdir().expect("tempdir");
+        crate::package::copy_tree(&source, temp.path()).expect("copy");
+        write_migrated_package(temp.path()).expect("migrate");
+        let v2 = ManifestV2::load(temp.path()).expect("v2");
+        assert_eq!(
+            v2.contributions
+                .iter()
+                .filter(|contribution| contribution.kind == "hook")
+                .count(),
+            3
+        );
+        let legacy = load_package_manifest(temp.path()).expect("load");
+        assert_eq!(legacy.contributes.hooks.len(), 3);
+    }
 }
