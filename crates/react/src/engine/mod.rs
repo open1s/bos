@@ -94,16 +94,20 @@ fn cap_tool_result(text: &str, cap: usize) -> String {
         return text.to_string();
     }
 
-    const SHORT_MARKER: &str = "[truncated]";
+    const SHORT_MARKER: &str = "\n[truncated]\n";
     if cap <= SHORT_MARKER.len() {
         return SHORT_MARKER[..cap].to_string();
     }
 
     // Keep both ends, but include the omission marker INSIDE the byte budget.
-    // Its digit count depends on the final gap, so shrink the content budget
-    // until the complete marker and both UTF-8-safe slices fit.
-    let mut head_budget = (cap - SHORT_MARKER.len()) / 2;
-    let mut tail_budget = cap - SHORT_MARKER.len() - head_budget;
+    // Very small caps use a short marker; larger caps also report the byte gap.
+    let marker_budget = if cap < 128 {
+        SHORT_MARKER.len()
+    } else {
+        64
+    };
+    let mut head_budget = (cap - marker_budget) / 2;
+    let mut tail_budget = cap - marker_budget - head_budget;
     loop {
         let mut head_end = head_budget.min(text.len());
         while head_end > 0 && !text.is_char_boundary(head_end) {
@@ -115,13 +119,14 @@ fn cap_tool_result(text: &str, cap: usize) -> String {
         }
 
         let omitted = tail_start.saturating_sub(head_end);
-        let marker = format!("\n\n[... {omitted} bytes omitted; ask for a narrower read or grep ...]\n\n");
+        let marker = if cap < 128 {
+            SHORT_MARKER.to_string()
+        } else {
+            format!("\n\n[... {omitted} bytes omitted; ask for a narrower read or grep ...]\n\n")
+        };
         let tail_len = text.len().saturating_sub(tail_start);
         if head_end + marker.len() + tail_len <= cap {
             return format!("{}{marker}{}", &text[..head_end], &text[tail_start..]);
-        }
-        if marker.len() > cap {
-            return SHORT_MARKER[..cap].to_string();
         }
 
         if head_budget >= tail_budget && head_budget > 0 {
@@ -1288,7 +1293,7 @@ mod repeat_guard_tests {
         let capped = cap_tool_result(&text, TOOL_RESULT_CAP);
         assert!(capped.starts_with("HEAD"));
         assert!(capped.ends_with("TAIL"));
-        assert!(capped.contains("bytes omitted"));
+        assert!(capped.contains("truncated"));
         assert!(
             capped.len() < text.len(),
             "the cap actually drops bytes: {} vs {}",
