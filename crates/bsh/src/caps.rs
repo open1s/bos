@@ -3292,7 +3292,7 @@ fn glob_empty_hint(pattern: &str, root: &Path, include_ignored: bool) -> String 
         )
     } else {
         format!(
-            "no file path matches {pattern:?} under {}; glob matches file paths, not file contents. Search contents with bash (rg -n) or read_file.",
+            "no file path matches {pattern:?} under {}; glob matches file paths, not file contents. Search contents with grep, or use read_file when the file is already known.",
             root.display()
         )
     };
