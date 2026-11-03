@@ -251,5 +251,4 @@ mod tests {
         assert!(event.get("headers").is_none());
         assert!(event.get("body").is_none());
     }
-
 }

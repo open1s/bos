@@ -216,11 +216,7 @@ impl Context {
 
     /// Register an effect body. The body runs now; its returned cleanup is
     /// owned by this context.
-    pub fn effect<F>(
-        &self,
-        label: impl Into<String>,
-        body: F,
-    ) -> Result<Disposer, EffectError>
+    pub fn effect<F>(&self, label: impl Into<String>, body: F) -> Result<Disposer, EffectError>
     where
         F: FnOnce(&Context) -> EffectCleanup,
     {

@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::declarative::{DeclarativeContributions, TextContribution};
 use crate::contract::{CallContext, Runtime, ToolDescriptor, ToolResult};
+use crate::declarative::{DeclarativeContributions, TextContribution};
 use bos_ext_core::capability::{CallScope, Capability, PolicyEngine};
 use bos_ext_core::events::{EventBus, EventFilter, Subscription};
 use bos_ext_core::manifest::{is_allowlisted_command, validate_relative_path, Manifest};

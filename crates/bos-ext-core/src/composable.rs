@@ -222,12 +222,7 @@ impl ServiceRegistry {
     ///
     /// Existing callers retain the legacy token-only result. Use
     /// provide_with_retirement when the previous generation must be drained.
-    pub fn provide<T>(
-        &self,
-        scope: Scope,
-        name: impl Into<String>,
-        service: Arc<T>,
-    ) -> ServiceToken
+    pub fn provide<T>(&self, scope: Scope, name: impl Into<String>, service: Arc<T>) -> ServiceToken
     where
         T: Any + Send + Sync,
     {
@@ -333,12 +328,7 @@ impl ServiceRegistry {
     }
 
     /// Resolve in one named isolation realm.
-    pub fn get_in_realm<T>(
-        &self,
-        scope: &Scope,
-        realm: Option<&str>,
-        name: &str,
-    ) -> Option<Arc<T>>
+    pub fn get_in_realm<T>(&self, scope: &Scope, realm: Option<&str>, name: &str) -> Option<Arc<T>>
     where
         T: Any + Send + Sync,
     {
@@ -498,12 +488,7 @@ impl ServiceRegistry {
     }
 
     /// Whether one named realm has a service of this type/name/scope.
-    pub fn contains_in_realm<T>(
-        &self,
-        scope: &Scope,
-        realm: Option<&str>,
-        name: &str,
-    ) -> bool
+    pub fn contains_in_realm<T>(&self, scope: &Scope, realm: Option<&str>, name: &str) -> bool
     where
         T: Any + Send + Sync,
     {
@@ -871,11 +856,7 @@ impl Fiber {
     }
 
     /// Register a labelled synchronous cleanup owned by this Fiber.
-    pub fn own_named(
-        &mut self,
-        label: impl Into<String>,
-        cleanup: impl FnOnce() + Send + 'static,
-    ) {
+    pub fn own_named(&mut self, label: impl Into<String>, cleanup: impl FnOnce() + Send + 'static) {
         self.effects.push_sync(label, cleanup);
     }
 

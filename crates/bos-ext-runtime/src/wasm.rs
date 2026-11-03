@@ -242,7 +242,6 @@ impl HostState {
                 .unwrap_or(false)
         })
     }
-
 }
 
 impl self::bsh::extension::types::Host for HostState {}

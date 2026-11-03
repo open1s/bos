@@ -826,7 +826,6 @@ impl ExtensionError {
             Self::NameConflict { .. } => "conflict",
         }
     }
-
 }
 
 /// A parsed semantic version requirement with the original text kept for

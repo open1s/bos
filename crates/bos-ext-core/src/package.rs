@@ -840,11 +840,7 @@ impl ExtensionStore {
     /// This is the last-resort control: the code is no longer loadable, the
     /// state record is removed and the data is retained for a later review or
     /// deliberate purge.
-    pub fn quarantine(
-        &self,
-        id: &ExtensionId,
-        reason: &str,
-    ) -> Result<PathBuf, ExtensionError> {
+    pub fn quarantine(&self, id: &ExtensionId, reason: &str) -> Result<PathBuf, ExtensionError> {
         let source = self.installed_root().join(id.as_str());
         if !source.exists() {
             return Err(ExtensionError::NotInstalled { id: id.to_string() });
@@ -877,9 +873,7 @@ impl ExtensionStore {
     }
 
     /// Scan every installed version.
-    pub fn scan_installed(
-        &self,
-    ) -> Result<(Vec<Package>, Vec<ScanFailure>), ExtensionError> {
+    pub fn scan_installed(&self) -> Result<(Vec<Package>, Vec<ScanFailure>), ExtensionError> {
         let registry = self.read_registry()?;
         let mut packages = Vec::new();
         let mut failures = Vec::new();
@@ -1158,11 +1152,7 @@ impl ExtensionStore {
     /// Business data is retained unless `purge_data` is true. The state record
     /// is always removed, because the flags describe an installed package and
     /// a later install starts from the defaults.
-    pub fn uninstall(
-        &self,
-        id: &ExtensionId,
-        purge_data: bool,
-    ) -> Result<(), ExtensionError> {
+    pub fn uninstall(&self, id: &ExtensionId, purge_data: bool) -> Result<(), ExtensionError> {
         let directory = self.installed_root().join(id.as_str());
         if !directory.exists() {
             return Err(ExtensionError::NotInstalled { id: id.to_string() });
@@ -1190,11 +1180,7 @@ impl ExtensionStore {
     }
 
     /// Record a failure in the state document.
-    pub fn record_failure(
-        &self,
-        id: &ExtensionId,
-        error: &str,
-    ) -> Result<(), ExtensionError> {
+    pub fn record_failure(&self, id: &ExtensionId, error: &str) -> Result<(), ExtensionError> {
         self.update_state(id, |state| {
             state.last_error = Some(error.to_string());
             state.last_state = Some("failed".to_string());

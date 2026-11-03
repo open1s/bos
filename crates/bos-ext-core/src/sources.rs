@@ -302,10 +302,7 @@ pub fn download(
 }
 
 /// Extract a tar.gz archive into a cache directory and find its package root.
-pub fn extract_archive(
-    archive_path: &Path,
-    cache_root: &Path,
-) -> Result<PathBuf, ExtensionError> {
+pub fn extract_archive(archive_path: &Path, cache_root: &Path) -> Result<PathBuf, ExtensionError> {
     let destination = cache_root.join(format!(
         "extract-{}-{}",
         sanitize(

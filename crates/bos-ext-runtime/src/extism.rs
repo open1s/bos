@@ -20,15 +20,13 @@ use extism::{
 };
 use serde_json::{json, Value};
 
-use crate::declarative::DeclarativeContributions;
 use crate::contract::{load_tool_descriptors, CallContext, Runtime, ToolDescriptor, ToolResult};
+use crate::declarative::DeclarativeContributions;
 use bos_ext_core::capability::{CallScope, Capability, PolicyEngine};
 use bos_ext_core::events::{EventBus, EventFilter, ExtensionEvent, Subscription, TopicPattern};
 use bos_ext_core::manifest::{validate_relative_path, Manifest};
 use bos_ext_core::storage::ExtensionStorage;
-use bos_ext_core::types::{
-    ContributionId, ExtensionError, ExtensionId, RuntimeKind, TrustLevel,
-};
+use bos_ext_core::types::{ContributionId, ExtensionError, ExtensionId, RuntimeKind, TrustLevel};
 
 /// The largest request or result body the bridge accepts.
 const MAX_BRIDGE_BODY: usize = 8 * 1024 * 1024;

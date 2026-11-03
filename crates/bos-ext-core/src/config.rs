@@ -305,13 +305,7 @@ fn set_path(value: &mut Value, key: &str, replacement: Value) {
 }
 
 /// Validate a JSON value against the supported schema subset.
-pub fn validate(
-    schema: &Value,
-    value: &Value,
-    path: &str,
-    errors: &mut Vec<String>,
-    depth: usize,
-) {
+pub fn validate(schema: &Value, value: &Value, path: &str, errors: &mut Vec<String>, depth: usize) {
     if depth > 32 {
         errors.push(format!("{path}: schema nesting exceeds 32"));
         return;

@@ -825,11 +825,7 @@ impl PolicyEngine {
     }
 
     /// Revoke a grant. Returns whether it existed.
-    pub fn revoke(
-        &self,
-        extension: &str,
-        capability: Capability,
-    ) -> Result<bool, ExtensionError> {
+    pub fn revoke(&self, extension: &str, capability: Capability) -> Result<bool, ExtensionError> {
         self.grants
             .lock()
             .map_err(|_| ExtensionError::Corrupt {

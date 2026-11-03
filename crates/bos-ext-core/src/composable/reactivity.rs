@@ -80,12 +80,7 @@ impl Inject {
     }
 
     /// Declare a soft dependency.
-    pub fn optional(
-        mut self,
-        scope: Scope,
-        name: impl Into<String>,
-        reaction: Reaction,
-    ) -> Self {
+    pub fn optional(mut self, scope: Scope, name: impl Into<String>, reaction: Reaction) -> Self {
         self.soft.push(ServiceRequirement {
             name: name.into(),
             scope,
@@ -131,10 +126,7 @@ impl Inject {
     }
 
     /// Hard requirements that currently have no provider.
-    pub fn missing_hard(
-        &self,
-        registry: &ServiceRegistry,
-    ) -> Vec<(Scope, Option<String>, String)> {
+    pub fn missing_hard(&self, registry: &ServiceRegistry) -> Vec<(Scope, Option<String>, String)> {
         self.hard
             .iter()
             .filter(|requirement| {

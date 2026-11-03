@@ -200,4 +200,3 @@ mod tests {
         let _ = ExtensionId::parse("com.example.demo").expect("id");
     }
 }
-

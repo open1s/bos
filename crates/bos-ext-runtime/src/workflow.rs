@@ -13,8 +13,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::declarative::RawContribution;
 use crate::contract::{CallContext, Runtime, ToolDescriptor, ToolResult};
+use crate::declarative::RawContribution;
 use bos_ext_core::capability::{authorize_each, call_scope, PolicyEngine};
 use bos_ext_core::types::{ExtensionError, RuntimeKind, TrustLevel};
 

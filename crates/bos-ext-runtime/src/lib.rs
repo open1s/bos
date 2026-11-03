@@ -9,21 +9,21 @@ pub mod bridge;
 pub mod builtin;
 pub mod contract;
 pub use contract::*;
-pub mod hook;
-pub mod hooks;
+#[cfg(feature = "cordis")]
+pub mod cordis;
 #[cfg(feature = "declarative")]
 pub mod declarative;
-#[cfg(feature = "process")]
-pub mod process;
-#[cfg(feature = "mcp")]
-pub mod mcp;
 #[cfg(feature = "extism")]
 pub mod extism;
+pub mod hook;
+pub mod hooks;
+#[cfg(feature = "mcp")]
+pub mod mcp;
+#[cfg(feature = "process")]
+pub mod process;
 #[cfg(feature = "wasm")]
 #[allow(missing_docs)] // bindgen generates the WIT world types.
 pub mod wasm;
-#[cfg(feature = "cordis")]
-pub mod cordis;
 #[cfg(feature = "workflow")]
 pub mod workflow;
 

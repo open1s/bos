@@ -351,11 +351,7 @@ impl EventBus {
     }
 
     /// Subscribe with a bounded queue.
-    pub fn subscribe(
-        self: &Arc<Self>,
-        filter: EventFilter,
-        capacity: usize,
-    ) -> Subscription {
+    pub fn subscribe(self: &Arc<Self>, filter: EventFilter, capacity: usize) -> Subscription {
         let capacity = capacity.clamp(1, 4096);
         let (sender, receiver) = async_channel::bounded(capacity);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);

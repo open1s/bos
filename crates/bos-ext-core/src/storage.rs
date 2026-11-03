@@ -187,11 +187,7 @@ impl ExtensionStorage {
     }
 
     /// Write a JSON value.
-    pub fn write_json<T: Serialize>(
-        &self,
-        key: &str,
-        value: &T,
-    ) -> Result<(), ExtensionError> {
+    pub fn write_json<T: Serialize>(&self, key: &str, value: &T) -> Result<(), ExtensionError> {
         let bytes = serde_json::to_vec_pretty(value).map_err(|error| ExtensionError::Json {
             path: self.root.join(key),
             message: error.to_string(),

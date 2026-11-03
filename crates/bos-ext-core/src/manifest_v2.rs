@@ -70,7 +70,10 @@ fn runtime_config(legacy: &Manifest) -> toml::Value {
         table.insert("env".to_string(), toml::Value::Table(env));
     }
     if let Some(protocol) = &legacy.runtime.protocol {
-        table.insert("protocol".to_string(), toml::Value::String(protocol.clone()));
+        table.insert(
+            "protocol".to_string(),
+            toml::Value::String(protocol.clone()),
+        );
     }
     let startup = match legacy.runtime.startup {
         crate::types::StartupPolicy::OnStartup => "on-startup",
@@ -84,7 +87,6 @@ fn runtime_config(legacy: &Manifest) -> toml::Value {
     );
     toml::Value::Table(table)
 }
-
 
 /// The required-only capability list.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -308,10 +310,15 @@ impl ManifestV2 {
         }
         let mut capabilities = CapabilitiesSpec::default();
         for capability in &self.capabilities.required {
-            capabilities.required.push(capability.parse::<Capability>()?);
+            capabilities
+                .required
+                .push(capability.parse::<Capability>()?);
         }
         let config = &self.runtime.config;
-        let entry = config.get("entry").and_then(toml::Value::as_str).map(str::to_string);
+        let entry = config
+            .get("entry")
+            .and_then(toml::Value::as_str)
+            .map(str::to_string);
         let protocol = config
             .get("protocol")
             .and_then(toml::Value::as_str)

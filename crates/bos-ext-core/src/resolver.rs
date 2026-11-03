@@ -104,9 +104,7 @@ impl LockFile {
                     .as_ref()
                     .map(|path| path.display().to_string()),
                 revision: match &package.source {
-                    crate::types::ExtensionSource::Git { revision, .. } => {
-                        Some(revision.clone())
-                    }
+                    crate::types::ExtensionSource::Git { revision, .. } => Some(revision.clone()),
                     _ => None,
                 },
                 installed_at: package.installed_at,
@@ -170,10 +168,7 @@ impl LockFile {
 /// Resolve a set of root extensions against the packages available to the
 /// store. Roots are installed packages the host intends to load; their
 /// transitive dependencies are added from the same pool.
-pub fn resolve(
-    available: &[Package],
-    roots: &[ExtensionId],
-) -> Result<Resolution, ExtensionError> {
+pub fn resolve(available: &[Package], roots: &[ExtensionId]) -> Result<Resolution, ExtensionError> {
     let mut pool: BTreeMap<String, BTreeMap<Version, &Package>> = BTreeMap::new();
     for package in available {
         pool.entry(package.id().as_str().to_string())

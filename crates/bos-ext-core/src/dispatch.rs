@@ -25,8 +25,7 @@ pub trait InterceptorPolicy: Send + Sync {
 }
 
 /// How an event is dispatched.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DispatchMode {
     /// Observe; return value ignored.
     Emit,

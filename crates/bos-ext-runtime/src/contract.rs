@@ -5,7 +5,6 @@
 //! passes the extension id and a correlation id so every runtime reports the
 //! same diagnostics. Concrete runtimes live in this module's children.
 
-
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;

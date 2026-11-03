@@ -372,11 +372,7 @@ pub fn linux_bwrap_plan(
 /// This is a filesystem profile, not a network sandbox: the process protocol
 /// has no host network bridge, so network policy for a process package remains
 /// the capability decision that authorized spawning it.
-pub fn sandbox_profile(
-    root: &Path,
-    workspace: Option<&Path>,
-    data_root: Option<&Path>,
-) -> String {
+pub fn sandbox_profile(root: &Path, workspace: Option<&Path>, data_root: Option<&Path>) -> String {
     let mut profile = "(version 1)(allow default)(deny file-write*)(allow file-write*".to_string();
     let mut paths: Vec<PathBuf> = vec![
         root.canonicalize().unwrap_or_else(|_| root.to_path_buf()),
@@ -499,11 +495,7 @@ pub(super) fn configure_process_limits(command: &mut Command, memory: u64, cpu: 
 }
 
 /// Apply the same ceilings to the MCP client's synchronous command.
-pub fn configure_std_process_limits(
-    command: &mut std::process::Command,
-    memory: u64,
-    cpu: u64,
-) {
+pub fn configure_std_process_limits(command: &mut std::process::Command, memory: u64, cpu: u64) {
     #[cfg(unix)]
     {
         // SAFETY: `rlimit_hook` runs in the forked child before exec and only

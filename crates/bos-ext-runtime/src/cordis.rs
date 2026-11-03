@@ -287,13 +287,8 @@ mod tests {
         let manifest = Manifest::load(&root).expect("manifest");
         let data_root =
             std::env::temp_dir().join(format!("bsh-cordis-test-{}-{}", std::process::id(), "echo"));
-        let runtime = CordisRuntime::new(
-            &manifest,
-            &root,
-            &data_root,
-            Arc::new(TestTerminal),
-        )
-        .expect("runtime");
+        let runtime = CordisRuntime::new(&manifest, &root, &data_root, Arc::new(TestTerminal))
+            .expect("runtime");
         let tools = runtime.tools().await.expect("tools");
         assert!(tools.iter().any(|tool| tool.id.as_str() == "echo"));
 

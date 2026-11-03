@@ -53,8 +53,6 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-
-
 /// The shim source, embedded so a load needs no file on the host side.
 pub const HOST_SHIM_SOURCE: &str = include_str!("bridge/dsh-host-shim.js");
 
@@ -511,9 +509,9 @@ impl BridgeSession {
                         .get("reason")
                         .and_then(Value::as_str)
                         .unwrap_or("no reason reported");
-                    manifest.refusals.push(format!(
-                        "{reason} (reported as {kind}: {name})"
-                    ));
+                    manifest
+                        .refusals
+                        .push(format!("{reason} (reported as {kind}: {name})"));
                 }
                 Some("log") => {
                     let level = frame.get("level").and_then(Value::as_str).unwrap_or("info");

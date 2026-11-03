@@ -11,25 +11,25 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 pub mod capability;
-pub mod config;
-pub mod events;
-pub mod ui;
-pub mod sources;
-pub mod storage;
-pub mod terminal;
 #[cfg(feature = "tokio")]
 #[allow(dead_code, missing_docs)] // Phase 1 move; docs and consumers land with the manager API.
 pub mod composable;
+pub mod config;
 pub mod dispatch;
-pub mod manager;
+pub mod effects;
+pub mod events;
 pub mod host;
+pub mod manager;
 pub mod manifest;
 pub mod manifest_v2;
 pub mod package;
 pub mod resolver;
 pub mod signing;
+pub mod sources;
+pub mod storage;
+pub mod terminal;
 pub mod types;
-pub mod effects;
+pub mod ui;
 
 pub use dispatch::DispatchMode;
 

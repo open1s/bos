@@ -369,11 +369,7 @@ impl UiDocument {
     }
 
     /// Validate with explicit limits.
-    pub fn validate_with(
-        &self,
-        _extension: &ExtensionId,
-        limits: UiLimits,
-    ) -> ValidationReport {
+    pub fn validate_with(&self, _extension: &ExtensionId, limits: UiLimits) -> ValidationReport {
         let mut report = ValidationReport::default();
         if self.schema_version != UI_SCHEMA_VERSION {
             report.error(
@@ -684,10 +680,7 @@ pub struct UiSession {
 
 impl UiSession {
     /// Start a session from a validated document.
-    pub fn open(
-        extension: ExtensionId,
-        document: UiDocument,
-    ) -> Result<Self, ExtensionError> {
+    pub fn open(extension: ExtensionId, document: UiDocument) -> Result<Self, ExtensionError> {
         let report = document.validate(&extension);
         if !report.is_valid() {
             return Err(ExtensionError::Manifest {
@@ -719,11 +712,7 @@ impl UiSession {
 
     /// Apply a new document at `revision`. A revision at or below the current
     /// one is stale and refused.
-    pub fn apply(
-        &mut self,
-        document: UiDocument,
-        revision: u64,
-    ) -> Result<(), ExtensionError> {
+    pub fn apply(&mut self, document: UiDocument, revision: u64) -> Result<(), ExtensionError> {
         if revision <= self.revision {
             return Err(ExtensionError::Protocol {
                 extension: self.extension.to_string(),
