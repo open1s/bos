@@ -247,6 +247,33 @@ impl ManifestV2 {
                 });
             }
         }
+        for topic in &legacy.contributes.events {
+            if let Ok(id) = ContributionId::parse(topic.clone()) {
+                contributions.push(ContributionSpecV2 {
+                    kind: "event.subscribe".to_string(),
+                    id,
+                    payload: empty_table(),
+                });
+            }
+        }
+        for topic in &legacy.contributes.publishes {
+            if let Ok(id) = ContributionId::parse(topic.clone()) {
+                contributions.push(ContributionSpecV2 {
+                    kind: "event.publish".to_string(),
+                    id,
+                    payload: empty_table(),
+                });
+            }
+        }
+        for point in &legacy.contributes.hooks {
+            if let Ok(id) = ContributionId::parse(point.clone()) {
+                contributions.push(ContributionSpecV2 {
+                    kind: "hook".to_string(),
+                    id,
+                    payload: empty_table(),
+                });
+            }
+        }
         Self {
             schema_version: MANIFEST_V2_SCHEMA_VERSION.to_string(),
             extension: legacy.extension.clone(),
@@ -300,6 +327,9 @@ impl ManifestV2 {
                 "agent-provider" => contributes.agent_providers.push(id),
                 "theme" => contributes.themes.push(id),
                 "preset" => contributes.presets.push(id),
+                "event.subscribe" => contributes.events.push(id.as_str().to_string()),
+                "event.publish" => contributes.publishes.push(id.as_str().to_string()),
+                "hook" => contributes.hooks.push(id.as_str().to_string()),
                 other => {
                     return Err(ExtensionError::Manifest {
                         path: Path::new(MANIFEST_FILE).to_path_buf(),
@@ -546,5 +576,28 @@ id = "echo"
         let legacy = load_package_manifest(temp.path()).expect("load");
         assert_eq!(legacy.runtime.entry.as_deref(), Some("python3"));
         assert_eq!(legacy.runtime.args, vec!["server.py".to_string()]);
+    }
+
+    #[test]
+    fn event_contributions_survive_migration() {
+        let source =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/extensions/hook-demo");
+        let temp = tempfile::tempdir().expect("tempdir");
+        crate::package::copy_tree(&source, temp.path()).expect("copy");
+        write_migrated_package(temp.path()).expect("migrate");
+        let v2 = ManifestV2::load(temp.path()).expect("v2");
+        assert_eq!(
+            v2.contributions
+                .iter()
+                .filter(|contribution| contribution.kind == "event.subscribe")
+                .count(),
+            20
+        );
+        let legacy = load_package_manifest(temp.path()).expect("load");
+        assert_eq!(legacy.contributes.events.len(), 20);
+        assert_eq!(
+            legacy.contributes.publishes,
+            vec!["tool.completed".to_string()]
+        );
     }
 }
