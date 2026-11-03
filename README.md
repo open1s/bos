@@ -279,6 +279,7 @@ sensitive credentials in its encrypted vault.
 | [Python user guide](docs/python-user-guide.md) | Use BOS from Python |
 | [JavaScript user guide](docs/javascript-user-guide.md) | Use BOS from Node.js and JavaScript |
 | [BSH extension platform](docs/bsh-extension.md) | Manifest, runtimes, capabilities, CLI, security and authoring |
+| [BSH Built-in Tools 2.0](docs/bsh-built-in-tools-2.0.md) | LLM-oriented tool contracts, batch file operations, output budgets and benchmark plan |
 | [Contributor onboarding](ONBOARDING.md) | Set up a development environment |
 | [Settings](docs/bsh-settings-spec.md) · [Terminal policy](docs/bsh-terminal-policy.md) · [Hooks](docs/bsh-hook-system.md) | Subsystem specifications |
 | [REX guide](docs/rex-user-guide.md) · [Diagnostics](docs/diagnostics.md) | Resource tooling and troubleshooting |
