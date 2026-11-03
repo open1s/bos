@@ -845,6 +845,19 @@ pub(crate) struct IntegrationEntry {
 }
 
 impl ExtensionHost {
+    /// Build the host-neutral runtime resolver with this host's policy/events.
+    pub(crate) fn framework_resolver(
+        &self,
+    ) -> std::sync::Arc<super::framework::BosRuntimeResolver> {
+        std::sync::Arc::new(
+            super::framework::BosRuntimeResolver::new(self.config.workspace.clone()).with_ports(
+                std::sync::Arc::clone(&self.policy),
+                std::sync::Arc::clone(&self.events),
+                bos_ext_core::types::TrustLevel::Community,
+            ),
+        )
+    }
+
     /// Open the host-neutral manager against this host's root.
     pub(crate) fn framework_manager(
         &self,
