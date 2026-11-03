@@ -104,6 +104,43 @@ impl ExtensionManager {
 
     /// Apply one plan: start each runtime and apply its contributions.
     pub async fn apply(&self, plan: &ManagerPlan) -> Result<ActivationSet, ExtError> {
+        let mut activations = Vec::new();
+        for id in &plan.order {
+            activations.push(self.build_activation(id).await?);
+        }
+        Ok(ActivationSet { activations })
+    }
+
+    /// Reconcile an existing activation set with a new plan.
+    pub async fn reload(
+        &self,
+        current: ActivationSet,
+        plan: &ManagerPlan,
+    ) -> Result<ActivationSet, ExtError> {
+        let mut old: std::collections::BTreeMap<String, Activation> = current
+            .activations
+            .into_iter()
+            .map(|activation| (activation.extension.clone(), activation))
+            .collect();
+        let mut activations = Vec::new();
+        for id in &plan.order {
+            if let Some(existing) = old.remove(id) {
+                let current_version = self.version_of(id)?;
+                if existing.version == current_version {
+                    activations.push(existing);
+                    continue;
+                }
+                existing.shutdown().await?;
+            }
+            activations.push(self.build_activation(id).await?);
+        }
+        for (_, activation) in old {
+            activation.shutdown().await?;
+        }
+        Ok(ActivationSet { activations })
+    }
+
+    async fn build_activation(&self, id: &str) -> Result<Activation, ExtError> {
         let runtimes = self.runtimes.as_ref().ok_or_else(|| ExtError {
             code: ErrorCode::Runtime,
             message: "no runtime resolver is attached".to_string(),
@@ -114,54 +151,60 @@ impl ExtensionManager {
             message: "no contribution sink is attached".to_string(),
             details: serde_json::Value::Null,
         })?;
-        let mut activations = Vec::new();
-        for id in &plan.order {
-            let extension_id = ExtensionId::parse(id.clone()).map_err(|error| ExtError {
-                code: ErrorCode::Manifest,
-                message: error.to_string(),
-                details: serde_json::Value::Null,
-            })?;
-            let version = self
-                .store
-                .active_version(&extension_id)
-                .or_else(|| {
-                    self.store
-                        .versions(&extension_id)
-                        .ok()
-                        .and_then(|versions| versions.last().cloned())
-                })
-                .ok_or_else(|| ExtError {
-                    code: ErrorCode::Package,
-                    message: format!("{id} has no installed version"),
-                    details: serde_json::Value::Null,
-                })?;
-            let root = self.store.version_root(&extension_id, &version);
-            let manifest = Manifest::load(&root).map_err(|error| ExtError {
-                code: ErrorCode::Manifest,
-                message: error.to_string(),
-                details: serde_json::Value::Null,
-            })?;
-            let data_root = self.store.data_dir(&extension_id);
-            let runtime = runtimes.create(&manifest, &root, &data_root)?;
-            let listed = runtime
-                .start(&RuntimeContext {
-                    extension: id.clone(),
-                    root: root.clone(),
-                    data_root,
-                })
-                .await?;
-            let mut leases: Vec<Box<dyn ContributionLease>> = Vec::new();
-            for contribution in listed {
-                leases.push(contributions.apply(contribution).await?);
-            }
-            activations.push(Activation {
-                extension: id.clone(),
-                runtime,
-                leases,
-            });
+        let extension_id = ExtensionId::parse(id.to_string()).map_err(|error| ExtError {
+            code: ErrorCode::Manifest,
+            message: error.to_string(),
+            details: serde_json::Value::Null,
+        })?;
+        let version = self.version_of(id)?;
+        let root = self.store.version_root(&extension_id, &version);
+        let manifest = Manifest::load(&root).map_err(|error| ExtError {
+            code: ErrorCode::Manifest,
+            message: error.to_string(),
+            details: serde_json::Value::Null,
+        })?;
+        let data_root = self.store.data_dir(&extension_id);
+        let runtime = runtimes.create(&manifest, &root, &data_root)?;
+        let listed = runtime
+            .start(&RuntimeContext {
+                extension: id.to_string(),
+                root: root.clone(),
+                data_root,
+            })
+            .await?;
+        let mut leases: Vec<Box<dyn ContributionLease>> = Vec::new();
+        for contribution in listed {
+            leases.push(contributions.apply(contribution).await?);
         }
-        Ok(ActivationSet { activations })
+        Ok(Activation {
+            extension: id.to_string(),
+            version,
+            runtime,
+            leases,
+        })
     }
+
+    fn version_of(&self, id: &str) -> Result<String, ExtError> {
+        let extension_id = ExtensionId::parse(id.to_string()).map_err(|error| ExtError {
+            code: ErrorCode::Manifest,
+            message: error.to_string(),
+            details: serde_json::Value::Null,
+        })?;
+        self.store
+            .active_version(&extension_id)
+            .or_else(|| {
+                self.store
+                    .versions(&extension_id)
+                    .ok()
+                    .and_then(|versions| versions.last().cloned())
+            })
+            .ok_or_else(|| ExtError {
+                code: ErrorCode::Package,
+                message: format!("{id} has no installed version"),
+                details: serde_json::Value::Null,
+            })
+    }
+
 
     /// Resolve installed packages into an activation order.
     #[cfg(feature = "tokio")]
@@ -211,9 +254,20 @@ impl ExtensionManager {
 pub struct Activation {
     /// Extension id.
     pub extension: String,
+    /// Installed version this activation was built from.
+    pub version: String,
     /// Runtime holding the contributions.
     pub runtime: Arc<dyn Runtime>,
     leases: Vec<Box<dyn ContributionLease>>,
+}
+
+impl Activation {
+    async fn shutdown(self) -> Result<(), ExtError> {
+        for lease in self.leases.into_iter().rev() {
+            lease.revoke().await?;
+        }
+        self.runtime.shutdown().await
+    }
 }
 
 /// The set of started extensions for one applied plan.
@@ -235,10 +289,7 @@ impl ActivationSet {
     /// Shut down in reverse activation order, revoking every contribution.
     pub async fn unload(mut self) -> Result<(), ExtError> {
         while let Some(activation) = self.activations.pop() {
-            for lease in activation.leases.into_iter().rev() {
-                lease.revoke().await?;
-            }
-            activation.runtime.shutdown().await?;
+            activation.shutdown().await?;
         }
         Ok(())
     }
@@ -388,6 +439,34 @@ mod tests {
         let plan = manager.plan().expect("plan");
         let active = manager.apply(&plan).await.expect("apply");
         assert_eq!(active.len(), 1);
+        active.unload().await.expect("unload");
+        assert_eq!(revoked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+
+    #[tokio::test]
+    async fn reload_keeps_unchanged_activations() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let host = Arc::new(DemoHost {
+            root: root.path().to_path_buf(),
+            capabilities: CapabilityRegistry::default(),
+            contracts: ServiceContractRegistry::default(),
+        });
+        let revoked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let manager = ExtensionManager::open(host)
+            .expect("manager")
+            .with_ports(
+                Arc::new(MockResolver),
+                Arc::new(MockSink(Arc::clone(&revoked))),
+            );
+        let example =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/extensions/hello");
+        manager.install(&example).expect("install");
+        let plan = manager.plan().expect("plan");
+        let active = manager.apply(&plan).await.expect("apply");
+        let active = manager.reload(active, &plan).await.expect("reload");
+        assert_eq!(active.len(), 1);
+        assert_eq!(revoked.load(std::sync::atomic::Ordering::SeqCst), 0);
         active.unload().await.expect("unload");
         assert_eq!(revoked.load(std::sync::atomic::Ordering::SeqCst), 1);
     }

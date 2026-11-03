@@ -5,8 +5,9 @@ contract, builtin, declarative and process runtimes are in bos-ext-runtime.
 Status: Phase 3 in progress — every standard runtime and the Node bridge live
 in bos-ext-runtime; bos-ext-core now exposes the HostSpec boundary and an
 ExtensionManager that opens the canonical store, installs a local package,
-resolves an activation order and applies it through a runtime resolver and
-contribution sink. BSH is still the only host implementation.
+resolves an activation order, applies it through a runtime resolver and
+contribution sink, and reloads by plan diff. BSH is still the only host
+implementation.
 
 ## Goal
 
