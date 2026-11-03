@@ -346,6 +346,10 @@ fn command_validate(args: &[String]) -> Result<i32, String> {
     println!("id:      {}", package.manifest.extension.id);
     println!("version: {}", package.manifest.extension.version);
     println!("runtime: {}", package.manifest.runtime.kind);
+    if let Ok(v2) = bos_ext_core::manifest_v2::ManifestV2::load(&path) {
+        println!("schema:  {}", v2.schema_version);
+        println!("contributions: {}", v2.contributions.len());
+    }
     if package.hash.is_empty() {
         println!("hash:    (not computed while the manifest is invalid)");
     } else {

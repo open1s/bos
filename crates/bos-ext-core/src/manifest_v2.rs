@@ -346,7 +346,7 @@ impl ManifestV2 {
             _ => crate::types::StartupPolicy::OnDemand,
         };
         Ok(Manifest {
-            schema_version: "1.1".to_string(),
+            schema_version: crate::types::MANIFEST_SCHEMA_VERSION.to_string(),
             extension: self.extension,
             compatibility: Compatibility {
                 bsh: self.compatibility.host,
@@ -515,6 +515,7 @@ id = "echo"
             crate::types::TrustLevel::Local,
         )
         .expect("package");
+        assert!(package.report.is_valid(), "{:?}", package.report.errors);
         assert!(package
             .manifest
             .contributes
