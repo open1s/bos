@@ -291,8 +291,9 @@ conformance command. The remaining non-gate work is tracked in
 
 What is already true:
 
-- 192 BSH extension tests plus 50 core (types/capability/manifest/effects/
-  dispatch) tests pass, including composition and eight release budget tests;
+- 177 BSH extension tests plus 65 core (types/capability/manifest/package/
+  signing/resolver/effects/dispatch) tests pass, including composition and
+  eight release budget tests;
 - the all-in-one example covers tools, commands, panels, prompts, contexts,
   skills, languages, integrations, themes, presets, providers, workflows,
   events, configuration, and the process protocol;

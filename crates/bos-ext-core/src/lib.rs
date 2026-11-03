@@ -13,6 +13,9 @@ use std::sync::Arc;
 pub mod capability;
 pub mod dispatch;
 pub mod manifest;
+pub mod package;
+pub mod resolver;
+pub mod signing;
 pub mod types;
 pub mod effects;
 
