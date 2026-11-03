@@ -1379,6 +1379,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "uuid",
+ "wasmtime 50.0.1",
 ]
 
 [[package]]

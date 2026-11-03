@@ -13,7 +13,7 @@ builtin = []
 declarative = []
 process = []
 workflow = []
-wasm = []
+wasm = ["dep:wasmtime"]
 extism = ["dep:extism"]
 mcp = []
 cordis = []
@@ -30,3 +30,6 @@ log = "0.4"
 base64 = "0.23.1"
 reqwest = { workspace = true, features = ["blocking"] }
 extism = { version = "1.41.0", default-features = false, optional = true }
+wasmtime = { version = "50.0.1", default-features = false, features = [
+    "component-model", "cranelift", "parallel-compilation", "runtime", "std", "wat"
+], optional = true }

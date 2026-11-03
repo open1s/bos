@@ -17,7 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 bos-ext-core = { path = "../bos-ext-core", features = ["tokio"] }
-bos-ext-runtime = { path = "../bos-ext-runtime", features = ["extism"] }
+bos-ext-runtime = { path = "../bos-ext-runtime", features = ["extism", "wasm"] }
 arrow =  { version = "60.0.0"}
 parquet = { version = "60.0.0", features = ["arrow"] }
 # One UI dependency: gpui-kit re-exports gpui, gpui-base, gpui-component and the

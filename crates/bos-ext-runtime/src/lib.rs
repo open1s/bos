@@ -16,6 +16,9 @@ pub mod process;
 pub mod mcp;
 #[cfg(feature = "extism")]
 pub mod extism;
+#[cfg(feature = "wasm")]
+#[allow(missing_docs)] // bindgen generates the WIT world types.
+pub mod wasm;
 #[cfg(feature = "workflow")]
 pub mod workflow;
 
