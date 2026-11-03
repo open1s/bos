@@ -1040,6 +1040,15 @@ fn build_agent_for_session_inner(
                 preset.clone(),
             )));
         }
+        if writes && !off_tool("apply_patch") {
+            files.push(Arc::new(apply_patch_tool(
+                files_root.clone(),
+                enforce_escape,
+                policy.clone(),
+                session.to_string(),
+                preset.clone(),
+            )));
+        }
         if !off_tool("list_dir") {
             files.push(Arc::new(list_dir_tool(
                 files_root.clone(),
@@ -3760,6 +3769,201 @@ fn read_files_tool(
                 "bytes": total_bytes,
                 "truncated": truncated,
                 "max_bytes": MAX_BATCH_READ_BYTES
+            }))
+        },
+    )
+}
+
+/// apply_patch - apply exact-text edits to several files in one call.
+fn apply_patch_tool(
+    root: Option<PathBuf>,
+    enforce: bool,
+    policy: Arc<PolicySet>,
+    session: String,
+    preset: String,
+) -> FunctionTool {
+    FunctionTool::new(
+        "apply_patch",
+        "Apply up to 10 per-file groups of exact-text edits. Each file is checked for write permission before reading, all edits for that file are validated before its atomic write, and a failed edit leaves that file unchanged. This is not a cross-file transaction; inspect each result's error field.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "changes": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 10,
+                    "description": "One to ten distinct file paths, each with an ordered list of exact-text edits.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "minLength": 1,
+                                "description": "Existing UTF-8 file path relative to the workspace or absolute inside the allowed workspace."
+                            },
+                            "edits": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": 20,
+                                "description": "Ordered exact-text edits applied in memory before one atomic write.",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "old_string": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                            "description": "Exact non-empty text to find. It must occur exactly once unless replace_all is true."
+                                        },
+                                        "new_string": {
+                                            "type": "string",
+                                            "description": "Replacement text; an empty string deletes the matched text."
+                                        },
+                                        "replace_all": {
+                                            "type": "boolean",
+                                            "description": "Set true only when every occurrence of old_string should be replaced."
+                                        }
+                                    },
+                                    "required": ["old_string", "new_string"],
+                                    "additionalProperties": false
+                                }
+                            }
+                        },
+                        "required": ["path", "edits"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["changes"],
+            "additionalProperties": false
+        }),
+        move |args| {
+            let changes = args
+                .get("changes")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| ToolError::InvalidInput("changes must be an array".to_string()))?;
+            if changes.is_empty() || changes.len() > 10 {
+                return Err(ToolError::InvalidInput(
+                    "changes must contain between 1 and 10 files".to_string(),
+                ));
+            }
+
+            let mut seen = HashSet::with_capacity(changes.len());
+            let mut results = Vec::with_capacity(changes.len());
+            let mut changed_files = 0usize;
+
+            for change in changes {
+                let raw = change
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| ToolError::InvalidInput(
+                        "every change requires a string path".to_string()
+                    ))?;
+                let result = (|| -> Result<serde_json::Value, ToolError> {
+                    let target = resolve_path(root.as_deref(), raw, enforce)
+                        .map_err(ToolError::InvalidInput)?;
+                    if !seen.insert(target.clone()) {
+                        return Err(ToolError::InvalidInput(format!(
+                            "duplicate target path in apply_patch: {}",
+                            target.display()
+                        )));
+                    }
+                    check_path(
+                        &policy,
+                        &session,
+                        &preset,
+                        "apply_patch",
+                        Action::Write,
+                        &target,
+                    )?;
+
+                    let edits = change
+                        .get("edits")
+                        .and_then(serde_json::Value::as_array)
+                        .ok_or_else(|| ToolError::InvalidInput(
+                            "edits must be an array".to_string()
+                        ))?;
+                    if edits.is_empty() || edits.len() > 20 {
+                        return Err(ToolError::InvalidInput(
+                            "edits must contain between 1 and 20 operations per file".to_string()
+                        ));
+                    }
+
+                    let lock = file_lock(&target);
+                    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let mut content = read_editable(&target)?;
+                    let mut replacements = 0usize;
+
+                    for edit in edits {
+                        let old = edit
+                            .get("old_string")
+                            .and_then(serde_json::Value::as_str)
+                            .ok_or_else(|| ToolError::InvalidInput(
+                                "each edit requires old_string".to_string()
+                            ))?;
+                        let new = edit
+                            .get("new_string")
+                            .and_then(serde_json::Value::as_str)
+                            .ok_or_else(|| ToolError::InvalidInput(
+                                "each edit requires new_string".to_string()
+                            ))?;
+                        if old.is_empty() {
+                            return Err(ToolError::InvalidInput(
+                                "old_string must not be empty".to_string()
+                            ));
+                        }
+                        if old == new {
+                            return Err(ToolError::InvalidInput(
+                                "old_string and new_string are identical".to_string()
+                            ));
+                        }
+                        let replace_all = edit
+                            .get("replace_all")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
+                        let outcome = replace_text(&content, old, new, replace_all).map_err(|error| {
+                            match error {
+                                ReplaceError::NotFound => {
+                                    ToolError::Failed(not_found_message(&target, &content, old))
+                                }
+                                ReplaceError::Ambiguous(count) => ToolError::InvalidInput(format!(
+                                    "old_string occurs {count} times in {}; set replace_all=true only if every occurrence is intended",
+                                    target.display()
+                                )),
+                            }
+                        })?;
+                        replacements += outcome.replacements;
+                        if let Some(updated) = outcome.updated {
+                            content = updated;
+                        }
+                    }
+
+                    let original = read_editable(&target)?;
+                    let unchanged = original == content;
+                    if !unchanged {
+                        write_bytes(&target, content.as_bytes())?;
+                        changed_files += 1;
+                    }
+                    Ok(serde_json::json!({
+                        "path": target.display().to_string(),
+                        "replacements": replacements,
+                        "bytes": content.len(),
+                        "unchanged": unchanged
+                    }))
+                })();
+
+                match result {
+                    Ok(value) => results.push(value),
+                    Err(error) => results.push(serde_json::json!({
+                        "path": raw,
+                        "error": error.to_string()
+                    })),
+                }
+            }
+
+            Ok(serde_json::json!({
+                "files": results,
+                "count": changes.len(),
+                "changed_files": changed_files
             }))
         },
     )
@@ -7647,7 +7851,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         let built = build(&confined(&root));
         let registry = built.agent.registry().expect("registry");
 
-        for name in ["glob", "grep", "read_file", "read_files", "write_file", "edit_file", "list_dir"] {
+        for name in ["glob", "grep", "read_file", "read_files", "write_file", "edit_file", "apply_patch", "list_dir"] {
             let tool = registry.get(name).unwrap_or_else(|| panic!("{name} is registered"));
             let schema = tool.json_schema();
             assert_eq!(schema["additionalProperties"], false, "{name}");
