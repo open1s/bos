@@ -78,6 +78,9 @@ jobs:
         run: GOLD_STANDARD_RELEASE=1 bash scripts/ci/check-extension-gold-standard.sh
 
   windows:
+
+      - name: BOS extension SDK independence
+        run: bash scripts/ci/check-bos-ext-independence.sh
     name: Windows extension tests
     runs-on: windows-latest
     steps:

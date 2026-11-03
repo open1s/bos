@@ -10,6 +10,10 @@ members = [
     "crates/qserde",
     "crates/qserde_derive",
     "crates/resource",
+    "crates/bos-ext-core",
+    "crates/bos-ext-runtime",
+    "crates/bos-ext-sdk",
+    "crates/bos-ext-smoke",
     "crates/bsh"
 ]
 resolver = "2"

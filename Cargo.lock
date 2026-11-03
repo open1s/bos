@@ -1340,6 +1340,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "bos-ext-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "bos-ext-runtime"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bos-ext-core",
+ "serde_json",
+]
+
+[[package]]
+name = "bos-ext-sdk"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bos-ext-core",
+ "serde_json",
+]
+
+[[package]]
+name = "bos-ext-smoke"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bos-ext-core",
+ "bos-ext-sdk",
+ "serde_json",
+]
+
+[[package]]
 name = "brotli"
 version = "9.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

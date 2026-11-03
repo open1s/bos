@@ -731,10 +731,7 @@ impl Agent {
     /// Remove async extension tools without requiring a mutable Agent.
     pub fn remove_live_async_tools(&self, names: &[String]) -> usize {
         let mut live = self.live_tools.write().expect("live tool registry");
-        let removed = names
-            .iter()
-            .filter(|name| live.remove_async(name))
-            .count();
+        let removed = names.iter().filter(|name| live.remove_async(name)).count();
         if removed > 0 {
             self.engine_cache.lock().unwrap().take();
             self.context_cache.lock().unwrap().take();
@@ -812,12 +809,7 @@ impl Agent {
     pub fn live_skill_paths(&self) -> Vec<std::path::PathBuf> {
         self.live_skills
             .read()
-            .map(|skills| {
-                skills
-                    .iter()
-                    .map(|skill| skill.skill_dir.clone())
-                    .collect()
-            })
+            .map(|skills| skills.iter().map(|skill| skill.skill_dir.clone()).collect())
             .unwrap_or_default()
     }
 

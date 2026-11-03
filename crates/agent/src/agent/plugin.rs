@@ -414,10 +414,7 @@ impl PluginRegistry {
     }
 
     /// Run all plugins' on_turn_start in order.
-    pub async fn on_turn_start(
-        &self,
-        mut turn: TurnStartWrapper,
-    ) -> Option<TurnStartWrapper> {
+    pub async fn on_turn_start(&self, mut turn: TurnStartWrapper) -> Option<TurnStartWrapper> {
         for plugin in self.plugins() {
             match plugin.on_turn_start(turn).await {
                 Some(next) => turn = next,
@@ -540,7 +537,6 @@ mod tests {
             None
         }
     }
-
 
     struct Turns;
 

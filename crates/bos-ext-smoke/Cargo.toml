@@ -1,0 +1,18 @@
+[package]
+name = "bos-ext-smoke"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Standalone smoke crate for the BOS extension SDK"
+
+[[bin]]
+name = "bos-ext-smoke"
+path = "src/main.rs"
+
+[dependencies]
+bos-ext-core = { path = "../bos-ext-core" }
+bos-ext-sdk = { path = "../bos-ext-sdk" }
+async-trait.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,23 @@
+[package]
+name = "bos-ext-runtime"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Standard runtimes for the BOS extension framework"
+
+[features]
+default = ["builtin", "declarative", "process"]
+builtin = []
+declarative = []
+process = []
+wasm = []
+extism = []
+mcp = []
+cordis = []
+
+[dependencies]
+bos-ext-core = { path = "../bos-ext-core" }
+async-trait.workspace = true
+serde_json.workspace = true
