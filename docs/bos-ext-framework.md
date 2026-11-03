@@ -1,7 +1,7 @@
 # BOS Extension Framework (bos-ext)
 
-Status: Phase 1 in progress — core types, capability/policy, effect scopes and
-event dispatch moved to bos-ext-core; BSH re-exports them.
+Status: Phase 1 in progress — core types, capability/policy, manifest, effect
+scopes and event dispatch moved to bos-ext-core; BSH re-exports them.
 
 ## Goal
 

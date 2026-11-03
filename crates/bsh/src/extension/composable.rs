@@ -1124,7 +1124,7 @@ mod tests {
     }
 
     fn manifest_with_service_contract(id: &str, provides: &str, requires: &str) -> Manifest {
-        let base = include_str!("manifest.rs");
+        let base = include_str!("../../../bos-ext-core/src/manifest.rs");
         let start = base.find("fn sample() -> String").expect("sample helper");
         let source = &base[start..];
         let sample_start = source.find("r#\"").expect("raw manifest start") + 3;

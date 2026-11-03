@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 pub mod capability;
 pub mod dispatch;
+pub mod manifest;
 pub mod types;
 pub mod effects;
 
