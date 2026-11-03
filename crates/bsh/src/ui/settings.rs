@@ -1043,12 +1043,20 @@ impl Shell {
                 &crate::settings::resolve::SessionChoice::default(),
                 &self.state.mcp,
             );
-            self.caps = crate::caps::capabilities(&built.agent);
             self.plugins = built.plugins;
             // The dialog's build already knows the tool array, so the meter's
             // tools bucket follows the draft without a second build.
             self.state.set_tools_schema(built.tools_schema_chars);
             self.caps_generation = self.state.policy_generation;
+            // The pane's list is a PREVIEW that keeps a switched-off tool and
+            // skill on screen - its row is the only control that can switch it
+            // back on. See preview_capabilities for why the whole build above
+            // cannot serve as the list.
+            self.caps = crate::caps::preview_capabilities(
+                self.state.draft(),
+                &self.state.vault,
+                &self.state.mcp,
+            );
         }
         let lang = self.state.lang;
         let section = self.state.settings_section;

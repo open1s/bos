@@ -11,6 +11,7 @@ Related documents:
 - Author SDK, host facade and examples: [ferris-sdk.md](ferris-sdk.md)
 - Extension WIT contract: [../crates/bsh/wit/extension.wit](../crates/bsh/wit/extension.wit)
 - Runnable examples: [../examples/extensions](../examples/extensions)
+- Chinese course-style textbook: [bsh-extension-guide.zh.md](bsh-extension-guide.zh.md)
 
 ## 1. What an extension is
 

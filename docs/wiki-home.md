@@ -67,6 +67,7 @@ async with BrainOS() as brain:
 - [Rust 使用指南](https://github.com/open1s/bos/blob/main/docs/rust-user-guide.md)
 - [Python 使用指南](https://github.com/open1s/bos/blob/main/docs/python-user-guide.md)
 - [JavaScript 使用指南](https://github.com/open1s/bos/blob/main/docs/javascript-user-guide.md)
+- [BSH 扩展开发教材](https://github.com/open1s/bos/blob/main/docs/bsh-extension-guide.zh.md)
 - [BSH 扩展平台](https://github.com/open1s/bos/blob/main/docs/bsh-extension.md)
 - [版本与更新](https://github.com/open1s/bos/releases)
 - [问题反馈](https://github.com/open1s/bos/issues) · [社区讨论](https://github.com/open1s/bos/discussions)

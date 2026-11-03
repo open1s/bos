@@ -865,6 +865,11 @@ fn build_agent_for_session_inner(
         eff.disabled_tools.iter().any(|d| d == name)
             || preset_tools.is_some_and(|tools| !tools.iter().any(|tool| tool == name))
     };
+    // The goal tools are session-durable state, not a preset capability: a
+    // preset's tool allowlist must NOT withdraw the only path that can complete
+    // or block a goal, or a goal created under that preset can only run to its
+    // round cap. The reader's own per-tool switch still applies.
+    let off_goal_tool = |name: &str| eff.disabled_tools.iter().any(|d| d == name);
     let mut bundles: Vec<plugins::Bundle> = Vec::new();
 
     // The permission mode is the reference's own trinary, and each arm lands on
@@ -1068,18 +1073,27 @@ fn build_agent_for_session_inner(
     }
 
     // The model's way to settle a goal. This is session-durable state rather
-    // than a preset capability, so it answers to the per-tool switches and NOT
-    // to the preset's bundle list: a preset that names `shell`, `files` and
-    // `plan` must not silently withdraw the one path that can complete a goal
-    // (which is exactly the dormant-completion state this seam closes).
+    // than a preset capability, so it answers to the reader's per-tool switches
+    // and NOT to the preset's bundle list or tool allowlist: a preset that
+    // names `shell`, `files` and `plan` (or one that narrows the tools to a
+    // list) must not silently withdraw the one path that can complete a goal -
+    // a goal created under such a preset could otherwise only run to its round
+    // cap. Each goal tool answers to its OWN switch: gating the pair with one
+    // condition withdrew both when either was unchecked, and since the Tools
+    // pane lists the tools the built agent carries, the surviving row vanished
+    // too. The store is attached whenever EITHER tool is present, because
+    // settling a recorded transition needs it.
     let mut goal_store = None;
     if let Some(goal) = goal {
-        if !off_tool("get_goal") && !off_tool("update_goal") {
-            let store = GoalStore::new(goal);
-            let tools: Vec<Arc<dyn agent::tools::Tool>> = vec![
-                Arc::new(GetGoalTool::new(store.clone())),
-                Arc::new(UpdateGoalTool::new(store.clone())),
-            ];
+        let store = GoalStore::new(goal);
+        let mut tools: Vec<Arc<dyn agent::tools::Tool>> = Vec::new();
+        if !off_goal_tool("get_goal") {
+            tools.push(Arc::new(GetGoalTool::new(store.clone())));
+        }
+        if !off_goal_tool("update_goal") {
+            tools.push(Arc::new(UpdateGoalTool::new(store.clone())));
+        }
+        if !tools.is_empty() {
             goal_store = Some(store);
             bundles.push(plugins::Bundle::new("goal", tools));
         }
@@ -1671,6 +1685,35 @@ pub(crate) fn capabilities(agent: &Agent) -> Vec<CapInfo> {
     }
     caps.sort_by(|a, b| a.category.cmp(&b.category).then(a.name.cmp(&b.name)));
     caps
+}
+
+/// The capabilities the Tools pane lists.
+///
+/// The pane draws exactly this list, and each row's switch writes the disabled
+/// lists - so a preview that HONORED those lists would omit the very row the
+/// reader unchecked, and the pane would carry no control to restore it. A goal
+/// made that fatal: withdrawing `update_goal` withdrew the only way a running
+/// goal could be closed.
+///
+/// The preview therefore clears the tool and skill lists, and only those: a
+/// disabled extension still contributes nothing, and a preset still narrows the
+/// tools, because neither of those is a switch THIS pane owns. The meter and
+/// the plugin inventory are priced from the real build, not this preview.
+pub(crate) fn preview_capabilities(
+    settings: &Settings,
+    vault: &Vault,
+    mcp: &crate::mcp::McpPool,
+) -> Vec<CapInfo> {
+    let mut preview = settings.clone();
+    preview.workspace.disabled.tools.clear();
+    preview.workspace.disabled.skills.clear();
+    let built = build_agent(
+        &preview,
+        vault,
+        &crate::settings::resolve::SessionChoice::default(),
+        mcp,
+    );
+    capabilities(&built.agent)
 }
 
 /// The workspace root, expanded, when one is configured.
@@ -2929,6 +2972,13 @@ const MAX_LIST_ROWS: usize = 2_000;
 struct ReadOutcome {
     content: String,
     truncated: bool,
+    /// The window started past the last line of the file.
+    ///
+    /// An empty window is a real answer - there is nothing between `offset`
+    /// and the end - but on its own it is indistinguishable from an empty
+    /// file, and a model that mis-computed the offset takes it as "the file
+    /// is empty". The flag says which one happened.
+    past_end: bool,
 }
 
 /// One directory listing, as `list_dir` reports it.
@@ -2997,20 +3047,20 @@ fn read_ceiling(target: &Path, size: u64) -> ToolError {
 /// also invalid UTF-8 and "binary file" is the answer a caller can act on. The
 /// tail check uses a char search, which is a memchr: a byte-at-a-time scan of a
 /// multi-megabyte file cost 10ms a read for nothing.
-fn utf8_text(target: &Path, bytes: Vec<u8>) -> Result<String, ToolError> {
+fn utf8_text(target: &Path, bytes: Vec<u8>, base: usize) -> Result<String, ToolError> {
     let head = &bytes[..bytes.len().min(8 * 1024)];
     if let Some(at) = head.iter().position(|byte| *byte == 0) {
-        return Err(binary(target, at));
+        return Err(binary(target, base + at));
     }
     let content = String::from_utf8(bytes).map_err(|error| {
         ToolError::Failed(format!(
             "{} is not valid UTF-8 (the first invalid byte is at offset {})",
             target.display(),
-            error.utf8_error().valid_up_to()
+            base + error.utf8_error().valid_up_to()
         ))
     })?;
     if let Some(at) = content.find('\0') {
-        return Err(binary(target, at));
+        return Err(binary(target, base + at));
     }
     Ok(content)
 }
@@ -3036,10 +3086,11 @@ fn read_whole(target: &Path) -> Result<ReadOutcome, ToolError> {
     if bytes.len() > MAX_READ_BYTES {
         return Err(read_ceiling(target, bytes.len() as u64));
     }
-    let content = utf8_text(target, bytes)?;
+    let content = utf8_text(target, bytes, 0)?;
     Ok(ReadOutcome {
         content,
         truncated: false,
+        past_end: false,
     })
 }
 
@@ -3052,6 +3103,11 @@ fn read_window(target: &Path, offset: usize, limit: usize) -> Result<ReadOutcome
     let mut index = 1_usize;
     let mut kept = 0_usize;
     let mut truncated = false;
+    // The byte offset of `out`'s first byte, so a refusal inside the window
+    // reports a position a reader can seek to in the FILE, not one relative to
+    // the window it happens to be looking at.
+    let mut base = 0_usize;
+    let mut consumed = 0_usize;
     loop {
         line.clear();
         let read = reader
@@ -3065,13 +3121,21 @@ fn read_window(target: &Path, offset: usize, limit: usize) -> Result<ReadOutcome
                 truncated = true;
                 break;
             }
+            if kept == 0 {
+                base = consumed;
+            }
             out.extend_from_slice(&line);
             kept += 1;
         }
+        consumed += read;
         index += 1;
     }
-    let content = utf8_text(target, out)?;
-    Ok(ReadOutcome { content, truncated })
+    let content = utf8_text(target, out, base)?;
+    Ok(ReadOutcome {
+        content,
+        truncated,
+        past_end: kept == 0 && offset > 1,
+    })
 }
 
 /// Read a file for an edit, bounded by the edit ceiling.
@@ -3094,7 +3158,7 @@ fn read_editable(target: &Path) -> Result<String, ToolError> {
             target.display()
         )));
     }
-    utf8_text(target, bytes)
+    utf8_text(target, bytes, 0)
 }
 
 /// The one temp path a write uses beside its target.
@@ -3625,13 +3689,18 @@ fn read_file_tool(
                     read_window(&target, offset.unwrap_or(1), limit.unwrap_or(usize::MAX))?
                 }
             };
-            let ReadOutcome { content, truncated } = read;
+            let ReadOutcome {
+                content,
+                truncated,
+                past_end,
+            } = read;
             let bytes = content.len();
             Ok(serde_json::json!({
                 "path": target.display().to_string(),
                 "content": content,
                 "bytes": bytes,
                 "truncated": truncated,
+                "past_end": past_end,
             }))
         },
     )
@@ -6269,6 +6338,155 @@ mod tests {
         assert!(built.goal.is_none());
     }
 
+    /// The two goal tools answer to their own switch. Unchecking one used to
+    /// unmount BOTH, and the Tools pane lists the tools the build carries, so
+    /// the remaining row disappeared with it and could not be switched back.
+    #[test]
+    fn the_goal_tools_switch_independently() {
+        use std::sync::Arc;
+        let build_with = |disabled: &[&str]| {
+            let mut settings = bare();
+            settings.workspace.disabled.tools =
+                disabled.iter().map(|name| name.to_string()).collect();
+            let goal = agent::goal::Goal::new("ship it", Some(8)).expect("a goal");
+            crate::caps::build_agent_for_session_with_subagents_and_jobs(
+                &settings,
+                &Vault::disabled(),
+                &SessionChoice::default(),
+                &crate::mcp::McpPool::default(),
+                "session",
+                "session",
+                Arc::new(crate::subagent::SubagentRegistry::default()),
+                Arc::new(agent::jobs::JobRegistry::new()),
+                Arc::new(crate::browser::BrowserHandle::new()),
+                Some(goal),
+            )
+        };
+
+        let reader_off = build_with(&["get_goal"]);
+        let names = tool_names(&reader_off);
+        assert!(
+            names.iter().any(|name| name == "update_goal"),
+            "the settle path stays mounted: {names:?}"
+        );
+        assert!(!names.iter().any(|name| name == "get_goal"), "{names:?}");
+        assert!(
+            reader_off.goal.is_some(),
+            "the settle handle rides a build that mounts either goal tool"
+        );
+
+        let settle_off = build_with(&["update_goal"]);
+        let names = tool_names(&settle_off);
+        assert!(
+            names.iter().any(|name| name == "get_goal"),
+            "the reader stays mounted: {names:?}"
+        );
+        assert!(!names.iter().any(|name| name == "update_goal"), "{names:?}");
+        assert!(settle_off.goal.is_some());
+
+        let both_off = build_with(&["get_goal", "update_goal"]);
+        let names = tool_names(&both_off);
+        assert!(
+            !names
+                .iter()
+                .any(|name| name == "get_goal" || name == "update_goal"),
+            "{names:?}"
+        );
+        assert!(both_off.goal.is_none(), "no tool, no settle handle");
+    }
+
+    /// The Tools pane must list a tool the reader has switched off: that row is
+    /// the only control that can switch it back on. The preview build clears
+    /// the disabled lists for exactly that reason, while the real build still
+    /// honors them.
+    #[test]
+    fn the_tools_preview_keeps_a_disabled_tool_listed() {
+        let mut settings = bare();
+        settings.workspace.disabled.tools = vec!["read_file".to_string()];
+        let preview = crate::caps::preview_capabilities(
+            &settings,
+            &Vault::disabled(),
+            &crate::mcp::McpPool::default(),
+        );
+        assert!(
+            preview
+                .iter()
+                .any(|cap| cap.name == "read_file" && cap.category == "tool"),
+            "a disabled tool keeps its row so it can be switched back on"
+        );
+
+        let real = build(&settings);
+        assert!(
+            !crate::caps::capabilities(&real.agent)
+                .iter()
+                .any(|cap| cap.name == "read_file"),
+            "the turn's build still honors the disabled list"
+        );
+    }
+
+    /// A goal is session state, not a preset capability: a preset whose tool
+    /// allowlist omits the goal tools must still mount them, or a goal created
+    /// under that preset could only run to its round cap with no way to close
+    /// it. The reader's own per-tool switch is the one that still applies.
+    #[test]
+    fn a_preset_cannot_withdraw_the_goal_tools() {
+        use std::sync::Arc;
+        let build_with = |disabled: &[&str]| {
+            let mut settings = bare();
+            settings.global.presets.insert(
+                "files-only".to_string(),
+                Preset {
+                    name: Some("files-only".to_string()),
+                    plugins: vec!["files".to_string()],
+                    tools: Some(vec!["read_file".to_string()]),
+                    ..Default::default()
+                },
+            );
+            settings.global.default_preset = "files-only".to_string();
+            settings.workspace.disabled.tools =
+                disabled.iter().map(|name| name.to_string()).collect();
+            let goal = agent::goal::Goal::new("ship it", Some(8)).expect("a goal");
+            crate::caps::build_agent_for_session_with_subagents_and_jobs(
+                &settings,
+                &Vault::disabled(),
+                &SessionChoice::default(),
+                &crate::mcp::McpPool::default(),
+                "session",
+                "session",
+                Arc::new(crate::subagent::SubagentRegistry::default()),
+                Arc::new(agent::jobs::JobRegistry::new()),
+                Arc::new(crate::browser::BrowserHandle::new()),
+                Some(goal),
+            )
+        };
+
+        let built = build_with(&[]);
+        let names = tool_names(&built);
+        assert!(
+            names.iter().any(|name| name == "get_goal"),
+            "the reader stays mounted under a narrow preset: {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name == "update_goal"),
+            "the settle path stays mounted under a narrow preset: {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name == "read_file"),
+            "the preset still narrows the rest: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name == "write_file"),
+            "a tool the preset omits stays omitted: {names:?}"
+        );
+        assert!(built.goal.is_some(), "the settle handle rides the build");
+
+        // The reader's own switch still closes the completion path.
+        let off = build_with(&["update_goal"]);
+        let names = tool_names(&off);
+        assert!(names.iter().any(|name| name == "get_goal"), "{names:?}");
+        assert!(!names.iter().any(|name| name == "update_goal"), "{names:?}");
+    }
+
     /// The five gated capabilities, in display order.
     type Gates = (bool, bool, bool, bool, bool);
     /// One row of the registration table.
@@ -7599,6 +7817,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             .expect("a window reads");
         assert_eq!(window["content"], "line 10\nline 11\nline 12\n");
         assert_eq!(window["truncated"], true);
+        assert_eq!(window["past_end"], false);
 
         let past = registry
             .execute(
@@ -7611,6 +7830,10 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             .expect("an offset past the end is empty, not an error");
         assert_eq!(past["content"], "");
         assert_eq!(past["truncated"], false);
+        assert_eq!(
+            past["past_end"], true,
+            "an empty window past the last line says so, so it cannot be read as an empty file"
+        );
     }
 
     #[test]
@@ -7703,6 +7926,27 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         let message = binary.to_string();
         assert!(message.contains("binary file"), "{message}");
         assert!(message.contains("NUL byte at offset 4"), "{message}");
+
+        // A windowed read reports the NUL's offset in the FILE, not in the
+        // window: the caller has to be able to seek to it. The NUL sits on the
+        // second line, so a window that starts there sees it at window offset 3
+        // while the file offset is 7.
+        let split = root.join("split.bin");
+        std::fs::write(&split, [b'a', b'a', b'a', b'\n', b'b', b'b', b'b', 0, b'c'])
+            .expect("split");
+        let windowed = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({
+                    "path": split.to_string_lossy(),
+                    "offset": 2,
+                }),
+            )
+            .expect_err("a window that reaches the NUL is refused");
+        assert!(
+            windowed.to_string().contains("NUL byte at offset 7"),
+            "the offset is file-relative: {windowed}"
+        );
 
         let directory = registry
             .execute(

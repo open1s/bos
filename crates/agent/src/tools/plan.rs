@@ -295,10 +295,7 @@ mod tests {
         let items = tool.store().items();
         assert_eq!(items.len(), 2);
         assert!(items.iter().all(|item| !item.text.trim().is_empty()));
-        assert_eq!(
-            items.iter().filter(|item| item.status == PlanStatus::InProgress).count(),
-            1
-        );
+        assert_eq!(items.iter().filter(|item| item.status == PlanStatus::InProgress).count(), 1);
     }
 
     #[test]
@@ -336,15 +333,14 @@ mod tests {
         assert!(tool.run(&two_active).is_err());
         assert!(tool.store().items().is_empty());
     }
-
     #[test]
-    fn item_text_over_limit_is_rejected() {
+    fn item_text_is_trimmed_and_truncated() {
         let tool = tool();
-        let long = "x".repeat(MAX_TEXT + 1);
-        assert!(tool.run(&serde_json::json!({
-            "items": [{"text": long, "status": "in_progress"}]
-        })).is_err());
-        assert!(tool.store().items().is_empty());
+        let long = "x".repeat(MAX_TEXT + 40);
+        tool.run(&serde_json::json!({"items": [{"text": format!("  {long}  ")}]}))
+            .expect("run");
+        let items = tool.store().items();
+        assert_eq!(items[0].text.len(), MAX_TEXT);
     }
 
     /// The description carries the reference todo guidance, with BSH's tool

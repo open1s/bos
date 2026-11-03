@@ -506,6 +506,21 @@ fn strip_ansi(text: &str) -> String {
                 chars.next();
                 chars.next();
             }
+            Some(']') => {
+                // OSC (an operating-system command such as a window title or a
+                // hyperlink): the sequence ends at BEL or at ST (ESC ). Left
+                // alone it leaks the title text into the model's tool result.
+                chars.next();
+                while let Some(next) = chars.next() {
+                    if next == '\u{7}' {
+                        break;
+                    }
+                    if next == '\u{1b}' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
             Some(_) => {
                 chars.next();
             }
@@ -2658,5 +2673,12 @@ mod tests {
     fn captured_output_loses_ansi_sequences() {
         let input = "\u{1b}[32m+\u{1b}(B\u{1b}[m plain";
         assert_eq!(strip_ansi(input), "+ plain");
+
+        // OSC: a window title a command set (ESC ] ... BEL) and a hyperlink
+        // (ESC ] ... ST) both disappear whole; the text after them stays.
+        let title = "\u{1b}]0;cargo test\u{7}done";
+        assert_eq!(strip_ansi(title), "done");
+        let link = "\u{1b}]8;;https://example.com\u{1b}\\click";
+        assert_eq!(strip_ansi(link), "click");
     }
 }

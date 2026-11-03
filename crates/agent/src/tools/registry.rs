@@ -36,9 +36,13 @@ impl ToolRegistry {
     }
 
     /// Register a synchronous tool, failing on a duplicate name.
+    ///
+    /// The name is unique across BOTH maps: one `schema_cache` entry backs both
+    /// kinds, so a sync and an async tool sharing a name would validate one
+    /// through the other's schema and only one of them could ever be reached.
     pub fn register(&mut self, tool: Arc<dyn Tool>) -> Result<(), ToolError> {
         let name = tool.name().to_string();
-        if self.tools.contains_key(&name) {
+        if self.tools.contains_key(&name) || self.async_tools.contains_key(&name) {
             return Err(ToolError::Failed(format!("duplicate tool: {}", name)));
         }
         let schema = tool.json_schema();
@@ -48,9 +52,12 @@ impl ToolRegistry {
     }
 
     /// Register an asynchronous tool, failing on a duplicate name.
+    ///
+    /// The name is unique across BOTH maps, for the reason [Self::register]
+    /// gives.
     pub fn register_async(&mut self, tool: Arc<dyn AsyncTool>) -> Result<(), ToolError> {
         let name = tool.name().to_string();
-        if self.async_tools.contains_key(&name) {
+        if self.async_tools.contains_key(&name) || self.tools.contains_key(&name) {
             return Err(ToolError::Failed(format!("duplicate async tool: {}", name)));
         }
         let schema = tool.json_schema();
@@ -167,7 +174,11 @@ impl ToolRegistry {
         self.mcp_tool_entries()
     }
 
-    /// Find an async tool by exact name or suffix match
+    /// Find an async tool by exact name, else by an MCP `{namespace}_` suffix.
+    ///
+    /// [Self::execute] consults this only after both exact registries miss, so
+    /// the suffix can never take a call away from a sync tool with that exact
+    /// name.
     fn find_async_tool(&self, name: &str) -> Option<Arc<dyn AsyncTool>> {
         // Try exact match first
         if let Some(tool) = self.async_tools.get(name) {
@@ -185,6 +196,14 @@ impl ToolRegistry {
 
     /// Execute a tool by name, validating arguments against its schema.
     ///
+    /// Resolution is EXACT name first, in both registries, and only then the
+    /// MCP suffix fallback. A suffix match must never shadow a tool the caller
+    /// named exactly: an MCP server registers its tools as
+    /// `{namespace}_{tool_name}`, so a server tool called `read_file` used to
+    /// answer the model's `read_file` call and run the server's tool instead of
+    /// the built-in one. The fallback exists for the opposite direction only,
+    /// where the model names the bare tool an MCP server exposes.
+    ///
     /// Async tools are driven to completion on a dedicated thread with its own
     /// current-thread runtime, because this entry point is synchronous while
     /// the tool's future may await I/O. Their arguments are validated before
@@ -194,42 +213,61 @@ impl ToolRegistry {
         name: &str,
         args: &serde_json::Value,
     ) -> Result<serde_json::Value, ToolError> {
-        // First try async tools via suffix matching
-        if let Some(tool) = self.find_async_tool(name) {
-            let registry_name = tool.name().to_string();
-            let schema =
-                if let Some(cached) = self.schema_cache.get(&registry_name).map(|r| r.clone()) {
-                    cached
-                } else {
-                    let schema = tool.json_schema();
-                    self.schema_cache.insert(registry_name, schema.clone());
-                    schema
-                };
-            super::validate_args(&schema, args)?;
-
-            let args = args.clone();
-            let (tx, rx) = std::sync::mpsc::channel();
-
-            std::thread::spawn(move || {
-                let result = match tokio::runtime::Builder::new_current_thread().build() {
-                    Ok(rt) => rt.block_on(tool.run(&args)),
-                    Err(e) => Err(ToolError::Failed(format!(
-                        "Failed to create tool runtime: {e}"
-                    ))),
-                };
-                let _ = tx.send(result);
-            });
-
-            return rx
-                .recv()
-                .map_err(|e| ToolError::Failed(format!("Async tool thread failed: {e}")))?;
+        if let Some(tool) = self.async_tools.get(name).cloned() {
+            return self.run_async(tool, args);
         }
+        if let Some(tool) = self.tools.get(name).cloned() {
+            return self.run_sync(name, tool, args);
+        }
+        // The suffix match is the MCP bare-name fallback, so it is consulted
+        // only after both exact maps missed.
+        if let Some(tool) = self.find_async_tool(name) {
+            return self.run_async(tool, args);
+        }
+        Err(ToolError::NotFound(name.to_string()))
+    }
 
-        let tool = self
-            .tools
-            .get(name)
-            .ok_or_else(|| ToolError::NotFound(name.to_string()))?;
+    /// Validate one async tool's arguments and run it to completion.
+    fn run_async(
+        &self,
+        tool: Arc<dyn AsyncTool>,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value, ToolError> {
+        let registry_name = tool.name().to_string();
+        let schema = if let Some(cached) = self.schema_cache.get(&registry_name).map(|r| r.clone())
+        {
+            cached
+        } else {
+            let schema = tool.json_schema();
+            self.schema_cache.insert(registry_name, schema.clone());
+            schema
+        };
+        super::validate_args(&schema, args)?;
 
+        let args = args.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let result = match tokio::runtime::Builder::new_current_thread().build() {
+                Ok(rt) => rt.block_on(tool.run(&args)),
+                Err(e) => Err(ToolError::Failed(format!(
+                    "Failed to create tool runtime: {e}"
+                ))),
+            };
+            let _ = tx.send(result);
+        });
+
+        rx.recv()
+            .map_err(|e| ToolError::Failed(format!("Async tool thread failed: {e}")))?
+    }
+
+    /// Validate one synchronous tool's arguments and run it.
+    fn run_sync(
+        &self,
+        name: &str,
+        tool: Arc<dyn Tool>,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value, ToolError> {
         let schema = if let Some(cached) = self.schema_cache.get(name).map(|r| r.clone()) {
             cached
         } else {
@@ -237,7 +275,6 @@ impl ToolRegistry {
             self.schema_cache.insert(name.to_string(), schema.clone());
             schema
         };
-
         super::validate_args(&schema, args)?;
         tool.run(args)
     }
@@ -352,5 +389,101 @@ mod mcp_projection_tests {
         assert!(registry.get_async("ns_echo").is_none());
         assert!(registry.mcp_tool_entries().is_empty());
         assert!(!registry.remove_async("ns_echo"));
+    }
+
+    /// A synchronous tool that answers with its own name, so a test can tell
+    /// which of two same-shaped tools actually ran.
+    struct SyncTool(&'static str);
+
+    impl Tool for SyncTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn description(&self) -> String {
+            format!("{} (sync)", self.0)
+        }
+
+        fn json_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+
+        fn run(&self, _input: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
+            Ok(serde_json::json!({ "ran": "sync" }))
+        }
+    }
+
+    /// An async tool that answers with its own name.
+    struct NamedAsync(&'static str);
+
+    #[async_trait]
+    impl AsyncTool for NamedAsync {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn description(&self) -> String {
+            format!("{} (async)", self.0)
+        }
+
+        fn json_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+
+        async fn run(&self, _input: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
+            Ok(serde_json::json!({ "ran": "async" }))
+        }
+    }
+
+    /// A call by an exact tool name must reach that tool. An MCP server's
+    /// `{namespace}_{tool}` registration used to win the call through the suffix
+    /// match, so a server tool named `read_file` silently replaced the built-in
+    /// file reader.
+    #[test]
+    fn an_exact_sync_name_beats_an_mcp_suffix_match() {
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(SyncTool("read_file"))).unwrap();
+        r.register_async(Arc::new(NamedAsync("srv_read_file")))
+            .unwrap();
+
+        let exact = r.execute("read_file", &serde_json::json!({})).unwrap();
+        assert_eq!(exact["ran"], "sync", "the built-in tool keeps its name");
+
+        let namespaced = r.execute("srv_read_file", &serde_json::json!({})).unwrap();
+        assert_eq!(
+            namespaced["ran"], "async",
+            "the namespaced tool is reachable"
+        );
+    }
+
+    /// The suffix fallback still answers a bare tool name, which is what it is
+    /// for: the model names the tool an MCP server exposes without the
+    /// namespace prefix.
+    #[test]
+    fn a_bare_name_falls_back_to_the_namespaced_async_tool() {
+        let mut r = ToolRegistry::new();
+        r.register_async(Arc::new(NamedAsync("ns_echo"))).unwrap();
+        let value = r.execute("echo", &serde_json::json!({})).unwrap();
+        assert_eq!(value["ran"], "async");
+    }
+
+    /// One name identifies one tool: the registries are checked together, so a
+    /// sync and an async tool cannot share a name (and with it a schema cache
+    /// entry).
+    #[test]
+    fn a_name_is_unique_across_both_registries() {
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(SyncTool("dup"))).unwrap();
+        assert!(
+            r.register_async(Arc::new(NamedAsync("dup"))).is_err(),
+            "async registration must see the sync name"
+        );
+
+        let mut r = ToolRegistry::new();
+        r.register_async(Arc::new(NamedAsync("dup"))).unwrap();
+        assert!(
+            r.register(Arc::new(SyncTool("dup"))).is_err(),
+            "sync registration must see the async name"
+        );
     }
 }

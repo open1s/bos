@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use crate::jobs::{JobRegistry, JobStatus};
+use crate::jobs::JobRegistry;
 use crate::policy::{Action, PolicySet, Target};
 use crate::tools::bash::BashPolicy;
 use react::tool::{Tool, ToolError};
@@ -147,10 +147,10 @@ impl JobTool {
         let (job, registry) = self.owned(id)?;
         self.gate(Action::Spawn, &job)?;
         let killed = registry.kill(id);
-        let status = registry
-            .job(id)
-            .map(|job| job.status)
-            .unwrap_or(JobStatus::Killed);
+        // A job the roster no longer holds keeps the status it had when it was
+        // addressed: it settled, and the job cap pruned it. The fallback used
+        // to invent `killed` for a job this call never touched.
+        let status = registry.job(id).map(|job| job.status).unwrap_or(job.status);
         Ok(serde_json::json!({
             "id": id,
             "killed": killed,
@@ -255,6 +255,7 @@ impl Tool for JobTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jobs::JobStatus;
     use crate::policy::{PolicyData, PolicySet};
 
     #[test]
@@ -340,6 +341,22 @@ verdict := {"allow": false, "rule": "no-job-kill", "reason": "jobs may not be st
         assert_eq!(value["exit_code"], serde_json::json!(0));
         assert_eq!(value["output"], serde_json::json!("hi\n"));
         assert_eq!(value["running"], serde_json::json!(false));
+    }
+
+    /// Stopping a job that already settled reports what it did, not "killed":
+    /// the call touched nothing and the job's own outcome is the answer.
+    #[test]
+    fn stopping_a_settled_job_reports_its_own_status() {
+        let registry = Arc::new(JobRegistry::new());
+        let id = registry.begin("session-a", "bash", "true");
+        registry.finish(&id, JobStatus::Succeeded { code: 0 });
+        let kill = JobTool::stopper("job_kill").with_jobs(registry, "session-a");
+        let out = kill
+            .run(&serde_json::json!({ "id": id }))
+            .expect("a settled job still answers");
+        assert_eq!(out["killed"], serde_json::json!(false));
+        assert_eq!(out["status"], serde_json::json!("succeeded"));
+        assert_eq!(out["running"], serde_json::json!(false));
     }
 
     /// The user-facing promise: a wait that reports a finished job reports the

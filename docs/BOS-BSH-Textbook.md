@@ -5,12 +5,14 @@
 This is a working book, not a specification. Most chapters include commands you
 can run, output you should see, and the failure modes that waste the most time. The normative contract is [bsh-extension.md](bsh-extension.md);
 when this book and the standard disagree, the standard wins and the book has a
-bug.
+bug. A Chinese course-style companion is
+[bsh-extension-guide.zh.md](bsh-extension-guide.zh.md).
 
 The second edition adds what the framework grew after the first one:
 
 - the observe-hook layer and the five points it dispatches today;
-- `hooks.observe`, the twentieth capability;
+- `hooks.observe`, the twentieth capability (the vocabulary now has 21,
+  including `agent.intercept`);
 - request correlation between `model.request`, `model.response` and
   `http.exchange`;
 - a runnable Extism observer (`examples/extensions/extism-hook`);
