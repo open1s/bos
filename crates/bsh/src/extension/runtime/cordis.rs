@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
-use agent::extensions::bridge::{
+use bos_ext_runtime::bridge::{
     find_interpreter, BridgeKind, BridgeOptions, BridgeRegistration, BridgeSession,
 };
 

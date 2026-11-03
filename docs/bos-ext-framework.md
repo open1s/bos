@@ -2,8 +2,8 @@
 
 Status: Phase 2 in progress — core primitives are in bos-ext-core; runtime
 contract, builtin, declarative and process runtimes are in bos-ext-runtime.
-Hooks, Extism and WASM moved to runtime; Cordis and the Node bridge remain in
-BSH.
+Hooks, Extism, WASM and the Node bridge moved to runtime; the Cordis runtime
+still lives in BSH but uses the runtime bridge.
 
 ## Goal
 

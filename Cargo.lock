@@ -1377,6 +1377,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "uuid",
  "wasmtime 50.0.1",
