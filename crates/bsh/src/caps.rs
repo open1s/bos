@@ -3741,7 +3741,10 @@ fn read_files_tool(
                             limit.unwrap_or(usize::MAX),
                         )?,
                     };
-                    let ReadOutcome { content, truncated: file_truncated } = read;
+                    let ReadOutcome {
+                        content,
+                        truncated: file_truncated,
+                    } = read;
                     let content_bytes = content.as_bytes();
                     let keep = content_bytes.len().min(remaining);
                     let mut boundary = keep;
@@ -3870,9 +3873,11 @@ fn apply_patch_tool(
                 let raw = change
                     .get("path")
                     .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| ToolError::InvalidInput(
-                        "every change requires a string path".to_string()
-                    ))?;
+                    .ok_or_else(|| {
+                        ToolError::InvalidInput(
+                            "every change requires a string path".to_string(),
+                        )
+                    })?;
                 input_bytes = input_bytes.saturating_add(raw.len());
                 let target = resolve_path(root.as_deref(), raw, enforce)
                     .map_err(ToolError::InvalidInput)?;
@@ -3894,9 +3899,9 @@ fn apply_patch_tool(
                 let edits = change
                     .get("edits")
                     .and_then(serde_json::Value::as_array)
-                    .ok_or_else(|| ToolError::InvalidInput(
-                        "edits must be an array".to_string()
-                    ))?;
+                    .ok_or_else(|| {
+                        ToolError::InvalidInput("edits must be an array".to_string())
+                    })?;
                 if edits.is_empty() || edits.len() > MAX_PATCH_EDITS {
                     return Err(ToolError::InvalidInput(format!(
                         "edits must contain between 1 and {MAX_PATCH_EDITS} operations per file"
@@ -3906,18 +3911,23 @@ fn apply_patch_tool(
                     let old = edit
                         .get("old_string")
                         .and_then(serde_json::Value::as_str)
-                        .ok_or_else(|| ToolError::InvalidInput(
-                            "each edit requires old_string".to_string()
-                        ))?;
+                        .ok_or_else(|| {
+                            ToolError::InvalidInput(
+                                "each edit requires old_string".to_string(),
+                            )
+                        })?;
                     let new = edit
                         .get("new_string")
                         .and_then(serde_json::Value::as_str)
-                        .ok_or_else(|| ToolError::InvalidInput(
-                            "each edit requires new_string".to_string()
-                        ))?;
+                        .ok_or_else(|| {
+                            ToolError::InvalidInput(
+                                "each edit requires new_string".to_string(),
+                            )
+                        })?;
                     if old.is_empty() || old == new {
                         return Err(ToolError::InvalidInput(
-                            "old_string must be non-empty and different from new_string".to_string()
+                            "old_string must be non-empty and different from new_string"
+                                .to_string(),
                         ));
                     }
                     input_bytes = input_bytes
@@ -3963,17 +3973,18 @@ fn apply_patch_tool(
                             .get("replace_all")
                             .and_then(serde_json::Value::as_bool)
                             .unwrap_or(false);
-                        let outcome = replace_text(&content, old, new, replace_all).map_err(|error| {
-                            match error {
+                        let outcome = replace_text(&content, old, new, replace_all)
+                            .map_err(|error| match error {
                                 ReplaceError::NotFound => {
                                     ToolError::Failed(not_found_message(&target, &content, old))
                                 }
-                                ReplaceError::Ambiguous(count) => ToolError::InvalidInput(format!(
-                                    "old_string occurs {count} times in {}; set replace_all=true only if every occurrence is intended",
-                                    target.display()
-                                )),
-                            }
-                        })?;
+                                ReplaceError::Ambiguous(count) => ToolError::InvalidInput(
+                                    format!(
+                                        "old_string occurs {count} times in {}; set replace_all=true only if every occurrence is intended",
+                                        target.display()
+                                    ),
+                                ),
+                            })?;
                         replacements += outcome.replacements;
                         if let Some(updated) = outcome.updated {
                             content = updated;
@@ -7641,7 +7652,9 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             serde_json::json!(["a", "a"]),
         ] {
             assert!(
-                registry.execute("read_files", &serde_json::json!({"paths": paths})).is_err()
+                registry
+                    .execute("read_files", &serde_json::json!({"paths": paths}))
+                    .is_err()
             );
         }
     }
@@ -7735,8 +7748,14 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             )
             .expect("patch call");
         assert_eq!(result["changed_files"], 2);
-        assert_eq!(std::fs::read_to_string(root.join("a.rs")).expect("a"), "pub fn new_a() {}\n");
-        assert_eq!(std::fs::read_to_string(root.join("b.rs")).expect("b"), "fn new_b() {}\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.rs")).expect("a"),
+            "pub fn new_a() {}\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("b.rs")).expect("b"),
+            "fn new_b() {}\n"
+        );
         assert_eq!(result["files"][0]["replacements"], 2);
     }
 
@@ -7779,16 +7798,21 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
                 {"path": "src.rs", "edits": [{"old_string": "value", "new_string": "one"}]},
                 {"path": "src.rs", "edits": [{"old_string": "value", "new_string": "two"}]}
             ]}),
-        ).expect_err("duplicate targets reject the complete patch request");
+        )
+        .expect_err("duplicate targets reject the complete patch request");
         assert!(duplicate.to_string().contains("duplicate target"));
-        assert_eq!(std::fs::read_to_string(root.join("src.rs")).expect("unchanged"), "value");
+        assert_eq!(
+            std::fs::read_to_string(root.join("src.rs")).expect("unchanged"),
+            "value"
+        );
 
         let empty = registry.execute(
             "apply_patch",
             &serde_json::json!({"changes": [
                 {"path": "src.rs", "edits": [{"old_string": "", "new_string": "x"}]}
             ]}),
-        ).expect("per-file errors are reported");
+        )
+        .expect("per-file errors are reported");
         assert!(empty["files"][0]["error"].as_str().is_some());
         assert_eq!(std::fs::read_to_string(root.join("src.rs")).expect("unchanged"), "value");
     }
@@ -7989,7 +8013,16 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         let built = build(&confined(&root));
         let registry = built.agent.registry().expect("registry");
 
-        for name in ["glob", "grep", "read_file", "read_files", "write_file", "edit_file", "apply_patch", "list_dir"] {
+        for name in [
+            "glob",
+            "grep",
+            "read_file",
+            "read_files",
+            "write_file",
+            "edit_file",
+            "apply_patch",
+            "list_dir",
+        ] {
             let tool = registry.get(name).unwrap_or_else(|| panic!("{name} is registered"));
             let schema = tool.json_schema();
             assert_eq!(schema["additionalProperties"], false, "{name}");
