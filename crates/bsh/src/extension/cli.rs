@@ -550,7 +550,11 @@ fn command_install(args: &[String], root: Option<PathBuf>) -> Result<i32, String
     if let Err(error) = resolver::resolve(&available, &roots) {
         return Err(format!("dependencies do not resolve: {error}"));
     }
-    let package = sources::install_fetched(&store, &fetched).map_err(|error| error.to_string())?;
+    let manager = crate::extension::framework::manager_for(store.root().to_path_buf(), None)
+        .map_err(|error| error.to_string())?;
+    let package = manager
+        .install_package(&fetched.root, fetched.origin.clone())
+        .map_err(|error| error.to_string())?;
     println!("installed {} {}", package.id(), package.version());
     println!("source:  {}", fetched.origin.label());
     println!("hash:    {}", package.hash);
@@ -1865,8 +1869,11 @@ fn command_reproduce(args: &[String], root: Option<PathBuf>) -> Result<i32, Stri
                 sources::resolve(path, &store.cache_root()).map_err(|error| error.to_string())?
             }
         };
-        let package =
-            sources::install_fetched(&store, &fetched).map_err(|error| error.to_string())?;
+        let manager = crate::extension::framework::manager_for(store.root().to_path_buf(), None)
+            .map_err(|error| error.to_string())?;
+        let package = manager
+            .install_package(&fetched.root, fetched.origin.clone())
+            .map_err(|error| error.to_string())?;
         if package.id() != &id || package.version() != locked.version {
             return Err(format!(
                 "lock expected {} {} but the source provided {} {}",

@@ -5,8 +5,9 @@ loading are live. BSH imports core primitives and standard runtimes directly;
 the Phase-1 composable/runtime/core re-export modules are deleted (only the
 terminal/hooks adapters and the `topics` convenience alias remain). Phase 3 host
 wiring is partial: BSH has a `BosHostSpec` adapter and `framework_manager()`, and
-`statuses()` now merges packages the neutral manager sees with the host's loaded
-set (invalid manifests are listed with an error). ExtensionHost still owns
+`statuses()` merges packages the neutral manager sees with the host's loaded set
+(invalid manifests are listed with an error), and `bsh ext install` writes
+through `ExtensionManager::install_package`. ExtensionHost still owns
 activation. bos-ext-core exposes HostSpec, the Host bundle and an
 ExtensionManager with open/install/plan/apply/reload.
 

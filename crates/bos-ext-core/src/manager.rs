@@ -102,6 +102,15 @@ impl ExtensionManager {
         Ok(installed)
     }
 
+    /// Install one package tree with its source label.
+    pub fn install_package(
+        &self,
+        source: &Path,
+        origin: crate::types::ExtensionSource,
+    ) -> Result<crate::package::Package, ExtError> {
+        self.store.install_with(source, origin).map_err(package_error)
+    }
+
     /// Install one local package tree and return its identity.
     pub fn install(&self, source: &Path) -> Result<InstalledExtension, ExtError> {
         let package = self.store.install(source).map_err(package_error)?;
