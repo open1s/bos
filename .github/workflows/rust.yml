@@ -74,6 +74,9 @@ jobs:
           cargo build -p bsh --bin bsh
           BSH_BIN=./target/debug/bsh bash scripts/ci/verify-bsh-examples.sh
 
+      - name: Extension gold standard
+        run: GOLD_STANDARD_RELEASE=1 bash scripts/ci/check-extension-gold-standard.sh
+
   windows:
     name: Windows extension tests
     runs-on: windows-latest

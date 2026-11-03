@@ -199,9 +199,9 @@ The framework ships a conformance suite that runs in CI:
 Current status: **met**. The conformance script runs the 231-test extension
 suite (64 composition tests, eight release budgets), all-in-one and Cordis
 packages install through the host, negative/failure cases are denied and
-audited, and the self-hosting gate installs first-party inspector and
-diagnostics packages; the release benchmarks run automatically when CI=1 or
-GOLD_STANDARD_RELEASE=1.
+audited, and the self-hosting gate installs first-party packages; the release benchmarks
+run automatically when GOLD_STANDARD_RELEASE=1 or CI=true, and rust.yml runs
+the whole script as a required step.
 
 ### G10 -- Governance
 
@@ -212,8 +212,9 @@ GOLD_STANDARD_RELEASE=1.
 - a first-party feature that is not a package is a release blocker;
 - exceptions name the owner, the reason, and the removal date.
 
-Current status: **met** (the rule is recorded); enforcement is manual until G9
-adds a CI check.
+Current status: **met**. The rule is recorded in AGENTS.md and the conformance
+script is a required `.github/workflows/rust.yml` step, so a first-party feature
+that is not a package or a missing gate fails CI.
 
 ## 3. Scorecard
 

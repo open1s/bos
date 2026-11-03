@@ -31,7 +31,7 @@ echo "==> Cordis runtime coverage"
 cargo test -p bsh --lib extension::runtime::cordis -- --nocapture
 cargo test -p bsh --lib extension::e2e::the_cordis_example -- --nocapture
 
-if [[ "${GOLD_STANDARD_RELEASE:-${CI:-0}}" == "1" ]]; then
+if [[ "${GOLD_STANDARD_RELEASE:-${CI:-0}}" == "1" || "${GOLD_STANDARD_RELEASE:-${CI:-0}}" == "true" ]]; then
   echo "==> release budgets"
   bash scripts/ci/bench-extension.sh
 fi
