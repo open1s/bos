@@ -883,6 +883,8 @@ pub(crate) struct Shell {
     pub(crate) extension_market_installing: Option<String>,
     /// Editable Git URL for the extension market.
     pub(crate) extension_market_url_input: Entity<InputState>,
+    /// The name/id/description filter on the Extensions pane's Market tab.
+    pub(crate) extension_market_search: Entity<InputState>,
     /// The settings dialog's text fields.
     pub(crate) settings_inputs: SettingsInputs,
     /// The Vault pane's text fields.
@@ -1270,6 +1272,9 @@ impl Shell {
                 input.set_value(current_market_url, window, cx);
             });
         }
+        let extension_market_search = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "settings.marketSearch"))
+        });
         let skill_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "settings.skillsSearch"))
         });
@@ -1475,6 +1480,21 @@ impl Shell {
             ),
             cx.subscribe_in(
                 &extension_search,
+                window,
+                |_this: &mut Shell,
+                 _state: &Entity<InputState>,
+                 event: &InputEvent,
+                 _window: &mut Window,
+                 cx: &mut Context<Shell>| {
+                    if matches!(event, InputEvent::Change) {
+                        cx.notify();
+                    }
+                },
+            ),
+            // The Market tab reads its field's value while it renders, so a
+            // keystroke only has to schedule the frame that reads it.
+            cx.subscribe_in(
+                &extension_market_search,
                 window,
                 |_this: &mut Shell,
                  _state: &Entity<InputState>,
@@ -1801,6 +1821,7 @@ impl Shell {
             extension_market_fetching: false,
             extension_market_installing: None,
             extension_market_url_input,
+            extension_market_search,
             settings_inputs,
             vault_inputs,
             vault_revealed: None,

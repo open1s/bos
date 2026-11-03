@@ -130,8 +130,8 @@ impl Tool for PlanTool {
          skip it for trivial single-step tasks. Add one item per concrete step \
          before you start. Pass `items` as the COMPLETE list of steps — each \
          `{text, status}` with status `pending`, `in_progress`, or `completed` — \
-         every call overwrites the previous plan. While work remains, keep \
-         exactly one item `in_progress`. Mark each item `completed` as soon as it \
+         every call overwrites the previous plan. While work remains, keep at \
+         most one item `in_progress`. Mark each item `completed` as soon as it \
          is done, and pass an empty list when the plan no longer applies."
             .to_string()
     }
@@ -177,7 +177,15 @@ impl Tool for PlanTool {
         let parsed: UpdatePlanInput = serde_json::from_value(input.clone())
             .map_err(|e| ToolError::Failed(format!("invalid update_plan input: {e}")))?;
 
-        if parsed.items.len() > MAX_ITEMS {
+        // The cap applies to the steps that will be STORED: blank entries are
+        // dropped by PlanStore::replace, so counting them here refused a plan
+        // of 100 real steps plus one blank line.
+        let stored = parsed
+            .items
+            .iter()
+            .filter(|item| !item.text.trim().is_empty())
+            .count();
+        if stored > MAX_ITEMS {
             return Err(ToolError::InvalidInput(format!(
                 "items must contain at most {MAX_ITEMS} steps"
             )));
@@ -192,15 +200,19 @@ impl Tool for PlanTool {
                 )));
             }
         }
-        let active = parsed.items.iter().filter(|item| {
-            !item.text.trim().is_empty() && item.status == PlanStatus::InProgress
-        }).count();
-        let remaining = parsed.items.iter().filter(|item| {
-            !item.text.trim().is_empty() && item.status != PlanStatus::Completed
-        }).count();
-        if (remaining > 0 && active != 1) || active > 1 {
+        // At most one step is the one being worked on. Zero is valid: a plan
+        // recorded before the first step starts ("add one item per concrete
+        // step before you start") has nothing in progress yet, and refusing
+        // that call cost the model a round trip to learn a rule the schema
+        // could not state.
+        let active = parsed
+            .items
+            .iter()
+            .filter(|item| !item.text.trim().is_empty() && item.status == PlanStatus::InProgress)
+            .count();
+        if active > 1 {
             return Err(ToolError::InvalidInput(
-                "a plan with unfinished work must have exactly one in_progress step".to_string()
+                "a plan may keep at most one step in_progress; mark the others pending".to_string(),
             ));
         }
 
@@ -295,17 +307,25 @@ mod tests {
         let items = tool.store().items();
         assert_eq!(items.len(), 2);
         assert!(items.iter().all(|item| !item.text.trim().is_empty()));
-        assert_eq!(items.iter().filter(|item| item.status == PlanStatus::InProgress).count(), 1);
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| item.status == PlanStatus::InProgress)
+                .count(),
+            1
+        );
     }
 
     #[test]
     fn oversized_plan_is_rejected_without_truncation() {
         let tool = tool();
         let items: Vec<Value> = (0..MAX_ITEMS + 1)
-            .map(|i| serde_json::json!({
-                "text": format!("step {i}"),
-                "status": if i == 0 { "in_progress" } else { "pending" }
-            }))
+            .map(|i| {
+                serde_json::json!({
+                    "text": format!("step {i}"),
+                    "status": if i == 0 { "in_progress" } else { "pending" }
+                })
+            })
             .collect();
         assert!(tool.run(&serde_json::json!({"items": items})).is_err());
         assert!(tool.store().items().is_empty());
@@ -315,32 +335,68 @@ mod tests {
     fn oversized_step_text_is_rejected_without_truncation() {
         let tool = tool();
         let long = "x".repeat(MAX_TEXT + 1);
-        assert!(tool.run(&serde_json::json!({
-            "items": [{"text": long, "status": "in_progress"}]
-        })).is_err());
+        assert!(tool
+            .run(&serde_json::json!({
+                "items": [{"text": long, "status": "in_progress"}]
+            }))
+            .is_err());
         assert!(tool.store().items().is_empty());
     }
 
+    /// A plan recorded before the first step starts has nothing in progress;
+    /// two steps in progress would give the panel two focuses.
     #[test]
-    fn unfinished_plan_requires_one_active_step() {
+    fn a_recorded_plan_may_have_no_active_step_but_never_two() {
         let tool = tool();
         let no_active = serde_json::json!({"items": [{"text": "a", "status": "pending"}]});
-        assert!(tool.run(&no_active).is_err());
+        tool.run(&no_active)
+            .expect("a plan recorded before it starts is valid");
+        assert_eq!(tool.store().items().len(), 1);
+
         let two_active = serde_json::json!({"items": [
             {"text": "a", "status": "in_progress"},
             {"text": "b", "status": "in_progress"}
         ]});
         assert!(tool.run(&two_active).is_err());
-        assert!(tool.store().items().is_empty());
+        assert_eq!(
+            tool.store().items().len(),
+            1,
+            "the rejected call left the stored plan untouched"
+        );
     }
+
+    /// Blank steps are dropped by the store, so they must not consume one of
+    /// the 100 slots a real step may use.
     #[test]
-    fn item_text_is_trimmed_and_truncated() {
+    fn blank_steps_do_not_consume_the_step_cap() {
         let tool = tool();
-        let long = "x".repeat(MAX_TEXT + 40);
-        tool.run(&serde_json::json!({"items": [{"text": format!("  {long}  ")}]}))
-            .expect("run");
+        let mut items: Vec<Value> = (0..MAX_ITEMS)
+            .map(|i| serde_json::json!({"text": format!("step {i}"), "status": "pending"}))
+            .collect();
+        items.push(serde_json::json!({"text": "   ", "status": "pending"}));
+        tool.run(&serde_json::json!({ "items": items }))
+            .expect("a blank step rides along without taking a slot");
+        assert_eq!(tool.store().items().len(), MAX_ITEMS);
+    }
+    /// Text is trimmed before it is stored, and the length bound is measured
+    /// after trimming: surrounding whitespace neither survives nor counts
+    /// against the 500-character budget.
+    ///
+    /// This test used to pin truncation of an oversized step. The tool now
+    /// refuses one instead (see `oversized_step_text_is_rejected_without_truncation`),
+    /// because silently shortening the model's own step text made the stored
+    /// plan disagree with what the model believed it had recorded.
+    #[test]
+    fn item_text_is_trimmed_before_it_is_stored() {
+        let tool = tool();
+        let padded = format!("  {}  ", "x".repeat(MAX_TEXT));
+        tool.run(&serde_json::json!({
+            "items": [{"text": padded, "status": "in_progress"}]
+        }))
+        .expect("a step at the bound, once trimmed, is accepted");
         let items = tool.store().items();
-        assert_eq!(items[0].text.len(), MAX_TEXT);
+        assert_eq!(items[0].text, "x".repeat(MAX_TEXT));
+        assert_eq!(items[0].text.chars().count(), MAX_TEXT);
     }
 
     /// The description carries the reference todo guidance, with BSH's tool
@@ -352,7 +408,7 @@ mod tests {
         assert!(description.starts_with(
             "Record and update a task list to plan multi-step work and show progress; skip it for trivial single-step tasks. Add one item per concrete step before you start."
         ));
-        assert!(description.contains("While work remains, keep exactly one item `in_progress`"));
+        assert!(description.contains("While work remains, keep at most one item `in_progress`"));
         assert!(description.contains("Mark each item `completed` as soon as it is done"));
         assert!(description.contains("Pass `items` as the COMPLETE list of steps"));
         assert!(!description.contains("todo_write"));

@@ -30032,6 +30032,132 @@ fn the_extensions_pane_keeps_mcp_and_skills(cx: &mut TestAppContext) {
         "the Installed tab returns to the extension inventory"
     );
 }
+
+/// Type into the Market search the way a keystroke does.
+///
+/// The kit's `set_value` suppresses `InputEvent::Change`, so the field is loaded
+/// and the event a real key fires is emitted, which is what schedules the frame
+/// that re-reads the filter.
+fn set_market_query(shell: &Entity<Shell>, cx: &mut VisualTestContext, text: &str) {
+    let shell = shell.clone();
+    let text = text.to_string();
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.extension_market_search
+                .clone()
+                .update(cx, |state, cx| {
+                    state.set_value(text.clone(), window, cx);
+                    cx.emit(gpui_kit::component::input::InputEvent::Change);
+                });
+            cx.notify();
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+}
+
+/// The Market tab's own field narrows the provider's list, by name, id and
+/// description, and says which empty state the reader is looking at.
+#[gpui::test]
+fn the_market_search_narrows_the_git_provider(cx: &mut TestAppContext) {
+    use super::settings::section_index;
+    use crate::extension::market::MarketEntry;
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = AppState::with_store(scratch_store("extension-market-search"));
+        let section = section_index("extensions").expect("the extensions index");
+        let shell = cx.new(|cx| {
+            let mut shell = Shell::build_for_test(window, Some(section), state, cx);
+            shell.extensions_tab = 4;
+            // A seeded cache, not a clone: the pane reads the provider only
+            // when it holds nothing, so this keeps the test off the network.
+            shell.extension_market = Some(vec![
+                MarketEntry {
+                    id: "com.example.hello".to_string(),
+                    name: "Hello".to_string(),
+                    version: "1.0.0".to_string(),
+                    description: "A minimal declarative BSH extension".to_string(),
+                    path: "hello".to_string(),
+                    hash: None,
+                },
+                MarketEntry {
+                    id: "com.example.computer-use".to_string(),
+                    name: "Computer Use".to_string(),
+                    version: "1.0.0".to_string(),
+                    description: "Real macOS screen tools".to_string(),
+                    path: "computer-use".to_string(),
+                    hash: None,
+                },
+            ]);
+            shell
+        });
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("extension-market-search").is_some(),
+        "the Market tab draws its search field"
+    );
+    assert!(
+        cx.debug_bounds("extension-market-com.example.hello")
+            .is_some()
+            && cx
+                .debug_bounds("extension-market-com.example.computer-use")
+                .is_some(),
+        "an empty query keeps every entry"
+    );
+
+    // The NAME matches only the first row.
+    set_market_query(&shell, cx, "hello");
+    assert!(
+        cx.debug_bounds("extension-market-com.example.hello")
+            .is_some(),
+        "the name narrows the list to Hello"
+    );
+    assert!(
+        cx.debug_bounds("extension-market-com.example.computer-use")
+            .is_none(),
+        "and drops the row it does not name"
+    );
+
+    // The DESCRIPTION matches only the second row.
+    set_market_query(&shell, cx, "screen");
+    assert!(
+        cx.debug_bounds("extension-market-com.example.computer-use")
+            .is_some(),
+        "the description narrows the list to Computer Use"
+    );
+    assert!(
+        cx.debug_bounds("extension-market-com.example.hello")
+            .is_none(),
+        "the name is no longer considered"
+    );
+
+    // A query that matches nothing says so, rather than reusing the empty
+    // provider's wording.
+    set_market_query(&shell, cx, "zzz");
+    assert!(
+        cx.debug_bounds("extension-market-empty-settings.marketNoMatches")
+            .is_some(),
+        "an unmatched search draws the no-matches line"
+    );
+    assert!(
+        cx.debug_bounds("extension-market-empty-settings.marketGitEmpty")
+            .is_none(),
+        "and not the empty-provider line"
+    );
+
+    // Clearing the field restores the whole list.
+    set_market_query(&shell, cx, "");
+    assert!(
+        cx.debug_bounds("extension-market-com.example.hello")
+            .is_some()
+            && cx
+                .debug_bounds("extension-market-com.example.computer-use")
+                .is_some(),
+        "clearing the query restores every entry"
+    );
+}
 /// The plugins header opens the extension panel host.
 #[gpui::test]
 fn the_plugins_header_opens_the_extension_panels(cx: &mut TestAppContext) {

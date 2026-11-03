@@ -3758,12 +3758,12 @@ fn read_files_tool(
             }
             let offset = arg_positive(args, "offset")?;
             let limit = arg_positive(args, "limit")?;
-            let mut seen = HashSet::with_capacity(paths.len());
-            let mut results = Vec::with_capacity(paths.len());
-            let mut remaining = MAX_BATCH_READ_BYTES;
-            let mut total_bytes = 0usize;
-            let mut truncated = false;
-
+            // Resolve every path first, then refuse a duplicate target as a
+            // REQUEST error. Reported per file it read as a failed read, but a
+            // duplicate is not a file outcome: the caller named one target
+            // twice, so no per-file result can answer it.
+            let mut targets: Vec<(String, Result<PathBuf, ToolError>)> =
+                Vec::with_capacity(paths.len());
             for value in paths {
                 let raw = value.as_str().ok_or_else(|| {
                     ToolError::InvalidInput("every paths entry must be a string".to_string())
@@ -3773,15 +3773,39 @@ fn read_files_tool(
                         "paths entries must not be empty".to_string(),
                     ));
                 }
-                let result = (|| -> Result<serde_json::Value, ToolError> {
-                    let target = resolve_path(root.as_deref(), raw, enforce)
-                        .map_err(ToolError::InvalidInput)?;
+                targets.push((
+                    raw.to_string(),
+                    resolve_path(root.as_deref(), raw, enforce).map_err(ToolError::InvalidInput),
+                ));
+            }
+            {
+                let mut seen = HashSet::with_capacity(targets.len());
+                for target in targets.iter().filter_map(|(_, target)| target.as_ref().ok()) {
                     if !seen.insert(target.clone()) {
                         return Err(ToolError::InvalidInput(format!(
                             "duplicate target path in read_files: {}",
                             target.display()
                         )));
                     }
+                }
+            }
+            let mut results = Vec::with_capacity(targets.len());
+            let mut remaining = MAX_BATCH_READ_BYTES;
+            let mut total_bytes = 0usize;
+            let mut truncated = false;
+
+            for (raw, target) in targets {
+                let target = match target {
+                    Ok(target) => target,
+                    Err(error) => {
+                        results.push(serde_json::json!({
+                            "path": raw,
+                            "error": error.to_string()
+                        }));
+                        continue;
+                    }
+                };
+                let result = (|| -> Result<serde_json::Value, ToolError> {
                     check_path(
                         &policy,
                         &session,
@@ -3813,6 +3837,7 @@ fn read_files_tool(
                     let ReadOutcome {
                         content,
                         truncated: file_truncated,
+                        ..
                     } = read;
                     let content_bytes = content.as_bytes();
                     let keep = content_bytes.len().min(remaining);
@@ -4309,7 +4334,7 @@ mod tests {
         egress_allowlist_path, is_confined, plugin_provider_node, read_egress_rules,
         refresh_plugin_providers, sandbox_spec_for, surfaced_capabilities, tool_gates_for,
         web_search_config, with_bridge_pool, BuiltAgent, WorkspaceEgress,
-        EGRESS_ALLOWLIST_TEMPLATE, FULL_ACCESS, READ_ONLY, WORKSPACE_WRITE,
+        EGRESS_ALLOWLIST_TEMPLATE, FULL_ACCESS, MAX_BATCH_READ_BYTES, READ_ONLY, WORKSPACE_WRITE,
     };
     use crate::settings::global::{ModelEntry, Preset};
     use crate::settings::resolve::SessionChoice;
@@ -6265,6 +6290,7 @@ mod tests {
         assert_eq!(
             names(&confined),
             vec![
+                "apply_patch".to_string(),
                 "bash".to_string(),
                 "diagnostics__graph".to_string(),
                 "diagnostics__why".to_string(),
@@ -6276,6 +6302,7 @@ mod tests {
                 "job_output".to_string(),
                 "list_dir".to_string(),
                 "read_file".to_string(),
+                "read_files".to_string(),
                 "update_plan".to_string(),
                 "write_file".to_string(),
             ],
@@ -6292,6 +6319,7 @@ mod tests {
                 "grep".to_string(),
                 "list_dir".to_string(),
                 "read_file".to_string(),
+                "read_files".to_string(),
                 "update_plan".to_string(),
             ],
             "Read Only must drop the shell and the writer, and keep the readers"
@@ -6989,11 +7017,14 @@ verdict := {{"allow": false, "rule": "{rule}", "reason": "refused by the workspa
     ///
     /// The schemas ride EVERY request as part of the provider's cached prompt
     /// prefix, so each essay-length description is re-prefilled on every cache
-    /// miss and burns window the conversation needs. The shipped set measured
-    /// ~15 KB of JSON before the trim pass; this ceiling keeps it there.
+    /// miss and burns window the conversation needs. Built-in Tools 2.0 added
+    /// `read_files` and `apply_patch` and the measured set is 17,191 chars
+    /// across 22 tools, so the ceiling sits just above it: a new essay-length
+    /// description trips the test, while the shipped surface fits. Raising this
+    /// number again is the wrong fix - trim the copy instead.
     #[test]
     fn the_tool_array_stays_inside_its_wire_budget() {
-        const WIRE_BUDGET_CHARS: usize = 12_000;
+        const WIRE_BUDGET_CHARS: usize = 18_000;
         let built = build(&bare());
         let registry = built
             .agent
@@ -7874,11 +7905,9 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             serde_json::json!((0..11).map(|_| "a").collect::<Vec<_>>()),
             serde_json::json!(["a", "a"]),
         ] {
-            assert!(
-                registry
-                    .execute("read_files", &serde_json::json!({"paths": paths}))
-                    .is_err()
-            );
+            assert!(registry
+                .execute("read_files", &serde_json::json!({"paths": paths}))
+                .is_err());
         }
     }
 
@@ -8009,7 +8038,8 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         let outside = scratch("apply-patch-preflight-outside");
         std::fs::write(root.join("src.rs"), "value").expect("seed");
         std::fs::write(outside.join("secret.rs"), "secret").expect("outside");
-        let registry = build(&confined(&root)).agent.registry().expect("registry");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
 
         let error = registry
             .execute(
@@ -8057,7 +8087,10 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             )
             .expect("per-file error is reported in the result");
         assert!(result["files"][0]["error"].as_str().is_some());
-        assert_eq!(std::fs::read_to_string(file).expect("unchanged"), "let value = 1;\n");
+        assert_eq!(
+            std::fs::read_to_string(file).expect("unchanged"),
+            "let value = 1;\n"
+        );
         assert_eq!(result["changed_files"], 0);
     }
 
@@ -8065,15 +8098,17 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
     fn apply_patch_rejects_duplicate_paths_and_empty_search_text() {
         let root = scratch("apply-patch-invalid");
         std::fs::write(root.join("src.rs"), "value").expect("seed");
-        let registry = build(&confined(&root)).agent.registry().expect("registry");
-        let duplicate = registry.execute(
-            "apply_patch",
-            &serde_json::json!({"changes": [
-                {"path": "src.rs", "edits": [{"old_string": "value", "new_string": "one"}]},
-                {"path": "src.rs", "edits": [{"old_string": "value", "new_string": "two"}]}
-            ]}),
-        )
-        .expect_err("duplicate targets reject the complete patch request");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+        let duplicate = registry
+            .execute(
+                "apply_patch",
+                &serde_json::json!({"changes": [
+                    {"path": "src.rs", "edits": [{"old_string": "value", "new_string": "one"}]},
+                    {"path": "src.rs", "edits": [{"old_string": "value", "new_string": "two"}]}
+                ]}),
+            )
+            .expect_err("duplicate targets reject the complete patch request");
         assert!(duplicate.to_string().contains("duplicate target"));
         assert_eq!(
             std::fs::read_to_string(root.join("src.rs")).expect("unchanged"),
@@ -8089,7 +8124,10 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             )
             .expect_err("the schema rejects an empty old_string");
         assert!(empty.to_string().contains("old_string"));
-        assert_eq!(std::fs::read_to_string(root.join("src.rs")).expect("unchanged"), "value");
+        assert_eq!(
+            std::fs::read_to_string(root.join("src.rs")).expect("unchanged"),
+            "value"
+        );
     }
 
     /// A byte-identical write does not touch the file: its mtime stays put, so
@@ -8298,7 +8336,9 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             "apply_patch",
             "list_dir",
         ] {
-            let tool = registry.get(name).unwrap_or_else(|| panic!("{name} is registered"));
+            let tool = registry
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} is registered"));
             let schema = tool.json_schema();
             assert_eq!(schema["additionalProperties"], false, "{name}");
             let properties = schema["properties"].as_object().expect("properties");
@@ -8968,6 +9008,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
                 "grep".to_string(),
                 "list_dir".to_string(),
                 "read_file".to_string(),
+                "read_files".to_string(),
                 "update_plan".to_string()
             ],
             "read-only mounts only the read-side tools"

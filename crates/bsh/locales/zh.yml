@@ -613,6 +613,7 @@
 "settings.marketSourceHint": "来自 Git 仓库的扩展"
 "settings.marketGitHint": "来自 github.com/open1s/bsh_extensions 的扩展"
 "settings.marketGitEmpty": "缓存市场中没有扩展。刷新以克隆提供方。"
+"settings.marketNoMatches": "没有匹配此搜索的扩展。"
 "settings.marketLoading": "正在刷新市场..."
 "settings.extensionInstall": "安装"
 "settings.marketInstalling": "正在安装…"

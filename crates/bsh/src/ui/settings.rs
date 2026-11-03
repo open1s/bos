@@ -1281,6 +1281,28 @@ impl Shell {
                                         })
                                         .child(icon(IconName::Info, 12.0, theme::faint())),
                                 )
+                            })
+                            // The Market tab's filter sits in the row the pane
+                            // leaves empty beside its subtitle: the hint names the
+                            // Git provider, and the field narrows the entries that
+                            // provider lists, so it costs no extra row above the
+                            // install controls.
+                            .when(section == 17 && self.extensions_tab == 4, |row| {
+                                row.child(div().flex_1().min_w_0()).child(
+                                    div()
+                                        .debug_selector(|| "extension-market-search".to_string())
+                                        .w(px(240.0))
+                                        .px(px(8.0))
+                                        .py(px(4.0))
+                                        .rounded(px(6.0))
+                                        .bg(rgb(theme::new_session_fill()))
+                                        .border_1()
+                                        .border_color(rgb(theme::border_soft()))
+                                        .child(
+                                            Input::new(&self.extension_market_search)
+                                                .appearance(false),
+                                        ),
+                                )
                             }),
                     )
                     .children(content),
@@ -6744,6 +6766,7 @@ impl Shell {
     fn extension_market_rows(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         self.load_extension_market();
         let lang = self.state.lang;
+        let query = self.extension_market_search.read(cx).value().to_string();
         let statuses = self.extension_statuses.clone().unwrap_or_default();
         let mut rows = Vec::new();
         let refresh = div()
@@ -6810,10 +6833,33 @@ impl Shell {
                     .into_any_element(),
             );
         }
-        let entries = self.extension_market.clone().unwrap_or_default();
+        // The field narrows the provider's own list by the three facts a row
+        // shows - id, name and description - and an empty query keeps every
+        // entry.
+        let entries: Vec<_> = self
+            .extension_market
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|entry| {
+                crate::state::matches(&query, &entry.name)
+                    || crate::state::matches(&query, &entry.id)
+                    || crate::state::matches(&query, &entry.description)
+            })
+            .collect();
         if entries.is_empty() && !self.extension_market_fetching {
+            // A search that matches nothing is not the same fact as a provider
+            // that advertised nothing, so the two states keep their own wording.
+            let key = if query.trim().is_empty() {
+                "settings.marketGitEmpty"
+            } else {
+                "settings.marketNoMatches"
+            };
             rows.push(
-                txt(tr(lang, "settings.marketGitEmpty"), 12.0, theme::muted()).into_any_element(),
+                div()
+                    .debug_selector(move || format!("extension-market-empty-{key}"))
+                    .child(txt(tr(lang, key), 12.0, theme::muted()))
+                    .into_any_element(),
             );
         }
         for entry in entries {

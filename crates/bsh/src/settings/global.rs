@@ -1457,8 +1457,9 @@ fn preset_deny_paths() -> Vec<String> {
 ///   file exists the same inheritance is constrained by it, and a preset can
 ///   never widen that floor. `creator` is the same.
 /// - `read-only` keeps only the read-side tools (`glob`, `grep`, `read_file`,
-///   `list_dir`), `update_plan` and the two goal tools - none of which opens a
-///   socket - so it declares `egress = []`, which DENIES ALL local egress. A
+///   `read_files`, `list_dir`), `update_plan` and the two goal tools - none of
+///   which opens a socket - so it declares `egress = []`, which DENIES ALL
+///   local egress. A
 ///   read of the workspace needs no network, and the derived proxy set is
 ///   empty, so the kernel denies outbound traffic with no proxy running.
 ///
@@ -1537,6 +1538,7 @@ pub(crate) fn built_in_preset(id: &str) -> Option<Preset> {
                 "glob".to_string(),
                 "grep".to_string(),
                 "read_file".to_string(),
+                "read_files".to_string(),
                 "list_dir".to_string(),
                 "update_goal".to_string(),
                 "update_plan".to_string(),

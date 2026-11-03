@@ -618,6 +618,7 @@
 "settings.marketSourceHint": "Extensions from a Git repository"
 "settings.marketGitHint": "Extensions from github.com/open1s/bsh_extensions"
 "settings.marketGitEmpty": "No extensions in the cached market. Refresh to clone the provider."
+"settings.marketNoMatches": "No extensions match this search."
 "settings.marketLoading": "Refreshing the market..."
 "settings.extensionInstall": "Install"
 "settings.marketInstalling": "Installing…"
