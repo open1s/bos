@@ -2,7 +2,8 @@
 //!
 //! The shared identity, persona slot and workflow guidance live in
 //! [`agent::prompts`]; this module owns the guidance for the tools BSH registers
-//! itself (`glob`, `grep`, `read_file`, `write_file`, `edit_file`, `list_dir`, `web_search`), the
+//! itself (`glob`, `grep`, `read_file`, `write_file`, `edit_file`, `list_dir`,
+//! `web_search`), the
 //! standing subagent rule, the shipped preset personas, and the plan-mode
 //! directive. Every constant is pinned by a test and documented against the
 //! shipped DeepSeek Harness wording in `docs/bsh-prompts.md`.
@@ -103,9 +104,9 @@ pub(crate) const TOOL_GUIDANCE: &[(&str, &str)] = &[
     ("subagent", SUBAGENT_GUIDANCE),
 ];
 
-/// Every tool name a BSH build may register.
+/// Tool names the BSH prompt corpus may reference.
 ///
-/// Used by the stale-reference test: a prompt may only name one of these.
+/// Used by the stale-reference test to catch references to tools this shell does not expose.
 #[cfg(test)]
 pub(crate) const KNOWN_TOOLS: &[&str] = &[
     "bash",
