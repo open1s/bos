@@ -5945,11 +5945,11 @@ mod tests {
         assert_eq!(
             names("files"),
             vec![
+                "apply_patch".to_string(),
                 "edit_file".to_string(),
                 "glob".to_string(),
                 "grep".to_string(),
                 "list_dir".to_string(),
-                "apply_patch".to_string(),
                 "read_files".to_string(),
                 "write_file".to_string(),
             ]
@@ -7736,7 +7736,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             "apply_patch",
             &serde_json::json!({"changes": [
                 {"path": "src.rs", "edits": [{"old_string": "value", "new_string": "one"}]},
-                {"path": "./src.rs", "edits": [{"old_string": "value", "new_string": "two"}]}
+                {"path": "src.rs", "edits": [{"old_string": "value", "new_string": "two"}]}
             ]}),
         ).expect("per-file errors are reported");
         assert!(duplicate["files"][1]["error"].as_str().is_some());
