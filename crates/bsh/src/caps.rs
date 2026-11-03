@@ -3882,6 +3882,14 @@ fn apply_patch_tool(
                         target.display()
                     )));
                 }
+                check_path(
+                    &policy,
+                    &session,
+                    &preset,
+                    "apply_patch",
+                    Action::Write,
+                    &target,
+                )?;
 
                 let edits = change
                     .get("edits")
@@ -3931,17 +3939,8 @@ fn apply_patch_tool(
                 let raw = change
                     .get("path")
                     .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default();
+                    .expect("path was validated during preflight");
                 let result = (|| -> Result<serde_json::Value, ToolError> {
-                    check_path(
-                        &policy,
-                        &session,
-                        &preset,
-                        "apply_patch",
-                        Action::Write,
-                        &target,
-                    )?;
-
                     let edits = change
                         .get("edits")
                         .and_then(serde_json::Value::as_array)
