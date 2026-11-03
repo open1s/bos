@@ -4,7 +4,9 @@ Status: Phase 5 in progress — manifest 2.0 envelope, migration and dual-versio
 loading are live; migration preserves runtime entry, args, env, protocol,
 startup policy and event subscribe/publish contributions, migrated packages
 validate, and
-`bsh ext validate` reports `schema: 2.0` plus the generic contribution count; the independent `ferris-smoke` binary
+`bsh ext validate` reports `schema: 2.0` plus the generic contribution count,
+and `bsh ext graph` reads effects from the 2.0 generic contribution list when
+present; the independent `ferris-smoke` binary
 parses and validates a 2.0 manifest with no BSH dependency, and the SDK carries
 unit tests for its author runtime adapter. BSH imports core primitives and standard runtimes directly;
 the Phase-1 composable/runtime/core re-export modules are deleted, and the

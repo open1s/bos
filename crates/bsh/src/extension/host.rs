@@ -1873,33 +1873,46 @@ impl ExtensionHost {
                     })
                     .collect();
                 let mut effects = Vec::new();
-                for (kind, ids) in [
-                    ("tool", &manifest.contributes.tools),
-                    ("command", &manifest.contributes.commands),
-                    ("panel", &manifest.contributes.panels),
-                    ("prompt", &manifest.contributes.prompts),
-                    ("context", &manifest.contributes.contexts),
-                    ("skill", &manifest.contributes.skills),
-                    ("workflow", &manifest.contributes.workflows),
-                    ("language", &manifest.contributes.languages),
-                    ("integration", &manifest.contributes.integrations),
-                    ("model", &manifest.contributes.model_providers),
-                    ("agent", &manifest.contributes.agent_providers),
-                    ("theme", &manifest.contributes.themes),
-                    ("preset", &manifest.contributes.presets),
-                ] {
-                    for id in ids {
-                        effects.push(format!("{kind}:{id}"));
+                if let Ok(v2) = ferris_core::manifest_v2::ManifestV2::load(&entry.package.root) {
+                    for contribution in &v2.contributions {
+                        let kind = match contribution.kind.as_str() {
+                            "event.subscribe" => "event",
+                            "event.publish" => "publish",
+                            "model-provider" => "model",
+                            "agent-provider" => "agent",
+                            other => other,
+                        };
+                        effects.push(format!("{kind}:{}", contribution.id));
                     }
-                }
-                for topic in &manifest.contributes.events {
-                    effects.push(format!("event:{topic}"));
-                }
-                for topic in &manifest.contributes.publishes {
-                    effects.push(format!("publish:{topic}"));
-                }
-                for hook in &manifest.contributes.hooks {
-                    effects.push(format!("hook:{hook}"));
+                } else {
+                    for (kind, ids) in [
+                        ("tool", &manifest.contributes.tools),
+                        ("command", &manifest.contributes.commands),
+                        ("panel", &manifest.contributes.panels),
+                        ("prompt", &manifest.contributes.prompts),
+                        ("context", &manifest.contributes.contexts),
+                        ("skill", &manifest.contributes.skills),
+                        ("workflow", &manifest.contributes.workflows),
+                        ("language", &manifest.contributes.languages),
+                        ("integration", &manifest.contributes.integrations),
+                        ("model", &manifest.contributes.model_providers),
+                        ("agent", &manifest.contributes.agent_providers),
+                        ("theme", &manifest.contributes.themes),
+                        ("preset", &manifest.contributes.presets),
+                    ] {
+                        for id in ids {
+                            effects.push(format!("{kind}:{id}"));
+                        }
+                    }
+                    for topic in &manifest.contributes.events {
+                        effects.push(format!("event:{topic}"));
+                    }
+                    for topic in &manifest.contributes.publishes {
+                        effects.push(format!("publish:{topic}"));
+                    }
+                    for hook in &manifest.contributes.hooks {
+                        effects.push(format!("hook:{hook}"));
+                    }
                 }
                 for service in &manifest.services.provides {
                     effects.push(format!("service:{}", service.name));
