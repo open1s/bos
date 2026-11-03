@@ -1272,8 +1272,12 @@ impl Shell {
                 input.set_value(current_market_url, window, cx);
             });
         }
+        // Escape clears this field, the way the reference input's
+        // type="search" does; the shell only sees the Change the clear emits.
         let extension_market_search = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "settings.marketSearch"))
+            InputState::new(window, cx)
+                .placeholder(crate::i18n::tr(lang, "settings.marketSearch"))
+                .clean_on_escape()
         });
         let skill_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "settings.skillsSearch"))

@@ -30157,6 +30157,73 @@ fn the_market_search_narrows_the_git_provider(cx: &mut TestAppContext) {
                 .is_some(),
         "clearing the query restores every entry"
     );
+
+    // Escape is the field's own clear, the counterpart of the reference
+    // input's type="search": the kit owns the key and clears through the same
+    // path its clear control uses, so the list restores the same way.
+    set_market_query(&shell, cx, "hello");
+    let field = cx
+        .debug_bounds("extension-market-search")
+        .expect("the search box");
+    cx.simulate_click(field.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.simulate_keystrokes("escape");
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(
+        cx.update(|_, cx| {
+            shell
+                .read(cx)
+                .extension_market_search
+                .read(cx)
+                .value()
+                .to_string()
+        }),
+        "",
+        "Escape empties the field"
+    );
+    assert!(
+        cx.debug_bounds("extension-market-com.example.hello")
+            .is_some()
+            && cx
+                .debug_bounds("extension-market-com.example.computer-use")
+                .is_some(),
+        "and the whole list returns"
+    );
+
+    // The clear control is the mouse counterpart of Escape, so the field's own
+    // value is where the proof lies: press it and the field is empty again and
+    // the list is whole. It only draws while the field holds text, which is
+    // why the empty field above must not carry one.
+    assert!(
+        cx.debug_bounds("extension-market-clear").is_none(),
+        "an empty field carries no clear control"
+    );
+    set_market_query(&shell, cx, "computer");
+    let clear = cx
+        .debug_bounds("extension-market-clear")
+        .expect("the clear control appears with text");
+    cx.simulate_click(clear.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(
+        cx.update(|_, cx| {
+            shell
+                .read(cx)
+                .extension_market_search
+                .read(cx)
+                .value()
+                .to_string()
+        }),
+        "",
+        "the clear control empties the field"
+    );
+    assert!(
+        cx.debug_bounds("extension-market-com.example.hello")
+            .is_some()
+            && cx
+                .debug_bounds("extension-market-com.example.computer-use")
+                .is_some(),
+        "and the whole list returns"
+    );
 }
 /// The plugins header opens the extension panel host.
 #[gpui::test]

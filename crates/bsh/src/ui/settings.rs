@@ -1286,22 +1286,24 @@ impl Shell {
                             // leaves empty beside its subtitle: the hint names the
                             // Git provider, and the field narrows the entries that
                             // provider lists, so it costs no extra row above the
-                            // install controls.
+                            // install controls. It takes the row's leftover width
+                            // (the reference's `flex: 1; min-width: 120px`) and
+                            // carries a clear control while it holds text, the
+                            // counterpart of the reference input's type="search".
+                            //
+                            // The clear control is bsh's own rather than the
+                            // kit's `cleanable` one: measured in the harness, a
+                            // click inside the field never reached the kit's
+                            // suffix button - every offset targeted the input
+                            // itself - so drawing it would be a control that only
+                            // looks wired.
                             .when(section == 17 && self.extensions_tab == 4, |row| {
-                                row.child(div().flex_1().min_w_0()).child(
+                                row.child(
                                     div()
+                                        .flex_1()
+                                        .min_w(px(140.0))
                                         .debug_selector(|| "extension-market-search".to_string())
-                                        .w(px(240.0))
-                                        .px(px(8.0))
-                                        .py(px(4.0))
-                                        .rounded(px(6.0))
-                                        .bg(rgb(theme::new_session_fill()))
-                                        .border_1()
-                                        .border_color(rgb(theme::border_soft()))
-                                        .child(
-                                            Input::new(&self.extension_market_search)
-                                                .appearance(false),
-                                        ),
+                                        .child(self.extension_market_search_field(cx)),
                                 )
                             }),
                     )
@@ -8785,9 +8787,11 @@ impl Shell {
 
     /// The full-width search field every Extensions tab opens with.
     ///
-    /// One definition for the four tabs, so the list, MCP, Skills and Market
-    /// panes cannot drift into four different search boxes.
-    fn plugins_search_box(&self, input: &Entity<InputState>) -> Div {
+    /// One style for the list, MCP, Skills and Market panes, so they cannot
+    /// drift into four different search boxes. A caller that wants a clear
+    /// affordance adds it to the field it passes in, because whether a clear
+    /// control exists is the field's behaviour, not the box's look.
+    fn search_box(&self, field: impl IntoElement) -> Div {
         div()
             .w_full()
             .flex()
@@ -8799,7 +8803,64 @@ impl Shell {
             .rounded(px(10.0))
             .bg(rgb(theme::new_session_fill()))
             .child(icon(IconName::Search, 14.0, theme::faint()))
-            .child(Input::new(input).appearance(false))
+            .child(field)
+    }
+
+    fn plugins_search_box(&self, input: &Entity<InputState>) -> Div {
+        self.search_box(Input::new(input).appearance(false))
+    }
+
+    /// The Market tab's filter: the shared search box, with its clear control
+    /// drawn only while the field holds text.
+    fn extension_market_search_field(&self, cx: &mut Context<Self>) -> Div {
+        let typed = !self
+            .extension_market_search
+            .read(cx)
+            .value()
+            .trim()
+            .is_empty();
+        self.search_box(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .flex_1()
+                .min_w_0()
+                .child(Input::new(&self.extension_market_search).appearance(false))
+                .when(typed, |field| field.child(self.extension_market_clear(cx))),
+        )
+    }
+
+    /// The market filter's clear control.
+    ///
+    /// bsh draws its own instead of using the kit's `cleanable` one: measured in
+    /// the harness, a click inside the field never reached the kit's suffix
+    /// button - every offset targeted the input itself - so that control would
+    /// only look wired. This one hands focus back to the field, the way the
+    /// kit's does, so typing continues after a clear.
+    fn extension_market_clear(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        div()
+            .id("extension-market-clear")
+            .debug_selector(|| "extension-market-clear".to_string())
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(18.0))
+            .h(px(18.0))
+            .rounded(px(4.0))
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(theme::hover())))
+            .child(icon(IconName::Close, 12.0, theme::faint()))
+            .on_click(cx.listener(|this, _event, window, cx| {
+                this.extension_market_search
+                    .clone()
+                    .update(cx, |state, cx| {
+                        state.clean(window, cx);
+                        state.focus(window, cx);
+                    });
+                cx.notify();
+            }))
     }
 
     /// A section heading: 14px semibold in the tertiary colour, no rule.
