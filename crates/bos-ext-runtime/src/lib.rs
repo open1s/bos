@@ -6,6 +6,8 @@
 
 pub mod builtin;
 pub mod contract;
+pub mod hook;
+pub mod hooks;
 #[cfg(feature = "declarative")]
 pub mod declarative;
 #[cfg(feature = "process")]

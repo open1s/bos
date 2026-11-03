@@ -895,6 +895,7 @@ impl ExtensionHost {
             super::terminal::HostTerminal,
         )));
         host.terminal_token = Some(host.services.provide(Scope::Host, "terminal", terminal));
+        super::hooks::install_host_provider();
         host.register_builtins();
         host.rebuild()?;
         host.crash_history = host.store.crash_history(16);
