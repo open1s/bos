@@ -7409,6 +7409,31 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         assert_eq!(result["truncated"], false);
     }
 
+    #[test]
+    fn built_in_file_tool_schemas_are_strict_and_descriptive() {
+        let root = scratch("file-tool-schemas");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        for name in ["glob", "grep", "read_file", "write_file", "edit_file", "list_dir"] {
+            let tool = registry.get(name).unwrap_or_else(|| panic!("{name} is registered"));
+            let schema = tool.json_schema();
+            assert_eq!(schema["additionalProperties"], false, "{name}");
+            let properties = schema["properties"].as_object().expect("properties");
+            assert!(!properties.is_empty(), "{name} has parameters");
+            for (field, definition) in properties {
+                assert!(
+                    definition["description"]
+                        .as_str()
+                        .is_some_and(|description| !description.trim().is_empty()),
+                    "{name}.{field} needs a model-facing description"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The glob tool matches by path, reports workspace-relative paths, and
     /// keeps the walk's ignore/hidden policy unless asked otherwise.
     #[test]
