@@ -14,6 +14,8 @@ name: release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
   workflow_dispatch:
@@ -240,6 +242,12 @@ jobs:
         shell: bash
         env:
           BSH_LIBCXX_DIR: ${{ runner.os == 'Linux' && '/usr/lib/llvm-21/lib' || '' }}
+          # Free arm64 runners are reclaimed mid-job; a fat-LTO, one-codegen-unit
+          # link of the whole app takes 30-70 minutes there and gets killed.
+          # Thin LTO plus parallel codegen keeps that platform inside the
+          # window; every other platform keeps the workspace's own profile.
+          CARGO_PROFILE_RELEASE_LTO: ${{ matrix.platform == 'linux-arm64' && 'thin' || 'true' }}
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: ${{ matrix.platform == 'linux-arm64' && '16' || '1' }}
         run: |
           # Ghostty's Zig build lazily fetches a few packages; a reset from
           # deps.files.ghostty.org is transient, so retry and let Zig reuse
