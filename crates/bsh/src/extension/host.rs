@@ -2159,7 +2159,13 @@ impl ExtensionHost {
             }
             // The preset is a property of this build, not of the cached host:
             // the host is shared across presets, so the filter arrives here.
-            if preset_allowed.is_some_and(|allowed| !allowed.contains(entry.package.id().as_str()))
+            // Built-ins are the host's own baseline. A preset lists bundles and
+            // package ids and never names a built-in's id, so filtering them
+            // here would strip diagnostics and the extension inventory from
+            // every build whose preset names any bundle at all.
+            if entry.package.source != ExtensionSource::Builtin
+                && preset_allowed
+                    .is_some_and(|allowed| !allowed.contains(entry.package.id().as_str()))
             {
                 continue;
             }
@@ -2253,7 +2259,13 @@ impl ExtensionHost {
             if !entry.applied || entry.error.is_some() {
                 continue;
             }
-            if preset_allowed.is_some_and(|allowed| !allowed.contains(entry.package.id().as_str()))
+            // Built-ins are the host's own baseline. A preset lists bundles and
+            // package ids and never names a built-in's id, so filtering them
+            // here would strip diagnostics and the extension inventory from
+            // every build whose preset names any bundle at all.
+            if entry.package.source != ExtensionSource::Builtin
+                && preset_allowed
+                    .is_some_and(|allowed| !allowed.contains(entry.package.id().as_str()))
             {
                 continue;
             }

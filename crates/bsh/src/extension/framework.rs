@@ -470,8 +470,22 @@ mod manager_tests {
         manager.install(&source).expect("install");
         let plan = manager.plan().expect("plan");
         let applied = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // A Cordis/Extism runtime authorizes through the resolver's policy
+        // port, so the resolver needs the same ports the host gives it.
+        let policy = Arc::new(
+            ferris_sdk::capability::PolicyEngine::open(
+                temp.path().join("grants.toml"),
+                temp.path().join("audit.log"),
+                ferris_sdk::capability::PolicyMode::Enforce,
+            )
+            .expect("policy"),
+        );
         let manager = manager.with_ports(
-            Arc::new(FerrisRuntimeResolver::new(None)),
+            Arc::new(FerrisRuntimeResolver::new(None).with_ports(
+                policy,
+                ferris_sdk::events::EventBus::new(),
+                ferris_sdk::types::TrustLevel::Community,
+            )),
             Arc::new(CollectSink(Arc::clone(&applied))),
         );
         let active = manager
@@ -492,8 +506,22 @@ mod manager_tests {
         manager.install(&source).expect("install");
         let plan = manager.plan().expect("plan");
         let applied = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // A Cordis/Extism runtime authorizes through the resolver's policy
+        // port, so the resolver needs the same ports the host gives it.
+        let policy = Arc::new(
+            ferris_sdk::capability::PolicyEngine::open(
+                temp.path().join("grants.toml"),
+                temp.path().join("audit.log"),
+                ferris_sdk::capability::PolicyMode::Enforce,
+            )
+            .expect("policy"),
+        );
         let manager = manager.with_ports(
-            Arc::new(FerrisRuntimeResolver::new(None)),
+            Arc::new(FerrisRuntimeResolver::new(None).with_ports(
+                policy,
+                ferris_sdk::events::EventBus::new(),
+                ferris_sdk::types::TrustLevel::Community,
+            )),
             Arc::new(CollectSink(Arc::clone(&applied))),
         );
         let active = manager
@@ -517,8 +545,22 @@ mod manager_tests {
         manager.install(&source).expect("install");
         let plan = manager.plan().expect("plan");
         let applied = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // A Cordis/Extism runtime authorizes through the resolver's policy
+        // port, so the resolver needs the same ports the host gives it.
+        let policy = Arc::new(
+            ferris_sdk::capability::PolicyEngine::open(
+                temp.path().join("grants.toml"),
+                temp.path().join("audit.log"),
+                ferris_sdk::capability::PolicyMode::Enforce,
+            )
+            .expect("policy"),
+        );
         let manager = manager.with_ports(
-            Arc::new(FerrisRuntimeResolver::new(None)),
+            Arc::new(FerrisRuntimeResolver::new(None).with_ports(
+                policy,
+                ferris_sdk::events::EventBus::new(),
+                ferris_sdk::types::TrustLevel::Community,
+            )),
             Arc::new(CollectSink(Arc::clone(&applied))),
         );
         let active = manager
