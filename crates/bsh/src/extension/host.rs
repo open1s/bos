@@ -1774,6 +1774,20 @@ impl ExtensionHost {
         Ok(())
     }
 
+    /// Discover an on-demand MCP package's tools and declarative
+    /// contributions at agent-build time, the point at which the host
+    /// activates it. Host construction skips this discovery for such packages.
+    fn on_demand_projection(
+        &self,
+        runtime: &Arc<dyn Runtime>,
+    ) -> (Vec<ToolDescriptor>, DeclarativeContributions) {
+        let for_tools = Arc::clone(runtime);
+        let tools = super::block_on_tokio_scoped(async move { for_tools.tools().await })
+            .unwrap_or_default();
+        let contributions = runtime.declarative();
+        (tools, contributions)
+    }
+
     /// Apply every enabled extension to one agent build.
     pub(crate) fn apply(
         &self,
@@ -1795,14 +1809,20 @@ impl ExtensionHost {
             let Some(runtime) = &entry.runtime else {
                 continue;
             };
-            let contributions = &entry.contributions;
+            let on_demand = entry.package.manifest.runtime.kind == RuntimeKind::Mcp
+                && entry.package.manifest.runtime.startup == StartupPolicy::OnDemand;
+            let (tools, contributions) = if on_demand {
+                self.on_demand_projection(runtime)
+            } else {
+                (entry.tools.clone(), entry.contributions.clone())
+            };
             // A package may contribute only skills; skipping it here silently
             // dropped every skill it declared. The directory is resolved once so
             // the gate and the install cannot disagree about which form the
             // package uses: a runtime-registered skill has no manifest
             // declaration, only a materialized directory.
             let skills_dir = contributed_skills_dir(entry);
-            let has_agent_contribution = !entry.tools.is_empty()
+            let has_agent_contribution = !tools.is_empty()
                 || !contributions.commands.is_empty()
                 || !contributions.panels.is_empty()
                 || !contributions.prompts.is_empty()
@@ -1818,7 +1838,7 @@ impl ExtensionHost {
                 name: entry.package.manifest.extension.name.clone(),
                 runtime: Arc::clone(runtime),
                 trust: entry.package.trust,
-                tools: entry.tools.clone(),
+                tools: tools.clone(),
                 commands: contributions.commands.clone(),
                 panels: contributions.panels.clone(),
                 prompts: contributions.prompts.clone(),
@@ -1869,12 +1889,18 @@ impl ExtensionHost {
             let Some(runtime) = &entry.runtime else {
                 continue;
             };
-            let contributions = &entry.contributions;
+            let on_demand = entry.package.manifest.runtime.kind == RuntimeKind::Mcp
+                && entry.package.manifest.runtime.startup == StartupPolicy::OnDemand;
+            let (tools, contributions) = if on_demand {
+                self.on_demand_projection(runtime)
+            } else {
+                (entry.tools.clone(), entry.contributions.clone())
+            };
             // Same gate as the compatibility path: a package may contribute
             // only a skill, and a runtime-registered skill has no manifest
             // declaration - only the directory the runtime materialized.
             let skills_dir = contributed_skills_dir(entry);
-            let has_agent_contribution = !entry.tools.is_empty()
+            let has_agent_contribution = !tools.is_empty()
                 || !contributions.commands.is_empty()
                 || !contributions.panels.is_empty()
                 || !contributions.prompts.is_empty()
@@ -1890,7 +1916,7 @@ impl ExtensionHost {
                 name: entry.package.manifest.extension.name.clone(),
                 runtime: Arc::clone(runtime),
                 trust: entry.package.trust,
-                tools: entry.tools.clone(),
+                tools: tools.clone(),
                 commands: contributions.commands.clone(),
                 panels: contributions.panels.clone(),
                 prompts: contributions.prompts.clone(),
@@ -3783,11 +3809,13 @@ tools = ["echo"]
             .into_iter()
             .flat_map(|status| status.tools)
             .collect();
+        // mcp-echo is on-demand: its tools are discovered when an agent build
+        // activates it, not when the host scans the store (covered by the
+        // factory test an_on_demand_mcp_package_is_not_discovered_by_the_factory).
         for qualified in [
             "hello__echo",
             "process-echo__echo",
             "wasm-echo__echo",
-            "mcp-echo__echo",
             "extism-echo__echo",
         ] {
             assert!(

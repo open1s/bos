@@ -11,7 +11,7 @@ use ferris_core::capability::PolicyEngine;
 use ferris_core::events::EventBus;
 use ferris_core::manifest::Manifest;
 use ferris_core::terminal::TerminalService;
-use ferris_core::types::{ExtensionError, RuntimeKind, TrustLevel};
+use ferris_core::types::{ExtensionError, RuntimeKind, StartupPolicy, TrustLevel};
 
 use crate::declarative::{self, DeclarativeContributions};
 use crate::workflow::WorkflowRuntime;
@@ -93,8 +93,14 @@ pub fn build(
                 ports.trust,
                 Arc::clone(&ports.events),
             )?;
-            let tools = runtime.descriptors()?;
-            let contributions = runtime.contributions()?;
+            // An on-demand server is not started during host construction. Its
+            // tools and contributions are discovered when the agent build
+            // activates it, not when the store is merely scanned.
+            let (tools, contributions) = if manifest.runtime.startup == StartupPolicy::OnDemand {
+                (Vec::new(), DeclarativeContributions::default())
+            } else {
+                (runtime.descriptors()?, runtime.contributions()?)
+            };
             finish(Arc::new(runtime), tools, contributions, &ports)
         }
         RuntimeKind::WasmComponent => {
@@ -206,5 +212,37 @@ mod tests {
         let manifest = ferris_core::manifest_v2::load_package_manifest(&root).expect("manifest");
         let built = build(&manifest, &root, ports(&root)).expect("factory");
         assert!(built.tools.iter().any(|tool| tool.id.as_str() == "echo"));
+    }
+
+    #[tokio::test]
+    async fn an_on_demand_mcp_package_is_not_discovered_by_the_factory() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/extensions/mcp-echo");
+        let manifest = ferris_core::manifest_v2::load_package_manifest(&root).expect("manifest");
+        assert_eq!(manifest.runtime.startup, StartupPolicy::OnDemand);
+        let ports = ports(&root);
+        ports
+            .policy
+            .grant(
+                "com.example.mcp-echo",
+                ferris_core::capability::Capability::ProcessExecute,
+                ferris_core::capability::GrantScope::Program("python3".to_string()),
+                None,
+            )
+            .expect("grant");
+        let built = build(&manifest, &root, ports).expect("factory");
+        assert!(
+            built.tools.is_empty(),
+            "the factory must not start an on-demand MCP server"
+        );
+        let tools = built.runtime.tools().await.expect("activation discovery");
+        assert!(tools.iter().any(|tool| tool.id.as_str() == "echo"));
     }
 }

@@ -1425,6 +1425,10 @@ impl Runtime for McpRuntime {
         RuntimeKind::Mcp
     }
 
+    fn declarative(&self) -> DeclarativeContributions {
+        self.contributions().unwrap_or_default()
+    }
+
     async fn activate(&self) -> Result<(), ExtensionError> {
         // Discovery performs a process spawn, handshake and synchronous stdio
         // exchange. Running it inline on an executor worker starved the

@@ -257,6 +257,13 @@ pub trait Runtime: Send + Sync {
         None
     }
 
+    /// Declarative contributions the runtime discovered itself (contexts,
+    /// prompts, commands, panels). The factory usually supplies these; a lazy
+    /// runtime that discovers them only on activation answers here.
+    fn declarative(&self) -> crate::declarative::DeclarativeContributions {
+        crate::declarative::DeclarativeContributions::default()
+    }
+
     /// Current linear-memory usage, when the runtime tracks it.
     fn memory_used(&self) -> Option<u64> {
         None
