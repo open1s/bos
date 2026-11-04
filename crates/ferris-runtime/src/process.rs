@@ -1269,8 +1269,15 @@ impl ProcessRuntime {
                             source,
                         }
                     })?;
-                use std::os::windows::io::AsRawHandle as _;
-                if let Err(source) = job.assign(child.as_raw_handle() as _) {
+                let Some(raw) = child.raw_handle() else {
+                    let _ = child.start_kill();
+                    return Err(ExtensionError::Runtime {
+                        extension: self.extension.to_string(),
+                        message: "the child exposed no process handle for its job object"
+                            .to_string(),
+                    });
+                };
+                if let Err(source) = job.assign(raw as _) {
                     let _ = child.start_kill();
                     return Err(ExtensionError::Io {
                         path: self.root.clone(),
