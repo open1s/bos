@@ -30395,6 +30395,175 @@ fn the_market_search_narrows_the_git_provider(cx: &mut TestAppContext) {
         "and the whole list returns"
     );
 }
+/// A provider that advertises one entry per release still draws one row, and
+/// the version choice lives on that row instead of becoming a second row.
+#[gpui::test]
+fn the_market_groups_one_extension_under_one_row(cx: &mut TestAppContext) {
+    use super::settings::section_index;
+    use crate::extension::market::MarketEntry;
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = AppState::with_store(scratch_store("extension-market-versions"));
+        let section = section_index("extensions").expect("the extensions index");
+        let shell = cx.new(|cx| {
+            let mut shell = Shell::build_for_test(window, Some(section), state, cx);
+            shell.extensions_tab = 4;
+            let entry = |version: &str| MarketEntry {
+                id: "com.example.devkit".to_string(),
+                name: "Extension DevKit".to_string(),
+                version: version.to_string(),
+                description: "Ship extensions".to_string(),
+                path: format!("packages/com.example.devkit/{version}"),
+                hash: None,
+            };
+            shell.extension_market = Some(vec![entry("1.1.0"), entry("2.0.0")]);
+            shell
+        });
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("extension-market-com.example.devkit")
+            .is_some(),
+        "the two advertised versions share one row"
+    );
+    assert!(
+        cx.debug_bounds("extension-market-version-com.example.devkit-2.0.0")
+            .is_some(),
+        "the row offers the newest version by default"
+    );
+    assert!(
+        cx.debug_bounds("extension-market-version-com.example.devkit-1.1.0")
+            .is_none(),
+        "the older version is a choice inside the control, not a second row"
+    );
+    cx.update(|_, cx| {
+        shell.update(cx, |shell, _| {
+            shell
+                .extension_market_versions
+                .insert("com.example.devkit".to_string(), "1.1.0".to_string());
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("extension-market-version-com.example.devkit-1.1.0")
+            .is_some(),
+        "the picked version is what the row shows"
+    );
+    assert!(
+        cx.debug_bounds("extension-market-version-com.example.devkit-2.0.0")
+            .is_none(),
+        "and the previous choice is no longer the one on the row"
+    );
+}
+
+/// An installed version that is not the active one is a switch ("Use"), while
+/// only the active version offers Enable/Disable - the bug the old per-id
+/// toggle caused by toggling the active build from the other version's row.
+#[gpui::test]
+fn the_market_offers_use_for_an_installed_inactive_version(cx: &mut TestAppContext) {
+    use crate::extension::host::ExtensionStatus;
+    use crate::extension::market::MarketEntry;
+    use ferris_sdk::lifecycle::Health;
+    use ferris_sdk::types::LifecycleState;
+
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = AppState::with_store(scratch_store("extension-market-use-version"));
+        let section = section_index("extensions").expect("the extensions index");
+        let shell = cx.new(|cx| {
+            let mut shell = Shell::build_for_test(window, Some(section), state, cx);
+            shell.extensions_tab = 4;
+            let entry = |version: &str| MarketEntry {
+                id: "com.example.devkit".to_string(),
+                name: "Extension DevKit".to_string(),
+                version: version.to_string(),
+                description: "Ship extensions".to_string(),
+                path: format!("packages/com.example.devkit/{version}"),
+                hash: None,
+            };
+            shell.extension_market = Some(vec![entry("1.1.0"), entry("2.0.0")]);
+            shell.extension_statuses = Some(vec![ExtensionStatus {
+                id: "com.example.devkit".to_string(),
+                name: "Extension DevKit".to_string(),
+                version: "2.0.0".to_string(),
+                versions: vec!["1.1.0".to_string(), "2.0.0".to_string()],
+                runtime: "process".to_string(),
+                program: None,
+                trust: "community".to_string(),
+                source: "installed".to_string(),
+                root: String::new(),
+                hash: String::new(),
+                state: LifecycleState::Active,
+                health: Health::Healthy,
+                configured: true,
+                applied: true,
+                tools: Vec::new(),
+                commands: Vec::new(),
+                panels: Vec::new(),
+                skills: Vec::new(),
+                languages: Vec::new(),
+                integrations: Vec::new(),
+                capabilities: Vec::new(),
+                error: None,
+                startup_ms: 0,
+                installed_at: 0,
+                dependencies: Vec::new(),
+                signature: "unsigned".to_string(),
+                publisher: None,
+            }]);
+            shell
+        });
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("extension-toggle-com.example.devkit")
+            .is_some(),
+        "the active version offers Enable/Disable"
+    );
+    assert!(
+        cx.debug_bounds("extension-use-com.example.devkit-1.1.0")
+            .is_none(),
+        "and the inactive version is not what the row is showing"
+    );
+
+    cx.update(|_, cx| {
+        shell.update(cx, |shell, _| {
+            shell
+                .extension_market_versions
+                .insert("com.example.devkit".to_string(), "1.1.0".to_string());
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("extension-use-com.example.devkit-1.1.0")
+            .is_some(),
+        "an installed inactive version offers Use"
+    );
+    assert!(
+        cx.debug_bounds("extension-toggle-com.example.devkit")
+            .is_none(),
+        "and no longer offers Enable/Disable for the active build"
+    );
+
+    cx.update(|_, cx| {
+        shell.update(cx, |shell, _| {
+            shell
+                .extension_market_versions
+                .insert("com.example.devkit".to_string(), "2.0.0".to_string());
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("extension-toggle-com.example.devkit")
+            .is_some(),
+        "returning to the active version restores the toggle"
+    );
+}
+
 /// The plugins header opens the extension panel host.
 #[gpui::test]
 fn the_plugins_header_opens_the_extension_panels(cx: &mut TestAppContext) {

@@ -358,8 +358,12 @@ bsh_extensions/
   packages/<id>/<version>/...
 ~~~
 
-bsh ext market lists entries, bsh ext market install <id> installs the newest
-compatible version, and registry add/list configures private providers.
+bsh ext market lists entries, bsh ext market install <id> [version] installs a
+version (the newest compatible one when none is named), and registry add/list
+configures private providers. An index may advertise several versions of one
+id; the settings Market tab draws one row per extension and offers the versions
+on that row, while installed versions that the index no longer carries stay
+selectable because the store keeps them for rollback.
 
 ## 6. CLI reference
 
@@ -399,7 +403,7 @@ All commands are under bsh ext:
 | providers / languages / integrations | List declared descriptors |
 | language-check <id> <lang> <path> | Run a language service diagnostic |
 | integrate <id> <integration> [json] | Run an integration action |
-| market [query] / market install <id> | Git market |
+| market [query] / market install <id> [version] | Git market |
 | doctor | Check store, hashes, dependencies and policy |
 | keygen / sign / verify / trust / untrust / publishers | Signing and trust |
 | registry add/list | Registry configuration |

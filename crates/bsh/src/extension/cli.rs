@@ -66,7 +66,7 @@ Commands:
   language-check <id> <lang> <path>   run a language service's diagnostics tool
   integrate <id> <integration> [json] run an integration's tool or command
   market [query]                      list the Git extension market
-  market install <id>                 install the newest market version
+  market install <id> [version]       install a market version (default: newest)
   doctor                              check the store, hashes, dependencies and policy
   keygen <publisher> [--out <path>]   create an Ed25519 publisher key pair
   sign <path> --publisher <name> --key <file-or-base64>
@@ -1803,10 +1803,15 @@ fn command_market(args: &[String], root: Option<PathBuf>) -> Result<i32, String>
     if args.first().map(String::as_str) == Some("install") {
         let id = args
             .get(1)
-            .ok_or_else(|| "usage: bsh ext market install <id>".to_string())?;
-        let entry = index
-            .newest(id)
-            .ok_or_else(|| format!("{id} is not in the market"))?;
+            .ok_or_else(|| "usage: bsh ext market install <id> [version]".to_string())?;
+        let entry = match args.get(2).map(String::as_str) {
+            Some(version) => index
+                .entry(id, version)
+                .ok_or_else(|| format!("{id} {version} is not in the market"))?,
+            None => index
+                .newest(id)
+                .ok_or_else(|| format!("{id} is not in the market"))?,
+        };
         let package = market
             .install(&store, entry)
             .map_err(|error| error.to_string())?;

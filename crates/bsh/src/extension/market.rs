@@ -100,6 +100,13 @@ impl MarketIndex {
             .collect()
     }
 
+    /// The advertised entry with this exact id and version.
+    pub(crate) fn entry(&self, id: &str, version: &str) -> Option<&MarketEntry> {
+        self.extensions
+            .iter()
+            .find(|entry| entry.id == id && entry.version == version)
+    }
+
     /// The newest advertised version of one id.
     pub(crate) fn newest(&self, id: &str) -> Option<&MarketEntry> {
         let mut best: Option<(&MarketEntry, semver::Version)> = None;
@@ -113,6 +120,68 @@ impl MarketIndex {
         }
         best.map(|(entry, _)| entry)
     }
+}
+
+/// Order two version strings; unparsable ones sort lexically.
+fn compare_versions(left: &str, right: &str) -> std::cmp::Ordering {
+    match (semver::Version::parse(left), semver::Version::parse(right)) {
+        (Ok(left), Ok(right)) => left.cmp(&right),
+        _ => left.cmp(right),
+    }
+}
+
+/// Group entries by id in first-mention order, versions newest first.
+///
+/// An index advertises one entry per version, so the same id appears once for
+/// each release. One row per extension is what the reader installs, and the
+/// version list under it is the choice that row now offers.
+pub(crate) fn group_by_id(entries: &[MarketEntry]) -> Vec<Vec<MarketEntry>> {
+    let mut groups: Vec<Vec<MarketEntry>> = Vec::new();
+    let mut positions: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for entry in entries {
+        match positions.get(entry.id.as_str()) {
+            Some(&at) => groups[at].push(entry.clone()),
+            None => {
+                positions.insert(entry.id.as_str(), groups.len());
+                groups.push(vec![entry.clone()]);
+            }
+        }
+    }
+    for group in &mut groups {
+        group.sort_by(|left, right| compare_versions(&right.version, &left.version));
+    }
+    groups
+}
+
+/// The versions one row offers, newest first.
+///
+/// The index's entries come first, then any version already on disk: a local
+/// install can outlive its index entry, and the reader must still be able to
+/// switch back to it instead of only seeing what the provider still advertises.
+pub(crate) fn version_choices(entries: &[MarketEntry], installed: &[String]) -> Vec<String> {
+    let mut versions: Vec<String> = entries
+        .iter()
+        .map(|entry| entry.version.clone())
+        .chain(installed.iter().cloned())
+        .collect();
+    versions.sort_by(|left, right| compare_versions(right, left));
+    versions.dedup();
+    versions
+}
+
+/// The version a row shows: the reader's pick while it is still offered, else
+/// the version the host resolves, else the newest offered.
+pub(crate) fn resolve_version(
+    choice: Option<&str>,
+    active: Option<&str>,
+    offered: &[String],
+) -> Option<String> {
+    let is_offered = |version: &&str| offered.iter().any(|candidate| candidate == version);
+    choice
+        .filter(is_offered)
+        .or_else(|| active.filter(is_offered))
+        .map(str::to_string)
+        .or_else(|| offered.first().cloned())
 }
 
 fn validate_entry(entry: &MarketEntry, path: &Path) -> Result<(), ExtensionError> {
@@ -329,6 +398,67 @@ mod tests {
         assert_eq!(
             index.newest("com.example.hello").expect("hello").name,
             "Hello"
+        );
+    }
+
+    fn entry(id: &str, version: &str) -> MarketEntry {
+        MarketEntry {
+            id: id.to_string(),
+            name: "Extension".to_string(),
+            version: version.to_string(),
+            description: String::new(),
+            path: format!("packages/{id}/{version}"),
+            hash: None,
+        }
+    }
+
+    #[test]
+    fn one_id_is_one_group_with_its_versions_newest_first() {
+        let entries = vec![
+            entry("com.example.devkit", "1.1.0"),
+            entry("com.example.other", "1.0.0"),
+            entry("com.example.devkit", "2.0.0"),
+        ];
+        let groups = group_by_id(&entries);
+        assert_eq!(groups.len(), 2, "two ids make two rows, not three");
+        assert_eq!(groups[0][0].id, "com.example.devkit");
+        assert_eq!(
+            groups[0]
+                .iter()
+                .map(|entry| entry.version.as_str())
+                .collect::<Vec<_>>(),
+            ["2.0.0", "1.1.0"],
+            "the row offers the newest version first"
+        );
+    }
+
+    #[test]
+    fn the_choices_include_an_installed_version_the_index_dropped() {
+        let entries = vec![
+            entry("com.example.devkit", "2.0.0"),
+            entry("com.example.devkit", "1.1.0"),
+        ];
+        let choices = version_choices(&entries, &["1.0.0".to_string()]);
+        assert_eq!(choices, ["2.0.0", "1.1.0", "1.0.0"]);
+    }
+
+    #[test]
+    fn a_row_shows_the_pick_then_the_active_version_then_the_newest() {
+        let offered = ["2.0.0".to_string(), "1.1.0".to_string()];
+        assert_eq!(
+            resolve_version(Some("1.1.0"), Some("2.0.0"), &offered).as_deref(),
+            Some("1.1.0"),
+            "the reader's pick wins while it is still offered"
+        );
+        assert_eq!(
+            resolve_version(Some("9.9.9"), Some("1.1.0"), &offered).as_deref(),
+            Some("1.1.0"),
+            "a vanished pick falls back to the version the host resolves"
+        );
+        assert_eq!(
+            resolve_version(None, None, &offered).as_deref(),
+            Some("2.0.0"),
+            "an uninstalled extension starts on its newest version"
         );
     }
 

@@ -3664,3 +3664,47 @@ what makes "the status bar stays quiet" true rather than "it shows something
 stale". Evidence: the 15 goal tests are green and clippy is clean; the five
 unrelated failures in the shared working copy are the ones the note above
 already records.
+
+Round 187 made the market's version a choice instead of a duplicate row. The
+provider advertises one entry per version, so an extension with 1.1.0 and 2.0.0
+appeared twice, each row claimed the installed id and pressing Enable on the
+1.1.0 row toggled the 2.0.0 build (the toggle is per id) - a control that only
+looked wired. Four axes:
+
+- **Backend.** `extension::market::group_by_id` groups the index by id in
+  first-mention order with versions newest first; `version_choices` unions the
+  advertised versions with the installed ones (a version can outlive its index
+  entry) and `resolve_version` picks the reader's choice, then the active
+  version, then the newest. `ExtensionStatus.versions` carries every installed
+  version, so an installed-but-inactive version is a switch and one that is not
+  on disk is an install; `extension::activate` pins the active version (the
+  installer refuses an existing version, so re-installing would fail).
+  `bsh ext market install <id> [version]` accepts the same pin.
+- **Interaction.** One row per id; when more than one version is offered the
+  title line carries a `v<version> ▾` control whose menu checks the current
+  pick, and a single-version row states its version as plain text. The action is
+  Install for a version that is not on disk, Use for an installed inactive
+  version, and Enable/Disable only for the active one.
+- **Tips, help and prompts.** The state line now has three honest facts:
+  Enabled/Disabled for the active version, Installed for an installed inactive
+  one, Available for a version that must be installed. New keys:
+  `settings.extensionUseVersion`, `settings.extensionVersionInstalled`,
+  `settings.extensionVersionActivated` (EN/ZH).
+- **Errors.** An install names the exact id and version when the cached index no
+  longer carries it; activation failures surface as the store's own notice. The
+  row keeps the previous pick while it is still offered and silently falls back
+  to the active version when it is not.
+
+Evidence: `extension::market::` 5 green (three new: grouping order, installed
+version in the choices, pick/active/newest resolution); all 8 `the_market_`
+tests green, including `the_market_groups_one_extension_under_one_row` (one row,
+the 2.0.0 picker by default, the 1.1.0 picker after the map is set) and
+`the_market_offers_use_for_an_installed_inactive_version` (the active version
+offers Enable/Disable, the installed inactive one offers Use, returning to the
+active version restores the toggle); clippy `-D warnings` clean. The three
+`extension::` failures in the suite are the harness seatbelt
+(`sandbox-exec: sandbox_apply: Operation not permitted`), not this change.
+Honest gap: the kit menu itself is not click-driven by the interaction test, so
+the pick is proved through the row's state; and the installed tab still shows
+only the active version (its version list is now available, but the tab's
+controls were left as they were).

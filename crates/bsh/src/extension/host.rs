@@ -188,6 +188,11 @@ pub(crate) struct ExtensionStatus {
     pub(crate) name: String,
     /// Version.
     pub(crate) version: String,
+    /// Every installed version of this id, ascending.
+    ///
+    /// The market row needs this to tell an installed-but-inactive version from
+    /// one that is not on disk: the first is a switch, the second an install.
+    pub(crate) versions: Vec<String>,
     /// Runtime kind.
     pub(crate) runtime: String,
     /// Declared process executable, when the runtime is a process.
@@ -2036,11 +2041,29 @@ impl ExtensionHost {
             statuses.iter().map(|status| status.id.clone()).collect();
         if let Ok(manager) = self.framework_manager() {
             if let Ok(installed) = manager.installed() {
+                // One row per id, not one per version: an extension with two
+                // installed versions is still one row, and its active version
+                // names the one the host would load.
+                let mut by_id: std::collections::BTreeMap<String, Vec<String>> =
+                    std::collections::BTreeMap::new();
                 for extension in installed {
-                    if known.contains(&extension.id) {
+                    by_id
+                        .entry(extension.id)
+                        .or_default()
+                        .push(extension.version);
+                }
+                for (id, versions) in by_id {
+                    if known.contains(&id) {
                         continue;
                     }
-                    let package_root = manager.package_root(&extension.id, &extension.version).ok();
+                    let active = manager
+                        .active_version(&id)
+                        .ok()
+                        .flatten()
+                        .filter(|version| versions.iter().any(|candidate| candidate == version))
+                        .or_else(|| versions.last().cloned())
+                        .unwrap_or_default();
+                    let package_root = manager.package_root(&id, &active).ok();
                     let manifest = package_root
                         .as_deref()
                         .and_then(|root| ferris_sdk::manifest_v2::load_package_manifest(root).ok());
@@ -2053,12 +2076,13 @@ impl ExtensionHost {
                         .map(|root| root.display().to_string())
                         .unwrap_or_default();
                     statuses.push(ExtensionStatus {
-                        id: extension.id.clone(),
+                        id: id.clone(),
                         name: manifest
                             .as_ref()
                             .map(|manifest| manifest.extension.name.clone())
-                            .unwrap_or_else(|| extension.id.clone()),
-                        version: extension.version,
+                            .unwrap_or_else(|| id.clone()),
+                        version: active,
+                        versions,
                         runtime: manifest
                             .as_ref()
                             .map(|manifest| manifest.runtime.kind.to_string())
@@ -2835,6 +2859,7 @@ impl ExtensionHost {
             id: id.as_str().to_string(),
             name: entry.package.manifest.extension.name.clone(),
             version: entry.package.manifest.extension.version.to_string(),
+            versions: self.store.versions(id).unwrap_or_default(),
             runtime: entry.package.manifest.runtime.kind.as_str().to_string(),
             program: (entry.package.manifest.runtime.kind == RuntimeKind::Process)
                 .then(|| entry.package.manifest.runtime.entry.clone())
@@ -3325,6 +3350,25 @@ pub(crate) fn uninstall(
             .map_err(|error| error.to_string())?;
     manager
         .uninstall(id, purge_data)
+        .map_err(|error| error.to_string())
+}
+
+/// Pin one installed version as the one the host loads.
+///
+/// The store keeps every version for rollback; switching is a state write, not
+/// a reinstall, so a version already on disk is selected rather than installed
+/// again (the installer refuses an existing version).
+pub(crate) fn activate(
+    settings: &crate::settings::Settings,
+    workspace: Option<&Path>,
+    id: &str,
+    version: &str,
+) -> Result<(), String> {
+    let manager =
+        super::framework::manager_for(extension_root(settings), workspace.map(Path::to_path_buf))
+            .map_err(|error| error.to_string())?;
+    manager
+        .activate(id, version)
         .map_err(|error| error.to_string())
 }
 

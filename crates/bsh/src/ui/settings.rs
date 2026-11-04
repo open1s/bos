@@ -6717,12 +6717,12 @@ impl Shell {
         self.refresh_extension_market(cx);
     }
 
-    /// Install one market entry off the UI thread.
-    fn install_extension_market(&mut self, id: String, cx: &mut Context<Self>) {
+    /// Install one advertised version of a market entry off the UI thread.
+    fn install_extension_market(&mut self, id: String, version: String, cx: &mut Context<Self>) {
         if self.extension_market_installing.is_some() {
             return;
         }
-        self.extension_market_installing = Some(id.clone());
+        self.extension_market_installing = Some((id.clone(), version.clone()));
         self.extension_market_error = None;
         cx.notify();
         let root = crate::extension::store_root(&self.state.settings);
@@ -6733,9 +6733,11 @@ impl Shell {
             let result = store.map_err(|error| error.to_string()).and_then(|store| {
                 let market = crate::extension::market::GitMarket::open(&root, &url);
                 let index = market.cached().map_err(|error| error.to_string())?;
+                // The version is pinned, not resolved to the newest: the row
+                // the reader pressed names exactly which release to install.
                 let entry = index
-                    .newest(&id)
-                    .ok_or_else(|| format!("{id} is not in the cached market"))?;
+                    .entry(&id, &version)
+                    .ok_or_else(|| format!("{id} {version} is not in the cached market"))?;
                 market
                     .install(&store, entry)
                     .map(|package| package.id().to_string())
@@ -6763,6 +6765,27 @@ impl Shell {
             });
         })
         .detach();
+    }
+
+    /// Switch an extension to one of its other installed versions.
+    fn activate_extension_version(&mut self, id: String, version: String, cx: &mut Context<Self>) {
+        let settings = self.state.settings.clone();
+        let workspace = {
+            let root = settings.active_workspace_root();
+            (!root.is_empty()).then(|| std::path::PathBuf::from(root))
+        };
+        match crate::extension::activate(&settings, workspace.as_deref(), &id, &version) {
+            Ok(()) => {
+                self.state.notice(tr_args(
+                    self.state.lang,
+                    "settings.extensionVersionActivated",
+                    &[("version", version.clone())],
+                ));
+                self.refresh_extension_surfaces(cx);
+            }
+            Err(error) => self.state.notice(error),
+        }
+        cx.notify();
     }
 
     fn extension_market_rows(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -6864,21 +6887,96 @@ impl Shell {
                     .into_any_element(),
             );
         }
-        for entry in entries {
-            let installed = statuses.iter().find(|status| status.id == entry.id);
-            let enabled = installed.is_some_and(|status| status.configured);
-            let installing = self.extension_market_installing.as_deref() == Some(entry.id.as_str());
-            let action = if installed.is_some() {
-                let id = entry.id.clone();
-                let label = if enabled {
-                    tr(self.state.lang, "settings.extensionDisable")
+        for group in crate::extension::market::group_by_id(&entries) {
+            let first = &group[0];
+            let id = first.id.clone();
+            let name = first.name.clone();
+            let description = first.description.clone();
+            let status = statuses.iter().find(|status| status.id == id);
+            let installed_versions = status
+                .map(|status| status.versions.clone())
+                .unwrap_or_default();
+            let active = status.map(|status| status.version.clone());
+            let choices = crate::extension::market::version_choices(&group, &installed_versions);
+            // The row seeds itself from the host: the installed version wins
+            // while the provider still offers it, so the row states what runs
+            // rather than what happens to be newest.
+            let chosen = crate::extension::market::resolve_version(
+                self.extension_market_versions.get(&id).map(String::as_str),
+                active.as_deref(),
+                &choices,
+            )
+            .unwrap_or_default();
+            let chosen_installed = installed_versions.iter().any(|version| version == &chosen);
+            let chosen_active = active.as_deref() == Some(chosen.as_str());
+            let installing = self
+                .extension_market_installing
+                .as_ref()
+                .is_some_and(|(pending, version)| pending == &id && version == &chosen);
+            // A single-version row states its version as plain text; a row
+            // with a choice opens the versions on its own control.
+            let version_control = if choices.len() > 1 {
+                let shell = cx.entity();
+                let pick_id = id.clone();
+                let pick_choices = choices.clone();
+                let pick_current = chosen.clone();
+                // The version is part of the selector so a test (and a
+                // debugger) can tell which choice the row is showing.
+                let selector = format!("extension-market-version-{id}-{chosen}");
+                let debug = selector.clone();
+                // The dropdown trait lives on the kit's Button, not on a bare
+                // div; the wrapper carries the debug selector a Button has no
+                // hook for.
+                let trigger = Button::new(SharedString::from(selector))
+                    .ghost()
+                    .h(px(24.0))
+                    .px(px(8.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .rounded(px(7.0))
+                    .bg(rgb(theme::new_session_fill()))
+                    .cursor_pointer()
+                    .child(txt(format!("v{chosen}"), 11.0, theme::text()))
+                    .child(icon(IconName::ChevronDown, 10.0, theme::muted()))
+                    .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                        let mut menu = menu.min_w(px(180.0));
+                        for version in pick_choices.iter() {
+                            let pick = shell.clone();
+                            let target = pick_id.clone();
+                            let value = version.clone();
+                            menu = menu.item(
+                                PopupMenuItem::new(format!("v{version}"))
+                                    .checked(*version == pick_current)
+                                    .on_click(move |_, _window, cx| {
+                                        pick.update(cx, |this, cx| {
+                                            this.extension_market_versions
+                                                .insert(target.clone(), value.clone());
+                                            cx.notify();
+                                        });
+                                    }),
+                            );
+                        }
+                        menu
+                    });
+                div()
+                    .debug_selector(move || debug.clone())
+                    .child(trigger)
+                    .into_any_element()
+            } else {
+                txt(format!("v{chosen}"), 11.0, theme::faint()).into_any_element()
+            };
+            let action = if chosen_installed && chosen_active {
+                let id = id.clone();
+                let label = if status.is_some_and(|status| status.configured) {
+                    tr(lang, "settings.extensionDisable")
                 } else {
-                    tr(self.state.lang, "settings.extensionEnable")
+                    tr(lang, "settings.extensionEnable")
                 };
                 div()
-                    .id(SharedString::from(format!("extension-toggle-{}", entry.id)))
+                    .id(SharedString::from(format!("extension-toggle-{id}")))
                     .debug_selector({
-                        let id = entry.id.clone();
+                        let id = id.clone();
                         move || format!("extension-toggle-{id}")
                     })
                     .h(px(28.0))
@@ -6892,15 +6990,42 @@ impl Shell {
                         this.refresh_extension_surfaces(cx);
                         cx.notify();
                     }))
-            } else {
-                let id = entry.id.clone();
+                    .into_any_element()
+            } else if chosen_installed {
+                // The version is on disk but the host resolves another one, so
+                // the press is a switch: install refuses an existing version.
+                let target_id = id.clone();
+                let target_version = chosen.clone();
+                let selector = format!("extension-use-{id}-{chosen}");
                 div()
-                    .id(SharedString::from(format!(
-                        "extension-install-{}",
-                        entry.id
-                    )))
+                    .id(SharedString::from(selector.clone()))
+                    .debug_selector(move || selector.clone())
+                    .h(px(28.0))
+                    .px(px(10.0))
+                    .rounded(px(7.0))
+                    .bg(rgb(theme::new_session_fill()))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(theme::hover())))
+                    .child(txt(
+                        tr(lang, "settings.extensionUseVersion"),
+                        11.0,
+                        theme::text(),
+                    ))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.activate_extension_version(
+                            target_id.clone(),
+                            target_version.clone(),
+                            cx,
+                        );
+                    }))
+                    .into_any_element()
+            } else {
+                let target_id = id.clone();
+                let target_version = chosen.clone();
+                div()
+                    .id(SharedString::from(format!("extension-install-{id}")))
                     .debug_selector({
-                        let id = entry.id.clone();
+                        let id = id.clone();
                         move || format!("extension-install-{id}")
                     })
                     .h(px(28.0))
@@ -6918,24 +7043,30 @@ impl Shell {
                         theme::page(),
                     ))
                     .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.install_extension_market(id.clone(), cx);
+                        this.install_extension_market(
+                            target_id.clone(),
+                            target_version.clone(),
+                            cx,
+                        );
                     }))
+                    .into_any_element()
             };
-            let state_label = match installed {
-                Some(_) => {
-                    if enabled {
+            let state_label = match status {
+                Some(status) if chosen_active => {
+                    if status.configured {
                         tr(lang, "settings.extensionEnabled")
                     } else {
                         tr(lang, "settings.extensionDisabled")
                     }
                 }
-                None => tr(lang, "settings.extensionAvailable"),
+                _ if chosen_installed => tr(lang, "settings.extensionVersionInstalled"),
+                _ => tr(lang, "settings.extensionAvailable"),
             };
             rows.push(
                 div()
-                    .id(SharedString::from(format!("extension-market-{}", entry.id)))
+                    .id(SharedString::from(format!("extension-market-{id}")))
                     .debug_selector({
-                        let id = entry.id.clone();
+                        let id = id.clone();
                         move || format!("extension-market-{id}")
                     })
                     .flex()
@@ -6952,15 +7083,16 @@ impl Shell {
                             .gap(px(2.0))
                             .flex_1()
                             .min_w_0()
-                            .child(txt(entry.name.clone(), 13.0, theme::text()))
-                            .child(txt(
-                                format!(
-                                    "{} · v{} · {}",
-                                    entry.id, entry.version, entry.description
-                                ),
-                                11.0,
-                                theme::muted(),
-                            ))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(8.0))
+                                    .child(txt(name, 13.0, theme::text()))
+                                    .child(version_control),
+                            )
+                            .child(txt(format!("{id} · {description}"), 11.0, theme::muted()))
                             .child(txt(state_label, 11.0, theme::faint())),
                     )
                     .child(action)

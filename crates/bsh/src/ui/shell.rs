@@ -879,8 +879,14 @@ pub(crate) struct Shell {
     pub(crate) extension_market_error: Option<String>,
     /// Whether a market refresh is in flight.
     pub(crate) extension_market_fetching: bool,
-    /// The market entry currently being installed, if any.
-    pub(crate) extension_market_installing: Option<String>,
+    /// The market entry currently being installed, as its id and version.
+    pub(crate) extension_market_installing: Option<(String, String)>,
+    /// The market version the reader picked per extension id.
+    ///
+    /// View state, not a setting: the row still seeds itself from the installed
+    /// version - or the newest offered - whenever the pick is gone from the
+    /// provider's list.
+    pub(crate) extension_market_versions: std::collections::HashMap<String, String>,
     /// Editable Git URL for the extension market.
     pub(crate) extension_market_url_input: Entity<InputState>,
     /// The name/id/description filter on the Extensions pane's Market tab.
@@ -1827,6 +1833,7 @@ impl Shell {
             extension_market_error: None,
             extension_market_fetching: false,
             extension_market_installing: None,
+            extension_market_versions: std::collections::HashMap::new(),
             extension_market_url_input,
             extension_market_search,
             settings_inputs,

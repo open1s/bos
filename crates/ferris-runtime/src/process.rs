@@ -1337,6 +1337,13 @@ impl ProcessRuntime {
         };
         #[cfg(windows)]
         let mut child = {
+            if !self.sandbox {
+                return Err(ExtensionError::Runtime {
+                    extension: self.extension.to_string(),
+                    message: "the Windows process runtime requires the AppContainer sandbox"
+                        .to_string(),
+                });
+            }
             let sandbox = self.sandbox().await?;
             let mut envs = vec![("BSH_IPC_TOKEN".to_string(), token.clone())];
             for key in ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"] {
