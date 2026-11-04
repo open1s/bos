@@ -12,7 +12,9 @@ use std::collections::{BTreeMap, VecDeque};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+#[cfg(unix)]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -422,6 +424,8 @@ fn signal_kill(pid: u32) {
 
 /// Resident memory of one child, from procfs on Linux or ps on macOS.
 fn process_rss_bytes(pid: u32) -> Option<u64> {
+    #[cfg(not(unix))]
+    let _ = pid;
     #[cfg(target_os = "linux")]
     {
         let page_size = page_size_bytes()?;
@@ -1585,6 +1589,7 @@ impl Runtime for ProcessRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[cfg(unix)]
