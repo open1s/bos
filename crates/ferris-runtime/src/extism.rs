@@ -1468,11 +1468,20 @@ mod tests {
         // Wait deterministically for the worker to enter CALL_RUNNING: a
         // cancel before the call acquires the plugin is cleared by the call's
         // own idle transition.
-        for _ in 0..200 {
+        // A loaded CI runner can take seconds to instantiate the plugin and
+        // enter CALL_RUNNING; two seconds was too tight and failed the gate
+        // before the cancellation this test exists to prove could run.
+        let mut running = false;
+        for _ in 0..2000 {
             if runtime.call_state.load(Ordering::SeqCst) == CALL_RUNNING {
+                running = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if !running {
+            runtime.cancel().await.expect("cancel");
+            panic!("the spinning call never entered CALL_RUNNING within 20s");
         }
         assert_eq!(runtime.call_state.load(Ordering::SeqCst), CALL_RUNNING);
         let started = Instant::now();
