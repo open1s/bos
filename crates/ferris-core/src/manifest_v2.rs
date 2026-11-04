@@ -210,6 +210,56 @@ impl ManifestV2 {
                 });
             }
         }
+        let config = &self.runtime.config;
+        for key in ["entry", "protocol"] {
+            if let Some(value) = config.get(key) {
+                if !value.is_str() {
+                    return Err(ExtensionError::Manifest {
+                        path,
+                        message: format!("runtime.config.{key} must be a string"),
+                    });
+                }
+            }
+        }
+        if let Some(args) = config.get("args") {
+            let values = args.as_array().ok_or_else(|| ExtensionError::Manifest {
+                path: path.clone(),
+                message: "runtime.config.args must be an array".to_string(),
+            })?;
+            if values.iter().any(|value| !value.is_str()) {
+                return Err(ExtensionError::Manifest {
+                    path,
+                    message: "runtime.config.args must contain only strings".to_string(),
+                });
+            }
+        }
+        if let Some(env) = config.get("env") {
+            let table = env.as_table().ok_or_else(|| ExtensionError::Manifest {
+                path: path.clone(),
+                message: "runtime.config.env must be a table".to_string(),
+            })?;
+            if table.values().any(|value| !value.is_str()) {
+                return Err(ExtensionError::Manifest {
+                    path,
+                    message: "runtime.config.env values must be strings".to_string(),
+                });
+            }
+        }
+        if let Some(startup) = config.get("startup") {
+            let value = startup.as_str().ok_or_else(|| ExtensionError::Manifest {
+                path: path.clone(),
+                message: "runtime.config.startup must be a string".to_string(),
+            })?;
+            if !matches!(
+                value,
+                "on-startup" | "on-workspace-open" | "on-demand" | "manual"
+            ) {
+                return Err(ExtensionError::Manifest {
+                    path,
+                    message: format!("unknown runtime.config.startup {value:?}"),
+                });
+            }
+        }
         Ok(())
     }
 

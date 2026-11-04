@@ -1024,7 +1024,9 @@ fn valid_env_name(name: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || character == '_')
 }
 
-fn is_dangerous_env(name: &str) -> bool {
+/// Whether an environment variable may alter the loader or interpreter
+/// environment of the host that launches a sandboxed child.
+pub fn is_dangerous_env(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     matches!(
         upper.as_str(),

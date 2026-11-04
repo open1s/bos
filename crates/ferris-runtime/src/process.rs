@@ -1004,6 +1004,17 @@ impl ProcessRuntime {
                 message: "the process runtime needs runtime.kind = \"process\"".to_string(),
             });
         }
+        if let Some(key) = manifest
+            .runtime
+            .env
+            .keys()
+            .find(|key| ferris_core::manifest::is_dangerous_env(key))
+        {
+            return Err(ExtensionError::Manifest {
+                path: root.join("extension.toml"),
+                message: format!("runtime.env may not set {key}"),
+            });
+        }
         let entry = manifest
             .runtime
             .entry

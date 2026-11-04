@@ -23,6 +23,29 @@ pub struct InstalledExtension {
 }
 
 /// The manager owns one canonical store rooted at HostSpec::root.
+fn load_validated_manifest(root: &std::path::Path) -> Result<crate::manifest::Manifest, ExtError> {
+    let manifest = crate::manifest_v2::load_package_manifest(root).map_err(|error| ExtError {
+        code: ErrorCode::Manifest,
+        message: error.to_string(),
+        details: serde_json::Value::Null,
+    })?;
+    let report = manifest.validate();
+    if !report.is_valid() {
+        return Err(ExtError {
+            code: ErrorCode::Manifest,
+            message: report
+                .errors
+                .iter()
+                .map(|issue| format!("{}: {}", issue.field, issue.message))
+                .collect::<Vec<_>>()
+                .join("; "),
+            details: serde_json::Value::Null,
+        });
+    }
+    Ok(manifest)
+}
+
+/// Plans and owns Ferris extension activations for one host.
 pub struct ExtensionManager {
     host: Arc<dyn HostSpec>,
     store: ExtensionStore,
@@ -332,12 +355,7 @@ impl ExtensionManager {
         })?;
         let version = self.version_of(id)?;
         let root = self.store.version_root(&extension_id, &version);
-        let manifest =
-            crate::manifest_v2::load_package_manifest(&root).map_err(|error| ExtError {
-                code: ErrorCode::Manifest,
-                message: error.to_string(),
-                details: serde_json::Value::Null,
-            })?;
+        let manifest = load_validated_manifest(&root)?;
         let data_root = self.store.data_dir(&extension_id);
         let runtime = runtimes.create(&manifest, &root, &data_root)?;
         let listed = match runtime
@@ -432,12 +450,7 @@ impl ExtensionManager {
                     details: serde_json::Value::Null,
                 })?;
             let root = self.store.version_root(&id, &version);
-            let manifest =
-                crate::manifest_v2::load_package_manifest(&root).map_err(|error| ExtError {
-                    code: ErrorCode::Manifest,
-                    message: error.to_string(),
-                    details: serde_json::Value::Null,
-                })?;
+            let manifest = load_validated_manifest(&root)?;
             let parsed = semver::Version::parse(&version).map_err(|error| ExtError {
                 code: ErrorCode::Package,
                 message: format!("{id} has an invalid installed version {version}: {error}"),

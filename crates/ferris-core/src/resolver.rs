@@ -199,7 +199,9 @@ pub fn resolve(available: &[Package], roots: &[ExtensionId]) -> Result<Resolutio
     roots.sort_by(|left, right| left.as_str().cmp(right.as_str()));
     let mut excluded: BTreeMap<String, BTreeSet<Version>> = BTreeMap::new();
     let mut last: Option<ExtensionError> = None;
-    for _ in 0..MAX_RESOLUTION_ATTEMPTS {
+    // One extra pass: the final exclusion inside the budget must still get a
+    // chance to select the newly available candidate.
+    for _ in 0..=MAX_RESOLUTION_ATTEMPTS {
         let mut selected: BTreeMap<String, &Package> = BTreeMap::new();
         let mut order: Vec<String> = Vec::new();
         let mut visiting: Vec<String> = Vec::new();
