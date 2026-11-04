@@ -117,8 +117,9 @@ pub(crate) fn selection_drag(dx: f32, dy: f32) -> bool {
 /// The MIME type and file extension one clipboard image format is sent as.
 ///
 /// The set is the same four the picker accepts, because it is what the
-/// providers decode; a clipboard format outside it is refused with a notice
-/// rather than sent as bytes no provider reads.
+/// providers decode. A pasteboard format outside it (macOS copies and
+/// screenshots commonly hand over TIFF) is normalized to PNG by
+/// `normalized_clipboard_image` instead of being refused.
 fn clipboard_image_mime(format: gpui_kit::ImageFormat) -> Option<(&'static str, &'static str)> {
     match format {
         gpui_kit::ImageFormat::Png => Some(("image/png", "png")),
@@ -127,6 +128,34 @@ fn clipboard_image_mime(format: gpui_kit::ImageFormat) -> Option<(&'static str, 
         gpui_kit::ImageFormat::Gif => Some(("image/gif", "gif")),
         _ => None,
     }
+}
+
+/// One clipboard image in a form a provider decodes.
+///
+/// The four provider formats pass through untouched. Any other format gpui can
+/// read from the pasteboard is decoded once and re-encoded as PNG: macOS puts
+/// TIFF on the clipboard for a Preview copy, a PixPin copy and some screenshot
+/// tools, and refusing those made an ordinary Cmd-V report "Unsupported or
+/// malformed image data" instead of attaching the picture.
+///
+/// `None` means the payload is not a decodable raster image (an SVG, or bytes
+/// the decoder rejects), which the caller reports through
+/// `composer.imageUnsupported`.
+fn normalized_clipboard_image(
+    format: gpui_kit::ImageFormat,
+    bytes: &[u8],
+) -> Option<(&'static str, &'static str, std::borrow::Cow<'_, [u8]>)> {
+    if let Some((mime, extension)) = clipboard_image_mime(format) {
+        return Some((mime, extension, std::borrow::Cow::Borrowed(bytes)));
+    }
+    let decoded = image::load_from_memory(bytes).ok()?;
+    let mut png = std::io::Cursor::new(Vec::new());
+    decoded.write_to(&mut png, image::ImageFormat::Png).ok()?;
+    Some((
+        "image/png",
+        "png",
+        std::borrow::Cow::Owned(png.into_inner()),
+    ))
 }
 
 /// The row text one classified compaction failure earns.
@@ -2349,12 +2378,14 @@ impl Shell {
             match entry {
                 gpui_kit::ClipboardEntry::Image(image) => {
                     took = true;
-                    let Some((mime, extension)) = clipboard_image_mime(image.format) else {
+                    let Some((mime, extension, bytes)) =
+                        normalized_clipboard_image(image.format, &image.bytes)
+                    else {
                         let why = crate::i18n::tr(self.state.lang, "composer.imageUnsupported");
                         self.state.notice(why);
                         continue;
                     };
-                    self.attach_image(format!("image.{extension}"), mime, &image.bytes, cx);
+                    self.attach_image(format!("image.{extension}"), mime, bytes.as_ref(), cx);
                 }
                 gpui_kit::ClipboardEntry::ExternalPaths(paths) => {
                     took = true;

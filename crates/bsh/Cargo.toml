@@ -216,10 +216,15 @@ features = ["handshake"]
 # Decoding a captured PNG/JPEG frame into the RGBA buffer RenderImage takes.
 # gpui-pre already builds against image 0.25, so this unifies onto the one copy
 # in the graph rather than adding a second version.
+#
+# The clipboard path also re-encodes the formats macOS pasteboards commonly
+# hand over (TIFF from Preview/PixPin/screenshot tools, plus BMP, ICO and PNM)
+# as PNG, so those decoders are declared here rather than inherited from
+# gpui-pre's feature unification.
 [dependencies.image]
 version = "0.25"
 default-features = false
-features = ["png", "jpeg"]
+features = ["png", "jpeg", "tiff", "bmp", "ico", "pnm"]
 
 # RenderImage::new takes a SmallVec of frames. The container crate is already in
 # the graph through gpui-pre, so naming it adds no package; the alternative is

@@ -10941,6 +10941,60 @@ fn pasting_an_image_attaches_it(cx: &mut TestAppContext) {
     );
 }
 
+/// macOS hands some pasted screenshots over as TIFF (PixPin, Preview and
+/// several screenshot tools do). The providers read only PNG/JPEG/WebP/GIF, so
+/// the paste normalizes the payload to PNG instead of reporting unsupported
+/// image data - the reported bug.
+#[gpui::test]
+#[cfg_attr(target_os = "linux", ignore = "X11 clipboard is unavailable in CI")]
+fn pasting_a_tiff_image_attaches_it_as_png(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_image_model("attach-tiff-paste");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    focus_composer(&shell, cx);
+    // A real TIFF encoder: the test covers the decoder the pasteboard path
+    // uses instead of a hand-built header.
+    let mut tiff = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        2,
+        2,
+        image::Rgba([20, 40, 60, 255]),
+    ))
+    .write_to(&mut tiff, image::ImageFormat::Tiff)
+    .expect("encode a TIFF");
+    cx.update(|_, cx| {
+        cx.write_to_clipboard(ClipboardItem::new_image(&gpui_kit::Image::from_bytes(
+            ImageFormat::Tiff,
+            tiff.into_inner(),
+        )));
+    });
+    cx.simulate_keystrokes("cmd-v");
+    draw_until(cx, "the pasted TIFF is attached", DRAW_UNTIL_MAX, |cx| {
+        !cx.update(|_, cx| shell.read(cx).state.attachments.is_empty())
+    });
+    let (name, mime, preview, base64) = cx.update(|_, cx| {
+        let attachment = &shell.read(cx).state.attachments[0];
+        (
+            attachment.name.clone(),
+            attachment.mime.clone(),
+            attachment.preview.is_some(),
+            attachment.base64.clone(),
+        )
+    });
+    assert_eq!(name, "image.png", "the normalized payload is a PNG");
+    assert_eq!(mime, "image/png");
+    assert!(preview, "the rail has a picture to draw");
+    assert!(
+        base64.starts_with("iVBORw0KGgo"),
+        "the provider receives PNG bytes, not TIFF"
+    );
+}
+
 /// A text paste still reaches the field: the image handler consumes only what
 /// it can attach, so copying a word still types a word.
 #[gpui::test]
