@@ -20,7 +20,7 @@
 //! dispatcher declares a proxy target, and the engine resolves it before
 //! dispatch).
 
-use crate::tools::{describe_schema, FunctionTool, ToolRegistry};
+use crate::tools::{describe_schema, validate_args, FunctionTool, Tool, ToolRegistry};
 use async_trait::async_trait;
 use react::llm::LlmTool;
 use react::tool::registry::AsyncTool;
@@ -34,16 +34,27 @@ pub const CALL_TOOL: &str = "call_tool";
 pub const FIND_TOOL: &str = "find_tool";
 
 /// The description both the definition and the tool carry.
-const FIND_DESCRIPTION: &str = "Find a tool you were not given directly, by what you need to do. Returns the name and argument schema of the best matches; run one with call_tool. Tools already in your list are not returned. Use it before concluding a capability is missing.";
+///
+/// It promises the full argument schema, because a search that described a
+/// tool's parameters in shorthand left the model guessing at the JSON that
+/// actually runs it.
+const FIND_DESCRIPTION: &str = "Find a tool you were not given directly, by what you need to do or by its exact name. Returns each match's description and full JSON Schema for its arguments. Run one with call_tool, passing args that match that schema. Tools already in your list are not returned. Use it before concluding a capability is missing.";
 /// The dispatcher's description.
-const CALL_DESCRIPTION: &str = "Run a registered tool by name with a JSON arguments object. Use this for tools that find_tool returned instead of the tools you were given directly.";
+///
+/// It states the contract an error counts on: args are validated against the
+/// tool's schema, and a rejected call names the shape the tool takes.
+const CALL_DESCRIPTION: &str = "Run a registered tool by name with a JSON args object, for tools find_tool returned instead of the ones you were given directly. args is validated against that tool's schema; a rejected call names the field at fault and the shape the tool expects.";
 
 /// Most tools one search describes in full.
 const FIND_DESCRIBED: usize = 3;
 /// The longest description one result keeps.
 const FIND_DESCRIPTION_CHARS: usize = 200;
 /// The byte budget for one search result.
-const FIND_BUDGET: usize = 2_048;
+///
+/// A result now carries each shortlisted tool's whole schema rather than a
+/// one-line rendering, so the budget is priced against the JSON the model
+/// actually has to send.
+const FIND_BUDGET: usize = 4_096;
 /// Most names a result lists without describing them.
 const FIND_NAMES: usize = 80;
 
@@ -68,11 +79,11 @@ pub fn find_tool_schema() -> Value {
             },
             "name": {
                 "type": "string",
-                "description": "An exact tool name; returns just that one, with its full schema."
+                "description": "An exact tool name; returns just that one, with its full argument schema."
             },
             "limit": {
                 "type": "integer",
-                "description": "How many tools to describe in full (default 3, max 5)."
+                "description": "How many tools to describe in full, schema included (default 3, max 5)."
             }
         }
     })
@@ -89,7 +100,7 @@ pub fn call_tool_schema() -> Value {
             },
             "args": {
                 "type": "object",
-                "description": "The arguments object that tool expects."
+                "description": "The arguments object for that tool. It must match the tool's schema: find_tool returns it as \"parameters\", and call the tool again with the fields it names."
             }
         },
         "required": ["name"]
@@ -379,8 +390,10 @@ fn search(catalogue: &Catalogue<'_>, args: &Value) -> Value {
             Lookup::Withheld(description, schema) => json!({
                 "name": name,
                 "description": description,
-                "schema": describe_schema(&schema),
                 "parameters": schema,
+                "hint": format!(
+                    "Call call_tool with {{\"name\": \"{name}\", \"args\": {{...}}}}; args must match parameters."
+                ),
             }),
             Lookup::Advertised => json!({
                 "error": format!(
@@ -428,15 +441,17 @@ fn search(catalogue: &Catalogue<'_>, args: &Value) -> Value {
     let mut described = Vec::new();
     let mut spent = 0usize;
     for (_, (name, description, schema)) in ranked.iter().take(limit) {
-        let rendered = describe_schema(schema);
-        spent += name.len() + rendered.len() + description.len();
+        // Price the schema itself, not a rendering of it: the JSON below is
+        // what the model reads, and parameter definitions are the reason it
+        // asked.
+        spent += name.len() + description.len() + schema.to_string().len();
         if spent > FIND_BUDGET && !described.is_empty() {
             break;
         }
         described.push(json!({
             "name": name,
             "description": clip(description, FIND_DESCRIPTION_CHARS),
-            "schema": rendered,
+            "parameters": schema,
         }));
     }
 
@@ -456,7 +471,7 @@ fn search(catalogue: &Catalogue<'_>, args: &Value) -> Value {
         "total": entries.len(),
         "tools": described,
         "other_names": names_only,
-        "hint": "Call call_tool with {name, args} to run one.",
+        "hint": "Call call_tool with {name, args}, where args is an object matching that tool's parameters. Call find_tool with {name: \"<tool>\"} for the full schema of any name in other_names.",
     });
     if result.to_string().len() > FIND_BUDGET + FIND_BUDGET / 2 {
         if let Some(object) = result.as_object_mut() {
@@ -514,13 +529,21 @@ fn score_text(words: &[String], name: &str, description: &str) -> i64 {
 /// turn.
 fn split_call(args: &Value) -> Result<(String, Value), String> {
     let Some(object) = args.as_object() else {
-        return Err("call_tool expects an object with a 'name' and 'args'".to_string());
+        return Err(format!(
+            "call_tool expects {{\"name\": \"<tool>\", \"args\": {{...}}}}, got {}",
+            value_kind(args)
+        ));
     };
     let Some(name) = object.get("name").and_then(Value::as_str) else {
-        return Err("call_tool needs the 'name' of the tool to run".to_string());
+        return Err(
+            "call_tool needs 'name' - the tool to run, as find_tool returned it, e.g. {\"name\": \"github_search\", \"args\": {...}}"
+                .to_string(),
+        );
     };
     if name == CALL_TOOL || name == FIND_TOOL {
-        return Err(format!("'{name}' cannot call itself"));
+        return Err(format!(
+            "'{name}' cannot call itself; name the tool you want it to run"
+        ));
     }
     let inner = match object.get("args") {
         Some(Value::Object(map)) => Value::Object(map.clone()),
@@ -536,6 +559,120 @@ fn split_call(args: &Value) -> Result<(String, Value), String> {
         Some(other) => other.clone(),
     };
     Ok((name.to_string(), inner))
+}
+
+/// A JSON value's kind, for an error that says what arrived instead.
+fn value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
+/// The tool a dispatch names, whichever trait it implements.
+///
+/// Carrying the target as one value keeps the schema beside the runner, so an
+/// error cannot quote one tool's arguments while another tool runs.
+enum Target {
+    /// A synchronous tool.
+    Sync(Arc<dyn Tool>),
+    /// An asynchronous tool.
+    Async(Arc<dyn AsyncTool>),
+}
+
+impl Target {
+    /// The argument schema this target publishes to the model.
+    fn schema(&self) -> Value {
+        match self {
+            Self::Sync(tool) => tool.json_schema(),
+            Self::Async(tool) => tool.json_schema(),
+        }
+    }
+}
+
+/// Resolve one name in one registry, with the names it is a near miss for.
+///
+/// Async first, the order [ToolRegistry::execute] uses: one name cannot be
+/// registered in both maps, but two dispatch paths that disagreed about
+/// precedence would be a defect waiting for the first duplicate.
+fn resolve_in(registry: &ToolRegistry, name: &str) -> (Option<Target>, Vec<String>) {
+    let target = registry
+        .get_async(name)
+        .map(Target::Async)
+        .or_else(|| registry.get(name).map(Target::Sync));
+    // A near miss runs in both directions: a name the tool list contains to
+    // spare ("search" for "github_search"), and a name that contains a
+    // registered one because the model added a letter ("create_issues").
+    let similar = registry
+        .list()
+        .into_iter()
+        .filter(|candidate| {
+            candidate != name && (candidate.contains(name) || name.contains(candidate))
+        })
+        .take(8)
+        .collect();
+    (target, similar)
+}
+
+/// What a call that names no registered tool says back.
+///
+/// A near miss is the ordinary failure of a name retyped from memory, so the
+/// message lists the candidates AND both calls that turn a guess into a
+/// schema: a query to find the tool, an exact name to read its arguments.
+fn unknown_tool(name: &str, similar: &[String]) -> String {
+    let mut message = name.to_string();
+    if !similar.is_empty() {
+        message.push_str(&format!(" (similar: {})", similar.join(", ")));
+    }
+    message.push_str(
+        ". Call find_tool with a query for what you need to do, or with {\"name\": \"<tool>\"} for one tool's full schema.",
+    );
+    message
+}
+
+/// What a call whose arguments the schema rejects says back.
+///
+/// The mismatch alone ("missing required field: url") leaves the model to
+/// reconstruct the rest from a result it may not still be reading, so the
+/// error quotes the whole shape the tool takes, and the wrapper that carries
+/// it.
+fn rejected_arguments(name: &str, error: &ToolError, schema: &Value) -> String {
+    let mismatch = match error {
+        ToolError::SchemaMismatch { message } => message.as_str(),
+        ToolError::Failed(text)
+        | ToolError::InvalidInput(text)
+        | ToolError::NotFound(text)
+        | ToolError::Timeout(text) => text.as_str(),
+    };
+    format!(
+        "{name} rejected the arguments: {mismatch}. It expects {}. Pass those fields as args: {{\"name\": \"{name}\", \"args\": {{...}}}}.",
+        describe_schema(schema)
+    )
+}
+
+/// What a failed dispatch says back to the model.
+///
+/// The message used to be "{name}: {error:?}", which buried the tool's own
+/// sentence inside a debug rendering of the error; the model read the wrapper
+/// instead of the instruction it was given. A rejected argument is the one
+/// class the schema answers, so that error quotes the shape it expects.
+fn dispatch_failure(name: &str, error: ToolError, schema: &Value) -> ToolError {
+    match error {
+        ToolError::InvalidInput(text) => ToolError::InvalidInput(format!(
+            "{name}: {text}. It expects {}.",
+            describe_schema(schema)
+        )),
+        ToolError::SchemaMismatch { message } => ToolError::SchemaMismatch {
+            message: format!("{name}: {message}. It expects {}.", describe_schema(schema)),
+        },
+        ToolError::Failed(text) => ToolError::Failed(format!("{name}: {text}")),
+        ToolError::NotFound(text) => ToolError::NotFound(format!("{name}: {text}")),
+        ToolError::Timeout(text) => ToolError::Timeout(format!("{name}: {text}")),
+    }
 }
 
 /// The dispatcher: run any registered tool by name.
@@ -570,54 +707,43 @@ impl AsyncTool for CallTool {
         // The registry guards are read and dropped before anything is awaited:
         // a std lock held across an await is neither Send nor a good idea while
         // a tool runs.
-        let mut async_tool = None;
-        let mut sync_tool = None;
+        let mut target = None;
         let mut similar: Vec<String> = Vec::new();
         if let Some(registry) = self.registry.as_deref() {
-            async_tool = registry.get_async(&name);
-            sync_tool = registry.get(&name);
-            similar.extend(
-                registry
-                    .list()
-                    .into_iter()
-                    .filter(|candidate| candidate != &name && candidate.contains(name.as_str()))
-                    .take(8),
-            );
+            let (found, near) = resolve_in(registry, &name);
+            target = found;
+            similar.extend(near);
         }
-        if async_tool.is_none() && sync_tool.is_none() {
+        if target.is_none() {
             if let Ok(live) = self.live.read() {
-                async_tool = live.get_async(&name);
-                sync_tool = live.get(&name);
-                similar.extend(
-                    live.list()
-                        .into_iter()
-                        .filter(|candidate| candidate != &name && candidate.contains(name.as_str()))
-                        .take(8),
-                );
+                let (found, near) = resolve_in(&live, &name);
+                target = found;
+                similar.extend(near);
             }
-        }
-
-        if let Some(tool) = async_tool {
-            return tool
-                .run(&inner)
-                .await
-                .map_err(|error| ToolError::Failed(format!("{name}: {error:?}")));
-        }
-        if let Some(tool) = sync_tool {
-            return tool
-                .run(&inner)
-                .map_err(|error| ToolError::Failed(format!("{name}: {error:?}")));
         }
         similar.sort();
         similar.dedup();
-        Err(ToolError::NotFound(format!(
-            "{name} (call find_tool to discover the right name{}).",
-            if similar.is_empty() {
-                String::new()
-            } else {
-                format!("; similar: {}", similar.join(", "))
-            }
-        )))
+        let Some(target) = target else {
+            return Err(ToolError::NotFound(unknown_tool(&name, &similar)));
+        };
+
+        // Arguments are checked against the schema the tool publishes before
+        // it runs, exactly as a direct call through ToolRegistry::execute is.
+        // Without this the dispatcher was the one entry point that forwarded
+        // whatever the model guessed, so the tool failed on its own internals
+        // and the model never learned which field was wrong.
+        let schema = target.schema();
+        if let Err(error) = validate_args(&schema, &inner) {
+            return Err(ToolError::SchemaMismatch {
+                message: rejected_arguments(&name, &error, &schema),
+            });
+        }
+
+        let result = match &target {
+            Target::Sync(tool) => tool.run(&inner),
+            Target::Async(tool) => tool.run(&inner).await,
+        };
+        result.map_err(|error| dispatch_failure(&name, error, &schema))
     }
 
     /// The engine resolves the target before dispatch, so hooks, bus events,
@@ -785,7 +911,12 @@ mod tests {
         let result = search(&catalogue, &json!({"query": "open an issue"}));
         let tools = result["tools"].as_array().unwrap();
         assert_eq!(tools[0]["name"], "create_issue");
-        assert!(tools[0]["schema"].as_str().unwrap().contains("x"));
+        // A query result carries the schema itself, not a shorthand of it:
+        // the model has to send that JSON back through call_tool.
+        assert_eq!(
+            tools[0]["parameters"]["properties"]["x"]["type"],
+            json!("string")
+        );
         // Only tools that matched are listed: an unrelated tool is not
         // offered in the "other names" tail, because nothing recommends it.
         let rest = result["other_names"].as_array().unwrap();
@@ -961,5 +1092,171 @@ mod tests {
         let result = search(&catalogue, &json!({"name": "alpha"}));
         assert_eq!(result["name"], "alpha");
         assert_eq!(result["parameters"]["type"], "object");
+    }
+
+    /// A shortlisted tool comes back with the JSON Schema the call has to
+    /// match, not a rendering of it: the model sends args field for field, and
+    /// a shorthand drops the nesting, the required list and the defaults.
+    #[test]
+    fn a_search_returns_the_argument_schema_a_call_has_to_match() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(Arc::new(FunctionTool::new(
+                "create_issue",
+                "Open a tracker issue",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string", "description": "Issue title"},
+                        "labels": {"type": "array", "items": {"type": "string"}}
+                    },
+                    "required": ["title"]
+                }),
+                |_| Ok(json!({})),
+            )))
+            .unwrap();
+        registry.mark_mcp_tool("create_issue");
+        let catalogue = Catalogue {
+            registry: Some(&registry),
+            live: None,
+            withheld: Withheld::default(),
+        };
+
+        let result = search(&catalogue, &json!({"query": "open an issue"}));
+        let parameters = &result["tools"][0]["parameters"];
+        assert_eq!(parameters["required"], json!(["title"]));
+        assert_eq!(
+            parameters["properties"]["title"]["description"],
+            json!("Issue title")
+        );
+        assert!(
+            result["tools"][0].get("schema").is_none(),
+            "the free-form rendering is gone: {result}"
+        );
+    }
+
+    /// The dispatcher's own test registry: one tool whose schema requires a
+    /// field, and one that fails at run time the way a precondition does.
+    fn dispatch_registry() -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(Arc::new(FunctionTool::new(
+                "create_issue",
+                "Open a tracker issue",
+                json!({
+                    "type": "object",
+                    "properties": {"title": {"type": "string"}},
+                    "required": ["title"]
+                }),
+                |_| Ok(json!({"issue": 1})),
+            )))
+            .unwrap();
+        registry
+            .register(Arc::new(FunctionTool::new(
+                "browser_reload",
+                "Reload the open page",
+                json!({"type": "object", "properties": {}}),
+                |_| {
+                    Err(ToolError::Failed(
+                        "There is no page to reload. Call browser_open with a URL.".to_string(),
+                    ))
+                },
+            )))
+            .unwrap();
+        registry
+    }
+
+    fn dispatcher(registry: ToolRegistry) -> CallTool {
+        CallTool::new(
+            Some(Arc::new(registry)),
+            Arc::new(std::sync::RwLock::new(ToolRegistry::new())),
+        )
+    }
+
+    /// Arguments are validated before dispatch, exactly as a direct call is,
+    /// and the rejection says which field is wrong AND the shape the tool
+    /// takes - the mismatch alone leaves the model guessing at the rest.
+    #[tokio::test]
+    async fn the_dispatcher_rejects_arguments_the_schema_forbids() {
+        let dispatcher = dispatcher(dispatch_registry());
+        let error = AsyncTool::run(
+            &dispatcher,
+            &json!({"name": "create_issue", "args": {"labels": ["bug"]}}),
+        )
+        .await
+        .expect_err("a missing required field is refused before the tool runs");
+
+        assert!(
+            matches!(error, ToolError::SchemaMismatch { .. }),
+            "the argument class is kept: {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("missing required field: title"),
+            "the field at fault is named: {message}"
+        );
+        assert!(
+            message.contains("title: string"),
+            "the shape the tool expects is quoted: {message}"
+        );
+        assert!(
+            message.contains("\"name\": \"create_issue\""),
+            "and the wrapper that carries it: {message}"
+        );
+    }
+
+    /// A valid call still runs. Validation is a guard against a wrong shape,
+    /// not a second implementation of the tool.
+    #[tokio::test]
+    async fn the_dispatcher_runs_arguments_the_schema_accepts() {
+        let dispatcher = dispatcher(dispatch_registry());
+        let result = AsyncTool::run(
+            &dispatcher,
+            &json!({"name": "create_issue", "args": {"title": "bug"}}),
+        )
+        .await
+        .expect("a matching call runs");
+        assert_eq!(result["issue"], 1);
+    }
+
+    /// A tool's own failure reaches the model as the sentence the tool wrote,
+    /// not as a debug rendering of the error that wraps it. That rendering is
+    /// what turned "call browser_open with a URL" into a line about Failed("...").
+    #[tokio::test]
+    async fn a_failed_dispatch_quotes_the_tool_not_a_debug_rendering() {
+        let dispatcher = dispatcher(dispatch_registry());
+        let error = AsyncTool::run(&dispatcher, &json!({"name": "browser_reload", "args": {}}))
+            .await
+            .expect_err("the tool refuses to reload nothing");
+
+        let message = error.to_string();
+        assert!(
+            message.contains(
+                "browser_reload: There is no page to reload. Call browser_open with a URL."
+            ),
+            "the tool's sentence arrives intact: {message}"
+        );
+        assert!(
+            !message.contains("Failed(") && !message.contains("\"There is no page"),
+            "no debug wrapper survives: {message}"
+        );
+    }
+
+    /// A name that is a near miss of a registered tool names the candidates
+    /// and the two calls that turn a guess into a schema.
+    #[tokio::test]
+    async fn an_unknown_name_points_at_find_tool() {
+        let dispatcher = dispatcher(dispatch_registry());
+        let error = AsyncTool::run(
+            &dispatcher,
+            &json!({"name": "create_issues", "args": {"title": "bug"}}),
+        )
+        .await
+        .expect_err("no such tool");
+
+        assert!(matches!(error, ToolError::NotFound(_)), "{error:?}");
+        let message = error.to_string();
+        assert!(message.contains("similar: create_issue"), "{message}");
+        assert!(message.contains("find_tool"), "{message}");
     }
 }

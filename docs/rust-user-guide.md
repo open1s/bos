@@ -400,6 +400,14 @@ tools are advertised in its place: `find_tool` (a ranked search over the
 withheld tools - a tool the model already has is never a result) and
 `call_tool` (`{name, args}`).
 
+`find_tool` answers with each shortlisted tool's full JSON Schema under
+`parameters`, not a short rendering of it, so the model has the field names,
+types and `required` list the call must match. `call_tool` validates `args`
+against that same schema before dispatch, exactly as a direct call does; a
+rejected call names the field at fault and quotes the shape the tool expects,
+and a failure at run time carries the tool's own sentence rather than a debug
+rendering of it.
+
 ```rust
 let agent = Agent::from_config(AgentConfig::default())
     .defer_tool("image_generate")    // one name

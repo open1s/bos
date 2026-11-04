@@ -55,7 +55,7 @@ You are the agent inside a harness: get work done with tools instead of talking 
 ///
 /// The wording names the two tools by their registered names and nothing else,
 /// so it stays true when a host renames its file tools or adds an MCP server.
-pub const DISCOVERY_GUIDANCE: &str = "You are given a subset of this machine's tools. When the tool you need is not among them, call find_tool with what you need to do - or with no query to list every name - then call call_tool with {name, args} to run it. Do not conclude a capability is missing before searching for it.";
+pub const DISCOVERY_GUIDANCE: &str = "You are given a subset of this machine's tools. When the tool you need is not among them, call find_tool with what you need to do - or with no query to list every name - then call call_tool with {name, args}, where args matches the parameters find_tool returned. Do not conclude a capability is missing before searching for it.";
 
 /// What the model is told when skills are searched instead of catalogued.
 ///

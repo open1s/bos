@@ -537,7 +537,7 @@ skill_dir: {}
                                 let result_text = cap_tool_result(
                                     &match &result {
                                         Ok(ret) => ret.to_string(),
-                                        Err(error) => format!("Error: {error:?}"),
+                                        Err(error) => format!("Error: {error}"),
                                     },
                                     self.tool_result_cap,
                                 );
@@ -759,7 +759,7 @@ skill_dir: {}
                                 let result_text = cap_tool_result(
                                     &match &result {
                                         Ok(ret) => ret.to_string(),
-                                        Err(error) => format!("Error: {error:?}"),
+                                        Err(error) => format!("Error: {error}"),
                                     },
                                     self.tool_result_cap,
                                 );
