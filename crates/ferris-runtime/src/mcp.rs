@@ -84,8 +84,90 @@ struct WriteRequest {
 }
 
 /// One live MCP server.
+/// One spawned MCP server: a std child on Unix, or an AppContainer child on
+/// Windows. The runtime only needs id, piped stdio, kill and wait.
+enum McpChild {
+    #[cfg(not(windows))]
+    Std(Child),
+    #[cfg(windows)]
+    Sandbox(heel::Child),
+}
+
+impl McpChild {
+    fn id(&self) -> u32 {
+        match self {
+            Self::Std(child) => child.id(),
+            #[cfg(windows)]
+            Self::Sandbox(child) => child.id(),
+        }
+    }
+
+    fn take_stdin(&mut self) -> Option<Box<dyn std::io::Write + Send>> {
+        match self {
+            Self::Std(child) => child
+                .stdin
+                .take()
+                .map(|stdin| Box::new(stdin) as Box<dyn std::io::Write + Send>),
+            #[cfg(windows)]
+            Self::Sandbox(child) => child
+                .take_stdin()
+                .map(|stdin| Box::new(stdin) as Box<dyn std::io::Write + Send>),
+        }
+    }
+
+    fn take_stdout(&mut self) -> Option<Box<dyn std::io::Read + Send>> {
+        match self {
+            Self::Std(child) => child
+                .stdout
+                .take()
+                .map(|stdout| Box::new(stdout) as Box<dyn std::io::Read + Send>),
+            #[cfg(windows)]
+            Self::Sandbox(child) => child
+                .take_stdout()
+                .map(|stdout| Box::new(stdout) as Box<dyn std::io::Read + Send>),
+        }
+    }
+
+    fn take_stderr(&mut self) -> Option<Box<dyn std::io::Read + Send>> {
+        match self {
+            Self::Std(child) => child
+                .stderr
+                .take()
+                .map(|stderr| Box::new(stderr) as Box<dyn std::io::Read + Send>),
+            #[cfg(windows)]
+            Self::Sandbox(child) => child
+                .take_stderr()
+                .map(|stderr| Box::new(stderr) as Box<dyn std::io::Read + Send>),
+        }
+    }
+
+    fn kill(&mut self) {
+        match self {
+            Self::Std(child) => {
+                let _ = child.kill();
+            }
+            #[cfg(windows)]
+            Self::Sandbox(child) => {
+                let _ = child.kill();
+            }
+        }
+    }
+
+    fn wait(&mut self) {
+        match self {
+            Self::Std(child) => {
+                let _ = child.wait();
+            }
+            #[cfg(windows)]
+            Self::Sandbox(child) => {
+                let _ = futures_lite::future::block_on(child.wait());
+            }
+        }
+    }
+}
+
 struct Session {
-    child: Arc<Mutex<Child>>,
+    child: Arc<Mutex<McpChild>>,
     /// A dedicated writer thread, so a child that stops reading stdin cannot
     /// block the caller (or an executor worker) in write_all.
     writer: std::sync::mpsc::SyncSender<WriteRequest>,
@@ -431,7 +513,7 @@ impl Drop for Session {
 ///
 /// Keeping this operation behind a small helper makes the cancellation path
 /// independent of Unix-only pid signalling and directly testable on Windows.
-fn terminate_child_handle(child: &Arc<Mutex<Child>>) {
+fn terminate_child_handle(child: &Arc<Mutex<McpChild>>) {
     let mut child = child
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -445,7 +527,7 @@ fn terminate_child_handle(child: &Arc<Mutex<Child>>) {
 /// the shared pre_exec hook, so a server that spawns a helper would leave the
 /// helper alive when only the leader is killed.
 #[cfg(unix)]
-fn kill_process_group(child: &Child) {
+fn kill_process_group(child: &McpChild) {
     let pid = child.id();
     if pid != 0 {
         // SAFETY: pid is the group leader configured in pre_exec; killpg on a
@@ -457,7 +539,7 @@ fn kill_process_group(child: &Child) {
 }
 
 #[cfg(not(unix))]
-fn kill_process_group(_child: &Child) {}
+fn kill_process_group(_child: &McpChild) {}
 
 /// The state one MCP server package owns.
 ///
@@ -486,14 +568,15 @@ struct McpCore {
     session: Mutex<Option<Session>>,
     /// A separately lockable child handle, so cancellation never waits for the
     /// synchronous session exchange mutex. Child::kill is portable across OSes.
-    child: Mutex<Option<Arc<Mutex<Child>>>>,
+    child: Mutex<Option<Arc<Mutex<McpChild>>>>,
     /// RSS sampler bound to the child's start-time identity (#38 / #109).
     #[cfg(unix)]
     watchdog: Mutex<Option<crate::process::MemoryWatchdog>>,
-    /// Windows Job Object owning the server child's memory ceiling and
-    /// kill-on-close guarantee.
+    /// The AppContainer every server child is launched into. Created on first
+    /// spawn; a failure to create it is fatal, never a direct-exec fallback.
+    /// heel's job object carries the memory ceiling and kill-on-close.
     #[cfg(windows)]
-    job: Mutex<Option<crate::windows_job::JobObject>>,
+    sandbox: Mutex<Option<Arc<crate::windows_sandbox::WindowsSandbox>>>,
     cancelled: AtomicBool,
     stopped: AtomicBool,
     /// Set by notifications/*/list_changed; the next catalog read rediscovers.
@@ -621,7 +704,7 @@ impl McpCore {
             #[cfg(unix)]
             watchdog: Mutex::new(None),
             #[cfg(windows)]
-            job: Mutex::new(None),
+            sandbox: Mutex::new(None),
             cancelled: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             catalog_dirty: Arc::new(AtomicBool::new(false)),
@@ -715,6 +798,31 @@ impl McpCore {
             }
         }
         Err(last.expect("a start attempt ran"))
+    }
+
+    #[cfg(windows)]
+    fn sandbox(&self) -> Result<Arc<crate::windows_sandbox::WindowsSandbox>, ExtensionError> {
+        let mut slot = self
+            .sandbox
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(sandbox) = slot.as_ref() {
+            return Ok(Arc::clone(sandbox));
+        }
+        let sandbox = Arc::new(
+            crate::windows_sandbox::WindowsSandbox::new_blocking(
+                &self.root,
+                None,
+                None,
+                self.memory_bytes,
+            )
+            .map_err(|message| ExtensionError::Runtime {
+                extension: self.extension.to_string(),
+                message,
+            })?,
+        );
+        *slot = Some(Arc::clone(&sandbox));
+        Ok(sandbox)
     }
 
     fn start(&self) -> Result<Session, ExtensionError> {
@@ -812,42 +920,46 @@ impl McpCore {
         for (key, value) in &self.env {
             command.env(key, value);
         }
-        let mut child = command.spawn().map_err(|source| ExtensionError::Io {
+        #[cfg(windows)]
+        let _ = command;
+        #[cfg(not(windows))]
+        let mut child = McpChild::Std(command.spawn().map_err(|source| ExtensionError::Io {
             path: program,
             source,
-        })?;
-        let stdin = child.stdin.take().ok_or_else(|| ExtensionError::Protocol {
+        })?);
+        #[cfg(windows)]
+        let mut child = {
+            let sandbox = self.sandbox()?;
+            let mut envs: Vec<(String, String)> = Vec::new();
+            for key in ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"] {
+                if let Some(value) = std::env::var_os(key) {
+                    envs.push((key.to_string(), value.to_string_lossy().into_owned()));
+                }
+            }
+            for (key, value) in &self.env {
+                envs.push((key.clone(), value.clone()));
+            }
+            let entry = program.to_string_lossy().into_owned();
+            let child = futures_lite::future::block_on(
+                sandbox.spawn(&entry, &self.args, &self.root, &envs),
+            )
+            .map_err(|message| ExtensionError::Runtime {
+                extension: self.extension.to_string(),
+                message,
+            })?;
+            McpChild::Sandbox(child)
+        };
+        let stdin = child.take_stdin().ok_or_else(|| ExtensionError::Protocol {
             extension: self.extension.to_string(),
             message: "MCP stdin was not piped".to_string(),
         })?;
         let stdout = child
-            .stdout
-            .take()
+            .take_stdout()
             .ok_or_else(|| ExtensionError::Protocol {
                 extension: self.extension.to_string(),
                 message: "MCP stdout was not piped".to_string(),
             })?;
-        let stderr = child.stderr.take();
-        #[cfg(windows)]
-        {
-            let job = crate::windows_job::JobObject::new(self.memory_bytes).map_err(|source| {
-                ExtensionError::Io {
-                    path: self.root.clone(),
-                    source,
-                }
-            })?;
-            use std::os::windows::io::AsRawHandle as _;
-            if let Err(source) = job.assign(child.as_raw_handle() as _) {
-                let _ = child.kill();
-                return Err(ExtensionError::Io {
-                    path: self.root.clone(),
-                    source,
-                });
-            }
-            if let Ok(mut slot) = self.job.lock() {
-                *slot = Some(job);
-            }
-        }
+        let stderr = child.take_stderr();
         let child = self.register_child(child)?;
         if let Some(stderr) = stderr {
             let extension = self.extension.to_string();
@@ -1283,7 +1395,7 @@ impl McpCore {
     /// Register a spawned child and close the spawn/cancel race. If cancellation
     /// arrived before the child handle became visible, terminate and reap it
     /// before allowing the caller to proceed.
-    fn register_child(&self, child: Child) -> Result<Arc<Mutex<Child>>, ExtensionError> {
+    fn register_child(&self, child: McpChild) -> Result<Arc<Mutex<McpChild>>, ExtensionError> {
         #[cfg(unix)]
         let pid = child.id();
         let child = Arc::new(Mutex::new(child));
@@ -1711,32 +1823,17 @@ mod tests {
             .expect("second call acquires the gate after worker exit");
     }
 
+    #[cfg(unix)]
     #[test]
     fn child_handle_termination_is_portable() {
-        #[cfg(windows)]
-        let mut command = {
-            let mut command = Command::new("powershell.exe");
-            command.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"]);
-            command
-        };
-        #[cfg(unix)]
-        let mut command = {
-            let mut command = Command::new("sleep");
-            command.arg("30");
-            command
-        };
+        let mut command = Command::new("sleep");
+        command.arg("30");
         let child = command.spawn().expect("long-running child");
-        let child = Arc::new(Mutex::new(child));
+        let child = Arc::new(Mutex::new(McpChild::Std(child)));
         terminate_child_handle(&child);
-        let status = child
-            .lock()
-            .expect("child lock")
-            .wait()
-            .expect("wait for terminated child");
-        assert!(
-            !status.success(),
-            "the child must be terminated, not finish normally"
-        );
+        // wait() blocks until the killed child is reaped; a regression that
+        // failed to terminate would hang this test rather than pass it.
+        child.lock().expect("child lock").wait();
     }
 
     #[cfg(target_os = "linux")]

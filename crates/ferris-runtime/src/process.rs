@@ -45,12 +45,52 @@ pub const HANDSHAKE_MS: u64 = 10_000;
 pub const SHUTDOWN_MS: u64 = 1_000;
 
 /// One live child process.
+#[cfg(not(windows))]
+type ProcessChild = Child;
+#[cfg(windows)]
+type ProcessChild = heel::Child;
+
+#[cfg(not(windows))]
+type ProcessStdin = ChildStdin;
+#[cfg(windows)]
+type ProcessStdin = tokio::fs::File;
+
+#[cfg(not(windows))]
+type ProcessStdout = ChildStdout;
+#[cfg(windows)]
+type ProcessStdout = tokio::fs::File;
+
 struct ProcessSession {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    child: ProcessChild,
+    stdin: ProcessStdin,
+    stdout: BufReader<ProcessStdout>,
     next_id: u64,
     token: String,
+}
+
+/// Kill the session child through the platform handle.
+fn start_kill(child: &mut ProcessChild) {
+    #[cfg(not(windows))]
+    let _ = child.start_kill();
+    #[cfg(windows)]
+    let _ = child.kill();
+}
+
+/// Wait for the session child, ignoring the exit status.
+async fn wait_child(child: &mut ProcessChild) {
+    let _ = child.wait().await;
+}
+
+/// The child pid, when the platform handle exposes one.
+fn child_id(child: &ProcessChild) -> Option<u32> {
+    #[cfg(not(windows))]
+    {
+        child.id()
+    }
+    #[cfg(windows)]
+    {
+        Some(child.id())
+    }
 }
 
 impl ProcessSession {
@@ -930,10 +970,10 @@ pub struct ProcessRuntime {
     /// Bound to the spawned child's identity and cancelled on every stop path.
     #[cfg(unix)]
     watchdog: StdMutex<Option<MemoryWatchdog>>,
-    /// The Windows Job Object owning this child's memory ceiling and
-    /// kill-on-close guarantee.
+    /// The AppContainer child processes run in. Created on first spawn; a
+    /// failure is fatal, never a direct-exec fallback.
     #[cfg(windows)]
-    job: StdMutex<Option<crate::windows_job::JobObject>>,
+    sandbox: tokio::sync::Mutex<Option<std::sync::Arc<crate::windows_sandbox::WindowsSandbox>>>,
 }
 
 impl ProcessRuntime {
@@ -979,14 +1019,18 @@ impl ProcessRuntime {
             policy: None,
             // Process extensions are untrusted code: require the platform OS sandbox by default.
             // On Linux, a missing/unsupported bubblewrap must fail the spawn rather than fall back.
-            sandbox: cfg!(any(target_os = "linux", target_os = "macos")),
+            sandbox: cfg!(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "windows"
+            )),
             child_pid: AtomicU32::new(0),
             session: Mutex::new(None),
             subscriptions: std::sync::Mutex::new(Vec::new()),
             #[cfg(unix)]
             watchdog: StdMutex::new(None),
             #[cfg(windows)]
-            job: StdMutex::new(None),
+            sandbox: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -1141,6 +1185,32 @@ impl ProcessRuntime {
 
     /// Start with two bounded retries; a failed handshake leaves no tool side
     /// effect, so retrying the transport is safe. Delays are 100ms and 250ms.
+    /// The AppContainer this runtime's children run in, created once.
+    #[cfg(windows)]
+    async fn sandbox(
+        &self,
+    ) -> Result<std::sync::Arc<crate::windows_sandbox::WindowsSandbox>, ExtensionError> {
+        let mut slot = self.sandbox.lock().await;
+        if let Some(sandbox) = slot.as_ref() {
+            return Ok(std::sync::Arc::clone(sandbox));
+        }
+        let sandbox = std::sync::Arc::new(
+            crate::windows_sandbox::WindowsSandbox::new(
+                &self.root,
+                self.workspace.as_deref(),
+                self.data_root.as_deref(),
+                self.memory_bytes,
+            )
+            .await
+            .map_err(|message| ExtensionError::Runtime {
+                extension: self.extension.to_string(),
+                message,
+            })?,
+        );
+        *slot = Some(std::sync::Arc::clone(&sandbox));
+        Ok(sandbox)
+    }
+
     async fn start_with_retry(&self) -> Result<ProcessSession, ExtensionError> {
         let mut last = None;
         for delay in [0_u64, 100, 250] {
@@ -1212,93 +1282,97 @@ impl ProcessRuntime {
             })?;
         }
         let token = uuid::Uuid::new_v4().to_string();
-        let mut wrapped = false;
-        let mut command = if self.sandbox && cfg!(target_os = "linux") {
-            wrapped = true;
-            let mut command = Command::new("bwrap");
-            command.args(linux_bwrap_plan(
-                &self.root,
-                self.workspace.as_deref(),
-                self.data_root.as_deref(),
-                &program,
-                &self.args,
-            ));
-            command
-        } else if self.sandbox && cfg!(target_os = "macos") {
-            let mut command = Command::new("/usr/bin/sandbox-exec");
-            command
-                .arg("-p")
-                .arg(sandbox_profile(
+        #[cfg(not(windows))]
+        let mut child = {
+            let mut wrapped = false;
+            let mut command = if self.sandbox && cfg!(target_os = "linux") {
+                wrapped = true;
+                let mut command = Command::new("bwrap");
+                command.args(linux_bwrap_plan(
                     &self.root,
                     self.workspace.as_deref(),
                     self.data_root.as_deref(),
-                ))
-                .arg(&program);
+                    &program,
+                    &self.args,
+                ));
+                command
+            } else if self.sandbox && cfg!(target_os = "macos") {
+                let mut command = Command::new("/usr/bin/sandbox-exec");
+                command
+                    .arg("-p")
+                    .arg(sandbox_profile(
+                        &self.root,
+                        self.workspace.as_deref(),
+                        self.data_root.as_deref(),
+                    ))
+                    .arg(&program);
+                command
+            } else {
+                Command::new(&program)
+            };
+            configure_process_limits(&mut command, self.memory_bytes, self.cpu_seconds);
+            if !wrapped {
+                command.args(&self.args);
+            }
             command
-        } else {
-            Command::new(&program)
-        };
-        configure_process_limits(&mut command, self.memory_bytes, self.cpu_seconds);
-        if !wrapped {
-            command.args(&self.args);
-        }
-        command
-            .current_dir(&self.root)
-            .env_clear()
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        command.env("BSH_IPC_TOKEN", &token);
-        for key in ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"] {
-            if let Some(value) = std::env::var_os(key) {
+                .current_dir(&self.root)
+                .env_clear()
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            command.env("BSH_IPC_TOKEN", &token);
+            for key in ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"] {
+                if let Some(value) = std::env::var_os(key) {
+                    command.env(key, value);
+                }
+            }
+            for (key, value) in &self.env {
                 command.env(key, value);
             }
-        }
-        for (key, value) in &self.env {
-            command.env(key, value);
-        }
-        let mut child = command.spawn().map_err(|source| ExtensionError::Io {
-            path: program.clone(),
-            source,
-        })?;
-        if let Some(pid) = child.id() {
+            command.spawn().map_err(|source| ExtensionError::Io {
+                path: program.clone(),
+                source,
+            })?
+        };
+        #[cfg(windows)]
+        let mut child = {
+            let sandbox = self.sandbox().await?;
+            let mut envs = vec![("BSH_IPC_TOKEN".to_string(), token.clone())];
+            for key in ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"] {
+                if let Some(value) = std::env::var_os(key) {
+                    envs.push((key.to_string(), value.to_string_lossy().into_owned()));
+                }
+            }
+            for (key, value) in &self.env {
+                envs.push((key.clone(), value.clone()));
+            }
+            sandbox
+                .spawn(&program.to_string_lossy(), &self.args, &self.root, &envs)
+                .await
+                .map_err(|message| ExtensionError::Runtime {
+                    extension: self.extension.to_string(),
+                    message,
+                })?
+        };
+        if let Some(pid) = child_id(&child) {
             self.child_pid.store(pid, Ordering::Relaxed);
             #[cfg(unix)]
             self.start_watchdog(pid);
-            #[cfg(windows)]
-            {
-                let job =
-                    crate::windows_job::JobObject::new(self.memory_bytes).map_err(|source| {
-                        ExtensionError::Io {
-                            path: self.root.clone(),
-                            source,
-                        }
-                    })?;
-                let Some(raw) = child.raw_handle() else {
-                    let _ = child.start_kill();
-                    return Err(ExtensionError::Runtime {
-                        extension: self.extension.to_string(),
-                        message: "the child exposed no process handle for its job object"
-                            .to_string(),
-                    });
-                };
-                if let Err(source) = job.assign(raw as _) {
-                    let _ = child.start_kill();
-                    return Err(ExtensionError::Io {
-                        path: self.root.clone(),
-                        source,
-                    });
-                }
-                if let Ok(mut slot) = self.job.lock() {
-                    *slot = Some(job);
-                }
-            }
         }
+        #[cfg(not(windows))]
         let stdin = child.stdin.take().ok_or_else(|| ExtensionError::Protocol {
             extension: self.extension.to_string(),
             message: "child stdin was not piped".to_string(),
         })?;
+        #[cfg(windows)]
+        let stdin = tokio::fs::File::from_std(child.take_stdin().ok_or_else(|| {
+            ExtensionError::Protocol {
+                extension: self.extension.to_string(),
+                message: "the AppContainer child exposed no stdin".to_string(),
+            }
+        })?);
+        #[cfg(not(windows))]
         let stdout = child
             .stdout
             .take()
@@ -1306,8 +1380,19 @@ impl ProcessRuntime {
                 extension: self.extension.to_string(),
                 message: "child stdout was not piped".to_string(),
             })?;
+        #[cfg(windows)]
+        let stdout = tokio::fs::File::from_std(child.take_stdout().ok_or_else(|| {
+            ExtensionError::Protocol {
+                extension: self.extension.to_string(),
+                message: "the AppContainer child exposed no stdout".to_string(),
+            }
+        })?);
         let stderr_tail = Arc::new(StdMutex::new(VecDeque::<String>::new()));
-        if let Some(stderr) = child.stderr.take() {
+        #[cfg(not(windows))]
+        let stderr = child.stderr.take();
+        #[cfg(windows)]
+        let stderr = child.take_stderr().map(tokio::fs::File::from_std);
+        if let Some(stderr) = stderr {
             let extension = self.extension.clone();
             let tail = Arc::clone(&stderr_tail);
             tokio::spawn(async move {
@@ -1377,7 +1462,7 @@ impl ProcessRuntime {
             .and_then(Value::as_str)
             .unwrap_or_default();
         if !version.starts_with("1.") {
-            let _ = session.child.start_kill();
+            start_kill(&mut session.child);
             return Err(ExtensionError::Protocol {
                 extension: self.extension.to_string(),
                 message: format!(
@@ -1390,7 +1475,7 @@ impl ProcessRuntime {
             .and_then(Value::as_str)
             .unwrap_or_default();
         if echoed != session.token.as_str() {
-            let _ = session.child.start_kill();
+            start_kill(&mut session.child);
             return Err(ExtensionError::Protocol {
                 extension: self.extension.to_string(),
                 message: "process did not echo the handshake token".to_string(),
@@ -1401,12 +1486,6 @@ impl ProcessRuntime {
 
     async fn stop(&self) {
         self.stop_watchdog();
-        // Dropping the job kills the child and every descendant it created
-        // (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE).
-        #[cfg(windows)]
-        if let Ok(mut slot) = self.job.lock() {
-            *slot = None;
-        }
         let mut guard = self.session.lock().await;
         let Some(mut session) = guard.take() else {
             return;
@@ -1420,14 +1499,14 @@ impl ProcessRuntime {
         // id. Signal the whole group: a language server's grandchildren would
         // otherwise survive the parent and keep the workspace busy.
         #[cfg(unix)]
-        if let Some(pid) = session.child.id() {
+        if let Some(pid) = child_id(&session.child) {
             // SAFETY: pid is the group leader this runtime spawned.
             unsafe {
                 libc::killpg(pid as libc::pid_t, libc::SIGKILL);
             }
         }
-        let _ = session.child.start_kill();
-        let _ = session.child.wait().await;
+        start_kill(&mut session.child);
+        wait_child(&mut session.child).await;
         self.child_pid.store(0, Ordering::Relaxed);
     }
 }
