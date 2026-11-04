@@ -1004,28 +1004,48 @@ impl WasmRuntime {
                 message: "runtime is shut down".to_string(),
             });
         }
-        let instance = guard.as_mut().expect("instance");
-        self.prepare_call(
-            instance,
-            context.timeout_ms.min(self.resources.execution_ms()),
-        )?;
-        instance.store.data_mut().progress = progress;
-        let arguments = serde_json::to_string(&arguments).unwrap_or_default();
-        let result = instance.bindings.bsh_extension_extension().call_call_tool(
-            &mut instance.store,
-            name,
-            &arguments,
-            &context.correlation_id,
-        );
-        // Clear even when the guest trapped, so the next call cannot inherit
-        // a sender that belongs to this invocation.
-        instance.store.data_mut().progress = None;
-        self.record_fuel(&instance.store);
-        let result = result.map_err(|error| ExtensionError::Runtime {
-            extension: self.extension.to_string(),
-            message: error.to_string(),
-        })?;
+        let outcome = {
+            let instance = guard.as_mut().expect("instance");
+            match self.prepare_call(
+                instance,
+                context.timeout_ms.min(self.resources.execution_ms()),
+            ) {
+                Ok(()) => {
+                    instance.store.data_mut().progress = progress;
+                    let arguments = serde_json::to_string(&arguments).unwrap_or_default();
+                    let result = instance.bindings.bsh_extension_extension().call_call_tool(
+                        &mut instance.store,
+                        name,
+                        &arguments,
+                        &context.correlation_id,
+                    );
+                    // Clear even when the guest trapped, so the next call cannot
+                    // inherit a sender that belongs to this invocation.
+                    instance.store.data_mut().progress = None;
+                    self.record_fuel(&instance.store);
+                    Some(result)
+                }
+                Err(error) => {
+                    *guard = None;
+                    return Err(error);
+                }
+            }
+        };
+        let result = match outcome.expect("set above") {
+            Ok(result) => result,
+            Err(error) => {
+                // A trapped call leaves the component instance unusable; drop
+                // it so the next call re-instantiates instead of failing with
+                // "cannot enter component instance".
+                *guard = None;
+                return Err(ExtensionError::Runtime {
+                    extension: self.extension.to_string(),
+                    message: error.to_string(),
+                });
+            }
+        };
         let result = result.map_err(|error| host_failure(&self.extension, error))?;
+        let instance = guard.as_mut().expect("instance still present");
         self.deliver_events(instance)?;
         if result.is_error {
             return Err(ExtensionError::Runtime {
@@ -1495,5 +1515,80 @@ mod tests {
             "the fetch outlived the call deadline: {:?}",
             started.elapsed()
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_interrupts_pure_guest_computation_and_resets() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/extensions/wasm-spin")
+            .canonicalize()
+            .expect("the spin example exists");
+        let manifest = ferris_core::manifest_v2::load_package_manifest(&root).expect("manifest");
+        let scratch = scratch("spin");
+        let policy = Arc::new(
+            PolicyEngine::open(
+                scratch.join("grants.toml"),
+                scratch.join("audit.jsonl"),
+                PolicyMode::Enforce,
+            )
+            .expect("policy"),
+        );
+        let runtime = Arc::new(
+            WasmRuntime::new(
+                &manifest,
+                &root,
+                &scratch.join("data"),
+                policy,
+                EventBus::new(),
+                None,
+                "{}".to_string(),
+                TestTrust::Builtin,
+            )
+            .expect("runtime"),
+        );
+        let context = CallContext::new(
+            ExtensionId::parse("com.example.wasm-spin").expect("id"),
+            "test",
+            None,
+            60_000,
+        );
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let call = {
+            let runtime = Arc::clone(&runtime);
+            let context = context.clone();
+            tokio::spawn(async move {
+                runtime
+                    .call_tool_progress("spin", serde_json::json!({}), &context, Some(sender))
+                    .await
+            })
+        };
+        // The guest announces that it is inside the pure-compute loop; there
+        // are no further host calls, so only the epoch/fuel interrupt can stop
+        // it.
+        let progress = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("the guest started")
+            .expect("progress");
+        assert_eq!(progress["progress"], 1);
+        let started = Instant::now();
+        runtime.cancel().await.expect("cancel");
+        let outcome = tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .expect("the cancelled call returns")
+            .expect("join");
+        assert!(
+            outcome.is_err(),
+            "a spinning guest must be interrupted: {outcome:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // The same runtime serves the next call: prepare_call resets the
+        // cancellation flag and the deadline under the instance lock.
+        let result = runtime
+            .call_tool("echo", serde_json::json!({"x": 1}), &context)
+            .await
+            .expect("the next call succeeds");
+        assert_eq!(result["x"], 1);
+        runtime.shutdown().await.expect("shutdown");
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 }

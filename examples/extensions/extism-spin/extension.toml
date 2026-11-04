@@ -1,0 +1,45 @@
+schema_version = "2.0"
+
+[extension]
+id = "com.example.extism-spin"
+name = "Extism Spin"
+version = "1.0.0"
+description = "A pure-compute fixture used to test Extism cancellation"
+authors = ["BSH Example"]
+license = "MIT"
+
+[compatibility]
+host = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+
+[runtime]
+kind = "extism"
+
+[runtime.config]
+entry = "plugin.wasm"
+startup = "on-demand"
+
+[capabilities]
+required = ["agent.tools.register"]
+
+[[contribution]]
+kind = "tool"
+id = "spin"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "tool"
+id = "echo"
+
+[contribution.payload]
+
+[resources]
+max_memory_mb = 64
+max_execution_ms = 60000
+
+[dependencies]
+
+[services]
+provides = []
+requires = []

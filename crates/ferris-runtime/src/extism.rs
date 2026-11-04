@@ -1404,4 +1404,80 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_interrupts_a_spinning_plugin_and_recovers() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/extensions/extism-spin")
+            .canonicalize()
+            .expect("the spin example exists");
+        let manifest = ferris_core::manifest_v2::load_package_manifest(&root).expect("manifest");
+        let scratch = std::env::temp_dir().join(format!("bsh-extism-spin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).expect("scratch");
+        let policy = Arc::new(
+            PolicyEngine::open(
+                scratch.join("grants.toml"),
+                scratch.join("audit.jsonl"),
+                ferris_core::capability::PolicyMode::Enforce,
+            )
+            .expect("policy"),
+        );
+        let runtime = Arc::new(
+            ExtismRuntime::new(
+                &manifest,
+                &root,
+                &scratch.join("data"),
+                policy,
+                EventBus::new(),
+                None,
+                "{}".to_string(),
+                TrustLevel::Builtin,
+            )
+            .expect("runtime"),
+        );
+        let context = CallContext::new(
+            ExtensionId::parse("com.example.extism-spin").expect("id"),
+            "test",
+            None,
+            60_000,
+        );
+        let call = {
+            let runtime = Arc::clone(&runtime);
+            let context = context.clone();
+            tokio::spawn(async move {
+                runtime
+                    .call_tool("spin", serde_json::json!({}), &context)
+                    .await
+            })
+        };
+        // Wait deterministically for the worker to enter CALL_RUNNING: a
+        // cancel before the call acquires the plugin is cleared by the call's
+        // own idle transition.
+        for _ in 0..200 {
+            if runtime.call_state.load(Ordering::SeqCst) == CALL_RUNNING {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(runtime.call_state.load(Ordering::SeqCst), CALL_RUNNING);
+        let started = Instant::now();
+        runtime.cancel().await.expect("cancel");
+        let outcome = tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .expect("the cancelled call returns")
+            .expect("join");
+        assert!(
+            outcome.is_err(),
+            "a spinning plugin must be interrupted: {outcome:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let result = runtime
+            .call_tool("echo", serde_json::json!({"x": 1}), &context)
+            .await
+            .expect("the plugin recovers after cancellation");
+        assert_eq!(result["content"][0]["text"], "{\"x\":1}");
+        runtime.shutdown().await.expect("shutdown");
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
 }
