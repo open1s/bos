@@ -1082,6 +1082,8 @@ pub(crate) struct ExtensionHost {
     pump_generation: Arc<AtomicU64>,
     /// The active on-startup batch, owned so rebuild/shutdown can stop it.
     warm: Option<WarmStart>,
+    /// Runtimes whose shutdown timed out; retried by the next rebuild.
+    pending_shutdown: Vec<(String, Arc<dyn Runtime>)>,
     startup_millis: u64,
     crash_history: Vec<String>,
     languages: Vec<LanguageEntry>,
@@ -1211,6 +1213,7 @@ impl ExtensionHost {
             last_stamp: None,
             pump_generation: Arc::new(AtomicU64::new(0)),
             warm: None,
+            pending_shutdown: Vec::new(),
             startup_millis: 0,
             crash_history: Vec::new(),
             languages: Vec::new(),
@@ -1754,7 +1757,7 @@ impl ExtensionHost {
             .values()
             .filter_map(|entry| entry.runtime.clone())
             .collect();
-        let superseded = Self::superseded_runtimes(
+        let mut superseded = Self::superseded_runtimes(
             previous.values().filter_map(|entry| {
                 entry
                     .runtime
@@ -1763,7 +1766,17 @@ impl ExtensionHost {
             }),
             &current,
         );
+        // Retry anything a previous rebuild timed out on before starting the
+        // new generation's work.
+        superseded.append(&mut self.pending_shutdown);
+        let retain: BTreeMap<String, Arc<dyn Runtime>> = superseded.iter().cloned().collect();
         let report = Self::stop_runtimes(superseded);
+        for id in &report.timed_out {
+            if let Some(runtime) = retain.get(id) {
+                self.pending_shutdown
+                    .push((id.clone(), Arc::clone(runtime)));
+            }
+        }
         if !report.is_clean() {
             let summary = report.summary();
             log::warn!(
