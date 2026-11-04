@@ -28,6 +28,11 @@ pub struct ExtensionStorage {
     root: PathBuf,
     id: ExtensionId,
     max_bytes: u64,
+    /// An open handle to the namespace root. Operations are anchored to it so
+    /// a path component swapped after validation cannot redirect a read or
+    /// write outside the namespace.
+    #[cfg(unix)]
+    root_fd: std::sync::Arc<std::os::fd::OwnedFd>,
 }
 
 impl ExtensionStorage {
@@ -81,10 +86,26 @@ impl ExtensionStorage {
                 message: "the storage namespace escapes the data root".to_string(),
             });
         }
+        #[cfg(unix)]
+        let root_fd = {
+            use rustix::fs::{open, Mode, OFlags};
+            let fd = open(
+                &canonical_root,
+                OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|error| ExtensionError::Io {
+                path: root.clone(),
+                source: std::io::Error::from_raw_os_error(error.raw_os_error()),
+            })?;
+            std::sync::Arc::new(fd)
+        };
         Ok(Self {
             root,
             id: id.clone(),
             max_bytes: MAX_NAMESPACE_BYTES,
+            #[cfg(unix)]
+            root_fd,
         })
     }
 
@@ -161,27 +182,174 @@ impl ExtensionStorage {
         Ok(path)
     }
 
+    /// Walk a validated key from the root handle and return the parent
+    /// directory handle together with the final component. Intermediate
+    /// components are opened with O_NOFOLLOW, so a symlink planted after the
+    /// lexical check cannot be followed.
+    #[cfg(unix)]
+    fn anchored_parent(
+        &self,
+        key: &str,
+        create: bool,
+    ) -> Result<(std::os::fd::OwnedFd, std::ffi::OsString), ExtensionError> {
+        use rustix::fs::{mkdirat, openat, Mode, OFlags};
+        let relative = validate_relative_path(key).map_err(|reason| ExtensionError::Corrupt {
+            path: self.root.join(key),
+            message: reason,
+        })?;
+        let mut current = openat(
+            &*self.root_fd,
+            ".",
+            OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| self.io_error(&self.root, error))?;
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
+            let name = component.as_os_str();
+            if components.peek().is_none() {
+                return Ok((current, name.to_os_string()));
+            }
+            current = match openat(
+                &current,
+                name,
+                OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(fd) => fd,
+                Err(error) if create && error == rustix::io::Errno::NOENT => {
+                    mkdirat(&current, name, Mode::from_raw_mode(0o755))
+                        .map_err(|error| self.io_error(&self.root, error))?;
+                    openat(
+                        &current,
+                        name,
+                        OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    )
+                    .map_err(|error| self.io_error(&self.root, error))?
+                }
+                Err(error) => return Err(self.io_error(&self.root, error)),
+            };
+        }
+        Err(ExtensionError::Corrupt {
+            path: self.root.clone(),
+            message: "empty storage key".to_string(),
+        })
+    }
+
+    #[cfg(unix)]
+    fn io_error(&self, path: &Path, error: rustix::io::Errno) -> ExtensionError {
+        ExtensionError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::from_raw_os_error(error.raw_os_error()),
+        }
+    }
+
+    /// Write through the anchored root: temp file in the parent, fsync, then
+    /// renameat within that same directory handle.
+    #[cfg(unix)]
+    fn write_anchored(&self, key: &str, bytes: &[u8]) -> Result<(), ExtensionError> {
+        use rustix::fs::{openat, renameat, unlinkat, AtFlags, Mode, OFlags};
+        use std::io::Write as _;
+
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let (parent, leaf) = self.anchored_parent(key, true)?;
+        let temp = format!(
+            ".{}.tmp-{}-{}",
+            leaf.to_string_lossy(),
+            std::process::id(),
+            SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let fd = openat(
+            &parent,
+            temp.as_str(),
+            OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )
+        .map_err(|error| self.io_error(&self.root.join(key), error))?;
+        {
+            let mut file = std::fs::File::from(fd);
+            file.write_all(bytes).map_err(|source| ExtensionError::Io {
+                path: self.root.join(key),
+                source,
+            })?;
+            file.sync_all().map_err(|source| ExtensionError::Io {
+                path: self.root.join(key),
+                source,
+            })?;
+        }
+        if let Err(error) = renameat(&parent, temp.as_str(), &parent, &leaf) {
+            let _ = unlinkat(&parent, temp.as_str(), AtFlags::empty());
+            return Err(self.io_error(&self.root.join(key), error));
+        }
+        Ok(())
+    }
+
     /// Read a value, returning None when it does not exist.
     pub fn read(&self, key: &str) -> Result<Option<Vec<u8>>, ExtensionError> {
-        let path = self.path(key)?;
-        if !path.is_file() {
-            return Ok(None);
+        #[cfg(unix)]
+        {
+            use rustix::fs::{Mode, OFlags};
+            use std::io::Read as _;
+
+            // The lexical/existence check still runs (it also creates the
+            // parent directories read paths historically expected), but the
+            // actual open is anchored to the root handle with O_NOFOLLOW.
+            let _ = self.path(key)?;
+            let (parent, leaf) = self.anchored_parent(key, false)?;
+            let fd = match rustix::fs::openat(
+                &parent,
+                &leaf,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(fd) => fd,
+                Err(error) if error == rustix::io::Errno::NOENT => return Ok(None),
+                Err(error) => return Err(self.io_error(&self.root.join(key), error)),
+            };
+            let metadata = rustix::fs::fstat(&fd)
+                .map_err(|error| self.io_error(&self.root.join(key), error))?;
+            if metadata.st_size > MAX_VALUE_BYTES as i64 {
+                return Err(ExtensionError::Limit {
+                    extension: self.id.to_string(),
+                    message: format!(
+                        "stored value {key:?} is {} bytes; the ceiling is {MAX_VALUE_BYTES}",
+                        metadata.st_size
+                    ),
+                });
+            }
+            let mut bytes = Vec::new();
+            std::fs::File::from(fd)
+                .read_to_end(&mut bytes)
+                .map_err(|source| ExtensionError::Io {
+                    path: self.root.join(key),
+                    source,
+                })?;
+            Ok(Some(bytes))
         }
-        let metadata = std::fs::metadata(&path).map_err(|source| ExtensionError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        if metadata.len() > MAX_VALUE_BYTES as u64 {
-            return Err(ExtensionError::Limit {
-                extension: self.id.to_string(),
-                message: format!(
-                    "stored value {key:?} is {} bytes; the ceiling is {MAX_VALUE_BYTES}",
-                    metadata.len()
-                ),
-            });
+        #[cfg(not(unix))]
+        {
+            let path = self.path(key)?;
+            if !path.is_file() {
+                return Ok(None);
+            }
+            let metadata = std::fs::metadata(&path).map_err(|source| ExtensionError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if metadata.len() > MAX_VALUE_BYTES as u64 {
+                return Err(ExtensionError::Limit {
+                    extension: self.id.to_string(),
+                    message: format!(
+                        "stored value {key:?} is {} bytes; the ceiling is {MAX_VALUE_BYTES}",
+                        metadata.len()
+                    ),
+                });
+            }
+            let bytes =
+                std::fs::read(&path).map_err(|source| ExtensionError::Io { path, source })?;
+            Ok(Some(bytes))
         }
-        let bytes = std::fs::read(&path).map_err(|source| ExtensionError::Io { path, source })?;
-        Ok(Some(bytes))
     }
 
     /// Read a UTF-8 value.
@@ -230,6 +398,12 @@ impl ExtensionStorage {
                 message: format!("namespace would exceed its {} byte budget", self.max_bytes),
             });
         }
+        #[cfg(unix)]
+        {
+            self.write_anchored(key, bytes)?;
+            Ok(())
+        }
+        #[cfg(not(unix))]
         super::package::write_atomic(&path, bytes)
     }
 
@@ -297,12 +471,28 @@ impl ExtensionStorage {
 
     /// Remove a value.
     pub fn remove(&self, key: &str) -> Result<bool, ExtensionError> {
-        let path = self.path(key)?;
-        if !path.exists() {
-            return Ok(false);
+        #[cfg(unix)]
+        {
+            let path = self.path(key)?;
+            if !path.exists() {
+                return Ok(false);
+            }
+            let (parent, leaf) = self.anchored_parent(key, false)?;
+            match rustix::fs::unlinkat(&parent, &leaf, rustix::fs::AtFlags::empty()) {
+                Ok(()) => Ok(true),
+                Err(error) if error == rustix::io::Errno::NOENT => Ok(false),
+                Err(error) => Err(self.io_error(&path, error)),
+            }
         }
-        std::fs::remove_file(&path).map_err(|source| ExtensionError::Io { path, source })?;
-        Ok(true)
+        #[cfg(not(unix))]
+        {
+            let path = self.path(key)?;
+            if !path.exists() {
+                return Ok(false);
+            }
+            std::fs::remove_file(&path).map_err(|source| ExtensionError::Io { path, source })?;
+            Ok(true)
+        }
     }
 
     /// List stored keys, sorted.
@@ -484,5 +674,21 @@ mod tests {
         // Replacing a value within the budget is allowed.
         storage.write("a.bin", b"1234").expect("shrinks");
         storage.write("a.bin", b"12345678").expect("restores");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_anchored_walk_refuses_a_swapped_parent_symlink() {
+        let scratch = Scratch::new("anchored-symlink");
+        let storage = storage(&scratch);
+        std::fs::create_dir_all(storage.root().join("sub")).expect("sub");
+        std::fs::remove_dir_all(storage.root().join("sub")).expect("remove sub");
+        let outside = scratch.0.with_extension("outside");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::os::unix::fs::symlink(&outside, storage.root().join("sub")).expect("symlink");
+        assert!(
+            storage.anchored_parent("sub/value", false).is_err(),
+            "the anchored walk must not follow a swapped parent symlink"
+        );
     }
 }

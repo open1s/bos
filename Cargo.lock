@@ -3451,6 +3451,7 @@ dependencies = [
  "futures",
  "rand 0.10.3",
  "reqwest",
+ "rustix",
  "semver",
  "serde",
  "serde_json",
