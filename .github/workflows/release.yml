@@ -60,6 +60,13 @@ jobs:
           INPUT_PUBLISH: ${{ inputs.publish }}
         run: bash scripts/ci/resolve-release-version.sh
 
+      # The same tag also releases npm and PyPI, so all three manifests must
+      # carry the version the tag names.
+      - name: Check the manifests agree with the tag
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: bash scripts/ci/check-release-versions.sh "$VERSION"
+
   verify:
     name: Test the tagged tree
     needs: prepare

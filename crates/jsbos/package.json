@@ -1,6 +1,6 @@
 {
   "name": "@open1s/jsbos",
-  "version": "3.0.2",
+  "version": "4.0.1",
   "type": "module",
   "description": "BOS (BrainOS) for Node.js — AI agents with tools, skills, memory, MCP and a multi-agent event bus, on a Rust core. The runtime behind the BSH desktop harness.",
   "main": "./index.js",

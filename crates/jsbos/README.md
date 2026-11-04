@@ -1,4 +1,4 @@
-# @open1s/jsbos — v3.0.2
+# @open1s/jsbos — v4.0.1
 
 [![npm](https://img.shields.io/npm/v/@open1s/jsbos?label=npm&logo=npm&color=CB3837)](https://www.npmjs.com/package/@open1s/jsbos)
 [![License](https://img.shields.io/github/license/open1s/bos?color=blue)](https://github.com/open1s/bos/blob/main/LICENSE)

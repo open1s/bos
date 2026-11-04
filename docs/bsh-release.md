@@ -49,23 +49,38 @@ the release notes are rendered from it.
 
 ## Cut a release
 
+One version, one tag, three releases. `vX.Y.Z` is the only number a release
+carries: the script writes it into every manifest, and each pipeline refuses a
+tag whose manifests disagree.
+
 The repository uses jj, so the release commit is finished before it is tagged:
 
 ```bash
-# 1. Bump [workspace.package] version and add the changelog entry.
-jj describe -m "release: BSH 3.0.3"
+# 1. Write the version into Cargo.toml/Cargo.lock, crates/jsbos/package.json,
+#    crates/nbos/pyproject.toml, the napi loader and both READMEs, then assert
+#    the three agree.
+bash scripts/ci/bump-release-version.sh 1.1.1
+
+# 2. Add the changelog entry, then finish the release commit.
+jj describe -m "release: BSH 1.1.1"
 jj new
 
-# 2. Tag the release commit (the working copy's parent), then push code + tag.
-jj tag set v3.0.3 -r @-
+# 3. Tag the release commit (the working copy's parent), then push code + tag.
+jj tag set v1.1.1 -r @-
 jj git push                    # the release commit onto main
-jj git push --tag v3.0.3       # starts the release workflow
+jj git push --tag v1.1.1       # starts all three pipelines
 ```
 
-The tag push starts the workflow. It builds five platform jobs in parallel,
-with arm64 best-effort, then a single `release` job downloads every artifact, checks every expected
-artifact is present, writes `SHA256SUMS`, and creates the GitHub release with
-notes generated from the changelog.
+The tag starts three pipelines: this one publishes the BSH installers, the
+`jsbos` pipeline publishes `@open1s/jsbos` to npm, and the `nbos` pipeline
+publishes `nbos` to PyPI. `check-release-versions.sh` runs in all three gates,
+so a tag that one manifest does not match fails loudly instead of publishing
+part of the set.
+
+The installer workflow builds five platform jobs in parallel, with Linux arm64
+best-effort, then a single `release` job downloads every artifact, checks every
+expected artifact is present, writes `SHA256SUMS`, and creates the GitHub
+release with notes generated from the changelog.
 
 Tag a commit whose `rust` workflow is green. The pipeline's `verify` job
 re-runs the workspace test suite on the tagged tree before anything is
