@@ -274,6 +274,20 @@ fn relative_path(root: &Path, path: &Path) -> String {
         .join("/")
 }
 
+/// Serializes store mutations inside this process.
+///
+/// Two installs of the same id/version race the destination check and share a
+/// staging directory; a state update interleaved with an install can lose one
+/// writer's fields. The guard is process-wide (a second host process is a
+/// separate concern), which is the granularity the manager has.
+static STORE_MUTATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn store_mutation_lock() -> std::sync::MutexGuard<'static, ()> {
+    STORE_MUTATION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Write a file atomically: a sibling temp file, fsync, rename.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ExtensionError> {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -309,7 +323,34 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ExtensionError> {
         })?;
     }
     #[cfg(windows)]
-    let _ = std::fs::remove_file(path);
+    {
+        // fs::rename cannot replace an existing file on Windows, and the old
+        // remove-then-rename destroyed the previous document when the second
+        // rename failed. Move it aside and restore it on failure instead.
+        let backup = path.with_extension("bak");
+        let had_existing = path.exists();
+        if had_existing {
+            let _ = std::fs::remove_file(&backup);
+            std::fs::rename(path, &backup).map_err(|source| ExtensionError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        }
+        if let Err(source) = std::fs::rename(&temporary, path) {
+            if had_existing {
+                let _ = std::fs::rename(&backup, path);
+            }
+            return Err(ExtensionError::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+        if had_existing {
+            let _ = std::fs::remove_file(&backup);
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
     std::fs::rename(&temporary, path).map_err(|source| ExtensionError::Io {
         path: path.to_path_buf(),
         source,
@@ -765,6 +806,16 @@ impl ExtensionStore {
         id: &ExtensionId,
         update: impl FnOnce(&mut ExtensionState),
     ) -> Result<ExtensionState, ExtensionError> {
+        let _guard = store_mutation_lock();
+        self.update_state_locked(id, update)
+    }
+
+    /// The update body, for callers that already hold the store mutation lock.
+    fn update_state_locked(
+        &self,
+        id: &ExtensionId,
+        update: impl FnOnce(&mut ExtensionState),
+    ) -> Result<ExtensionState, ExtensionError> {
         let mut document = self.read_state()?;
         let entry = document
             .extensions
@@ -845,17 +896,25 @@ impl ExtensionStore {
     /// state record is removed and the data is retained for a later review or
     /// deliberate purge.
     pub fn quarantine(&self, id: &ExtensionId, reason: &str) -> Result<PathBuf, ExtensionError> {
+        let _guard = store_mutation_lock();
         let source = self.installed_root().join(id.as_str());
         if !source.exists() {
             return Err(ExtensionError::NotInstalled { id: id.to_string() });
         }
-        let destination = self
-            .quarantine_root()
-            .join(format!("{}-{}", id.as_str(), unix_now()));
-        std::fs::create_dir_all(&destination).map_err(|source| ExtensionError::Io {
-            path: destination.clone(),
+        // Create the parent, never the destination: a pre-created destination
+        // makes rename fail on Windows (and on Unix for an existing directory).
+        let quarantine_root = self.quarantine_root();
+        std::fs::create_dir_all(&quarantine_root).map_err(|source| ExtensionError::Io {
+            path: quarantine_root.clone(),
             source,
         })?;
+        let base = format!("{}-{}", id.as_str(), unix_now());
+        let mut destination = quarantine_root.join(&base);
+        let mut suffix = 1u32;
+        while destination.exists() {
+            destination = quarantine_root.join(format!("{base}-{suffix}"));
+            suffix = suffix.saturating_add(1);
+        }
         std::fs::rename(&source, &destination).map_err(|error| ExtensionError::Io {
             path: source.clone(),
             source: error,
@@ -1034,6 +1093,7 @@ impl ExtensionStore {
         origin: ExtensionSource,
         fallback: TrustLevel,
     ) -> Result<Package, ExtensionError> {
+        let _guard = store_mutation_lock();
         let staged = Package::load(source, ExtensionSource::Development, fallback)?;
         if !staged.report.is_valid() {
             return Err(ExtensionError::Manifest {
@@ -1109,46 +1169,55 @@ impl ExtensionStore {
             path: destination.clone(),
             source: error,
         })?;
-        let mut package = Package::load(&destination, origin.clone(), trust_level)?;
-        package.hash = hash.clone();
-        package.installed_at = unix_now();
-        package.verification = verification.clone();
-        package.signature = staged.signature.clone();
-        package.source_path = Some(source.to_path_buf());
-        let mut registry = self.read_registry()?;
-        registry.insert(
-            id.as_str(),
-            &version,
-            InstalledRecord {
-                path: format!("installed/{}/{version}", id.as_str()),
-                hash,
-                source: origin,
-                trust: trust_level,
-                installed_at: package.installed_at,
-                dependencies: staged
-                    .manifest
-                    .dependencies
-                    .iter()
-                    .map(|(id, requirement)| (id.to_string(), requirement.to_string()))
-                    .collect(),
-                verification: Some(verification),
-                publisher,
-                source_path: Some(source.display().to_string()),
-            },
-        );
-        self.write_registry(&registry)?;
-        self.update_state(&id, |state| {
-            // An upgrade must not switch a package the reader disabled back on:
-            // the enabled flag is the reader's decision and survives the install
-            // (§7). A fresh record already defaults to enabled.
-            state.installed_at = package.installed_at;
-            state.last_error = None;
-            state.active_version = Some(version.clone());
-            if state.data_version.is_none() {
-                state.data_version = Some(version.clone());
-            }
-        })?;
-        Ok(package)
+        // From here on the package exists on disk. A failure while recording
+        // it must remove the directory again, or a retry reports AlreadyInstalled
+        // for a package the registry never learned about.
+        let installed = (|| -> Result<Package, ExtensionError> {
+            let mut package = Package::load(&destination, origin.clone(), trust_level)?;
+            package.hash = hash.clone();
+            package.installed_at = unix_now();
+            package.verification = verification.clone();
+            package.signature = staged.signature.clone();
+            package.source_path = Some(source.to_path_buf());
+            let mut registry = self.read_registry()?;
+            registry.insert(
+                id.as_str(),
+                &version,
+                InstalledRecord {
+                    path: format!("installed/{}/{version}", id.as_str()),
+                    hash,
+                    source: origin,
+                    trust: trust_level,
+                    installed_at: package.installed_at,
+                    dependencies: staged
+                        .manifest
+                        .dependencies
+                        .iter()
+                        .map(|(id, requirement)| (id.to_string(), requirement.to_string()))
+                        .collect(),
+                    verification: Some(verification),
+                    publisher,
+                    source_path: Some(source.display().to_string()),
+                },
+            );
+            self.write_registry(&registry)?;
+            self.update_state_locked(&id, |state| {
+                // An upgrade must not switch a package the reader disabled back on:
+                // the enabled flag is the reader's decision and survives the install
+                // (§7). A fresh record already defaults to enabled.
+                state.installed_at = package.installed_at;
+                state.last_error = None;
+                state.active_version = Some(version.clone());
+                if state.data_version.is_none() {
+                    state.data_version = Some(version.clone());
+                }
+            })?;
+            Ok(package)
+        })();
+        if installed.is_err() {
+            let _ = std::fs::remove_dir_all(&destination);
+        }
+        installed
     }
 
     /// Remove every installed version of `id`.
@@ -1157,22 +1226,53 @@ impl ExtensionStore {
     /// is always removed, because the flags describe an installed package and
     /// a later install starts from the defaults.
     pub fn uninstall(&self, id: &ExtensionId, purge_data: bool) -> Result<(), ExtensionError> {
+        let _guard = store_mutation_lock();
         let directory = self.installed_root().join(id.as_str());
         if !directory.exists() {
             return Err(ExtensionError::NotInstalled { id: id.to_string() });
         }
-        std::fs::remove_dir_all(&directory).map_err(|source| ExtensionError::Io {
-            path: directory,
+        // Move the tree aside before touching metadata: removing it first
+        // left the registry naming files that no longer existed when a later
+        // write failed. The trash directory and both metadata documents are
+        // restored on that error.
+        let previous_registry = self.read_registry()?;
+        let previous_state = self.read_state()?;
+        let trash_root = self.root.join("trash");
+        std::fs::create_dir_all(&trash_root).map_err(|source| ExtensionError::Io {
+            path: trash_root.clone(),
             source,
         })?;
-        let mut registry = self.read_registry()?;
-        if registry.remove(id.as_str()) {
-            self.write_registry(&registry)?;
+        let trash = trash_root.join(format!(
+            "{}-{}-{}",
+            id.as_str(),
+            std::process::id(),
+            unix_now()
+        ));
+        std::fs::rename(&directory, &trash).map_err(|source| ExtensionError::Io {
+            path: directory.clone(),
+            source,
+        })?;
+        let metadata = (|| -> Result<(), ExtensionError> {
+            let mut registry = self.read_registry()?;
+            if registry.remove(id.as_str()) {
+                self.write_registry(&registry)?;
+            }
+            let mut state = self.read_state()?;
+            if state.extensions.remove(id.as_str()).is_some() {
+                self.write_state(&state)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = metadata {
+            // Best effort: put the package and the documents back exactly as
+            // they were, so a retry sees an installed package rather than a
+            // half-removed one.
+            let _ = self.write_registry(&previous_registry);
+            let _ = self.write_state(&previous_state);
+            let _ = std::fs::rename(&trash, &directory);
+            return Err(error);
         }
-        let mut state = self.read_state()?;
-        if state.extensions.remove(id.as_str()).is_some() {
-            self.write_state(&state)?;
-        }
+        let _ = std::fs::remove_dir_all(&trash);
         if purge_data {
             let data = self.data_dir(id);
             if data.exists() {
@@ -1437,6 +1537,65 @@ id = "echo"
         assert!(
             !store.state_of(&id).enabled,
             "an unreadable state document must fail closed"
+        );
+    }
+
+    #[test]
+    fn quarantine_moves_the_tree_to_a_new_directory() {
+        let scratch = Scratch::new("quarantine");
+        let source = scratch.0.join("source");
+        write_package(&source, &manifest());
+        let store = ExtensionStore::open(scratch.0.join("store")).expect("store");
+        store.install(&source).expect("install");
+        let id = ExtensionId::parse("com.example.echo").expect("id");
+        let destination = store.quarantine(&id, "test").expect("quarantine");
+        assert!(
+            destination.is_dir(),
+            "the quarantine destination is a directory"
+        );
+        assert!(
+            destination.join("1.2.3").join(MANIFEST_FILE).is_file(),
+            "the installed version moved with the tree"
+        );
+        assert!(!store.installed_root().join(id.as_str()).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_uninstall_restores_the_package_and_registry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = Scratch::new("uninstall-rollback");
+        let source = scratch.0.join("source");
+        write_package(&source, &manifest());
+        let store = ExtensionStore::open(scratch.0.join("store")).expect("store");
+        store.install(&source).expect("install");
+        let id = ExtensionId::parse("com.example.echo").expect("id");
+        let state_parent = store
+            .state_path()
+            .parent()
+            .expect("state root")
+            .to_path_buf();
+        let mut permissions = std::fs::metadata(&state_parent)
+            .expect("state metadata")
+            .permissions();
+        permissions.set_mode(0o555);
+        std::fs::set_permissions(&state_parent, permissions).expect("read-only state root");
+        let result = store.uninstall(&id, false);
+        let mut permissions = std::fs::metadata(&state_parent)
+            .expect("state metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&state_parent, permissions).expect("writable state root");
+        assert!(result.is_err(), "the state write must fail");
+        assert!(
+            store.installed_root().join(id.as_str()).is_dir(),
+            "the package tree is restored"
+        );
+        let registry = store.read_registry().expect("registry");
+        assert!(
+            registry.extensions.contains_key(id.as_str()),
+            "the registry entry is restored"
         );
     }
 }

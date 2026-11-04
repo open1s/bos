@@ -600,7 +600,31 @@ pub fn write_grant_atomic(path: &Path, bytes: &[u8]) -> Result<(), ExtensionErro
         })?;
     }
     #[cfg(windows)]
-    let _ = std::fs::remove_file(path);
+    {
+        let backup = path.with_extension("bak");
+        let had_existing = path.exists();
+        if had_existing {
+            let _ = std::fs::remove_file(&backup);
+            std::fs::rename(path, &backup).map_err(|source| ExtensionError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        }
+        if let Err(source) = std::fs::rename(&temporary, path) {
+            if had_existing {
+                let _ = std::fs::rename(&backup, path);
+            }
+            return Err(ExtensionError::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+        if had_existing {
+            let _ = std::fs::remove_file(&backup);
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
     std::fs::rename(&temporary, path).map_err(|source| ExtensionError::Io {
         path: path.to_path_buf(),
         source,
