@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, VecDeque};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+#[cfg(not(windows))]
 use std::process::Stdio;
 #[cfg(unix)]
 use std::sync::atomic::AtomicBool;
@@ -21,6 +22,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(not(windows))]
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
@@ -736,6 +738,7 @@ fn rlimit_hook(
 }
 
 /// Apply the manifest's resource ceilings to a tokio command.
+#[cfg(not(windows))]
 pub(super) fn configure_process_limits(command: &mut Command, memory: u64, cpu: u64) {
     #[cfg(unix)]
     {
@@ -958,6 +961,7 @@ pub struct ProcessRuntime {
     max_execution_ms: u64,
     max_output_bytes: u64,
     memory_bytes: u64,
+    #[cfg_attr(windows, allow(dead_code))]
     cpu_seconds: u64,
     config: String,
     workspace: Option<PathBuf>,

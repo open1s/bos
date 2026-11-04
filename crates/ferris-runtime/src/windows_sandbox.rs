@@ -10,7 +10,7 @@
 
 use std::path::Path;
 
-use heel::{Access, DenyAll, Sandbox, SandboxConfig, StdioConfig};
+use heel::{DenyAll, Sandbox, SandboxConfig, StdioConfig};
 
 /// Environment variables a Windows child needs to find its runtime and temp
 /// directory. Everything else is cleared by the sandbox.

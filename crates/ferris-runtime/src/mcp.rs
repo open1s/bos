@@ -94,6 +94,7 @@ enum McpChild {
 }
 
 impl McpChild {
+    #[cfg_attr(windows, allow(dead_code))]
     fn id(&self) -> u32 {
         match self {
             Self::Std(child) => child.id(),
@@ -335,8 +336,8 @@ impl Session {
     fn close(&mut self) {
         if let Ok(mut child) = self.child.lock() {
             kill_process_group(&child);
-            let _ = child.kill();
-            let _ = child.wait();
+            child.kill();
+            child.wait();
         }
     }
 }
@@ -503,8 +504,8 @@ impl Drop for Session {
     fn drop(&mut self) {
         if let Ok(mut child) = self.child.lock() {
             kill_process_group(&child);
-            let _ = child.kill();
-            let _ = child.wait();
+            child.kill();
+            child.wait();
         }
     }
 }
@@ -518,7 +519,7 @@ fn terminate_child_handle(child: &Arc<Mutex<McpChild>>) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     kill_process_group(&child);
-    let _ = child.kill();
+    child.kill();
 }
 
 /// Signal the child's process group, not just the child.
@@ -1408,7 +1409,7 @@ impl McpCore {
         if self.stopped.load(Ordering::SeqCst) || self.cancelled.load(Ordering::SeqCst) {
             terminate_child_handle(&child);
             if let Ok(mut process) = child.lock() {
-                let _ = process.wait();
+                process.wait();
             }
             self.stop_watchdog();
             let mut slot = self
