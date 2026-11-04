@@ -224,6 +224,13 @@ impl ManifestBuilder {
         self
     }
 
+    /// Set the WASM table element ceiling.
+    #[must_use]
+    pub fn max_table_elements(mut self, value: u64) -> Self {
+        self.resources.max_table_elements = Some(value);
+        self
+    }
+
     /// Set the package-relative JSON Schema path.
     #[must_use]
     pub fn configuration_schema(mut self, path: impl Into<String>) -> Self {

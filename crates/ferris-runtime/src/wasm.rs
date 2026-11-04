@@ -41,6 +41,9 @@ bindgen!({
 /// The largest file or network body a host function will return.
 const MAX_HOST_BODY: usize = 8 * 1024 * 1024;
 
+/// The largest number of event subscriptions one component may hold.
+const MAX_SUBSCRIPTIONS: usize = 16;
+
 /// One epoch tick is ten milliseconds.
 const EPOCH_TICK_MS: u64 = 10;
 
@@ -127,7 +130,8 @@ struct HostState {
     subscribes: Vec<String>,
     config: String,
     limits: TrackingLimiter,
-    subscriptions: BTreeMap<u64, ferris_core::events::Subscription>,
+    /// subscription id -> (topic, queue), so a repeat is idempotent.
+    subscriptions: BTreeMap<u64, (String, ferris_core::events::Subscription)>,
     next_subscription: u64,
     deadline: Instant,
     cancelled: Arc<AtomicBool>,
@@ -219,6 +223,23 @@ impl HostState {
                 "path escapes the workspace".to_string(),
             ));
         }
+        // The ancestor walk resolves parents; an existing leaf still has to be
+        // checked itself, because fs::read/write follow a final symlink.
+        if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+            if metadata.file_type().is_symlink() {
+                return Err(self::bsh::extension::types::HostError::Denied(
+                    "the final path component is a symlink".to_string(),
+                ));
+            }
+            let canonical = path.canonicalize().map_err(|error| {
+                self::bsh::extension::types::HostError::Runtime(error.to_string())
+            })?;
+            if !canonical.starts_with(&canonical_workspace) {
+                return Err(self::bsh::extension::types::HostError::Denied(
+                    "path escapes the workspace".to_string(),
+                ));
+            }
+        }
         Ok(path)
     }
 
@@ -303,7 +324,19 @@ impl self::bsh::extension::host::Host for HostState {
             )));
         }
         self.authorize(Capability::EventsSubscribe, CallScope::default())?;
-        let filter = EventFilter::from_topics(&[topic])
+        if let Some((id, _)) = self
+            .subscriptions
+            .iter()
+            .find(|(_, (existing, _))| existing == &topic)
+        {
+            return Ok(*id);
+        }
+        if self.subscriptions.len() >= MAX_SUBSCRIPTIONS {
+            return Err(self::bsh::extension::types::HostError::Limited(format!(
+                "the extension already holds {MAX_SUBSCRIPTIONS} event subscriptions"
+            )));
+        }
+        let filter = EventFilter::from_topics(&[topic.clone()])
             .map_err(self::bsh::extension::types::HostError::Denied)?;
         let id = self.next_subscription;
         self.next_subscription = self.next_subscription.saturating_add(1);
@@ -311,7 +344,7 @@ impl self::bsh::extension::host::Host for HostState {
             .events
             .subscribe(filter, 64)
             .map_err(Self::host_error)?;
-        self.subscriptions.insert(id, subscription);
+        self.subscriptions.insert(id, (topic, subscription));
         Ok(id)
     }
 
@@ -456,28 +489,31 @@ impl self::bsh::extension::host::Host for HostState {
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
-        let bytes = match response.bytes() {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                let message = error.to_string();
-                crate::hooks::observe(
-                    "http.exchange",
-                    crate::hooks::http_exchange(
-                        self.extension.as_str(),
-                        &method_text,
-                        &url,
-                        Some(status),
-                        requested_bytes,
-                        0,
-                        content_type.as_deref(),
-                        ttfb_ms,
-                        started.elapsed().as_millis() as u64,
-                        Some(&message),
-                    ),
-                );
-                return Err(self::bsh::extension::types::HostError::Runtime(message));
-            }
-        };
+        // Read through a hard take: response.bytes() buffers the whole body
+        // before the ceiling is checked, so an unbounded response could be
+        // allocated in full before it was refused.
+        use std::io::Read as _;
+        let mut bytes = Vec::new();
+        let mut limited = response.take((MAX_HOST_BODY as u64) + 1);
+        if let Err(error) = limited.read_to_end(&mut bytes) {
+            let message = error.to_string();
+            crate::hooks::observe(
+                "http.exchange",
+                crate::hooks::http_exchange(
+                    self.extension.as_str(),
+                    &method_text,
+                    &url,
+                    Some(status),
+                    requested_bytes,
+                    0,
+                    content_type.as_deref(),
+                    ttfb_ms,
+                    started.elapsed().as_millis() as u64,
+                    Some(&message),
+                ),
+            );
+            return Err(self::bsh::extension::types::HostError::Runtime(message));
+        }
         crate::hooks::observe(
             "http.exchange",
             crate::hooks::http_exchange(
@@ -696,6 +732,7 @@ impl WasmRuntime {
         })?;
         let limits = StoreLimitsBuilder::new()
             .memory_size((self.resources.memory_mb() * 1024 * 1024) as usize)
+            .table_elements(self.resources.table_elements() as usize)
             .build();
         let state = HostState {
             extension: self.extension.clone(),
@@ -791,17 +828,24 @@ impl WasmRuntime {
     }
 
     fn deliver_events(&self, instance: &mut Instance) -> Result<(), ExtensionError> {
-        let events: Vec<ExtensionEvent> = {
-            let state = instance.store.data_mut();
-            let mut events = Vec::new();
-            for subscription in state.subscriptions.values() {
-                while let Some(event) = subscription.try_recv() {
-                    events.push(event);
+        // Deliver one queued event at a time. Draining the whole queue first
+        // lost every remaining event when one callback failed; now the failed
+        // event is dropped and the rest stay queued for the next pump.
+        loop {
+            let event = {
+                let state = instance.store.data_mut();
+                let mut next = None;
+                for (_, subscription) in state.subscriptions.values() {
+                    if let Some(event) = subscription.try_recv() {
+                        next = Some(event);
+                        break;
+                    }
                 }
-            }
-            events
-        };
-        for event in events {
+                next
+            };
+            let Some(event) = event else {
+                break;
+            };
             instance
                 .bindings
                 .bsh_extension_extension()
@@ -828,6 +872,21 @@ fn to_wit_event(event: &ExtensionEvent) -> self::bsh::extension::types::Event {
 }
 
 impl WasmRuntime {
+    /// Enforce the manifest output ceiling on a guest string reply.
+    fn bounded_output(&self, text: &str) -> Result<(), ExtensionError> {
+        let bytes = text.len() as u64;
+        if bytes > self.resources.output_bytes() {
+            return Err(ExtensionError::Limit {
+                extension: self.extension.to_string(),
+                message: format!(
+                    "component reply is {bytes} bytes; the ceiling is {}",
+                    self.resources.output_bytes()
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// List the component's tools synchronously, instantiating it if needed.
     ///
     /// The agent build is synchronous and needs descriptors before it can price
@@ -1075,6 +1134,7 @@ impl Runtime for WasmRuntime {
             })?;
         self.record_fuel(&instance.store);
         let text = text.map_err(|error| host_failure(&self.extension, error))?;
+        self.bounded_output(&text)?;
         self.deliver_events(instance)?;
         Ok(serde_json::from_str(&text).unwrap_or(Value::String(text)))
     }
@@ -1098,6 +1158,7 @@ impl Runtime for WasmRuntime {
             })?;
         self.record_fuel(&instance.store);
         let text = text.map_err(|error| host_failure(&self.extension, error))?;
+        self.bounded_output(&text)?;
         self.deliver_events(instance)?;
         serde_json::from_str(&text).map_err(|error| ExtensionError::Runtime {
             extension: self.extension.to_string(),
@@ -1120,7 +1181,12 @@ impl Runtime for WasmRuntime {
         let Some(instance) = guard.as_mut() else {
             return Ok(());
         };
-        self.deliver_events(instance)
+        // A pump is a call too: its callback must get a fresh deadline and
+        // fuel, not the previous call's exhausted budget or cancelled flag.
+        self.prepare_call(instance, self.resources.execution_ms())?;
+        self.deliver_events(instance)?;
+        self.record_fuel(&instance.store);
+        Ok(())
     }
 }
 

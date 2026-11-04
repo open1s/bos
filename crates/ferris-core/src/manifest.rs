@@ -43,6 +43,8 @@ pub const HARD_MAX_EXECUTION_MS: u64 = 600_000;
 pub const HARD_MAX_CONCURRENT_CALLS: u32 = 64;
 /// Hard host ceiling for one result or event payload.
 pub const HARD_MAX_OUTPUT_BYTES: u64 = 16 * 1024 * 1024;
+/// Hard host ceiling for a WASM table's element count.
+pub const HARD_MAX_TABLE_ELEMENTS: u64 = 16_777_216;
 
 /// The package identity block.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,6 +203,10 @@ pub struct ResourcesSpec {
     /// One-result output ceiling in bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_bytes: Option<u64>,
+    /// WASM table element ceiling. A table can grow without touching linear
+    /// memory, so it needs its own manifest-backed budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_table_elements: Option<u64>,
 }
 
 impl ResourcesSpec {
@@ -222,6 +228,16 @@ impl ResourcesSpec {
     /// Effective result ceiling.
     pub fn output_bytes(&self) -> u64 {
         self.max_output_bytes.unwrap_or(1024 * 1024)
+    }
+
+    /// Effective WASM table element ceiling.
+    ///
+    /// Derived from the memory ceiling by default (128 elements per MiB, at
+    /// least 1024) so a table cannot grow into an unbounded resource without
+    /// the package declaring a budget.
+    pub fn table_elements(&self) -> u64 {
+        self.max_table_elements
+            .unwrap_or_else(|| self.memory_mb().saturating_mul(128).max(1024))
     }
 }
 
@@ -805,6 +821,14 @@ impl Manifest {
                 );
             }
         }
+        if let Some(value) = resources.max_table_elements {
+            if value == 0 || value > HARD_MAX_TABLE_ELEMENTS {
+                report.error(
+                    "resources.max_table_elements",
+                    format!("must be 1..={HARD_MAX_TABLE_ELEMENTS}"),
+                );
+            }
+        }
     }
 
     fn validate_dependencies(&self, report: &mut ValidationReport) {
@@ -1284,6 +1308,26 @@ provides = [
         for topic in ["Workspace.Opened", "workspace..opened", "*", "a.*.b"] {
             assert!(validate_topic(topic, true).is_err(), "{topic}");
         }
+    }
+
+    #[test]
+    fn the_wasm_table_ceiling_is_manifest_backed_with_a_memory_derived_default() {
+        let default = ResourcesSpec::default();
+        assert_eq!(default.table_elements(), 256 * 128);
+        let small = ResourcesSpec {
+            max_memory_mb: Some(1),
+            ..ResourcesSpec::default()
+        };
+        assert_eq!(
+            small.table_elements(),
+            1024,
+            "the floor keeps tiny tables usable"
+        );
+        let explicit = ResourcesSpec {
+            max_table_elements: Some(4096),
+            ..ResourcesSpec::default()
+        };
+        assert_eq!(explicit.table_elements(), 4096);
     }
 
     #[test]
