@@ -107,9 +107,15 @@ jobs:
       # resetting; a real test failure still fails on the second attempt.
       - name: Test
         shell: bash
+        # One test thread: GPUI's test scheduler is thread-local and asserts
+        # when activity from another thread reaches the running test. Under
+        # parallel execution a background task from one shell test lands on
+        # the next test's scheduler and fails the run with "your test is not
+        # deterministic" even though every assertion passed. Serial execution
+        # is slower but reproducible, which is what a publish gate needs.
         run: |
           for attempt in 1 2; do
-            if xvfb-run -a cargo test --workspace --exclude jsbos --exclude nbos -- --skip browser::engine::tests; then
+            if xvfb-run -a cargo test --workspace --exclude jsbos --exclude nbos -- --test-threads=1 --skip browser::engine::tests; then
               exit 0
             fi
             if [ "$attempt" -eq 2 ]; then exit 1; fi
