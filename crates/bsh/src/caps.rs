@@ -822,11 +822,12 @@ fn build_agent_for_session_inner(
     config.api_mode = eff.api_mode.clone();
     // Search is a LOCAL tool here (see `crate::web`), so the framework's hosted
     // `web_search` object stays withdrawn: it is a Responses-only capability and
-    // two tools named `web_search` on one request would collide. The preset's
-    // own declaration still decides whether the reader gets search at all, which
-    // is the same precedence the hosted switch used.
+    // two tools named `web_search` on one request would collide. What decides
+    // whether the reader gets search at all is the workspace switch, narrowed by
+    // the preset - see `offers_local_web_search` for why that is an
+    // intersection and not an override.
     config.web_search = false;
-    let web_search_on = eff.preset_web_search.unwrap_or(eff.web_tools_enabled);
+    let web_search_on = offers_local_web_search(eff.web_tools_enabled, eff.preset_web_search);
     // A zero context budget disables pressure compaction; it must disable the
     // mid-turn check too. Otherwise the manual-/compact fallback ceiling would
     // turn it back on behind the setting's back.
@@ -1637,6 +1638,19 @@ pub(crate) fn tools_schema_chars(tools: &[react::llm::LlmTool]) -> usize {
     serde_json::to_string(tools)
         .map(|json| json.chars().count())
         .unwrap_or(0)
+}
+
+/// Whether this build offers the local `web_search` tool.
+///
+/// The reader's workspace switch is the MASTER and a preset may only decline:
+/// read-only does, because the tool opens a socket. The two therefore
+/// INTERSECT, which is the rule egress already follows - a preset that declares
+/// `web_search = true` states what it is for, it cannot re-offer a tool the
+/// reader switched off. Letting the preset override the switch made both the
+/// Tools pane and the Web search pane carry a control that only looked wired:
+/// pressing it wrote the draft and changed nothing in the build.
+pub(crate) fn offers_local_web_search(enabled: bool, preset: Option<bool>) -> bool {
+    enabled && preset.unwrap_or(true)
 }
 
 /// The capabilities the agent exposes, for the tools-and-skills pane.
@@ -4363,9 +4377,9 @@ fn open_memory(settings: &Settings) -> Option<Arc<dyn MemoryStore>> {
 mod tests {
     use super::{
         agent_messages, allows_writes, build_agent, check_spawn, compactable_span,
-        egress_allowlist_path, is_confined, plugin_provider_node, read_egress_rules,
-        refresh_plugin_providers, sandbox_spec_for, surfaced_capabilities, tool_gates_for,
-        web_search_config, with_bridge_pool, BuiltAgent, WorkspaceEgress,
+        egress_allowlist_path, is_confined, offers_local_web_search, plugin_provider_node,
+        read_egress_rules, refresh_plugin_providers, sandbox_spec_for, surfaced_capabilities,
+        tool_gates_for, web_search_config, with_bridge_pool, BuiltAgent, WorkspaceEgress,
         EGRESS_ALLOWLIST_TEMPLATE, FULL_ACCESS, MAX_BATCH_READ_BYTES, READ_ONLY, WORKSPACE_WRITE,
     };
     use crate::settings::global::{ModelEntry, Preset};
@@ -5210,16 +5224,19 @@ mod tests {
     /// exactly when the switch is on - and that the hosted flag stays off on
     /// every build, because two tools named `web_search` would collide.
     ///
-    /// The preset is cleared first, on purpose: `Settings::default()` ships the
-    /// STANDARD preset, which declares `web_search = true` and therefore
-    /// OVERRIDES this switch (that precedence is the resolver's own -
-    /// `preset_web_search.unwrap_or(web_tools_enabled)`). With the preset
-    /// cleared the switch is the only thing deciding, which is what this test
-    /// is about.
+    /// The shipped preset is left IN PLACE: it declares `web_search = true`, and
+    /// that declaration must not re-offer a tool the reader switched off. It
+    /// did once, because the build read
+    /// `preset_web_search.unwrap_or(web_tools_enabled)`, which made both the
+    /// Tools pane's row and the Web search pane's switch no-ops under every
+    /// shipped preset.
     #[test]
     fn the_web_tools_switch_reaches_the_agent() {
         let mut settings = bare();
-        settings.global.default_preset = String::new();
+        assert_eq!(
+            settings.global.default_preset, "standard",
+            "the premise: the shipped preset declares web_search = true"
+        );
         assert!(
             settings.workspace.agent.web_tools_enabled,
             "the shipped default offers web search"
@@ -5238,8 +5255,33 @@ mod tests {
         let names = build_tool_names(&settings);
         assert!(
             !names.iter().any(|name| name == "web_search"),
-            "switching it off withdraws the tool: {names:?}"
+            "switching it off withdraws the tool even though the preset declares \
+             it: {names:?}"
         );
+    }
+
+    /// The intersection itself, as a truth table: the workspace switch is the
+    /// master, an absent preset inherits it, and a declared `false` narrows
+    /// only. Each arm is a state the two panes and the shipped presets put the
+    /// build in.
+    #[test]
+    fn web_search_is_the_switch_intersected_with_the_preset() {
+        // switch, preset declaration, offered
+        let table = [
+            (true, None, true),
+            (true, Some(true), true),
+            (true, Some(false), false),
+            (false, None, false),
+            (false, Some(true), false),
+            (false, Some(false), false),
+        ];
+        for (enabled, preset, expected) in table {
+            assert_eq!(
+                offers_local_web_search(enabled, preset),
+                expected,
+                "switch={enabled} preset={preset:?}"
+            );
+        }
     }
 
     /// Every tool name one build registered, sorted.

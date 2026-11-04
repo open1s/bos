@@ -166,6 +166,18 @@ The search is LOCAL network access: the workspace egress allowlist and the
 preset's own `egress` decide whether the tool may reach the endpoint, and the
 read-only preset declines search for exactly that reason.
 
+Two rules about the switch above the fields:
+
+- The workspace's `web_tools_enabled` is the MASTER switch and a preset may only
+  DECLINE (`offers_local_web_search`; read-only declares `false` because the
+  tool opens a socket). A preset that declares `web_search = true` states what it
+  is for - it cannot re-offer a tool the reader switched off, which is the
+  intersection `egress` already follows.
+- The Tools pane's Web search row carries a `Configure` entry into this pane
+  beside its switch, because the row is where a reader decides about the tool;
+  the Extensions pane's Built-in plugin settings lists the pane as well, as the
+  reference's own inventory does.
+
 **Implementation note, found while writing the parser.** A model leaf sits
 *directly* under its provider, so the model map is `#[serde(flatten)]`ed rather
 than a named `models` table. Without the flatten,

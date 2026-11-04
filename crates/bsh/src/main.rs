@@ -64,7 +64,7 @@ fn main() {
     // --help is answered here so it works without opening a window.
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!(
-            "bsh - BOS Harness\n\nUSAGE: bsh [--settings[=SECTION]] [--browser=URL]\n       bsh ext <command> [options]\n\n  --settings  open the settings dialog on launch\n  SECTION     the rail's six cells - account | vault | general | models |\n              plugins | agent-presets - or a hosted view: plugin-inventory |\n              shell | agent-loop | tools | mcp | archived-sessions |\n              presentation | workspaces | context | automation (default: account)\n  --browser   open the Browser pane on URL (http or https)\n  ext         run the extension developer CLI; bsh ext help for the commands"
+            "bsh - BOS Harness\n\nUSAGE: bsh [--settings[=SECTION]] [--browser=URL]\n       bsh ext <command> [options]\n\n  --settings  open the settings dialog on launch\n  SECTION     a rail cell - account | vault | general | models | web-search |\n              extensions | agent-presets - or a hosted view: tools |\n              plugin-inventory | shell | agent-loop | mcp | archived-sessions |\n              workspaces | context | plugins | automation | policy | extensions\n              (default: account)\n  --browser   open the Browser pane on URL (http or https)\n  ext         run the extension developer CLI; bsh ext help for the commands"
         );
         return;
     }

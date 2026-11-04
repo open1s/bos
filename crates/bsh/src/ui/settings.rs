@@ -45,19 +45,26 @@ pub(crate) const SECTIONS: [&str; 18] = [
     "settings.extensions",
 ];
 
-/// The rail's cells: the reference's five, plus the Vault.
+/// The rail's cells: the reference's five, plus the Vault and Web search.
 ///
 /// DSH registers five `settings.section`s and sorts them by `order`: account
 /// (-10), general (0), models (10), plugins (15, "Extensions") and
-/// agent-presets (20). The Vault is a BSH addition and sits after Account, the
-/// surface it is administered from. Everything else this crate's `SECTIONS`
-/// carries is a card, a tab or a sidebar panel in the reference, so it is not a
-/// rail cell here either. See `docs/ui-mirror/reference/dsh-settings-rail.md`.
-pub(crate) const NAV: [&str; 6] = [
+/// agent-presets (20). Everything else this crate's `SECTIONS` carries is a
+/// card, a tab or a sidebar panel in the reference, so it is not a rail cell
+/// here either. See `docs/ui-mirror/reference/dsh-settings-rail.md`.
+///
+/// Two BSH additions. The Vault sits after Account, the surface it is
+/// administered from. Web search sits after Models, because that is where a
+/// reader looks for the thing the model calls: the reference only reaches its
+/// own Web search page through the plugins pane's built-in inventory, which is
+/// a list of what is installed rather than a place to find a tool's settings -
+/// and this pane owns a credential and a request shape, not just a switch.
+pub(crate) const NAV: [&str; 7] = [
     "account",
     "vault",
     "general",
     "models",
+    "web-search",
     "extensions",
     "agent-presets",
 ];
@@ -1067,8 +1074,8 @@ impl Shell {
         // background or divider - the panel surface runs under it, and the cell
         // label is label-primary whether or not the cell is the active one.
         let mut list = div().flex().flex_col().gap(px(4.0));
-        // The rail is the reference's five cells: `NAV` names them and
-        // `section_index` resolves each to its pane.
+        // `NAV` names the rail's cells in display order and `section_index`
+        // resolves each to its pane, so a cell and its pane cannot disagree.
         for (cell, id) in NAV.iter().enumerate() {
             let Some(index) = section_index(id) else {
                 continue;
@@ -6027,9 +6034,13 @@ impl Shell {
     ) -> (&'static str, &'static str, Vec<AnyElement>) {
         let lang = self.state.lang;
         let web = self.state.draft().workspace.agent.web_tools_enabled;
-        // The hosted web tool has no local registrar, so it cannot appear in the
-        // capability list below - the provider runs it. It is still a tool the
-        // reader can switch off, so it leads the pane as its own row.
+        // The tool's master switch leads the pane. The capability list below is
+        // name-keyed and can withdraw this one tool, but it cannot say what the
+        // search endpoint, the method, the budget or the key are - so the row
+        // carries the workspace switch AND the door into the pane that owns
+        // them. Without that door the only way in was Extensions > Built-in
+        // plugin settings, which is an inventory rather than the place a reader
+        // looks for a tool's own settings.
         // The section's hint is drawn under the title by the pane header, so it is
         // NOT repeated as the first row: the sentence appeared twice, once above
         // the list and once at the top of it.
@@ -6056,6 +6067,22 @@ impl Shell {
                             theme::faint(),
                         )),
                 )
+                .child({
+                    let target = section_index("web-search");
+                    self.models_link(
+                        "settings-web-search-open".to_string(),
+                        tr(lang, "settings.webSearchOpen"),
+                    )
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        // The same write the built-in row makes, so the tool's
+                        // switch and the pane its settings live in cannot
+                        // disagree about where that pane is.
+                        if let Some(section) = target {
+                            this.state.settings_section = section;
+                            cx.notify();
+                        }
+                    }))
+                })
                 .child(self.switch("settings-web-tools", web, true, web_tools_action, cx)),
         )
         .into_any_element()];

@@ -425,6 +425,8 @@
 "settings.webSearchKeyRequired": "请先粘贴密钥再保存。"
 "settings.webSearchKeySaved": "网页搜索密钥已保存到保险库"
 "settings.webSearchNotice": "搜索接口走本机网络：工作区出站白名单决定工具能否访问，拒绝时会给出规则。密钥保存在保险库，从不写入设置文件。"
+"settings.webSearchOpen": "配置"
+"settings.web-search": "网页搜索"
 "settings.mcp": "MCP 服务"
 "settings.mcpIntro": "为 Agent 提供工具的服务。每个服务只连接一次，所有轮次共用。"
 "settings.mcpSearch": "搜索 MCP 服务"

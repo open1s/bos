@@ -7062,14 +7062,12 @@ fn the_tools_pane_switches_the_hosted_web_search(cx: &mut TestAppContext) {
     });
     assert_eq!(after, !before, "the switch writes the setting it shows");
 
-    // And the agent the shell builds follows the draft. The preset is cleared
-    // first, on purpose: the shipped default is the STANDARD preset, which
-    // declares `web_search = true` and therefore overrides this switch (the
-    // resolver's own precedence, older than this change). Clearing it leaves
-    // the switch as the only thing deciding, which is what this test proves.
+    // And the agent the shell builds follows the draft. The shipped preset is
+    // left in place: it declares `web_search = true`, and the switch must win
+    // over that declaration - the preset may only decline, never re-offer a
+    // tool the reader switched off.
     let built = cx.update(|_, cx| {
-        let mut draft = shell.read(cx).state.draft().clone();
-        draft.global.default_preset = String::new();
+        let draft = shell.read(cx).state.draft().clone();
         let built = crate::caps::build_agent(
             &draft,
             &shell.read(cx).state.vault,
@@ -7083,6 +7081,39 @@ fn the_tools_pane_switches_the_hosted_web_search(cx: &mut TestAppContext) {
             .unwrap_or(false)
     });
     assert!(!built, "the built agent follows the switch");
+}
+
+/// The Tools pane carries a way INTO the web-search settings.
+///
+/// A switch alone left the reader with a tool they could turn off and no door
+/// to the endpoint, method, budget and key it reads: the pane existed, but the
+/// only entry to it was the Extensions pane's built-in inventory.
+#[gpui::test]
+fn the_tools_pane_opens_the_web_search_settings(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::component::init);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = AppState::with_store(scratch_store("web-search-entry"));
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("tools"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let link = cx
+        .debug_bounds("settings-web-search-open")
+        .expect("the entry draws on the tool's own row");
+    cx.simulate_click(link.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let section = cx.update(|_, cx| harness.read(cx).shell.read(cx).state.settings_section);
+    assert_eq!(
+        section,
+        section_index("web-search").expect("the web-search pane"),
+        "the row opens the pane the tool's settings live in"
+    );
+    assert!(
+        cx.debug_bounds("settings-web-search-enabled").is_some(),
+        "and the pane it opened owns the switch, endpoint, method and key"
+    );
 }
 
 /// The footer Save commits without closing, and a second press commits again
@@ -13582,10 +13613,12 @@ fn the_job_stop_arms_then_stops_within_its_window(cx: &mut TestAppContext) {
     });
 }
 
-/// The rail is the reference's five cells plus the Vault, which BSH adds after
-/// Account. The reference's own order is otherwise untouched.
+/// The rail is the reference's five cells, plus the Vault (after Account, the
+/// surface it is administered from) and Web search (after Models, where a reader
+/// looks for what the model calls). The reference's own order is otherwise
+/// untouched.
 #[test]
-fn the_settings_rail_is_the_measured_cells_plus_the_vault() {
+fn the_settings_rail_is_the_measured_cells_plus_the_vault_and_web_search() {
     use super::settings::NAV;
     assert_eq!(
         NAV,
@@ -13594,10 +13627,23 @@ fn the_settings_rail_is_the_measured_cells_plus_the_vault() {
             "vault",
             "general",
             "models",
+            "web-search",
             "extensions",
             "agent-presets",
         ],
-        "the measured settings.section registrations, with the Vault after Account"
+        "the measured settings.section registrations with the two BSH additions"
+    );
+    // The rail renders each cell through `tr`, so a section key with no locale
+    // entry draws the raw key: `settings.web-search` shipped that way once.
+    assert_eq!(
+        crate::i18n::tr(crate::i18n::Lang::En, "settings.web-search"),
+        "Web search",
+        "the Web search cell is labelled, not the raw section key"
+    );
+    assert_eq!(
+        crate::i18n::tr(crate::i18n::Lang::Zh, "settings.web-search"),
+        "网页搜索",
+        "and its Chinese label is 网页搜索"
     );
     // BSH replaces the reference's plugin page with the extension platform.
     assert_eq!(
@@ -13612,10 +13658,10 @@ fn the_settings_rail_is_the_measured_cells_plus_the_vault() {
     );
 }
 
-/// The settings rail is the reference's five cells plus the Vault - there is no
-/// seventh - and the About block is General's own last row group, not a cell.
+/// The settings rail draws every `NAV` cell - seven, and no eighth - and the
+/// About block is General's own last row group, not a cell.
 #[gpui::test]
-fn the_settings_rail_is_six_cells_and_about_lives_in_general(cx: &mut TestAppContext) {
+fn the_settings_rail_draws_every_nav_cell_and_about_lives_in_general(cx: &mut TestAppContext) {
     use super::settings::section_index;
     init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
@@ -13631,12 +13677,13 @@ fn the_settings_rail_is_six_cells_and_about_lives_in_general(cx: &mut TestAppCon
         "set-nav-3",
         "set-nav-4",
         "set-nav-5",
+        "set-nav-6",
     ] {
         assert!(cx.debug_bounds(cell).is_some(), "{cell} draws");
     }
     assert!(
-        cx.debug_bounds("set-nav-6").is_none(),
-        "the rail is six cells: the reference's five plus the Vault"
+        cx.debug_bounds("set-nav-7").is_none(),
+        "the rail is seven cells: the reference's five plus the Vault and Web search"
     );
     cx.update(|_window, cx| {
         let shell = harness.read(cx).shell.clone();
@@ -13649,6 +13696,46 @@ fn the_settings_rail_is_six_cells_and_about_lives_in_general(cx: &mut TestAppCon
     assert!(
         cx.debug_bounds("general-item-current-version").is_some(),
         "the About block lives inside General"
+    );
+}
+
+/// The Web search cell is the entry: one press on the rail opens the pane, so
+/// the setting is reachable without knowing what the Extensions pane's built-in
+/// inventory lists.
+#[gpui::test]
+fn the_web_search_rail_cell_opens_the_tool_settings(cx: &mut TestAppContext) {
+    use super::settings::{section_index, NAV};
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = AppState::with_store(scratch_store("rail-web-search"));
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("general"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let cell = NAV
+        .iter()
+        .position(|id| *id == "web-search")
+        .expect("Web search is a rail cell");
+    // `debug_bounds` wants a `&'static str`, so the selector is literal here;
+    // the assertion above ties it to `NAV` and fails the moment the order moves.
+    assert_eq!(cell, 4, "the rail puts Web search after Models");
+    let bounds = cx
+        .debug_bounds("set-nav-4")
+        .expect("the Web search cell draws");
+    cx.simulate_click(bounds.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let section = cx.update(|_, cx| harness.read(cx).shell.read(cx).state.settings_section);
+    assert_eq!(
+        section,
+        section_index("web-search").expect("the web-search pane"),
+        "the rail cell opens the tool's settings pane"
+    );
+    assert!(
+        cx.debug_bounds("settings-web-search-enabled").is_some()
+            && cx.debug_bounds("field-web-search-key").is_some(),
+        "and the pane that opened owns the switch and the key field"
     );
 }
 

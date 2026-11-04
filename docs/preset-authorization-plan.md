@@ -97,11 +97,12 @@ standard/ptc/creator 的字段完全相同（只有 persona 与 parallel_tool_ca
 
 ### `web_search`
 
-`true` 显式授予；`false` **从请求的工具数组中移除** hosted web-search 工具
-（`AgentConfig::web_search`，由 `offers_web_search(enabled, api_mode)` 只在
-Responses 协议下提供）；缺省继承工作区/模型的 `web_tools_enabled`。这与
-`egress = []` 拒绝网络是同一种“缺席而不是调用时拒绝”的做法：工具根本不在请求里。
-hosted search 跑在模型供应商的服务器上，不是本机 egress，两者互不替代。
+`web_search` 现在是**本机工具**（见 `crates/bsh/src/web.rs`），不是 hosted 对象：
+`false` **从请求的工具数组中移除**它，`true` 只声明“这个 preset 要搜索”，`None`
+继承工作区开关。工作区的 `web_tools_enabled` 是**主开关**，preset 只能收窄，不能
+覆盖它把读者关掉的工具重新加回来（`offers_local_web_search(enabled, preset)`，与
+`egress` 一样是交集）。这与 `egress = []` 拒绝网络是同一种“缺席而不是调用时拒绝”
+的做法：工具根本不在请求里。
 
 ### `policy_mode`
 
@@ -231,7 +232,7 @@ PTC 通过 parallel_tool_calls 和批量工具人设实现；Creator 通过扩�
 | write | 写白名单：同上；None = 整个工作区，[] = 完全不写；仍受工作区根与权限层级约束 |
 | deny | 拒绝路径/glob；在 read/write 之前判定，优先级最高，始终并入 baseline 的 .git/.bsh |
 | egress | Preset 网络白名单；与会话 allowlist 取交集。None = 继承：工作区文件不存在时是“不受限”，存在但为空时是“全部拒绝” |
-| web_search | false 直接把 hosted web-search 工具从请求中移除；None 继承 web_tools_enabled |
+| web_search | false 把本机 web_search 工具从请求中移除；true 只声明意图；None 继承 web_tools_enabled。工作区开关是主开关，preset 只能收窄 |
 | plugins | 核心 bundle 列表；空列表 = 不挂载 |
 | tools | 内置工具白名单；None = 全部，[] = 无 |
 | skills | 技能白名单；None = 全部启用，[] = 无 |

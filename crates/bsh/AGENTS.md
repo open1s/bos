@@ -826,6 +826,9 @@ the line instead of indenting it, and run clippy before claiming green.
   plugins pane's `VIEWS` list (inventory tab first, then Shell 10 / Agent loop 20,
   then the sidebar panes); About is General's own `current-version` row group. A test
   asserts `NAV` + `VIEWS` partition `SECTIONS`, so a new pane goes into one of them.
+  (Round 130 superseded the five-cell part for Web search - see the end of this
+  file: `NAV` carries a seventh cell, `web-search`, between Models and
+  Extensions.)
 
 - The composer's command card is `crates/bsh/src/ui/command_menu.rs`: `entries(
   streaming)` is the reference's option list (attach a file, new chat, settings,
@@ -3797,4 +3800,33 @@ sentence"]`.
 No known gap is left in this round's scope: the live send is observed at the
 wire, a stored annotation replays as its block, and both the in-flight and the
 finished child rows show the reader's annotation.
+
+**The Web search settings are reachable now (round 130).** The pane existed and
+had no entry a reader could find: the rail carried the reference's five cells
+plus the Vault, and the only door was Extensions > Built-in plugin settings, an
+inventory. `NAV` gains a `web-search` cell between Models and Extensions - the
+position a reader looks for the model-facing thing - and the Tools pane's Web
+search row gains a `Configure` link beside its switch, because that row is
+where the tool is switched. The CLI's `--help` SECTION list now matches
+`SECTIONS`; it listed a `presentation` that does not exist and omitted
+`web-search`, `policy` and `plugins`.
+
+The switch had also been a no-op under every shipped preset, the second half of
+"the setting is lost": `build_agent` read
+`preset_web_search.unwrap_or(web_tools_enabled)`, while standard, ptc and
+creator all declare `web_search = true`, so a press wrote the draft and
+changed nothing in the build. `offers_local_web_search(enabled, preset)` is
+the intersection `egress` already follows: the workspace switch is the master
+and a preset may only decline (read-only does). Evidence:
+`caps::tests::web_search_is_the_switch_intersected_with_the_preset` (six-arm
+truth table), `the_web_tools_switch_reaches_the_agent` (shipped preset left in
+place), `the_tools_pane_switches_the_hosted_web_search` (the built agent
+follows the press with no preset cleared),
+`ui::shell_tests::the_web_search_rail_cell_opens_the_tool_settings` (a real
+press on the rail cell) and `the_tools_pane_opens_the_web_search_settings`
+(the Configure link); the two rail tests now pin seven cells and both labels.
+Trap: the rail renders `tr(lang, SECTIONS[index])`, so a section key with no
+locale entry draws the raw `settings.web-search` - the build showed exactly
+that until `settings.web-search` was added to both YAML files, and the label
+assertion is what keeps it from coming back.
 

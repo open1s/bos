@@ -430,6 +430,8 @@
 "settings.webSearchKeyRequired": "Paste a key before saving it."
 "settings.webSearchKeySaved": "Web search key saved to the vault"
 "settings.webSearchNotice": "The search endpoint is reached as local network access: the workspace egress allowlist decides whether the tool may reach it, and a refusal names the rule. The key is stored in the vault, never in a settings file."
+"settings.webSearchOpen": "Configure"
+"settings.web-search": "Web search"
 "settings.mcp": "MCP servers"
 "settings.mcpIntro": "Servers that offer tools to the agent. Each one is connected once and shared by every turn."
 "settings.mcpSearch": "Search MCP servers"
