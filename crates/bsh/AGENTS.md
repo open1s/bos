@@ -3708,3 +3708,55 @@ Honest gap: the kit menu itself is not click-driven by the interaction test, so
 the pick is proved through the row's state; and the installed tab still shows
 only the active version (its version list is now available, but the tab's
 controls were left as they were).
+
+
+Round 188 fixed the extension command that pasted its own template into the
+composer. The report was the slash card's row: choosing it replaced the draft
+with the command's whole prompt body - a paragraph the reader never typed, with
+no room for the words the command was meant to take.
+
+The contract is the reference's command CLAIM, not a text paste. A command is a
+prompt TEMPLATE: choosing the row writes the annotation `/name ` and parks the
+caret after it, and the SEND composes the template, a `---` divider and the
+reader's words into the one message the model reads, dropping the leading token
+once its template is attached. The draft therefore stays what the reader wrote
+(and what the transcript replays), and the template never masquerades as it.
+
+Three seams, one grammar:
+
+- `command_invocation` (`src/command_invocation.rs`) owns `draft` and `compose`.
+  The gesture is the LEADING token only, its name alphabet is the sanitized
+  qualified name (`[A-Za-z0-9_-]`), and the name ends at whitespace or end of
+  input. `ns__local` fails `skill_invocation`'s hyphen-only grammar, so a
+  command token can never be claimed as a skill (or draw the skill notice).
+- `Shell::request_text` is the one request composer, called by `submit`,
+  `steer_now` and `drain_inbox`. It composes BEFORE `turn_text`, which is
+  load bearing: `turn_text` prepends the plan directive and the @reference
+  guidance, so composing afterwards would leave the token mid-text and neither
+  leading nor droppable under plan mode or an @reference.
+- `send_to_subagent` composes too: the child view uses the same composer, so
+  one gesture cannot mean a template in the parent and prose in the child.
+
+The row actions carry the NAME now (`SlashAction::Extension`,
+`CardAction::Extension`), and one `insert_extension_command` handles all three
+draft shapes: a typed `/query` is replaced, an empty draft becomes the
+annotation, and words the `+` card was opened over are kept AFTER it. That last
+case was a silent no-op before this round: `cut_command_token` returned early
+when the draft carried no `/` or `@`, so picking an extension row from `+`
+on a non-empty draft changed nothing at all.
+
+Evidence:
+`command_invocation::tests` (6: annotation vs template, bare annotation,
+template+words, unknown names as prose incl. `/usr/bin` and a suffixed name,
+mid-sentence token, leading whitespace),
+`ui::shell_tests::choosing_an_extension_command_writes_the_annotation` (both
+cards; the slash path replaces a typed query, the `+` path keeps the words),
+and `an_extension_command_sends_its_template_with_the_readers_words` (drives
+`steer_now` and reads the turn's mailbox: the composed message is exact).
+Discrimination: with `request_text` forced back to `turn_text(text)`, the send
+test fails with `left: "/hello__greet in one sentence"`.
+
+Honest gap: the fresh-submit path is not observed at the wire by a fake
+provider; it shares `request_text` with the steer path the test drives, and the
+pure composer is tested directly.
+

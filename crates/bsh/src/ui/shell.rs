@@ -2817,6 +2817,20 @@ impl Shell {
         self.state.notice(notice);
     }
 
+    /// The text one submission sends to the model.
+    ///
+    /// The draft keeps the reader's own line, `/name` annotation included. This
+    /// is where an extension command's TEMPLATE joins it: the command's
+    /// instructions head the request, the reader's words follow the divider,
+    /// and the plan and reference guidance `turn_text` owns still ride in front
+    /// of both. A draft whose leading token names no loaded command is sent as
+    /// written, so ordinary prose pays one lookup and nothing else.
+    fn request_text(&self, text: &str, plan: bool) -> String {
+        let composed = crate::command_invocation::compose(&self.extension_commands, text)
+            .unwrap_or_else(|| text.to_string());
+        crate::state::turn_text(&composed, plan)
+    }
+
     /// Put one message into the session: queue it behind a running turn, or
     /// open a turn when the session is idle.
     ///
@@ -2856,7 +2870,7 @@ impl Shell {
         // NOT put on an ordinary request - the reference keeps goal state out of
         // model context and sends it only in a goal round's prompt.
         let plan = self.state.active_plan_mode();
-        let request = crate::state::turn_text(&text, plan);
+        let request = self.request_text(&text, plan);
         let input = crate::state::turn_input(&request, &attachments);
         // The transcript row keeps the reader's own words and the ORIGINAL image
         // bytes. The filename marker was only a stand-in for a renderer this
@@ -2943,7 +2957,7 @@ impl Shell {
         };
         self.warn_unresolved_skill(&queued.text, id);
         let plan = self.state.plan_mode(id);
-        let request = crate::state::turn_text(&queued.text, plan);
+        let request = self.request_text(&queued.text, plan);
         let input = crate::state::turn_input(&request, &queued.attachments);
         // A message into a running turn is still the reader's own request, so a
         // `/name` gesture in it loads that skill the way a fresh turn would.
@@ -3038,6 +3052,12 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A child is a model too: a `/command` annotation in the child
+        // composer composes its template the way a parent turn does, so one
+        // gesture cannot mean a template in one composer and prose in the
+        // other.
+        let prompt =
+            crate::command_invocation::compose(&self.extension_commands, &prompt).unwrap_or(prompt);
         let Some(run) = self.state.subagents.run(&id) else {
             self.state
                 .notice(crate::i18n::tr(self.state.lang, "subagents.unavailable").to_string());
@@ -3676,7 +3696,7 @@ impl Shell {
             return;
         };
         let plan = self.state.plan_mode(id);
-        let request = crate::state::turn_text(&queued.text, plan);
+        let request = self.request_text(&queued.text, plan);
         let input = crate::state::turn_input(&request, &queued.attachments);
         let images = crate::state::attachment_images(&queued.attachments);
         let image_slot = self

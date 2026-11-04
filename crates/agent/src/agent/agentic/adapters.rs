@@ -47,6 +47,18 @@ impl ReactToolTrait for ExtensibleToolAdapter {
     fn cancel(&self, call_id: &str) {
         self.inner.cancel(call_id);
     }
+
+    /// Deferral and proxy identity are properties of the tool, not of this
+    /// wrapper: a wrapper that answered them with its own defaults would
+    /// advertise a withheld tool again and hide a dispatcher's target from the
+    /// hooks.
+    fn deferred(&self) -> bool {
+        self.inner.deferred()
+    }
+
+    fn proxy_target(&self, args: &serde_json::Value) -> Option<(String, serde_json::Value)> {
+        self.inner.proxy_target(args)
+    }
 }
 
 pub(super) struct AsyncExtensibleToolAdapter {
@@ -94,6 +106,17 @@ impl AsyncTool for AsyncExtensibleToolAdapter {
 
     fn is_cancelable(&self) -> bool {
         self.inner.is_cancelable()
+    }
+
+    /// See [`ExtensibleToolAdapter`]: the wrapper must not answer for the tool
+    /// it wraps.
+    fn deferred(&self) -> bool {
+        self.inner.deferred()
+    }
+
+    /// See [`ExtensibleToolAdapter`].
+    fn proxy_target(&self, args: &serde_json::Value) -> Option<(String, serde_json::Value)> {
+        self.inner.proxy_target(args)
     }
 
     fn cancel(&self, call_id: &str) {

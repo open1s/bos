@@ -21,6 +21,7 @@ pub struct FunctionTool {
     func: Arc<dyn Fn(&serde_json::Value) -> Result<serde_json::Value, ToolError> + Send + Sync>,
     skill: bool,
     category: String,
+    deferred: bool,
 }
 
 impl FunctionTool {
@@ -40,6 +41,7 @@ impl FunctionTool {
             func: Arc::new(func),
             skill: false,
             category: "general".to_string(),
+            deferred: false,
         }
     }
 
@@ -55,12 +57,22 @@ impl FunctionTool {
             func: Arc::new(func),
             skill: true,
             category: "skill".to_string(),
+            deferred: false,
         }
     }
 
     /// Override the tool category.
     pub fn with_category(mut self, category: &str) -> Self {
         self.category = category.to_string();
+        self
+    }
+
+    /// Keep this tool out of the advertised array.
+    ///
+    /// The tool stays callable; the model reaches it through `find_tool` and
+    /// `call_tool`. See [`Tool::deferred`].
+    pub fn with_deferred(mut self, deferred: bool) -> Self {
+        self.deferred = deferred;
         self
     }
 
@@ -120,6 +132,10 @@ impl Tool for FunctionTool {
     fn category(&self) -> String {
         self.category.clone()
     }
+
+    fn deferred(&self) -> bool {
+        self.deferred
+    }
 }
 
 /// A wrapper that converts an async closure into an [`AsyncTool`].
@@ -154,6 +170,7 @@ pub struct AsyncFunctionTool {
     func: Arc<dyn for<'a> Fn(&'a serde_json::Value) -> BoxedToolFuture<'a> + Send + Sync>,
     skill: bool,
     category: String,
+    deferred: bool,
 }
 
 impl AsyncFunctionTool {
@@ -169,6 +186,7 @@ impl AsyncFunctionTool {
             func: Arc::new(func),
             skill: false,
             category: "general".to_string(),
+            deferred: false,
         }
     }
 
@@ -223,12 +241,22 @@ impl AsyncFunctionTool {
             func: Arc::new(func),
             skill: true,
             category: "skill".to_string(),
+            deferred: false,
         }
     }
 
     /// Override the tool category.
     pub fn with_category(mut self, category: &str) -> Self {
         self.category = category.to_string();
+        self
+    }
+
+    /// Keep this tool out of the advertised array.
+    ///
+    /// The tool stays callable; the model reaches it through `find_tool` and
+    /// `call_tool`. See [`AsyncTool::deferred`].
+    pub fn with_deferred(mut self, deferred: bool) -> Self {
+        self.deferred = deferred;
         self
     }
 
@@ -262,6 +290,10 @@ impl AsyncTool for AsyncFunctionTool {
 
     fn category(&self) -> String {
         self.category.clone()
+    }
+
+    fn deferred(&self) -> bool {
+        self.deferred
     }
 }
 

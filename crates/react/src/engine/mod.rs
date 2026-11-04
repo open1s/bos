@@ -384,6 +384,12 @@ impl<A: ReActApp> ReActEngine<A> {
                             // passes its before-hook first. The hooks take the
                             // session, so they stay in the model own order.
                             let mut batch: Vec<(String, String, serde_json::Value)> = Vec::new();
+                            // The identity each call reports to hooks, telemetry
+                            // and the failure guard. A proxy (see
+                            // `Tool::proxy_target`) resolves to the tool it
+                            // forwards to; the session keeps the advertised name.
+                            let mut hook_names: std::collections::HashMap<String, String> =
+                                std::collections::HashMap::new();
                             for tc in tool_calls {
                                 found_tool_call = true;
                                 let call_id = tc.id.clone();
@@ -418,9 +424,16 @@ skill_dir: {}
 
                                 self.inject_call_id(&mut args, &call_id);
 
+                                let (hook_name, mut hook_args) = self.call_identity(&name, &args);
                                 match self
                                     .react_app
-                                    .before_tool_call(&name, &mut args, &call_id, session, context)
+                                    .before_tool_call(
+                                        &hook_name,
+                                        &mut hook_args,
+                                        &call_id,
+                                        session,
+                                        context,
+                                    )
                                     .await
                                 {
                                     HookDecision::Continue => {}
@@ -433,7 +446,17 @@ skill_dir: {}
                                         return Err(ReactError::HookAbort(msg));
                                     }
                                 }
+                                // A hook may rewrite the arguments it was shown.
+                                // For a proxy those are the inner arguments, so
+                                // they go back where the dispatcher will read
+                                // them; otherwise the call's own arguments stand.
+                                if hook_name == name {
+                                    args = hook_args;
+                                } else {
+                                    Self::write_proxy_args(&mut args, hook_args);
+                                }
 
+                                hook_names.insert(call_id.clone(), hook_name);
                                 batch.push((name, call_id, args));
                             }
 
@@ -482,10 +505,14 @@ skill_dir: {}
                             for ((name, call_id, args), mut result) in
                                 batch.into_iter().zip(results)
                             {
+                                // What the call actually was, when the tool that
+                                // ran was a dispatcher for another one.
+                                let observed =
+                                    hook_names.remove(&call_id).unwrap_or_else(|| name.clone());
                                 match self
                                     .react_app
                                     .after_tool_result(
-                                        &name,
+                                        &observed,
                                         &mut result,
                                         &call_id,
                                         session,
@@ -537,7 +564,7 @@ skill_dir: {}
                                     }
 
                                     self.telemetry.emit(&TelemetryEvent::ToolInvocation {
-                                        tool: name.clone(),
+                                        tool: observed.clone(),
                                         input: args.clone(),
                                         output: ret.clone(),
                                     });
@@ -563,7 +590,7 @@ skill_dir: {}
                                     });
                                 }
                                 let failure_text = result_text;
-                                if repeated.note(&name, &failure_text) {
+                                if repeated.note(&observed, &failure_text) {
                                     closing = true;
                                     session.push(LlmMessage::user_text(REPEAT_FAILURE_NOTE));
                                 }
@@ -666,9 +693,18 @@ skill_dir: {}
 
                                 self.inject_call_id(&mut args, &call_id);
 
+                                // A dispatcher reports the tool it forwarded to;
+                                // everything below keys off that identity.
+                                let (observed, mut hook_args) = self.call_identity(&name, &args);
                                 match self
                                     .react_app
-                                    .before_tool_call(&name, &mut args, &call_id, session, context)
+                                    .before_tool_call(
+                                        &observed,
+                                        &mut hook_args,
+                                        &call_id,
+                                        session,
+                                        context,
+                                    )
                                     .await
                                 {
                                     HookDecision::Continue => {}
@@ -680,6 +716,11 @@ skill_dir: {}
                                     HookDecision::Error(msg) => {
                                         return Err(ReactError::HookAbort(msg));
                                     }
+                                }
+                                if observed == name {
+                                    args = hook_args;
+                                } else {
+                                    Self::write_proxy_args(&mut args, hook_args);
                                 }
 
                                 let tool_started = Instant::now();
@@ -693,7 +734,7 @@ skill_dir: {}
                                 match self
                                     .react_app
                                     .after_tool_result(
-                                        &name,
+                                        &observed,
                                         &mut result,
                                         &call_id,
                                         session,
@@ -745,7 +786,7 @@ skill_dir: {}
                                     }
 
                                     self.telemetry.emit(&TelemetryEvent::ToolInvocation {
-                                        tool: name.clone(),
+                                        tool: observed.clone(),
                                         input: args.clone(),
                                         output: ret.clone(),
                                     });
@@ -771,7 +812,7 @@ skill_dir: {}
                                     });
                                 }
                                 let failure_text = result_text;
-                                if repeated.note(&name, &failure_text) {
+                                if repeated.note(&observed, &failure_text) {
                                     closing = true;
                                     session.push(LlmMessage::user_text(REPEAT_FAILURE_NOTE));
                                 }
@@ -980,8 +1021,11 @@ skill_dir: {}
 
                             self.inject_call_id(&mut args, &call_id);
 
+                            // A dispatcher reports the tool it forwarded to; the
+                            // hooks, telemetry and failure guard all follow that.
+                            let (observed, mut hook_args) = self.call_identity(&name, &args);
                             match self.react_app
-                                .before_tool_call(&name, &mut args, &call_id, session, context)
+                                .before_tool_call(&observed, &mut hook_args, &call_id, session, context)
                                 .await
                             {
                                 HookDecision::Continue => {}
@@ -995,6 +1039,11 @@ skill_dir: {}
                                     yield Err(ReactError::HookAbort(msg));
                                     break;
                                 }
+                            }
+                            if observed == name {
+                                args = hook_args;
+                            } else {
+                                Self::write_proxy_args(&mut args, hook_args);
                             }
 
                             let tool_started = Instant::now();
@@ -1018,7 +1067,13 @@ skill_dir: {}
                                 .fetch_add(tool_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
                             match self.react_app
-                                .after_tool_result(&name, &mut result, &call_id, session, context)
+                                .after_tool_result(
+                                    &observed,
+                                    &mut result,
+                                    &call_id,
+                                    session,
+                                    context,
+                                )
                                 .await
                                 {
                                 HookDecision::Continue => {}
@@ -1045,7 +1100,7 @@ skill_dir: {}
                                         }
                                     }
                                     self.telemetry.emit(&TelemetryEvent::ToolInvocation {
-                                        tool: name.clone(),
+                                        tool: observed.clone(),
                                         input: args.clone(),
                                         output: ret.clone(),
                                     });
@@ -1076,7 +1131,7 @@ skill_dir: {}
                             // A failing command that is retried unchanged is
                             // the environment refusing, not the model learning:
                             // three strikes and the turn closes with a report.
-                            if repeated.note(&name, &result_text) {
+                            if repeated.note(&observed, &result_text) {
                                 closing = true;
                                 session.push(LlmMessage::user_text(REPEAT_FAILURE_NOTE));
                             }

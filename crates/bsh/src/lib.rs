@@ -13,6 +13,7 @@ pub(crate) mod assets;
 pub(crate) mod audit;
 pub(crate) mod browser;
 pub(crate) mod caps;
+pub(crate) mod command_invocation;
 pub(crate) mod context;
 mod editors;
 pub(crate) mod export;

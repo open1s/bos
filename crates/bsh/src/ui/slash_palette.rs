@@ -139,8 +139,12 @@ pub(crate) struct SlashItem {
 pub(crate) enum SlashAction {
     /// Run a command this build backs.
     Command(SlashCommand),
-    /// Put one extension command's template into the draft.
-    Template(String),
+    /// Put one extension command's `/name ` annotation into the draft.
+    ///
+    /// The template is NOT draft text: it heads the request the send
+    /// composes ([`crate::command_invocation`]), so the reader sees the
+    /// command they chose and keeps their own words beside it.
+    Extension(String),
     /// Put the skill's name in the prompt, after its slash.
     ///
     /// The load itself belongs to the SEND: the runner's turn task resolves
@@ -475,7 +479,7 @@ impl SlashCatalogue {
                 label: command.name.clone(),
                 description: command.description.clone(),
                 user_only: false,
-                action: SlashAction::Template(command.template.clone()),
+                action: SlashAction::Extension(command.name.clone()),
             });
         }
         for skill in skills {
@@ -1073,9 +1077,11 @@ impl Shell {
             // gesture against the skills that build registered and appends
             // the instructions (crate::skill_invocation), which is exactly
             // the reference's pre-step skill listener.
-            SlashAction::Template(template) => {
-                self.slash.close();
-                self.set_composer_text(&template, window, cx);
+            // The annotation, not the template. The template is the command's
+            // prompt body and belongs to the request the send composes, so a
+            // one-row choice never pastes a paragraph into the reader's draft.
+            SlashAction::Extension(name) => {
+                self.insert_extension_command(&name, window, cx);
             }
             SlashAction::Insert(name) => {
                 self.slash.close();

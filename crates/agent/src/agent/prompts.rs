@@ -42,10 +42,27 @@ You are the agent inside a harness: get work done with tools instead of talking 
 1. Act now. As soon as a tool can answer the question or do the thing, call it in the same message, and batch every independent call into that one message. Do not send a message that only describes the next step, and do not restate the request back to the reader.
 2. Think briefly. Decide the next action in a sentence or two, then make the call. Do not plan twice, do not re-read instructions you already have, and do not weigh two equivalent tools - pick the direct one.
 3. Plan once, for real multi-step work. Record the plan with update_plan before changing anything: one item per concrete step, exactly one item in_progress. Skip the plan for a single trivial step.
-4. Change in small, verifiable increments. Read the relevant code and configuration before you change it, prefer edit_file over rewriting a whole file, and follow the workspace's existing functions and patterns before adding new machinery. Keep each change the smallest that solves the task.
+4. Change in small, verifiable increments. Read the relevant code and configuration before you change it, prefer a targeted edit over rewriting a whole file, and follow the workspace's existing functions and patterns before adding new machinery. Keep each change the smallest that solves the task.
 5. Verify before you claim done. Run the build, test or command that proves the change when a shell is available; otherwise re-read the result and state what you could not check. Investigate failures before moving on, and never describe unverified work as complete.
 6. Ask only for what you cannot discover. Resolve discoverable facts by inspection. When a decision is the reader's to make, or a material ambiguity remains that inspection cannot answer, ask one direct, self-contained question instead of guessing.
 7. Report honestly and briefly. Lead with the answer, name the files you touched, and state what you verified and what you could not. If you were blocked, say what blocked you and what would unblock you.";
+
+/// What the model is told when some tools are withheld from its tool list.
+///
+/// Appended only when the agent actually withholds a tool: a prompt that named
+/// `find_tool` on an agent that does not carry it would be the stale-reference
+/// mistake the workflow guidance itself warns about.
+///
+/// The wording names the two tools by their registered names and nothing else,
+/// so it stays true when a host renames its file tools or adds an MCP server.
+pub const DISCOVERY_GUIDANCE: &str = "You are given a subset of this machine's tools. When the tool you need is not among them, call find_tool with what you need to do - or with no query to list every name - then call call_tool with {name, args} to run it. Do not conclude a capability is missing before searching for it.";
+
+/// What the model is told when skills are searched instead of catalogued.
+///
+/// Appended only when the agent carries model-invocable skills and its
+/// catalogue is off, for the same reason as [`DISCOVERY_GUIDANCE`]: a prompt
+/// that names a tool on an agent that does not carry it is a lie.
+pub const SKILL_DISCOVERY_GUIDANCE: &str = "Skills work the same way. When one could apply, call find_skill with what you need to do - or with no query to list every skill name - then call load_skill with a name to read its instructions. Load one only when its description matches the request; being listed is not a reason.";
 
 /// The default system prompt: identity, the default persona, then workflow guidance.
 ///
@@ -62,7 +79,7 @@ You are the agent inside a harness: get work done with tools instead of talking 
 1. Act now. As soon as a tool can answer the question or do the thing, call it in the same message, and batch every independent call into that one message. Do not send a message that only describes the next step, and do not restate the request back to the reader.
 2. Think briefly. Decide the next action in a sentence or two, then make the call. Do not plan twice, do not re-read instructions you already have, and do not weigh two equivalent tools - pick the direct one.
 3. Plan once, for real multi-step work. Record the plan with update_plan before changing anything: one item per concrete step, exactly one item in_progress. Skip the plan for a single trivial step.
-4. Change in small, verifiable increments. Read the relevant code and configuration before you change it, prefer edit_file over rewriting a whole file, and follow the workspace's existing functions and patterns before adding new machinery. Keep each change the smallest that solves the task.
+4. Change in small, verifiable increments. Read the relevant code and configuration before you change it, prefer a targeted edit over rewriting a whole file, and follow the workspace's existing functions and patterns before adding new machinery. Keep each change the smallest that solves the task.
 5. Verify before you claim done. Run the build, test or command that proves the change when a shell is available; otherwise re-read the result and state what you could not check. Investigate failures before moving on, and never describe unverified work as complete.
 6. Ask only for what you cannot discover. Resolve discoverable facts by inspection. When a decision is the reader's to make, or a material ambiguity remains that inspection cannot answer, ask one direct, self-contained question instead of guessing.
 7. Report honestly and briefly. Lead with the answer, name the files you touched, and state what you verified and what you could not. If you were blocked, say what blocked you and what would unblock you.";
@@ -208,6 +225,36 @@ mod tests {
         assert_eq!(guidance_for_tool("not_a_tool"), None);
     }
 
+    /// Standing guidance names no tool by name: a host's tool set is its own,
+    /// and a rule that says `edit_file` stops being true the moment a host
+    /// names its editor something else.
+    #[test]
+    fn the_workflow_rules_do_not_name_a_tool_a_host_may_not_have() {
+        for text in [WORKFLOW_GUIDANCE, DEFAULT_SYSTEM_PROMPT] {
+            assert!(
+                !text.contains("edit_file"),
+                "the workflow rules stay name-agnostic: {text}"
+            );
+        }
+    }
+
+    /// The discovery paragraph is the one block that names two tools, and it
+    /// names exactly the pair the agent advertises with it.
+    #[test]
+    fn the_discovery_guidance_names_the_pair_it_uses() {
+        assert!(DISCOVERY_GUIDANCE.contains("find_tool"));
+        assert!(DISCOVERY_GUIDANCE.contains("call_tool"));
+        assert!(!DISCOVERY_GUIDANCE.trim().is_empty());
+    }
+
+    /// The skill paragraph names the pair a searched install actually carries.
+    #[test]
+    fn the_skill_guidance_names_the_pair_it_uses() {
+        assert!(SKILL_DISCOVERY_GUIDANCE.contains("find_skill"));
+        assert!(SKILL_DISCOVERY_GUIDANCE.contains("load_skill"));
+        assert!(!SKILL_DISCOVERY_GUIDANCE.trim().is_empty());
+    }
+
     /// The prompt must not name a tool the request does not carry.
     #[test]
     fn no_stale_reference_to_a_removed_tool() {
@@ -217,6 +264,8 @@ mod tests {
             TOOL_BASH,
             TOOL_JOBS,
             TOOL_PLAN,
+            DISCOVERY_GUIDANCE,
+            SKILL_DISCOVERY_GUIDANCE,
         ];
         let forbidden = [
             "`glob`",

@@ -106,14 +106,26 @@ impl Agent {
             context.tools.push(react::llm::LlmTool::web_search(None));
         }
 
-        // The catalogue is the model-facing projection of the agent's whole
-        // skill set: a package's `SKILL.md` files are loaded into the live
-        // overlay after the build, and the catalogue is the only thing that
-        // tells the model they exist. A skill whose manifest says
-        // `disable-model-invocation: true` stays out (the reader's `/name`
-        // gesture still loads it), which is why the projection, not the raw
-        // list, is what the request carries.
-        context.skills = self.model_skills();
+        // The array is part of the provider's cached prefix, so its order must
+        // be a function of the set, not of what was appended last. The
+        // discovery pair is already part of `model_tools` when anything is
+        // withheld; nothing is added here.
+        context.tools.sort_by(|a, b| a.name.cmp(&b.name));
+
+        // Skills follow the tool rule: the request carries no catalogue, and
+        // the model asks for what it needs with `find_skill`. The catalogue
+        // stays available for a host that wants the model to see every skill up
+        // front (see `Agent::with_skill_catalogue`); a skill whose manifest says
+        // `disable-model-invocation: true` is out of both, because the reader's
+        // `/name` gesture still loads it.
+        if self.skill_search() {
+            context
+                .tools
+                .push(super::discovery::find_skill_definition());
+            context.tools.sort_by(|a, b| a.name.cmp(&b.name));
+        } else {
+            context.skills = self.model_skills();
+        }
 
         context
     }
@@ -195,6 +207,53 @@ impl Agent {
                     builder = builder.with_tool(ToolVariant::Async(tool_adapter));
                 }
             }
+        }
+
+        // A withheld tool is still callable; these two are how the model finds
+        // one and runs it. Registering them only when something is withheld
+        // keeps the pair honest: with nothing to find they are two names that
+        // can only answer "nothing".
+        if self.has_deferred_tools() {
+            // The host's own withheld names travel with the search, so a tool
+            // it listed can be found even though the tool itself carries no
+            // mark. A tool's own mark is read per call, which keeps a package
+            // registered after this build discoverable too.
+            let withheld = super::discovery::Withheld::new(
+                self.deferred_tools.clone(),
+                self.deferred_prefixes.clone(),
+            );
+            let find = super::discovery::find_tool(
+                self.registry.clone(),
+                Arc::clone(&self.live_tools),
+                withheld,
+            );
+            builder = builder.with_tool(ToolVariant::Sync(Box::new(ExtensibleToolAdapter::new(
+                Arc::new(find),
+                self.plugins.clone(),
+                self.hooks.clone(),
+                self.config.name.clone(),
+            ))));
+            let call = super::discovery::CallTool::new(
+                self.registry.clone(),
+                Arc::clone(&self.live_tools),
+            );
+            builder = builder.with_tool(ToolVariant::Async(Box::new(
+                AsyncExtensibleToolAdapter::new(Arc::new(call)),
+            )));
+        }
+
+        // Skills are searched the same way when the catalogue is off: one tool
+        // that names the ones a request could use, with `load_skill` opening
+        // the one it picked.
+        if self.skill_search() {
+            let search =
+                super::discovery::find_skill(self.skills.clone(), Arc::clone(&self.live_skills));
+            builder = builder.with_tool(ToolVariant::Sync(Box::new(ExtensibleToolAdapter::new(
+                Arc::new(search),
+                self.plugins.clone(),
+                self.hooks.clone(),
+                self.config.name.clone(),
+            ))));
         }
 
         // The loader advertises the MODEL-INVOCABLE skills only: a skill whose
@@ -292,6 +351,23 @@ impl Agent {
     /// it uses the configured prompt unchanged.
     async fn system_prompt_for(&self, task: &Content) -> String {
         let mut base = self.config.system_prompt.clone();
+        // A withheld tool is only usable if the model knows the way back to it;
+        // the paragraph that says so is appended here, not in the constant, so
+        // an agent that withholds nothing never names a tool it does not carry.
+        if self.has_deferred_tools() {
+            if !base.is_empty() {
+                base.push_str("\n\n");
+            }
+            base.push_str(crate::agent::prompts::DISCOVERY_GUIDANCE);
+        }
+        // The same rule for skills: no catalogue means the model needs the
+        // paragraph that names the way to one.
+        if self.skill_search() {
+            if !base.is_empty() {
+                base.push_str("\n\n");
+            }
+            base.push_str(crate::agent::prompts::SKILL_DISCOVERY_GUIDANCE);
+        }
         if let Ok(prompts) = self.live_prompts.read() {
             for prompt in prompts.iter() {
                 if !base.is_empty() {

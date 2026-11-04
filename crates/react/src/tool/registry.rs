@@ -34,6 +34,25 @@ pub trait Tool: Send + Sync {
     }
     /// Cancel the call with the given id, if running.
     fn cancel(&self, _call_id: &str) {}
+    /// Whether the model is told this tool exists without being sent its
+    /// definition.
+    ///
+    /// A deferred tool stays registered and stays callable: only the advertised
+    /// array omits it, so a dispatcher can reach it while the per-step prompt
+    /// keeps its size. Default `false` - a registered tool is advertised.
+    fn deferred(&self) -> bool {
+        false
+    }
+    /// The tool this call actually resolves to, when this tool is a proxy.
+    ///
+    /// A dispatcher forwards one invocation to another registered tool by name.
+    /// The engine asks this BEFORE it dispatches, so hooks, bus events and the
+    /// repeated-failure guard are keyed to the real tool rather than to the
+    /// dispatcher. The proxy still runs; the resolved pair is the identity the
+    /// outside world observes.
+    fn proxy_target(&self, _args: &Value) -> Option<(String, Value)> {
+        None
+    }
 }
 
 #[async_trait]
@@ -76,6 +95,16 @@ pub trait AsyncTool: Send + Sync {
     }
     /// Cancel the call with the given id, if running.
     fn cancel(&self, _call_id: &str) {}
+    /// Whether the model is told this tool exists without being sent its
+    /// definition. See [`Tool::deferred`].
+    fn deferred(&self) -> bool {
+        false
+    }
+    /// The tool this call actually resolves to, when this tool is a proxy.
+    /// See [`Tool::proxy_target`].
+    fn proxy_target(&self, _args: &Value) -> Option<(String, Value)> {
+        None
+    }
     /// Run the tool and stream partial output.
     async fn run_streaming(
         &self,
@@ -163,6 +192,22 @@ impl ToolVariant {
         match self {
             Self::Sync(tool) => tool.is_cancelable(),
             Self::Async(tool) => tool.is_cancelable(),
+        }
+    }
+
+    /// Whether the model is told this tool exists without its definition.
+    pub fn deferred(&self) -> bool {
+        match self {
+            Self::Sync(tool) => tool.deferred(),
+            Self::Async(tool) => tool.deferred(),
+        }
+    }
+
+    /// The tool this call resolves to, when the wrapped tool is a proxy.
+    pub fn proxy_target(&self, args: &Value) -> Option<(String, Value)> {
+        match self {
+            Self::Sync(tool) => tool.proxy_target(args),
+            Self::Async(tool) => tool.proxy_target(args),
         }
     }
 }

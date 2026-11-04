@@ -483,6 +483,19 @@ impl react::tool::registry::AsyncTool for ExtensionTool {
         true
     }
 
+    /// A package contributes a FAMILY of tools at install time, and every one
+    /// of them used to ride in the request's tool array on every step - three
+    /// installed packages are eighteen schemas, most of them unrelated to the
+    /// turn.
+    ///
+    /// They stay registered and callable; the model reaches one through
+    /// `find_tool`/`call_tool`, which the build advertises as soon as it
+    /// withholds anything. The Tools pane still lists them, because the pane
+    /// lists capabilities (`Agent::all_tools`), not advertisement.
+    fn deferred(&self) -> bool {
+        true
+    }
+
     fn cancel(&self, call_id: &str) {
         if !self.calls.cancel(call_id) {
             // The call already finished; there is nothing to signal.

@@ -1396,18 +1396,22 @@ fn build_agent_for_session_inner(
     // priced from exactly that array - the build registry AND the live overlay
     // the extension platform installs into.
     let model_tools = agent.model_tools();
-    let tools_schema_chars = tools_schema_chars(&model_tools);
+    let schema_chars = tools_schema_chars(&model_tools);
+    // What the request no longer carries, so a build's deferral can be judged
+    // from the log instead of from a bill: every char here is one that left
+    // each step's cached prefix when MCP tools moved behind find_tool.
+    let withheld_chars = tools_schema_chars(&agent.all_tools()).saturating_sub(schema_chars);
     // A schema this large is re-sent on every step; name it at build time so a
     // connected MCP server or a wide preset can be seen in the log instead of
     // felt as latency.
     let tool_count = model_tools.len();
     log::info!(
-        "build session={session} tools={tool_count} schema_chars={tools_schema_chars} mcp_tools={}",
+        "build session={session} tools={tool_count} schema_chars={schema_chars} withheld_chars={withheld_chars} mcp_tools={}",
         mcp.tools().count()
     );
-    if tools_schema_chars > 20_000 {
+    if schema_chars > 20_000 {
         log::warn!(
-            "tool schema is {tools_schema_chars} chars; a preset allowlist or a lazy MCP gateway would cut every request"
+            "tool schema is {schema_chars} chars; a preset allowlist or a lazy MCP gateway would cut every request"
         );
     }
 
@@ -1427,14 +1431,15 @@ fn build_agent_for_session_inner(
             "preset": preset,
             "tools": tool_count,
             "skills": agent.all_skills().len(),
-            "schema_chars": tools_schema_chars,
+            "schema_chars": schema_chars,
+            "withheld_chars": withheld_chars,
         }),
     );
     let built = BuiltAgent {
         agent: Arc::new(agent),
         plugins,
         extension_activations: extension_activations.into(),
-        tools_schema_chars,
+        tools_schema_chars: schema_chars,
         credential_error,
         policy,
         effective: eff,
@@ -1653,11 +1658,14 @@ pub(crate) fn web_search_config(settings: &Settings, vault: &Vault) -> crate::we
 }
 
 pub(crate) fn capabilities(agent: &Agent) -> Vec<CapInfo> {
-    // The pane lists what the model can call, from the same derivation the
-    // request uses: a row read from the build registry alone left every
-    // extension package's tool out of the pane it was installed for.
+    // The pane lists what the model can CALL, which is the whole registry: a
+    // row read from the build registry alone left every extension package's
+    // tool out of the pane it was installed for, and reading the advertised
+    // array instead hid every deferred tool - still callable through
+    // `call_tool`, so still a capability the reader may switch. The meter
+    // prices the advertised array separately (see `build_agent_for_session`).
     let mut caps: Vec<CapInfo> = agent
-        .model_tools()
+        .all_tools()
         .into_iter()
         .map(|tool| CapInfo {
             name: tool.name,
@@ -3496,7 +3504,7 @@ fn grep_tool(
 ) -> FunctionTool {
     FunctionTool::new(
         "grep",
-        "Search file contents with a ripgrep regular expression. Returns each matching line with its file and 1-based line number. path may be a directory, searched recursively, or a single file, which is always searched whatever its ignore status or include glob. Ignored and hidden files, and dependency or build trees, are skipped unless include_ignored is set. Matching is case-sensitive unless case_insensitive is set. include takes one glob filter for the walk (negation unsupported); invert reports the lines that do NOT match; context adds that many lines on each side of a match; files_without_match returns the paths of files with no match; text searches binary files as text.",
+        "Search code (file contents) with a ripgrep pattern, a regular expression. Returns each matching line with its file and 1-based line number. path may be a directory, searched recursively, or a single file, which is always searched whatever its ignore status or include glob. Ignored and hidden files, and dependency or build trees, are skipped unless include_ignored is set. Matching is case-sensitive unless case_insensitive is set. include takes one glob filter for the walk (negation unsupported); invert reports the lines that do NOT match; context adds that many lines on each side of a match; files_without_match returns the paths of files with no match; text searches binary files as text.",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -4339,8 +4347,10 @@ mod tests {
     use crate::vault::Vault;
     use agent::policy::{Action, EgressRuleSet, PolicyInput, Target};
 
-    /// The browser's tools reach the request. A pane the model cannot drive is
-    /// a picture; this asserts the nine names are on the agent a turn runs.
+    /// The browser's tools are reachable without being advertised. A pane the
+    /// model cannot drive is a picture, so the nine names must be on the agent
+    /// a turn runs - as the registry behind `find_tool`, not as nine schemas in
+    /// every request.
     #[test]
     fn a_build_offers_the_browser_tools() {
         let built = build_agent(
@@ -4351,6 +4361,17 @@ mod tests {
         );
         let registry = built.agent.registry().expect("a tool registry");
         let names = registry.async_tool_names();
+        let advertised: Vec<String> = built
+            .agent
+            .model_tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert!(
+            advertised.iter().any(|name| name == "find_tool")
+                && advertised.iter().any(|name| name == "call_tool"),
+            "the pair replaces the family: {advertised:?}"
+        );
         for tool in [
             "browser_open",
             "browser_snapshot",
@@ -4364,7 +4385,11 @@ mod tests {
         ] {
             assert!(
                 names.iter().any(|name| name == tool),
-                "{tool} is offered to the model: {names:?}"
+                "{tool} is registered and callable: {names:?}"
+            );
+            assert!(
+                !advertised.iter().any(|name| name == tool),
+                "{tool} is withheld from the request: {advertised:?}"
             );
         }
     }
@@ -4830,10 +4855,10 @@ mod tests {
             drop(live);
             tool
         };
-        // The model learns a tool from the request's tool array alone, so a
-        // platform tool that is executable but absent there is one the model
-        // never calls. The array and the Tools pane must both carry it, from
-        // the same derivation.
+        // A package's tools are WITHHELD from the request's array now: they are
+        // a family installed at once, and a step paid for every schema. The
+        // contract is the pair instead - the array carries `find_tool` and
+        // `call_tool`, the pane still lists the tools, and each one still runs.
         let platform_names: Vec<String> = built
             .extension_activations
             .iter()
@@ -4852,12 +4877,27 @@ mod tests {
             .collect();
         for name in &platform_names {
             assert!(
-                model_names.contains(name),
-                "{name} must be advertised to the model, not only registered: {model_names:?}"
+                !model_names.contains(name),
+                "{name} is withheld from the advertised array: {model_names:?}"
             );
         }
+        assert!(
+            model_names.iter().any(|name| name == "find_tool")
+                && model_names.iter().any(|name| name == "call_tool"),
+            "the pair replaces the withheld tools: {model_names:?}"
+        );
+        let registered: Vec<String> = built
+            .agent
+            .all_tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
         let pane = crate::caps::capabilities(&built.agent);
         for name in &platform_names {
+            assert!(
+                registered.contains(name),
+                "{name} is still registered, only not advertised"
+            );
             assert!(
                 pane.iter()
                     .any(|cap| &cap.name == name && cap.category == "tool"),

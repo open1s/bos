@@ -995,6 +995,553 @@ fn prepare_context_advertises_a_live_tool_once() {
     assert_eq!(count, 1, "one name, one array entry");
 }
 
+/// Withholding a tool removes its schema from every step but keeps it
+/// callable, and the pair that replaces it is advertised in its place.
+#[test]
+fn a_deferred_tool_leaves_the_array_and_the_discovery_pair_takes_its_place() {
+    let mut agent = Agent::new(AgentConfig::default(), Arc::new(make_llm_provider()));
+    agent.add_tool(Arc::new(FunctionTool::new(
+        "hidden",
+        "a tool the prompt does not name",
+        serde_json::json!({"type": "object"}),
+        |_args| Ok(serde_json::json!("hidden")),
+    )));
+    let agent = agent.defer_tool("hidden");
+
+    assert!(agent.has_deferred_tools());
+    assert!(agent.is_deferred_tool("hidden"));
+    assert!(!agent.is_deferred_tool("visible"));
+
+    let names: Vec<String> = agent
+        .prepare_context()
+        .tools
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect();
+    assert!(
+        !names.iter().any(|name| name == "hidden"),
+        "a deferred tool is not advertised: {names:?}"
+    );
+    assert!(
+        names.iter().any(|name| name == "find_tool")
+            && names.iter().any(|name| name == "call_tool"),
+        "the way back to a withheld tool is advertised: {names:?}"
+    );
+}
+
+/// The default agent withholds nothing, so it pays for no discovery pair.
+#[test]
+fn nothing_is_deferred_by_default() {
+    let agent = Agent::new(AgentConfig::default(), Arc::new(make_llm_provider()));
+    assert!(!agent.has_deferred_tools());
+    let names: Vec<String> = agent
+        .prepare_context()
+        .tools
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect();
+    assert!(
+        !names
+            .iter()
+            .any(|name| name == "find_tool" || name == "call_tool"),
+        "no withheld tool means no discovery pair: {names:?}"
+    );
+}
+
+/// The dispatcher runs a registered tool and returns its result unchanged.
+#[tokio::test]
+async fn the_dispatcher_runs_the_tool_it_names() {
+    let mut registry = crate::tools::ToolRegistry::new();
+    registry
+        .register(Arc::new(FunctionTool::new(
+            "echo",
+            "echo the arguments",
+            serde_json::json!({"type": "object"}),
+            |args| Ok(args.clone()),
+        )))
+        .expect("the tool registers");
+    let live = Arc::new(std::sync::RwLock::new(crate::tools::ToolRegistry::new()));
+    let dispatcher =
+        crate::agent::agentic::discovery::CallTool::new(Some(Arc::new(registry)), live);
+
+    let result = react::tool::registry::AsyncTool::run(
+        &dispatcher,
+        &serde_json::json!({"name": "echo", "args": {"text": "hi"}}),
+    )
+    .await
+    .expect("the dispatch succeeds");
+    assert_eq!(result["text"], "hi");
+
+    let missing = react::tool::registry::AsyncTool::run(
+        &dispatcher,
+        &serde_json::json!({"name": "nope", "args": {}}),
+    )
+    .await;
+    assert!(missing.is_err(), "an unknown name is an error, not silence");
+}
+
+// =========================================================================
+// Deferred tools end to end
+// =========================================================================
+
+/// An MCP-shaped async tool that records that it ran.
+struct CountingMcpTool {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl react::tool::registry::AsyncTool for CountingMcpTool {
+    fn name(&self) -> &str {
+        "github_search"
+    }
+
+    fn description(&self) -> String {
+        "Search GitHub issues in the connected repository".to_string()
+    }
+
+    fn json_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {"query": {"type": "string", "description": "Search text"}},
+            "required": ["query"]
+        })
+    }
+
+    async fn run(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value, react::tool::ToolError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(serde_json::json!({
+            "issues": [{"title": format!("found for {}", args["query"].as_str().unwrap_or(""))}]
+        }))
+    }
+}
+
+/// Records the name each before-tool hook was given.
+struct ToolNameHook {
+    names: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl AgentHook for ToolNameHook {
+    async fn on_event(&self, _event: HookEvent, context: &HookContext) -> HookDecision {
+        if let Some(name) = context.get("tool_name") {
+            self.names.lock().unwrap().push(name.clone());
+        }
+        HookDecision::Continue
+    }
+}
+
+/// A model that discovers a withheld tool through `find_tool`, then runs it
+/// through `call_tool` - the whole round trip, through the real agent loop.
+struct DiscoveringLlm {
+    step: std::sync::atomic::AtomicUsize,
+    advertised: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl LlmClient<AgentSession, AgentReactContext> for DiscoveringLlm {
+    async fn complete(
+        &self,
+        _persona: Option<String>,
+        _req: LlmRequest,
+        _session: &mut AgentSession,
+        context: &mut AgentReactContext,
+    ) -> Result<LlmResponse, LlmError> {
+        if self.step.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            let names = context.tools.iter().map(|tool| tool.name.clone()).collect();
+            *self.advertised.lock().unwrap() = names;
+        }
+        let step = self.step.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(match step {
+            0 => make_tool_call_response("find_tool", "{\"query\":\"github issue search\"}"),
+            1 => make_tool_call_response(
+                "call_tool",
+                "{\"name\":\"github_search\",\"args\":{\"query\":\"bug\"}}",
+            ),
+            _ => make_text_response("Final Answer: found the issues".to_string()),
+        })
+    }
+
+    async fn stream_complete(
+        &self,
+        _persona: Option<String>,
+        _req: LlmRequest,
+        _session: &mut AgentSession,
+        _context: &mut AgentReactContext,
+    ) -> Result<react::llm::TokenStream, LlmError> {
+        Ok(Box::pin(futures::stream::empty()))
+    }
+
+    fn supports_tools(&self) -> bool {
+        true
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "discovering-mock"
+    }
+}
+
+fn discovering_agent(
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    advertised: Arc<std::sync::Mutex<Vec<String>>>,
+) -> Agent {
+    let mut provider = LlmProvider::new();
+    provider.register_vendor(
+        "mock".to_string(),
+        Box::new(DiscoveringLlm {
+            step: std::sync::atomic::AtomicUsize::new(0),
+            advertised,
+        }),
+    );
+    let mut agent = Agent::new(AgentConfig::default(), Arc::new(provider));
+    agent
+        .add_mcp_tool("github", "search", Arc::new(CountingMcpTool { calls }))
+        .expect("the MCP tool registers");
+    agent
+}
+
+/// An MCP tool is callable, and unreachable without the pair: the model asks
+/// `find_tool`, runs the answer through `call_tool`, and the hooks and the tool
+/// itself see one real invocation - not a dispatcher and a victim.
+#[tokio::test]
+async fn a_withheld_mcp_tool_is_found_and_run_through_the_agent() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let advertised = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut agent = discovering_agent(calls.clone(), advertised.clone());
+    let hook_names = Arc::new(std::sync::Mutex::new(Vec::new()));
+    agent.add_hook(
+        HookEvent::BeforeToolCall,
+        Arc::new(ToolNameHook {
+            names: hook_names.clone(),
+        }),
+    );
+
+    let answer = agent
+        .react("find the open bugs".to_string())
+        .await
+        .expect("the turn completes");
+
+    assert!(
+        answer.contains("found the issues"),
+        "the model's answer came back: {answer}"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the MCP tool ran exactly once"
+    );
+    let seen = advertised.lock().unwrap().clone();
+    assert!(
+        seen.iter().any(|name| name == "find_tool") && seen.iter().any(|name| name == "call_tool"),
+        "the pair is advertised: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|name| name == "github_search"),
+        "the MCP tool is not advertised: {seen:?}"
+    );
+    assert_eq!(
+        *hook_names.lock().unwrap(),
+        vec!["find_tool".to_string(), "github_search".to_string()],
+        "the second hook sees the tool behind the dispatcher"
+    );
+}
+
+/// A scripted model that names the withheld tool directly.
+struct DirectLlm {
+    step: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl LlmClient<AgentSession, AgentReactContext> for DirectLlm {
+    async fn complete(
+        &self,
+        _persona: Option<String>,
+        _req: LlmRequest,
+        _session: &mut AgentSession,
+        _context: &mut AgentReactContext,
+    ) -> Result<LlmResponse, LlmError> {
+        let step = self.step.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(match step {
+            0 => make_tool_call_response("github_search", "{\"query\":\"bug\"}"),
+            _ => make_text_response("Final Answer: done".to_string()),
+        })
+    }
+
+    async fn stream_complete(
+        &self,
+        _persona: Option<String>,
+        _req: LlmRequest,
+        _session: &mut AgentSession,
+        _context: &mut AgentReactContext,
+    ) -> Result<react::llm::TokenStream, LlmError> {
+        Ok(Box::pin(futures::stream::empty()))
+    }
+
+    fn supports_tools(&self) -> bool {
+        true
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "direct-mock"
+    }
+}
+
+/// Withholding is advertisement, not permission: a model that names a withheld
+/// tool still reaches it, which is what makes the pair a convenience rather
+/// than a gate.
+#[tokio::test]
+async fn a_withheld_tool_still_runs_when_named_directly() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut provider = LlmProvider::new();
+    provider.register_vendor(
+        "mock".to_string(),
+        Box::new(DirectLlm {
+            step: std::sync::atomic::AtomicUsize::new(0),
+        }),
+    );
+    let mut agent = Agent::new(AgentConfig::default(), Arc::new(provider));
+    agent
+        .add_mcp_tool(
+            "github",
+            "search",
+            Arc::new(CountingMcpTool {
+                calls: calls.clone(),
+            }),
+        )
+        .expect("the MCP tool registers");
+
+    let _ = agent.react("bugs".to_string()).await.expect("turn");
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a withheld tool is still registered and callable"
+    );
+}
+
+/// A model that finds a skill, loads it, and reports whether the instructions
+/// arrived - the search path end to end, through the real agent loop.
+struct SkillSearchLlm {
+    step: std::sync::atomic::AtomicUsize,
+    saw_instructions: Arc<std::sync::atomic::AtomicBool>,
+    advertised: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl LlmClient<AgentSession, AgentReactContext> for SkillSearchLlm {
+    async fn complete(
+        &self,
+        _persona: Option<String>,
+        _req: LlmRequest,
+        session: &mut AgentSession,
+        context: &mut AgentReactContext,
+    ) -> Result<LlmResponse, LlmError> {
+        if self.step.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            *self.advertised.lock().unwrap() =
+                context.tools.iter().map(|tool| tool.name.clone()).collect();
+        }
+        let step = self.step.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(match step {
+            0 => make_tool_call_response("find_skill", "{\"query\":\"package instructions\"}"),
+            1 => make_tool_call_response("load_skill", "{\"name\":\"extension-skill\"}"),
+            _ => {
+                let seen = session.history().is_some_and(|history| {
+                    history.iter().any(|message| {
+                        matches!(
+                            message,
+                            react::llm::LlmMessage::ToolResult { content, .. }
+                                if content.contains("PACKAGE INSTRUCTIONS")
+                        )
+                    })
+                });
+                self.saw_instructions
+                    .store(seen, std::sync::atomic::Ordering::SeqCst);
+                make_text_response("Final Answer: followed the skill".to_string())
+            }
+        })
+    }
+
+    async fn stream_complete(
+        &self,
+        _persona: Option<String>,
+        _req: LlmRequest,
+        _session: &mut AgentSession,
+        _context: &mut AgentReactContext,
+    ) -> Result<react::llm::TokenStream, LlmError> {
+        Ok(Box::pin(futures::stream::empty()))
+    }
+
+    fn supports_tools(&self) -> bool {
+        true
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "skill-search-mock"
+    }
+}
+
+/// A skill is found by what it does, then opened by name; the catalogue block
+/// never had to be in the request.
+#[tokio::test]
+async fn a_skill_is_found_then_loaded_through_the_agent() {
+    let advertised = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let saw = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut provider = LlmProvider::new();
+    provider.register_vendor(
+        "mock".to_string(),
+        Box::new(SkillSearchLlm {
+            step: std::sync::atomic::AtomicUsize::new(0),
+            saw_instructions: saw.clone(),
+            advertised: advertised.clone(),
+        }),
+    );
+    let agent = Agent::new(AgentConfig::default(), Arc::new(provider));
+    agent.add_live_skill(crate::skills::SkillContent {
+        metadata: crate::skills::SkillMetadata::new(
+            "extension-skill".to_string(),
+            "Write the package instructions a release needs".to_string(),
+            std::path::PathBuf::from("/ext/skills/extension-skill/SKILL.md"),
+        ),
+        instructions: "PACKAGE INSTRUCTIONS: do the thing".to_string(),
+        skill_dir: std::path::PathBuf::from("/ext/skills/extension-skill"),
+    });
+
+    let answer = agent
+        .react("package a release".to_string())
+        .await
+        .expect("the turn completes");
+
+    assert!(answer.contains("followed the skill"), "{answer}");
+    assert!(
+        saw.load(std::sync::atomic::Ordering::SeqCst),
+        "load_skill delivered the instructions the search named"
+    );
+    let seen = advertised.lock().unwrap().clone();
+    assert!(
+        seen.iter().any(|name| name == "find_skill"),
+        "find_skill is advertised: {seen:?}"
+    );
+    assert!(
+        seen.iter().any(|name| name == "load_skill"),
+        "load_skill is advertised beside the search: {seen:?}"
+    );
+}
+
+/// One MCP-shaped schema: several described parameters, the shape a server
+/// ships. Real servers are wordier, so this understates the saving.
+fn mcp_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "owner": {"type": "string", "description": "Repository owner"},
+            "repo": {"type": "string", "description": "Repository name"},
+            "state": {"type": "string", "enum": ["open", "closed", "all"], "description": "Issue state"},
+            "labels": {"type": "array", "items": {"type": "string"}, "description": "Filter by labels"},
+            "per_page": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Results per page"},
+            "page": {"type": "integer", "minimum": 1, "description": "Page number"}
+        },
+        "required": ["owner", "repo"]
+    })
+}
+
+/// What the request carries for one tool, as the provider serialises it.
+fn tool_chars(tool: &react::llm::LlmTool) -> usize {
+    tool.name.len() + tool.description.len() + tool.parameters.to_string().len()
+}
+
+/// Withholding an MCP namespace must pay for the pair that replaces it.
+///
+/// The whole reason for deferral is prompt bytes: the advertised array is part
+/// of every step's cached prefix. This pins the arithmetic in both directions -
+/// what leaves, and what the two discovery tools plus their prompt paragraph
+/// cost - so a future change that makes the pair expensive, or the filter
+/// ineffective, fails here rather than in a bill.
+#[test]
+fn withholding_an_mcp_namespace_pays_for_the_discovery_pair() {
+    let mut agent = Agent::new(AgentConfig::default(), Arc::new(make_llm_provider()));
+    const SERVERS: usize = 40;
+    for index in 0..SERVERS {
+        let name = format!("github_tool_{index}");
+        agent.add_tool(Arc::new(FunctionTool::new(
+            &name,
+            "Work with a GitHub issue in the connected repository",
+            mcp_schema(),
+            |_args| Ok(serde_json::json!({})),
+        )));
+        agent.mark_mcp_tool(&name);
+    }
+
+    let full: usize = agent.all_tools().iter().map(tool_chars).sum();
+    let advertised: usize = agent.model_tools().iter().map(tool_chars).sum();
+    let pair: usize = [
+        crate::agent::agentic::discovery::find_tool_definition(),
+        crate::agent::agentic::discovery::call_tool_definition(),
+    ]
+    .iter()
+    .map(tool_chars)
+    .sum();
+    let paragraph = crate::agent::prompts::DISCOVERY_GUIDANCE.len() + 2;
+
+    let saved = full - advertised;
+    println!(
+        "mcp={SERVERS} full={full} advertised={advertised} pair={pair} paragraph={paragraph} saved={saved}"
+    );
+
+    // The pair is INSIDE `model_tools`, so the count difference is what was
+    // withheld minus the two entries that replaced it.
+    assert_eq!(
+        agent.all_tools().len() as i64 - agent.model_tools().len() as i64,
+        SERVERS as i64 - 2,
+        "every MCP tool leaves the array, and the pair joins it"
+    );
+    let net = saved.saturating_sub(paragraph);
+    assert!(
+        net > 4 * pair,
+        "deferring {SERVERS} MCP tools saves {net} chars after paying {paragraph} for the paragraph"
+    );
+}
+
+/// The discovery paragraph is spent only where it is true: an agent that
+/// withholds nothing never names `find_tool`.
+#[tokio::test]
+async fn the_discovery_paragraph_appears_only_when_a_tool_is_withheld() {
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let mut provider = LlmProvider::new();
+    provider.register_vendor(
+        "mock".to_string(),
+        Box::new(PersonaCapturingLlm(seen.clone())),
+    );
+    let agent = Agent::new(AgentConfig::default(), Arc::new(provider));
+    let _ = agent.react("task".to_string()).await;
+    let plain = seen.lock().unwrap().clone().expect("a persona");
+    assert!(
+        !plain.contains("find_tool"),
+        "nothing is withheld, so nothing points at find_tool"
+    );
+
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let mut provider = LlmProvider::new();
+    provider.register_vendor(
+        "mock".to_string(),
+        Box::new(PersonaCapturingLlm(seen.clone())),
+    );
+    let mut agent = Agent::new(AgentConfig::default(), Arc::new(provider));
+    agent.add_tool(Arc::new(FunctionTool::new(
+        "hidden",
+        "withheld",
+        serde_json::json!({"type": "object"}),
+        |_args| Ok(serde_json::json!({})),
+    )));
+    let agent = agent.defer_tool("hidden");
+    let _ = agent.react("task".to_string()).await;
+    let guided = seen.lock().unwrap().clone().expect("a persona");
+    assert!(
+        guided.contains(crate::agent::prompts::DISCOVERY_GUIDANCE),
+        "a withheld tool comes with the way back to it"
+    );
+}
+
 /// A mock that asks for `load_skill` first and reports, on the second call,
 /// whether the engine answered with the package's instructions.
 struct LoaderLlm {
@@ -1103,6 +1650,36 @@ async fn a_package_only_skill_is_loadable_by_the_model() {
 /// catalogue must be drawn from both sets.
 #[test]
 fn prepare_context_advertises_live_extension_skills() {
+    let agent = Agent::new(AgentConfig::default(), Arc::new(make_llm_provider()))
+        .with_skill_catalogue(true);
+    agent.add_live_skill(crate::skills::SkillContent {
+        metadata: crate::skills::SkillMetadata::new(
+            "extension-skill".to_string(),
+            "a skill from a package".to_string(),
+            std::path::PathBuf::from("/ext/skills/extension-skill/SKILL.md"),
+        ),
+        instructions: "do the thing".to_string(),
+        skill_dir: std::path::PathBuf::from("/ext/skills/extension-skill"),
+    });
+
+    let context = agent.prepare_context();
+    assert!(
+        context
+            .skills
+            .iter()
+            .any(|skill| skill.name == "extension-skill"),
+        "catalogue mode carries the skill"
+    );
+    assert!(
+        !context.tools.iter().any(|tool| tool.name == "find_skill"),
+        "the catalogue and the search are alternatives, not layers"
+    );
+}
+
+/// The default mode searches: the request carries no skill metadata, and the
+/// one tool that reaches a skill is advertised in its place.
+#[test]
+fn a_live_extension_skill_is_searched_not_catalogued() {
     let agent = Agent::new(AgentConfig::default(), Arc::new(make_llm_provider()));
     agent.add_live_skill(crate::skills::SkillContent {
         metadata: crate::skills::SkillMetadata::new(
@@ -1114,10 +1691,20 @@ fn prepare_context_advertises_live_extension_skills() {
         skill_dir: std::path::PathBuf::from("/ext/skills/extension-skill"),
     });
 
-    let skills = agent.prepare_context().skills;
+    let context = agent.prepare_context();
     assert!(
-        skills.iter().any(|skill| skill.name == "extension-skill"),
-        "a live extension skill must reach the catalogue"
+        context.skills.is_empty(),
+        "no catalogue block by default: {:?}",
+        context.skills
+    );
+    assert!(
+        context.tools.iter().any(|tool| tool.name == "find_skill"),
+        "find_skill replaces the catalogue: {:?}",
+        context
+            .tools
+            .iter()
+            .map(|tool| &tool.name)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -1375,7 +1962,8 @@ fn a_user_only_skill_is_not_in_the_models_catalogue() {
     write("open", "");
     write("reserved", "disable-model-invocation: true\n");
 
-    let mut agent = Agent::new(AgentConfig::default(), Arc::new(make_llm_provider()));
+    let mut agent = Agent::new(AgentConfig::default(), Arc::new(make_llm_provider()))
+        .with_skill_catalogue(true);
     agent
         .register_skills_from_dir(root.clone())
         .expect("the skills register");

@@ -255,14 +255,30 @@ Which surface a kind reaches is part of the contract, not an implementation deta
 
 | Surface | Kinds | Where it lands |
 |---|---|---|
-| Model-callable | tool | the request's tool array, as a namespaced live tool |
+| Model-callable | tool | the build registry, as a namespaced live tool - withheld from the request's array until `find_tool` selects it |
 | Model-readable | prompt, context, skill | the system prompt, or the skill catalogue |
 | Reader-only | command, panel, theme, workflow | the host's plugin registry and inventory |
+
+A package's tools are DEFERRED: registered and callable, but not part of the
+request's tool array, because one install contributes a family and every schema
+is re-sent on every step. The build advertises `find_tool` and `call_tool` in
+their place, and the Tools pane still lists them (it reads the registered set,
+not the advertised one). A tool the model should see without searching is a
+tool the prompt should name; the deferral exists for the long tail.
 
 A command is never promoted to a tool: the reader invokes it, and the model
 operating the reader's shell is a different grant. A package that wants the model
 to run the same effect declares a `tool` too and shares the handler, so one
 effect has two front doors and the extension author decides which ones exist.
+
+The composer carries the command's ANNOTATION, not its template. Choosing the
+row writes `/name ` into the draft and the reader keeps typing; the send then
+composes the template, a `---` divider and those words into the one message the
+model reads, and the leading annotation leaves the request once its template is
+attached. So the transcript keeps the line the reader wrote, and a command's
+prompt body never masquerades as text they typed. The token is the qualified
+name the palette draws (`namespace__contribution`), which is why the draft and
+the resolver cannot disagree about the spelling.
 
 A skill reaches the model in one of two forms, and both feed the same set the
 catalogue and the `load_skill` tool read:

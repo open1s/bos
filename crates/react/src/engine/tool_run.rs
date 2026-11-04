@@ -19,6 +19,13 @@ pub struct ToolCallEvent {
 /// Tracks in-flight tool calls and publishes their lifecycle events.
 pub struct ToolRunManager {
     running: Arc<DashMap<String, String>>,
+    /// The name events report, when it differs from the dispatched tool.
+    ///
+    /// A proxy (see [`crate::tool::registry::Tool::proxy_target`]) dispatches
+    /// as itself and reports the tool it forwarded to, so this map is usually
+    /// shorter than `running` - an entry exists only for a call whose two names
+    /// differ.
+    labels: Arc<DashMap<String, String>>,
     bus: Option<Bus>,
     agent_name: String,
 }
@@ -34,6 +41,7 @@ impl ToolRunManager {
     pub fn new() -> Self {
         Self {
             running: Arc::new(DashMap::new()),
+            labels: Arc::new(DashMap::new()),
             bus: None,
             agent_name: String::new(),
         }
@@ -74,10 +82,32 @@ impl ToolRunManager {
         }
     }
 
+    /// The name an event reports for a running call.
+    ///
+    /// A dispatcher borrows its target's name: the outside world must hear
+    /// about the tool that actually ran, while cancellation still has to
+    /// resolve to the tool the engine holds.
+    pub(crate) fn label_for(&self, call_id: &str) -> Option<String> {
+        self.labels
+            .get(call_id)
+            .map(|label| label.clone())
+            .or_else(|| self.running.get(call_id).map(|name| name.clone()))
+    }
+
     /// Mark `call_id` running and publish a started event.
     pub fn register(&self, call_id: &str, name: &str) {
-        self.running.insert(call_id.to_string(), name.to_string());
-        self.publish_event(call_id, name, "started");
+        self.register_with_label(call_id, name, name);
+    }
+
+    /// Mark `call_id` running under `dispatch` while events report `label`.
+    ///
+    /// The two differ for a proxy: the engine dispatches the dispatcher, and
+    /// the dispatcher reports the tool it forwarded to.
+    pub fn register_with_label(&self, call_id: &str, dispatch: &str, label: &str) {
+        self.running
+            .insert(call_id.to_string(), dispatch.to_string());
+        self.labels.insert(call_id.to_string(), label.to_string());
+        self.publish_event(call_id, label, "started");
     }
 
     /// Whether `call_id` is still running.
@@ -85,30 +115,46 @@ impl ToolRunManager {
         self.running.contains_key(call_id)
     }
 
-    /// Mark `call_id` cancelled, returning the tool name if it was running.
+    /// Mark `call_id` cancelled, returning the DISPATCHED tool name.
+    ///
+    /// The return value is what cancellation needs: the tool the engine holds.
+    /// The event reports the label instead, which a proxy fills with the tool
+    /// it forwarded to.
     pub fn cancel(&self, call_id: &str) -> Option<String> {
-        let name = self.running.remove(call_id).map(|(_, n)| n);
-        if let Some(ref n) = name {
-            self.publish_event(call_id, n, "cancelled");
+        let dispatch = self.running.remove(call_id).map(|(_, name)| name);
+        if let Some(ref name) = dispatch {
+            let label = self.settle_label(call_id, name);
+            self.publish_event(call_id, &label, "cancelled");
         }
-        name
+        dispatch
+    }
+
+    /// Read a call's event label, then forget it.
+    fn settle_label(&self, call_id: &str, fallback: &str) -> String {
+        let label = self
+            .label_for(call_id)
+            .unwrap_or_else(|| fallback.to_string());
+        self.labels.remove(call_id);
+        label
     }
 
     /// Mark `call_id` completed.
     pub fn complete(&self, call_id: &str) {
         if let Some((_, name)) = self.running.remove(call_id) {
-            self.publish_event(call_id, &name, "completed");
+            let label = self.settle_label(call_id, &name);
+            self.publish_event(call_id, &label, "completed");
         }
     }
 
     /// Mark `call_id` failed.
     pub fn fail(&self, call_id: &str) {
         if let Some((_, name)) = self.running.remove(call_id) {
-            self.publish_event(call_id, &name, "failed");
+            let label = self.settle_label(call_id, &name);
+            self.publish_event(call_id, &label, "failed");
         }
     }
 
-    /// Cancel every running call and return their ids and tool names.
+    /// Cancel every running call and return their ids and DISPATCHED names.
     pub fn cancel_all_running(&self) -> Vec<(String, String)> {
         let mut result = Vec::new();
         for entry in self.running.iter() {
@@ -116,7 +162,8 @@ impl ToolRunManager {
         }
         for (id, name) in &result {
             self.running.remove(id);
-            self.publish_event(id, name, "cancelled");
+            let label = self.settle_label(id, name);
+            self.publish_event(id, &label, "cancelled");
         }
         result
     }
@@ -147,5 +194,39 @@ impl ToolRunManager {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A dispatch and its event label are separate facts.
+    ///
+    /// Cancellation asks the manager which TOOL the engine holds, so it must
+    /// answer the dispatcher; a reader watching the bus asks which tool ran, so
+    /// the event must answer the tool behind the dispatcher.
+    #[test]
+    fn an_event_labels_the_tool_a_dispatcher_ran() {
+        let manager = ToolRunManager::new();
+        manager.register_with_label("call-1", "call_tool", "bash");
+
+        assert!(manager.is_running("call-1"));
+        assert_eq!(manager.label_for("call-1").as_deref(), Some("bash"));
+        assert_eq!(
+            manager.cancel("call-1"),
+            Some("call_tool".to_string()),
+            "cancellation resolves the tool the engine holds"
+        );
+        assert_eq!(manager.cancel("call-1"), None, "a settled call is gone");
+    }
+
+    /// A plain call reports its own name and keeps no separate label.
+    #[test]
+    fn an_ordinary_call_is_its_own_label() {
+        let manager = ToolRunManager::new();
+        manager.register("call-2", "bash");
+        assert_eq!(manager.label_for("call-2").as_deref(), Some("bash"));
+        assert_eq!(manager.cancel("call-2"), Some("bash".to_string()));
     }
 }

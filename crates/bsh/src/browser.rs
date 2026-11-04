@@ -2270,7 +2270,11 @@ fn focused_payload(focused: &str) -> serde_json::Value {
 /// (see the module note), so a host the turn's policy refuses is still reachable
 /// here by the owner's decision.
 pub(crate) fn attach(agent: &mut Agent, tools: Tools) {
+    // The browser is a FAMILY of nine tools and only some turns drive a page.
+    // They stay registered and callable; `find_tool` selects one, which keeps
+    // nine schemas out of every step that never opens a browser.
     let mut add = |tool: AsyncFunctionTool| {
+        let tool = tool.with_deferred(true);
         if let Err(error) = agent.try_add_async_tool(Arc::new(tool)) {
             log::warn!("browser tool was not registered: {error}");
         }

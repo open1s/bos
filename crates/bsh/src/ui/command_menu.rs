@@ -189,6 +189,12 @@ pub(crate) enum CardAction {
     Run(fn(&mut Shell, &mut Window, &mut Context<Shell>)),
     /// Replace the trigger token with this mention and close the card.
     Insert(String),
+    /// Write one extension command's `/name ` annotation and close the card.
+    ///
+    /// The command's template is not inserted: the send composes it with the
+    /// words the reader types after the annotation
+    /// ([`crate::command_invocation`]).
+    Extension(String),
     /// Replace the trigger token with this directory mention and keep the card
     /// open, so the next query lists inside that directory (the reference's
     /// `onPick` returning `continue: true`).
@@ -469,6 +475,9 @@ impl Shell {
                 self.command_menu.close();
                 self.cut_command_token(&format!("{text} "), window, cx);
             }
+            CardAction::Extension(name) => {
+                self.insert_extension_command(&name, window, cx);
+            }
             CardAction::Drill(text) => {
                 self.cut_command_token(&text, window, cx);
                 self.command_menu.open = true;
@@ -494,6 +503,46 @@ impl Shell {
         let handle = self.composer.read(cx).focus_handle(cx);
         window.focus(&handle, cx);
         cx.notify();
+    }
+
+    /// Write one extension command's `/name ` annotation into the draft.
+    ///
+    /// The annotation is the COMMAND, not its template: the template is the
+    /// prompt body and belongs to the request the send composes. Three draft
+    /// shapes are handled, so a picked row is never a silent no-op:
+    ///
+    /// - the `/query` the row was picked under is replaced by the annotation;
+    /// - an empty draft becomes the annotation plus the caret;
+    /// - words the reader already typed - the `+` card can open over a draft -
+    ///   are kept AFTER the annotation, because a command token resolves only
+    ///   at the start of a message.
+    pub(crate) fn insert_extension_command(
+        &mut self,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.command_menu.close();
+        self.slash.close();
+        let annotation = crate::command_invocation::draft(name);
+        let text = self.composer_value.clone();
+        let token = text.rsplit(char::is_whitespace).next().unwrap_or_default();
+        let remainder = if token.starts_with('/') {
+            text[..text.len() - token.len()].trim()
+        } else {
+            text.trim()
+        };
+        let next = if remainder.is_empty() {
+            annotation
+        } else {
+            format!("{annotation}{remainder}")
+        };
+        // The reader continues typing the command's input, so the composer owns
+        // the keys again and the caret parks after the annotation (a multi-line
+        // editor resets its selection to 0..0 on a write while unfocused).
+        let handle = self.composer.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+        self.set_composer_text(&next, window, cx);
     }
 
     /// Replace the draft's active trigger token with `append`, keeping what
@@ -537,7 +586,7 @@ impl Shell {
                         id: format!("ext-command-{}", command.name),
                         label: command.name.clone(),
                         detail: command.description.clone(),
-                        action: CardAction::Insert(command.template.clone()),
+                        action: CardAction::Extension(command.name.clone()),
                     });
                 }
                 rows

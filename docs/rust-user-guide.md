@@ -358,7 +358,10 @@ let delayed = AsyncFunctionTool::new(
 Implement `Tool` or `AsyncTool` directly when you need cancellation or
 streaming: alongside `name`, `description`, `json_schema`, and `run`, a
 tool declares `is_cancelable`/`cancel` and (for `AsyncTool`)
-`run_streaming`.
+`run_streaming`. Two further defaults matter for prompt size: `deferred`
+keeps a tool out of the advertised array (see *Deferred Tools*), and
+`proxy_target` names the tool a dispatcher forwards to, so hooks and policy
+see the real name.
 
 ### Registering Tools
 
@@ -386,6 +389,40 @@ agent.register_mcp_tools(mcp_client.clone()).await?;
 // With namespace
 agent.register_mcp_tools_with_namespace(mcp_client, "mcp").await?;
 ```
+
+### Deferred Tools
+
+Every registered tool is advertised on every step, and its name, description
+and JSON schema are prompt bytes inside the provider's cached prefix. A machine
+with MCP servers can carry hundreds of tools that a given turn never touches.
+`defer_tool` withholds one; the tool stays registered and callable, and two
+tools are advertised in its place: `find_tool` (a ranked search over the
+withheld tools - a tool the model already has is never a result) and
+`call_tool` (`{name, args}`).
+
+```rust
+let agent = Agent::from_config(AgentConfig::default())
+    .defer_tool("image_generate")    // one name
+    .defer_tool_prefix("github_");   // a whole MCP namespace
+```
+
+MCP tools, every tool an extension package contributes, and BSH's own browser
+family are deferred by default, because that is where the count comes from - a
+package installs a family at once, and three installed packages plus the nine
+browser tools were twenty-seven schemas on every step.
+`Agent::defer_tool` and `Agent::defer_tool_prefix` cover the rest. An agent
+that withholds nothing advertises neither `find_tool` nor `call_tool`, and
+its system prompt does not mention them.
+
+The Tools pane lists `all_tools`, so a withheld tool stays visible and
+switchable there; the meter and the request are priced from `model_tools`, the
+smaller array. Deferring is not a permission boundary: `call_tool` reaches every
+registered tool. What is withheld is the definition, not the ability. The engine resolves
+the dispatcher's target before dispatch, so hooks, policy rules, telemetry and
+the repeated-failure guard all see the tool that actually ran.
+
+Defer a tool only when the prompt does not name it. An instruction that says
+`update_plan` is a promise that `update_plan` is advertised.
 
 ### Remote Agent Tools
 
@@ -418,6 +455,23 @@ let schemas = agent.get_skills_schemas();
 // Get skill content (name, description pairs)
 let content = agent.get_skills_content();
 ```
+
+Skills are searched, not catalogued: the request carries no skill metadata, and
+one tool named `find_skill` answers "which skill fits this?" while
+`load_skill` reads the one it picked. That is the same shape as
+`find_tool`/`call_tool`, and it keeps a 100-skill install from spending a
+catalogue block on every step.
+
+```rust
+let agent = Agent::from_config(AgentConfig::default())     // find_skill (default)
+    .with_skill_catalogue(true);                            // the ranked catalogue
+```
+
+The two are alternatives, not layers: an agent that carries the catalogue does
+not advertise `find_skill`, because paying for both means paying twice for the
+same knowledge. A skill whose manifest sets `disable-model-invocation: true` is
+reachable by the reader's `/name` gesture and by neither the catalogue nor the
+search.
 
 ---
 
@@ -710,6 +764,10 @@ Agent::new(config: AgentConfig, llm: Arc<LlmProvider>) -> Self
 | `register_mcp_tools(...)` | Register MCP tools |
 | `register_skills_from_dir(path)` | Load skills from directory |
 | `get_skills_schemas()` | Get skill schemas for LLM |
+| `defer_tool(name)` | Keep one tool out of the advertised array |
+| `defer_tool_prefix(prefix)` | Keep a namespace out of the advertised array |
+| `all_tools()` | Every registered tool, advertised or not |
+| `model_tools()` | The tool array the request carries |
 | `save_session(path)` | Save agent session to file |
 | `restore_session(path)` | Restore session from file |
 

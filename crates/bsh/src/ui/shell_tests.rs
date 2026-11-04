@@ -30621,8 +30621,7 @@ fn extension_commands_join_the_composer_palette(cx: &mut TestAppContext) {
     );
     assert!(rows.iter().any(|row| matches!(
         &row.action,
-        super::command_menu::CardAction::Insert(template)
-            if template == "Say hello to {{input.name}}."
+        super::command_menu::CardAction::Extension(name) if name == "hello__greet"
     )));
 
     let slash = cx.update(|_, cx| {
@@ -30650,7 +30649,114 @@ fn extension_commands_join_the_composer_palette(cx: &mut TestAppContext) {
     );
     assert!(slash.iter().any(|(_, _, action)| matches!(
         action,
-        super::slash_palette::SlashAction::Template(template)
-            if template == "Say hello to {{input.name}}."
+        super::slash_palette::SlashAction::Extension(name) if name == "hello__greet"
     )));
+}
+
+/// Choosing an extension command writes its `/name` annotation, never its
+/// template. The template is the prompt body the SEND composes, so a one-row
+/// choice leaves the reader a short marker and a caret ready for their words
+/// instead of a paragraph they did not type.
+#[gpui::test]
+fn choosing_an_extension_command_writes_the_annotation(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = AppState::with_store(scratch_store("extension-command-draft"));
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.extension_commands = vec![crate::extension::CommandSurface {
+                name: "hello__greet".to_string(),
+                description: "Greet the reader".to_string(),
+                template: "Say hello to {{input.name}}.".to_string(),
+            }];
+        });
+    });
+    // The slash card's path: the draft is the typed query, and the row replaces
+    // it with the annotation.
+    let index = cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.composer_value = "/hel".to_string();
+            this.slash
+                .sync("/hel", &this.state, &this.extension_commands);
+            this.slash
+                .rows()
+                .position(|row| row.id == "ext-command-hello__greet")
+                .expect("the extension row")
+        })
+    });
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| this.run_slash_row(index, window, cx));
+    });
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).composer_value.clone()),
+        "/hello__greet ",
+        "the draft carries the annotation, not the template"
+    );
+
+    // The plus card's path over a NON-empty draft: the + can open while the
+    // reader has already typed words, and the row must not be a silent no-op
+    // there either. The words survive after the annotation, because a command
+    // token only resolves at the start of a message.
+    let index = cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.composer_value = "summarize this".to_string();
+            this.command_menu.open = true;
+            this.command_menu.trigger = Some(super::command_menu::Trigger::Command);
+            this.card_rows(super::command_menu::Trigger::Command)
+                .iter()
+                .position(|row| row.id == "ext-command-hello__greet")
+                .expect("the extension row in the plus card")
+        })
+    });
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| this.run_row(index, window, cx));
+    });
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).composer_value.clone()),
+        "/hello__greet summarize this",
+        "the annotation leads and the reader's words follow it"
+    );
+}
+
+/// The send composes the command's template with the reader's own words, and
+/// the annotation leaves the request once its template is attached.
+#[gpui::test]
+fn an_extension_command_sends_its_template_with_the_readers_words(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_queue("extension-command-send", &["/hello__greet in one sentence"]);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let (_id, mailbox) = begin_steerable_turn(&shell, cx);
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.extension_commands = vec![crate::extension::CommandSurface {
+                name: "hello__greet".to_string(),
+                description: "Greet the reader".to_string(),
+                template: "Say hello from com.example.hello.".to_string(),
+            }];
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let arrow = cx
+        .debug_bounds("queue-steer-1")
+        .expect("the send-now control renders on a queued row");
+    cx.simulate_click(arrow.center(), Modifiers::default());
+    let taken = mailbox.take();
+    assert_eq!(taken.len(), 1, "the turn takes the steered message");
+    let text = match &taken[0].content {
+        react::llm::Content::Text(text) => text.clone(),
+        other => panic!("a text steer stays text: {other:?}"),
+    };
+    assert_eq!(
+        text, "Say hello from com.example.hello.\n\n---\n\nin one sentence",
+        "the template heads one message and the reader's words follow the divider"
+    );
 }

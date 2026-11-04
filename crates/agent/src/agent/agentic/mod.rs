@@ -31,6 +31,7 @@ use react::tool::{Tool as ReactToolTrait, ToolError as ReactToolError};
 use react::{CircuitBreakerConfig, LlmRequest, RateLimiterConfig, ReActResilience};
 
 mod adapters;
+mod discovery;
 mod engine;
 mod llm;
 
@@ -283,6 +284,22 @@ pub struct Agent {
     /// Extension skills that can change while the agent is shared.
     #[rkyv(with = qserde::rkyv::with::Skip)]
     live_skills: Arc<std::sync::RwLock<Vec<crate::skills::SkillContent>>>,
+    /// Whether skills are advertised as a catalogue rather than searched.
+    ///
+    /// Off by default: the catalogue is a block in every step's prompt, and
+    /// `find_skill` answers the same question on demand.
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    skill_catalogue: bool,
+    /// Tools kept out of the advertised array by exact name.
+    ///
+    /// A deferred tool stays registered and callable; the model reaches it
+    /// through `find_tool` and `call_tool`. The point is prompt bytes: the
+    /// advertised array is part of every step's cached prefix.
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    deferred_tools: Vec<String>,
+    /// Tools kept out of the advertised array by name prefix.
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    deferred_prefixes: Vec<String>,
     #[rkyv(with = qserde::rkyv::with::Map<qserde::rkyv::with::AsString>)]
     skills_dir: Option<std::path::PathBuf>,
     skills: Vec<crate::skills::SkillContent>,
@@ -349,6 +366,9 @@ impl Agent {
             live_tools: Arc::new(std::sync::RwLock::new(ToolRegistry::new())),
             live_prompts: Arc::new(std::sync::RwLock::new(Vec::new())),
             live_skills: Arc::new(std::sync::RwLock::new(Vec::new())),
+            skill_catalogue: false,
+            deferred_tools: Vec::new(),
+            deferred_prefixes: Vec::new(),
             skills_dir: None,
             skills: Vec::new(),
             resilience,
@@ -703,7 +723,115 @@ impl Agent {
         &self.live_tools
     }
 
-    /// The tool array this agent offers the model.
+    /// Advertise skills as a catalogue instead of searching them.
+    ///
+    /// The default is `find_skill`: no catalogue block in the prompt, and the
+    /// model asks for the skill a request needs. Turning this on restores the
+    /// ranked catalogue and stops advertising `find_skill`; the two are
+    /// alternatives, not layers, because an agent that carries both pays for
+    /// the catalogue and the search.
+    #[must_use]
+    pub fn with_skill_catalogue(mut self, catalogue: bool) -> Self {
+        self.skill_catalogue = catalogue;
+        self.engine_cache.lock().unwrap().take();
+        self.context_cache.lock().unwrap().take();
+        self
+    }
+
+    /// Whether skills are searched on demand rather than catalogued.
+    pub fn skill_catalogue(&self) -> bool {
+        self.skill_catalogue
+    }
+
+    /// Whether this build searches skills: catalogue off and at least one
+    /// model-invocable skill to find.
+    pub(super) fn skill_search(&self) -> bool {
+        !self.skill_catalogue && !self.model_skills().is_empty()
+    }
+
+    /// Keep a registered tool out of the advertised array.
+    ///
+    /// The tool stays registered and callable. What changes is that its schema
+    /// is no longer sent on every step: `find_tool` and `call_tool` are
+    /// advertised instead, and the model reaches it on demand. Use this for the
+    /// long tail, not for a tool the prompt itself names.
+    #[must_use]
+    pub fn defer_tool(mut self, name: impl Into<String>) -> Self {
+        self.deferred_tools.push(name.into());
+        self.engine_cache.lock().unwrap().take();
+        self.context_cache.lock().unwrap().take();
+        self
+    }
+
+    /// Keep every tool whose name starts with `prefix` out of the array.
+    ///
+    /// Prefixes fit MCP namespaces, which register as `{namespace}_{tool}`.
+    #[must_use]
+    pub fn defer_tool_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.deferred_prefixes.push(prefix.into());
+        self.engine_cache.lock().unwrap().take();
+        self.context_cache.lock().unwrap().take();
+        self
+    }
+
+    /// Whether this name is withheld from the advertised array by name or
+    /// prefix.
+    ///
+    /// An MCP tool is withheld by default; see [`Agent::defer_tool`] for the
+    /// rest.
+    pub fn is_deferred_tool(&self, name: &str) -> bool {
+        self.deferred_tools.iter().any(|exact| exact == name)
+            || self
+                .deferred_prefixes
+                .iter()
+                .any(|prefix| name.starts_with(prefix.as_str()))
+    }
+
+    /// Whether any registered tool is withheld from the advertised array.
+    ///
+    /// False means `find_tool` and `call_tool` have nothing to find, so they
+    /// are not advertised either: two tools that can only answer "none" are
+    /// prompt bytes for no capability.
+    pub fn has_deferred_tools(&self) -> bool {
+        // A host that deferred a name before the tool existed still gets the
+        // way back to it: the policy is what it asked for, not what happened to
+        // be registered at the instant the engine was built.
+        if !self.deferred_tools.is_empty() || !self.deferred_prefixes.is_empty() {
+            return true;
+        }
+        if let Some(registry) = self.registry.as_deref() {
+            let sync = registry.iter().any(|(name, tool)| {
+                tool.deferred() || registry.is_mcp_tool(name) || self.is_deferred_tool(name)
+            });
+            if sync {
+                return true;
+            }
+            if registry.async_tool_names().iter().any(|name| {
+                registry.is_mcp_tool(name)
+                    || self.is_deferred_tool(name)
+                    || registry.get_async(name).is_some_and(|tool| tool.deferred())
+            }) {
+                return true;
+            }
+        }
+        match self.live_tools.read() {
+            Ok(live) => {
+                if live.iter().any(|(name, tool)| {
+                    tool.deferred() || live.is_mcp_tool(name) || self.is_deferred_tool(name)
+                }) {
+                    return true;
+                }
+                live.async_tool_names().iter().any(|name| {
+                    live.is_mcp_tool(name)
+                        || self.is_deferred_tool(name)
+                        || live.get_async(name).is_some_and(|tool| tool.deferred())
+                })
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Every registered tool, whether or not the request advertises it.
     ///
     /// The build registry and the live overlay are one list here because they
     /// are one list to the model: an extension package applies after the build,
@@ -716,12 +844,20 @@ impl Agent {
     /// the array is part of the provider's cached prompt prefix and must be a
     /// function of the set, not of registration order. The hosted tools the
     /// provider runs itself are not included: nothing here executes them.
-    pub fn model_tools(&self) -> Vec<react::llm::LlmTool> {
+    ///
+    /// A deferred tool IS in this list: it exists and it can be called, it is
+    /// simply not sent. [`Agent::model_tools`] is the projection a request
+    /// carries; this one is what a capability pane lists.
+    pub fn all_tools(&self) -> Vec<react::llm::LlmTool> {
         let mut tools: Vec<react::llm::LlmTool> = Vec::new();
         if let Some(ref registry) = self.registry {
-            tools.extend(registry.iter().map(|(name, tool)| {
-                react::llm::LlmTool::function(name.clone(), tool.description(), tool.json_schema())
-            }));
+            for (name, tool) in registry.iter() {
+                tools.push(react::llm::LlmTool::function(
+                    name.clone(),
+                    tool.description(),
+                    tool.json_schema(),
+                ));
+            }
             for name in registry.async_tool_names() {
                 if let Some(async_tool) = registry.get_async(&name) {
                     tools.push(react::llm::LlmTool::function(
@@ -733,9 +869,13 @@ impl Agent {
             }
         }
         if let Ok(live) = self.live_tools.read() {
-            tools.extend(live.iter().map(|(_name, tool)| {
-                react::llm::LlmTool::function(tool.name(), tool.description(), tool.json_schema())
-            }));
+            for (name, tool) in live.iter() {
+                tools.push(react::llm::LlmTool::function(
+                    name.clone(),
+                    tool.description(),
+                    tool.json_schema(),
+                ));
+            }
             for name in live.async_tool_names() {
                 if let Some(async_tool) = live.get_async(&name) {
                     tools.push(react::llm::LlmTool::function(
@@ -748,6 +888,67 @@ impl Agent {
         }
         tools.sort_by(|a, b| a.name.cmp(&b.name));
         tools.dedup_by(|a, b| a.name == b.name);
+        tools
+    }
+
+    /// The tool array this agent offers the model.
+    ///
+    /// This is [`Agent::all_tools`] minus everything withheld: a tool marked
+    /// [`react::tool::Tool::deferred`], an MCP tool (withheld by default), and
+    /// any name this agent was told to defer. The model reaches a withheld tool
+    /// through `find_tool` and `call_tool` instead, so the array the provider
+    /// sees stays a function of the set rather than of the turn.
+    pub fn model_tools(&self) -> Vec<react::llm::LlmTool> {
+        let all = self.all_tools();
+        let deferred: std::collections::HashSet<String> = self
+            .registry
+            .as_deref()
+            .map(|registry| {
+                registry
+                    .iter()
+                    .filter(|(name, tool)| {
+                        tool.deferred() || registry.is_mcp_tool(name) || self.is_deferred_tool(name)
+                    })
+                    .map(|(name, _)| name.clone())
+                    .chain(registry.async_tool_names().into_iter().filter(|name| {
+                        registry.is_mcp_tool(name)
+                            || self.is_deferred_tool(name)
+                            || registry.get_async(name).is_some_and(|tool| tool.deferred())
+                    }))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let deferred_live: std::collections::HashSet<String> = match self.live_tools.read() {
+            Ok(live) => live
+                .iter()
+                .filter(|(name, tool)| {
+                    tool.deferred() || live.is_mcp_tool(name) || self.is_deferred_tool(name)
+                })
+                .map(|(name, _)| name.clone())
+                .chain(live.async_tool_names().into_iter().filter(|name| {
+                    live.is_mcp_tool(name)
+                        || self.is_deferred_tool(name)
+                        || live.get_async(name).is_some_and(|tool| tool.deferred())
+                }))
+                .collect(),
+            Err(_) => std::collections::HashSet::new(),
+        };
+        let mut tools: Vec<react::llm::LlmTool> = all
+            .into_iter()
+            .filter(|tool| !deferred.contains(&tool.name) && !deferred_live.contains(&tool.name))
+            .collect();
+        // The pair that reaches a withheld tool belongs in the SAME derivation:
+        // a host that prices or lists the array must see what the request
+        // actually carries, and a surface reading `model_tools` alone would
+        // undercount the two entries that make deferral usable.
+        // The SAME predicate the engine registers the pair with: a host that
+        // deferred a name before its tool exists still gets the way back to it,
+        // and the request never advertises a tool the engine did not build.
+        if self.has_deferred_tools() {
+            tools.push(discovery::find_tool_definition());
+            tools.push(discovery::call_tool_definition());
+            tools.sort_by(|a, b| a.name.cmp(&b.name));
+        }
         tools
     }
 
@@ -1566,6 +1767,9 @@ impl Clone for Agent {
             live_tools: Arc::clone(&self.live_tools),
             live_prompts: Arc::clone(&self.live_prompts),
             live_skills: Arc::clone(&self.live_skills),
+            skill_catalogue: self.skill_catalogue,
+            deferred_tools: self.deferred_tools.clone(),
+            deferred_prefixes: self.deferred_prefixes.clone(),
             skills_dir: self.skills_dir.clone(),
             skills: self.skills.clone(),
             resilience: self.resilience.clone(),
