@@ -68,6 +68,9 @@ struct Bridge {
     /// ceiling is visible without scanning filters.
     subscriptions: Mutex<Vec<(String, Subscription)>>,
     events_out: Mutex<Vec<ExtensionEvent>>,
+    /// The manifest's per-call wall-clock ceiling, used to bound blocking host
+    /// I/O that the guest's cancellation flag cannot interrupt.
+    timeout: Duration,
     /// Shared lifecycle state; the bridge rejects operations after cancellation.
     call_state: Arc<AtomicU8>,
 }
@@ -239,41 +242,97 @@ impl Bridge {
                 let method = reqwest::Method::from_bytes(method.as_bytes())
                     .map_err(|error| error.to_string())?;
                 let client = reqwest::blocking::Client::builder()
-                    .timeout(Duration::from_millis(15_000))
+                    .timeout(self.timeout)
+                    // Follow redirects by hand so every hop is authorized
+                    // against its own host, like the WASM bridge.
+                    .redirect(reqwest::redirect::Policy::none())
                     .build()
                     .map_err(|error| error.to_string())?;
-                let requested_bytes = request
+                let body = request
                     .get("body")
                     .and_then(Value::as_str)
-                    .map(|body| body.len() as u64)
-                    .unwrap_or(0);
+                    .map(str::to_string);
+                let requested_bytes = body.as_ref().map(|body| body.len() as u64).unwrap_or(0);
                 let method_text = method.as_str().to_string();
                 let started = Instant::now();
-                let mut outgoing = client.request(method, parsed);
-                if let Some(body) = request.get("body").and_then(Value::as_str) {
-                    outgoing = outgoing.body(body.to_string());
-                }
-                let response = match outgoing.send() {
-                    Ok(response) => response,
-                    Err(error) => {
-                        let message = error.to_string();
-                        crate::hooks::observe(
-                            "http.exchange",
-                            crate::hooks::http_exchange(
-                                self.extension.as_str(),
-                                &method_text,
-                                raw,
-                                None,
-                                requested_bytes,
-                                0,
-                                None,
-                                0,
-                                started.elapsed().as_millis() as u64,
-                                Some(&message),
-                            ),
-                        );
-                        return Err(message);
+                let mut current = parsed;
+                let mut current_method = method;
+                let mut current_body = body;
+                let mut redirects = 0usize;
+                let response = loop {
+                    let mut outgoing = client.request(current_method.clone(), current.clone());
+                    if let Some(body) = &current_body {
+                        outgoing = outgoing.body(body.clone());
                     }
+                    let response = match outgoing.send() {
+                        Ok(response) => response,
+                        Err(error) => {
+                            let message = error.to_string();
+                            crate::hooks::observe(
+                                "http.exchange",
+                                crate::hooks::http_exchange(
+                                    self.extension.as_str(),
+                                    &method_text,
+                                    current.as_str(),
+                                    None,
+                                    requested_bytes,
+                                    0,
+                                    None,
+                                    0,
+                                    started.elapsed().as_millis() as u64,
+                                    Some(&message),
+                                ),
+                            );
+                            return Err(message);
+                        }
+                    };
+                    if matches!(
+                        self.call_state.load(Ordering::SeqCst),
+                        CALL_CANCELLED | CALL_STOPPED
+                    ) {
+                        return Err("the call was cancelled".to_string());
+                    }
+                    if !response.status().is_redirection() {
+                        break response;
+                    }
+                    redirects += 1;
+                    if redirects > 5 {
+                        return Err("too many redirects".to_string());
+                    }
+                    let Some(location) = response
+                        .headers()
+                        .get(reqwest::header::LOCATION)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string)
+                    else {
+                        break response;
+                    };
+                    let next = current.join(&location).map_err(|error| error.to_string())?;
+                    if !matches!(next.scheme(), "http" | "https") {
+                        return Err("redirect target is not http or https".to_string());
+                    }
+                    if current.scheme() == "https" && next.scheme() == "http" {
+                        return Err("redirect downgrades https to http".to_string());
+                    }
+                    let next_method = if matches!(response.status().as_u16(), 307 | 308) {
+                        current_method.clone()
+                    } else {
+                        reqwest::Method::GET
+                    };
+                    self.authorize(
+                        Capability::NetworkHttp,
+                        CallScope {
+                            domain: next.host_str().map(str::to_string),
+                            method: Some(next_method.as_str().to_ascii_uppercase()),
+                            ..CallScope::default()
+                        },
+                    )
+                    .map_err(|error| error.to_string())?;
+                    if next_method == reqwest::Method::GET {
+                        current_body = None;
+                    }
+                    current_method = next_method;
+                    current = next;
                 };
                 let ttfb_ms = started.elapsed().as_millis() as u64;
                 let status = response.status().as_u16();
@@ -282,34 +341,36 @@ impl Bridge {
                     .get(reqwest::header::CONTENT_TYPE)
                     .and_then(|value| value.to_str().ok())
                     .map(str::to_string);
-                let bytes = match response.bytes() {
-                    Ok(bytes) => bytes,
-                    Err(error) => {
-                        let message = error.to_string();
-                        crate::hooks::observe(
-                            "http.exchange",
-                            crate::hooks::http_exchange(
-                                self.extension.as_str(),
-                                &method_text,
-                                raw,
-                                Some(status),
-                                requested_bytes,
-                                0,
-                                content_type.as_deref(),
-                                ttfb_ms,
-                                started.elapsed().as_millis() as u64,
-                                Some(&message),
-                            ),
-                        );
-                        return Err(message);
-                    }
-                };
+                // Read through a hard take: response.bytes() buffers the
+                // whole body before the ceiling check.
+                use std::io::Read as _;
+                let mut bytes = Vec::new();
+                let mut limited = response.take((MAX_BRIDGE_BODY as u64) + 1);
+                if let Err(error) = limited.read_to_end(&mut bytes) {
+                    let message = error.to_string();
+                    crate::hooks::observe(
+                        "http.exchange",
+                        crate::hooks::http_exchange(
+                            self.extension.as_str(),
+                            &method_text,
+                            current.as_str(),
+                            Some(status),
+                            requested_bytes,
+                            0,
+                            content_type.as_deref(),
+                            ttfb_ms,
+                            started.elapsed().as_millis() as u64,
+                            Some(&message),
+                        ),
+                    );
+                    return Err(message);
+                }
                 crate::hooks::observe(
                     "http.exchange",
                     crate::hooks::http_exchange(
                         self.extension.as_str(),
                         &method_text,
-                        raw,
+                        current.as_str(),
                         Some(status),
                         requested_bytes,
                         bytes.len() as u64,
@@ -548,6 +609,7 @@ impl ExtismRuntime {
             config: config.clone(),
             subscriptions: Mutex::new(Vec::new()),
             events_out: Mutex::new(Vec::new()),
+            timeout: Duration::from_millis(manifest.resources.execution_ms()),
             call_state: Arc::clone(&call_state),
         });
         let tools = load_tool_descriptors(root, manifest)?;
@@ -606,7 +668,17 @@ impl ExtismRuntime {
                         None => "{}".to_string(),
                     };
                     let response = bridge.dispatch(&request);
-                    let out = plugin.memory_new(response.to_string())?;
+                    let text = response.to_string();
+                    // The bridge answer is serialized once and measured before
+                    // it crosses into guest memory: storage and file values can
+                    // expand through base64, so the per-value caps alone do not
+                    // bound the envelope.
+                    let text = if text.len() > MAX_BRIDGE_BODY {
+                        json!({"ok": false, "error": "host response is too large"}).to_string()
+                    } else {
+                        text
+                    };
+                    let out = plugin.memory_new(text)?;
                     outputs[0] = plugin.memory_to_val(out);
                     Ok(())
                 },
@@ -1211,6 +1283,7 @@ mod tests {
             config: "{}".to_string(),
             subscriptions: Mutex::new(Vec::new()),
             events_out: Mutex::new(Vec::new()),
+            timeout: Duration::from_secs(5),
             call_state: Arc::new(AtomicU8::new(CALL_IDLE)),
         };
         let response = bridge.dispatch(r#"{"op":"nope"}"#);
@@ -1218,6 +1291,100 @@ mod tests {
         let denied = bridge.dispatch(r#"{"op":"read_file","path":"a.txt"}"#);
         assert_eq!(denied["ok"], false);
         assert!(!denied["error"].as_str().unwrap_or_default().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn bridge_for(root: &Path, domain: &str) -> Bridge {
+        let id = ExtensionId::parse("com.example.extism").expect("id");
+        let policy = PolicyEngine::open(
+            root.join("grants.toml"),
+            root.join("audit.jsonl"),
+            ferris_core::capability::PolicyMode::Enforce,
+        )
+        .expect("policy");
+        policy
+            .grant(
+                id.as_str(),
+                Capability::NetworkHttp,
+                ferris_core::capability::GrantScope::Domain(domain.to_string()),
+                None,
+            )
+            .expect("grant");
+        Bridge {
+            extension: id.clone(),
+            trust: TrustLevel::Local,
+            policy: Arc::new(policy),
+            events: EventBus::new(),
+            storage: ExtensionStorage::open(&root.join("data"), &id).expect("storage"),
+            workspace: Some(root.join("workspace")),
+            publishes: Vec::new(),
+            subscribes: Vec::new(),
+            config: "{}".to_string(),
+            subscriptions: Mutex::new(Vec::new()),
+            events_out: Mutex::new(Vec::new()),
+            timeout: Duration::from_secs(5),
+            call_state: Arc::new(AtomicU8::new(CALL_IDLE)),
+        }
+    }
+
+    #[test]
+    fn a_redirect_to_an_unauthorized_host_is_refused() {
+        let root = std::env::temp_dir().join(format!("bsh-ext-redirect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("data")).expect("data");
+        std::fs::create_dir_all(root.join("workspace")).expect("workspace");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buffer = [0u8; 1024];
+                let _ = stream.read(&mut buffer);
+                let response = "HTTP/1.1 302 Found\r\nLocation: http://example.invalid/steal\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        let bridge = bridge_for(&root, "127.0.0.1");
+        let error = bridge
+            .run_op(
+                "fetch",
+                &json!({"url": format!("http://{address}/start"), "method": "GET"}),
+            )
+            .expect_err("the redirect target is not granted");
+        assert!(error.contains("grant"), "{error}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_stalled_fetch_is_bounded_by_the_call_budget() {
+        let root = std::env::temp_dir().join(format!("bsh-ext-stall-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("data")).expect("data");
+        std::fs::create_dir_all(root.join("workspace")).expect("workspace");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        std::thread::spawn(move || {
+            use std::io::Read;
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buffer = [0u8; 1024];
+                let _ = stream.read(&mut buffer);
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        });
+        let mut bridge = bridge_for(&root, "127.0.0.1");
+        bridge.timeout = Duration::from_millis(250);
+        let started = Instant::now();
+        bridge
+            .run_op(
+                "fetch",
+                &json!({"url": format!("http://{address}/stall"), "method": "GET"}),
+            )
+            .expect_err("a stalled fetch must fail at the call budget");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the fetch outlived the call budget: {:?}",
+            started.elapsed()
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

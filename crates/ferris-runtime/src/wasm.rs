@@ -449,8 +449,17 @@ impl self::bsh::extension::host::Host for HostState {
                 "method {method} is not allowed"
             )));
         }
+        // A blocking host fetch cannot be interrupted by the guest's cancel
+        // flag, so it must not outlive the call deadline: derive the client
+        // timeout from the remaining per-call budget.
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(self::bsh::extension::types::HostError::Timeout(
+                "the call deadline elapsed before the fetch".to_string(),
+            ));
+        }
         let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_millis(15_000))
+            .timeout(remaining)
             // Every redirect is followed by hand so each hop is authorized
             // against its own host. reqwest's default policy would follow up
             // to ten hops on the strength of the first authorization.
@@ -491,6 +500,11 @@ impl self::bsh::extension::host::Host for HostState {
                     return Err(self::bsh::extension::types::HostError::Runtime(message));
                 }
             };
+            if self.cancelled.load(Ordering::Relaxed) {
+                return Err(self::bsh::extension::types::HostError::Denied(
+                    "the call was cancelled".to_string(),
+                ));
+            }
             if !response.status().is_redirection() {
                 break response;
             }
@@ -1426,5 +1440,37 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_stalled_fetch_is_bounded_by_the_call_deadline() {
+        let workspace = scratch("stalled-fetch");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        std::thread::spawn(move || {
+            use std::io::Read;
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buffer = [0u8; 1024];
+                let _ = stream.read(&mut buffer);
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        });
+        let mut state = host_state(
+            &workspace,
+            &[(
+                Capability::NetworkHttp,
+                GrantScope::Domain("127.0.0.1".to_string()),
+            )],
+        );
+        state.deadline = Instant::now() + Duration::from_millis(250);
+        let started = Instant::now();
+        state
+            .fetch(format!("http://{address}/stall"), "GET".to_string(), None)
+            .expect_err("a stalled fetch must fail at the call deadline");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the fetch outlived the call deadline: {:?}",
+            started.elapsed()
+        );
     }
 }
