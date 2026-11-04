@@ -34,6 +34,18 @@ const MAX_BRIDGE_BODY: usize = 8 * 1024 * 1024;
 /// The largest number of event subscriptions one plugin may hold.
 const MAX_SUBSCRIPTIONS: usize = 16;
 
+/// Run a synchronous Extism call without occupying a multi-thread Tokio
+/// worker. On a current-thread runtime the call runs inline (block_in_place
+/// would panic there).
+fn off_worker<T>(work: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(work)
+        }
+        _ => work(),
+    }
+}
+
 /// Extism call lifecycle. Only the thread holding the plugin mutex may move
 /// IDLE to RUNNING; cancellation can therefore only target an active call.
 const CALL_IDLE: u8 = 0;
@@ -870,33 +882,35 @@ impl Runtime for ExtismRuntime {
     }
 
     async fn activate(&self) -> Result<(), ExtensionError> {
-        self.ensure_plugin()
+        off_worker(|| self.ensure_plugin())
     }
 
     async fn deactivate(&self) -> Result<(), ExtensionError> {
-        let mut plugin = self.plugin.lock().map_err(|_| ExtensionError::Corrupt {
-            path: self.component.clone(),
-            message: "Extism plugin lock is poisoned".to_string(),
-        })?;
-        *plugin = None;
-        let mut cancel_handle = self
-            .cancel_handle
-            .lock()
-            .map_err(|_| ExtensionError::Corrupt {
+        off_worker(|| {
+            let mut plugin = self.plugin.lock().map_err(|_| ExtensionError::Corrupt {
                 path: self.component.clone(),
-                message: "Extism cancel-handle lock is poisoned".to_string(),
+                message: "Extism plugin lock is poisoned".to_string(),
             })?;
-        *cancel_handle = None;
-        // Subscriptions and queued outbound events belong to the plugin that
-        // just went away. Keeping them would double each delivery after a
-        // reactivation and let a dead plugin's queue leak into the next one.
-        if let Ok(mut subscriptions) = self.bridge.subscriptions.lock() {
-            subscriptions.clear();
-        }
-        if let Ok(mut events) = self.bridge.events_out.lock() {
-            events.clear();
-        }
-        Ok(())
+            *plugin = None;
+            let mut cancel_handle =
+                self.cancel_handle
+                    .lock()
+                    .map_err(|_| ExtensionError::Corrupt {
+                        path: self.component.clone(),
+                        message: "Extism cancel-handle lock is poisoned".to_string(),
+                    })?;
+            *cancel_handle = None;
+            // Subscriptions and queued outbound events belong to the plugin that
+            // just went away. Keeping them would double each delivery after a
+            // reactivation and let a dead plugin's queue leak into the next one.
+            if let Ok(mut subscriptions) = self.bridge.subscriptions.lock() {
+                subscriptions.clear();
+            }
+            if let Ok(mut events) = self.bridge.events_out.lock() {
+                events.clear();
+            }
+            Ok(())
+        })
     }
 
     async fn cancel(&self) -> Result<(), ExtensionError> {
@@ -936,7 +950,7 @@ impl Runtime for ExtismRuntime {
     }
 
     async fn tools(&self) -> Result<Vec<ToolDescriptor>, ExtensionError> {
-        self.descriptors()
+        off_worker(|| self.descriptors())
     }
 
     async fn hook(&self, point: &str, payload: Value) -> Result<(), ExtensionError> {
@@ -944,7 +958,7 @@ impl Runtime for ExtismRuntime {
         // export is only required for packages that declared a hook point,
         // which manifest validation enforces.
         let _ = point;
-        let _ = self.call::<_, Value>("bsh_hook", &payload)?;
+        let _ = off_worker(|| self.call::<_, Value>("bsh_hook", &payload))?;
         Ok(())
     }
 
@@ -966,10 +980,11 @@ impl Runtime for ExtismRuntime {
             "correlationId": context.correlation_id,
             "config": self.config,
         });
-        let value = self
-            .call::<_, Value>("bsh_call_tool", &input)?
-            .ok_or_else(|| ExtensionError::NotFound {
-                id: format!("{}::{name}", self.extension),
+        let value =
+            off_worker(|| self.call::<_, Value>("bsh_call_tool", &input))?.ok_or_else(|| {
+                ExtensionError::NotFound {
+                    id: format!("{}::{name}", self.extension),
+                }
             })?;
         let bytes = serde_json::to_vec(&value)
             .map(|bytes| bytes.len())
@@ -1016,18 +1031,18 @@ impl Runtime for ExtismRuntime {
     }
 
     async fn command(&self, id: &str, arguments: Value) -> Result<Value, ExtensionError> {
-        let value = self
-            .call::<_, Value>("bsh_command", &json!({"id": id, "arguments": arguments}))?
-            .ok_or_else(|| ExtensionError::NotFound {
-                id: format!("{}::{id}", self.extension),
-            })?;
+        let value = off_worker(|| {
+            self.call::<_, Value>("bsh_command", &json!({"id": id, "arguments": arguments}))
+        })?
+        .ok_or_else(|| ExtensionError::NotFound {
+            id: format!("{}::{id}", self.extension),
+        })?;
         self.bounded_output(&value)?;
         Ok(value)
     }
 
     async fn panel(&self, id: &str) -> Result<Value, ExtensionError> {
-        let value = self
-            .call::<_, Value>("bsh_panel", &json!({"id": id}))?
+        let value = off_worker(|| self.call::<_, Value>("bsh_panel", &json!({"id": id})))?
             .ok_or_else(|| ExtensionError::NotFound {
                 id: format!("{}::{id}", self.extension),
             })?;
@@ -1036,59 +1051,61 @@ impl Runtime for ExtismRuntime {
     }
 
     async fn pump(&self) -> Result<(), ExtensionError> {
-        self.ensure_plugin()?;
-        let mut guard = self.plugin.lock().map_err(|_| ExtensionError::Corrupt {
-            path: self.component.clone(),
-            message: "Extism plugin lock is poisoned".to_string(),
-        })?;
-        if self.stopped.load(Ordering::SeqCst) {
-            return Err(ExtensionError::Runtime {
-                extension: self.extension.to_string(),
-                message: "runtime is shut down".to_string(),
-            });
-        }
-        let cancel_gate = self
-            .cancel_gate
-            .lock()
-            .map_err(|_| ExtensionError::Corrupt {
+        off_worker(|| {
+            self.ensure_plugin()?;
+            let mut guard = self.plugin.lock().map_err(|_| ExtensionError::Corrupt {
                 path: self.component.clone(),
-                message: "Extism cancellation gate is poisoned".to_string(),
+                message: "Extism plugin lock is poisoned".to_string(),
             })?;
-        self.call_state
-            .compare_exchange(CALL_IDLE, CALL_RUNNING, Ordering::SeqCst, Ordering::SeqCst)
-            .map_err(|state| ExtensionError::Runtime {
-                extension: self.extension.to_string(),
-                message: if state == CALL_STOPPED {
-                    "runtime is shut down".to_string()
-                } else {
-                    "Extism call state is not idle".to_string()
-                },
-            })?;
-        let _call_state = CallStateGuard(&self.call_state);
-        drop(cancel_gate);
-        let plugin = guard.as_mut().ok_or_else(|| ExtensionError::Runtime {
-            extension: self.extension.to_string(),
-            message: "Extism plugin is unavailable".to_string(),
-        })?;
-        // Do not drain the subscription until this invocation owns the plugin
-        // lifecycle; a busy/cancelled call must not silently lose queued events.
-        let events = self.bridge.take_events();
-        for event in events {
-            let text = serde_json::to_string(&event).map_err(|error| ExtensionError::Json {
-                path: self.component.clone(),
-                message: error.to_string(),
-            })?;
-            if let Err(error) = plugin.call::<&str, String>("bsh_event", text.as_str()) {
-                // Event delivery is best effort, but it must not be silent: a
-                // failing callback is how a guest stops receiving its queue.
-                log::warn!(
-                    target: "bsh::extension",
-                    "{}: event delivery failed: {error}",
-                    self.extension
-                );
+            if self.stopped.load(Ordering::SeqCst) {
+                return Err(ExtensionError::Runtime {
+                    extension: self.extension.to_string(),
+                    message: "runtime is shut down".to_string(),
+                });
             }
-        }
-        Ok(())
+            let cancel_gate = self
+                .cancel_gate
+                .lock()
+                .map_err(|_| ExtensionError::Corrupt {
+                    path: self.component.clone(),
+                    message: "Extism cancellation gate is poisoned".to_string(),
+                })?;
+            self.call_state
+                .compare_exchange(CALL_IDLE, CALL_RUNNING, Ordering::SeqCst, Ordering::SeqCst)
+                .map_err(|state| ExtensionError::Runtime {
+                    extension: self.extension.to_string(),
+                    message: if state == CALL_STOPPED {
+                        "runtime is shut down".to_string()
+                    } else {
+                        "Extism call state is not idle".to_string()
+                    },
+                })?;
+            let _call_state = CallStateGuard(&self.call_state);
+            drop(cancel_gate);
+            let plugin = guard.as_mut().ok_or_else(|| ExtensionError::Runtime {
+                extension: self.extension.to_string(),
+                message: "Extism plugin is unavailable".to_string(),
+            })?;
+            // Do not drain the subscription until this invocation owns the plugin
+            // lifecycle; a busy/cancelled call must not silently lose queued events.
+            let events = self.bridge.take_events();
+            for event in events {
+                let text = serde_json::to_string(&event).map_err(|error| ExtensionError::Json {
+                    path: self.component.clone(),
+                    message: error.to_string(),
+                })?;
+                if let Err(error) = plugin.call::<&str, String>("bsh_event", text.as_str()) {
+                    // Event delivery is best effort, but it must not be silent: a
+                    // failing callback is how a guest stops receiving its queue.
+                    log::warn!(
+                        target: "bsh::extension",
+                        "{}: event delivery failed: {error}",
+                        self.extension
+                    );
+                }
+            }
+            Ok(())
+        })
     }
 }
 

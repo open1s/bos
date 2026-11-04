@@ -41,6 +41,18 @@ bindgen!({
 /// The largest file or network body a host function will return.
 const MAX_HOST_BODY: usize = 8 * 1024 * 1024;
 
+/// Run a synchronous guest operation without occupying a multi-thread Tokio
+/// worker. On a current-thread runtime there is no other worker to protect, so
+/// the call runs inline; block_in_place would panic there.
+fn off_worker<T>(work: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(work)
+        }
+        _ => work(),
+    }
+}
+
 /// The largest number of event subscriptions one component may hold.
 const MAX_SUBSCRIPTIONS: usize = 16;
 
@@ -1099,44 +1111,48 @@ impl Runtime for WasmRuntime {
     }
 
     async fn activate(&self) -> Result<(), ExtensionError> {
-        self.ensure_instance()?;
-        let mut guard = self.instance.lock().map_err(|_| ExtensionError::Corrupt {
-            path: self.component.clone(),
-            message: "wasm instance lock is poisoned".to_string(),
-        })?;
-        self.ensure_running()?;
-        let instance = guard.as_mut().expect("instance was just created");
-        self.prepare_call(instance, self.resources.execution_ms())?;
-        instance
-            .bindings
-            .bsh_extension_extension()
-            .call_activate(&mut instance.store)
-            .map_err(|error| ExtensionError::Runtime {
-                extension: self.extension.to_string(),
-                message: error.to_string(),
-            })?
-            .map_err(|error| host_failure(&self.extension, error))?;
-        Ok(())
-    }
-
-    async fn deactivate(&self) -> Result<(), ExtensionError> {
-        let mut guard = self.instance.lock().map_err(|_| ExtensionError::Corrupt {
-            path: self.component.clone(),
-            message: "wasm instance lock is poisoned".to_string(),
-        })?;
-        if let Some(instance) = guard.as_mut() {
+        off_worker(|| {
+            self.ensure_instance()?;
+            let mut guard = self.instance.lock().map_err(|_| ExtensionError::Corrupt {
+                path: self.component.clone(),
+                message: "wasm instance lock is poisoned".to_string(),
+            })?;
+            self.ensure_running()?;
+            let instance = guard.as_mut().expect("instance was just created");
             self.prepare_call(instance, self.resources.execution_ms())?;
             instance
                 .bindings
                 .bsh_extension_extension()
-                .call_deactivate(&mut instance.store)
+                .call_activate(&mut instance.store)
                 .map_err(|error| ExtensionError::Runtime {
                     extension: self.extension.to_string(),
                     message: error.to_string(),
                 })?
                 .map_err(|error| host_failure(&self.extension, error))?;
-        }
-        Ok(())
+            Ok(())
+        })
+    }
+
+    async fn deactivate(&self) -> Result<(), ExtensionError> {
+        off_worker(|| {
+            let mut guard = self.instance.lock().map_err(|_| ExtensionError::Corrupt {
+                path: self.component.clone(),
+                message: "wasm instance lock is poisoned".to_string(),
+            })?;
+            if let Some(instance) = guard.as_mut() {
+                self.prepare_call(instance, self.resources.execution_ms())?;
+                instance
+                    .bindings
+                    .bsh_extension_extension()
+                    .call_deactivate(&mut instance.store)
+                    .map_err(|error| ExtensionError::Runtime {
+                        extension: self.extension.to_string(),
+                        message: error.to_string(),
+                    })?
+                    .map_err(|error| host_failure(&self.extension, error))?;
+            }
+            Ok(())
+        })
     }
 
     async fn shutdown(&self) -> Result<(), ExtensionError> {
@@ -1145,18 +1161,20 @@ impl Runtime for WasmRuntime {
         // Interrupt a currently running guest before waiting for its Store lock.
         engine().increment_epoch();
         self.deactivate().await?;
-        let mut guard = self.instance.lock().map_err(|_| ExtensionError::Corrupt {
-            path: self.component.clone(),
-            message: "wasm instance lock is poisoned".to_string(),
-        })?;
-        if let Some(instance) = guard.as_mut() {
-            let _ = instance
-                .bindings
-                .bsh_extension_extension()
-                .call_shutdown(&mut instance.store);
-        }
-        *guard = None;
-        Ok(())
+        off_worker(|| {
+            let mut guard = self.instance.lock().map_err(|_| ExtensionError::Corrupt {
+                path: self.component.clone(),
+                message: "wasm instance lock is poisoned".to_string(),
+            })?;
+            if let Some(instance) = guard.as_mut() {
+                let _ = instance
+                    .bindings
+                    .bsh_extension_extension()
+                    .call_shutdown(&mut instance.store);
+            }
+            *guard = None;
+            Ok(())
+        })
     }
 
     async fn cancel(&self) -> Result<(), ExtensionError> {
@@ -1169,7 +1187,7 @@ impl Runtime for WasmRuntime {
     }
 
     async fn tools(&self) -> Result<Vec<ToolDescriptor>, ExtensionError> {
-        self.descriptors()
+        off_worker(|| self.descriptors())
     }
 
     async fn call_tool(
@@ -1178,7 +1196,7 @@ impl Runtime for WasmRuntime {
         arguments: Value,
         context: &CallContext,
     ) -> Result<Value, ExtensionError> {
-        self.run_tool(name, arguments, context, None)
+        off_worker(|| self.run_tool(name, arguments, context, None))
     }
 
     async fn call_tool_progress(
@@ -1188,82 +1206,87 @@ impl Runtime for WasmRuntime {
         context: &CallContext,
         progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
     ) -> Result<ToolResult, ExtensionError> {
-        self.run_tool(name, arguments, context, progress)
-            .map(ToolResult::from_value)
+        off_worker(|| self.run_tool(name, arguments, context, progress)).map(ToolResult::from_value)
     }
 
     async fn command(&self, id: &str, arguments: Value) -> Result<Value, ExtensionError> {
-        self.ensure_instance()?;
-        let mut guard = self.instance.lock().map_err(|_| ExtensionError::Corrupt {
-            path: self.component.clone(),
-            message: "wasm instance lock is poisoned".to_string(),
-        })?;
-        self.ensure_running()?;
-        let instance = guard.as_mut().expect("instance");
-        self.prepare_call(instance, self.resources.execution_ms())?;
-        let text = instance
-            .bindings
-            .bsh_extension_extension()
-            .call_command(&mut instance.store, id, &arguments.to_string())
-            .map_err(|error| ExtensionError::Runtime {
-                extension: self.extension.to_string(),
-                message: error.to_string(),
+        off_worker(|| {
+            self.ensure_instance()?;
+            let mut guard = self.instance.lock().map_err(|_| ExtensionError::Corrupt {
+                path: self.component.clone(),
+                message: "wasm instance lock is poisoned".to_string(),
             })?;
-        self.record_fuel(&instance.store);
-        let text = text.map_err(|error| host_failure(&self.extension, error))?;
-        self.bounded_output(&text)?;
-        self.deliver_events(instance)?;
-        Ok(serde_json::from_str(&text).unwrap_or(Value::String(text)))
+            self.ensure_running()?;
+            let instance = guard.as_mut().expect("instance");
+            self.prepare_call(instance, self.resources.execution_ms())?;
+            let text = instance
+                .bindings
+                .bsh_extension_extension()
+                .call_command(&mut instance.store, id, &arguments.to_string())
+                .map_err(|error| ExtensionError::Runtime {
+                    extension: self.extension.to_string(),
+                    message: error.to_string(),
+                })?;
+            self.record_fuel(&instance.store);
+            let text = text.map_err(|error| host_failure(&self.extension, error))?;
+            self.bounded_output(&text)?;
+            self.deliver_events(instance)?;
+            Ok(serde_json::from_str(&text).unwrap_or(Value::String(text)))
+        })
     }
 
     async fn panel(&self, id: &str) -> Result<Value, ExtensionError> {
-        self.ensure_instance()?;
-        let mut guard = self.instance.lock().map_err(|_| ExtensionError::Corrupt {
-            path: self.component.clone(),
-            message: "wasm instance lock is poisoned".to_string(),
-        })?;
-        self.ensure_running()?;
-        let instance = guard.as_mut().expect("instance");
-        self.prepare_call(instance, self.resources.execution_ms())?;
-        let text = instance
-            .bindings
-            .bsh_extension_extension()
-            .call_panel(&mut instance.store, id)
-            .map_err(|error| ExtensionError::Runtime {
-                extension: self.extension.to_string(),
-                message: error.to_string(),
+        off_worker(|| {
+            self.ensure_instance()?;
+            let mut guard = self.instance.lock().map_err(|_| ExtensionError::Corrupt {
+                path: self.component.clone(),
+                message: "wasm instance lock is poisoned".to_string(),
             })?;
-        self.record_fuel(&instance.store);
-        let text = text.map_err(|error| host_failure(&self.extension, error))?;
-        self.bounded_output(&text)?;
-        self.deliver_events(instance)?;
-        serde_json::from_str(&text).map_err(|error| ExtensionError::Runtime {
-            extension: self.extension.to_string(),
-            message: format!("panel document is not JSON: {error}"),
+            self.ensure_running()?;
+            let instance = guard.as_mut().expect("instance");
+            self.prepare_call(instance, self.resources.execution_ms())?;
+            let text = instance
+                .bindings
+                .bsh_extension_extension()
+                .call_panel(&mut instance.store, id)
+                .map_err(|error| ExtensionError::Runtime {
+                    extension: self.extension.to_string(),
+                    message: error.to_string(),
+                })?;
+            self.record_fuel(&instance.store);
+            let text = text.map_err(|error| host_failure(&self.extension, error))?;
+            self.bounded_output(&text)?;
+            self.deliver_events(instance)?;
+            serde_json::from_str(&text).map_err(|error| ExtensionError::Runtime {
+                extension: self.extension.to_string(),
+                message: format!("panel document is not JSON: {error}"),
+            })
         })
     }
 
     async fn pump(&self) -> Result<(), ExtensionError> {
-        if self.stopped.load(Ordering::SeqCst) {
-            return Err(ExtensionError::Runtime {
-                extension: self.extension.to_string(),
-                message: "runtime is shut down".to_string(),
-            });
-        }
-        let mut guard = self.instance.lock().map_err(|_| ExtensionError::Corrupt {
-            path: self.component.clone(),
-            message: "wasm instance lock is poisoned".to_string(),
-        })?;
-        self.ensure_running()?;
-        let Some(instance) = guard.as_mut() else {
-            return Ok(());
-        };
-        // A pump is a call too: its callback must get a fresh deadline and
-        // fuel, not the previous call's exhausted budget or cancelled flag.
-        self.prepare_call(instance, self.resources.execution_ms())?;
-        self.deliver_events(instance)?;
-        self.record_fuel(&instance.store);
-        Ok(())
+        off_worker(|| {
+            if self.stopped.load(Ordering::SeqCst) {
+                return Err(ExtensionError::Runtime {
+                    extension: self.extension.to_string(),
+                    message: "runtime is shut down".to_string(),
+                });
+            }
+            let mut guard = self.instance.lock().map_err(|_| ExtensionError::Corrupt {
+                path: self.component.clone(),
+                message: "wasm instance lock is poisoned".to_string(),
+            })?;
+            self.ensure_running()?;
+            let Some(instance) = guard.as_mut() else {
+                return Ok(());
+            };
+            // A pump is a call too: its callback must get a fresh deadline and
+            // fuel, not the previous call's exhausted budget or cancelled flag.
+            self.prepare_call(instance, self.resources.execution_ms())?;
+            self.deliver_events(instance)?;
+            self.record_fuel(&instance.store);
+            Ok(())
+        })
     }
 }
 

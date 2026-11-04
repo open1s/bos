@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -77,10 +77,18 @@ fn catalog_limit(extension: &ExtensionId, bytes: usize) -> ExtensionError {
     }
 }
 
+/// One write queued for the MCP writer thread.
+struct WriteRequest {
+    line: Vec<u8>,
+    done: std::sync::mpsc::SyncSender<std::io::Result<()>>,
+}
+
 /// One live MCP server.
 struct Session {
     child: Arc<Mutex<Child>>,
-    stdin: ChildStdin,
+    /// A dedicated writer thread, so a child that stops reading stdin cannot
+    /// block the caller (or an executor worker) in write_all.
+    writer: std::sync::mpsc::SyncSender<WriteRequest>,
     lines: Receiver<Vec<u8>>,
     next_id: u64,
     /// Optional capabilities the server advertised at initialize time.
@@ -119,16 +127,7 @@ impl Session {
             message: error.to_string(),
         })?;
         line.push(b'\n');
-        self.stdin
-            .write_all(&line)
-            .map_err(|error| ExtensionError::Io {
-                path: PathBuf::from("<mcp stdin>"),
-                source: error,
-            })?;
-        self.stdin.flush().map_err(|error| ExtensionError::Io {
-            path: PathBuf::from("<mcp stdin>"),
-            source: error,
-        })?;
+        self.send_line(line, timeout_ms)?;
         let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -181,14 +180,59 @@ impl Session {
             extension: "mcp".to_string(),
             message: error.to_string(),
         })?;
-        self.stdin
-            .write_all(&line)
-            .and_then(|()| self.stdin.write_all(b"\n"))
-            .and_then(|()| self.stdin.flush())
-            .map_err(|error| ExtensionError::Io {
-                path: PathBuf::from("<mcp stdin>"),
-                source: error,
-            })
+        let mut line = line;
+        line.push(b'\n');
+        self.send_line(line, HANDSHAKE_MS)
+    }
+
+    /// Queue one line for the writer thread and wait, under the call deadline,
+    /// for it to be written. A child that stops reading makes the queue fill;
+    /// send_timeout then fails instead of blocking indefinitely.
+    fn send_line(&mut self, line: Vec<u8>, timeout_ms: u64) -> Result<(), ExtensionError> {
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
+        let (done, result) = sync_channel(0);
+        let mut request = WriteRequest { line, done };
+        loop {
+            match self.writer.try_send(request) {
+                Ok(()) => break,
+                Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                    if Instant::now() >= deadline {
+                        self.close();
+                        return Err(ExtensionError::Timeout {
+                            extension: "mcp".to_string(),
+                            operation: "write".to_string(),
+                            millis: timeout_ms,
+                        });
+                    }
+                    request = returned;
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    self.close();
+                    return Err(protocol_error("MCP writer thread stopped"));
+                }
+            }
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match result.recv_timeout(remaining) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                self.close();
+                Err(ExtensionError::Io {
+                    path: PathBuf::from("<mcp stdin>"),
+                    source: error,
+                })
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                self.close();
+                Err(ExtensionError::Timeout {
+                    extension: "mcp".to_string(),
+                    operation: "write".to_string(),
+                    millis: timeout_ms,
+                })
+            }
+            Err(RecvTimeoutError::Disconnected) => Err(protocol_error("MCP writer thread stopped")),
+        }
     }
 
     /// Drain queued notifications outside a request and mark a list change.
@@ -825,9 +869,21 @@ impl McpCore {
                 }
             }
         });
+        let (writer, writer_rx) = sync_channel::<WriteRequest>(8);
+        std::thread::spawn(move || {
+            let mut stdin = stdin;
+            while let Ok(request) = writer_rx.recv() {
+                let result = stdin.write_all(&request.line).and_then(|()| stdin.flush());
+                let failed = result.is_err();
+                let _ = request.done.send(result);
+                if failed {
+                    break;
+                }
+            }
+        });
         let mut session = Session {
             child,
-            stdin,
+            writer,
             lines,
             next_id: 1,
             capabilities: ServerCapabilities::default(),
