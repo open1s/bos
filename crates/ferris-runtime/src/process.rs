@@ -590,16 +590,23 @@ pub fn sandbox_profile(root: &Path, workspace: Option<&Path>, data_root: Option<
         profile.push_str(&format!(" (subpath \"{escaped}\")"));
     }
     profile.push(')');
+    // The Linux plan uses --unshare-all, which includes the network namespace;
+    // macOS has no equivalent, so deny network explicitly to keep the two
+    // platforms' process sandboxes comparable. A future network-capable
+    // process runtime must add a scoped allow rather than relying on this one.
+    profile.push_str("(deny network*)");
     profile
 }
 
 /// The child-side hook that installs the manifest's resource ceilings.
 ///
-/// RLIMIT_AS bounds virtual address space (not RSS), RLIMIT_CPU is the
-/// wall-independent CPU backstop behind the host's wall-clock timeout, and
-/// RLIMIT_NOFILE limits descriptor exhaustion. Every requested limit and the
-/// process-group setup are mandatory: a failure aborts exec rather than
-/// launching a child with weaker-than-requested restrictions.
+/// RLIMIT_AS bounds virtual address space (not RSS), RLIMIT_NOFILE limits
+/// descriptor exhaustion, and RLIMIT_CPU is deliberately left unlimited:
+/// `max_execution_ms` is a per-call wall-clock deadline, and deriving a
+/// process-lifetime CPU budget from it killed long-lived language servers after
+/// a few calls. The per-call deadline is enforced by the host. Every requested
+/// limit and the process-group setup are mandatory: a failure aborts exec
+/// rather than launching a child with weaker-than-requested restrictions.
 ///
 /// The host builds two kinds of command - tokio's for the process runtime and
 /// the standard library's for the MCP client - and `pre_exec` is spelled the
@@ -641,7 +648,12 @@ unsafe fn apply_unix_limits(
         }
     }
 
-    let cpu = cpu.max(1) as libc::rlim_t;
+    // `max_execution_ms` is a per-call wall-clock ceiling, not a lifetime CPU
+    // budget. Deriving RLIMIT_CPU from it killed a long-lived language server
+    // after a handful of calls, so the lifetime CPU limit stays unlimited; the
+    // host already enforces the per-call deadline.
+    let _ = cpu;
+    let cpu = libc::RLIM_INFINITY;
     let cpu_limit = libc::rlimit {
         rlim_cur: cpu,
         rlim_max: cpu,
@@ -1358,6 +1370,16 @@ impl ProcessRuntime {
             session.request("shutdown", json!({}), SHUTDOWN_MS, &self.extension),
         )
         .await;
+        // The child called setpgid(0, 0) in pre_exec, so its pid is the group
+        // id. Signal the whole group: a language server's grandchildren would
+        // otherwise survive the parent and keep the workspace busy.
+        #[cfg(unix)]
+        if let Some(pid) = session.child.id() {
+            // SAFETY: pid is the group leader this runtime spawned.
+            unsafe {
+                libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
         let _ = session.child.start_kill();
         let _ = session.child.wait().await;
         self.child_pid.store(0, Ordering::Relaxed);
@@ -1714,8 +1736,40 @@ mod tests {
     fn the_macos_profile_denies_writes_outside_declared_roots() {
         let profile = sandbox_profile(Path::new("/pkg"), None, None);
         assert!(profile.contains("(deny file-write*)"));
+        assert!(profile.contains("(deny network*)"));
         assert!(profile.contains("(subpath \"/pkg\")"));
         assert!(profile.contains("(subpath \"/tmp\")"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_macos_sandbox_denies_network_access() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let port = listener.local_addr().expect("address").port();
+        let profile = sandbox_profile(Path::new("/tmp"), None, None);
+        let script = format!(
+            "import socket; s=socket.socket(); s.settimeout(1); s.connect(('127.0.0.1',{port}))"
+        );
+        let output = std::process::Command::new("/usr/bin/sandbox-exec")
+            .arg("-p")
+            .arg(&profile)
+            .arg("python3")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .expect("sandbox-exec");
+        assert!(
+            !output.status.success(),
+            "the child reached the network inside the sandbox: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

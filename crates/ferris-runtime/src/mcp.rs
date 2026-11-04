@@ -144,6 +144,7 @@ impl Session {
 
     fn close(&mut self) {
         if let Ok(mut child) = self.child.lock() {
+            kill_process_group(&child);
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -311,6 +312,7 @@ fn discard_rest_of_line_sync<R: BufRead>(reader: &mut R) -> std::io::Result<()> 
 impl Drop for Session {
     fn drop(&mut self) {
         if let Ok(mut child) = self.child.lock() {
+            kill_process_group(&child);
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -325,8 +327,29 @@ fn terminate_child_handle(child: &Arc<Mutex<Child>>) {
     let mut child = child
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    kill_process_group(&child);
     let _ = child.kill();
 }
+
+/// Signal the child's process group, not just the child.
+///
+/// stdio limits only configure the rlimits; the process-group setup happens in
+/// the shared pre_exec hook, so a server that spawns a helper would leave the
+/// helper alive when only the leader is killed.
+#[cfg(unix)]
+fn kill_process_group(child: &Child) {
+    let pid = child.id();
+    if pid != 0 {
+        // SAFETY: pid is the group leader configured in pre_exec; killpg on a
+        // non-leader fails with ESRCH and is harmless.
+        unsafe {
+            libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_child: &Child) {}
 
 /// The state one MCP server package owns.
 ///
@@ -1564,9 +1587,9 @@ required = ["process.execute"]
             "MCP child must inherit RLIMIT_AS"
         );
         assert_eq!(
-            values.get(2).and_then(|value| value.parse::<u64>().ok()),
-            Some(32),
-            "MCP child must inherit RLIMIT_CPU"
+            values.get(2),
+            Some(&"-1"),
+            "RLIMIT_CPU stays unlimited: max_execution_ms is a per-call deadline, not a lifetime CPU budget"
         );
         assert_eq!(
             values.get(3).and_then(|value| value.parse::<u64>().ok()),
