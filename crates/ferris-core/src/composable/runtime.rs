@@ -217,6 +217,14 @@ impl CompositionRuntime {
         fiber.transition(FiberState::Loading)?;
         if let Err(message) = component.apply(&context) {
             let _ = fiber.transition(FiberState::Failed);
+            // Effects registered before the failing step must be torn down
+            // before activation reports failure; awaiting disposal also keeps
+            // async cleanups from outliving the failed activation.
+            if let Err(cleanup) = fiber.dispose_async().await {
+                return Err(RuntimeError::Apply(format!(
+                    "{message}; cleanup failed: {cleanup}"
+                )));
+            }
             return Err(RuntimeError::Apply(message));
         }
         fiber.transition(FiberState::Active)?;
@@ -784,6 +792,109 @@ mod tests {
             runtime.is_suspended("x"),
             "the new fiber's reconciler registration must survive the old unload"
         );
+    }
+    #[tokio::test]
+    async fn a_failed_apply_awaits_its_async_cleanup() {
+        let runtime = Arc::new(CompositionRuntime::new());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let component = {
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            let cleaned = Arc::clone(&cleaned);
+            move |ctx: &Context| {
+                let started = Arc::clone(&started);
+                let release = Arc::clone(&release);
+                let cleaned = Arc::clone(&cleaned);
+                ctx.effect("partial", move |_| {
+                    EffectCleanup::async_cleanup(async move {
+                        started.notify_waiters();
+                        release.notified().await;
+                        cleaned.store(true, Ordering::SeqCst);
+                    })
+                })
+                .map_err(|error| error.to_string())?;
+                Err("apply failed".to_string())
+            }
+        };
+        let activation = {
+            let runtime = Arc::clone(&runtime);
+            tokio::spawn(async move {
+                runtime
+                    .activate(
+                        "partial",
+                        Scope::Host,
+                        Arc::new(component),
+                        Inject::default(),
+                    )
+                    .await
+            })
+        };
+        started.notified().await;
+        assert!(
+            !activation.is_finished(),
+            "activation must not return before async cleanup finishes"
+        );
+        release.notify_waiters();
+        let error = activation.await.expect("join");
+        let error = match error {
+            Ok(()) => panic!("the apply must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("apply failed"), "{error}");
+        assert!(cleaned.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_reload_apply_failure_keeps_the_component_retryable() {
+        let runtime = CompositionRuntime::new();
+        let fail_next = Arc::new(AtomicBool::new(false));
+        let component = {
+            let fail_next = Arc::clone(&fail_next);
+            move |_ctx: &Context| {
+                if fail_next.swap(false, Ordering::SeqCst) {
+                    Err("transient apply failure".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        };
+        let inject = Inject::default().require(Scope::Host, "clock");
+        runtime
+            .activate("x", Scope::Host, Arc::new(component), inject)
+            .await
+            .expect("activate");
+        let _first = runtime
+            .services()
+            .provide(Scope::Host, "clock", Arc::new(1_u64));
+        runtime
+            .on_change(&change(ServiceChangeKind::Available, "clock", 1))
+            .await
+            .expect("first activation");
+        assert!(runtime.is_active("x"));
+
+        fail_next.store(true, Ordering::SeqCst);
+        let _second = runtime
+            .services()
+            .provide(Scope::Host, "clock", Arc::new(2_u64));
+        let error = runtime
+            .on_change(&change(ServiceChangeKind::Replaced, "clock", 2))
+            .await;
+        assert!(error.is_err(), "the transient apply failure is reported");
+        assert!(
+            runtime.is_suspended("x"),
+            "the failed reload keeps a retryable suspended entry"
+        );
+
+        let _third = runtime
+            .services()
+            .provide(Scope::Host, "clock", Arc::new(3_u64));
+        runtime
+            .on_change(&change(ServiceChangeKind::Replaced, "clock", 3))
+            .await
+            .expect("retry after the transient failure");
+        assert!(runtime.is_active("x"));
     }
     #[tokio::test]
     async fn unload_disposes_effects_and_forgets_the_fiber() {
