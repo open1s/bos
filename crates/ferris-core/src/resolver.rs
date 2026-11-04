@@ -165,9 +165,29 @@ impl LockFile {
     }
 }
 
+/// The internal failure of one greedy pass.
+enum SolveConflict {
+    /// A later requirement excludes the version already selected for an id;
+    /// the resolver excludes that version and retries with the next-best one.
+    Version {
+        id: String,
+        version: Version,
+        required_by: String,
+        requirement: VersionReq,
+    },
+    Fatal(ExtensionError),
+}
+
+/// How many times a conflicting greedy choice may be retried.
+const MAX_RESOLUTION_ATTEMPTS: usize = 64;
+
 /// Resolve a set of root extensions against the packages available to the
 /// store. Roots are installed packages the host intends to load; their
 /// transitive dependencies are added from the same pool.
+///
+/// Roots are sorted first, so the resolved set does not depend on the order the
+/// caller names them. A later constraint that excludes a greedy choice retries
+/// with that version excluded instead of failing the whole resolution.
 pub fn resolve(available: &[Package], roots: &[ExtensionId]) -> Result<Resolution, ExtensionError> {
     let mut pool: BTreeMap<String, BTreeMap<Version, &Package>> = BTreeMap::new();
     for package in available {
@@ -175,34 +195,73 @@ pub fn resolve(available: &[Package], roots: &[ExtensionId]) -> Result<Resolutio
             .or_default()
             .insert(package.manifest.extension.version.clone(), package);
     }
-    let mut selected: BTreeMap<String, &Package> = BTreeMap::new();
-    let mut order: Vec<String> = Vec::new();
-    let mut visiting: Vec<String> = Vec::new();
-    let mut stack: BTreeSet<String> = BTreeSet::new();
-    for root in roots {
-        visit(
-            root.as_str(),
-            &VersionReq::STAR,
-            "<root>",
-            &pool,
-            &mut selected,
-            &mut order,
-            &mut visiting,
-            &mut stack,
-        )?;
+    let mut roots: Vec<&ExtensionId> = roots.iter().collect();
+    roots.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    let mut excluded: BTreeMap<String, BTreeSet<Version>> = BTreeMap::new();
+    let mut last: Option<ExtensionError> = None;
+    for _ in 0..MAX_RESOLUTION_ATTEMPTS {
+        let mut selected: BTreeMap<String, &Package> = BTreeMap::new();
+        let mut order: Vec<String> = Vec::new();
+        let mut visiting: Vec<String> = Vec::new();
+        let mut conflict = None;
+        for root in &roots {
+            match visit(
+                root.as_str(),
+                &VersionReq::STAR,
+                "<root>",
+                &pool,
+                &mut selected,
+                &mut order,
+                &mut visiting,
+                &excluded,
+            ) {
+                Ok(()) => {}
+                Err(SolveConflict::Version {
+                    id,
+                    version,
+                    required_by,
+                    requirement,
+                }) => {
+                    excluded.entry(id.clone()).or_default().insert(version);
+                    conflict = Some(ExtensionError::Dependency {
+                        extension: required_by,
+                        message: format!(
+                            "requires {id} {requirement}; no single version satisfies every dependency"
+                        ),
+                    });
+                    break;
+                }
+                Err(SolveConflict::Fatal(error)) => {
+                    // Excluding a version can leave no candidate for an earlier
+                    // constraint; report the conflict that caused the exclusion
+                    // rather than the now-empty range.
+                    if matches!(error, ExtensionError::NoMatchingVersion { .. }) && last.is_some() {
+                        return Err(last.take().expect("checked above"));
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        if conflict.is_none() {
+            let mut packages = Vec::with_capacity(order.len());
+            for id in &order {
+                packages.push(
+                    selected
+                        .get(id)
+                        .copied()
+                        .expect("every ordered id was selected")
+                        .clone(),
+                );
+            }
+            let lock = LockFile::from_packages(&packages);
+            return Ok(Resolution { packages, lock });
+        }
+        last = conflict;
     }
-    let mut packages = Vec::with_capacity(order.len());
-    for id in &order {
-        packages.push(
-            selected
-                .get(id)
-                .copied()
-                .expect("every ordered id was selected")
-                .clone(),
-        );
-    }
-    let lock = LockFile::from_packages(&packages);
-    Ok(Resolution { packages, lock })
+    Err(last.unwrap_or_else(|| ExtensionError::Dependency {
+        extension: "<root>".to_string(),
+        message: format!("resolution did not converge after {MAX_RESOLUTION_ATTEMPTS} attempts"),
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -214,59 +273,46 @@ fn visit<'a>(
     selected: &mut BTreeMap<String, &'a Package>,
     order: &mut Vec<String>,
     visiting: &mut Vec<String>,
-    stack: &mut BTreeSet<String>,
-) -> Result<(), ExtensionError> {
+    excluded: &BTreeMap<String, BTreeSet<Version>>,
+) -> Result<(), SolveConflict> {
     if let Some(existing) = selected.get(id) {
         let existing_version = &existing.manifest.extension.version;
         if requirement.matches(existing_version) {
             return Ok(());
         }
-        return Err(ExtensionError::Dependency {
-            extension: required_by.to_string(),
-            message: format!(
-                "requires {id} {requirement}, but {id} {existing_version} is already selected by another dependency"
-            ),
+        return Err(SolveConflict::Version {
+            id: id.to_string(),
+            version: existing_version.clone(),
+            required_by: required_by.to_string(),
+            requirement: requirement.clone(),
         });
     }
     if let Some(position) = visiting.iter().position(|candidate| candidate == id) {
         let mut chain: Vec<String> = visiting[position..].to_vec();
         chain.push(id.to_string());
-        return Err(ExtensionError::Cycle {
+        return Err(SolveConflict::Fatal(ExtensionError::Cycle {
             chain: chain.join(" -> "),
-        });
+        }));
     }
     let Some(versions) = pool.get(id) else {
-        return Err(ExtensionError::NoMatchingVersion {
+        return Err(SolveConflict::Fatal(ExtensionError::NoMatchingVersion {
             id: id.to_string(),
             requirement: requirement.to_string(),
-        });
+        }));
     };
-    let chosen = versions
-        .iter()
-        .rev()
-        .find(|(version, _)| requirement.matches(version))
-        .map(|(_, package)| *package);
-    let Some(package) = chosen else {
-        return Err(ExtensionError::NoMatchingVersion {
+    let chosen = versions.iter().rev().find(|(version, package)| {
+        requirement.matches(version)
+            && !excluded.get(id).is_some_and(|set| set.contains(version))
+            && package.report.is_valid()
+            && package.manifest.compatibility.bsh.matches(&host_version())
+    });
+    let Some((_, package)) = chosen else {
+        return Err(SolveConflict::Fatal(ExtensionError::NoMatchingVersion {
             id: id.to_string(),
             requirement: requirement.to_string(),
-        });
+        }));
     };
-    if !package.report.is_valid() {
-        return Err(ExtensionError::Manifest {
-            path: package.root.join(super::manifest::MANIFEST_FILE),
-            message: package.error_message(),
-        });
-    }
-    if !package.manifest.compatibility.bsh.matches(&host_version()) {
-        return Err(ExtensionError::Incompatible {
-            extension: id.to_string(),
-            requirement: package.manifest.compatibility.bsh.to_string(),
-            host: host_version().to_string(),
-        });
-    }
     visiting.push(id.to_string());
-    stack.insert(id.to_string());
     let dependencies: Vec<(ExtensionId, Requirement)> = package
         .manifest
         .dependencies
@@ -282,16 +328,14 @@ fn visit<'a>(
             selected,
             order,
             visiting,
-            stack,
+            excluded,
         )?;
     }
-    stack.remove(id);
     visiting.pop();
     selected.insert(id.to_string(), package);
     order.push(id.to_string());
     Ok(())
 }
-
 /// A compact inventory used by `bsh ext info` and diagnostics.
 #[derive(Debug, Clone)]
 pub struct InventoryRow {
@@ -383,6 +427,29 @@ tools = ["echo"]
 
     fn id(raw: &str) -> ExtensionId {
         ExtensionId::parse(raw).expect("id")
+    }
+
+    #[test]
+    fn a_later_constraint_backtracks_the_greedy_version_choice() {
+        let a = package("com.example.a", "1.0.0", &[("com.example.c", "^2")]);
+        let b = package("com.example.b", "1.0.0", &[("com.example.c", "=2.0.0")]);
+        let c21 = package("com.example.c", "2.1.0", &[]);
+        let c20 = package("com.example.c", "2.0.0", &[]);
+        let available = [a, b, c21, c20];
+        let resolution = resolve(&available, &[id("com.example.a"), id("com.example.b")])
+            .expect("the later constraint backtracks c");
+        let c = resolution
+            .packages
+            .iter()
+            .find(|package| package.id().as_str() == "com.example.c")
+            .expect("c is resolved");
+        assert_eq!(c.manifest.extension.version.to_string(), "2.0.0");
+        assert_eq!(resolution.lock.version_of("com.example.c"), Some("2.0.0"));
+
+        // Root order must not change the resolved set.
+        let reversed = resolve(&available, &[id("com.example.b"), id("com.example.a")])
+            .expect("reversed roots resolve");
+        assert_eq!(reversed.lock, resolution.lock);
     }
 
     #[test]
