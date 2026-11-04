@@ -973,7 +973,8 @@ pub struct ProcessRuntime {
     /// The AppContainer child processes run in. Created on first spawn; a
     /// failure is fatal, never a direct-exec fallback.
     #[cfg(windows)]
-    sandbox: tokio::sync::Mutex<Option<std::sync::Arc<crate::windows_sandbox::WindowsSandbox>>>,
+    appcontainer:
+        tokio::sync::Mutex<Option<std::sync::Arc<crate::windows_sandbox::WindowsSandbox>>>,
 }
 
 impl ProcessRuntime {
@@ -1030,7 +1031,7 @@ impl ProcessRuntime {
             #[cfg(unix)]
             watchdog: StdMutex::new(None),
             #[cfg(windows)]
-            sandbox: tokio::sync::Mutex::new(None),
+            appcontainer: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -1190,7 +1191,7 @@ impl ProcessRuntime {
     async fn sandbox(
         &self,
     ) -> Result<std::sync::Arc<crate::windows_sandbox::WindowsSandbox>, ExtensionError> {
-        let mut slot = self.sandbox.lock().await;
+        let mut slot = self.appcontainer.lock().await;
         if let Some(sandbox) = slot.as_ref() {
             return Ok(std::sync::Arc::clone(sandbox));
         }

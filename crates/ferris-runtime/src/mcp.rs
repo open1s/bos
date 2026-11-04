@@ -9,9 +9,7 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-#[cfg(not(windows))]
-use std::process::Child;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -89,7 +87,7 @@ struct WriteRequest {
 /// One spawned MCP server: a std child on Unix, or an AppContainer child on
 /// Windows. The runtime only needs id, piped stdio, kill and wait.
 enum McpChild {
-    #[cfg(not(windows))]
+    #[cfg_attr(windows, allow(dead_code))]
     Std(Child),
     #[cfg(windows)]
     Sandbox(heel::Child),
@@ -1359,11 +1357,6 @@ impl McpCore {
             terminate_child_handle(&child);
         }
         self.stop_watchdog();
-        // Closing the job kills the server and any helpers it spawned.
-        #[cfg(windows)]
-        if let Ok(mut slot) = self.job.lock() {
-            *slot = None;
-        }
     }
 
     /// Start an RSS sampler bound to this child, replacing any previous one.
