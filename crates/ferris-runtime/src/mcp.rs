@@ -1973,12 +1973,10 @@ required = ["process.execute"]
             command
         };
         let child = command.spawn().expect("long-running child");
-        assert!(
-            cancelled_runtime
-                .core
-                .register_child(McpChild::Std(child))
-                .is_err()
-        );
+        assert!(cancelled_runtime
+            .core
+            .register_child(McpChild::Std(child))
+            .is_err());
         assert!(
             cancelled_runtime
                 .core
@@ -2010,12 +2008,10 @@ required = ["process.execute"]
             command
         };
         let child = command.spawn().expect("late child");
-        assert!(
-            cancelled_runtime
-                .core
-                .register_child(McpChild::Std(child))
-                .is_err()
-        );
+        assert!(cancelled_runtime
+            .core
+            .register_child(McpChild::Std(child))
+            .is_err());
         assert!(
             cancelled_runtime
                 .core

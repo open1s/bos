@@ -1221,10 +1221,8 @@ impl ExtensionHost {
     pub(crate) fn framework_manager(
         &self,
     ) -> Result<ferris_sdk::manager::ExtensionManager, ferris_sdk::ExtError> {
-        let mut manager = super::framework::manager_for(
-            self.config.root.clone(),
-            self.config.workspace.clone(),
-        )?;
+        let mut manager =
+            super::framework::manager_for(self.config.root.clone(), self.config.workspace.clone())?;
         for builtin in &self.builtins {
             manager.register_linked(
                 builtin.package.manifest.clone(),

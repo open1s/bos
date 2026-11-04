@@ -897,8 +897,7 @@ mod tests {
             capabilities: CapabilityRegistry::default(),
             contracts: ServiceContractRegistry::default(),
         });
-        let example =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/legacy/hello");
+        let example = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/legacy/hello");
         let manifest_path = example.join("extension.toml");
         let text = std::fs::read_to_string(&manifest_path).expect("the fixture manifest");
         let manifest = Manifest::parse(&text, &manifest_path).expect("parse");
