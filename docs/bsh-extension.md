@@ -273,12 +273,23 @@ effect has two front doors and the extension author decides which ones exist.
 
 The composer carries the command's ANNOTATION, not its template. Choosing the
 row writes `/name ` into the draft and the reader keeps typing; the send then
-composes the template, a `---` divider and those words into the one message the
-model reads, and the leading annotation leaves the request once its template is
-attached. So the transcript keeps the line the reader wrote, and a command's
-prompt body never masquerades as text they typed. The token is the qualified
-name the palette draws (`namespace__contribution`), which is why the draft and
-the resolver cannot disagree about the spelling.
+composes one message for the model - the template in an `<extension_command
+name="...">` block (the framing a skill uses), a `---` divider, then those words -
+and the leading annotation leaves the request once its block is attached. So the
+transcript keeps the line the reader wrote, and a command's prompt body never
+masquerades as text they typed. The token is the qualified name the palette
+draws (`namespace__contribution`), which is why the draft and the resolver
+cannot disagree about the spelling. The block also carries that name, so a child
+run - whose row is flattened from its own agent, i.e. the model-facing request -
+can be shown back as `/name words` instead of the template.
+
+The stored row stays the annotation, so every later turn replays it AS THE SAME
+BLOCK (`Runner::seed_session`), not as a bare `/name` the model has no
+instruction for. The transcript is never rewritten: only the request's view of
+the history is. The palette only offers loaded commands; a hand-typed qualified
+name that resolves to none is reported by name (`slash.commandUnavailable`) and
+the line travels as text, so a typo or a switched-off package does not look like
+a command that silently did nothing.
 
 A skill reaches the model in one of two forms, and both feed the same set the
 catalogue and the `load_skill` tool read:

@@ -157,16 +157,33 @@ impl Runner {
     /// immediately before the stream, so the fresh context is never folded
     /// into the checkpoint it was meant to supersede.
     pub(crate) fn seed_session(agent: &Agent, transcript: &[ChatMessage]) {
+        let commands = crate::extension::cached_commands();
+        Self::seed_session_with(agent, transcript, &commands);
+    }
+
+    /// The same seed against an explicit command list.
+    ///
+    /// Split out so the replay of a `/command` annotation is testable without a
+    /// live extension host: the production path is [`Self::seed_session`], which
+    /// reads the host's current list once per seed.
+    pub(crate) fn seed_session_with(
+        agent: &Agent,
+        transcript: &[ChatMessage],
+        commands: &[crate::extension::CommandSurface],
+    ) {
         let mut session = agent.session();
         session.restore_messages(Vec::new());
         for (row_index, message) in transcript.iter().enumerate() {
             match message.role {
                 // A stored user row with images replays as the same multimodal
                 // content its live turn sent, which is how the /goal attachment
-                // message stays readable by a later goal round.
+                // message stays readable by a later goal round. An extension
+                // command's `/name` annotation replays as the block its live
+                // send carried, or a later turn reads a command it cannot see.
                 Role::User => {
                     if let Some(content) = crate::state::message_content(message) {
-                        session.add_user_content(content);
+                        session
+                            .add_user_content(crate::command_invocation::replay(commands, content));
                     }
                 }
                 Role::Assistant => {
@@ -845,6 +862,47 @@ mod tests {
             (calls, results),
             (2, 2),
             "both calls replay with their results: {messages:?}"
+        );
+    }
+
+    /// A stored `/command` annotation replays as the block its live send
+    /// attached, so a later turn's model does not read a name it has no
+    /// instruction for. The stored row itself stays the reader's line.
+    #[test]
+    fn a_stored_command_annotation_replays_as_its_block() {
+        let commands = vec![crate::extension::CommandSurface {
+            name: "hello__greet".to_string(),
+            description: "Greet the reader".to_string(),
+            template: "Say hello from com.example.hello.".to_string(),
+        }];
+        let agent = capturing_agent(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let transcript = vec![
+            crate::model::ChatMessage::user("/hello__greet in one sentence".to_string()),
+            crate::model::ChatMessage::assistant(),
+        ];
+        Runner::seed_session_with(&agent, &transcript, &commands);
+        let users: Vec<String> = agent
+            .session()
+            .messages()
+            .iter()
+            .filter_map(|message| match message {
+                react::llm::LlmMessage::User { content } => {
+                    Some(content.as_text().unwrap_or("").to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            users,
+            vec![
+                "<extension_command name=\"hello__greet\">\nSay hello from com.example.hello.\n</extension_command>\n\n---\n\nin one sentence"
+                    .to_string()
+            ],
+            "the replayed row carries the block again"
+        );
+        assert_eq!(
+            transcript[0].text, "/hello__greet in one sentence",
+            "seeding never rewrites the stored transcript"
         );
     }
 

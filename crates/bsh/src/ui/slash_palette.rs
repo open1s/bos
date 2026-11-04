@@ -1071,18 +1071,18 @@ impl Shell {
                     self.set_composer_text("", window, cx);
                 }
             },
-            // The reference inserts the picked skill's name as the prompt's
-            // slash invocation; it never runs a tool on the reader's behalf.
-            // The send is what loads it: the runner's turn task resolves the
-            // gesture against the skills that build registered and appends
-            // the instructions (crate::skill_invocation), which is exactly
-            // the reference's pre-step skill listener.
             // The annotation, not the template. The template is the command's
             // prompt body and belongs to the request the send composes, so a
             // one-row choice never pastes a paragraph into the reader's draft.
             SlashAction::Extension(name) => {
                 self.insert_extension_command(&name, window, cx);
             }
+            // The reference inserts the picked skill's name as the prompt's
+            // slash invocation; it never runs a tool on the reader's behalf.
+            // The send is what loads it: the runner's turn task resolves the
+            // gesture against the skills that build registered and appends
+            // the instructions (crate::skill_invocation), which is exactly
+            // the reference's pre-step skill listener.
             SlashAction::Insert(name) => {
                 self.slash.close();
                 self.set_composer_text(&format!("/{name} "), window, cx);

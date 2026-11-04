@@ -2817,6 +2817,26 @@ impl Shell {
         self.state.notice(notice);
     }
 
+    /// Tell the reader when a leading `/name` token has the qualified-command
+    /// shape but no loaded extension answers for it.
+    ///
+    /// The palette only offers loaded commands, so a hand-typed name is the one
+    /// path that can name a command this turn cannot compose - a switched-off
+    /// package or a typo. The request still goes out (the line is ordinary text
+    /// then), but the reader is told why no template was attached instead of
+    /// watching the model answer a `/ns__local` it cannot read. A token without
+    /// `__` is not reported: that is prose or a skill, and the skill has its own
+    /// notice.
+    pub(crate) fn warn_unresolved_command(&mut self, text: &str) {
+        let Some(name) = crate::command_invocation::unavailable(&self.extension_commands, text)
+        else {
+            return;
+        };
+        let notice =
+            crate::i18n::tr(self.state.lang, "slash.commandUnavailable").replace("{name}", name);
+        self.state.notice(notice);
+    }
+
     /// The text one submission sends to the model.
     ///
     /// The draft keeps the reader's own line, `/name` annotation included. This
@@ -2852,6 +2872,7 @@ impl Shell {
         if let Some(id) = self.state.active_id.clone() {
             self.warn_unresolved_skill(&text, &id);
         }
+        self.warn_unresolved_command(&text);
         // Measured: the reference queues a submission while its session is
         // already running instead of opening a second turn over the same
         // transcript, which is what its queue dock lists.
@@ -2956,6 +2977,7 @@ impl Shell {
             return;
         };
         self.warn_unresolved_skill(&queued.text, id);
+        self.warn_unresolved_command(&queued.text);
         let plan = self.state.plan_mode(id);
         let request = self.request_text(&queued.text, plan);
         let input = crate::state::turn_input(&request, &queued.attachments);
@@ -3052,12 +3074,6 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // A child is a model too: a `/command` annotation in the child
-        // composer composes its template the way a parent turn does, so one
-        // gesture cannot mean a template in one composer and prose in the
-        // other.
-        let prompt =
-            crate::command_invocation::compose(&self.extension_commands, &prompt).unwrap_or(prompt);
         let Some(run) = self.state.subagents.run(&id) else {
             self.state
                 .notice(crate::i18n::tr(self.state.lang, "subagents.unavailable").to_string());
@@ -3171,6 +3187,15 @@ impl Shell {
         eff: crate::settings::Effective,
         cx: &mut Context<Self>,
     ) {
+        // A child is a model too: the reader's `/command` annotation composes
+        // its template at the ONE place the child's model input is built. The
+        // run's own row keeps the annotation (the caller reopened it with the
+        // raw prompt), and `caps::child_transcript` projects a finished turn's
+        // model-facing row back to the same line.
+        let prompt = match crate::command_invocation::compose(&self.extension_commands, &prompt) {
+            Some(composed) => composed,
+            None => prompt,
+        };
         // The UI task outlives this frame, so the id it reports against is
         // owned rather than borrowed from the caller.
         let id = id.to_string();

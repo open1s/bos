@@ -30756,7 +30756,274 @@ fn an_extension_command_sends_its_template_with_the_readers_words(cx: &mut TestA
         other => panic!("a text steer stays text: {other:?}"),
     };
     assert_eq!(
-        text, "Say hello from com.example.hello.\n\n---\n\nin one sentence",
+        text,
+        "<extension_command name=\"hello__greet\">\nSay hello from com.example.hello.\n</extension_command>\n\n---\n\nin one sentence",
         "the template heads one message and the reader's words follow the divider"
+    );
+    assert_eq!(
+        crate::command_invocation::visible_text(&text).as_deref(),
+        Some("/hello__greet in one sentence"),
+        "the model-facing request reads back as the reader's own line"
+    );
+}
+
+/// Read one HTTP/1.1 request's body from `stream`, for the loopback provider.
+///
+/// The shell's provider client writes a normal request with a `Content-Length`,
+/// so the body is framed even when it arrives in a later TCP segment.
+fn read_request_body(stream: &mut std::net::TcpStream) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let header_end = loop {
+        let read = std::io::Read::read(stream, &mut chunk).expect("the request head");
+        assert!(read > 0, "the provider request closed before its head");
+        buf.extend_from_slice(&chunk[..read]);
+        if let Some(at) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
+            break at;
+        }
+    };
+    let head = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
+    let length = head
+        .lines()
+        .find_map(|line| line.strip_prefix("content-length:"))
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let body_start = header_end + 4;
+    while buf.len() < body_start + length {
+        let read = std::io::Read::read(stream, &mut chunk).expect("the request body");
+        if read == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..read]);
+    }
+    buf[body_start..body_start + length].to_vec()
+}
+
+/// The SEND is the real seam: the wire request carries the composed command,
+/// and the transcript keeps the annotation. The provider is a one-shot loopback
+/// server, so the assertion is the model's actual input rather than a helper's
+/// return value.
+#[gpui::test]
+fn a_fresh_extension_command_reaches_the_model_composed(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    // The request is made on the runner's Tokio runtime and the reply wakes the
+    // GPUI pump from that worker, which is the production path.
+    cx.dispatcher.allow_parking();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let port = listener
+        .local_addr()
+        .expect("the bound loopback address")
+        .port();
+    let (sent, answered) = std::sync::mpsc::channel::<Vec<u8>>();
+    let server = std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+        let body = read_request_body(&mut stream);
+        let _ = sent.send(body);
+        // One content chunk and the terminal signal are the whole Chat
+        // Completions stream this test needs.
+        let reply = concat!(
+            "HTTP/1.1 200 OK\r\n",
+            "Content-Type: text/event-stream\r\n",
+            "Connection: close\r\n\r\n",
+            "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":0,",
+            "\"model\":\"local-id\",\"choices\":[{\"index\":0,",
+            "\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},",
+            "\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let _ = std::io::Write::write_all(&mut stream, reply.as_bytes());
+        let _ = std::io::Write::flush(&mut stream);
+    });
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("extension-command-wire", 0);
+        let mut provider = crate::settings::global::Provider {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            ..Default::default()
+        };
+        provider.models.insert(
+            "local".to_string(),
+            crate::settings::global::ModelEntry {
+                model: "local-id".to_string(),
+                ..Default::default()
+            },
+        );
+        state
+            .settings
+            .global
+            .providers
+            .insert("p".to_string(), provider);
+        state.select_model("local");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.extension_commands = vec![crate::extension::CommandSurface {
+                name: "hello__greet".to_string(),
+                description: "Greet the reader".to_string(),
+                template: "Say hello from com.example.hello.".to_string(),
+            }];
+            this.set_composer_text("/hello__greet in one sentence", window, cx);
+            this.send(window, cx);
+        });
+    });
+    let body = answered
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("the provider request reaches the loopback server");
+    let request: serde_json::Value = serde_json::from_slice(&body).expect("a JSON request body");
+    let expected = concat!(
+        "<extension_command name=\"hello__greet\">\n",
+        "Say hello from com.example.hello.\n",
+        "</extension_command>\n\n---\n\nin one sentence"
+    );
+    let users: Vec<&str> = request["messages"]
+        .as_array()
+        .expect("the request's messages")
+        .iter()
+        .filter(|message| message["role"] == "user")
+        .filter_map(|message| message["content"].as_str())
+        .collect();
+    let user = users
+        .iter()
+        .copied()
+        .find(|content| content.contains("com.example.hello"))
+        .unwrap_or_else(|| panic!("no composed command on the wire: {users:#?}"));
+    assert_eq!(user, expected, "the model reads one composed request");
+    // The durable row keeps what the reader wrote, annotation included.
+    let (id, row) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        let id = shell.state.active_id.clone().expect("the session");
+        let row = shell
+            .state
+            .store
+            .session(&id)
+            .expect("the session")
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == Role::User)
+            .expect("the submitted user row")
+            .text
+            .clone();
+        (id, row)
+    });
+    assert_eq!(
+        row, "/hello__greet in one sentence",
+        "the transcript keeps the reader's line"
+    );
+    cx.update(|_, cx| shell.update(cx, |this, _| this.state.stop(&id)));
+    let _ = server.join();
+}
+
+/// A child prompt keeps the reader's annotation while it waits. The template is
+/// composed at the child's MODEL seam (`spawn_child_turn`), not when the row is
+/// stored, so the queue dock and the run's own transcript show what was typed.
+#[gpui::test]
+fn a_queued_child_command_keeps_its_annotation(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("child-command-queue", 1);
+        let parent = state.active_id.clone().expect("a session");
+        let id = state.subagents.begin(
+            &parent,
+            &parent,
+            1,
+            0,
+            "Inspect the files",
+            "List the workspace files",
+        );
+        state.show_subagent(&id);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let id = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .subagents
+            .snapshot()
+            .first()
+            .expect("the run")
+            .id
+            .clone()
+    });
+    cx.update(|_, cx| shell.update(cx, |this, _| this.state.show_subagent(&id)));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.extension_commands = vec![crate::extension::CommandSurface {
+                name: "hello__greet".to_string(),
+                description: "Greet the reader".to_string(),
+                template: "Say hello from com.example.hello.".to_string(),
+            }];
+            this.set_composer_text("/hello__greet in one sentence", window, cx);
+            this.send(window, cx);
+        });
+    });
+    let pending = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .subagents
+            .run(&id)
+            .expect("the run")
+            .pending
+            .clone()
+    });
+    assert_eq!(
+        pending,
+        vec!["/hello__greet in one sentence".to_string()],
+        "the queued row keeps the reader's annotation, not the template"
+    );
+}
+
+/// A hand-typed qualified command that is not loaded is reported by name, and
+/// a loaded one is not. The request still goes out either way - the notice says
+/// why no template was attached instead of letting the line pass as prose.
+#[gpui::test]
+fn a_missing_extension_command_is_reported(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_queue("extension-command-notice", &[]);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.extension_commands = vec![crate::extension::CommandSurface {
+                name: "hello__greet".to_string(),
+                description: "Greet the reader".to_string(),
+                template: "Say hello from com.example.hello.".to_string(),
+            }];
+        });
+    });
+    let (_id, _mailbox) = begin_steerable_turn(&shell, cx);
+    let send = |shell: &Entity<Shell>, cx: &mut VisualTestContext, text: &str| {
+        cx.update(|window, cx| {
+            shell.update(cx, |this, cx| {
+                this.set_composer_text(text, window, cx);
+                this.send(window, cx);
+            });
+        });
+    };
+    send(&shell, cx, "/nosuch__command do it");
+    let notice = cx.update(|_, cx| shell.read(cx).state.notice.clone());
+    let notice = notice.expect("the missing command is reported");
+    assert!(
+        notice.contains("nosuch__command"),
+        "the notice names the command: {notice}"
+    );
+    cx.update(|_, cx| shell.update(cx, |this, _| this.state.notice = None));
+    send(&shell, cx, "/hello__greet do it");
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).state.notice.clone()),
+        None,
+        "a loaded command composes, so there is nothing to report"
     );
 }

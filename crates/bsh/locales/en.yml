@@ -66,6 +66,7 @@
 "slash.planExit": "Exit plan mode"
 "slash.planOn": "Plan mode on. Use /plan off to leave."
 "slash.planOff": "Plan mode off."
+"slash.commandUnavailable": "No loaded extension command is named \"{name}\" - the request is sent as text."
 "plan.onHint": "Plan mode on — click to turn off (/plan off)"
 "hint.plan": "describe your task to generate plan"
 "hint.goal": "describe the objective for a long-running task"

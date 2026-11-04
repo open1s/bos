@@ -3717,12 +3717,15 @@ no room for the words the command was meant to take.
 
 The contract is the reference's command CLAIM, not a text paste. A command is a
 prompt TEMPLATE: choosing the row writes the annotation `/name ` and parks the
-caret after it, and the SEND composes the template, a `---` divider and the
+caret after it, and the SEND composes the template in an `<extension_command
+name="...">` block (the same framing a skill uses), a `---` divider and the
 reader's words into the one message the model reads, dropping the leading token
-once its template is attached. The draft therefore stays what the reader wrote
+once its block is attached. The draft therefore stays what the reader wrote
 (and what the transcript replays), and the template never masquerades as it.
+The block also carries the command's NAME, which is what lets a child view read
+its row back as the annotation (`command_invocation::visible_text`).
 
-Three seams, one grammar:
+Four seams, one grammar:
 
 - `command_invocation` (`src/command_invocation.rs`) owns `draft` and `compose`.
   The gesture is the LEADING token only, its name alphabet is the sanitized
@@ -3734,8 +3737,20 @@ Three seams, one grammar:
   load bearing: `turn_text` prepends the plan directive and the @reference
   guidance, so composing afterwards would leave the token mid-text and neither
   leading nor droppable under plan mode or an @reference.
-- `send_to_subagent` composes too: the child view uses the same composer, so
-  one gesture cannot mean a template in the parent and prose in the child.
+- `spawn_child_turn` composes the child's model input, because the child view
+  uses the same composer and one gesture cannot mean a template in the parent
+  and prose in the child. It is the ONE seam both child paths go through (an
+  idle send and the queue drain), and it is deliberately later than the run's
+  own record: `begin_followup`/`queue_followup` keep the annotation, so the
+  queue dock and the in-flight row show what the reader typed. A finished row
+  is flattened from the child's agent (the model-facing request), so
+  `caps::child_transcript` runs `command_invocation::visible_text` after the
+  skill projection and shows `/name words` again.
+- `Runner::seed_session` replays a stored `/name` row as its block, because the
+  session keeps the reader's annotation and a later turn must see the same
+  command the live turn saw. `seed_session_with` takes an explicit list so the
+  rule is testable without an extension host; the production path reads the
+  host's list once per seed. The stored row is never rewritten.
 
 The row actions carry the NAME now (`SlashAction::Extension`,
 `CardAction::Extension`), and one `insert_extension_command` handles all three
@@ -3745,18 +3760,41 @@ case was a silent no-op before this round: `cut_command_token` returned early
 when the draft carried no `/` or `@`, so picking an extension row from `+`
 on a non-empty draft changed nothing at all.
 
+A hand-typed `/ns__local` that names no loaded command is reported by name
+(`slash.commandUnavailable`, both locales): the request still travels as text,
+but the reader is told why no template was attached. The check is the qualified
+SHAPE (`__`), which no skill name can contain, so prose (`/usr/bin`) and a skill
+gesture are never misreported.
+
 Evidence:
-`command_invocation::tests` (6: annotation vs template, bare annotation,
-template+words, unknown names as prose incl. `/usr/bin` and a suffixed name,
-mid-sentence token, leading whitespace),
+`command_invocation::tests` (13: annotation vs template, bare annotation,
+template+words, the block's visible projection incl. through a skill block,
+unknown names as prose incl. `/usr/bin` and a suffixed name, mid-sentence
+token, leading whitespace, an empty body, the replay of an annotation and its
+idempotence, a replayed parts row keeping its images, and the missing-command
+name), `ui::shell_tests::a_missing_extension_command_is_reported` (the notice
+names the absent command and a loaded one sets none),
 `ui::shell_tests::choosing_an_extension_command_writes_the_annotation` (both
 cards; the slash path replaces a typed query, the `+` path keeps the words),
-and `an_extension_command_sends_its_template_with_the_readers_words` (drives
-`steer_now` and reads the turn's mailbox: the composed message is exact).
-Discrimination: with `request_text` forced back to `turn_text(text)`, the send
-test fails with `left: "/hello__greet in one sentence"`.
+`an_extension_command_sends_its_template_with_the_readers_words` (drives
+`steer_now` and reads the turn's mailbox), and
+`a_fresh_extension_command_reaches_the_model_composed` (a one-shot loopback
+provider reads the real wire body of a fresh submit, and the durable row still
+reads `/hello__greet in one sentence`). `caps::tests::
+a_child_row_reads_back_as_its_command_annotation` pins the child projection
+from a seeded agent, not from the helper's return value, and
+`a_queued_child_command_keeps_its_annotation` pins the queued row's annotation
+(the composition is not done when the row is stored), and
+`runner::tests::a_stored_command_annotation_replays_as_its_block` seeds a stored
+annotation and reads the agent's session back as the block.
+Discrimination, both re-injected and watched to fail: with `request_text` forced
+back to `turn_text(text)` the wire test fails with `no composed command on the
+wire`; with the command projection dropped from `child_transcript` the child
+row test fails with the raw block; with the replay dropped from
+`seed_session_with` the runner test fails with `left: ["/hello__greet in one
+sentence"]`.
 
-Honest gap: the fresh-submit path is not observed at the wire by a fake
-provider; it shares `request_text` with the steer path the test drives, and the
-pure composer is tested directly.
+No known gap is left in this round's scope: the live send is observed at the
+wire, a stored annotation replays as its block, and both the in-flight and the
+finished child rows show the reader's annotation.
 

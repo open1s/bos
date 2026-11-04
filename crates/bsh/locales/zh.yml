@@ -66,6 +66,7 @@
 "slash.planExit": "退出计划模式"
 "slash.planOn": "计划模式已开启。使用 /plan off 退出。"
 "slash.planOff": "计划模式已关闭。"
+"slash.commandUnavailable": "没有已加载的扩展命令\"{name}\"，请求已按原文发送。"
 "plan.onHint": "计划模式已开启 — 点击关闭（/plan off）"
 "hint.plan": "描述你的任务以生成计划"
 "hint.goal": "输入目标，智能体将持续执行"
