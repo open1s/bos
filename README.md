@@ -325,4 +325,4 @@ help guide its development.
 
 ## License
 
-MIT OR Apache-2.0 · Version 3.0.2 · [Releases](https://github.com/open1s/bos/releases)
+MIT OR Apache-2.0 · Version 4.0.1 · [Releases](https://github.com/open1s/bos/releases)

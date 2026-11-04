@@ -1,5 +1,39 @@
 # Changelog
 
+## v4.0.1 (2026-11-04)
+
+**Breaking**: extension manifest 2.0 is now the only schema the host accepts, so
+1.x packages must be migrated with `bsh ext migrate`. That break is why the
+platform moves to 4.x.
+
+- **Extensions**: a host-neutral `ExtensionManager` now owns install,
+  activation, rollback, retry and quarantine; packages load through the
+  manifest 2.0 envelope with legacy migration; `bsh ext plan` previews the
+  activation plan; versioned service contracts resolve into the activation
+  graph with generation-scoped leases, drain handles and fiber-owned
+  revocation.
+- **Ferris SDK**: the standalone `bos-ext` crates (core, runtime, SDK, smoke)
+  land with a manifest surface, an author API and examples; BSH runs on the
+  SDK host facade.
+- **Windows**: Process and MCP children launch in an AppContainer and their
+  memory is capped with Job Objects; a Windows lane covers the extension
+  runtimes.
+- **Agent tools**: `find_tool`/`find_skill` expose full schemas, tool-call
+  errors are schema-aware, batched file reads are bounded, and a multi-file
+  patch tool applies atomically; tool arguments are enforced against their
+  JSON schemas.
+- **BSH workspace**: installed extensions can be searched and uninstalled,
+  installed themes render as cards, extension commands appear in the slash
+  menu, and image paste is fixed.
+- **Runtime safety**: rkyv archives arriving over the network are validated,
+  session ids stay out of logs, MCP discovery and writes are bounded and run
+  off executor workers, WASM/Extism cancellation interrupts pure compute,
+  child process groups are terminated, and per-id lifecycle work is serialized
+  so failed reloads stay retryable.
+- **Release**: a tagged pipeline builds and publishes installers for macOS
+  (dmg/app zip), Linux (deb/rpm/tar.gz) and Windows (msi/zip), with signing and
+  notarization hooks, a tagged-tree test gate and artifact verification.
+
 ## v3.0.2 (2026-10-07)
 
 - **Fix**: rate-limiter and retry waits are now recorded on the live
