@@ -194,6 +194,21 @@ jobs:
             libfontconfig1-dev libfreetype6-dev libssl-dev libasound2-dev libxdo-dev \
             libc++-dev libc++abi-dev libxml2-dev rpm
 
+      # Zig 0.16's libc++ headers need LLVM 21 symbols that jammy/noble's
+      # default libc++ (14/18) does not export. Install LLVM 21's static
+      # archives so the release binary carries the runtime instead of
+      # depending on a newer libc++ than the target distro has.
+      - name: Install the static libc++ runtime
+        if: runner.os == 'Linux'
+        run: |
+          . /etc/os-release
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
+          echo "deb http://apt.llvm.org/$VERSION_CODENAME/ llvm-toolchain-$VERSION_CODENAME-21 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm-21.list
+          sudo apt-get update
+          sudo apt-get install -y libc++-21-dev libc++abi-21-dev
+
       - name: Toolchain versions
         shell: bash
         run: |
@@ -203,6 +218,8 @@ jobs:
 
       - name: Build BSH
         shell: bash
+        env:
+          BSH_LIBCXX_DIR: ${{ runner.os == 'Linux' && '/usr/lib/llvm-21/lib' || '' }}
         run: |
           # Ghostty's Zig build lazily fetches a few packages; a reset from
           # deps.files.ghostty.org is transient, so retry and let Zig reuse

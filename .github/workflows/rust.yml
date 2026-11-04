@@ -244,6 +244,20 @@ jobs:
           rpm -qp --requires target/ci-package/*.rpm
           tar -tzf target/ci-package/*.tar.gz | sed -n '1,5p'
 
+      # Temporary diagnosis: the hook-demo process test closes stdout before
+      # answering on Linux only. Reproduce the host's child constraints here,
+      # where this job is fast, to see whether Python starts at all.
+      - name: Diagnose the hook-demo process limits
+        run: |
+          cd examples/extensions/hook-demo
+          msg='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+          echo '--- plain ---'
+          printf '%s\n' "$msg" | python3 server.py || echo 'plain failed'
+          echo '--- cleared env ---'
+          printf '%s\n' "$msg" | env -i PATH="$PATH" HOME="$HOME" TMPDIR=/tmp LANG=C.UTF-8 python3 server.py || echo 'env failed'
+          echo '--- 128MB address space, 256 fds, 5s cpu ---'
+          ( ulimit -v 131072; ulimit -n 256; ulimit -t 5; printf '%s\n' "$msg" | env -i PATH="$PATH" HOME="$HOME" TMPDIR=/tmp LANG=C.UTF-8 python3 server.py ) || echo 'limits failed'
+
   packaging-macos:
     name: Validate the macOS packager
     runs-on: macos-15

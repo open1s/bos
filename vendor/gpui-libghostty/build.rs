@@ -38,6 +38,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=HOME");
     println!("cargo:rerun-if-env-changed=PATH");
     println!("cargo:rerun-if-env-changed=ZIG");
+    println!("cargo:rerun-if-env-changed=BSH_LIBCXX_DIR");
 
     let target_os = env::var_os("CARGO_CFG_TARGET_OS");
     if target_os.as_deref() == Some(OsStr::new("linux")) {
@@ -130,8 +131,20 @@ fn build_linux() {
     println!("cargo:rustc-link-lib=static=ghostty-internal");
     println!("cargo:rustc-link-lib=static=gpui_ghostty_surface_linux");
     // The bundled fontconfig archive calls libxml2. Zig's libc++ headers also
-    // require a system libc++ runtime from LLVM 21 or newer.
-    for library in ["c++", "xml2", "dl", "pthread", "m"] {
+    // require libc++ from LLVM 21 or newer; distributions ship older runtimes
+    // (14 on jammy, 18 on noble), so CI points BSH_LIBCXX_DIR at a static
+    // LLVM 21 archive. Without it, fall back to the system shared runtime.
+    if let Some(dir) = env::var_os("BSH_LIBCXX_DIR") {
+        println!(
+            "cargo:rustc-link-search=native={}",
+            Path::new(&dir).display()
+        );
+        println!("cargo:rustc-link-lib=static=c++");
+        println!("cargo:rustc-link-lib=static=c++abi");
+    } else {
+        println!("cargo:rustc-link-lib=c++");
+    }
+    for library in ["xml2", "dl", "pthread", "m"] {
         println!("cargo:rustc-link-lib={library}");
     }
 }
