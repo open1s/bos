@@ -7,6 +7,7 @@
 //! in-process access to the host.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
@@ -26,6 +27,8 @@ pub struct CordisRuntime {
     data_root: std::path::PathBuf,
     options: BridgeOptions,
     session: Mutex<Option<BridgeSession>>,
+    /// Terminal shutdown; deactivate remains reversible.
+    stopped: AtomicBool,
     registrations: Mutex<Vec<BridgeRegistration>>,
     tools: Mutex<Vec<ToolDescriptor>>,
     terminal: Arc<dyn ferris_core::terminal::TerminalService>,
@@ -66,10 +69,26 @@ impl CordisRuntime {
             data_root: data_root.to_path_buf(),
             options,
             session: Mutex::new(None),
+            stopped: AtomicBool::new(false),
             registrations: Mutex::new(Vec::new()),
             tools: Mutex::new(Vec::new()),
             terminal,
         })
+    }
+
+    /// Take and terminate the current bridge process. A poisoned mutex still
+    /// owns a live child, so recover it rather than treating the slot as empty.
+    fn stop_session(&self) -> Result<(), ExtensionError> {
+        let mut slot = match self.session.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let session = slot.take();
+        drop(slot);
+        if let Some(session) = session {
+            session.shutdown();
+        }
+        Ok(())
     }
 
     /// Start the bridge if needed and list the tools it registered.
@@ -90,6 +109,12 @@ impl CordisRuntime {
     }
 
     fn ensure(&self) -> Result<(), ExtensionError> {
+        if self.stopped.load(Ordering::SeqCst) {
+            return Err(ExtensionError::Runtime {
+                extension: self.extension.clone(),
+                message: "runtime is shut down".to_string(),
+            });
+        }
         let mut session = self.session.lock().expect("cordis session lock");
         if session.is_some() {
             return Ok(());
@@ -185,22 +210,12 @@ impl Runtime for CordisRuntime {
     }
 
     async fn deactivate(&self) -> Result<(), ExtensionError> {
-        self.shutdown().await
+        self.stop_session()
     }
 
     async fn shutdown(&self) -> Result<(), ExtensionError> {
-        // A poisoned mutex still owns a live child; recover the guard so the
-        // session is taken and terminated rather than reported as absent.
-        let mut slot = match self.session.lock() {
-            Ok(slot) => slot,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let session = slot.take();
-        drop(slot);
-        if let Some(session) = session {
-            session.shutdown();
-        }
-        Ok(())
+        self.stopped.store(true, Ordering::SeqCst);
+        self.stop_session()
     }
 
     async fn tools(&self) -> Result<Vec<ToolDescriptor>, ExtensionError> {

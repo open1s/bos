@@ -56,7 +56,13 @@ pub fn build(
             let runtime = declarative::DeclarativeRuntime::new(root, manifest)?;
             let tools = runtime.descriptors();
             let contributions = runtime.contributions().clone();
-            finish(Arc::new(runtime), tools, contributions, &ports)
+            finish(
+                Arc::new(runtime),
+                tools,
+                contributions,
+                &ports,
+                manifest.resources.output_bytes(),
+            )
         }
         RuntimeKind::Process => {
             let runtime = crate::process::ProcessRuntime::new(manifest, root)?
@@ -67,7 +73,13 @@ pub fn build(
                 .with_events(Arc::clone(&ports.events), &manifest.contributes.events);
             let tools = runtime.descriptors();
             let contributions = declarative::load_contributions(root, manifest)?;
-            finish(Arc::new(runtime), tools, contributions, &ports)
+            finish(
+                Arc::new(runtime),
+                tools,
+                contributions,
+                &ports,
+                manifest.resources.output_bytes(),
+            )
         }
         RuntimeKind::Extism => {
             let runtime = crate::extism::ExtismRuntime::new(
@@ -82,7 +94,13 @@ pub fn build(
             )?;
             let tools = runtime.descriptors()?;
             let contributions = declarative::load_contributions(root, manifest)?;
-            finish(Arc::new(runtime), tools, contributions, &ports)
+            finish(
+                Arc::new(runtime),
+                tools,
+                contributions,
+                &ports,
+                manifest.resources.output_bytes(),
+            )
         }
         RuntimeKind::Mcp => {
             let runtime = crate::mcp::McpRuntime::new(
@@ -101,7 +119,13 @@ pub fn build(
             } else {
                 (runtime.descriptors()?, runtime.contributions()?)
             };
-            finish(Arc::new(runtime), tools, contributions, &ports)
+            finish(
+                Arc::new(runtime),
+                tools,
+                contributions,
+                &ports,
+                manifest.resources.output_bytes(),
+            )
         }
         RuntimeKind::WasmComponent => {
             let runtime = crate::wasm::WasmRuntime::new(
@@ -116,7 +140,13 @@ pub fn build(
             )?;
             let tools = runtime.descriptors()?;
             let contributions = declarative::load_contributions(root, manifest)?;
-            finish(Arc::new(runtime), tools, contributions, &ports)
+            finish(
+                Arc::new(runtime),
+                tools,
+                contributions,
+                &ports,
+                manifest.resources.output_bytes(),
+            )
         }
         RuntimeKind::Cordis => {
             let terminal = ports
@@ -130,7 +160,13 @@ pub fn build(
                 crate::cordis::CordisRuntime::new(manifest, root, &ports.data_root, terminal)?;
             let tools = runtime.descriptors()?;
             let contributions = declarative::load_contributions(root, manifest)?;
-            finish(Arc::new(runtime), tools, contributions, &ports)
+            finish(
+                Arc::new(runtime),
+                tools,
+                contributions,
+                &ports,
+                manifest.resources.output_bytes(),
+            )
         }
         RuntimeKind::Builtin => Err(ExtensionError::Manifest {
             path: root.join("extension.toml"),
@@ -145,6 +181,7 @@ fn finish(
     tools: Vec<ToolDescriptor>,
     contributions: DeclarativeContributions,
     ports: &RuntimePorts,
+    max_output_bytes: u64,
 ) -> Result<BuiltRuntime, ExtensionError> {
     let runtime: Arc<dyn Runtime> = Arc::new(LazyRuntime::new(runtime));
     if contributions.workflows.is_empty() {
@@ -160,6 +197,7 @@ fn finish(
         &tools,
         Arc::clone(&ports.policy),
         ports.trust,
+        max_output_bytes,
     )?;
     let tools = wrapped.descriptors();
     Ok(BuiltRuntime {

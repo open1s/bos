@@ -44,6 +44,9 @@ pub struct WorkflowFile {
     pub steps: Vec<WorkflowStep>,
 }
 
+/// Maximum size of one raw workflow file.
+const MAX_WORKFLOW_BYTES: usize = 256 * 1024;
+
 /// A runtime that adds workflow tools in front of another runtime.
 pub struct WorkflowRuntime {
     inner: Arc<dyn Runtime>,
@@ -52,6 +55,8 @@ pub struct WorkflowRuntime {
     policy: Arc<PolicyEngine>,
     trust: TrustLevel,
     tools: Vec<ToolDescriptor>,
+    /// Aggregate serialized result budget for one workflow run.
+    max_output_bytes: u64,
 }
 
 impl WorkflowRuntime {
@@ -62,6 +67,7 @@ impl WorkflowRuntime {
         inner_tools: &[ToolDescriptor],
         policy: Arc<PolicyEngine>,
         trust: TrustLevel,
+        max_output_bytes: u64,
     ) -> Result<Self, ExtensionError> {
         let mut workflows = BTreeMap::new();
         let step_tools: BTreeMap<String, ToolDescriptor> = inner_tools
@@ -71,19 +77,45 @@ impl WorkflowRuntime {
             .collect();
         let mut tools = inner_tools.to_vec();
         for contribution in contributions {
-            let text = std::fs::read_to_string(&contribution.path).map_err(|source| {
-                ExtensionError::Io {
+            let file =
+                std::fs::File::open(&contribution.path).map_err(|source| ExtensionError::Io {
                     path: contribution.path.clone(),
                     source,
-                }
-            })?;
+                })?;
+            let mut text = String::new();
+            use std::io::Read as _;
+            file.take(MAX_WORKFLOW_BYTES as u64 + 1)
+                .read_to_string(&mut text)
+                .map_err(|source| ExtensionError::Io {
+                    path: contribution.path.clone(),
+                    source,
+                })?;
+            if text.len() > MAX_WORKFLOW_BYTES {
+                return Err(ExtensionError::Limit {
+                    extension: contribution.id.to_string(),
+                    message: format!("workflow file exceeds {MAX_WORKFLOW_BYTES} bytes"),
+                });
+            }
             let workflow: WorkflowFile =
                 serde_json::from_str(&text).map_err(|error| ExtensionError::Json {
                     path: contribution.path.clone(),
                     message: error.to_string(),
                 })?;
-            // Validate step references while the package is being loaded.
+            // Validate step names and tool references while loading.
+            let mut names = std::collections::BTreeSet::new();
             for step in &workflow.steps {
+                if step.name.trim().is_empty() {
+                    return Err(ExtensionError::Corrupt {
+                        path: contribution.path.clone(),
+                        message: "workflow step name is empty".to_string(),
+                    });
+                }
+                if !names.insert(step.name.as_str()) {
+                    return Err(ExtensionError::Corrupt {
+                        path: contribution.path.clone(),
+                        message: format!("duplicate workflow step name {:?}", step.name),
+                    });
+                }
                 if !step_tools.contains_key(&step.tool) {
                     return Err(ExtensionError::NotFound {
                         id: format!(
@@ -118,6 +150,7 @@ impl WorkflowRuntime {
             policy,
             trust,
             tools,
+            max_output_bytes,
         })
     }
 
@@ -134,8 +167,9 @@ impl WorkflowRuntime {
         progress: Option<&tokio::sync::mpsc::Sender<Value>>,
     ) -> Result<Value, ExtensionError> {
         let mut outputs = serde_json::Map::new();
+        let mut total_bytes = 0u64;
         for step in &workflow.steps {
-            let arguments = resolve(&step.arguments, &input, &outputs);
+            let arguments = resolve(&step.arguments, &input, &outputs)?;
             let descriptor =
                 self.inner_tools
                     .get(&step.tool)
@@ -161,51 +195,73 @@ impl WorkflowRuntime {
                     .to_value(),
                 None => self.inner.call_tool(&step.tool, arguments, context).await?,
             };
+            total_bytes = total_bytes.saturating_add(value.to_string().len() as u64);
+            if total_bytes > self.max_output_bytes {
+                return Err(ExtensionError::Limit {
+                    extension: context.extension.to_string(),
+                    message: format!(
+                        "workflow result exceeds {} bytes after step {:?}",
+                        self.max_output_bytes, step.name
+                    ),
+                });
+            }
             outputs.insert(step.name.clone(), value);
         }
         Ok(json!({ "steps": outputs }))
     }
 }
 
-fn resolve(template: &Value, input: &Value, steps: &serde_json::Map<String, Value>) -> Value {
+fn resolve(
+    template: &Value,
+    input: &Value,
+    steps: &serde_json::Map<String, Value>,
+) -> Result<Value, ExtensionError> {
     match template {
-        Value::String(text) => Value::String(expand(text, input, steps)),
-        Value::Array(items) => Value::Array(
+        Value::String(text) => Ok(Value::String(expand(text, input, steps)?)),
+        Value::Array(items) => Ok(Value::Array(
             items
                 .iter()
                 .map(|item| resolve(item, input, steps))
-                .collect(),
-        ),
-        Value::Object(map) => Value::Object(
+                .collect::<Result<_, _>>()?,
+        )),
+        Value::Object(map) => Ok(Value::Object(
             map.iter()
-                .map(|(key, value)| (key.clone(), resolve(value, input, steps)))
-                .collect(),
-        ),
-        other => other.clone(),
+                .map(|(key, value)| resolve(value, input, steps).map(|value| (key.clone(), value)))
+                .collect::<Result<_, _>>()?,
+        )),
+        other => Ok(other.clone()),
     }
 }
 
-fn expand(text: &str, input: &Value, steps: &serde_json::Map<String, Value>) -> String {
+fn expand(
+    text: &str,
+    input: &Value,
+    steps: &serde_json::Map<String, Value>,
+) -> Result<String, ExtensionError> {
     let mut result = String::new();
     let mut rest = text;
     while let Some(start) = rest.find("{{") {
         result.push_str(&rest[..start]);
         let Some(end) = rest[start + 2..].find("}}") else {
-            result.push_str(&rest[start..]);
-            return result;
+            return Err(ExtensionError::Corrupt {
+                path: std::path::PathBuf::from("<workflow>"),
+                message: format!("unclosed workflow placeholder in {text:?}"),
+            });
         };
         let path = rest[start + 2..start + 2 + end].trim();
-        let replacement = lookup(path, input, steps)
-            .map(|value| match value {
-                Value::String(text) => text.clone(),
-                other => other.to_string(),
-            })
-            .unwrap_or_default();
+        let value = lookup(path, input, steps).ok_or_else(|| ExtensionError::Corrupt {
+            path: std::path::PathBuf::from("<workflow>"),
+            message: format!("unresolved workflow placeholder {{{{{path}}}}}"),
+        })?;
+        let replacement = match value {
+            Value::String(text) => text.clone(),
+            other => other.to_string(),
+        };
         result.push_str(&replacement);
         rest = &rest[start + 2 + end + 2..];
     }
     result.push_str(rest);
-    result
+    Ok(result)
 }
 
 fn lookup<'a>(
@@ -364,7 +420,7 @@ mod tests {
         let mut steps = serde_json::Map::new();
         steps.insert("first".to_string(), json!({"value": 7}));
         assert_eq!(
-            expand("hello {{input.name}} {{steps.first.value}}", &input, &steps),
+            expand("hello {{input.name}} {{steps.first.value}}", &input, &steps).expect("resolved"),
             "hello bos 7"
         );
     }
@@ -421,6 +477,7 @@ mod tests {
             &tools,
             policy,
             TrustLevel::Community,
+            1_000_000,
         )
         .expect("runtime");
         let workflow_descriptor = runtime
@@ -512,6 +569,7 @@ mod tests {
             &tools,
             policy,
             TrustLevel::Local,
+            1_000_000,
         )
         .expect("runtime");
         let context = CallContext::new(

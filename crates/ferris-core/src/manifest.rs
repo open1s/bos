@@ -749,6 +749,11 @@ impl Manifest {
             ContributionKind::Context,
             ContributionKind::Workflow,
             ContributionKind::Theme,
+            ContributionKind::Language,
+            ContributionKind::Integration,
+            ContributionKind::ModelProvider,
+            ContributionKind::AgentProvider,
+            ContributionKind::Preset,
         ] {
             if self.contribution_ids(kind).len() > 256 {
                 report.error(
@@ -756,6 +761,31 @@ impl Manifest {
                     "must contain at most 256 entries",
                 );
             }
+        }
+        // Per-kind ceilings do not bound the aggregate: a manifest could
+        // declare 256 of every kind. Cap the total declaration count too.
+        let total: usize = [
+            ContributionKind::Tool,
+            ContributionKind::Command,
+            ContributionKind::Panel,
+            ContributionKind::Prompt,
+            ContributionKind::Context,
+            ContributionKind::Workflow,
+            ContributionKind::Theme,
+            ContributionKind::Language,
+            ContributionKind::Integration,
+            ContributionKind::ModelProvider,
+            ContributionKind::AgentProvider,
+            ContributionKind::Preset,
+        ]
+        .into_iter()
+        .map(|kind| self.contribution_ids(kind).len())
+        .sum();
+        if total > 1_024 {
+            report.error(
+                "contributes",
+                "must declare at most 1024 contributions in total",
+            );
         }
     }
 

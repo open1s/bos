@@ -969,6 +969,8 @@ pub struct ProcessRuntime {
     policy: Option<(Arc<PolicyEngine>, TrustLevel)>,
     sandbox: bool,
     child_pid: AtomicU32,
+    /// Terminal shutdown; unlike deactivate, this cannot be reversed.
+    stopped: AtomicBool,
     session: Mutex<Option<ProcessSession>>,
     subscriptions: std::sync::Mutex<Vec<Subscription>>,
     /// Bound to the spawned child's identity and cancelled on every stop path.
@@ -982,6 +984,17 @@ pub struct ProcessRuntime {
 }
 
 impl ProcessRuntime {
+    /// Reject work once shutdown is terminal; deactivate stays reversible.
+    fn ensure_live(&self) -> Result<(), ExtensionError> {
+        if self.stopped.load(Ordering::SeqCst) {
+            return Err(ExtensionError::Runtime {
+                extension: self.extension.to_string(),
+                message: "runtime is shut down".to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// Prepare a process runtime. This validates the descriptor files and the
     /// entry's path shape but does not spawn; the first call does.
     pub fn new(manifest: &Manifest, root: &Path) -> Result<Self, ExtensionError> {
@@ -1030,6 +1043,7 @@ impl ProcessRuntime {
                 target_os = "windows"
             )),
             child_pid: AtomicU32::new(0),
+            stopped: AtomicBool::new(false),
             session: Mutex::new(None),
             subscriptions: std::sync::Mutex::new(Vec::new()),
             #[cfg(unix)]
@@ -1124,6 +1138,7 @@ impl ProcessRuntime {
         context: &CallContext,
         progress: Option<&tokio::sync::mpsc::Sender<Value>>,
     ) -> Result<Value, ExtensionError> {
+        self.ensure_live()?;
         if !self.tools.iter().any(|tool| tool.id.as_str() == name) {
             return Err(ExtensionError::NotFound {
                 id: format!("{}::{name}", self.extension),
@@ -1541,6 +1556,7 @@ impl Runtime for ProcessRuntime {
     }
 
     async fn activate(&self) -> Result<(), ExtensionError> {
+        self.ensure_live()?;
         // On-demand packages still start on their first call, because nothing
         // calls activate for them. An on-startup package is warmed by the host
         // right after load, and this is the one place the child is spawned.
@@ -1557,6 +1573,7 @@ impl Runtime for ProcessRuntime {
     }
 
     async fn shutdown(&self) -> Result<(), ExtensionError> {
+        self.stopped.store(true, Ordering::SeqCst);
         self.stop().await;
         Ok(())
     }
@@ -1586,6 +1603,7 @@ impl Runtime for ProcessRuntime {
     }
 
     async fn command(&self, id: &str, arguments: Value) -> Result<Value, ExtensionError> {
+        self.ensure_live()?;
         if !self.commands.iter().any(|command| command.as_str() == id) {
             return Err(ExtensionError::NotFound {
                 id: format!("{}::{id}", self.extension),

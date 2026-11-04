@@ -404,6 +404,8 @@ impl ExtensionManager {
     pub fn plan(&self) -> Result<ManagerPlan, ExtError> {
         let registry = self.store.read_registry().map_err(package_error)?;
         let mut manifests = Vec::new();
+        let mut versions: std::collections::BTreeMap<String, semver::Version> =
+            std::collections::BTreeMap::new();
         for raw in registry.extensions.keys() {
             let id = ExtensionId::parse(raw.clone()).map_err(|error| ExtError {
                 code: ErrorCode::Manifest,
@@ -436,6 +438,12 @@ impl ExtensionManager {
                     message: error.to_string(),
                     details: serde_json::Value::Null,
                 })?;
+            let parsed = semver::Version::parse(&version).map_err(|error| ExtError {
+                code: ErrorCode::Package,
+                message: format!("{id} has an invalid installed version {version}: {error}"),
+                details: serde_json::Value::Null,
+            })?;
+            versions.insert(id.as_str().to_string(), parsed);
             manifests.push(manifest);
         }
         let included: std::collections::BTreeSet<String> = manifests
@@ -443,7 +451,7 @@ impl ExtensionManager {
             .map(|manifest| manifest.id().as_str().to_string())
             .collect();
         for manifest in &manifests {
-            for dependency in manifest.dependencies.keys() {
+            for (dependency, requirement) in &manifest.dependencies {
                 if !included.contains(dependency.as_str()) {
                     return Err(ExtError {
                         code: ErrorCode::Package,
@@ -454,6 +462,19 @@ impl ExtensionManager {
                         ),
                         details: serde_json::Value::Null,
                     });
+                }
+                if let Some(installed) = versions.get(dependency.as_str()) {
+                    if !requirement.matches(installed) {
+                        return Err(ExtError {
+                            code: ErrorCode::Package,
+                            message: format!(
+                                "{} requires {} {requirement}, but {installed} is installed",
+                                manifest.id(),
+                                dependency
+                            ),
+                            details: serde_json::Value::Null,
+                        });
+                    }
                 }
             }
         }

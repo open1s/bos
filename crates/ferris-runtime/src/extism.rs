@@ -1067,7 +1067,6 @@ impl Runtime for ExtismRuntime {
 
     async fn pump(&self) -> Result<(), ExtensionError> {
         off_worker(|| {
-            self.ensure_plugin()?;
             let mut guard = self.plugin.lock().map_err(|_| ExtensionError::Corrupt {
                 path: self.component.clone(),
                 message: "Extism plugin lock is poisoned".to_string(),
@@ -1097,10 +1096,10 @@ impl Runtime for ExtismRuntime {
                 })?;
             let _call_state = CallStateGuard(&self.call_state);
             drop(cancel_gate);
-            let plugin = guard.as_mut().ok_or_else(|| ExtensionError::Runtime {
-                extension: self.extension.to_string(),
-                message: "Extism plugin is unavailable".to_string(),
-            })?;
+            // A pump tick must not instantiate a dormant on-demand plugin.
+            let Some(plugin) = guard.as_mut() else {
+                return Ok(());
+            };
             // Do not drain the subscription until this invocation owns the plugin
             // lifecycle; a busy/cancelled call must not silently lose queued events.
             let events = self.bridge.take_events();

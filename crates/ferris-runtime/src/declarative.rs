@@ -512,10 +512,27 @@ fn raw_contribution(
     // A declared file must parse at load time: an unreadable theme or provider
     // descriptor used to pass `validate`, install, and then vanish at the
     // consumer, which §13/§14 forbid.
-    let text = std::fs::read_to_string(&path).map_err(|source| ExtensionError::Io {
+    // Raw JSON contributions (workflows, themes, presets, providers,
+    // languages, integrations) share the 256 KiB budget. Read through a bounded
+    // handle so a hostile file cannot allocate without limit.
+    let file = std::fs::File::open(&path).map_err(|source| ExtensionError::Io {
         path: path.clone(),
         source,
     })?;
+    let mut text = String::new();
+    use std::io::Read as _;
+    file.take(MAX_CONTRIBUTION_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(|source| ExtensionError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    if text.len() as u64 > MAX_CONTRIBUTION_BYTES {
+        return Err(ExtensionError::Limit {
+            extension: id.to_string(),
+            message: format!("raw contribution {id} exceeds {MAX_CONTRIBUTION_BYTES} bytes"),
+        });
+    }
     serde_json::from_str::<serde_json::Value>(&text).map_err(|error| ExtensionError::Json {
         path: path.clone(),
         message: error.to_string(),

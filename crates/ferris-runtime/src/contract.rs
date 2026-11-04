@@ -6,7 +6,7 @@
 //! same diagnostics. Concrete runtimes live in this module's children.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -527,6 +527,11 @@ pub struct LazyRuntime {
     /// Whether the inner runtime is currently activated. A plain bool under an
     /// async mutex (rather than a OnceCell) lets deactivation reopen the gate.
     activated: tokio::sync::Mutex<bool>,
+    /// Terminal shutdown; deactivate only closes the activation gate.
+    shutdown: AtomicBool,
+    /// Lifecycle/call admission: calls hold a read guard across the inner
+    /// operation, deactivate and shutdown hold the write guard.
+    lifecycle: tokio::sync::RwLock<()>,
     failures: AtomicU32,
 }
 
@@ -536,6 +541,8 @@ impl LazyRuntime {
         Self {
             inner,
             activated: tokio::sync::Mutex::new(false),
+            shutdown: AtomicBool::new(false),
+            lifecycle: tokio::sync::RwLock::new(()),
             failures: AtomicU32::new(0),
         }
     }
@@ -547,6 +554,12 @@ impl LazyRuntime {
     /// startup dependency is briefly unavailable recovers without a hot loop and
     /// without unbounded delay.
     async fn ensure(&self) -> Result<(), ExtensionError> {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return Err(ExtensionError::Runtime {
+                extension: "lazy".to_string(),
+                message: "runtime is shut down".to_string(),
+            });
+        }
         let failures = self.failures.load(Ordering::Relaxed);
         if failures > 0 {
             let shift = failures.saturating_sub(1).min(3);
@@ -602,19 +615,31 @@ impl Runtime for LazyRuntime {
     }
 
     async fn activate(&self) -> Result<(), ExtensionError> {
+        let _lifecycle = self.lifecycle.write().await;
         self.ensure().await
     }
 
     async fn deactivate(&self) -> Result<(), ExtensionError> {
-        let result = self.inner.deactivate().await;
-        // Clear the gate even when deactivation failed: the next activate must
-        // be allowed to try again rather than silently reusing a dead runtime.
+        // Serialize with activation and with calls: a call admitted before
+        // this point finishes before the inner runtime is deactivated.
+        let _lifecycle = self.lifecycle.write().await;
         let mut activated = self.activated.lock().await;
+        let was_active = *activated;
         *activated = false;
-        result
+        drop(activated);
+        if was_active {
+            self.inner.deactivate().await
+        } else {
+            Ok(())
+        }
     }
 
     async fn shutdown(&self) -> Result<(), ExtensionError> {
+        let _lifecycle = self.lifecycle.write().await;
+        self.shutdown.store(true, Ordering::SeqCst);
+        let mut activated = self.activated.lock().await;
+        *activated = false;
+        drop(activated);
         self.inner.shutdown().await
     }
 
@@ -623,6 +648,7 @@ impl Runtime for LazyRuntime {
     }
 
     async fn tools(&self) -> Result<Vec<ToolDescriptor>, ExtensionError> {
+        let _lifecycle = self.lifecycle.read().await;
         self.ensure().await?;
         self.inner.tools().await
     }
@@ -633,6 +659,7 @@ impl Runtime for LazyRuntime {
         arguments: Value,
         context: &CallContext,
     ) -> Result<Value, ExtensionError> {
+        let _lifecycle = self.lifecycle.read().await;
         self.ensure().await?;
         self.inner.call_tool(name, arguments, context).await
     }
@@ -643,6 +670,7 @@ impl Runtime for LazyRuntime {
         arguments: Value,
         context: &CallContext,
     ) -> Result<ToolResult, ExtensionError> {
+        let _lifecycle = self.lifecycle.read().await;
         self.ensure().await?;
         self.inner.call_tool_result(name, arguments, context).await
     }
@@ -654,6 +682,7 @@ impl Runtime for LazyRuntime {
         context: &CallContext,
         progress: Option<tokio::sync::mpsc::Sender<Value>>,
     ) -> Result<ToolResult, ExtensionError> {
+        let _lifecycle = self.lifecycle.read().await;
         self.ensure().await?;
         self.inner
             .call_tool_progress(name, arguments, context, progress)
@@ -661,11 +690,13 @@ impl Runtime for LazyRuntime {
     }
 
     async fn command(&self, id: &str, arguments: Value) -> Result<Value, ExtensionError> {
+        let _lifecycle = self.lifecycle.read().await;
         self.ensure().await?;
         self.inner.command(id, arguments).await
     }
 
     async fn panel(&self, id: &str) -> Result<Value, ExtensionError> {
+        let _lifecycle = self.lifecycle.read().await;
         self.ensure().await?;
         self.inner.panel(id).await
     }
@@ -673,6 +704,10 @@ impl Runtime for LazyRuntime {
     async fn pump(&self) -> Result<(), ExtensionError> {
         // Pump must not activate an on-demand package: an idle host with no
         // subscribers should pay nothing for a package nobody called yet.
+        if self.shutdown.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let _lifecycle = self.lifecycle.read().await;
         self.inner.pump().await
     }
 }
