@@ -39,12 +39,52 @@ const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
 /// The largest number of each contribution kind read from one server.
 const MAX_ITEMS: usize = 256;
 
+/// The largest number of catalog pages one discovery may read.
+const MAX_CATALOG_PAGES: usize = 64;
+
+/// The aggregate byte ceiling for one discovered catalog.
+const MAX_CATALOG_BYTES: usize = 8 * 1024 * 1024;
+
+/// The optional capabilities the server advertised during initialize.
+#[derive(Default, Clone)]
+struct ServerCapabilities {
+    resources: bool,
+    prompts: bool,
+}
+
+impl ServerCapabilities {
+    fn from_initialize(value: &Value) -> Self {
+        let capabilities = value.get("capabilities");
+        Self {
+            resources: capabilities
+                .and_then(|caps| caps.get("resources"))
+                .is_some(),
+            prompts: capabilities.and_then(|caps| caps.get("prompts")).is_some(),
+        }
+    }
+}
+
+fn catalog_size(descriptor: &ToolDescriptor) -> usize {
+    descriptor.id.as_str().len()
+        + descriptor.description.len()
+        + descriptor.input_schema.to_string().len()
+}
+
+fn catalog_limit(extension: &ExtensionId, bytes: usize) -> ExtensionError {
+    ExtensionError::Limit {
+        extension: extension.to_string(),
+        message: format!("MCP catalog is {bytes} bytes; the ceiling is {MAX_CATALOG_BYTES}"),
+    }
+}
+
 /// One live MCP server.
 struct Session {
     child: Arc<Mutex<Child>>,
     stdin: ChildStdin,
     lines: Receiver<Vec<u8>>,
     next_id: u64,
+    /// Optional capabilities the server advertised at initialize time.
+    capabilities: ServerCapabilities,
 }
 
 impl Session {
@@ -743,6 +783,7 @@ impl McpCore {
             stdin,
             lines,
             next_id: 1,
+            capabilities: ServerCapabilities::default(),
         };
         let initialized = session.request(
             "initialize",
@@ -767,19 +808,30 @@ impl McpCore {
                 ),
             });
         }
+        session.capabilities = ServerCapabilities::from_initialize(&initialized);
         session.notify("notifications/initialized", Value::Null)?;
         Ok(session)
     }
 
     fn read_catalog(&self, session: &mut Session) -> Result<Catalog, ExtensionError> {
         let timeout = self.max_execution_ms;
+        let mut budget = 0usize;
         let mut tools = Vec::new();
-        let mut cursor = Value::Null;
         let mut wire = self.wire.lock().map_err(|_| ExtensionError::Corrupt {
             path: self.root.clone(),
             message: "MCP wire-name lock is poisoned".to_string(),
         })?;
+        let mut cursor = Value::Null;
+        let mut seen = std::collections::HashSet::new();
+        let mut pages = 0usize;
+        let mut raw = 0usize;
         loop {
+            pages += 1;
+            if pages > MAX_CATALOG_PAGES {
+                return Err(protocol_error(format!(
+                    "tools/list exceeded {MAX_CATALOG_PAGES} pages"
+                )));
+            }
             let result = session.request(
                 "tools/list",
                 if cursor.is_null() {
@@ -790,17 +842,19 @@ impl McpCore {
                 timeout,
             )?;
             if let Some(list) = result.get("tools").and_then(Value::as_array) {
-                for tool in list.iter().take(MAX_ITEMS) {
+                for tool in list {
+                    // The ceiling counts raw items, not only accepted ones: a
+                    // server that sends unusable names must not loop forever.
+                    raw += 1;
+                    if raw > MAX_ITEMS {
+                        break;
+                    }
                     let name = tool.get("name").and_then(Value::as_str).unwrap_or_default();
                     let id = match ContributionId::parse(sanitize_id(name)) {
                         Ok(id) => id,
                         Err(_) => continue,
                     };
                     if wire.contains_key(id.as_str()) {
-                        // Two server names can map onto one contribution id
-                        // once they are sanitized. Keep the first and say so;
-                        // silently replacing would route calls to the wrong
-                        // tool.
                         log::warn!(
                             target: "bsh::extension",
                             "{}: MCP tools {:?} and {:?} share the id {:?}; the later one is ignored",
@@ -812,7 +866,7 @@ impl McpCore {
                         continue;
                     }
                     wire.insert(id.as_str().to_string(), name.to_string());
-                    tools.push(ToolDescriptor {
+                    let descriptor = ToolDescriptor {
                         id,
                         description: tool
                             .get("description")
@@ -824,95 +878,207 @@ impl McpCore {
                             .cloned()
                             .unwrap_or_else(|| json!({"type":"object","properties":{}})),
                         capabilities: Vec::new(),
-                    });
+                    };
+                    budget = budget.saturating_add(catalog_size(&descriptor));
+                    if budget > MAX_CATALOG_BYTES {
+                        return Err(catalog_limit(&self.extension, budget));
+                    }
+                    tools.push(descriptor);
                 }
             }
             cursor = result.get("nextCursor").cloned().unwrap_or(Value::Null);
-            if cursor.is_null() || tools.len() >= MAX_ITEMS {
+            if cursor.is_null() || raw >= MAX_ITEMS {
                 break;
             }
+            if !seen.insert(cursor.to_string()) {
+                return Err(protocol_error("tools/list repeated a cursor"));
+            }
         }
+        drop(wire);
 
         let mut contexts = Vec::new();
-        if let Ok(resources) = session.request("resources/list", json!({}), timeout) {
-            if let Some(list) = resources.get("resources").and_then(Value::as_array) {
-                for resource in list.iter().take(MAX_ITEMS) {
-                    let uri = resource
-                        .get("uri")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    let name = resource.get("name").and_then(Value::as_str).unwrap_or(uri);
-                    let Some(id) = ContributionId::parse(sanitize_id(name)).ok() else {
-                        continue;
-                    };
-                    let text = session
-                        .request("resources/read", json!({ "uri": uri }), timeout)
-                        .ok()
-                        .and_then(|result| {
-                            result
-                                .get("contents")
-                                .and_then(Value::as_array)
-                                .and_then(|contents| contents.first())
-                                .and_then(|content| content.get("text"))
-                                .and_then(Value::as_str)
-                                .map(str::to_string)
-                        });
-                    if let Some(text) = text {
-                        contexts.push(TextContribution {
-                            id,
-                            description: resource
-                                .get("description")
-                                .and_then(Value::as_str)
-                                .unwrap_or(uri)
-                                .to_string(),
-                            text: text.chars().take(64 * 1024).collect(),
-                            scope: Vec::new(),
-                        });
+        // Only ask for resources/prompts the server declared. A server that
+        // omits the capability gets no optional request, so a method-not-found
+        // cannot masquerade as a discovery failure.
+        if session.capabilities.resources {
+            let mut cursor = Value::Null;
+            let mut seen = std::collections::HashSet::new();
+            let mut pages = 0usize;
+            let mut raw = 0usize;
+            loop {
+                pages += 1;
+                if pages > MAX_CATALOG_PAGES {
+                    return Err(protocol_error(format!(
+                        "resources/list exceeded {MAX_CATALOG_PAGES} pages"
+                    )));
+                }
+                // A failure here is reported: the server advertised resources,
+                // so a partial catalog is an error, not an empty feature.
+                let result = session.request(
+                    "resources/list",
+                    if cursor.is_null() {
+                        json!({})
+                    } else {
+                        json!({ "cursor": cursor })
+                    },
+                    timeout,
+                )?;
+                if let Some(list) = result.get("resources").and_then(Value::as_array) {
+                    for resource in list {
+                        raw += 1;
+                        if raw > MAX_ITEMS {
+                            break;
+                        }
+                        let uri = resource
+                            .get("uri")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let name = resource.get("name").and_then(Value::as_str).unwrap_or(uri);
+                        let Some(id) = ContributionId::parse(sanitize_id(name)).ok() else {
+                            continue;
+                        };
+                        match session.request("resources/read", json!({ "uri": uri }), timeout) {
+                            Ok(result) => {
+                                let text = result
+                                    .get("contents")
+                                    .and_then(Value::as_array)
+                                    .and_then(|contents| contents.first())
+                                    .and_then(|content| content.get("text"))
+                                    .and_then(Value::as_str);
+                                match text {
+                                    Some(text) => {
+                                        let text: String = text.chars().take(64 * 1024).collect();
+                                        budget = budget.saturating_add(text.len());
+                                        if budget > MAX_CATALOG_BYTES {
+                                            return Err(catalog_limit(&self.extension, budget));
+                                        }
+                                        contexts.push(TextContribution {
+                                            id,
+                                            description: resource
+                                                .get("description")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or(uri)
+                                                .to_string(),
+                                            text,
+                                            scope: Vec::new(),
+                                        });
+                                    }
+                                    None => log::warn!(
+                                        target: "bsh::extension",
+                                        "{}: resources/read for {uri:?} returned no text",
+                                        self.extension
+                                    ),
+                                }
+                            }
+                            Err(error) => log::warn!(
+                                target: "bsh::extension",
+                                "{}: resources/read for {uri:?} failed: {error}",
+                                self.extension
+                            ),
+                        }
                     }
+                }
+                cursor = result.get("nextCursor").cloned().unwrap_or(Value::Null);
+                if cursor.is_null() || raw >= MAX_ITEMS {
+                    break;
+                }
+                if !seen.insert(cursor.to_string()) {
+                    return Err(protocol_error("resources/list repeated a cursor"));
                 }
             }
         }
 
         let mut prompts = Vec::new();
-        if let Ok(result) = session.request("prompts/list", json!({}), timeout) {
-            if let Some(list) = result.get("prompts").and_then(Value::as_array) {
-                for prompt in list.iter().take(MAX_ITEMS) {
-                    let name = prompt
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    let Some(id) = ContributionId::parse(sanitize_id(name)).ok() else {
-                        continue;
-                    };
-                    let text = session
-                        .request("prompts/get", json!({ "name": name }), timeout)
-                        .ok()
-                        .and_then(|result| {
-                            let messages = result.get("messages")?.as_array()?;
-                            let text: Vec<String> = messages
-                                .iter()
-                                .filter_map(|message| {
-                                    message
-                                        .get("content")?
-                                        .get("text")?
-                                        .as_str()
-                                        .map(str::to_string)
-                                })
-                                .collect();
-                            Some(text.join("\n\n"))
-                        });
-                    if let Some(text) = text {
-                        prompts.push(TextContribution {
-                            id,
-                            description: prompt
-                                .get("description")
-                                .and_then(Value::as_str)
-                                .unwrap_or(name)
-                                .to_string(),
-                            text: text.chars().take(64 * 1024).collect(),
-                            scope: Vec::new(),
-                        });
+        if session.capabilities.prompts {
+            let mut cursor = Value::Null;
+            let mut seen = std::collections::HashSet::new();
+            let mut pages = 0usize;
+            let mut raw = 0usize;
+            loop {
+                pages += 1;
+                if pages > MAX_CATALOG_PAGES {
+                    return Err(protocol_error(format!(
+                        "prompts/list exceeded {MAX_CATALOG_PAGES} pages"
+                    )));
+                }
+                let result = session.request(
+                    "prompts/list",
+                    if cursor.is_null() {
+                        json!({})
+                    } else {
+                        json!({ "cursor": cursor })
+                    },
+                    timeout,
+                )?;
+                if let Some(list) = result.get("prompts").and_then(Value::as_array) {
+                    for prompt in list {
+                        raw += 1;
+                        if raw > MAX_ITEMS {
+                            break;
+                        }
+                        let name = prompt
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let Some(id) = ContributionId::parse(sanitize_id(name)).ok() else {
+                            continue;
+                        };
+                        match session.request("prompts/get", json!({ "name": name }), timeout) {
+                            Ok(result) => {
+                                let text = result.get("messages").and_then(Value::as_array).map(
+                                    |messages| {
+                                        messages
+                                            .iter()
+                                            .filter_map(|message| {
+                                                message
+                                                    .get("content")?
+                                                    .get("text")?
+                                                    .as_str()
+                                                    .map(str::to_string)
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join("\n\n")
+                                    },
+                                );
+                                match text {
+                                    Some(text) => {
+                                        let text: String = text.chars().take(64 * 1024).collect();
+                                        budget = budget.saturating_add(text.len());
+                                        if budget > MAX_CATALOG_BYTES {
+                                            return Err(catalog_limit(&self.extension, budget));
+                                        }
+                                        prompts.push(TextContribution {
+                                            id,
+                                            description: prompt
+                                                .get("description")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or(name)
+                                                .to_string(),
+                                            text,
+                                            scope: Vec::new(),
+                                        });
+                                    }
+                                    None => log::warn!(
+                                        target: "bsh::extension",
+                                        "{}: prompts/get for {name:?} returned no messages",
+                                        self.extension
+                                    ),
+                                }
+                            }
+                            Err(error) => log::warn!(
+                                target: "bsh::extension",
+                                "{}: prompts/get for {name:?} failed: {error}",
+                                self.extension
+                            ),
+                        }
                     }
+                }
+                cursor = result.get("nextCursor").cloned().unwrap_or(Value::Null);
+                if cursor.is_null() || raw >= MAX_ITEMS {
+                    break;
+                }
+                if !seen.insert(cursor.to_string()) {
+                    return Err(protocol_error("prompts/list repeated a cursor"));
                 }
             }
         }
@@ -923,6 +1089,7 @@ impl McpCore {
             prompts,
         })
     }
+
     /// The name the server itself uses for a contribution id.
     fn wire_name(&self, id: &str) -> String {
         self.wire
@@ -1159,21 +1326,11 @@ impl Runtime for McpRuntime {
     }
 
     async fn deactivate(&self) -> Result<(), ExtensionError> {
-        let mut slot = self
-            .core
-            .session
-            .lock()
-            .map_err(|_| ExtensionError::Corrupt {
-                path: self.core.root.clone(),
-                message: "MCP session lock is poisoned".to_string(),
-            })?;
-        if let Some(mut session) = slot.take() {
-            session.close();
-        }
-        if let Ok(mut child) = self.core.child.lock() {
-            *child = None;
-        }
-        Ok(())
+        // Stop new calls and terminate an active exchange before waiting for
+        // the session mutex the blocking worker holds.
+        self.stop();
+        let _gate = self.call_gate.lock().await;
+        self.deactivate_locked()
     }
 
     async fn shutdown(&self) -> Result<(), ExtensionError> {
@@ -1182,7 +1339,7 @@ impl Runtime for McpRuntime {
         // Wait for an active blocking exchange to observe cancellation before
         // closing and clearing its session. New calls fail after taking this gate.
         let _gate = self.call_gate.lock().await;
-        self.deactivate().await
+        self.deactivate_locked()
     }
 
     async fn cancel(&self) -> Result<(), ExtensionError> {
@@ -1240,6 +1397,31 @@ impl Runtime for McpRuntime {
 }
 
 impl McpRuntime {
+    /// Close the session and invalidate the catalog. The caller owns the
+    /// lifecycle gate, so no exchange can start while this runs.
+    fn deactivate_locked(&self) -> Result<(), ExtensionError> {
+        let mut slot = self
+            .core
+            .session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(mut session) = slot.take() {
+            session.close();
+        }
+        if let Ok(mut child) = self.core.child.lock() {
+            *child = None;
+        }
+        // The catalog describes a server that is now gone; a later activate
+        // must discover again instead of reporting success from the cache.
+        if let Ok(mut catalog) = self.core.catalog.lock() {
+            *catalog = None;
+        }
+        if !self.core.stopped.load(Ordering::SeqCst) {
+            self.core.cancelled.store(false, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
     /// Run one call on the blocking pool under the caller's deadline.
     ///
     /// The MCP transport is synchronous stdio: running it inline on an executor
@@ -1409,7 +1591,7 @@ for line in sys.stdin:
     method = request.get("method")
     rid = request.get("id")
     if method == "initialize":
-        result = {"protocolVersion": "2024-11-05", "capabilities": {}, "serverInfo": {"name": "sandbox-test", "version": "1"}}
+        result = {"protocolVersion": "2024-11-05", "capabilities": {"resources": {}, "prompts": {}}, "serverInfo": {"name": "sandbox-test", "version": "1"}}
     elif method == "notifications/initialized":
         continue
     elif method == "tools/list":
@@ -1682,6 +1864,78 @@ required = ["process.execute"]
             .expect("repeated shutdown is idempotent");
     }
 
+    #[tokio::test]
+    async fn deactivation_and_reactivation_start_a_fresh_server() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/extensions/mcp-echo")
+            .canonicalize()
+            .expect("the MCP example exists");
+        let manifest = ferris_core::manifest_v2::load_package_manifest(&root).expect("manifest");
+        let scratch =
+            std::env::temp_dir().join(format!("bsh-mcp-reactivate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).expect("scratch");
+        let policy = Arc::new(
+            PolicyEngine::open(
+                scratch.join("grants.toml"),
+                scratch.join("audit.jsonl"),
+                ferris_core::capability::PolicyMode::Enforce,
+            )
+            .expect("policy"),
+        );
+        policy
+            .grant(
+                "com.example.mcp-echo",
+                Capability::ProcessExecute,
+                ferris_core::capability::GrantScope::Program("python3".to_string()),
+                None,
+            )
+            .expect("grant");
+        let runtime = McpRuntime::new(
+            &manifest,
+            &root,
+            "{}".to_string(),
+            policy,
+            TrustLevel::Local,
+            EventBus::new(),
+        )
+        .expect("runtime");
+        runtime.activate().await.expect("first activation");
+        assert!(runtime.core.catalog.lock().expect("catalog").is_some());
+        runtime.deactivate().await.expect("deactivate");
+        assert!(
+            runtime.core.catalog.lock().expect("catalog").is_none(),
+            "deactivation must invalidate the cached catalog"
+        );
+        assert!(runtime.core.session.lock().expect("session").is_none());
+        runtime
+            .activate()
+            .await
+            .expect("reactivation starts a fresh server");
+        assert!(
+            runtime.core.catalog.lock().expect("catalog").is_some(),
+            "reactivation must re-run discovery"
+        );
+        let context = CallContext::new(
+            ExtensionId::parse("com.example.mcp-echo").expect("id"),
+            "test",
+            None,
+            5000,
+        );
+        runtime
+            .call_tool("echo", serde_json::json!({"x": 1}), &context)
+            .await
+            .expect("the restarted server answers");
+        runtime.shutdown().await.expect("shutdown");
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
     #[test]
     fn a_malformed_response_envelope_is_rejected() {
         let rejected = |value: Value| {
