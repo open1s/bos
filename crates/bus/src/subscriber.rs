@@ -19,7 +19,8 @@ pub struct Subscriber<T> {
 impl<T> Subscriber<T>
 where
     T: Archive + Send + 'static,
-    T::Archived: Deserialize<T, HighDeserializer<Error>>,
+    T::Archived: Deserialize<T, HighDeserializer<Error>>
+        + for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, Error>>,
 {
     /// Create a new subscriber for the specified topic
     pub fn new(topic: impl Into<String>) -> Self {
@@ -141,7 +142,8 @@ impl<T> Clone for Subscriber<T> {
 impl<T> Default for Subscriber<T>
 where
     T: Archive + Send + 'static,
-    T::Archived: Deserialize<T, HighDeserializer<Error>>,
+    T::Archived: Deserialize<T, HighDeserializer<Error>>
+        + for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, Error>>,
 {
     fn default() -> Self {
         Self::new("default/subscriber")

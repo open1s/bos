@@ -42,7 +42,8 @@ impl Query {
         Q: Archive,
         for<'a> Q: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
         R: Archive,
-        R::Archived: rkyv::Deserialize<R, rkyv::api::high::HighDeserializer<Error>>,
+        R::Archived: rkyv::Deserialize<R, rkyv::api::high::HighDeserializer<Error>>
+            + for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, Error>>,
     {
         let codec = DEFAULT_CODEC;
         let bytes = codec
@@ -65,7 +66,8 @@ impl Query {
         Q: Archive,
         for<'a> Q: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
         R: Archive,
-        R::Archived: rkyv::Deserialize<R, rkyv::api::high::HighDeserializer<Error>>,
+        R::Archived: rkyv::Deserialize<R, rkyv::api::high::HighDeserializer<Error>>
+            + for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, Error>>,
     {
         let codec = DEFAULT_CODEC;
         let bytes = codec
@@ -88,7 +90,8 @@ impl Query {
         Q: Archive,
         for<'a> Q: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
         R: Archive,
-        R::Archived: rkyv::Deserialize<R, rkyv::api::high::HighDeserializer<Error>>,
+        R::Archived: rkyv::Deserialize<R, rkyv::api::high::HighDeserializer<Error>>
+            + for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, Error>>,
     {
         let codec = DEFAULT_CODEC;
         let session = self.session.as_ref().ok_or(ZenohError::NotConnected)?;

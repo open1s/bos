@@ -25,7 +25,8 @@ impl Caller {
         Q: Archive,
         for<'a> Q: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
         R: Archive,
-        R::Archived: rkyv::Deserialize<R, rkyv::api::high::HighDeserializer<Error>>,
+        R::Archived: rkyv::Deserialize<R, rkyv::api::high::HighDeserializer<Error>>
+            + for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, Error>>,
     {
         let session = self.session.clone();
         if let Some(session) = session {

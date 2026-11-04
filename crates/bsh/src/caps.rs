@@ -1405,8 +1405,10 @@ fn build_agent_for_session_inner(
     // connected MCP server or a wide preset can be seen in the log instead of
     // felt as latency.
     let tool_count = model_tools.len();
+    // The counters diagnose a build; the session id does not belong in a
+    // cleartext log line.
     log::info!(
-        "build session={session} tools={tool_count} schema_chars={schema_chars} withheld_chars={withheld_chars} mcp_tools={}",
+        "build tools={tool_count} schema_chars={schema_chars} withheld_chars={withheld_chars} mcp_tools={}",
         mcp.tools().count()
     );
     if schema_chars > 20_000 {
@@ -2080,8 +2082,15 @@ pub(crate) fn child_transcript(child: &Agent) -> Vec<crate::subagent::SubagentMe
         let row = match message {
             react::llm::LlmMessage::System { .. } => None,
             react::llm::LlmMessage::User { content } => {
-                let text = crate::skill_invocation::visible_text(content.as_text().unwrap_or(""))
-                    .to_string();
+                let raw = content.as_text().unwrap_or("");
+                // The child's row is the model-facing request, so an extension
+                // command's template block reads back as the `/name` annotation
+                // the reader typed - the same line the parent's row keeps. The
+                // skill projection runs first: a send appends skill blocks in
+                // FRONT of the command, and both are harness injections.
+                let skill_visible = crate::skill_invocation::visible_text(raw);
+                let text = crate::command_invocation::visible_text(skill_visible)
+                    .unwrap_or_else(|| skill_visible.to_string());
                 // The per-turn runtime snapshot and workspace instructions are
                 // harness injections, not something the child or its caller
                 // said; the read-only view shows the child's work.
@@ -11776,5 +11785,33 @@ verdict := {"allow": false, "rule": "require-sandbox", "reason": "this workspace
                 .expect("edit");
         });
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A child's user row is projected back to the annotation the reader typed,
+    /// even though the child's own agent holds the model-facing command block.
+    /// The parent's row never needs this: it stores the annotation itself.
+    #[test]
+    fn a_child_row_reads_back_as_its_command_annotation() {
+        let names = vec![crate::extension::CommandSurface {
+            name: "com_example_hello__greet".to_string(),
+            description: "Greet the reader".to_string(),
+            template: "Say hello from com.example.hello.".to_string(),
+        }];
+        let composed =
+            crate::command_invocation::compose(&names, "/com_example_hello__greet in one sentence")
+                .expect("the annotation composes");
+        let agent = agent::Agent::new(
+            agent::AgentConfig::default(),
+            std::sync::Arc::new(agent::agent::agentic::LlmProvider::new()),
+        );
+        crate::runner::Runner::seed_session(&agent, &[crate::model::ChatMessage::user(composed)]);
+        let rows = super::child_transcript(&agent);
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.role == "user")
+                .map(|row| row.content.as_str()),
+            Some("/com_example_hello__greet in one sentence"),
+            "the child view shows the annotation, not the template: {rows:?}"
+        );
     }
 }

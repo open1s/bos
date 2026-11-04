@@ -15,8 +15,10 @@ pub struct Callable<Q, R>
 where
     Q: Archive + 'static,
     R: Archive + Send + 'static,
-    Q::Archived: Deserialize<Q, HighDeserializer<Error>>,
-    R::Archived: Deserialize<R, HighDeserializer<Error>>,
+    Q::Archived: Deserialize<Q, HighDeserializer<Error>>
+        + for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, Error>>,
+    R::Archived: Deserialize<R, HighDeserializer<Error>>
+        + for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, Error>>,
     for<'a> Q: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
     for<'a> R: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
 {
@@ -29,8 +31,10 @@ impl<Q, R> Callable<Q, R>
 where
     Q: Archive + 'static,
     R: Archive + Send + 'static,
-    Q::Archived: Deserialize<Q, HighDeserializer<Error>>,
-    R::Archived: Deserialize<R, HighDeserializer<Error>>,
+    Q::Archived: Deserialize<Q, HighDeserializer<Error>>
+        + for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, Error>>,
+    R::Archived: Deserialize<R, HighDeserializer<Error>>
+        + for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, Error>>,
     for<'a> Q: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
     for<'a> R: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
 {
@@ -44,8 +48,10 @@ impl<Q, R> Callable<Q, R>
 where
     Q: Archive + 'static,
     R: Archive + Send + 'static,
-    Q::Archived: Deserialize<Q, HighDeserializer<Error>>,
-    R::Archived: Deserialize<R, HighDeserializer<Error>>,
+    Q::Archived: Deserialize<Q, HighDeserializer<Error>>
+        + for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, Error>>,
+    R::Archived: Deserialize<R, HighDeserializer<Error>>
+        + for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, Error>>,
     for<'a> Q: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
     for<'a> R: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
 {
