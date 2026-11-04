@@ -7,13 +7,13 @@
 //! shell. The wire is one JSON object per line, with an explicit initialize
 //! handshake and a tools/call request whose result is the tool's JSON value.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -213,6 +213,27 @@ impl ProcessSession {
 /// SIGKILL itself; Linux keeps the rlimit as the first line and the sampler as
 /// the same backstop.
 #[cfg(unix)]
+/// Attach the child's recent stderr to a protocol failure.
+///
+/// "process closed stdout before answering" is true but not actionable; the
+/// line the interpreter or sandbox printed on stderr is what names the cause.
+fn with_stderr_tail(error: ExtensionError, tail: &StdMutex<VecDeque<String>>) -> ExtensionError {
+    let lines = {
+        let tail = tail.lock().expect("stderr tail lock");
+        tail.iter().cloned().collect::<Vec<_>>().join(" | ")
+    };
+    if lines.is_empty() {
+        return error;
+    }
+    match error {
+        ExtensionError::Protocol { extension, message } => ExtensionError::Protocol {
+            extension,
+            message: format!("{message} (stderr: {lines})"),
+        },
+        other => other,
+    }
+}
+
 fn spawn_memory_watchdog(pid: u32, limit: u64) {
     if limit == 0 {
         return;
@@ -930,19 +951,27 @@ impl ProcessRuntime {
                 extension: self.extension.to_string(),
                 message: "child stdout was not piped".to_string(),
             })?;
+        let stderr_tail = Arc::new(StdMutex::new(VecDeque::<String>::new()));
         if let Some(stderr) = child.stderr.take() {
             let extension = self.extension.clone();
+            let tail = Arc::clone(&stderr_tail);
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stderr);
                 while let Ok(Some(line)) =
                     read_limited_line(&mut reader, 64 * 1024, &extension).await
                 {
+                    let line = String::from_utf8_lossy(&line).trim_end().to_string();
                     log::debug!(
                         target: "bsh::extension",
                         "{} stderr: {}",
                         extension,
-                        String::from_utf8_lossy(&line).trim_end()
+                        line
                     );
+                    let mut tail = tail.lock().expect("stderr tail lock");
+                    if tail.len() == 8 {
+                        tail.pop_front();
+                    }
+                    tail.push_back(line);
                 }
             });
         }
@@ -953,7 +982,7 @@ impl ProcessRuntime {
             next_id: 1,
             token: token.clone(),
         };
-        let initialized = session
+        let initialized = match session
             .request(
                 "initialize",
                 json!({
@@ -966,7 +995,16 @@ impl ProcessRuntime {
                 HANDSHAKE_MS,
                 &self.extension,
             )
-            .await?;
+            .await
+        {
+            Ok(initialized) => initialized,
+            Err(error) => {
+                // The child has exited by the time stdout closes; give the
+                // stderr reader a moment to drain before quoting it.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                return Err(with_stderr_tail(error, stderr_tail.as_ref()));
+            }
+        };
         let version = initialized
             .get("protocolVersion")
             .and_then(Value::as_str)
