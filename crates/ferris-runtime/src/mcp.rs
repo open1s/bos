@@ -490,6 +490,10 @@ struct McpCore {
     /// RSS sampler bound to the child's start-time identity (#38 / #109).
     #[cfg(unix)]
     watchdog: Mutex<Option<crate::process::MemoryWatchdog>>,
+    /// Windows Job Object owning the server child's memory ceiling and
+    /// kill-on-close guarantee.
+    #[cfg(windows)]
+    job: Mutex<Option<crate::windows_job::JobObject>>,
     cancelled: AtomicBool,
     stopped: AtomicBool,
     /// Set by notifications/*/list_changed; the next catalog read rediscovers.
@@ -616,6 +620,8 @@ impl McpCore {
             child: Mutex::new(None),
             #[cfg(unix)]
             watchdog: Mutex::new(None),
+            #[cfg(windows)]
+            job: Mutex::new(None),
             cancelled: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             catalog_dirty: Arc::new(AtomicBool::new(false)),
@@ -822,6 +828,26 @@ impl McpCore {
                 message: "MCP stdout was not piped".to_string(),
             })?;
         let stderr = child.stderr.take();
+        #[cfg(windows)]
+        {
+            let job = crate::windows_job::JobObject::new(self.memory_bytes).map_err(|source| {
+                ExtensionError::Io {
+                    path: self.root.clone(),
+                    source,
+                }
+            })?;
+            use std::os::windows::io::AsRawHandle as _;
+            if let Err(source) = job.assign(child.as_raw_handle() as _) {
+                let _ = child.kill();
+                return Err(ExtensionError::Io {
+                    path: self.root.clone(),
+                    source,
+                });
+            }
+            if let Ok(mut slot) = self.job.lock() {
+                *slot = Some(job);
+            }
+        }
         let child = self.register_child(child)?;
         if let Some(stderr) = stderr {
             let extension = self.extension.to_string();
@@ -1219,6 +1245,11 @@ impl McpCore {
             terminate_child_handle(&child);
         }
         self.stop_watchdog();
+        // Closing the job kills the server and any helpers it spawned.
+        #[cfg(windows)]
+        if let Ok(mut slot) = self.job.lock() {
+            *slot = None;
+        }
     }
 
     /// Start an RSS sampler bound to this child, replacing any previous one.

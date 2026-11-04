@@ -924,6 +924,10 @@ pub struct ProcessRuntime {
     /// Bound to the spawned child's identity and cancelled on every stop path.
     #[cfg(unix)]
     watchdog: StdMutex<Option<MemoryWatchdog>>,
+    /// The Windows Job Object owning this child's memory ceiling and
+    /// kill-on-close guarantee.
+    #[cfg(windows)]
+    job: StdMutex<Option<crate::windows_job::JobObject>>,
 }
 
 impl ProcessRuntime {
@@ -975,6 +979,8 @@ impl ProcessRuntime {
             subscriptions: std::sync::Mutex::new(Vec::new()),
             #[cfg(unix)]
             watchdog: StdMutex::new(None),
+            #[cfg(windows)]
+            job: StdMutex::new(None),
         })
     }
 
@@ -1254,6 +1260,27 @@ impl ProcessRuntime {
             self.child_pid.store(pid, Ordering::Relaxed);
             #[cfg(unix)]
             self.start_watchdog(pid);
+            #[cfg(windows)]
+            {
+                let job =
+                    crate::windows_job::JobObject::new(self.memory_bytes).map_err(|source| {
+                        ExtensionError::Io {
+                            path: self.root.clone(),
+                            source,
+                        }
+                    })?;
+                use std::os::windows::io::AsRawHandle as _;
+                if let Err(source) = job.assign(child.as_raw_handle() as _) {
+                    let _ = child.start_kill();
+                    return Err(ExtensionError::Io {
+                        path: self.root.clone(),
+                        source,
+                    });
+                }
+                if let Ok(mut slot) = self.job.lock() {
+                    *slot = Some(job);
+                }
+            }
         }
         let stdin = child.stdin.take().ok_or_else(|| ExtensionError::Protocol {
             extension: self.extension.to_string(),
@@ -1361,6 +1388,12 @@ impl ProcessRuntime {
 
     async fn stop(&self) {
         self.stop_watchdog();
+        // Dropping the job kills the child and every descendant it created
+        // (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE).
+        #[cfg(windows)]
+        if let Ok(mut slot) = self.job.lock() {
+            *slot = None;
+        }
         let mut guard = self.session.lock().await;
         let Some(mut session) = guard.take() else {
             return;
@@ -1631,6 +1664,29 @@ mod tests {
             Ok(StderrLine::Line(line)) => assert_eq!(line, b"next\n"),
             _ => panic!("the next stderr line must still be readable"),
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_job_kills_its_child_when_the_handle_closes() {
+        use std::os::windows::io::AsRawHandle as _;
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "ping", "-n", "30", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("child");
+        let job = crate::windows_job::JobObject::new(64 * 1024 * 1024).expect("job object");
+        job.assign(child.as_raw_handle() as _).expect("assign");
+        drop(job);
+        for _ in 0..50 {
+            if child.try_wait().expect("wait").is_some() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = child.kill();
+        panic!("closing the job did not kill its child");
     }
 
     #[cfg(unix)]
