@@ -6,20 +6,23 @@
 # signtool before they are written.
 #
 # Usage:
-#   package-windows.ps1 -Version 3.0.3 -Binary target/release/bsh.exe -OutDir dist
+#   package-windows.ps1 -Version 3.0.3 -Binary target/release/bsh.exe [-Arch x64|arm64] -OutDir dist
 #
 # Environment:
 #   WINDOWS_CERTIFICATE_FILE      path to a PFX; when set, sign bsh.exe and the MSI
 #   WINDOWS_CERTIFICATE_PASSWORD  its password
 #
-# Outputs (in -OutDir):
-#   bsh-<version>-windows-x64.zip
-#   bsh-<version>-windows-x64.msi
+# Outputs (in -OutDir), where <arch> is -Arch (x64 or arm64):
+#   bsh-<version>-windows-<arch>.zip
+#   bsh-<version>-windows-<arch>.msi
 
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$Version,
     [Parameter(Mandatory = $true)][string]$Binary,
+    # The MSI platform and the artifact name. Both runners build natively, so
+    # the host architecture decides which of the two a job passes.
+    [ValidateSet('x64', 'arm64')][string]$Arch = 'x64',
     [Parameter(Mandatory = $true)][string]$OutDir
 )
 
@@ -103,7 +106,7 @@ New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $outFull = (Resolve-Path $OutDir).Path
 
 # --- Portable zip ----------------------------------------------------------
-$portableName = "bsh-$Version-windows-x64"
+$portableName = "bsh-$Version-windows-$Arch"
 $portableDir = Join-Path $outFull $portableName
 if (Test-Path $portableDir) { Remove-Item -Recurse -Force $portableDir }
 New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
@@ -124,13 +127,14 @@ $wxs = Join-Path $root 'installer/bsh.wxs'
 $objDir = Join-Path $outFull 'wix'
 New-Item -ItemType Directory -Force -Path $objDir | Out-Null
 $wixobj = Join-Path $objDir 'bsh.wixobj'
-$msiPath = Join-Path $outFull "bsh-$Version-windows-x64.msi"
+$msiPath = Join-Path $outFull "bsh-$Version-windows-$Arch.msi"
 
 $candle = Find-WixTool 'candle.exe'
 $light = Find-WixTool 'light.exe'
 
 $candleArgs = @(
-    '-nologo', '-arch', 'x64',
+    '-nologo', '-arch', $Arch,
+    "-dPlatform=$Arch",
     "-dProductVersion=$msiVersion",
     "-dBinaryPath=$stagedExe",
     "-dLicensePath=$licensePath",

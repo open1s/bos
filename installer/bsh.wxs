@@ -19,10 +19,12 @@
            Manufacturer="BrickOS Team"
            UpgradeCode="E65D2886-D3A8-422E-AC45-35C30CACC3CB">
 
+    <!-- The platform comes from -dPlatform, which package-windows.ps1 sets
+         from -Arch: x64 on the x64 runner, arm64 on the arm64 one. -->
     <Package InstallerVersion="500"
              Compressed="yes"
              InstallScope="perUser"
-             Platform="x64"
+             Platform="$(var.Platform)"
              Description="BSH - BOS Harness"
              Comments="Native desktop agent workspace" />
 

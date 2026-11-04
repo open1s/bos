@@ -9,10 +9,10 @@ version tag; nothing is assembled by hand.
 | Platform | Installer | Portable | Built on |
 |---|---|---|---|
 | macOS, Apple silicon | `bsh-<version>-macos-arm64.dmg` | `bsh-<version>-macos-arm64.app.zip` | `macos-15` |
-| macOS, Intel | `bsh-<version>-macos-x86_64.dmg` | `bsh-<version>-macos-x86_64.app.zip` | `macos-15-intel` |
 | Linux, x86_64 | `bsh_<deb-version>_amd64.deb`, `bsh-<version>-linux-x86_64.rpm` | `bsh-<version>-linux-x86_64.tar.gz` | `ubuntu-22.04` |
 | Linux, arm64 (best-effort) | `bsh_<deb-version>_arm64.deb`, `bsh-<version>-linux-aarch64.rpm` | `bsh-<version>-linux-aarch64.tar.gz` | `ubuntu-24.04-arm` |
 | Windows, x64 | `bsh-<version>-windows-x64.msi` | `bsh-<version>-windows-x64.zip` | `windows-2022` |
+| Windows, arm64 | `bsh-<version>-windows-arm64.msi` | `bsh-<version>-windows-arm64.zip` | `windows-11-arm` |
 
 Every release also carries `SHA256SUMS`. The arm64 job is best-effort: GitHub's
 free arm64 runners are periodically preempted mid-build, so a release publishes
@@ -221,8 +221,8 @@ does not replace launching the app.
 - **The arm64 runner is preempted** — `linux-arm64` uses `ubuntu-24.04-arm`;
   GitHub's free arm64 runners periodically shut down mid-build. The job is
   `continue-on-error` and its artifacts are optional, so the release proceeds
-  without them. `macos-x86_64` uses `macos-15-intel`; on a plan without that
-  label, drop that matrix entry rather than cross-compiling native deps.
+  without them. `windows-arm64` runs on the `windows-11-arm` image and builds
+  natively; its WiX package takes the platform from `-Arch arm64`.
 - **Release job says an artifact is missing** — the build job's packaging step
   failed or the file name changed. Update the expected list in
   `release.yml` together with the script; that check is what keeps a

@@ -46,12 +46,12 @@ section="$(printf '%s\n' "$section" | sed '/./,$!d')"
 | Platform | Artifact | How |
 |---|---|---|
 | macOS (Apple silicon) | `bsh-@VERSION@-macos-arm64.dmg` | Open the dmg, drag **BSH** to Applications. |
-| macOS (Intel) | `bsh-@VERSION@-macos-x86_64.dmg` | Same as above. |
 | Linux (x86_64) | `bsh_@DEB@_amd64.deb` / `bsh-@VERSION@-linux-x86_64.rpm` | `sudo apt install ./bsh_@DEB@_amd64.deb` or `sudo dnf install ./bsh-@VERSION@-linux-x86_64.rpm` |
 | Linux (arm64, when available) | `bsh_@DEB@_arm64.deb` / `bsh-@VERSION@-linux-aarch64.rpm` | Same, on an arm64 machine. |
 | Linux (portable) | `bsh-@VERSION@-linux-<arch>.tar.gz` | `tar xzf ...` then `./install.sh` (installs to `~/.local`; `PREFIX` overrides). |
 | Windows (x64) | `bsh-@VERSION@-windows-x64.msi` | Per-user install, no administrator rights required. |
-| Windows (portable) | `bsh-@VERSION@-windows-x64.zip` | Unzip and run `bsh.exe`. |
+| Windows (arm64) | `bsh-@VERSION@-windows-arm64.msi` | Same, on Windows on Arm. |
+| Windows (portable) | `bsh-@VERSION@-windows-<arch>.zip` | Unzip and run `bsh.exe`. |
 
 The `.app.zip` files are the same signed bundles as the dmgs, for tools that
 prefer a zip.
@@ -79,8 +79,8 @@ sha256sum --check SHA256SUMS
   a release may carry only the x86_64 Linux packages. The WebView pane needs
   WebKitGTK 4.1, which the `.deb` declares and the `.rpm` discovers by soname.
   The RPM is unsigned. A Wayland or X11 session is required.
-- **Windows** builds are x64 and unsigned unless the Windows signing secret is
-  configured. The terminal pane is not available on Windows yet: the vendored
+- **Windows** builds are x64 and arm64 (Windows on Arm), and unsigned unless
+  the Windows signing secret is configured. The terminal pane is not available on Windows yet: the vendored
   Ghostty surface only implements macOS and Wayland, so the pane reports that
   it is unavailable. The browser pane needs the Edge WebView2 runtime, which
   ships with Windows 10 and 11. If the app does not start, install the

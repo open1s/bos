@@ -71,13 +71,14 @@ done
 release="$repo_root/.github/workflows/release.yml"
 for name in \
   'bsh-${VERSION}-macos-arm64.dmg' \
-  'bsh-${VERSION}-macos-x86_64.dmg' \
   'bsh-${VERSION}-macos-arm64.app.zip' \
   'bsh-${VERSION}-linux-x86_64.tar.gz' \
   'bsh_${deb_version}_amd64.deb' \
   'bsh-${VERSION}-linux-x86_64.rpm' \
   'bsh-${VERSION}-windows-x64.zip' \
-  'bsh-${VERSION}-windows-x64.msi'; do
+  'bsh-${VERSION}-windows-x64.msi' \
+  'bsh-${VERSION}-windows-arm64.zip' \
+  'bsh-${VERSION}-windows-arm64.msi'; do
   grep -Fq "\"$name\"" "$release" || fail "release job no longer verifies $name"
 done
 
