@@ -36,6 +36,26 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # bsh links the vendored Ghostty surface, whose build script shells out
+      # to Zig. Without it the build panics with "read Zig version from zig".
+      - name: Setup Zig 0.16
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # Zig 0.16's libc++ headers need LLVM 21 symbols that jammy's default
+      # libc++ does not export; the release workflow installs the same
+      # archives for the same reason.
+      - name: Install the static libc++ runtime
+        run: |
+          . /etc/os-release
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
+          echo "deb http://apt.llvm.org/$VERSION_CODENAME/ llvm-toolchain-$VERSION_CODENAME-21 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm-21.list
+          sudo apt-get update
+          sudo apt-get install -y libc++-21-dev libc++abi-21-dev
+
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
@@ -44,6 +64,8 @@ jobs:
         run: cargo install tauri-driver --locked
 
       - name: Build the desktop app
+        env:
+          BSH_LIBCXX_DIR: /usr/lib/llvm-21/lib
         run: cargo build -p bsh
 
       - uses: actions/setup-node@v4
