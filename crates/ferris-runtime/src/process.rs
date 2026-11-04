@@ -207,12 +207,6 @@ impl ProcessSession {
     }
 }
 
-/// Kill a child whose resident memory exceeds its manifest ceiling.
-///
-/// RLIMIT_AS is not honoured by macOS, so the host samples RSS and sends
-/// SIGKILL itself; Linux keeps the rlimit as the first line and the sampler as
-/// the same backstop.
-#[cfg(unix)]
 /// Attach the child's recent stderr to a protocol failure.
 ///
 /// "process closed stdout before answering" is true but not actionable; the
@@ -234,6 +228,12 @@ fn with_stderr_tail(error: ExtensionError, tail: &StdMutex<VecDeque<String>>) ->
     }
 }
 
+/// Kill a child whose resident memory exceeds its manifest ceiling.
+///
+/// RLIMIT_AS is not honoured by macOS, so the host samples RSS and sends
+/// SIGKILL itself; Linux keeps the rlimit as the first line and the sampler as
+/// the same backstop.
+#[cfg(unix)]
 fn spawn_memory_watchdog(pid: u32, limit: u64) {
     if limit == 0 {
         return;
@@ -883,6 +883,15 @@ impl ProcessRuntime {
                     ..CallScope::default()
                 },
             )?;
+        }
+        // bwrap --bind requires its source to exist; the per-extension data
+        // directory is created on first write, which may be later than the
+        // first process spawn. Create it before building the sandbox plan.
+        if let Some(data_root) = &self.data_root {
+            std::fs::create_dir_all(data_root).map_err(|source| ExtensionError::Io {
+                path: data_root.clone(),
+                source,
+            })?;
         }
         let token = uuid::Uuid::new_v4().to_string();
         let mut wrapped = false;
