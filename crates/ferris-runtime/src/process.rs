@@ -1835,6 +1835,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_linux_plan_recreates_only_declared_roots_under_hidden_home() {
         let plan = linux_bwrap_plan(
