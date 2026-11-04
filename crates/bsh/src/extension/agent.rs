@@ -264,7 +264,13 @@ impl CallTracker {
     /// so a revoke cannot land between the check and the insert.
     async fn admit(&self, call_id: &str) -> Option<Arc<AtomicBool>> {
         loop {
+            // Register the waiter BEFORE checking the predicate. Notify does
+            // not store a permit for notify_waiters(), so a finish() between
+            // the check and the first poll of the future would otherwise be
+            // lost and this call could sleep while a slot is free.
             let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             {
                 let mut state = self
                     .state
@@ -368,6 +374,8 @@ impl CallTracker {
         let deadline = tokio::time::Instant::now() + grace;
         loop {
             let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.in_flight() == 0 {
                 return;
             }

@@ -960,7 +960,9 @@ impl WarmStart {
     /// A runtime that ignores cancellation is left detached rather than
     /// blocking a rebuild forever; it still cannot activate another runtime
     /// because the worker checks the token before every step.
-    fn stop(mut self) {
+    /// Returns false when the worker could not be joined within the grace
+    /// period; the caller records that cleanup is still pending.
+    fn stop(mut self) -> bool {
         self.cancel.store(true, Ordering::SeqCst);
         self.wake.notify_waiters();
         if self
@@ -971,6 +973,9 @@ impl WarmStart {
             if let Some(thread) = self.thread.take() {
                 let _ = thread.join();
             }
+            true
+        } else {
+            false
         }
     }
 }
@@ -993,6 +998,13 @@ fn start_warm(runtimes: Vec<(String, Arc<dyn Runtime>)>) -> WarmStart {
         };
         reactor.block_on(async move {
             for (id, runtime) in runtimes {
+                // Enable the waiter before checking the flag. notify_waiters()
+                // does not retain a permit, so a stop between the check and the
+                // first poll of notified() would otherwise be lost and leave
+                // this worker blocked in activate().
+                let notified = worker_wake.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
                 if worker_cancel.load(Ordering::SeqCst) {
                     return;
                 }
@@ -1001,7 +1013,7 @@ fn start_warm(runtimes: Vec<(String, Arc<dyn Runtime>)>) -> WarmStart {
                 // rolled back, rather than keeping the worker alive.
                 let activated = tokio::select! {
                     biased;
-                    _ = worker_wake.notified() => None,
+                    _ = &mut notified => None,
                     result = runtime.activate() => Some(result),
                 };
                 match activated {
@@ -1875,7 +1887,14 @@ impl ExtensionHost {
     /// Cancel and join the on-startup batch, bounded.
     fn stop_warm_startup(&mut self) {
         if let Some(warm) = self.warm.take() {
-            warm.stop();
+            if !warm.stop() {
+                log::warn!(
+                    target: "bsh::extension",
+                    "on-startup activation did not stop within 2s; it can no longer activate runtimes"
+                );
+                self.issues
+                    .push("on-startup activation cleanup pending".to_string());
+            }
         }
     }
 
