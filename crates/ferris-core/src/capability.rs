@@ -1534,8 +1534,12 @@ mod tests {
     #[test]
     fn a_failed_grant_persist_does_not_change_the_in_memory_store() {
         let scratch = Scratch::new("grant-persist");
-        let path = scratch.0.join("grants.toml");
-        std::fs::create_dir_all(&path).expect("a directory where the grant file goes");
+        // A file where the grants directory should be makes create_dir_all
+        // fail on every platform (a directory at the file path is renamed away
+        // on Windows, so it would not fail there).
+        let blocked = scratch.0.join("blocked");
+        std::fs::write(&blocked, b"not a directory").expect("blocking file");
+        let path = blocked.join("grants.toml");
         let policy = PolicyEngine::open(
             path.clone(),
             scratch.0.join("audit.jsonl"),
@@ -1557,6 +1561,7 @@ mod tests {
         assert!(policy.audit_degraded().is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_failed_revoke_persist_keeps_the_grant() {
         let scratch = Scratch::new("revoke-persist");
