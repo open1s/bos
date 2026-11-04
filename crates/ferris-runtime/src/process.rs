@@ -229,10 +229,12 @@ fn with_stderr_tail(error: ExtensionError, tail: &StdMutex<VecDeque<String>>) ->
 }
 
 /// How often the watchdog samples resident memory.
+#[cfg(unix)]
 const MEMORY_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 
 /// How many consecutive sampling failures are tolerated before the child is
 /// treated as unobservable and terminated.
+#[cfg(unix)]
 const MEMORY_SAMPLE_RETRIES: u32 = 8;
 
 /// A live memory watchdog.
@@ -1585,6 +1587,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[cfg(unix)]
     static TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
     #[cfg(unix)]
@@ -1920,8 +1923,10 @@ mod tests {
         assert_eq!(plan[plan.len() - 1], "--flag");
     }
 
+    #[cfg(unix)]
     struct Scratch(PathBuf);
 
+    #[cfg(unix)]
     impl Scratch {
         fn new(label: &str) -> Self {
             let index = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -1943,12 +1948,14 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl Drop for Scratch {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
+    #[cfg(unix)]
     fn manifest() -> Manifest {
         Manifest::parse(
             r#"
