@@ -76,9 +76,6 @@ for name in \
   'bsh-${VERSION}-linux-x86_64.tar.gz' \
   'bsh_${deb_version}_amd64.deb' \
   'bsh-${VERSION}-linux-x86_64.rpm' \
-  'bsh-${VERSION}-linux-aarch64.tar.gz' \
-  'bsh_${deb_version}_arm64.deb' \
-  'bsh-${VERSION}-linux-aarch64.rpm' \
   'bsh-${VERSION}-windows-x64.zip' \
   'bsh-${VERSION}-windows-x64.msi'; do
   grep -Fq "\"$name\"" "$release" || fail "release job no longer verifies $name"

@@ -122,6 +122,11 @@ jobs:
     needs: prepare
     runs-on: ${{ matrix.os }}
     timeout-minutes: 240
+    # GitHub's free arm64 runners are periodically preempted mid-build (three
+    # observed shutdowns at 21-28 minutes). Keep attempting arm64, publish it
+    # when it survives, and never let that infrastructure failure block the
+    # x86_64, macOS and Windows release.
+    continue-on-error: ${{ matrix.platform == 'linux-arm64' }}
     strategy:
       fail-fast: false
       matrix:
@@ -356,9 +361,6 @@ jobs:
             "bsh-${VERSION}-linux-x86_64.tar.gz"
             "bsh_${deb_version}_amd64.deb"
             "bsh-${VERSION}-linux-x86_64.rpm"
-            "bsh-${VERSION}-linux-aarch64.tar.gz"
-            "bsh_${deb_version}_arm64.deb"
-            "bsh-${VERSION}-linux-aarch64.rpm"
             "bsh-${VERSION}-windows-x64.zip"
             "bsh-${VERSION}-windows-x64.msi"
           )

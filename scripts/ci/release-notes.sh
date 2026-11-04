@@ -48,7 +48,7 @@ section="$(printf '%s\n' "$section" | sed '/./,$!d')"
 | macOS (Apple silicon) | `bsh-@VERSION@-macos-arm64.dmg` | Open the dmg, drag **BSH** to Applications. |
 | macOS (Intel) | `bsh-@VERSION@-macos-x86_64.dmg` | Same as above. |
 | Linux (x86_64) | `bsh_@DEB@_amd64.deb` / `bsh-@VERSION@-linux-x86_64.rpm` | `sudo apt install ./bsh_@DEB@_amd64.deb` or `sudo dnf install ./bsh-@VERSION@-linux-x86_64.rpm` |
-| Linux (arm64) | `bsh_@DEB@_arm64.deb` / `bsh-@VERSION@-linux-aarch64.rpm` | Same, on an arm64 machine. |
+| Linux (arm64, when available) | `bsh_@DEB@_arm64.deb` / `bsh-@VERSION@-linux-aarch64.rpm` | Same, on an arm64 machine. |
 | Linux (portable) | `bsh-@VERSION@-linux-<arch>.tar.gz` | `tar xzf ...` then `./install.sh` (installs to `~/.local`; `PREFIX` overrides). |
 | Windows (x64) | `bsh-@VERSION@-windows-x64.msi` | Per-user install, no administrator rights required. |
 | Windows (portable) | `bsh-@VERSION@-windows-x64.zip` | Unzip and run `bsh.exe`. |
@@ -74,9 +74,11 @@ sha256sum --check SHA256SUMS
   quarantine attribute:
   `xattr -dr com.apple.quarantine /Applications/BSH.app`.
 - **Linux** x86_64 builds need glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+);
-  arm64 builds need glibc 2.39 (Ubuntu 24.04+, Debian 13+). The WebView pane
-  needs WebKitGTK 4.1, which the `.deb` declares and the `.rpm` discovers by
-  soname. The RPM is unsigned. A Wayland or X11 session is required.
+  arm64 builds need glibc 2.39 (Ubuntu 24.04+, Debian 13+). The arm64 job is
+  best-effort because GitHub's free arm64 runners are periodically preempted;
+  a release may carry only the x86_64 Linux packages. The WebView pane needs
+  WebKitGTK 4.1, which the `.deb` declares and the `.rpm` discovers by soname.
+  The RPM is unsigned. A Wayland or X11 session is required.
 - **Windows** builds are x64 and unsigned unless the Windows signing secret is
   configured. The terminal pane is not available on Windows yet: the vendored
   Ghostty surface only implements macOS and Wayland, so the pane reports that

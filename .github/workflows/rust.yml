@@ -223,7 +223,7 @@ jobs:
       - name: Install the packaging tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y rpm bubblewrap
+          sudo apt-get install -y rpm
 
       # Run the real dpkg-deb/rpmbuild path with a stand-in binary. The release
       # job supplies the built bsh; here the packaging logic, control files and
@@ -243,27 +243,6 @@ jobs:
           rpm -qip target/ci-package/*.rpm
           rpm -qp --requires target/ci-package/*.rpm
           tar -tzf target/ci-package/*.tar.gz | sed -n '1,5p'
-
-      # Temporary diagnosis: the hook-demo process test closes stdout before
-      # answering on Linux only. Reproduce the host's child constraints here,
-      # where this job is fast, to see whether Python starts at all.
-      - name: Diagnose the hook-demo process limits
-        run: |
-          cd examples/extensions/hook-demo
-          msg='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
-          echo '--- plain ---'
-          printf '%s\n' "$msg" | python3 server.py || echo 'plain failed'
-          echo '--- cleared env ---'
-          printf '%s\n' "$msg" | env -i PATH="$PATH" HOME="$HOME" TMPDIR=/tmp LANG=C.UTF-8 python3 server.py || echo 'env failed'
-          echo '--- 128MB address space, 256 fds, 5s cpu ---'
-          ( ulimit -v 131072; ulimit -n 256; ulimit -t 5; printf '%s\n' "$msg" | env -i PATH="$PATH" HOME="$HOME" TMPDIR=/tmp LANG=C.UTF-8 python3 server.py ) || echo 'limits failed'
-          echo '--- bubblewrap unshare ---'
-          bwrap --ro-bind / / --unshare-all --proc /proc --dev /dev --tmpfs /tmp /usr/bin/true && echo 'bwrap ok' || echo 'bwrap failed'
-          echo '--- userns sysctls ---'
-          sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone 2>&1 || true
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 2>&1 || true
-          sudo sysctl -w kernel.unprivileged_userns_clone=1 2>&1 || true
-          bwrap --ro-bind / / --unshare-all --proc /proc --dev /dev --tmpfs /tmp /usr/bin/true && echo 'bwrap ok after sysctl' || echo 'bwrap failed after sysctl'
 
   packaging-macos:
     name: Validate the macOS packager

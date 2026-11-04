@@ -11,10 +11,13 @@ version tag; nothing is assembled by hand.
 | macOS, Apple silicon | `bsh-<version>-macos-arm64.dmg` | `bsh-<version>-macos-arm64.app.zip` | `macos-15` |
 | macOS, Intel | `bsh-<version>-macos-x86_64.dmg` | `bsh-<version>-macos-x86_64.app.zip` | `macos-15-intel` |
 | Linux, x86_64 | `bsh_<deb-version>_amd64.deb`, `bsh-<version>-linux-x86_64.rpm` | `bsh-<version>-linux-x86_64.tar.gz` | `ubuntu-22.04` |
-| Linux, arm64 | `bsh_<deb-version>_arm64.deb`, `bsh-<version>-linux-aarch64.rpm` | `bsh-<version>-linux-aarch64.tar.gz` | `ubuntu-24.04-arm` |
+| Linux, arm64 (best-effort) | `bsh_<deb-version>_arm64.deb`, `bsh-<version>-linux-aarch64.rpm` | `bsh-<version>-linux-aarch64.tar.gz` | `ubuntu-24.04-arm` |
 | Windows, x64 | `bsh-<version>-windows-x64.msi` | `bsh-<version>-windows-x64.zip` | `windows-2022` |
 
-Every release also carries `SHA256SUMS`.
+Every release also carries `SHA256SUMS`. The arm64 job is best-effort: GitHub's
+free arm64 runners are periodically preempted mid-build, so a release publishes
+arm64 when that runner survives and otherwise ships the x86_64 Linux packages
+only. The arm64 job never blocks the release.
 
 ## The version contract
 
@@ -60,7 +63,7 @@ jj git push --tag v3.0.3       # starts the release workflow
 ```
 
 The tag push starts the workflow. It builds five platform jobs in parallel,
-then a single `release` job downloads every artifact, checks every expected
+with arm64 best-effort, then a single `release` job downloads every artifact, checks every expected
 artifact is present, writes `SHA256SUMS`, and creates the GitHub release with
 notes generated from the changelog.
 
@@ -172,12 +175,13 @@ does not replace launching the app.
   `MACOSX_DEPLOYMENT_TARGET=11.0` in the workflow and mirrored in
   `LSMinimumSystemVersion`. Raising one without the other is a bug.
 - **Linux x86_64** is built on Ubuntu 22.04 (glibc 2.35 floor: Ubuntu 22.04+,
-  Debian 12+); **Linux arm64** is built on Ubuntu 24.04 (glibc 2.39 floor:
-  Ubuntu 24.04+, Debian 13+). Both ship a `.deb`, an `.rpm` and a portable
-  tarball, and need a Wayland or X11 session plus WebKitGTK 4.1. The RPM's
-  `Requires` come from rpmbuild's soname generator and the package is
-  unsigned. No AppImage is produced: it would have to bundle WebKitGTK and GTK,
-  which is a different project from packaging this binary.
+  Debian 12+) and ships a `.deb`, an `.rpm` and a portable tarball; it needs a
+  Wayland or X11 session plus WebKitGTK 4.1. **Linux arm64** is built on Ubuntu
+  24.04 (glibc 2.39 floor) but is best-effort: the free arm64 runner is
+  periodically preempted, so the release may omit it. The RPM's `Requires`
+  come from rpmbuild's soname generator and the package is unsigned. No
+  AppImage is produced: it would have to bundle WebKitGTK and GTK, which is a
+  different project from packaging this binary.
 - **Windows x64**. The **terminal pane is unavailable**: the vendored Ghostty
   binding implements macOS and Wayland only and returns "libghostty native
   surfaces require macOS or Wayland" on Windows. The browser pane needs the
@@ -214,10 +218,11 @@ does not replace launching the app.
 - **`rpmbuild` not found** — install the `rpm` package on the builder; the
   script skips the RPM with a warning when it is absent, and the release job
   installs it on both Linux images.
-- **A runner label is unavailable** — `linux-arm64` uses `ubuntu-24.04-arm`
-  and `macos-x86_64` uses `macos-15-intel`; both are public-repo runners. On a
-  plan without them, drop that matrix entry and its expected artifact from
-  `release.yml` rather than cross-compiling native dependencies.
+- **The arm64 runner is preempted** — `linux-arm64` uses `ubuntu-24.04-arm`;
+  GitHub's free arm64 runners periodically shut down mid-build. The job is
+  `continue-on-error` and its artifacts are optional, so the release proceeds
+  without them. `macos-x86_64` uses `macos-15-intel`; on a plan without that
+  label, drop that matrix entry rather than cross-compiling native deps.
 - **Release job says an artifact is missing** — the build job's packaging step
   failed or the file name changed. Update the expected list in
   `release.yml` together with the script; that check is what keeps a

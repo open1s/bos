@@ -64,6 +64,12 @@ pub(crate) struct Contributed {
     pub(crate) themes: Vec<ferris_sdk::host_runtime::declarative::RawContribution>,
     /// One-call wall-clock ceiling.
     pub(crate) timeout_ms: u64,
+    /// One-result output ceiling, measured as serialized JSON bytes.
+    ///
+    /// Runtimes enforce this before host hooks run; the Agent adapter enforces
+    /// it again on the final post-hook value, because a `tool.after`
+    /// interceptor can expand a result the runtime already approved.
+    pub(crate) max_output_bytes: u64,
 }
 
 /// A revocation handle for the contributions installed into one Agent build.
@@ -184,6 +190,8 @@ pub(crate) struct ExtensionTool {
     events: Arc<EventBus>,
     workspace: Option<PathBuf>,
     timeout_ms: u64,
+    max_output_bytes: u64,
+    dispatch: Arc<ferris_sdk::composable::dispatch::EventDispatcher>,
     qualified: String,
     cancelled: Arc<AtomicBool>,
     active: Arc<AtomicBool>,
@@ -253,6 +261,31 @@ impl ExtensionTool {
         workspace: Option<PathBuf>,
         active: Arc<AtomicBool>,
     ) -> Self {
+        Self::with_dispatcher(
+            contributed,
+            descriptor,
+            policy,
+            events,
+            workspace,
+            active,
+            crate::extension::dispatcher(),
+        )
+    }
+
+    /// Build a tool against an explicit hook dispatcher.
+    ///
+    /// Production uses the process-wide dispatcher; tests inject a private one
+    /// so a `tool.after` interceptor registered by one case cannot observe (or
+    /// rewrite) another case's calls.
+    fn with_dispatcher(
+        contributed: &Contributed,
+        descriptor: ToolDescriptor,
+        policy: Arc<PolicyEngine>,
+        events: Arc<EventBus>,
+        workspace: Option<PathBuf>,
+        active: Arc<AtomicBool>,
+        dispatch: Arc<ferris_sdk::composable::dispatch::EventDispatcher>,
+    ) -> Self {
         let qualified = contributed.extension.qualify(&descriptor.id);
         Self {
             owner: contributed.extension.clone(),
@@ -263,6 +296,8 @@ impl ExtensionTool {
             events,
             workspace,
             timeout_ms: contributed.timeout_ms,
+            max_output_bytes: contributed.max_output_bytes,
+            dispatch,
             qualified,
             cancelled: Arc::new(AtomicBool::new(false)),
             active,
@@ -379,7 +414,8 @@ impl ExtensionTool {
         self.cancelled.store(false, Ordering::SeqCst);
         let started = std::time::Instant::now();
         let correlation = uuid::Uuid::new_v4().to_string();
-        let arguments = crate::extension::dispatcher()
+        let arguments = self
+            .dispatch
             .waterfall("tool.before", arguments.clone())
             .unwrap_or_else(|| arguments.clone());
         let scope = self.scope(&arguments);
@@ -454,12 +490,41 @@ impl ExtensionTool {
         match outcome {
             Ok(result) => {
                 let value = result.to_value();
-                let value = crate::extension::dispatcher()
+                let value = self
+                    .dispatch
                     .waterfall("tool.after", value.clone())
                     .unwrap_or(value);
+                // The final, post-hook representation is what the agent keeps
+                // and what the model sees, so the manifest ceiling applies
+                // here: a runtime's own pre-hook check cannot constrain an
+                // interceptor that expands the value afterwards.
                 let bytes = serde_json::to_vec(&value)
                     .map(|bytes| bytes.len())
                     .unwrap_or(0);
+                if bytes as u64 > self.max_output_bytes {
+                    super::host::record_tool_call(
+                        started.elapsed().as_millis() as u64,
+                        bytes as u64,
+                        false,
+                    );
+                    let error = ExtensionError::Limit {
+                        extension: self.owner.to_string(),
+                        message: format!(
+                            "tool result is {bytes} bytes; the ceiling is {}",
+                            self.max_output_bytes
+                        ),
+                    };
+                    self.emit(
+                        topics::TOOL_FAILED,
+                        serde_json::json!({
+                            "tool": self.descriptor.id.as_str(),
+                            "fiber": self.owner.as_str(),
+                            "error": truncate(&error.to_string(), 512),
+                        }),
+                        &correlation,
+                    );
+                    return Err(error.to_tool_error());
+                }
                 super::host::record_tool_call(
                     started.elapsed().as_millis() as u64,
                     bytes as u64,
@@ -825,6 +890,52 @@ mod tests {
             Ok(ferris_sdk::host_runtime::ToolResult::text("done"))
         }
     }
+    struct FixedRuntime(Value);
+
+    #[async_trait]
+    impl Runtime for FixedRuntime {
+        fn kind(&self) -> RuntimeKind {
+            RuntimeKind::Builtin
+        }
+
+        async fn tools(&self) -> Result<Vec<ToolDescriptor>, ExtensionError> {
+            Ok(Vec::new())
+        }
+
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: Value,
+            _context: &CallContext,
+        ) -> Result<Value, ExtensionError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn fixed_tool(
+        scratch: &Scratch,
+        value: Value,
+        max_output_bytes: u64,
+    ) -> (
+        ExtensionTool,
+        Arc<ferris_sdk::composable::dispatch::EventDispatcher>,
+    ) {
+        let mut contributed = contributed(vec![], TrustLevel::Builtin);
+        contributed.runtime = Arc::new(FixedRuntime(value));
+        contributed.max_output_bytes = max_output_bytes;
+        let dispatch = Arc::new(ferris_sdk::composable::dispatch::EventDispatcher::new());
+        let tool = ExtensionTool::with_dispatcher(
+            &contributed,
+            contributed.tools[0].clone(),
+            policy(scratch),
+            EventBus::new(),
+            None,
+            Arc::new(AtomicBool::new(true)),
+            Arc::clone(&dispatch),
+        );
+        (tool, dispatch)
+    }
+
     fn policy(scratch: &Scratch) -> Arc<PolicyEngine> {
         Arc::new(
             PolicyEngine::open(
@@ -858,6 +969,7 @@ mod tests {
             workflows: Vec::new(),
             themes: Vec::new(),
             timeout_ms: 1000,
+            max_output_bytes: 1024 * 1024,
         }
     }
 
@@ -969,5 +1081,82 @@ mod tests {
         .await
         .expect("run");
         assert_eq!(result["path"], "/tmp/workspace/a.txt");
+    }
+
+    #[tokio::test]
+    async fn a_result_exactly_at_the_output_ceiling_is_returned() {
+        let scratch = Scratch::new("budget-at");
+        let value = Value::String("a".repeat(100));
+        let bytes = serde_json::to_vec(&value).expect("json").len() as u64;
+        let (tool, _dispatch) = fixed_tool(&scratch, value.clone(), bytes);
+        let result = react::tool::registry::AsyncTool::run(&tool, &serde_json::json!({}))
+            .await
+            .expect("a result at the ceiling is allowed");
+        assert_eq!(result, value);
+    }
+
+    #[tokio::test]
+    async fn a_result_one_byte_over_the_output_ceiling_is_refused() {
+        let scratch = Scratch::new("budget-over");
+        let value = Value::String("a".repeat(100));
+        let bytes = serde_json::to_vec(&value).expect("json").len() as u64;
+        let (tool, _dispatch) = fixed_tool(&scratch, value, bytes - 1);
+        let error = react::tool::registry::AsyncTool::run(&tool, &serde_json::json!({}))
+            .await
+            .expect_err("a result over the ceiling must be refused");
+        let message = error.to_string();
+        assert!(message.contains("ceiling is 101"), "{message}");
+        assert!(message.contains("tool result is 102 bytes"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_tool_after_hook_cannot_expand_a_result_past_the_ceiling() {
+        use ferris_sdk::composable::dispatch::DispatchMode;
+
+        let scratch = Scratch::new("budget-hook");
+        let value = Value::String("ok".to_string());
+        let budget = serde_json::to_vec(&value).expect("json").len() as u64;
+        let (tool, dispatch) = fixed_tool(&scratch, value, budget);
+        let expanded = Arc::new(AtomicBool::new(false));
+        let marker = Arc::clone(&expanded);
+        let _hook = dispatch.on(
+            "tool.after",
+            DispatchMode::Waterfall,
+            0,
+            move |_value, chain| {
+                marker.store(true, Ordering::SeqCst);
+                chain.next(Value::String("x".repeat(4096)))
+            },
+        );
+        let error = react::tool::registry::AsyncTool::run(&tool, &serde_json::json!({}))
+            .await
+            .expect_err("the post-hook value is over the ceiling");
+        assert!(expanded.load(Ordering::SeqCst), "the hook did not run");
+        let message = error.to_string();
+        assert!(message.contains("tool result is 4098 bytes"), "{message}");
+        assert!(message.contains("ceiling is 4"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn run_streaming_reports_the_output_ceiling_instead_of_the_final_value() {
+        use futures::StreamExt as _;
+
+        let scratch = Scratch::new("budget-stream");
+        let value = Value::String("z".repeat(256));
+        let (tool, _dispatch) = fixed_tool(&scratch, value, 32);
+        let mut stream =
+            react::tool::registry::AsyncTool::run_streaming(&tool, &serde_json::json!({}))
+                .await
+                .expect("stream");
+        let mut items = Vec::new();
+        while let Some(item) = stream.next().await {
+            items.push(item);
+        }
+        assert_eq!(items.len(), 1, "{items:?}");
+        let message = items[0]
+            .as_ref()
+            .expect_err("an over-budget result is an error item")
+            .to_string();
+        assert!(message.contains("ceiling is 32"), "{message}");
     }
 }

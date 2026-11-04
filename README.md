@@ -182,8 +182,8 @@ On macOS, a development app can also be packaged with
 Prebuilt installers are published on the
 [releases page](https://github.com/open1s/bos/releases): a dmg for macOS
 (Apple silicon and Intel), `.deb`, `.rpm` and portable tarballs for Linux
-x86_64 and arm64, and a per-user MSI and portable zip for Windows x64. Each
-release carries `SHA256SUMS`.
+x86_64 (arm64 when the runner completes), and a per-user MSI and portable zip
+for Windows x64. Each release carries `SHA256SUMS`.
 
 The tag-driven build, signing and notarization setup is documented in
 [docs/bsh-release.md](docs/bsh-release.md).

@@ -1776,6 +1776,7 @@ impl ExtensionHost {
                 workflows: contributions.workflows.clone(),
                 themes: contributions.themes.clone(),
                 timeout_ms: entry.package.manifest.resources.execution_ms(),
+                max_output_bytes: entry.package.manifest.resources.output_bytes(),
             };
             infos.push(contribution::install(
                 agent,
@@ -1847,6 +1848,7 @@ impl ExtensionHost {
                 workflows: contributions.workflows.clone(),
                 themes: contributions.themes.clone(),
                 timeout_ms: entry.package.manifest.resources.execution_ms(),
+                max_output_bytes: entry.package.manifest.resources.output_bytes(),
             };
             let sink = Arc::new(super::framework::HostContributionSink::new(
                 Arc::clone(&self.policy),
