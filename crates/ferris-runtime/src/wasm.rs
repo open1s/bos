@@ -336,7 +336,7 @@ impl self::bsh::extension::host::Host for HostState {
                 "the extension already holds {MAX_SUBSCRIPTIONS} event subscriptions"
             )));
         }
-        let filter = EventFilter::from_topics(&[topic.clone()])
+        let filter = EventFilter::from_topics(std::slice::from_ref(&topic))
             .map_err(self::bsh::extension::types::HostError::Denied)?;
         let id = self.next_subscription;
         self.next_subscription = self.next_subscription.saturating_add(1);
@@ -451,36 +451,96 @@ impl self::bsh::extension::host::Host for HostState {
         }
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_millis(15_000))
+            // Every redirect is followed by hand so each hop is authorized
+            // against its own host. reqwest's default policy would follow up
+            // to ten hops on the strength of the first authorization.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| self::bsh::extension::types::HostError::Runtime(error.to_string()))?;
         let requested_bytes = body.as_ref().map(|body| body.len() as u64).unwrap_or(0);
         let method_text = method.as_str().to_string();
         let started = Instant::now();
-        let mut request = client.request(method, parsed);
-        if let Some(body) = body {
-            request = request.body(body);
-        }
-        let response = match request.send() {
-            Ok(response) => response,
-            Err(error) => {
-                let message = error.to_string();
-                crate::hooks::observe(
-                    "http.exchange",
-                    crate::hooks::http_exchange(
-                        self.extension.as_str(),
-                        &method_text,
-                        &url,
-                        None,
-                        requested_bytes,
-                        0,
-                        None,
-                        0,
-                        started.elapsed().as_millis() as u64,
-                        Some(&message),
-                    ),
-                );
-                return Err(self::bsh::extension::types::HostError::Runtime(message));
+        let mut current = parsed;
+        let mut current_method = method;
+        let mut current_body = body;
+        let mut redirects = 0usize;
+        let response = loop {
+            let mut request = client.request(current_method.clone(), current.clone());
+            if let Some(body) = &current_body {
+                request = request.body(body.clone());
             }
+            let response = match request.send() {
+                Ok(response) => response,
+                Err(error) => {
+                    let message = error.to_string();
+                    crate::hooks::observe(
+                        "http.exchange",
+                        crate::hooks::http_exchange(
+                            self.extension.as_str(),
+                            &method_text,
+                            current.as_str(),
+                            None,
+                            requested_bytes,
+                            0,
+                            None,
+                            0,
+                            started.elapsed().as_millis() as u64,
+                            Some(&message),
+                        ),
+                    );
+                    return Err(self::bsh::extension::types::HostError::Runtime(message));
+                }
+            };
+            if !response.status().is_redirection() {
+                break response;
+            }
+            redirects += 1;
+            if redirects > 5 {
+                return Err(self::bsh::extension::types::HostError::Denied(
+                    "too many redirects".to_string(),
+                ));
+            }
+            let Some(location) = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+            else {
+                // A redirect without a location is returned to the guest
+                // rather than guessed at.
+                break response;
+            };
+            let next = current.join(&location).map_err(|error| {
+                self::bsh::extension::types::HostError::Denied(error.to_string())
+            })?;
+            if !matches!(next.scheme(), "http" | "https") {
+                return Err(self::bsh::extension::types::HostError::Denied(
+                    "redirect target is not http or https".to_string(),
+                ));
+            }
+            if current.scheme() == "https" && next.scheme() == "http" {
+                return Err(self::bsh::extension::types::HostError::Denied(
+                    "redirect downgrades https to http".to_string(),
+                ));
+            }
+            let next_method = if matches!(response.status().as_u16(), 307 | 308) {
+                current_method.clone()
+            } else {
+                reqwest::Method::GET
+            };
+            self.authorize(
+                Capability::NetworkHttp,
+                CallScope {
+                    domain: next.host_str().map(str::to_string),
+                    method: Some(next_method.as_str().to_ascii_uppercase()),
+                    ..CallScope::default()
+                },
+            )?;
+            if next_method == reqwest::Method::GET {
+                current_body = None;
+            }
+            current_method = next_method;
+            current = next;
         };
         let ttfb_ms = started.elapsed().as_millis() as u64;
         let status = response.status().as_u16();
@@ -887,6 +947,82 @@ impl WasmRuntime {
         Ok(())
     }
 
+    /// Invoke one guest tool under the instance lock.
+    ///
+    /// The progress sender is installed and cleared inside the same lock
+    /// scope as the guest call; assigning it in a separate lock scope (the old
+    /// call_tool_progress) let a second caller overwrite the sender before the
+    /// first call reached the guest.
+    fn run_tool(
+        &self,
+        name: &str,
+        arguments: Value,
+        context: &CallContext,
+        progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+    ) -> Result<Value, ExtensionError> {
+        if self.stopped.load(Ordering::Relaxed) {
+            return Err(ExtensionError::Runtime {
+                extension: self.extension.to_string(),
+                message: "runtime is shut down".to_string(),
+            });
+        }
+        self.ensure_instance()?;
+        let mut guard = self.instance.lock().map_err(|_| ExtensionError::Corrupt {
+            path: self.component.clone(),
+            message: "wasm instance lock is poisoned".to_string(),
+        })?;
+        // A queued call must not revive a runtime shut down while it waited.
+        if self.stopped.load(Ordering::SeqCst) {
+            return Err(ExtensionError::Runtime {
+                extension: self.extension.to_string(),
+                message: "runtime is shut down".to_string(),
+            });
+        }
+        let instance = guard.as_mut().expect("instance");
+        self.prepare_call(
+            instance,
+            context.timeout_ms.min(self.resources.execution_ms()),
+        )?;
+        instance.store.data_mut().progress = progress;
+        let arguments = serde_json::to_string(&arguments).unwrap_or_default();
+        let result = instance.bindings.bsh_extension_extension().call_call_tool(
+            &mut instance.store,
+            name,
+            &arguments,
+            &context.correlation_id,
+        );
+        // Clear even when the guest trapped, so the next call cannot inherit
+        // a sender that belongs to this invocation.
+        instance.store.data_mut().progress = None;
+        self.record_fuel(&instance.store);
+        let result = result.map_err(|error| ExtensionError::Runtime {
+            extension: self.extension.to_string(),
+            message: error.to_string(),
+        })?;
+        let result = result.map_err(|error| host_failure(&self.extension, error))?;
+        self.deliver_events(instance)?;
+        if result.is_error {
+            return Err(ExtensionError::Runtime {
+                extension: self.extension.to_string(),
+                message: result.content,
+            });
+        }
+        if result.content.len() as u64 > self.resources.output_bytes() {
+            return Err(ExtensionError::Limit {
+                extension: self.extension.to_string(),
+                message: format!(
+                    "component result is {} bytes; the ceiling is {}",
+                    result.content.len(),
+                    self.resources.output_bytes()
+                ),
+            });
+        }
+        serde_json::from_str(&result.content).map_err(|error| ExtensionError::Runtime {
+            extension: self.extension.to_string(),
+            message: format!("tool result is not JSON: {error}"),
+        })
+    }
+
     /// List the component's tools synchronously, instantiating it if needed.
     ///
     /// The agent build is synchronous and needs descriptors before it can price
@@ -1028,68 +1164,7 @@ impl Runtime for WasmRuntime {
         arguments: Value,
         context: &CallContext,
     ) -> Result<Value, ExtensionError> {
-        if self.stopped.load(Ordering::Relaxed) {
-            return Err(ExtensionError::Runtime {
-                extension: self.extension.to_string(),
-                message: "runtime is shut down".to_string(),
-            });
-        }
-        self.ensure_instance()?;
-        let mut guard = self.instance.lock().map_err(|_| ExtensionError::Corrupt {
-            path: self.component.clone(),
-            message: "wasm instance lock is poisoned".to_string(),
-        })?;
-        // A queued call must not revive a runtime shut down while it waited.
-        if self.stopped.load(Ordering::SeqCst) {
-            return Err(ExtensionError::Runtime {
-                extension: self.extension.to_string(),
-                message: "runtime is shut down".to_string(),
-            });
-        }
-        let instance = guard.as_mut().expect("instance");
-        self.prepare_call(
-            instance,
-            context.timeout_ms.min(self.resources.execution_ms()),
-        )?;
-        let arguments = serde_json::to_string(&arguments).unwrap_or_default();
-        let result = instance
-            .bindings
-            .bsh_extension_extension()
-            .call_call_tool(
-                &mut instance.store,
-                name,
-                &arguments,
-                &context.correlation_id,
-            )
-            .map_err(|error| ExtensionError::Runtime {
-                extension: self.extension.to_string(),
-                message: error.to_string(),
-            })?;
-        self.record_fuel(&instance.store);
-        let result = result.map_err(|error| host_failure(&self.extension, error))?;
-        self.deliver_events(instance)?;
-        if result.is_error {
-            return Err(ExtensionError::Runtime {
-                extension: self.extension.to_string(),
-                message: result.content,
-            });
-        }
-        // The manifest ceiling applies to every runtime; a component could
-        // otherwise return up to its memory limit.
-        if result.content.len() as u64 > self.resources.output_bytes() {
-            return Err(ExtensionError::Limit {
-                extension: self.extension.to_string(),
-                message: format!(
-                    "component result is {} bytes; the ceiling is {}",
-                    result.content.len(),
-                    self.resources.output_bytes()
-                ),
-            });
-        }
-        serde_json::from_str(&result.content).map_err(|error| ExtensionError::Runtime {
-            extension: self.extension.to_string(),
-            message: format!("tool result is not JSON: {error}"),
-        })
+        self.run_tool(name, arguments, context, None)
     }
 
     async fn call_tool_progress(
@@ -1099,20 +1174,8 @@ impl Runtime for WasmRuntime {
         context: &CallContext,
         progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
     ) -> Result<ToolResult, ExtensionError> {
-        self.ensure_instance()?;
-        if let Ok(mut guard) = self.instance.lock() {
-            if let Some(instance) = guard.as_mut() {
-                self.ensure_running()?;
-                instance.store.data_mut().progress = progress;
-            }
-        }
-        let result = self.call_tool(name, arguments, context).await;
-        if let Ok(mut guard) = self.instance.lock() {
-            if let Some(instance) = guard.as_mut() {
-                instance.store.data_mut().progress = None;
-            }
-        }
-        result.map(ToolResult::from_value)
+        self.run_tool(name, arguments, context, progress)
+            .map(ToolResult::from_value)
     }
 
     async fn command(&self, id: &str, arguments: Value) -> Result<Value, ExtensionError> {
@@ -1192,8 +1255,9 @@ impl Runtime for WasmRuntime {
 
 #[cfg(test)]
 mod tests {
+    use super::bsh::extension::host::Host as _;
     use super::*;
-    use ferris_core::capability::PolicyMode;
+    use ferris_core::capability::{GrantScope, PolicyMode};
     use ferris_core::types::TrustLevel as TestTrust;
 
     fn scratch(label: &str) -> PathBuf {
@@ -1275,5 +1339,92 @@ mod tests {
             "post-shutdown entry points must not recreate the component"
         );
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    fn host_state(workspace: &Path, grants: &[(Capability, GrantScope)]) -> HostState {
+        let id = ExtensionId::parse("com.example.wasm-host").expect("id");
+        let policy = PolicyEngine::open(
+            workspace.join("grants.toml"),
+            workspace.join("audit.jsonl"),
+            PolicyMode::Enforce,
+        )
+        .expect("policy");
+        for (capability, scope) in grants {
+            policy
+                .grant(id.as_str(), *capability, scope.clone(), None)
+                .expect("grant");
+        }
+        HostState {
+            extension: id.clone(),
+            trust: TestTrust::Local,
+            policy: Arc::new(policy),
+            events: EventBus::new(),
+            storage: ExtensionStorage::open(&workspace.join("data"), &id).expect("storage"),
+            workspace: Some(workspace.to_path_buf()),
+            publishes: Vec::new(),
+            subscribes: Vec::new(),
+            config: "{}".to_string(),
+            limits: TrackingLimiter {
+                limits: StoreLimitsBuilder::new().build(),
+                used: Arc::new(AtomicU64::new(0)),
+            },
+            subscriptions: BTreeMap::new(),
+            next_subscription: 1,
+            deadline: Instant::now() + Duration::from_secs(5),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            progress: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_final_symlink_cannot_escape_the_workspace() {
+        let workspace = scratch("symlink");
+        let outside = workspace.with_extension("outside");
+        std::fs::write(&outside, "secret").expect("outside file");
+        std::os::unix::fs::symlink(&outside, workspace.join("link")).expect("symlink");
+        let state = host_state(&workspace, &[(Capability::WorkspaceRead, GrantScope::Any)]);
+        let error = state
+            .workspace_path("link")
+            .expect_err("a final symlink is refused");
+        match error {
+            self::bsh::extension::types::HostError::Denied(reason) => {
+                assert!(reason.contains("symlink"), "{reason}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        let _ = std::fs::remove_file(&outside);
+    }
+
+    #[test]
+    fn a_redirect_to_an_unauthorized_host_is_refused() {
+        let workspace = scratch("redirect");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buffer = [0u8; 1024];
+                let _ = stream.read(&mut buffer);
+                let response = "HTTP/1.1 302 Found\r\nLocation: http://example.invalid/steal\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        let mut state = host_state(
+            &workspace,
+            &[(
+                Capability::NetworkHttp,
+                GrantScope::Domain("127.0.0.1".to_string()),
+            )],
+        );
+        let error = state
+            .fetch(format!("http://{address}/start"), "GET".to_string(), None)
+            .expect_err("the redirect target is not granted");
+        match error {
+            self::bsh::extension::types::HostError::Denied(reason) => {
+                assert!(reason.contains("grant"), "{reason}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }
