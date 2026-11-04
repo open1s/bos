@@ -2236,6 +2236,19 @@ impl ExtensionHost {
     ) -> Vec<AppliedExtension> {
         let mut applied = Vec::new();
         let service_capabilities = self.service_capability_map();
+        let manager = match self.framework_manager() {
+            Ok(manager) => manager,
+            Err(error) => {
+                log::error!("extension manager unavailable; no package applied: {error}");
+                return applied;
+            }
+        };
+        let sink = Arc::new(super::framework::HostContributionSink::new(
+            Arc::clone(&self.policy),
+            Arc::clone(&self.events),
+            self.config.workspace.clone(),
+        ));
+        let mut eligible = BTreeSet::new();
         for entry in self.loaded.values() {
             if !entry.applied || entry.error.is_some() {
                 continue;
@@ -2254,9 +2267,6 @@ impl ExtensionHost {
             } else {
                 (entry.tools.clone(), entry.contributions.clone())
             };
-            // Same gate as the compatibility path: a package may contribute
-            // only a skill, and a runtime-registered skill has no manifest
-            // declaration - only the directory the runtime materialized.
             let skills_dir = contributed_skills_dir(entry);
             let has_agent_contribution = !tools.is_empty()
                 || !contributions.commands.is_empty()
@@ -2287,55 +2297,51 @@ impl ExtensionHost {
                 max_output_bytes: entry.package.manifest.resources.output_bytes(),
                 max_concurrent_calls: entry.package.manifest.resources.concurrent_calls() as usize,
             };
-            let sink = Arc::new(super::framework::HostContributionSink::new(
-                Arc::clone(&self.policy),
-                Arc::clone(&self.events),
-                self.config.workspace.clone(),
-            ));
-            sink.insert(entry.package.id().as_str(), contributed.clone());
-            let mut manager_activation = None;
-            if let Ok(manager) = self.framework_manager() {
-                let manager = manager.with_ports(
-                    Arc::new(self.build_framework_resolver()),
-                    Arc::clone(&sink) as Arc<dyn ferris_sdk::ContributionSink>,
-                );
-                if let Ok(mut plan) = manager.plan() {
-                    plan.order
-                        .retain(|candidate| candidate == entry.package.id().as_str());
-                    if !plan.order.is_empty() {
-                        if let Ok(mut set) = super::block_on_tokio_scoped(manager.apply(
-                            &plan,
-                            agent,
-                            registry,
-                            &mut super::framework::HostNoopHost,
-                        )) {
-                            manager_activation = Some((set.take(entry.package.id().as_str()), set));
-                        }
-                    }
-                }
+            sink.insert(entry.package.id().as_str(), contributed);
+            eligible.insert(entry.package.id().as_str().to_owned());
+        }
+        let manager = manager.with_ports(
+            Arc::new(self.build_framework_resolver()),
+            Arc::clone(&sink) as Arc<dyn ferris_sdk::ContributionSink>,
+        );
+        let mut plan = match manager.plan() {
+            Ok(plan) => plan,
+            Err(error) => {
+                log::error!("extension plan failed; no package applied: {error}");
+                return applied;
             }
-            let (info, lease, activation) = match manager_activation {
-                Some((activation, _set)) => {
-                    let info = sink.take_info(entry.package.id().as_str());
-                    let lease = sink.lease(entry.package.id().as_str());
-                    match (info, lease) {
-                        (Some(info), Some(lease)) => (info, lease, activation),
-                        _ => continue,
-                    }
-                }
-                None => {
-                    let (info, lease) = contribution::install_with_lease(
-                        agent,
-                        registry,
-                        &contributed,
-                        Arc::clone(&self.policy),
-                        Arc::clone(&self.events),
-                        self.config.workspace.clone(),
-                    );
-                    (info, lease, None)
-                }
+        };
+        // Keep the planner's dependency-first order; only exclude packages
+        // this build did not prepare (disabled, failed or outside the preset).
+        plan.order.retain(|id| eligible.contains(id));
+        if plan.order.is_empty() {
+            return applied;
+        }
+        let mut set = match super::block_on_tokio_scoped(manager.apply(
+            &plan,
+            agent,
+            registry,
+            &mut super::framework::HostNoopHost,
+        )) {
+            Ok(set) => set,
+            Err(error) => {
+                log::error!("extension activation failed; no package applied: {error}");
+                return applied;
+            }
+        };
+        for id in plan.order {
+            let Some(entry) = self.loaded.get(&id) else {
+                continue;
             };
-            let extension_id = entry.package.id().as_str().to_owned();
+            let Some(activation) = set.take(&id) else {
+                log::error!("extension {id}: the manager returned no activation");
+                continue;
+            };
+            let (Some(info), Some(lease)) = (sink.take_info(&id), sink.lease(&id)) else {
+                log::error!("extension {id}: contribution sink returned no info or lease");
+                continue;
+            };
+            let extension_id = id.clone();
             let authorizer = Arc::new(ServicePolicyAuthorizer {
                 policy: Arc::clone(&self.policy),
                 consumer: extension_id.clone(),
@@ -2370,7 +2376,7 @@ impl ExtensionHost {
             }
             applied.push(AppliedExtension {
                 info,
-                activation,
+                activation: Some(activation),
                 fiber,
                 lease,
                 services: Arc::clone(&self.services),

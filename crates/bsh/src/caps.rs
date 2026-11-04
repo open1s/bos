@@ -512,6 +512,17 @@ impl agent::agent::AgentPlugin for DispatcherPlugin {
     }
 }
 
+/// Aborts the live service watcher when the build that owns it is dropped.
+struct LiveDriverGuard(Option<tokio::task::JoinHandle<()>>);
+
+impl Drop for LiveDriverGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
 pub(crate) struct BuiltAgent {
     /// The agent the shell runs turns against.
     pub(crate) agent: Arc<Agent>,
@@ -525,6 +536,8 @@ pub(crate) struct BuiltAgent {
     pub(crate) plugins: Vec<PluginInfo>,
     /// Fiber activations held for exactly as long as this build is live.
     pub(crate) extension_activations: crate::extension::host::ActivationList,
+    /// The service-change watcher for this build; aborted on drop.
+    live_driver: LiveDriverGuard,
     /// Why the provider credential could not be resolved, if it could not.
     ///
     /// A locked vault is named here rather than silently handing the engine an
@@ -557,7 +570,7 @@ pub(crate) struct BuiltAgent {
 
 impl BuiltAgent {
     /// Start the service-change watcher for this build.
-    pub(crate) fn start_live_driver(&self) {
+    pub(crate) fn start_live_driver(&mut self) {
         let Some(services) = self
             .extension_activations
             .first()
@@ -582,7 +595,11 @@ impl BuiltAgent {
                 )
             })
             .collect();
-        crate::extension::live::start(Arc::clone(&self.agent), services, entries);
+        self.live_driver = LiveDriverGuard(crate::extension::live::start(
+            Arc::clone(&self.agent),
+            services,
+            entries,
+        ));
     }
 
     /// Suspend one extension's live tools/prompts/skills without dropping the
@@ -1437,10 +1454,11 @@ fn build_agent_for_session_inner(
             "withheld_chars": withheld_chars,
         }),
     );
-    let built = BuiltAgent {
+    let mut built = BuiltAgent {
         agent: Arc::new(agent),
         plugins,
         extension_activations: extension_activations.into(),
+        live_driver: LiveDriverGuard(None),
         tools_schema_chars: schema_chars,
         credential_error,
         policy,

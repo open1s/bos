@@ -83,15 +83,13 @@ pub(crate) fn start(
     agent: Arc<::agent::Agent>,
     services: Arc<ServiceRegistry>,
     entries: Vec<LiveEntry>,
-) {
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        return;
-    };
+) -> Option<tokio::task::JoinHandle<()>> {
+    let handle = tokio::runtime::Handle::try_current().ok()?;
     // Subscribe before the first readiness check so a transition between
     // LiveEntry::new() and this task start is either in the stream or in the
     // reconciliation below; the two together leave no gap.
     let mut changes = services.subscribe_changes();
-    handle.spawn(async move {
+    Some(handle.spawn(async move {
         // Initial reconciliation: close the construction/subscription gap.
         reconcile(&entries, &agent, &services, None);
         loop {
@@ -107,7 +105,7 @@ pub(crate) fn start(
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
-    });
+    }))
 }
 
 /// Apply the current readiness of every entry (or only entries naming

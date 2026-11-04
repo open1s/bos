@@ -131,7 +131,14 @@ impl ContributionLease {
 
     /// Remove only the live overlay pieces, keeping commands/panels in place.
     pub(crate) fn suspend_live(&self, agent: &agent::Agent) -> usize {
+        // Close admission first: a retained tool handle must not enter the
+        // runtime after the overlay is removed.
+        self.calls.set_suspended(true);
         self.cancel_in_flight();
+        let calls = Arc::clone(&self.calls);
+        let _ = crate::extension::block_on_tokio(async move {
+            calls.wait_empty(Duration::from_secs(2)).await
+        });
         let tools = agent.remove_live_async_tools(&self.tools);
         let prompts = self
             .prompt_sections
@@ -149,6 +156,7 @@ impl ContributionLease {
     /// entry but `load_skill` answers "not found" for a package that is active
     /// again.
     pub(crate) fn resume_live(&self, agent: &agent::Agent) -> usize {
+        self.calls.set_suspended(false);
         let mut restored = 0;
         for tool in &self.tool_handles {
             if agent.add_live_async_tool(Arc::clone(tool)).is_ok() {
@@ -250,6 +258,9 @@ struct CallState {
     /// finish, so a call started after the last-call decision cannot be hit by
     /// a cancel aimed at an earlier call.
     runtime_cancel: bool,
+    /// Suspension closes admission temporarily; resume reopens it, unlike
+    /// closed which is permanent.
+    suspended: bool,
 }
 
 impl CallTracker {
@@ -259,6 +270,7 @@ impl CallTracker {
                 calls: std::collections::HashMap::new(),
                 closed: false,
                 runtime_cancel: false,
+                suspended: false,
             }),
             changed: tokio::sync::Notify::new(),
             limit: limit.clamp(1, 64),
@@ -283,7 +295,7 @@ impl CallTracker {
                     .state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if state.closed {
+                if state.closed || state.suspended {
                     return None;
                 }
                 if !state.runtime_cancel && state.calls.len() < self.limit {
@@ -327,6 +339,14 @@ impl CallTracker {
             for token in state.calls.values() {
                 token.store(true, Ordering::SeqCst);
             }
+        }
+        self.changed.notify_waiters();
+    }
+
+    /// Close admission temporarily while a contribution is suspended.
+    fn set_suspended(&self, suspended: bool) {
+        if let Ok(mut state) = self.state.lock() {
+            state.suspended = suspended;
         }
         self.changed.notify_waiters();
     }
@@ -726,7 +746,7 @@ impl ExtensionTool {
         // runtime, rather than registering after cancel_all already ran.
         let Some(token) = self.calls.admit(&call_id).await else {
             return Err(agent::tools::ToolError::Failed(
-                "extension contribution has been revoked".to_string(),
+                "extension contribution is not accepting calls".to_string(),
             ));
         };
         let _guard = CallGuard {
@@ -1585,6 +1605,28 @@ mod tests {
         );
         calls.finish("a");
         assert!(calls.wait_empty(Duration::from_millis(20)).await);
+    }
+    #[tokio::test]
+    async fn suspension_closes_admission_for_a_retained_tool_handle() {
+        let scratch = Scratch::new("suspend-admission");
+        let contributor = contributed(Vec::new(), TrustLevel::Local);
+        let descriptor = contributor.tools[0].clone();
+        let tool = ExtensionTool::new(
+            &contributor,
+            descriptor,
+            policy(&scratch),
+            EventBus::new(),
+            None,
+        );
+        tool.run(&serde_json::json!({})).await.expect("admitted");
+        tool.calls.set_suspended(true);
+        let error = tool
+            .run(&serde_json::json!({}))
+            .await
+            .expect_err("suspended tools must refuse new calls");
+        assert!(error.to_string().contains("not accepting calls"), "{error}");
+        tool.calls.set_suspended(false);
+        tool.run(&serde_json::json!({})).await.expect("resumed");
     }
     #[tokio::test]
     async fn revoking_closes_admission_and_signals_in_flight_calls() {
