@@ -17,8 +17,9 @@ use crate::bridge::{
 };
 
 use crate::contract::{empty_schema, CallContext, Runtime, ToolDescriptor};
+use ferris_core::capability::{authorize_each, CallScope, Capability, PolicyEngine};
 use ferris_core::manifest::Manifest;
-use ferris_core::types::{ContributionId, ExtensionError, RuntimeKind};
+use ferris_core::types::{ContributionId, ExtensionError, RuntimeKind, TrustLevel};
 
 /// A live Cordis plugin process and the registrations it announced.
 pub struct CordisRuntime {
@@ -26,12 +27,15 @@ pub struct CordisRuntime {
     root: std::path::PathBuf,
     data_root: std::path::PathBuf,
     options: BridgeOptions,
-    session: Mutex<Option<BridgeSession>>,
+    session: Arc<Mutex<Option<BridgeSession>>>,
     /// Terminal shutdown; deactivate remains reversible.
     stopped: AtomicBool,
     registrations: Mutex<Vec<BridgeRegistration>>,
     tools: Mutex<Vec<ToolDescriptor>>,
     terminal: Arc<dyn ferris_core::terminal::TerminalService>,
+    /// Policy used for host service calls. Absent means deny.
+    policy: Option<Arc<PolicyEngine>>,
+    trust: TrustLevel,
 }
 
 impl CordisRuntime {
@@ -68,12 +72,52 @@ impl CordisRuntime {
             root: root.to_path_buf(),
             data_root: data_root.to_path_buf(),
             options,
-            session: Mutex::new(None),
+            session: Arc::new(Mutex::new(None)),
             stopped: AtomicBool::new(false),
             registrations: Mutex::new(Vec::new()),
             tools: Mutex::new(Vec::new()),
             terminal,
+            policy: None,
+            trust: TrustLevel::Community,
         })
+    }
+
+    /// Attach the policy used to authorize bridge host calls such as
+    /// terminal.run. Without it those calls are denied.
+    #[must_use]
+    pub fn with_authorization(mut self, policy: Arc<PolicyEngine>, trust: TrustLevel) -> Self {
+        self.policy = Some(policy);
+        self.trust = trust;
+        self
+    }
+
+    /// Run the synchronous bridge exchange on a blocking worker and apply the
+    /// caller's deadline to the bridge read.
+    async fn invoke_async(
+        &self,
+        registration: String,
+        arguments: Value,
+        timeout_ms: u64,
+    ) -> Result<Value, ExtensionError> {
+        let session = Arc::clone(&self.session);
+        let outcome = tokio::task::spawn_blocking(move || {
+            let mut slot = session
+                .lock()
+                .map_err(|_| "cordis session lock is poisoned".to_string())?;
+            let session = slot
+                .as_mut()
+                .ok_or_else(|| "the Cordis runtime is not running".to_string())?;
+            session
+                .invoke_with_timeout(
+                    &registration,
+                    arguments,
+                    Some(std::time::Duration::from_millis(timeout_ms.max(1))),
+                )
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| self.error(format!("cordis invoke task failed: {error}")))?;
+        outcome.map_err(|error| self.error(error))
     }
 
     /// Take and terminate the current bridge process. A poisoned mutex still
@@ -122,6 +166,10 @@ impl CordisRuntime {
         let (mut started, manifest) = BridgeSession::start(self.options.clone())
             .map_err(|error| self.error(format!("{}: {error}", self.root.display())))?;
         let terminal = Arc::clone(&self.terminal);
+        let policy = self.policy.clone();
+        let trust = self.trust;
+        let owner = self.extension.clone();
+        let workspace = self.root.clone();
         started.set_host_call(Arc::new(
             move |service: &str, method: &str, params: Value| {
                 if service != "terminal" || method != "run" {
@@ -135,6 +183,17 @@ impl CordisRuntime {
                     .get("cwd")
                     .and_then(Value::as_str)
                     .map(std::path::PathBuf::from);
+                let policy = policy
+                    .as_ref()
+                    .ok_or_else(|| "terminal.run is not authorized".to_string())?;
+                let scope = CallScope {
+                    workspace: Some(workspace.clone()),
+                    path: Some(cwd.clone().unwrap_or_else(|| workspace.clone())),
+                    program: Some(command.to_string()),
+                    ..CallScope::default()
+                };
+                authorize_each(policy, &owner, trust, &[Capability::ProcessExecute], &scope)
+                    .map_err(|error| error.to_string())?;
                 let output = terminal.run(command, cwd)?;
                 Ok(serde_json::json!({
                     "stdout": output.stdout,
@@ -243,32 +302,22 @@ impl Runtime for CordisRuntime {
                     .map(|registration| registration.id.clone())
             })
             .ok_or_else(|| self.error(format!("unknown Cordis command {id}")))?;
-        let mut session = self.session.lock().expect("cordis session lock");
-        let session = session
-            .as_mut()
-            .ok_or_else(|| self.error("the Cordis runtime is not running"))?;
-        session
-            .invoke(&registration, arguments)
-            .map_err(|error| self.error(error))
+        let timeout = self.options.invoke_timeout.as_millis() as u64;
+        self.invoke_async(registration, arguments, timeout).await
     }
 
     async fn call_tool(
         &self,
         name: &str,
         arguments: Value,
-        _context: &CallContext,
+        context: &CallContext,
     ) -> Result<Value, ExtensionError> {
         self.ensure()?;
         let registration = self
             .registration_id(name)
             .ok_or_else(|| self.error(format!("unknown Cordis tool {name}")))?;
-        let mut session = self.session.lock().expect("cordis session lock");
-        let session = session
-            .as_mut()
-            .ok_or_else(|| self.error("the Cordis runtime is not running"))?;
-        session
-            .invoke(&registration, arguments)
-            .map_err(|error| self.error(error))
+        self.invoke_async(registration, arguments, context.timeout_ms)
+            .await
     }
 }
 
@@ -308,8 +357,26 @@ mod tests {
         let manifest = ferris_core::manifest_v2::load_package_manifest(&root).expect("manifest");
         let data_root =
             std::env::temp_dir().join(format!("bsh-cordis-test-{}-{}", std::process::id(), "echo"));
+        std::fs::create_dir_all(&data_root).expect("data root");
+        let policy = Arc::new(
+            PolicyEngine::open(
+                data_root.join("grants.toml"),
+                data_root.join("audit.jsonl"),
+                ferris_core::capability::PolicyMode::Enforce,
+            )
+            .expect("policy"),
+        );
+        policy
+            .grant(
+                manifest.id().as_str(),
+                Capability::ProcessExecute,
+                ferris_core::capability::GrantScope::Any,
+                None,
+            )
+            .expect("grant");
         let runtime = CordisRuntime::new(&manifest, &root, &data_root, Arc::new(TestTerminal))
-            .expect("runtime");
+            .expect("runtime")
+            .with_authorization(policy, TrustLevel::Local);
         let tools = runtime.tools().await.expect("tools");
         assert!(tools.iter().any(|tool| tool.id.as_str() == "echo"));
 

@@ -552,6 +552,19 @@ impl BridgeSession {
     }
     /// Call one registration the plugin announced.
     pub fn invoke(&mut self, registration: &str, input: Value) -> Result<Value, BridgeError> {
+        self.invoke_with_timeout(registration, input, None)
+    }
+
+    /// Invoke with a caller deadline, capped by the bridge's own timeout.
+    pub fn invoke_with_timeout(
+        &mut self,
+        registration: &str,
+        input: Value,
+        timeout: Option<Duration>,
+    ) -> Result<Value, BridgeError> {
+        let timeout = timeout
+            .map(|timeout| timeout.min(self.options.invoke_timeout))
+            .unwrap_or(self.options.invoke_timeout);
         let id = self.mint();
         let frame = json!({
             "id": id,
@@ -562,7 +575,7 @@ impl BridgeSession {
             .map_err(|error| BridgeError::Failed(error.to_string()))?;
         loop {
             let frame = self
-                .read_frame(self.options.invoke_timeout, "invoke")
+                .read_frame(timeout, "invoke")
                 .map_err(|error| BridgeError::Failed(error.to_string()))?;
             match frame.get("type").and_then(Value::as_str) {
                 Some("result") => {

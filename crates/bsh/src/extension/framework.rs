@@ -191,13 +191,15 @@ impl ferris_sdk::RuntimeResolver for FerrisRuntimeResolver {
                 Arc::new(inner) as Arc<dyn ferris_sdk::host_runtime::Runtime>
             }
             ferris_sdk::types::RuntimeKind::Cordis => {
+                let policy = self.policy.clone().ok_or_else(|| missing_port("policy"))?;
                 let inner = ferris_sdk::host_runtime::cordis::CordisRuntime::new(
                     manifest,
                     root,
                     data_root,
                     Arc::new(super::terminal::HostTerminal),
                 )
-                .map_err(runtime_error)?;
+                .map_err(runtime_error)?
+                .with_authorization(policy, self.trust);
                 Arc::new(inner) as Arc<dyn ferris_sdk::host_runtime::Runtime>
             }
             ferris_sdk::types::RuntimeKind::Extism => {

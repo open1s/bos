@@ -190,7 +190,17 @@ impl ProcessSession {
                     }
                     continue;
                 }
-                if let Some(error) = value.get("error") {
+                let result = value.get("result");
+                let error = value.get("error");
+                if result.is_some() == error.is_some() {
+                    return Err(ExtensionError::Protocol {
+                        extension: extension.to_string(),
+                        message: format!(
+                            "JSON-RPC response for {method} must contain exactly one of result or error"
+                        ),
+                    });
+                }
+                if let Some(error) = error {
                     // A decoded JSON-RPC error is an application-level answer,
                     // not a broken pipe: the session stays usable.
                     return Err(ExtensionError::Remote {
@@ -198,7 +208,7 @@ impl ProcessSession {
                         message: jsonrpc_error_message(error),
                     });
                 }
-                return Ok(value.get("result").cloned().unwrap_or(Value::Null));
+                return Ok(result.cloned().unwrap_or(Value::Null));
             }
         };
         match tokio::time::timeout(deadline, exchange).await {

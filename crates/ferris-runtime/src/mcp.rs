@@ -684,6 +684,17 @@ impl McpCore {
                 message: reason,
             })?;
         }
+        if let Some(key) = manifest
+            .runtime
+            .env
+            .keys()
+            .find(|key| ferris_core::manifest::is_dangerous_env(key))
+        {
+            return Err(ExtensionError::Manifest {
+                path: root.join("extension.toml"),
+                message: format!("runtime.env may not set {key}"),
+            });
+        }
         Ok(Self {
             extension: manifest.id().clone(),
             root: root.to_path_buf(),

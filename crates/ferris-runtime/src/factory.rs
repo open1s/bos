@@ -157,7 +157,8 @@ pub fn build(
                     message: "the Cordis runtime needs a terminal service".to_string(),
                 })?;
             let runtime =
-                crate::cordis::CordisRuntime::new(manifest, root, &ports.data_root, terminal)?;
+                crate::cordis::CordisRuntime::new(manifest, root, &ports.data_root, terminal)?
+                    .with_authorization(Arc::clone(&ports.policy), ports.trust);
             let tools = runtime.descriptors()?;
             let contributions = declarative::load_contributions(root, manifest)?;
             finish(
