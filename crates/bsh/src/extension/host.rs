@@ -676,8 +676,12 @@ impl AppliedExtension {
             super::block_on_tokio_scoped(activation.unload_leases(&mut host))
                 .map_err(|error| error.to_string())
         } else {
-            let _ = self.lease.revoke(agent, registry);
-            Ok(())
+            let (_, drained) = self.lease.revoke(agent, registry);
+            if drained {
+                Ok(())
+            } else {
+                Err("lease removed but calls did not drain".to_string())
+            }
         };
         combine_unload(fiber, lease)
     }
@@ -694,8 +698,12 @@ impl AppliedExtension {
             super::block_on_tokio_scoped(activation.unload_leases(&mut host))
                 .map_err(|error| error.to_string())
         } else {
-            let _ = self.lease.revoke(agent, registry);
-            Ok(())
+            let (_, drained) = self.lease.revoke(agent, registry);
+            if drained {
+                Ok(())
+            } else {
+                Err("lease removed but calls did not drain".to_string())
+            }
         };
         combine_unload(fiber, lease)
     }
@@ -1076,6 +1084,34 @@ impl ShutdownReport {
     }
 }
 
+/// One host-owned event-pump thread, so rebuild/shutdown can stop and join it.
+struct PumpHandle {
+    generation: Arc<AtomicU64>,
+    done: std::sync::mpsc::Receiver<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PumpHandle {
+    /// Stop the worker after its current batch and join within two seconds.
+    /// Returns false when a stuck Runtime::pump kept it alive; the caller
+    /// records cleanup-pending and detaches it.
+    fn stop(mut self) -> bool {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        if self
+            .done
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .is_ok()
+        {
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// The extension host.
 pub(crate) struct ExtensionHost {
     config: HostConfig,
@@ -1092,6 +1128,8 @@ pub(crate) struct ExtensionHost {
     graph_cache: Arc<Mutex<Vec<ExtensionGraphNode>>>,
     last_stamp: Option<SystemTime>,
     pump_generation: Arc<AtomicU64>,
+    /// The active event-pump worker, owned so rebuild/shutdown can join it.
+    pump: Option<PumpHandle>,
     /// The active on-startup batch, owned so rebuild/shutdown can stop it.
     warm: Option<WarmStart>,
     /// Runtimes whose shutdown timed out; retried by the next rebuild.
@@ -1224,6 +1262,7 @@ impl ExtensionHost {
             graph_cache,
             last_stamp: None,
             pump_generation: Arc::new(AtomicU64::new(0)),
+            pump: None,
             warm: None,
             pending_shutdown: Vec::new(),
             startup_millis: 0,
@@ -1924,46 +1963,118 @@ impl ExtensionHost {
     /// The thread holds Weak handles, so dropping the host ends it. A new
     /// rebuild increments the generation and the previous thread exits, which
     /// keeps one delivery loop per host rather than one per scan.
-    fn start_event_pump(&self) {
-        let runtimes: Vec<Weak<dyn Runtime>> = self
+    fn start_event_pump(&mut self) {
+        self.stop_event_pump();
+        let runtimes: Vec<(String, Weak<dyn Runtime>)> = self
             .loaded
             .values()
-            .filter_map(|entry| entry.runtime.as_ref())
-            .map(Arc::downgrade)
+            .filter_map(|entry| {
+                entry
+                    .runtime
+                    .as_ref()
+                    .map(|runtime| (entry.package.id().to_string(), Arc::downgrade(runtime)))
+            })
             .collect();
         if runtimes.is_empty() {
             return;
         }
+        // Build the reactor on the host thread so failure is observable here
+        // instead of silently disabling event delivery inside the worker.
+        let Ok(reactor) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            log::warn!(target: "bsh::extension", "no reactor for the extension event pump");
+            self.issues
+                .push("event pump reactor initialization failed".to_string());
+            return;
+        };
         let generation = self.pump_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let watched = Arc::clone(&self.pump_generation);
-        std::thread::Builder::new()
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
             .name("bsh-extension-events".to_string())
             .spawn(move || {
-                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                else {
-                    return;
-                };
+                let mut failures: std::collections::HashMap<String, u32> =
+                    std::collections::HashMap::new();
                 loop {
                     if watched.load(Ordering::SeqCst) != generation {
-                        return;
+                        break;
                     }
-                    let live: Vec<Arc<dyn Runtime>> =
-                        runtimes.iter().filter_map(Weak::upgrade).collect();
+                    let live: Vec<(String, Arc<dyn Runtime>)> = runtimes
+                        .iter()
+                        .filter_map(|(id, runtime)| {
+                            runtime.upgrade().map(|runtime| (id.clone(), runtime))
+                        })
+                        .collect();
                     if live.is_empty() {
-                        return;
+                        break;
                     }
-                    runtime.block_on(async {
-                        for runtime in &live {
-                            let _ = runtime.pump().await;
+                    let mut failed = false;
+                    reactor.block_on(async {
+                        for (id, runtime) in &live {
+                            match runtime.pump().await {
+                                Ok(()) => {
+                                    failures.remove(id);
+                                }
+                                Err(error) => {
+                                    failed = true;
+                                    let count = failures.entry(id.clone()).or_insert(0);
+                                    *count += 1;
+                                    // Rate-limit a permanently failing pump:
+                                    // first failure, then every tenth.
+                                    if *count == 1 || count.is_multiple_of(10) {
+                                        log::warn!(
+                                            target: "bsh::extension",
+                                            "{id} event pump failed {count} times: {error}"
+                                        );
+                                    }
+                                }
+                            }
                         }
                     });
                     drop(live);
-                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    let backoff = if failed {
+                        let streak = failures.values().copied().max().unwrap_or(1);
+                        150_u64 << streak.min(4)
+                    } else {
+                        150
+                    };
+                    std::thread::sleep(std::time::Duration::from_millis(backoff.min(2_000)));
                 }
-            })
-            .ok();
+                let _ = done_tx.send(());
+            });
+        match spawned {
+            Ok(thread) => {
+                self.pump = Some(PumpHandle {
+                    generation: Arc::clone(&self.pump_generation),
+                    done,
+                    thread: Some(thread),
+                });
+            }
+            Err(error) => {
+                log::warn!(
+                    target: "bsh::extension",
+                    "could not start the extension event pump: {error}"
+                );
+                self.issues
+                    .push(format!("event pump thread failed to start: {error}"));
+            }
+        }
+    }
+
+    /// Stop the event pump, bounded; a stuck pump is reported as pending.
+    fn stop_event_pump(&mut self) {
+        if let Some(pump) = self.pump.take() {
+            if !pump.stop() {
+                log::warn!(
+                    target: "bsh::extension",
+                    "event pump did not stop within 2s; a Runtime::pump is still running"
+                );
+                self.issues
+                    .push("extension event pump cleanup pending".to_string());
+            }
+        }
     }
 
     fn build_runtime(&self, package: &Package) -> Result<BuiltRuntime, ExtensionError> {
@@ -2653,7 +2764,8 @@ impl ExtensionHost {
     /// Stop every loaded runtime and end the delivery thread.
     pub(crate) async fn shutdown(&mut self) {
         self.pump_generation.fetch_add(1, Ordering::SeqCst);
-        // Stop activation before stopping the runtimes it might be driving.
+        // Stop the pump and activation before stopping the runtimes they drive.
+        self.stop_event_pump();
         self.stop_warm_startup();
         let runtimes: Vec<(String, Arc<dyn Runtime>)> = self
             .loaded
@@ -4813,6 +4925,37 @@ tools = ["echo"]
             matches!(fiber_only, UnloadError::Fiber(_)),
             "{fiber_only:?}"
         );
+    }
+    #[test]
+    fn the_event_pump_handle_joins_and_reports_a_stuck_worker() {
+        let generation = Arc::new(AtomicU64::new(0));
+        let (tx, done) = std::sync::mpsc::channel();
+        let quick = std::thread::spawn(move || {
+            let _ = tx.send(());
+        });
+        let pump = PumpHandle {
+            generation: Arc::clone(&generation),
+            done,
+            thread: Some(quick),
+        };
+        assert!(pump.stop(), "an idle worker is joined");
+
+        let (tx, done) = std::sync::mpsc::channel();
+        let stuck = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            let _ = tx.send(());
+        });
+        let pump = PumpHandle {
+            generation,
+            done,
+            thread: Some(stuck),
+        };
+        let started = std::time::Instant::now();
+        assert!(
+            !pump.stop(),
+            "a pump still in Runtime::pump is reported as pending"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
     }
     struct FailingShutdown;
 

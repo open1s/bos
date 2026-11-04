@@ -103,19 +103,20 @@ impl ContributionLease {
     }
 
     /// Revoke this extension's tools, prompts, skills, commands and panels.
-    /// Returns the number of contributions removed from the build.
+    /// Returns the number of contributions removed and whether every in-flight
+    /// call drained within the grace period.
     pub(crate) fn revoke(
         &self,
         agent: &mut agent::Agent,
         registry: &mut agent::plugins::PluginRegistry,
-    ) -> usize {
+    ) -> (usize, bool) {
         self.active.store(false, Ordering::SeqCst);
         self.calls.close();
         // The call future observes its token within one poll interval; wait
         // briefly so a revoked tool cannot keep writing after this returns.
         let calls = Arc::clone(&self.calls);
-        crate::extension::block_on_tokio(async move {
-            calls.wait_empty(Duration::from_secs(2)).await;
+        let drained = crate::extension::block_on_tokio(async move {
+            calls.wait_empty(Duration::from_secs(2)).await
         });
         let tools = agent.remove_live_async_tools(&self.tools);
         let prompts = self
@@ -125,7 +126,7 @@ impl ContributionLease {
             .count();
         let skills = agent.remove_live_skills_by_paths(&self.skill_paths);
         let items = registry.remove_owner(&self.owner);
-        tools + prompts + skills + items
+        (tools + prompts + skills + items, drained)
     }
 
     /// Remove only the live overlay pieces, keeping commands/panels in place.
@@ -200,7 +201,13 @@ impl ferris_sdk::ContributionLease for ContributionLease {
         host.remove_registry_owner(&self.owner);
         // Cancellation is a signal; wait, bounded, for the calls to actually
         // leave before reporting the lease revoked.
-        self.calls.wait_empty(Duration::from_secs(2)).await;
+        if !self.calls.wait_empty(Duration::from_secs(2)).await {
+            return Err(ferris_sdk::ExtError {
+                code: ferris_sdk::ErrorCode::Lifecycle,
+                message: "lease removal completed but in-flight calls did not drain".to_string(),
+                details: serde_json::Value::Null,
+            });
+        }
         Ok(())
     }
 }
@@ -370,17 +377,17 @@ impl CallTracker {
     }
 
     /// Wait, bounded, for every call to leave the tracker.
-    async fn wait_empty(&self, grace: Duration) {
+    async fn wait_empty(&self, grace: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + grace;
         loop {
             let notified = self.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             if self.in_flight() == 0 {
-                return;
+                return true;
             }
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                return;
+                return false;
             }
         }
     }
@@ -1568,6 +1575,17 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn wait_empty_reports_whether_calls_drained() {
+        let calls = CallTracker::new(2);
+        let _call = calls.admit("a").await.expect("admitted");
+        assert!(
+            !calls.wait_empty(Duration::from_millis(20)).await,
+            "a still-running call must report an incomplete drain"
+        );
+        calls.finish("a");
+        assert!(calls.wait_empty(Duration::from_millis(20)).await);
+    }
     #[tokio::test]
     async fn revoking_closes_admission_and_signals_in_flight_calls() {
         let calls = CallTracker::new(2);

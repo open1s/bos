@@ -255,26 +255,56 @@ impl ExtensionManager {
             .map(|activation| (activation.extension.clone(), activation))
             .collect();
         let mut activations = Vec::new();
+        let mut leftovers = Vec::new();
+        let mut primary: Option<ExtError> = None;
         for id in &plan.order {
             if let Some(existing) = old.remove(id) {
-                let current_version = self.version_of(id)?;
-                if existing.version == current_version {
-                    activations.push(existing);
-                    continue;
+                match self.version_of(id) {
+                    Ok(current_version) if existing.version == current_version => {
+                        activations.push(existing);
+                        continue;
+                    }
+                    Ok(_) => {
+                        if let Err(error) = existing.shutdown(host).await {
+                            primary = Some(error);
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        leftovers.push(existing);
+                        primary = Some(error);
+                        break;
+                    }
                 }
-                existing.shutdown(host).await?;
             }
             match self.build_activation(id, agent, registry).await {
                 Ok(activation) => activations.push(activation),
                 Err(error) => {
-                    shutdown_all(activations, host).await;
-                    shutdown_all(old.into_values().collect(), host).await;
-                    return Err(error);
+                    primary = Some(error);
+                    break;
                 }
             }
         }
-        for (_, activation) in old {
-            activation.shutdown(host).await?;
+        if primary.is_none() {
+            let mut removed: Vec<Activation> = std::mem::take(&mut old).into_values().collect();
+            removed.append(&mut leftovers);
+            let failures = shutdown_all_collect(removed, host).await;
+            if !failures.is_empty() {
+                primary = Some(cleanup_error(
+                    ExtError {
+                        code: ErrorCode::Lifecycle,
+                        message: "reload could not shut down superseded activations".to_string(),
+                        details: serde_json::Value::Null,
+                    },
+                    failures,
+                ));
+            }
+        }
+        if let Some(primary) = primary {
+            let mut failures = shutdown_all_collect(activations, host).await;
+            failures.extend(shutdown_all_collect(leftovers, host).await);
+            failures.extend(shutdown_all_collect(old.into_values().collect(), host).await);
+            return Err(cleanup_error(primary, failures));
         }
         Ok(ActivationSet { activations })
     }
@@ -310,13 +340,26 @@ impl ExtensionManager {
             })?;
         let data_root = self.store.data_dir(&extension_id);
         let runtime = runtimes.create(&manifest, &root, &data_root)?;
-        let listed = runtime
+        let listed = match runtime
             .start(&RuntimeContext {
                 extension: id.to_string(),
                 root: root.clone(),
                 data_root,
             })
-            .await?;
+            .await
+        {
+            Ok(listed) => listed,
+            Err(primary) => {
+                // start() may have created a child or background task before
+                // failing; the runtime is not yet owned by an Activation, so
+                // shut it down here and keep the original error primary.
+                let cleanup = runtime.shutdown().await.err();
+                return Err(match cleanup {
+                    Some(error) => cleanup_error(primary, vec![(id.to_string(), error)]),
+                    None => primary,
+                });
+            }
+        };
         let lease = match contributions.apply(id, listed, agent, registry).await {
             Ok(lease) => lease,
             Err(error) => {
@@ -433,6 +476,38 @@ pub struct Activation {
     /// Runtime holding the contributions.
     pub runtime: Arc<dyn Runtime>,
     leases: Vec<Box<dyn ContributionLease>>,
+}
+
+/// Shut every activation down, collecting the failures instead of dropping them.
+async fn shutdown_all_collect(
+    activations: Vec<Activation>,
+    host: &mut dyn LeaseHost,
+) -> Vec<(String, ExtError)> {
+    let mut failures = Vec::new();
+    for activation in activations.into_iter().rev() {
+        let id = activation.extension.clone();
+        if let Err(error) = activation.shutdown(host).await {
+            failures.push((id, error));
+        }
+    }
+    failures
+}
+
+/// Preserve the primary error and report every cleanup failure beside it.
+fn cleanup_error(primary: ExtError, failures: Vec<(String, ExtError)>) -> ExtError {
+    if failures.is_empty() {
+        return primary;
+    }
+    let detail = failures
+        .iter()
+        .map(|(id, error)| format!("{id}: {}", error.message))
+        .collect::<Vec<_>>()
+        .join("; ");
+    ExtError {
+        code: primary.code,
+        message: format!("{}; cleanup failed for {detail}", primary.message),
+        details: primary.details,
+    }
 }
 
 async fn shutdown_all(activations: Vec<Activation>, host: &mut dyn LeaseHost) {
@@ -750,6 +825,209 @@ mod tests {
         assert_eq!(revoked.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
+    struct CountingRuntime {
+        shutdowns: Arc<std::sync::atomic::AtomicUsize>,
+        fail_shutdown: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::Runtime for CountingRuntime {
+        fn kind(&self) -> &str {
+            "counting"
+        }
+
+        async fn start(
+            &self,
+            _ctx: &crate::RuntimeContext,
+        ) -> Result<Vec<crate::Contribution>, ExtError> {
+            Ok(Vec::new())
+        }
+
+        async fn invoke(
+            &self,
+            _contribution: &crate::ContributionRef,
+            _input: serde_json::Value,
+            _ctx: &crate::InvokeContext,
+        ) -> Result<serde_json::Value, ExtError> {
+            Ok(serde_json::Value::Null)
+        }
+
+        async fn shutdown(&self) -> Result<(), ExtError> {
+            self.shutdowns
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail_shutdown {
+                Err(ExtError {
+                    code: ErrorCode::Runtime,
+                    message: "shutdown failed".to_string(),
+                    details: serde_json::Value::Null,
+                })
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    struct StartFailingRuntime {
+        shutdowns: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::Runtime for StartFailingRuntime {
+        fn kind(&self) -> &str {
+            "start-failing"
+        }
+
+        async fn start(
+            &self,
+            _ctx: &crate::RuntimeContext,
+        ) -> Result<Vec<crate::Contribution>, ExtError> {
+            Err(ExtError {
+                code: ErrorCode::Runtime,
+                message: "start failed".to_string(),
+                details: serde_json::Value::Null,
+            })
+        }
+
+        async fn invoke(
+            &self,
+            _contribution: &crate::ContributionRef,
+            _input: serde_json::Value,
+            _ctx: &crate::InvokeContext,
+        ) -> Result<serde_json::Value, ExtError> {
+            Ok(serde_json::Value::Null)
+        }
+
+        async fn shutdown(&self) -> Result<(), ExtError> {
+            self.shutdowns
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct StartFailResolver(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl crate::RuntimeResolver for StartFailResolver {
+        fn create(
+            &self,
+            _manifest: &Manifest,
+            _root: &Path,
+            _data_root: &Path,
+        ) -> Result<Arc<dyn crate::Runtime>, ExtError> {
+            Ok(Arc::new(StartFailingRuntime {
+                shutdowns: Arc::clone(&self.0),
+            }))
+        }
+    }
+
+    fn test_activation(
+        extension: &str,
+        version: &str,
+        runtime: Arc<dyn crate::Runtime>,
+        revoked: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Activation {
+        Activation {
+            extension: extension.to_string(),
+            version: version.to_string(),
+            runtime,
+            leases: vec![Box::new(MockLease(revoked))],
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_start_still_shuts_the_runtime_down() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let host = Arc::new(DemoHost {
+            root: root.path().to_path_buf(),
+            capabilities: CapabilityRegistry::default(),
+            contracts: ServiceContractRegistry::default(),
+        });
+        let shutdowns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let manager = ExtensionManager::open(host).expect("manager").with_ports(
+            Arc::new(StartFailResolver(Arc::clone(&shutdowns))),
+            Arc::new(MockSink(Arc::new(std::sync::atomic::AtomicUsize::new(0)))),
+        );
+        let example =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/extensions/hello");
+        manager.install(&example).expect("install");
+        let error = manager
+            .build_activation("com.example.hello", &mut (), &mut ())
+            .await
+            .err()
+            .expect("start must fail");
+        assert!(error.message.contains("start failed"), "{error:?}");
+        assert_eq!(shutdowns.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn reload_cleans_up_when_the_version_lookup_fails() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let host = Arc::new(DemoHost {
+            root: root.path().to_path_buf(),
+            capabilities: CapabilityRegistry::default(),
+            contracts: ServiceContractRegistry::default(),
+        });
+        let manager = ExtensionManager::open(host).expect("manager");
+        let revoked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let shutdowns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runtime: Arc<dyn crate::Runtime> = Arc::new(CountingRuntime {
+            shutdowns: Arc::clone(&shutdowns),
+            fail_shutdown: false,
+        });
+        let current = ActivationSet {
+            activations: vec![test_activation(
+                "com.example.missing",
+                "1.0.0",
+                runtime,
+                Arc::clone(&revoked),
+            )],
+        };
+        let plan = ManagerPlan {
+            order: vec!["com.example.missing".to_string()],
+        };
+        let mut host = TestHost;
+        let error = manager
+            .reload(current, &plan, &mut (), &mut (), &mut host)
+            .await
+            .err()
+            .expect("the version lookup fails");
+        assert!(error.message.contains("version"), "{error:?}");
+        assert_eq!(revoked.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(shutdowns.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn reload_reports_a_removed_activation_shutdown_failure() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let host = Arc::new(DemoHost {
+            root: root.path().to_path_buf(),
+            capabilities: CapabilityRegistry::default(),
+            contracts: ServiceContractRegistry::default(),
+        });
+        let manager = ExtensionManager::open(host).expect("manager");
+        let revoked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let shutdowns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runtime: Arc<dyn crate::Runtime> = Arc::new(CountingRuntime {
+            shutdowns: Arc::clone(&shutdowns),
+            fail_shutdown: true,
+        });
+        let current = ActivationSet {
+            activations: vec![test_activation(
+                "com.example.removed",
+                "1.0.0",
+                runtime,
+                Arc::clone(&revoked),
+            )],
+        };
+        let plan = ManagerPlan { order: Vec::new() };
+        let mut host = TestHost;
+        let error = manager
+            .reload(current, &plan, &mut (), &mut (), &mut host)
+            .await
+            .err()
+            .expect("the cleanup failure must be reported");
+        assert!(error.message.contains("cleanup failed"), "{error:?}");
+        assert_eq!(revoked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
     #[test]
     fn install_then_plan_orders_the_package() {
         let root = tempfile::tempdir().expect("tempdir");

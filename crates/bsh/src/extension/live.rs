@@ -87,29 +87,57 @@ pub(crate) fn start(
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return;
     };
+    // Subscribe before the first readiness check so a transition between
+    // LiveEntry::new() and this task start is either in the stream or in the
+    // reconciliation below; the two together leave no gap.
+    let mut changes = services.subscribe_changes();
     handle.spawn(async move {
-        let mut changes = services.subscribe_changes();
-        while let Ok(change) = changes.recv().await {
-            for entry in &entries {
-                if !entry
-                    .requirements
-                    .iter()
-                    .any(|(name, _)| name == &change.name)
-                {
-                    continue;
+        // Initial reconciliation: close the construction/subscription gap.
+        reconcile(&entries, &agent, &services, None);
+        loop {
+            match changes.recv().await {
+                Ok(change) => reconcile(&entries, &agent, &services, Some(&change.name)),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    log::warn!(
+                        target: "bsh::extension",
+                        "live service watcher lagged {skipped} events; reconciling against the registry"
+                    );
+                    reconcile(&entries, &agent, &services, None);
                 }
-                let ready = entry.ready(&services);
-                let suspended = entry.suspended.load(Ordering::Acquire);
-                if !ready && !suspended {
-                    entry.lease.suspend_live(&agent);
-                    entry.suspended.store(true, Ordering::Release);
-                    set_suspended(&entry.id, true);
-                } else if ready && suspended {
-                    entry.lease.resume_live(&agent);
-                    entry.suspended.store(false, Ordering::Release);
-                    set_suspended(&entry.id, false);
-                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
     });
+}
+
+/// Apply the current readiness of every entry (or only entries naming
+/// `changed`) against the registry, which is authoritative after a lag.
+fn reconcile(
+    entries: &[LiveEntry],
+    agent: &Arc<::agent::Agent>,
+    services: &ServiceRegistry,
+    changed: Option<&str>,
+) {
+    for entry in entries {
+        if let Some(name) = changed {
+            if !entry
+                .requirements
+                .iter()
+                .any(|(required, _)| required == name)
+            {
+                continue;
+            }
+        }
+        let ready = entry.ready(services);
+        let suspended = entry.suspended.load(Ordering::Acquire);
+        if !ready && !suspended {
+            entry.lease.suspend_live(agent);
+            entry.suspended.store(true, Ordering::Release);
+            set_suspended(&entry.id, true);
+        } else if ready && suspended {
+            entry.lease.resume_live(agent);
+            entry.suspended.store(false, Ordering::Release);
+            set_suspended(&entry.id, false);
+        }
+    }
 }

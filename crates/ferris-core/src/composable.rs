@@ -188,9 +188,10 @@ type GenerationKey = (Scope, Option<String>, String);
 
 pub struct ServiceRegistry {
     entries: RwLock<HashMap<ServiceKey, (u64, Arc<ServiceGeneration>)>>,
-    /// Generation index keyed by scope, realm and name, independent of the
-    /// concrete Rust type. Coeffect snapshots use it to detect replacement.
-    generations: RwLock<HashMap<GenerationKey, u64>>,
+    /// Generation index keyed by scope, realm and name. Each name keeps every
+    /// concrete type currently registered under it, so revoking one type does
+    /// not hide a different one that is still live.
+    generations: RwLock<HashMap<GenerationKey, HashMap<TypeId, u64>>>,
     next_generation: AtomicU64,
     changes: tokio::sync::broadcast::Sender<ServiceChange>,
 }
@@ -285,10 +286,10 @@ impl ServiceRegistry {
         let new_generation = Arc::new(ServiceGeneration::new(service));
         let previous = entries.insert(key.clone(), (generation, new_generation));
         if let Ok(mut generations) = self.generations.write() {
-            generations.insert(
-                (key.scope.clone(), key.realm.clone(), key.name.clone()),
-                generation,
-            );
+            generations
+                .entry((key.scope.clone(), key.realm.clone(), key.name.clone()))
+                .or_default()
+                .insert(key.type_id, generation);
         }
         // Retire while holding the write lock. No new lease can race in after
         // the replacement becomes visible.
@@ -432,20 +433,34 @@ impl ServiceRegistry {
             return None;
         }
         let (generation, owner) = entries.remove(&token.key)?;
+        let name_key = (
+            token.key.scope.clone(),
+            token.key.realm.clone(),
+            token.key.name.clone(),
+        );
+        let mut reported_generation = generation;
+        let mut kind = ServiceChangeKind::Unavailable;
         if let Ok(mut generations) = self.generations.write() {
-            generations.remove(&(
-                token.key.scope.clone(),
-                token.key.realm.clone(),
-                token.key.name.clone(),
-            ));
+            if let Some(state) = generations.get_mut(&name_key) {
+                state.remove(&token.key.type_id);
+                if state.is_empty() {
+                    generations.remove(&name_key);
+                } else {
+                    // Another concrete type still provides this name: the name
+                    // remains available and its generation is the newest live
+                    // provider, not the one that was just revoked.
+                    kind = ServiceChangeKind::Replaced;
+                    reported_generation = state.values().copied().max().unwrap_or(generation);
+                }
+            }
         }
         owner.retire();
         let _ = self.changes.send(ServiceChange {
             name: token.key.name.clone(),
             scope: token.key.scope.clone(),
             realm: token.key.realm.clone(),
-            generation,
-            kind: ServiceChangeKind::Unavailable,
+            generation: reported_generation,
+            kind,
         });
         drop(entries);
         Some(ServiceRetirement { generation, owner })
@@ -476,7 +491,7 @@ impl ServiceRegistry {
             .read()
             .ok()?
             .get(&(scope.clone(), realm.map(str::to_owned), name.to_owned()))
-            .copied()
+            .and_then(|state| state.values().copied().max())
     }
 
     /// Whether a service of this exact type/name/scope is currently available.
@@ -940,6 +955,30 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
+    #[test]
+    fn a_name_survives_revoking_one_of_two_concrete_types() {
+        let registry = ServiceRegistry::new();
+        let scope = Scope::Session("s1".into());
+        let number = registry.provide(scope.clone(), "mixed", Arc::new(7_u64));
+        let text = registry.provide(scope.clone(), "mixed", Arc::new("seven".to_string()));
+        assert!(registry.has_name("mixed"));
+        assert_eq!(
+            registry.generation(&scope, "mixed"),
+            Some(text.generation),
+            "the newest live provider is the reported generation"
+        );
+        assert!(registry.revoke(&number));
+        assert!(
+            registry.has_name("mixed"),
+            "revoking u64 must not hide the live String provider"
+        );
+        assert!(registry.get::<String>(&scope, "mixed").is_some());
+        assert!(registry.get::<u64>(&scope, "mixed").is_none());
+        assert_eq!(registry.generation(&scope, "mixed"), Some(text.generation));
+        assert!(registry.revoke(&text));
+        assert!(!registry.has_name("mixed"));
+        assert_eq!(registry.generation(&scope, "mixed"), None);
+    }
     #[test]
     fn service_replacement_is_generation_safe() {
         let registry = ServiceRegistry::new();
