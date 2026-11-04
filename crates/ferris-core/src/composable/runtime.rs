@@ -44,6 +44,9 @@ pub enum RuntimeError {
     Transition(FiberTransitionError),
     /// The component rejected activation.
     Apply(String),
+    /// One or more fibers failed during a reconciliation batch; the rest of
+    /// the batch still ran and the failed ids were requeued.
+    Batch(Vec<String>),
 }
 
 impl fmt::Display for RuntimeError {
@@ -53,6 +56,7 @@ impl fmt::Display for RuntimeError {
             Self::NotRegistered(id) => write!(f, "component {id} is not registered"),
             Self::Transition(error) => fmt::Display::fmt(error, f),
             Self::Apply(message) => write!(f, "component apply failed: {message}"),
+            Self::Batch(errors) => write!(f, "reconciliation failed: {}", errors.join("; ")),
         }
     }
 }
@@ -113,6 +117,10 @@ pub struct CompositionRuntime {
     fibers: Mutex<BTreeMap<String, ManagedFiber>>,
     suspended: Mutex<BTreeMap<String, SuspendedFiber>>,
     reconciler: Mutex<Reconciler>,
+    /// One async lifecycle gate per component id. Activate, unload and
+    /// reconcile take it before touching that id, so remove-then-await cannot
+    /// overlap another lifecycle transition on the same id.
+    lifecycle: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl Default for CompositionRuntime {
@@ -134,7 +142,14 @@ impl CompositionRuntime {
             fibers: Mutex::new(BTreeMap::new()),
             suspended: Mutex::new(BTreeMap::new()),
             reconciler: Mutex::new(Reconciler::new()),
+            lifecycle: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// The per-id lifecycle gate, created on first use.
+    fn gate(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut gates = self.lifecycle.lock().expect("lifecycle map poisoned");
+        Arc::clone(gates.entry(id.to_owned()).or_default())
     }
 
     /// The service registry this runtime composes against.
@@ -152,6 +167,8 @@ impl CompositionRuntime {
         inject: Inject,
     ) -> Result<(), RuntimeError> {
         let id = id.into();
+        let gate = self.gate(&id);
+        let _lifecycle = gate.lock().await;
         if self.is_active(&id) || self.is_suspended(&id) {
             return Err(RuntimeError::AlreadyRegistered(id));
         }
@@ -212,6 +229,8 @@ impl CompositionRuntime {
 
     /// Unload one component and await its effects.
     pub async fn unload(&self, id: &str) -> Result<DisposalReport, RuntimeError> {
+        let gate = self.gate(id);
+        let _lifecycle = gate.lock().await;
         let managed = self.fibers.lock().expect("fiber map poisoned").remove(id);
         let suspended = self
             .suspended
@@ -247,13 +266,32 @@ impl CompositionRuntime {
             reconciler.drain()
         };
         let mut changed = 0;
+        let mut failed = Vec::new();
         for id in affected {
-            changed += self.reconcile_one(&id).await?;
+            match self.reconcile_one(&id).await {
+                Ok(count) => changed += count,
+                Err(error) => failed.push((id, error)),
+            }
+        }
+        if !failed.is_empty() {
+            // Keep the failed ids dirty for a later service change instead of
+            // dropping work that a partial batch could not finish.
+            if let Ok(mut reconciler) = self.reconciler.lock() {
+                reconciler.requeue(failed.iter().map(|(id, _)| id.clone()));
+            }
+            return Err(RuntimeError::Batch(
+                failed
+                    .into_iter()
+                    .map(|(id, error)| format!("{id}: {error}"))
+                    .collect(),
+            ));
         }
         Ok(changed)
     }
 
     async fn reconcile_one(&self, id: &str) -> Result<usize, RuntimeError> {
+        let gate = self.gate(id);
+        let _lifecycle = gate.lock().await;
         let managed = { self.fibers.lock().expect("fiber map poisoned").remove(id) };
         if let Some(managed) = managed {
             return self.reconcile_active(id, managed).await;
@@ -266,14 +304,30 @@ impl CompositionRuntime {
         };
         if let Some(suspended) = suspended {
             if suspended.inject.hard_ready(&self.services) {
-                self.start(
-                    id,
-                    suspended.scope,
-                    Arc::clone(&suspended.component),
-                    suspended.inject,
-                )
-                .await?;
-                return Ok(1);
+                let inject = suspended.inject.clone();
+                let component = Arc::clone(&suspended.component);
+                let scope = suspended.scope.clone();
+                match self
+                    .start(id, scope.clone(), Arc::clone(&component), inject.clone())
+                    .await
+                {
+                    Ok(()) => return Ok(1),
+                    Err(error) => {
+                        // Keep the fiber retryable and let on_change requeue it.
+                        self.suspended
+                            .lock()
+                            .expect("suspended map poisoned")
+                            .insert(
+                                id.to_owned(),
+                                SuspendedFiber {
+                                    component,
+                                    inject,
+                                    scope,
+                                },
+                            );
+                        return Err(error);
+                    }
+                }
             }
             self.suspended
                 .lock()
@@ -299,8 +353,28 @@ impl CompositionRuntime {
                 let inject = managed.fiber.inject().clone();
                 let component = Arc::clone(&managed.component);
                 managed.fiber.dispose_async().await?;
-                self.start(id, scope, component, inject).await?;
-                Ok(1)
+                match self
+                    .start(id, scope.clone(), Arc::clone(&component), inject.clone())
+                    .await
+                {
+                    Ok(()) => Ok(1),
+                    Err(error) => {
+                        // The old fiber is gone; keep the component retryable
+                        // rather than dropping it on a transient apply error.
+                        self.suspended
+                            .lock()
+                            .expect("suspended map poisoned")
+                            .insert(
+                                id.to_owned(),
+                                SuspendedFiber {
+                                    component,
+                                    inject,
+                                    scope,
+                                },
+                            );
+                        Err(error)
+                    }
+                }
             }
             RefreshAction::Suspend => {
                 let inject = managed.fiber.inject().clone();
@@ -441,7 +515,7 @@ mod tests {
     use super::super::context::EffectCleanup;
     use super::*;
     use crate::composable::{ServiceChangeKind, ServiceToken};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn change(kind: ServiceChangeKind, name: &str, generation: u64) -> ServiceChange {
         ServiceChange {
@@ -593,6 +667,124 @@ mod tests {
         assert_eq!(cleanups.load(Ordering::SeqCst), 2);
     }
 
+    #[tokio::test]
+    async fn one_failing_dependent_does_not_skip_the_rest_of_the_batch() {
+        let runtime = CompositionRuntime::new();
+        let inject = Inject::default().require(Scope::Host, "clock");
+        for (id, fails) in [("a", true), ("b", false), ("c", false)] {
+            let component = move |_ctx: &Context| {
+                if fails {
+                    Err("boom".to_string())
+                } else {
+                    Ok(())
+                }
+            };
+            runtime
+                .activate(id, Scope::Host, Arc::new(component), inject.clone())
+                .await
+                .expect("activate");
+            assert!(runtime.is_suspended(id));
+        }
+        let _clock = runtime
+            .services()
+            .provide(Scope::Host, "clock", Arc::new(1_u64));
+        let error = match runtime
+            .on_change(&change(ServiceChangeKind::Available, "clock", 1))
+            .await
+        {
+            Ok(_) => panic!("the failing dependent must be reported"),
+            Err(error) => error,
+        };
+        match error {
+            RuntimeError::Batch(errors) => assert_eq!(errors.len(), 1, "{errors:?}"),
+            other => panic!("expected a batch error, got {other:?}"),
+        }
+        assert!(runtime.is_active("b"), "the second dependent still ran");
+        assert!(runtime.is_active("c"), "the third dependent still ran");
+        assert!(
+            runtime.is_suspended("a"),
+            "the failed dependent stays retryable"
+        );
+    }
+
+    #[tokio::test]
+    async fn unload_does_not_forget_a_fiber_activated_during_its_disposal() {
+        let runtime = Arc::new(CompositionRuntime::new());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let cleanup_done = Arc::new(AtomicBool::new(false));
+        let first = {
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            let cleanup_done = Arc::clone(&cleanup_done);
+            move |ctx: &Context| {
+                let started = Arc::clone(&started);
+                let release = Arc::clone(&release);
+                let cleanup_done = Arc::clone(&cleanup_done);
+                ctx.effect("blocking", move |_| {
+                    EffectCleanup::async_cleanup(async move {
+                        started.notify_waiters();
+                        release.notified().await;
+                        cleanup_done.store(true, Ordering::SeqCst);
+                    })
+                })
+                .map_err(|error| error.to_string())?;
+                Ok(())
+            }
+        };
+        let inject = Inject::default().require(Scope::Host, "clock");
+        let _clock = runtime
+            .services()
+            .provide(Scope::Host, "clock", Arc::new(1_u64));
+        runtime
+            .activate("x", Scope::Host, Arc::new(first), inject.clone())
+            .await
+            .expect("activate");
+
+        let unload = {
+            let runtime = Arc::clone(&runtime);
+            tokio::spawn(async move { runtime.unload("x").await })
+        };
+        started.notified().await;
+
+        let second = {
+            let cleanup_done = Arc::clone(&cleanup_done);
+            move |_ctx: &Context| {
+                if cleanup_done.load(Ordering::SeqCst) {
+                    Ok(())
+                } else {
+                    Err("activated before the old disposal finished".to_string())
+                }
+            }
+        };
+        let activate = {
+            let runtime = Arc::clone(&runtime);
+            tokio::spawn(async move {
+                runtime
+                    .activate("x", Scope::Host, Arc::new(second), inject.clone())
+                    .await
+            })
+        };
+        release.notify_waiters();
+        unload.await.expect("join unload").expect("unload");
+        activate
+            .await
+            .expect("join activate")
+            .expect("activate after unload");
+
+        let token = runtime
+            .services()
+            .provide(Scope::Host, "clock", Arc::new(2_u64));
+        runtime.services().revoke(&token);
+        runtime
+            .on_change(&change(ServiceChangeKind::Unavailable, "clock", 2))
+            .await
+            .expect("unavailable");
+        assert!(
+            runtime.is_suspended("x"),
+            "the new fiber's reconciler registration must survive the old unload"
+        );
+    }
     #[tokio::test]
     async fn unload_disposes_effects_and_forgets_the_fiber() {
         let runtime = CompositionRuntime::new();

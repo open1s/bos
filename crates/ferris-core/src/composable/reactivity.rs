@@ -360,6 +360,11 @@ impl Reconciler {
         self.dirty.extend(self.index.affected_many(changes));
     }
 
+    /// Put ids back into the dirty set, e.g. after a failed reconciliation.
+    pub fn requeue(&mut self, ids: impl IntoIterator<Item = String>) {
+        self.dirty.extend(ids);
+    }
+
     /// Take the current dirty set in deterministic order. The next drain starts
     /// empty, so a fiber is refreshed once per coalesced batch.
     pub fn drain(&mut self) -> Vec<String> {
