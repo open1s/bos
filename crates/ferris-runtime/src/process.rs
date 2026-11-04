@@ -380,6 +380,15 @@ pub fn linux_bwrap_plan(
         plan.push(path.display().to_string());
         bound.push(path);
     }
+    // A tmpfs hides these roots but is still writable, so a child could create
+    // files under its host HOME path. The sandbox promises writes only inside
+    // the package, workspace, data root and temp: remount the hidden roots
+    // read-only after the explicit binds, which remain writable as separate
+    // mounts underneath them.
+    for hidden in ["/home", "/root", "/run"] {
+        plan.push("--remount-ro".to_string());
+        plan.push(hidden.to_string());
+    }
     plan.push("--chdir".to_string());
     plan.push(root.display().to_string());
     plan.push(program.display().to_string());
