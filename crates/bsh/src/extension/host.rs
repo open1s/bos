@@ -1213,10 +1213,25 @@ impl ExtensionHost {
     }
 
     /// Open the host-neutral manager against this host's root.
+    ///
+    /// Built-ins are linked into the binary, so the manager's store has no
+    /// registry entry and no installed version to read back for them: register
+    /// each one with its manifest, runtime and root so it can be planned and
+    /// activated like an installed package.
     pub(crate) fn framework_manager(
         &self,
     ) -> Result<ferris_sdk::manager::ExtensionManager, ferris_sdk::ExtError> {
-        super::framework::manager_for(self.config.root.clone(), self.config.workspace.clone())
+        let mut manager = super::framework::manager_for(
+            self.config.root.clone(),
+            self.config.workspace.clone(),
+        )?;
+        for builtin in &self.builtins {
+            manager.register_linked(
+                builtin.package.manifest.clone(),
+                builtin.package.root.clone(),
+            );
+        }
+        Ok(manager)
     }
 
     /// The host-scoped service registry shared by its extension activations.
@@ -2159,13 +2174,7 @@ impl ExtensionHost {
             }
             // The preset is a property of this build, not of the cached host:
             // the host is shared across presets, so the filter arrives here.
-            // Built-ins are the host's own baseline. A preset lists bundles and
-            // package ids and never names a built-in's id, so filtering them
-            // here would strip diagnostics and the extension inventory from
-            // every build whose preset names any bundle at all.
-            if entry.package.source != ExtensionSource::Builtin
-                && preset_allowed
-                    .is_some_and(|allowed| !allowed.contains(entry.package.id().as_str()))
+            if preset_allowed.is_some_and(|allowed| !allowed.contains(entry.package.id().as_str()))
             {
                 continue;
             }
@@ -2259,13 +2268,7 @@ impl ExtensionHost {
             if !entry.applied || entry.error.is_some() {
                 continue;
             }
-            // Built-ins are the host's own baseline. A preset lists bundles and
-            // package ids and never names a built-in's id, so filtering them
-            // here would strip diagnostics and the extension inventory from
-            // every build whose preset names any bundle at all.
-            if entry.package.source != ExtensionSource::Builtin
-                && preset_allowed
-                    .is_some_and(|allowed| !allowed.contains(entry.package.id().as_str()))
+            if preset_allowed.is_some_and(|allowed| !allowed.contains(entry.package.id().as_str()))
             {
                 continue;
             }

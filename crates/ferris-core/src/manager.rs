@@ -51,6 +51,20 @@ pub struct ExtensionManager {
     store: ExtensionStore,
     runtimes: Option<Arc<dyn RuntimeResolver>>,
     contributions: Option<Arc<dyn ContributionSink>>,
+    /// Packages linked into the host binary, keyed by id.
+    linked: std::collections::BTreeMap<String, LinkedPackage>,
+}
+
+/// One package compiled into the host rather than installed on disk.
+///
+/// It carries its manifest and its runtime, so it plans and activates by id
+/// without a registry entry, an installed version or a store directory.
+#[derive(Clone)]
+struct LinkedPackage {
+    /// The manifest the plan reads (identity, dependencies, services).
+    manifest: crate::manifest::Manifest,
+    /// The package root handed to the runtime resolver and at start.
+    root: PathBuf,
 }
 
 impl ExtensionManager {
@@ -66,7 +80,22 @@ impl ExtensionManager {
             store,
             runtimes: None,
             contributions: None,
+            linked: std::collections::BTreeMap::new(),
         })
+    }
+
+    /// Register a package linked into the host binary.
+    ///
+    /// A linked package is not read from the store: the manifest and runtime
+    /// are supplied here, so it plans and activates without an installed
+    /// version on disk. Registering the same id twice replaces the earlier
+    /// entry. The store's enabled flag still applies, so a reader can switch a
+    /// linked package off like any other.
+    pub fn register_linked(&mut self, manifest: crate::manifest::Manifest, root: PathBuf) {
+        self.linked.insert(
+            manifest.id().as_str().to_string(),
+            LinkedPackage { manifest, root },
+        );
     }
 
     /// Attach the runtime resolver and contribution sink used by apply.
@@ -338,11 +367,6 @@ impl ExtensionManager {
         agent: &mut (dyn std::any::Any + Send),
         registry: &mut (dyn std::any::Any + Send),
     ) -> Result<Activation, ExtError> {
-        let runtimes = self.runtimes.as_ref().ok_or_else(|| ExtError {
-            code: ErrorCode::Runtime,
-            message: "no runtime resolver is attached".to_string(),
-            details: serde_json::Value::Null,
-        })?;
         let contributions = self.contributions.as_ref().ok_or_else(|| ExtError {
             code: ErrorCode::Contribution,
             message: "no contribution sink is attached".to_string(),
@@ -353,10 +377,27 @@ impl ExtensionManager {
             message: error.to_string(),
             details: serde_json::Value::Null,
         })?;
-        let version = self.version_of(id)?;
-        let root = self.store.version_root(&extension_id, &version);
-        let manifest = load_validated_manifest(&root)?;
         let data_root = self.store.data_dir(&extension_id);
+        let runtimes = self.runtimes.as_ref().ok_or_else(|| ExtError {
+            code: ErrorCode::Runtime,
+            message: "no runtime resolver is attached".to_string(),
+            details: serde_json::Value::Null,
+        })?;
+        // A linked package supplies its manifest and root; an installed one
+        // reads both back from the store. The runtime comes from the host's
+        // resolver either way, which is where a builtin's adapter is registered.
+        let (version, root, manifest) = if let Some(linked) = self.linked.get(id) {
+            (
+                linked.manifest.extension.version.to_string(),
+                linked.root.clone(),
+                linked.manifest.clone(),
+            )
+        } else {
+            let version = self.version_of(id)?;
+            let root = self.store.version_root(&extension_id, &version);
+            let manifest = load_validated_manifest(&root)?;
+            (version, root, manifest)
+        };
         let runtime = runtimes.create(&manifest, &root, &data_root)?;
         let listed = match runtime
             .start(&RuntimeContext {
@@ -397,6 +438,9 @@ impl ExtensionManager {
     }
 
     fn version_of(&self, id: &str) -> Result<String, ExtError> {
+        if let Some(linked) = self.linked.get(id) {
+            return Ok(linked.manifest.extension.version.to_string());
+        }
         let extension_id = ExtensionId::parse(id.to_string()).map_err(|error| ExtError {
             code: ErrorCode::Manifest,
             message: error.to_string(),
@@ -458,6 +502,21 @@ impl ExtensionManager {
             })?;
             versions.insert(id.as_str().to_string(), parsed);
             manifests.push(manifest);
+        }
+        // Linked packages have no registry entry and no version on disk, so
+        // they contribute both here. A package the reader disabled stays out
+        // of the plan like an installed one.
+        for (id, linked) in &self.linked {
+            let extension_id = ExtensionId::parse(id.clone()).map_err(|error| ExtError {
+                code: ErrorCode::Manifest,
+                message: error.to_string(),
+                details: serde_json::Value::Null,
+            })?;
+            if !self.store.state_of(&extension_id).enabled {
+                continue;
+            }
+            versions.insert(id.clone(), linked.manifest.extension.version.clone());
+            manifests.push(linked.manifest.clone());
         }
         let included: std::collections::BTreeSet<String> = manifests
             .iter()
@@ -817,6 +876,48 @@ mod tests {
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/extensions/hello");
         manager.install(&example).expect("install");
         let plan = manager.plan().expect("plan");
+        let mut host = TestHost;
+        let active = manager
+            .apply(&plan, &mut (), &mut (), &mut host)
+            .await
+            .expect("apply");
+        assert_eq!(active.len(), 1);
+        active.unload(&mut host).await.expect("unload");
+        assert_eq!(revoked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A package linked into the host binary needs no store entry: the manager
+    /// plans and activates it from the manifest and root it was registered with.
+    /// This is the path a host's own built-in bundles take.
+    #[tokio::test]
+    async fn a_linked_package_plans_and_activates_without_install() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let host = Arc::new(DemoHost {
+            root: root.path().to_path_buf(),
+            capabilities: CapabilityRegistry::default(),
+            contracts: ServiceContractRegistry::default(),
+        });
+        let example =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/legacy/hello");
+        let manifest_path = example.join("extension.toml");
+        let text = std::fs::read_to_string(&manifest_path).expect("the fixture manifest");
+        let manifest = Manifest::parse(&text, &manifest_path).expect("parse");
+        let id = manifest.id().as_str().to_string();
+
+        let mut manager = ExtensionManager::open(host).expect("manager");
+        manager.register_linked(manifest, example.clone());
+        let revoked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let manager = manager.with_ports(
+            Arc::new(MockResolver),
+            Arc::new(MockSink(Arc::clone(&revoked))),
+        );
+
+        let plan = manager.plan().expect("plan");
+        assert_eq!(
+            plan.order,
+            vec![id.clone()],
+            "the linked package is planned without an installed version"
+        );
         let mut host = TestHost;
         let active = manager
             .apply(&plan, &mut (), &mut (), &mut host)
