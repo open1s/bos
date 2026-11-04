@@ -648,6 +648,7 @@ mod tests {
         assert!(!storage.root().exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_symlinked_namespace_root_is_refused() {
         let scratch = Scratch::new("symlink-root");
