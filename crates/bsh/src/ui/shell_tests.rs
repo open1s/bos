@@ -8214,6 +8214,12 @@ fn the_trust_confirmation_names_the_commands_and_is_the_only_approval(cx: &mut T
         .expect("the installed row");
     cx.simulate_click(row.center(), Modifiers::default());
     cx.update(|window, cx| window.draw(cx).clear(cx));
+    // The expanded row's approve control sits below the harness window
+    // (measured y ~ 901 in an 820-high window), and a press on a clipped
+    // control is a silent no-op: bring the pane's tail into view first.
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    shell.update(cx, |this, _| this.settings_scroll.scroll_to_bottom());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
     let trust = cx
         .debug_bounds("installed-trust-trust-dialog")
         .expect("the approve control");

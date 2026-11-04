@@ -995,10 +995,23 @@ verdict := {"allow": false, "rule": "no-mcp-spawn", "reason": "mcp spawns are re
             &crate::settings::resolve::SessionChoice::default(),
             &pool,
         );
+        // The request array no longer carries an extension's MCP tools: they
+        // are a family installed at once and travel behind the find_tool /
+        // call_tool pair instead, so the schema stays the baseline. The tool is
+        // still registered and callable, which the registry assertion proves.
+        assert_eq!(
+            built.tools_schema_chars, baseline,
+            "an MCP tool stays behind find_tool, so the request array is unchanged"
+        );
+        let advertised: Vec<String> = built
+            .agent
+            .model_tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
         assert!(
-            built.tools_schema_chars > baseline,
-            "the extension's MCP tools reach the request schema ({baseline} -> {})",
-            built.tools_schema_chars
+            !advertised.contains(&"plugin_mcp-fixture__echo_echo_tool".to_string()),
+            "the extension MCP tool is withheld from the advertised array: {advertised:?}"
         );
         let registry = built.agent.registry().expect("the tool registry");
         let tool = registry
