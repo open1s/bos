@@ -1259,6 +1259,43 @@ impl ExtensionHost {
         }
     }
 
+    /// Runtimes a replacement package set no longer uses, deduplicated.
+    fn superseded_runtimes(
+        previous: impl Iterator<Item = Arc<dyn Runtime>>,
+        current: &[Arc<dyn Runtime>],
+    ) -> Vec<Arc<dyn Runtime>> {
+        let live: std::collections::HashSet<*const ()> = current
+            .iter()
+            .map(|runtime| Arc::as_ptr(runtime) as *const ())
+            .collect();
+        let mut seen: std::collections::HashSet<*const ()> = std::collections::HashSet::new();
+        let mut superseded = Vec::new();
+        for runtime in previous {
+            let pointer = Arc::as_ptr(&runtime) as *const ();
+            if !live.contains(&pointer) && seen.insert(pointer) {
+                superseded.push(runtime);
+            }
+        }
+        superseded
+    }
+
+    /// Stop runtimes together, bounded so one hung child cannot block a rebuild.
+    fn stop_runtimes(runtimes: Vec<Arc<dyn Runtime>>) {
+        if runtimes.is_empty() {
+            return;
+        }
+        super::block_on_tokio(async move {
+            let stops = runtimes.into_iter().map(|runtime| async move {
+                let _ = runtime.shutdown().await;
+            });
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                futures::future::join_all(stops),
+            )
+            .await;
+        });
+    }
+
     fn rebuild(&mut self) -> Result<(), ExtensionError> {
         let mut manager = LifecycleManager::new();
         let mut loaded: BTreeMap<String, LoadedExtension> = BTreeMap::new();
@@ -1480,6 +1517,7 @@ impl ExtensionHost {
             .filter(|entry| entry.applied)
             .map(|entry| entry.package.id().clone())
             .collect();
+        let previous = std::mem::take(&mut self.loaded);
         self.manager = manager;
         self.loaded = loaded;
         self.issues = issues;
@@ -1497,6 +1535,20 @@ impl ExtensionHost {
                 }
             }
         }
+        // A rebuild replaces the package set, so the old entries are dropped.
+        // Dropping an Arc does not stop a process, guest or thread it owns;
+        // every runtime the new set no longer uses must be shut down or a
+        // disable/upgrade leaks a live child until the process exits.
+        let current: Vec<Arc<dyn Runtime>> = self
+            .loaded
+            .values()
+            .filter_map(|entry| entry.runtime.clone())
+            .collect();
+        let superseded = Self::superseded_runtimes(
+            previous.values().filter_map(|entry| entry.runtime.clone()),
+            &current,
+        );
+        Self::stop_runtimes(superseded);
         let mut languages = Vec::new();
         let mut integrations = Vec::new();
         for entry in self.loaded.values().filter(|entry| entry.applied) {
@@ -4357,5 +4409,55 @@ tools = ["echo"]
             .find(|status| status.id == "com.example.secretive")
             .expect("status");
         assert!(!status.applied, "{status:?}");
+    }
+
+    struct CountShutdown(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl Runtime for CountShutdown {
+        fn kind(&self) -> RuntimeKind {
+            RuntimeKind::Builtin
+        }
+
+        async fn tools(&self) -> Result<Vec<ToolDescriptor>, ExtensionError> {
+            Ok(Vec::new())
+        }
+
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: Value,
+            _context: &CallContext,
+        ) -> Result<Value, ExtensionError> {
+            Ok(Value::Null)
+        }
+
+        async fn shutdown(&self) -> Result<(), ExtensionError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_rebuild_stops_exactly_the_runtimes_it_replaces() {
+        let stopped = Arc::new(AtomicUsize::new(0));
+        let kept: Arc<dyn Runtime> = Arc::new(CountShutdown(Arc::clone(&stopped)));
+        let replaced: Arc<dyn Runtime> = Arc::new(CountShutdown(Arc::clone(&stopped)));
+        let previous = vec![
+            Arc::clone(&kept),
+            Arc::clone(&replaced),
+            Arc::clone(&replaced),
+        ];
+        let current = vec![Arc::clone(&kept)];
+        let superseded = ExtensionHost::superseded_runtimes(previous.into_iter(), &current);
+        assert_eq!(superseded.len(), 1, "duplicates are stopped once");
+        assert!(Arc::ptr_eq(&superseded[0], &replaced));
+        ExtensionHost::stop_runtimes(superseded);
+        assert_eq!(stopped.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            stopped.load(Ordering::SeqCst),
+            1,
+            "the kept runtime is not stopped"
+        );
     }
 }

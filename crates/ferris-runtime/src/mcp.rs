@@ -116,24 +116,9 @@ impl Session {
                     extension: "mcp".to_string(),
                     message: format!("response is not JSON: {error}"),
                 })?;
-            if value.get("id").and_then(Value::as_u64) != Some(id) {
-                if let Some(sender) = progress {
-                    if value.get("method").and_then(Value::as_str) == Some("notifications/progress")
-                    {
-                        if let Some(params) = value.get("params") {
-                            let _ = sender.send(params.clone());
-                        }
-                    }
-                }
-                continue;
+            if let Some(result) = validate_response(&value, id, progress)? {
+                return Ok(result);
             }
-            if let Some(error) = value.get("error") {
-                return Err(ExtensionError::Remote {
-                    extension: "mcp".to_string(),
-                    message: error.to_string(),
-                });
-            }
-            return Ok(value.get("result").cloned().unwrap_or(Value::Null));
         }
     }
 
@@ -161,6 +146,164 @@ impl Session {
         if let Ok(mut child) = self.child.lock() {
             let _ = child.kill();
             let _ = child.wait();
+        }
+    }
+}
+
+/// Validate one inbound frame against the JSON-RPC envelope this client sent.
+///
+/// Returns the matching response's `result`, or `None` for a notification or
+/// a late response to another id. Anything that claims to answer this id but
+/// does not have exactly one well-formed outcome is a protocol error, so a
+/// malformed server cannot turn a missing result into a silent `null`.
+fn validate_response(
+    value: &Value,
+    expected_id: u64,
+    progress: Option<&tokio::sync::mpsc::UnboundedSender<Value>>,
+) -> Result<Option<Value>, ExtensionError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| protocol_error("response is not a JSON object"))?;
+    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return Err(protocol_error("response is missing jsonrpc \"2.0\""));
+    }
+    let frame_id = match object.get("id") {
+        None => None,
+        Some(Value::Number(number)) => Some(
+            number
+                .as_u64()
+                .ok_or_else(|| protocol_error("response id is not an integer"))?,
+        ),
+        Some(_) => return Err(protocol_error("response id is not an integer")),
+    };
+    if frame_id != Some(expected_id) {
+        if let Some(sender) = progress {
+            if object.get("method").and_then(Value::as_str) == Some("notifications/progress") {
+                if let Some(params) = object.get("params") {
+                    let _ = sender.send(params.clone());
+                }
+            }
+        }
+        // A notification has no id. A response for a different id is usually a
+        // timed-out call's late result; neither answers this request.
+        return Ok(None);
+    }
+    if object.contains_key("method") {
+        return Err(protocol_error("response carries a method field"));
+    }
+    match (object.get("result"), object.get("error")) {
+        (Some(result), None) => Ok(Some(result.clone())),
+        (None, Some(error)) => {
+            let code = error.get("code").and_then(Value::as_i64);
+            let message = error.get("message").and_then(Value::as_str);
+            let (Some(code), Some(message)) = (code, message) else {
+                return Err(protocol_error(
+                    "error object lacks an integer code or a string message",
+                ));
+            };
+            Err(ExtensionError::Remote {
+                extension: "mcp".to_string(),
+                message: format!("JSON-RPC error {code}: {message}"),
+            })
+        }
+        (Some(_), Some(_)) => Err(protocol_error("response has both result and error")),
+        (None, None) => Err(protocol_error("response has neither result nor error")),
+    }
+}
+
+/// A protocol violation attributed to the MCP transport.
+fn protocol_error(message: impl Into<String>) -> ExtensionError {
+    ExtensionError::Protocol {
+        extension: "mcp".to_string(),
+        message: message.into(),
+    }
+}
+
+/// One line read under a hard byte ceiling.
+enum LimitedLine {
+    /// A complete, in-ceiling line.
+    Line(Vec<u8>),
+    /// The line exceeded the ceiling; the reader consumed through its newline,
+    /// so the next call starts at the following line.
+    TooLong,
+    /// End of stream.
+    Eof,
+}
+
+/// Read a newline-terminated line without ever buffering past the ceiling.
+///
+/// `read_until` grows the buffer as it reads, so a server that never emits a
+/// newline could make the host allocate without bound before the size check
+/// ran. This reader checks the ceiling against the available slice and only
+/// copies the bytes it will keep.
+fn read_limited_line_sync<R: BufRead>(
+    reader: &mut R,
+    limit: usize,
+) -> std::io::Result<LimitedLine> {
+    let mut line = Vec::new();
+    loop {
+        let (consumed, complete, eof, too_long) = {
+            let buffer = reader.fill_buf()?;
+            let room = limit.saturating_sub(line.len());
+            if buffer.is_empty() {
+                (0, false, true, false)
+            } else if let Some(index) = buffer.iter().position(|byte| *byte == b'\n') {
+                let take = index + 1;
+                if take > room {
+                    line.extend_from_slice(&buffer[..room]);
+                    (take, true, false, true)
+                } else {
+                    line.extend_from_slice(&buffer[..take]);
+                    (take, true, false, false)
+                }
+            } else if buffer.len() > room {
+                line.extend_from_slice(&buffer[..room]);
+                (buffer.len(), false, false, true)
+            } else {
+                line.extend_from_slice(buffer);
+                (buffer.len(), false, false, false)
+            }
+        };
+        if consumed > 0 {
+            reader.consume(consumed);
+        }
+        if too_long {
+            // A complete line was already consumed through its newline; only
+            // an unterminated tail still needs discarding.
+            if !complete {
+                discard_rest_of_line_sync(reader)?;
+            }
+            return Ok(LimitedLine::TooLong);
+        }
+        if eof {
+            return Ok(if line.is_empty() {
+                LimitedLine::Eof
+            } else {
+                LimitedLine::Line(line)
+            });
+        }
+        if complete {
+            return Ok(LimitedLine::Line(line));
+        }
+    }
+}
+
+/// Consume the remainder of an over-long line through its newline.
+fn discard_rest_of_line_sync<R: BufRead>(reader: &mut R) -> std::io::Result<()> {
+    loop {
+        let (consumed, done) = {
+            let buffer = reader.fill_buf()?;
+            if buffer.is_empty() {
+                return Ok(());
+            }
+            match buffer.iter().position(|byte| *byte == b'\n') {
+                Some(index) => (index + 1, true),
+                None => (buffer.len(), false),
+            }
+        };
+        reader.consume(consumed);
+        if done {
+            return Ok(());
         }
     }
 }
@@ -213,6 +356,9 @@ struct McpCore {
     /// A separately lockable child handle, so cancellation never waits for the
     /// synchronous session exchange mutex. Child::kill is portable across OSes.
     child: Mutex<Option<Arc<Mutex<Child>>>>,
+    /// RSS sampler bound to the child's start-time identity (#38 / #109).
+    #[cfg(unix)]
+    watchdog: Mutex<Option<crate::process::MemoryWatchdog>>,
     cancelled: AtomicBool,
     stopped: AtomicBool,
 }
@@ -334,6 +480,8 @@ impl McpCore {
             catalog: Mutex::new(None),
             session: Mutex::new(None),
             child: Mutex::new(None),
+            #[cfg(unix)]
+            watchdog: Mutex::new(None),
             cancelled: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
         })
@@ -523,32 +671,46 @@ impl McpCore {
         if let Some(stderr) = stderr {
             let extension = self.extension.to_string();
             std::thread::spawn(move || {
-                let reader = BufReader::new(stderr);
-                for line in reader.lines().map_while(Result::ok) {
-                    log::debug!(target: "bsh::extension", "{extension} mcp stderr: {line}");
+                let mut reader = BufReader::new(stderr);
+                loop {
+                    match read_limited_line_sync(&mut reader, MAX_LINE_BYTES) {
+                        Ok(LimitedLine::Line(bytes)) => {
+                            let line = String::from_utf8_lossy(&bytes);
+                            log::debug!(target: "bsh::extension", "{extension} mcp stderr: {line}");
+                        }
+                        Ok(LimitedLine::TooLong) => {
+                            // Keep draining: stopping here would leave the pipe
+                            // full and turn every later write into a failure.
+                            log::warn!(
+                                target: "bsh::extension",
+                                "{extension} mcp stderr line exceeded {MAX_LINE_BYTES} bytes; discarding it"
+                            );
+                        }
+                        Ok(LimitedLine::Eof) | Err(_) => break,
+                    }
                 }
             });
         }
         let (sender, lines) = sync_channel(64);
         let extension = self.extension.to_string();
         std::thread::spawn(move || {
-            let reader = BufReader::new(stdout);
-            let mut buffer = Vec::new();
-            let mut reader = reader;
+            let mut reader = BufReader::new(stdout);
             loop {
-                buffer.clear();
-                match reader.read_until(b'\n', &mut buffer) {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        if buffer.len() > MAX_LINE_BYTES {
-                            log::warn!(target: "bsh::extension", "{extension} mcp line exceeded the cap");
-                            break;
-                        }
-                        if sender.send(buffer.clone()).is_err() {
+                match read_limited_line_sync(&mut reader, MAX_LINE_BYTES) {
+                    Ok(LimitedLine::Line(buffer)) => {
+                        if sender.send(buffer).is_err() {
                             break;
                         }
                     }
-                    Err(_) => break,
+                    Ok(LimitedLine::TooLong) => {
+                        // The line was consumed through its newline, so the
+                        // next read can resynchronize instead of dying here.
+                        log::warn!(
+                            target: "bsh::extension",
+                            "{extension} mcp line exceeded {MAX_LINE_BYTES} bytes; discarding it"
+                        );
+                    }
+                    Ok(LimitedLine::Eof) | Err(_) => break,
                 }
             }
         });
@@ -572,10 +734,13 @@ impl McpCore {
             .get("protocolVersion")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if protocol.is_empty() {
+        if protocol != MCP_PROTOCOL {
+            session.close();
             return Err(ExtensionError::Protocol {
                 extension: self.extension.to_string(),
-                message: "MCP initialize returned no protocolVersion".to_string(),
+                message: format!(
+                    "MCP server selected unsupported protocolVersion {protocol:?}; this host speaks {MCP_PROTOCOL}"
+                ),
             });
         }
         session.notify("notifications/initialized", Value::Null)?;
@@ -758,6 +923,28 @@ impl McpCore {
         if let Some(child) = child {
             terminate_child_handle(&child);
         }
+        self.stop_watchdog();
+    }
+
+    /// Start an RSS sampler bound to this child, replacing any previous one.
+    #[cfg(unix)]
+    fn start_watchdog(&self, pid: u32) {
+        self.stop_watchdog();
+        let identity = crate::process::child_identity(pid);
+        let watchdog = crate::process::spawn_memory_watchdog(pid, self.memory_bytes, identity);
+        if let Ok(mut slot) = self.watchdog.lock() {
+            *slot = Some(watchdog);
+        }
+    }
+
+    /// Cancel the sampler before the child is reaped.
+    fn stop_watchdog(&self) {
+        #[cfg(unix)]
+        if let Ok(mut slot) = self.watchdog.lock() {
+            if let Some(watchdog) = slot.take() {
+                watchdog.stop();
+            }
+        }
     }
 
     fn cancellation_error(&self) -> ExtensionError {
@@ -771,6 +958,8 @@ impl McpCore {
     /// arrived before the child handle became visible, terminate and reap it
     /// before allowing the caller to proceed.
     fn register_child(&self, child: Child) -> Result<Arc<Mutex<Child>>, ExtensionError> {
+        #[cfg(unix)]
+        let pid = child.id();
         let child = Arc::new(Mutex::new(child));
         {
             let mut slot = self
@@ -784,6 +973,7 @@ impl McpCore {
             if let Ok(mut process) = child.lock() {
                 let _ = process.wait();
             }
+            self.stop_watchdog();
             let mut slot = self
                 .child
                 .lock()
@@ -795,6 +985,10 @@ impl McpCore {
                 *slot = None;
             }
             return Err(self.cancellation_error());
+        }
+        #[cfg(unix)]
+        if pid != 0 {
+            self.start_watchdog(pid);
         }
         Ok(child)
     }
@@ -1462,5 +1656,102 @@ required = ["process.execute"]
             .shutdown()
             .await
             .expect("repeated shutdown is idempotent");
+    }
+
+    #[test]
+    fn a_malformed_response_envelope_is_rejected() {
+        let rejected = |value: Value| {
+            validate_response(&value, 7, None)
+                .expect_err("malformed envelope")
+                .to_string()
+        };
+        assert!(rejected(json!({"id": 7, "result": {}})).contains("jsonrpc"));
+        assert!(rejected(json!({"jsonrpc": "1.0", "id": 7, "result": {}})).contains("jsonrpc"));
+        assert!(rejected(json!({"jsonrpc": "2.0", "id": "7", "result": {}})).contains("integer"));
+        assert!(rejected(json!({"jsonrpc": "2.0", "id": 7})).contains("neither"));
+        assert!(rejected(json!({
+            "jsonrpc": "2.0", "id": 7, "result": {},
+            "error": {"code": 1, "message": "both"}
+        }))
+        .contains("both"));
+        assert!(rejected(json!({"jsonrpc": "2.0", "id": 7, "error": {}})).contains("error object"));
+        assert!(rejected(json!({
+            "jsonrpc": "2.0", "id": 7, "method": "tools/list", "result": {}
+        }))
+        .contains("method"));
+    }
+
+    #[test]
+    fn a_valid_result_and_a_remote_error_are_distinguished() {
+        let result = validate_response(
+            &json!({"jsonrpc": "2.0", "id": 7, "result": {"ok": 1}}),
+            7,
+            None,
+        )
+        .expect("valid result");
+        assert_eq!(result, Some(json!({"ok": 1})));
+        assert_eq!(
+            validate_response(&json!({"jsonrpc": "2.0", "id": 7, "result": null}), 7, None)
+                .expect("null is a result"),
+            Some(Value::Null)
+        );
+        assert_eq!(
+            validate_response(&json!({"jsonrpc": "2.0", "id": 8, "result": {}}), 7, None)
+                .expect("a late response is not a failure"),
+            None
+        );
+        let error = validate_response(
+            &json!({"jsonrpc": "2.0", "id": 7, "error": {"code": -32601, "message": "nope"}}),
+            7,
+            None,
+        )
+        .expect_err("remote error");
+        assert!(error.to_string().contains("-32601"), "{error}");
+    }
+
+    #[test]
+    fn the_mcp_line_reader_bounds_a_line_before_it_allocates() {
+        let mut reader = std::io::Cursor::new(vec![b'a'; 64]);
+        assert!(matches!(
+            read_limited_line_sync(&mut reader, 16),
+            Ok(LimitedLine::TooLong)
+        ));
+        assert!(matches!(
+            read_limited_line_sync(&mut reader, 16),
+            Ok(LimitedLine::Eof)
+        ));
+    }
+
+    #[test]
+    fn the_mcp_line_reader_resynchronizes_after_an_over_long_line() {
+        let mut data = vec![b'x'; 64];
+        data.push(b'\n');
+        data.extend_from_slice(b"{\"ok\":true}\n");
+        let mut reader = std::io::Cursor::new(data);
+        assert!(matches!(
+            read_limited_line_sync(&mut reader, 16),
+            Ok(LimitedLine::TooLong)
+        ));
+        match read_limited_line_sync(&mut reader, 16) {
+            Ok(LimitedLine::Line(line)) => assert_eq!(line, b"{\"ok\":true}\n"),
+            other => panic!(
+                "the next line must be readable, got {}",
+                matches!(other, Ok(LimitedLine::Eof))
+            ),
+        }
+    }
+
+    #[test]
+    fn the_mcp_line_reader_keeps_non_utf8_stderr() {
+        let mut reader = std::io::Cursor::new(vec![0xff, 0xfe, b'\n']);
+        match read_limited_line_sync(&mut reader, 16) {
+            Ok(LimitedLine::Line(line)) => {
+                assert_eq!(
+                    String::from_utf8_lossy(&line).trim_end(),
+                    "\u{fffd}\u{fffd}"
+                );
+            }
+            _ => panic!("a non-UTF-8 line must still be read"),
+        }
     }
 }

@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -228,43 +228,203 @@ fn with_stderr_tail(error: ExtensionError, tail: &StdMutex<VecDeque<String>>) ->
     }
 }
 
+/// How often the watchdog samples resident memory.
+const MEMORY_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How many consecutive sampling failures are tolerated before the child is
+/// treated as unobservable and terminated.
+const MEMORY_SAMPLE_RETRIES: u32 = 8;
+
+/// A live memory watchdog.
+///
+/// The sampler runs on its own thread, not a Tokio worker: sampling calls
+/// procfs or forks ps, which must never block an executor. Stopping only
+/// signals the flag; the thread exits at its next tick.
+#[cfg(unix)]
+pub(crate) struct MemoryWatchdog {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl MemoryWatchdog {
+    /// Ask the sampler to exit. It never signals a different process: identity
+    /// is re-read before every kill.
+    pub(crate) fn stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+#[cfg(unix)]
+impl Drop for MemoryWatchdog {
+    fn drop(&mut self) {
+        self.stop();
+        self.handle.take();
+    }
+}
+
 /// Kill a child whose resident memory exceeds its manifest ceiling.
 ///
 /// RLIMIT_AS is not honoured by macOS, so the host samples RSS and sends
 /// SIGKILL itself; Linux keeps the rlimit as the first line and the sampler as
-/// the same backstop.
+/// the same backstop. The sampler is bound to the child's start-time identity,
+/// so a pid recycled after the child exits is never signalled, and a sampling
+/// failure that persists while the child is alive terminates it (fail closed).
 #[cfg(unix)]
-fn spawn_memory_watchdog(pid: u32, limit: u64) {
-    if limit == 0 {
-        return;
+pub(crate) fn spawn_memory_watchdog(
+    pid: u32,
+    limit: u64,
+    identity: Option<String>,
+) -> MemoryWatchdog {
+    let stop = Arc::new(AtomicBool::new(false));
+    let token = Arc::clone(&stop);
+    if identity.is_none() {
+        log::warn!(
+            target: "bsh::extension",
+            "memory watchdog for pid {pid} could not read a start-time identity; it will not signal the child"
+        );
     }
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            match process_rss_bytes(pid) {
-                Some(rss) if rss > limit => {
-                    // SAFETY: pid names the child this runtime spawned; a
-                    // recycled pid would already be a different process, and
-                    // the session clears its pid on stop.
-                    unsafe {
-                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    let handle = (limit > 0).then(|| {
+        std::thread::Builder::new()
+            .name(format!("bsh-memory-{pid}"))
+            .spawn(move || {
+                let mut unavailable = 0u32;
+                while !token.load(Ordering::SeqCst) {
+                    std::thread::sleep(MEMORY_SAMPLE_INTERVAL);
+                    if token.load(Ordering::SeqCst) {
+                        break;
                     }
-                    break;
+                    match process_rss_bytes(pid) {
+                        Some(rss) if rss > limit => {
+                            if identity_matches(pid, identity.as_deref()) {
+                                signal_kill(pid);
+                            } else {
+                                log::warn!(
+                                    target: "bsh::extension",
+                                    "pid {pid} exceeded its memory ceiling but is no longer the child that was spawned; not signalling"
+                                );
+                            }
+                            break;
+                        }
+                        Some(_) => unavailable = 0,
+                        None => {
+                            // A missing process is not a sampling failure: the
+                            // child exited and the pid may already be reused.
+                            if !process_exists(pid) {
+                                break;
+                            }
+                            unavailable += 1;
+                            if unavailable >= MEMORY_SAMPLE_RETRIES {
+                                log::warn!(
+                                    target: "bsh::extension",
+                                    "pid {pid} could not be sampled for {}s while alive; terminating it",
+                                    MEMORY_SAMPLE_RETRIES as u64 * MEMORY_SAMPLE_INTERVAL.as_millis() as u64 / 1000
+                                );
+                                if identity_matches(pid, identity.as_deref()) {
+                                    signal_kill(pid);
+                                }
+                                break;
+                            }
+                        }
+                    }
                 }
-                Some(_) => {}
-                None => break,
-            }
-        }
+            })
+            .ok()
     });
+    MemoryWatchdog {
+        stop,
+        handle: handle.flatten(),
+    }
+}
+
+/// Whether the pid still names the process that was spawned.
+#[cfg(unix)]
+fn identity_matches(pid: u32, expected: Option<&str>) -> bool {
+    let Some(expected) = expected else {
+        return false;
+    };
+    child_identity(pid).is_some_and(|current| current == expected)
+}
+
+/// A start-time marker that distinguishes the spawned child from a pid reuse.
+#[cfg(unix)]
+pub(crate) fn child_identity(pid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let start = stat_start_time(&text)?;
+        return Some(format!("linux:{start}"));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("/bin/ps")
+            .args(["-o", "lstart=", "-p", &pid.to_string()])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8(output.stdout).ok()?;
+        let text = text.trim();
+        return (!text.is_empty()).then(|| format!("macos:{text}"));
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+/// The start time (field 22) in a /proc/<pid>/stat line.
+///
+/// The comm field may contain spaces and parentheses, so the parse starts after
+/// the last ')' rather than splitting from the beginning.
+#[cfg(any(target_os = "linux", test))]
+fn stat_start_time(text: &str) -> Option<u64> {
+    let close = text.rfind(')')?;
+    let rest = text.get(close + 1..)?.trim_start();
+    // Field 3 is the first token after comm; start time is field 22.
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// Resident bytes from a Linux statm line.
+///
+/// Field 1 is total virtual pages; only field 2 is resident memory, and the
+/// page size is the system's, not a hard-coded 4 KiB.
+#[cfg(any(target_os = "linux", test))]
+fn statm_rss_bytes(text: &str, page_size: u64) -> Option<u64> {
+    let pages: u64 = text.split_whitespace().nth(1)?.parse().ok()?;
+    Some(pages.saturating_mul(page_size))
+}
+
+#[cfg(target_os = "linux")]
+fn page_size_bytes() -> Option<u64> {
+    // SAFETY: sysconf is side-effect free and reports a process-wide constant.
+    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    (size > 0).then_some(size as u64)
+}
+
+/// Whether a pid still names a live process.
+#[cfg(unix)]
+fn process_exists(pid: u32) -> bool {
+    // SAFETY: signal 0 performs only an existence/permission check.
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Terminate one process. Callers verify the start-time identity first.
+#[cfg(unix)]
+fn signal_kill(pid: u32) {
+    // SAFETY: the caller has verified pid still names the spawned child.
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
 }
 
 /// Resident memory of one child, from procfs on Linux or ps on macOS.
 fn process_rss_bytes(pid: u32) -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
+        let page_size = page_size_bytes()?;
         let text = std::fs::read_to_string(format!("/proc/{pid}/statm")).ok()?;
-        let pages: u64 = text.split_whitespace().next()?.parse().ok()?;
-        return Some(pages.saturating_mul(4096));
+        return statm_rss_bytes(&text, page_size);
     }
     #[cfg(target_os = "macos")]
     {
@@ -637,6 +797,97 @@ async fn read_limited_line<R: AsyncBufRead + Unpin>(
     }
 }
 
+/// Consume and discard the remainder of an over-limit line, through its
+/// newline, without buffering it. Returns false at EOF.
+async fn discard_to_newline<R: AsyncBufRead + Unpin>(reader: &mut R) -> std::io::Result<bool> {
+    loop {
+        let (length, newline) = {
+            let buffer = reader.fill_buf().await?;
+            if buffer.is_empty() {
+                return Ok(false);
+            }
+            match buffer.iter().position(|byte| *byte == b'\n') {
+                Some(index) => (index + 1, true),
+                None => (buffer.len(), false),
+            }
+        };
+        reader.consume(length);
+        if newline {
+            return Ok(true);
+        }
+    }
+}
+
+/// One stderr line read under a hard ceiling.
+enum StderrLine {
+    /// A complete line, at or under the ceiling.
+    Line(Vec<u8>),
+    /// The line exceeded the ceiling and was discarded through its newline.
+    TooLong,
+    /// End of stream.
+    Eof,
+}
+
+/// Read one stderr line without buffering past the ceiling, discarding an
+/// over-long line so the pipe stays drained.
+async fn read_stderr_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    limit: usize,
+) -> std::io::Result<StderrLine> {
+    let mut line = Vec::new();
+    loop {
+        let mut consumed = 0usize;
+        let mut complete = false;
+        let mut eof = false;
+        let mut too_long = false;
+        {
+            let buffer = reader.fill_buf().await?;
+            let room = limit.saturating_sub(line.len());
+            if buffer.is_empty() {
+                eof = true;
+            } else if let Some(index) = buffer.iter().position(|byte| *byte == b'\n') {
+                let take = index + 1;
+                consumed = take;
+                complete = true;
+                if take > room {
+                    line.extend_from_slice(&buffer[..room]);
+                    too_long = true;
+                } else {
+                    line.extend_from_slice(&buffer[..take]);
+                }
+            } else if buffer.len() > room {
+                line.extend_from_slice(&buffer[..room]);
+                consumed = buffer.len();
+                too_long = true;
+            } else {
+                line.extend_from_slice(buffer);
+                consumed = buffer.len();
+            }
+        }
+        if consumed > 0 {
+            reader.consume(consumed);
+        }
+        if too_long {
+            // A complete line was consumed through its newline; only an
+            // unterminated tail still needs discarding.
+            if !complete {
+                discard_to_newline(reader).await?;
+            }
+            return Ok(StderrLine::TooLong);
+        }
+        if eof {
+            return Ok(if line.is_empty() {
+                StderrLine::Eof
+            } else {
+                StderrLine::Line(line)
+            });
+        }
+        if complete {
+            return Ok(StderrLine::Line(line));
+        }
+    }
+}
+
 /// The process runtime for one package.
 pub struct ProcessRuntime {
     extension: ExtensionId,
@@ -658,6 +909,9 @@ pub struct ProcessRuntime {
     child_pid: AtomicU32,
     session: Mutex<Option<ProcessSession>>,
     subscriptions: std::sync::Mutex<Vec<Subscription>>,
+    /// Bound to the spawned child's identity and cancelled on every stop path.
+    #[cfg(unix)]
+    watchdog: StdMutex<Option<MemoryWatchdog>>,
 }
 
 impl ProcessRuntime {
@@ -707,7 +961,31 @@ impl ProcessRuntime {
             child_pid: AtomicU32::new(0),
             session: Mutex::new(None),
             subscriptions: std::sync::Mutex::new(Vec::new()),
+            #[cfg(unix)]
+            watchdog: StdMutex::new(None),
         })
+    }
+
+    /// Start a sampler bound to this child, replacing any previous one.
+    #[cfg(unix)]
+    fn start_watchdog(&self, pid: u32) {
+        self.stop_watchdog();
+        let identity = child_identity(pid);
+        let watchdog = spawn_memory_watchdog(pid, self.memory_bytes, identity);
+        if let Ok(mut slot) = self.watchdog.lock() {
+            *slot = Some(watchdog);
+        }
+    }
+
+    /// Cancel the sampler. Called before every child exit path, so a stopped
+    /// child's pid is never sampled (or signalled) again.
+    fn stop_watchdog(&self) {
+        #[cfg(unix)]
+        if let Ok(mut slot) = self.watchdog.lock() {
+            if let Some(watchdog) = slot.take() {
+                watchdog.stop();
+            }
+        }
     }
 
     /// The tool descriptors, without spawning the process.
@@ -956,7 +1234,7 @@ impl ProcessRuntime {
         if let Some(pid) = child.id() {
             self.child_pid.store(pid, Ordering::Relaxed);
             #[cfg(unix)]
-            spawn_memory_watchdog(pid, self.memory_bytes);
+            self.start_watchdog(pid);
         }
         let stdin = child.stdin.take().ok_or_else(|| ExtensionError::Protocol {
             extension: self.extension.to_string(),
@@ -975,21 +1253,33 @@ impl ProcessRuntime {
             let tail = Arc::clone(&stderr_tail);
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stderr);
-                while let Ok(Some(line)) =
-                    read_limited_line(&mut reader, 64 * 1024, &extension).await
-                {
-                    let line = String::from_utf8_lossy(&line).trim_end().to_string();
-                    log::debug!(
-                        target: "bsh::extension",
-                        "{} stderr: {}",
-                        extension,
-                        line
-                    );
-                    let mut tail = tail.lock().expect("stderr tail lock");
-                    if tail.len() == 8 {
-                        tail.pop_front();
+                loop {
+                    match read_stderr_line(&mut reader, 64 * 1024).await {
+                        Ok(StderrLine::Line(line)) => {
+                            let line = String::from_utf8_lossy(&line).trim_end().to_string();
+                            log::debug!(
+                                target: "bsh::extension",
+                                "{} stderr: {}",
+                                extension,
+                                line
+                            );
+                            let mut tail = tail.lock().expect("stderr tail lock");
+                            if tail.len() == 8 {
+                                tail.pop_front();
+                            }
+                            tail.push_back(line);
+                        }
+                        Ok(StderrLine::TooLong) => {
+                            // An over-long line must not stop the reader: the
+                            // child keeps writing, and a discarded pipe turns
+                            // every later write into a broken-pipe failure.
+                            log::warn!(
+                                target: "bsh::extension",
+                                "{extension} stderr line exceeded 64 KiB; discarding it"
+                            );
+                        }
+                        Ok(StderrLine::Eof) | Err(_) => break,
                     }
-                    tail.push_back(line);
                 }
             });
         }
@@ -1051,6 +1341,7 @@ impl ProcessRuntime {
     }
 
     async fn stop(&self) {
+        self.stop_watchdog();
         let mut guard = self.session.lock().await;
         let Some(mut session) = guard.take() else {
             return;
@@ -1274,6 +1565,98 @@ mod tests {
     #[cfg(unix)]
     unsafe extern "C" fn test_setpgid_fail(_pid: libc::pid_t, _pgid: libc::pid_t) -> libc::c_int {
         -1
+    }
+
+    #[test]
+    fn resident_memory_uses_statm_field_two_and_the_system_page_size() {
+        let statm = "100 25 10 1 0 20 0";
+        assert_eq!(statm_rss_bytes(statm, 4096), Some(25 * 4096));
+        assert_eq!(statm_rss_bytes(statm, 16384), Some(25 * 16384));
+        assert_ne!(
+            statm_rss_bytes(statm, 4096),
+            Some(100 * 4096),
+            "field 1 is virtual size, not resident memory"
+        );
+        assert_eq!(statm_rss_bytes("", 4096), None);
+        assert_eq!(statm_rss_bytes("not a statm line", 4096), None);
+    }
+
+    #[test]
+    fn process_start_time_is_read_after_the_comm_field() {
+        let stat =
+            "123 (a name with spaces) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 987654 22 33";
+        assert_eq!(stat_start_time(stat), Some(987654));
+        assert_eq!(stat_start_time("no parentheses at all"), None);
+        assert_eq!(stat_start_time("1 (short) S 1 2"), None);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_stderr_line_is_discarded_and_the_next_line_is_read() {
+        let data = format!("{}tail\nnext\n", "x".repeat(64));
+        let mut reader = BufReader::new(data.as_bytes());
+        assert!(matches!(
+            read_stderr_line(&mut reader, 16).await,
+            Ok(StderrLine::TooLong)
+        ));
+        match read_stderr_line(&mut reader, 64).await {
+            Ok(StderrLine::Line(line)) => assert_eq!(line, b"next\n"),
+            _ => panic!("the next stderr line must still be readable"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_memory_watchdog_kills_a_child_over_its_ceiling() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let mut child = Command::new("python3")
+            .args([
+                "-c",
+                "x = b'x' * (256 * 1024 * 1024)\nimport time\ntime.sleep(30)",
+            ])
+            .spawn()
+            .expect("memory hog");
+        let pid = child.id().expect("pid");
+        let identity = child_identity(pid);
+        assert!(identity.is_some(), "the watchdog must identify its child");
+        let watchdog = spawn_memory_watchdog(pid, 32 * 1024 * 1024, identity);
+        let mut exited = false;
+        for _ in 0..50 {
+            if child.try_wait().expect("wait").is_some() {
+                exited = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        watchdog.stop();
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        assert!(
+            exited,
+            "a child that exceeds its memory ceiling must be terminated"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_live_process_has_a_stable_start_time_identity() {
+        let pid = std::process::id();
+        let identity = child_identity(pid);
+        assert!(
+            identity.is_some(),
+            "the watchdog must be able to identify a live child"
+        );
+        assert_eq!(identity, child_identity(pid));
+        assert!(identity_matches(pid, identity.as_deref()));
+        assert!(
+            !identity_matches(pid, Some("not-this-process")),
+            "a stale identity must not authorize a signal"
+        );
     }
 
     #[cfg(unix)]
