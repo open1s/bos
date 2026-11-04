@@ -31,6 +31,7 @@ jsbos_js="$repo_root/crates/jsbos/jsbos.js"
 jsbos_readme="$repo_root/crates/jsbos/README.md"
 nbos_pyproject="$repo_root/crates/nbos/pyproject.toml"
 nbos_readme="$repo_root/crates/nbos/README.md"
+nbos_package="$repo_root/crates/nbos/nbos/__init__.py"
 
 # The cargo workspace version lives at the top of its own table.
 awk -v v="$version" '
@@ -60,6 +61,10 @@ awk -v v="$version" '
 # The generated napi loader compares each optional platform package against
 # the version it was generated with.
 perl -pi -e "s/!== '[0-9][^']*'/!== '\$ENV{VERSION}'/g; s/expected [0-9][^ ]* but/expected \$ENV{VERSION} but/g" "$jsbos_js"
+
+# The Python package re-exports the version its own test compares with
+# pyproject.toml.
+perl -pi -e "s/^__version__ = \"[^\"]*\"/__version__ = \"\$ENV{VERSION}\"/" "$nbos_package"
 
 perl -pi -e "s/^(# @open1s\/jsbos — v).*/\1\$ENV{VERSION}/" "$jsbos_readme"
 perl -pi -e "s/^(# nbos — v).*/\1\$ENV{VERSION}/" "$nbos_readme"

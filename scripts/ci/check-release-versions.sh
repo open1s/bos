@@ -28,12 +28,18 @@ pypi_version="$(
   sed -n 's/^version = "\([^"]*\)"$/\1/p' \
     "$repo_root/crates/nbos/pyproject.toml" | head -n 1
 )"
+# nbos re-exports its version to Python; the package's own test compares the two.
+python_version="$(
+  sed -n 's/^__version__ = "\([^"]*\)"$/\1/p' \
+    "$repo_root/crates/nbos/nbos/__init__.py" | head -n 1
+)"
 
 fail=0
 for entry in \
   "Cargo.toml:$cargo_version" \
   "crates/jsbos/package.json:$npm_version" \
-  "crates/nbos/pyproject.toml:$pypi_version"; do
+  "crates/nbos/pyproject.toml:$pypi_version" \
+  "crates/nbos/nbos/__init__.py:$python_version"; do
   file="${entry%%:*}"
   value="${entry#*:}"
   if [[ -z "$value" ]]; then
@@ -43,9 +49,10 @@ for entry in \
 done
 
 if [[ "$fail" -eq 0 ]]; then
-  if [[ "$cargo_version" != "$npm_version" || "$cargo_version" != "$pypi_version" ]]; then
-    printf 'check-release-versions: error: manifests disagree: Cargo %s, jsbos %s, nbos %s\n' \
-      "$cargo_version" "$npm_version" "$pypi_version" >&2
+  if [[ "$cargo_version" != "$npm_version" || "$cargo_version" != "$pypi_version" \
+    || "$cargo_version" != "$python_version" ]]; then
+    printf 'check-release-versions: error: manifests disagree: Cargo %s, jsbos %s, nbos %s, nbos.py %s\n' \
+      "$cargo_version" "$npm_version" "$pypi_version" "$python_version" >&2
     fail=1
   fi
 fi
