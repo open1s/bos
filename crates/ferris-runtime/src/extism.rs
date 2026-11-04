@@ -1003,20 +1003,35 @@ impl Runtime for ExtismRuntime {
 
     async fn shutdown(&self) -> Result<(), ExtensionError> {
         self.stopped.store(true, Ordering::SeqCst);
+        let mut errors = Vec::new();
         {
-            let _cancel_gate = self
-                .cancel_gate
-                .lock()
-                .map_err(|_| ExtensionError::Corrupt {
-                    path: self.component.clone(),
-                    message: "Extism cancellation gate is poisoned".to_string(),
-                })?;
+            let _cancel_gate = match self.cancel_gate.lock() {
+                Ok(gate) => gate,
+                Err(poisoned) => {
+                    errors.push("Extism cancellation gate is poisoned".to_string());
+                    poisoned.into_inner()
+                }
+            };
             let previous = self.call_state.swap(CALL_STOPPED, Ordering::SeqCst);
             if matches!(previous, CALL_RUNNING | CALL_CANCELLED) {
-                self.interrupt_active_call()?;
+                if let Err(error) = self.interrupt_active_call() {
+                    errors.push(error.to_string());
+                }
             }
         }
-        self.deactivate().await
+        // Teardown is terminal: attempt it even when cancellation coordination
+        // failed, and report both failures.
+        if let Err(error) = self.deactivate().await {
+            errors.push(error.to_string());
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(ExtensionError::Runtime {
+                extension: self.extension.to_string(),
+                message: format!("extism shutdown incomplete: {}", errors.join("; ")),
+            })
+        }
     }
 
     async fn call_tool_result(

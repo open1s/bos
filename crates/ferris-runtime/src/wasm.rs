@@ -1180,21 +1180,48 @@ impl Runtime for WasmRuntime {
         self.cancelled.store(true, Ordering::SeqCst);
         // Interrupt a currently running guest before waiting for its Store lock.
         engine().increment_epoch();
-        self.deactivate().await?;
-        off_worker(|| {
+        let deactivate = self.deactivate().await;
+        // Teardown is unconditional: even when the deactivate hook fails, the
+        // guest shutdown hook is attempted and the instance is dropped.
+        let teardown = off_worker(|| {
             let mut guard = self.instance.lock().map_err(|_| ExtensionError::Corrupt {
                 path: self.component.clone(),
                 message: "wasm instance lock is poisoned".to_string(),
             })?;
+            let mut hook_error = None;
             if let Some(instance) = guard.as_mut() {
-                let _ = instance
+                if let Err(error) = instance
                     .bindings
                     .bsh_extension_extension()
-                    .call_shutdown(&mut instance.store);
+                    .call_shutdown(&mut instance.store)
+                {
+                    hook_error = Some(error.to_string());
+                }
             }
             *guard = None;
+            match hook_error {
+                None => Ok(()),
+                Some(error) => Err(ExtensionError::Runtime {
+                    extension: self.extension.to_string(),
+                    message: format!("guest shutdown hook failed: {error}"),
+                }),
+            }
+        });
+        let mut errors = Vec::new();
+        if let Err(error) = deactivate {
+            errors.push(error.to_string());
+        }
+        if let Err(error) = teardown {
+            errors.push(error.to_string());
+        }
+        if errors.is_empty() {
             Ok(())
-        })
+        } else {
+            Err(ExtensionError::Runtime {
+                extension: self.extension.to_string(),
+                message: format!("wasm shutdown incomplete: {}", errors.join("; ")),
+            })
+        }
     }
 
     async fn cancel(&self) -> Result<(), ExtensionError> {

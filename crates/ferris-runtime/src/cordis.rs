@@ -189,7 +189,14 @@ impl Runtime for CordisRuntime {
     }
 
     async fn shutdown(&self) -> Result<(), ExtensionError> {
-        let session = self.session.lock().ok().and_then(|mut slot| slot.take());
+        // A poisoned mutex still owns a live child; recover the guard so the
+        // session is taken and terminated rather than reported as absent.
+        let mut slot = match self.session.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let session = slot.take();
+        drop(slot);
         if let Some(session) = session {
             session.shutdown();
         }

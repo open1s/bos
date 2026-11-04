@@ -2773,7 +2773,7 @@ impl ExtensionHost {
         // Stop the pump and activation before stopping the runtimes they drive.
         self.stop_event_pump();
         self.stop_warm_startup();
-        let runtimes: Vec<(String, Arc<dyn Runtime>)> = self
+        let mut runtimes: Vec<(String, Arc<dyn Runtime>)> = self
             .loaded
             .values()
             .filter_map(|entry| {
@@ -2784,6 +2784,18 @@ impl ExtensionHost {
             })
             .collect();
         self.loaded.clear();
+        // A runtime whose shutdown timed out during an earlier rebuild is no
+        // longer in `loaded`; include it in the final attempt once.
+        let mut seen: std::collections::HashSet<*const ()> = runtimes
+            .iter()
+            .map(|(_, runtime)| Arc::as_ptr(runtime) as *const ())
+            .collect();
+        for (id, runtime) in std::mem::take(&mut self.pending_shutdown) {
+            let pointer = Arc::as_ptr(&runtime) as *const ();
+            if seen.insert(pointer) {
+                runtimes.push((id, runtime));
+            }
+        }
         // Stop them together: sequential shutdown paid every process's
         // one-second kill deadline in turn, so a machine with four process
         // packages hung the closing window for four seconds.
