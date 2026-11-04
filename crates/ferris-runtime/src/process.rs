@@ -1682,6 +1682,7 @@ impl Runtime for ProcessRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Stdio;
     #[cfg(unix)]
     use std::sync::atomic::{AtomicUsize, Ordering};
 
