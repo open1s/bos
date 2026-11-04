@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::SystemTime;
 
@@ -894,6 +894,105 @@ fn holds_skills(dir: &Path) -> bool {
     !skill_names_in(dir).is_empty()
 }
 
+/// One host-owned on-startup activation batch.
+///
+/// The worker is not detached: rebuild and shutdown cancel it through the
+/// cancel flag and wait (bounded) for done, so a superseded activation cannot
+/// keep starting runtimes after the host moved on. Cancellation also races the
+/// in-flight activate() future; a call that completes after the cancel is
+/// rolled back with shutdown() instead of being treated as live.
+struct WarmStart {
+    cancel: Arc<AtomicBool>,
+    wake: Arc<tokio::sync::Notify>,
+    done: std::sync::mpsc::Receiver<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl WarmStart {
+    /// Cancel the batch and wait up to two seconds for the worker to observe it.
+    ///
+    /// A runtime that ignores cancellation is left detached rather than
+    /// blocking a rebuild forever; it still cannot activate another runtime
+    /// because the worker checks the token before every step.
+    fn stop(mut self) {
+        self.cancel.store(true, Ordering::SeqCst);
+        self.wake.notify_waiters();
+        if self
+            .done
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .is_ok()
+        {
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+}
+
+/// Start one on-startup batch and return its ownership token.
+fn start_warm(runtimes: Vec<(String, Arc<dyn Runtime>)>) -> WarmStart {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let wake = Arc::new(tokio::sync::Notify::new());
+    let (done_tx, done) = std::sync::mpsc::channel();
+    let worker_cancel = Arc::clone(&cancel);
+    let worker_wake = Arc::clone(&wake);
+    let thread = std::thread::spawn(move || {
+        let Ok(reactor) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            log::warn!(target: "bsh::extension", "no reactor for on-startup activation");
+            let _ = done_tx.send(());
+            return;
+        };
+        reactor.block_on(async move {
+            for (id, runtime) in runtimes {
+                if worker_cancel.load(Ordering::SeqCst) {
+                    return;
+                }
+                // Racing the activation future is what makes shutdown prompt:
+                // an activation blocked on a handshake is dropped here, then
+                // rolled back, rather than keeping the worker alive.
+                let activated = tokio::select! {
+                    biased;
+                    _ = worker_wake.notified() => None,
+                    result = runtime.activate() => Some(result),
+                };
+                match activated {
+                    None => {
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            runtime.shutdown(),
+                        )
+                        .await;
+                        return;
+                    }
+                    Some(Ok(())) => {}
+                    Some(Err(error)) => log::warn!(
+                        target: "bsh::extension",
+                        "{id} on-startup activation failed: {error}"
+                    ),
+                }
+                // A cancel that landed while activate() was finishing must not
+                // leave a live runtime behind: shut it back down.
+                if worker_cancel.load(Ordering::SeqCst) {
+                    let _ =
+                        tokio::time::timeout(std::time::Duration::from_secs(2), runtime.shutdown())
+                            .await;
+                    return;
+                }
+            }
+        });
+        let _ = done_tx.send(());
+    });
+    WarmStart {
+        cancel,
+        wake,
+        done,
+        thread: Some(thread),
+    }
+}
+
 /// The extension host.
 pub(crate) struct ExtensionHost {
     config: HostConfig,
@@ -910,6 +1009,8 @@ pub(crate) struct ExtensionHost {
     graph_cache: Arc<Mutex<Vec<ExtensionGraphNode>>>,
     last_stamp: Option<SystemTime>,
     pump_generation: Arc<AtomicU64>,
+    /// The active on-startup batch, owned so rebuild/shutdown can stop it.
+    warm: Option<WarmStart>,
     startup_millis: u64,
     crash_history: Vec<String>,
     languages: Vec<LanguageEntry>,
@@ -1038,6 +1139,7 @@ impl ExtensionHost {
             graph_cache,
             last_stamp: None,
             pump_generation: Arc::new(AtomicU64::new(0)),
+            warm: None,
             startup_millis: 0,
             crash_history: Vec::new(),
             languages: Vec::new(),
@@ -1302,6 +1404,9 @@ impl ExtensionHost {
     }
 
     fn rebuild(&mut self) -> Result<(), ExtensionError> {
+        // A previous batch must not activate a runtime that this rebuild is
+        // about to replace, disable or remove.
+        self.stop_warm_startup();
         let mut manager = LifecycleManager::new();
         let mut loaded: BTreeMap<String, LoadedExtension> = BTreeMap::new();
         let mut issues: Vec<String> = Vec::new();
@@ -1622,7 +1727,8 @@ impl ExtensionHost {
     /// thread with its own current-thread reactor, so a slow handshake never
     /// blocks a build, and a failure is logged instead of failing the host. An
     /// on-demand package is untouched: only an explicit call activates it.
-    fn warm_startup_runtimes(&self) {
+    fn warm_startup_runtimes(&mut self) {
+        self.stop_warm_startup();
         let mut runtimes: Vec<(String, Arc<dyn Runtime>)> = Vec::new();
         for entry in self.loaded.values() {
             if !entry.applied || entry.package.manifest.runtime.startup != StartupPolicy::OnStartup
@@ -1636,25 +1742,14 @@ impl ExtensionHost {
         if runtimes.is_empty() {
             return;
         }
-        std::thread::spawn(move || {
-            let Ok(reactor) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            else {
-                log::warn!(target: "bsh::extension", "no reactor for on-startup activation");
-                return;
-            };
-            reactor.block_on(async {
-                for (id, runtime) in runtimes {
-                    if let Err(error) = runtime.activate().await {
-                        log::warn!(
-                            target: "bsh::extension",
-                            "{id} on-startup activation failed: {error}"
-                        );
-                    }
-                }
-            });
-        });
+        self.warm = Some(start_warm(runtimes));
+    }
+
+    /// Cancel and join the on-startup batch, bounded.
+    fn stop_warm_startup(&mut self) {
+        if let Some(warm) = self.warm.take() {
+            warm.stop();
+        }
     }
 
     /// Bring an upgraded package's data document to its current schema.
@@ -2410,6 +2505,8 @@ impl ExtensionHost {
     /// Stop every loaded runtime and end the delivery thread.
     pub(crate) async fn shutdown(&mut self) {
         self.pump_generation.fetch_add(1, Ordering::SeqCst);
+        // Stop activation before stopping the runtimes it might be driving.
+        self.stop_warm_startup();
         let runtimes: Vec<Arc<dyn Runtime>> = self
             .loaded
             .values()
@@ -4483,6 +4580,64 @@ tools = ["echo"]
         assert!(!status.applied, "{status:?}");
     }
 
+    struct BlockingActivate {
+        started: Arc<AtomicBool>,
+        shut: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Runtime for BlockingActivate {
+        fn kind(&self) -> RuntimeKind {
+            RuntimeKind::Builtin
+        }
+
+        async fn tools(&self) -> Result<Vec<ToolDescriptor>, ExtensionError> {
+            Ok(Vec::new())
+        }
+
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: Value,
+            _context: &CallContext,
+        ) -> Result<Value, ExtensionError> {
+            Ok(Value::Null)
+        }
+
+        async fn activate(&self) -> Result<(), ExtensionError> {
+            self.started.store(true, Ordering::SeqCst);
+            futures::future::pending::<()>().await;
+            Ok(())
+        }
+
+        async fn shutdown(&self) -> Result<(), ExtensionError> {
+            self.shut.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_superseded_warm_start_is_cancelled_and_rolled_back() {
+        let started = Arc::new(AtomicBool::new(false));
+        let shut = Arc::new(AtomicBool::new(false));
+        let runtime: Arc<dyn Runtime> = Arc::new(BlockingActivate {
+            started: Arc::clone(&started),
+            shut: Arc::clone(&shut),
+        });
+        let warm = start_warm(vec![("com.example.block".to_string(), runtime)]);
+        for _ in 0..200 {
+            if started.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(started.load(Ordering::SeqCst), "activation never started");
+        warm.stop();
+        assert!(
+            shut.load(Ordering::SeqCst),
+            "a cancelled activation must be shut back down, not published"
+        );
+    }
     struct CountShutdown(Arc<AtomicUsize>);
 
     #[async_trait::async_trait]
