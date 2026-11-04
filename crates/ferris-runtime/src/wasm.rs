@@ -307,7 +307,10 @@ impl self::bsh::extension::host::Host for HostState {
             .map_err(self::bsh::extension::types::HostError::Denied)?;
         let id = self.next_subscription;
         self.next_subscription = self.next_subscription.saturating_add(1);
-        let subscription = self.events.subscribe(filter, 64);
+        let subscription = self
+            .events
+            .subscribe(filter, 64)
+            .map_err(Self::host_error)?;
         self.subscriptions.insert(id, subscription);
         Ok(id)
     }

@@ -392,6 +392,7 @@ impl McpRuntime {
             EventFilter::from_topics(&manifest.contributes.events)
                 .ok()
                 .map(|filter| events.subscribe(filter, 64))
+                .transpose()?
         };
         Ok(Self {
             core: Arc::new(McpCore::new(

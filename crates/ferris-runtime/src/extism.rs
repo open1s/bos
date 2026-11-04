@@ -405,7 +405,10 @@ impl Bridge {
                 }
                 let filter = EventFilter::from_topics(&[topic.to_string()])
                     .map_err(|error| error.to_string())?;
-                let subscription = self.events.subscribe(filter, 64);
+                let subscription = self
+                    .events
+                    .subscribe(filter, 64)
+                    .map_err(|error| error.to_string())?;
                 let id = subscription.id();
                 self.subscriptions
                     .lock()

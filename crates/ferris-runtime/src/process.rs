@@ -1028,7 +1028,14 @@ impl ProcessRuntime {
         let mut subscriptions = Vec::new();
         for topic in topics {
             if let Ok(filter) = EventFilter::from_topics(std::slice::from_ref(topic)) {
-                subscriptions.push(events.subscribe(filter, 64));
+                match events.subscribe(filter, 64) {
+                    Ok(subscription) => subscriptions.push(subscription),
+                    Err(error) => log::warn!(
+                        target: "bsh::extension",
+                        "{}: event subscription failed: {error}",
+                        self.extension
+                    ),
+                }
             }
         }
         if let Ok(mut slot) = self.subscriptions.lock() {

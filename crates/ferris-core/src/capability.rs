@@ -484,12 +484,17 @@ impl GrantStore {
         scope: GrantScope,
         note: Option<String>,
     ) -> Result<(), ExtensionError> {
-        self.file
+        // Mutate a candidate and persist it first: the in-memory store must
+        // never describe a grant the durable file does not contain.
+        let mut candidate = self.file.clone();
+        candidate
             .grants
             .entry(extension.to_string())
             .or_default()
             .insert(capability.as_str().to_string(), Grant::new(scope, note));
-        self.save()
+        self.write(&candidate)?;
+        self.file = candidate;
+        Ok(())
     }
 
     /// Remove a grant and persist the document. Returns whether it existed.
@@ -498,22 +503,22 @@ impl GrantStore {
         extension: &str,
         capability: Capability,
     ) -> Result<bool, ExtensionError> {
-        let removed = self
-            .file
+        let mut candidate = self.file.clone();
+        let removed = candidate
             .grants
             .get_mut(extension)
             .map(|grants| grants.remove(capability.as_str()).is_some())
             .unwrap_or(false);
         if removed {
-            if self
-                .file
+            if candidate
                 .grants
                 .get(extension)
                 .is_some_and(BTreeMap::is_empty)
             {
-                self.file.grants.remove(extension);
+                candidate.grants.remove(extension);
             }
-            self.save()?;
+            self.write(&candidate)?;
+            self.file = candidate;
         }
         Ok(removed)
     }
@@ -526,8 +531,11 @@ impl GrantStore {
         })
     }
 
-    fn save(&self) -> Result<(), ExtensionError> {
-        let text = self.to_toml()?;
+    fn write(&self, file: &GrantFile) -> Result<(), ExtensionError> {
+        let text = toml::to_string_pretty(file).map_err(|error| ExtensionError::Corrupt {
+            path: self.path.clone(),
+            message: error.to_string(),
+        })?;
         write_grant_atomic(&self.path, text.as_bytes())
     }
 }
@@ -639,13 +647,14 @@ pub fn call_scope(arguments: &Value, workspace: Option<&Path>) -> CallScope {
         scope.path = Some(normalize_scope_path(&resolved));
     }
     if let Some(raw) = arguments.get("url").and_then(Value::as_str) {
-        if let Some((scheme, rest)) = raw.split_once("://") {
-            if matches!(scheme, "http" | "https") {
-                let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
-                let host = host.rsplit('@').next().unwrap_or(host);
-                let host = host.split(':').next().unwrap_or(host);
-                if !host.is_empty() {
-                    scope.domain = Some(host.to_string());
+        // Parse with the transport's own URL parser. Manual `://`/`@`/`:`
+        // splitting disagrees with reqwest on backslashes, userinfo and IPv6,
+        // so the policy could authorize a different host than the one the
+        // request actually reached.
+        if let Ok(parsed) = reqwest::Url::parse(raw) {
+            if matches!(parsed.scheme(), "http" | "https") {
+                if let Some(host) = parsed.host_str() {
+                    scope.domain = Some(host.to_ascii_lowercase());
                 }
             }
         }
@@ -691,7 +700,15 @@ impl GrantScope {
     pub fn covers(&self, call: &CallScope) -> bool {
         match self {
             Self::Any => true,
-            Self::Workspace => call.workspace.is_some(),
+            // A workspace grant covers paths inside the active workspace, not
+            // any path merely because a workspace happens to be open.
+            Self::Workspace => match (&call.path, &call.workspace) {
+                (Some(path), Some(workspace)) => {
+                    normalize_scope_path(path).starts_with(normalize_scope_path(workspace))
+                }
+                (None, workspace) => workspace.is_some(),
+                (Some(_), None) => false,
+            },
             // Compare normalized paths: a lexical prefix check on the raw
             // argument would let `..` walk out of the granted prefix.
             Self::Path(prefix) => {
@@ -774,6 +791,9 @@ pub struct PolicyEngine {
     audit: AuditLog,
     mode: PolicyMode,
     network: Mutex<HashMap<String, VecDeque<Instant>>>,
+    /// The first audit write that failed, if any. A policy that cannot record
+    /// its decisions is degraded, and the host must be able to say so.
+    audit_failure: Mutex<Option<String>>,
 }
 
 impl PolicyEngine {
@@ -788,7 +808,16 @@ impl PolicyEngine {
             audit: AuditLog::new(audit_path),
             mode,
             network: Mutex::new(HashMap::new()),
+            audit_failure: Mutex::new(None),
         })
+    }
+
+    /// The first audit persistence failure, if any.
+    pub fn audit_degraded(&self) -> Option<String> {
+        self.audit_failure
+            .lock()
+            .ok()
+            .and_then(|failure| failure.clone())
     }
 
     /// The grant store path, for diagnostics.
@@ -844,8 +873,14 @@ impl PolicyEngine {
         scope: &CallScope,
     ) -> Decision {
         let decision = self.decide(extension, trust, capability, scope);
-        self.audit
-            .record(extension, capability.as_str(), &decision, trust);
+        if let Err(error) = self
+            .audit
+            .record(extension, capability.as_str(), &decision, trust)
+        {
+            if let Ok(mut failure) = self.audit_failure.lock() {
+                failure.get_or_insert_with(|| error.to_string());
+            }
+        }
         if self.mode == PolicyMode::Advisory {
             if let Decision::Deny { .. } = decision {
                 return Decision::Allow {
@@ -915,12 +950,27 @@ impl PolicyEngine {
         match self.evaluate(extension, trust, capability, scope) {
             Decision::Allow { scope } => {
                 if capability == Capability::NetworkHttp && !self.meter_network(extension) {
+                    let reason = format!(
+                        "more than {MAX_NETWORK_CALLS_PER_SECOND} network calls in one second"
+                    );
+                    // The policy decision was "allow"; the meter then refused.
+                    // Record the final outcome, so the audit cannot claim a
+                    // request went out when rate limiting stopped it.
+                    let denial = Decision::Deny {
+                        reason: reason.clone(),
+                    };
+                    if let Err(error) =
+                        self.audit
+                            .record(extension, capability.as_str(), &denial, trust)
+                    {
+                        if let Ok(mut failure) = self.audit_failure.lock() {
+                            failure.get_or_insert_with(|| error.to_string());
+                        }
+                    }
                     return Err(ExtensionError::Denied {
                         extension: extension.to_string(),
                         capability: capability.as_str().to_string(),
-                        reason: format!(
-                            "more than {MAX_NETWORK_CALLS_PER_SECOND} network calls in one second"
-                        ),
+                        reason,
                     });
                 }
                 Ok(scope)
@@ -960,21 +1010,32 @@ impl PolicyEngine {
         capability: Capability,
         scope: &CallScope,
     ) -> Decision {
-        if let Ok(store) = self.grants.lock() {
-            if let Some(grant) = store.get(extension, capability) {
-                if grant.scope.covers(scope) {
-                    return Decision::Allow {
-                        scope: grant.scope.clone(),
-                    };
-                }
+        let store = match self.grants.lock() {
+            Ok(store) => store,
+            // A grant store we cannot read is not "no grant": falling through
+            // to the trust defaults would silently widen a call after a panic
+            // in another thread.
+            Err(_) => {
                 return Decision::Deny {
-                    reason: format!(
-                        "grant is scoped to {}, which does not cover this call",
-                        grant.scope
-                    ),
+                    reason: "grant store is unavailable (lock poisoned); refusing a                              trust-default decision"
+                        .to_string(),
                 };
             }
+        };
+        if let Some(grant) = store.get(extension, capability) {
+            if grant.scope.covers(scope) {
+                return Decision::Allow {
+                    scope: grant.scope.clone(),
+                };
+            }
+            return Decision::Deny {
+                reason: format!(
+                    "grant is scoped to {}, which does not cover this call",
+                    grant.scope
+                ),
+            };
         }
+        drop(store);
         match trust {
             TrustLevel::Builtin => Decision::Allow {
                 scope: GrantScope::Any,
@@ -1045,7 +1106,13 @@ impl AuditLog {
         &self.path
     }
 
-    fn record(&self, extension: &str, capability: &str, decision: &Decision, trust: TrustLevel) {
+    fn record(
+        &self,
+        extension: &str,
+        capability: &str,
+        decision: &Decision,
+        trust: TrustLevel,
+    ) -> Result<(), ExtensionError> {
         let (allowed, scope, reason) = match decision {
             Decision::Allow { scope } => (true, Some(scope.to_string()), None),
             Decision::Deny { reason } => (false, None, Some(reason.as_str())),
@@ -1061,16 +1128,24 @@ impl AuditLog {
         });
         self.rotate_if_needed();
         if let Some(parent) = self.path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent).map_err(|source| ExtensionError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
         }
-        if let Ok(mut file) = std::fs::OpenOptions::new()
+        let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)
-        {
-            use std::io::Write;
-            let _ = writeln!(file, "{line}");
-        }
+            .map_err(|source| ExtensionError::Io {
+                path: self.path.clone(),
+                source,
+            })?;
+        use std::io::Write;
+        writeln!(file, "{line}").map_err(|source| ExtensionError::Io {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     fn rotate_if_needed(&self) {
@@ -1088,6 +1163,7 @@ impl AuditLog {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     static TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
@@ -1407,5 +1483,194 @@ mod tests {
                 },
             )
             .is_allowed());
+    }
+
+    #[test]
+    fn a_poisoned_grant_store_denies_instead_of_trusting() {
+        let scratch = Scratch::new("poisoned-grants");
+        let policy = Arc::new(engine(&scratch));
+        let poison = Arc::clone(&policy);
+        let _ = std::thread::spawn(move || {
+            let _guard = poison.grants.lock().expect("grants");
+            panic!("poison the grant store");
+        })
+        .join();
+        let decision = policy.decide(
+            "com.example.builtin",
+            TrustLevel::Builtin,
+            Capability::WorkspaceRead,
+            &CallScope::default(),
+        );
+        assert!(
+            matches!(decision, Decision::Deny { .. }),
+            "a poisoned grant store must not fall through to trust defaults: {decision:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_grant_persist_does_not_change_the_in_memory_store() {
+        let scratch = Scratch::new("grant-persist");
+        let path = scratch.0.join("grants.toml");
+        std::fs::create_dir_all(&path).expect("a directory where the grant file goes");
+        let policy = PolicyEngine::open(
+            path.clone(),
+            scratch.0.join("audit.jsonl"),
+            PolicyMode::Enforce,
+        )
+        .expect("policy");
+        assert!(policy
+            .grant(
+                "com.example",
+                Capability::WorkspaceRead,
+                GrantScope::Any,
+                None,
+            )
+            .is_err());
+        assert!(
+            policy.grants_for("com.example").is_empty(),
+            "a grant that could not be written must not be applied in memory"
+        );
+        assert!(policy.audit_degraded().is_none());
+    }
+
+    #[test]
+    fn a_failed_revoke_persist_keeps_the_grant() {
+        let scratch = Scratch::new("revoke-persist");
+        let path = scratch.0.join("grants.toml");
+        let policy = engine(&scratch);
+        policy
+            .grant(
+                "com.example",
+                Capability::WorkspaceRead,
+                GrantScope::Any,
+                None,
+            )
+            .expect("grant");
+        std::fs::remove_file(&path).expect("remove grant file");
+        std::fs::create_dir_all(&path).expect("a directory where the grant file was");
+        assert!(policy
+            .revoke("com.example", Capability::WorkspaceRead)
+            .is_err());
+        assert!(
+            policy
+                .grants_for("com.example")
+                .contains_key("workspace.read"),
+            "a revoke that could not be written must not remove the in-memory grant"
+        );
+    }
+
+    #[test]
+    fn a_workspace_grant_covers_only_paths_inside_the_workspace() {
+        let scope = GrantScope::Workspace;
+        let workspace = PathBuf::from("/work/project");
+        let call = |path: Option<&str>| CallScope {
+            workspace: Some(workspace.clone()),
+            path: path.map(PathBuf::from),
+            ..CallScope::default()
+        };
+        assert!(scope.covers(&call(Some("/work/project/src/main.rs"))));
+        assert!(!scope.covers(&call(Some("/etc/passwd"))));
+        assert!(!scope.covers(&call(Some("/work/project/../secrets"))));
+        assert!(scope.covers(&call(None)));
+        assert!(!scope.covers(&CallScope::default()));
+    }
+
+    #[test]
+    fn url_scope_is_derived_with_the_transport_parser() {
+        let scope =
+            |raw: &str| call_scope(&serde_json::json!({"url": raw}), Some(Path::new("/w"))).domain;
+        assert_eq!(
+            scope("https://api.example.com/v1"),
+            Some("api.example.com".to_string())
+        );
+        assert_eq!(
+            scope("https://user:pass@evil.example/x"),
+            Some("evil.example".to_string())
+        );
+        assert_eq!(
+            scope("https://API.EXAMPLE.COM/x"),
+            Some("api.example.com".to_string())
+        );
+        assert_eq!(
+            scope("http://trusted.example\\@evil.example/"),
+            Some("trusted.example".to_string())
+        );
+        assert_eq!(scope("ftp://example.com/x"), None);
+        assert_eq!(scope("not a url"), None);
+    }
+
+    #[test]
+    fn a_rate_limited_request_is_audited_as_a_denial() {
+        let scratch = Scratch::new("network-audit");
+        let policy = engine(&scratch);
+        policy
+            .grant(
+                "com.example.flood",
+                Capability::NetworkHttp,
+                GrantScope::Any,
+                None,
+            )
+            .expect("grant");
+        let call = CallScope {
+            domain: Some("example.com".to_string()),
+            ..CallScope::default()
+        };
+        for _ in 0..MAX_NETWORK_CALLS_PER_SECOND {
+            policy
+                .authorize_call(
+                    "com.example.flood",
+                    TrustLevel::Community,
+                    Capability::NetworkHttp,
+                    &call,
+                )
+                .expect("within the window");
+        }
+        policy
+            .authorize_call(
+                "com.example.flood",
+                TrustLevel::Community,
+                Capability::NetworkHttp,
+                &call,
+            )
+            .expect_err("over the window");
+        let audit = std::fs::read_to_string(scratch.0.join("audit.jsonl")).expect("audit");
+        let rows: Vec<serde_json::Value> = audit
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("audit row"))
+            .collect();
+        assert!(
+            rows.iter().any(|row| {
+                row["capability"] == "network.http"
+                    && row["allowed"] == false
+                    && row["reason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("more than"))
+            }),
+            "the final metering denial must be audited: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn an_unwritable_audit_log_is_surfaced() {
+        let scratch = Scratch::new("audit-degraded");
+        let audit_path = scratch.0.join("audit.jsonl");
+        std::fs::create_dir_all(&audit_path).expect("a directory where the audit log goes");
+        let policy = PolicyEngine::open(
+            scratch.0.join("grants.toml"),
+            audit_path,
+            PolicyMode::Enforce,
+        )
+        .expect("policy");
+        let decision = policy.evaluate(
+            "com.example",
+            TrustLevel::Builtin,
+            Capability::WorkspaceRead,
+            &CallScope::default(),
+        );
+        assert!(decision.is_allowed(), "the policy itself still decided");
+        assert!(
+            policy.audit_degraded().is_some(),
+            "a dropped audit row must be visible to the host"
+        );
     }
 }

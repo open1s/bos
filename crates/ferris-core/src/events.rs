@@ -28,6 +28,12 @@ pub const DEFAULT_QUEUE_DEPTH: usize = 64;
 /// The most events one publisher may emit in a second.
 pub const MAX_EVENTS_PER_SECOND: u64 = 200;
 
+/// The largest publisher table the per-source rate limiter keeps in one second.
+///
+/// The table is swept when it fills; a new publisher beyond the sweep is
+/// refused rather than allowed to grow the map without bound.
+pub const MAX_TRACKED_PUBLISHERS: usize = 4096;
+
 /// Topics the platform itself publishes. A package may subscribe to any
 /// declared topic; these are the reserved ones its subscriptions are checked
 /// against by documentation, not by a hard allowlist.
@@ -351,18 +357,30 @@ impl EventBus {
     }
 
     /// Subscribe with a bounded queue.
-    pub fn subscribe(self: &Arc<Self>, filter: EventFilter, capacity: usize) -> Subscription {
+    ///
+    /// A poisoned subscriber map is an error, not a subscription that silently
+    /// never receives anything: the caller must know its handler is not wired.
+    pub fn subscribe(
+        self: &Arc<Self>,
+        filter: EventFilter,
+        capacity: usize,
+    ) -> Result<Subscription, ExtensionError> {
         let capacity = capacity.clamp(1, 4096);
         let (sender, receiver) = async_channel::bounded(capacity);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        if let Ok(mut subscribers) = self.subscribers.lock() {
-            subscribers.insert(id, Subscriber { filter, sender });
-        }
-        Subscription {
+        let mut subscribers = self
+            .subscribers
+            .lock()
+            .map_err(|_| ExtensionError::Protocol {
+                extension: "bus".to_string(),
+                message: "event bus subscriber map is poisoned".to_string(),
+            })?;
+        subscribers.insert(id, Subscriber { filter, sender });
+        Ok(Subscription {
             id,
             receiver,
             bus: Arc::downgrade(self),
-        }
+        })
     }
 
     /// Publish one event.
@@ -377,22 +395,50 @@ impl EventBus {
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs())
             .unwrap_or_default();
-        if let Ok(mut rate) = self.rate.lock() {
-            let entry = rate.entry(event.source.clone()).or_insert((second, 0));
-            if entry.0 != second {
-                *entry = (second, 0);
+        let mut rate = match self.rate.lock() {
+            Ok(rate) => rate,
+            Err(_) => {
+                if let Ok(mut metrics) = self.metrics.lock() {
+                    metrics.rejected = metrics.rejected.saturating_add(1);
+                }
+                return Err(ExtensionError::Protocol {
+                    extension: event.source.clone(),
+                    message: "event bus rate limiter lock is poisoned".to_string(),
+                });
             }
-            if entry.1 >= MAX_EVENTS_PER_SECOND {
+        };
+        if !rate.contains_key(&event.source) && rate.len() >= MAX_TRACKED_PUBLISHERS {
+            // The table only grows when distinct sources publish. Sweep the
+            // previous second's windows before refusing a new source, so an
+            // idle publisher's entry is reclaimed instead of accumulating.
+            rate.retain(|_, (started, _)| *started == second);
+            if rate.len() >= MAX_TRACKED_PUBLISHERS {
                 if let Ok(mut metrics) = self.metrics.lock() {
                     metrics.rejected = metrics.rejected.saturating_add(1);
                 }
                 return Err(ExtensionError::Limit {
                     extension: event.source.clone(),
-                    message: format!("more than {MAX_EVENTS_PER_SECOND} events in one second"),
+                    message: format!(
+                        "more than {MAX_TRACKED_PUBLISHERS} distinct publishers in one second"
+                    ),
                 });
             }
-            entry.1 = entry.1.saturating_add(1);
         }
+        let entry = rate.entry(event.source.clone()).or_insert((second, 0));
+        if entry.0 != second {
+            *entry = (second, 0);
+        }
+        if entry.1 >= MAX_EVENTS_PER_SECOND {
+            if let Ok(mut metrics) = self.metrics.lock() {
+                metrics.rejected = metrics.rejected.saturating_add(1);
+            }
+            return Err(ExtensionError::Limit {
+                extension: event.source.clone(),
+                message: format!("more than {MAX_EVENTS_PER_SECOND} events in one second"),
+            });
+        }
+        entry.1 = entry.1.saturating_add(1);
+        drop(rate);
         let subscribers = match self.subscribers.lock() {
             Ok(subscribers) => subscribers,
             Err(_) => {
@@ -430,6 +476,13 @@ impl EventBus {
             .lock()
             .map(|metrics| *metrics)
             .unwrap_or_default()
+    }
+
+    /// The number of publisher windows currently tracked, for the reclamation
+    /// test.
+    #[cfg(test)]
+    fn tracked_publishers(&self) -> usize {
+        self.rate.lock().map(|rate| rate.len()).unwrap_or(0)
     }
 
     /// The number of live subscribers.
@@ -549,7 +602,7 @@ mod tests {
     #[test]
     fn a_full_queue_drops_and_counts_instead_of_blocking() {
         let bus = EventBus::new();
-        let subscription = bus.subscribe(EventFilter::all(), 1);
+        let subscription = bus.subscribe(EventFilter::all(), 1).expect("subscribe");
         let first =
             ExtensionEvent::new("bsh", "app.started", serde_json::json!({})).expect("event");
         let second =
@@ -618,10 +671,58 @@ mod tests {
     fn dropping_a_subscription_unsubscribes_it() {
         let bus = EventBus::new();
         {
-            let _subscription = bus.subscribe(EventFilter::all(), 4);
+            let _subscription = bus.subscribe(EventFilter::all(), 4).expect("subscribe");
             assert_eq!(bus.subscriber_count(), 1);
         }
         assert_eq!(bus.subscriber_count(), 0);
+    }
+
+    #[test]
+    fn a_poisoned_rate_limiter_fails_closed() {
+        let bus = EventBus::new();
+        let poison = Arc::clone(&bus);
+        let _ = std::thread::spawn(move || {
+            let _guard = poison.rate.lock().expect("rate lock");
+            panic!("poison the rate limiter");
+        })
+        .join();
+        let event =
+            ExtensionEvent::new("bsh", "app.started", serde_json::json!({})).expect("event");
+        let error = bus.publish(&event).expect_err("poisoned rate limiter");
+        assert!(matches!(error, ExtensionError::Protocol { .. }), "{error}");
+        assert_eq!(bus.subscriber_count(), 0);
+    }
+
+    #[test]
+    fn a_poisoned_subscriber_map_refuses_a_subscription() {
+        let bus = EventBus::new();
+        let poison = Arc::clone(&bus);
+        let _ = std::thread::spawn(move || {
+            let _guard = poison.subscribers.lock().expect("subscriber lock");
+            panic!("poison the subscriber map");
+        })
+        .join();
+        let error = match bus.subscribe(EventFilter::all(), 4) {
+            Ok(_) => panic!("a poisoned subscriber map must not return a subscription"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, ExtensionError::Protocol { .. }), "{error}");
+    }
+
+    #[test]
+    fn stale_publisher_windows_are_reclaimed() {
+        let bus = EventBus::new();
+        {
+            let mut rate = bus.rate.lock().expect("rate");
+            for index in 0..MAX_TRACKED_PUBLISHERS {
+                rate.insert(format!("stale-{index}"), (0, 1));
+            }
+        }
+        let event =
+            ExtensionEvent::new("fresh", "app.started", serde_json::json!({})).expect("event");
+        bus.publish(&event)
+            .expect("a fresh publisher reclaims the table");
+        assert_eq!(bus.tracked_publishers(), 1);
     }
 
     #[test]
