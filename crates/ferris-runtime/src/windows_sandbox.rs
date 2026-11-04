@@ -40,6 +40,7 @@ impl WindowsSandbox {
         workspace: Option<&Path>,
         data: Option<&Path>,
         memory_bytes: u64,
+        program: &Path,
     ) -> Result<Self, String> {
         let limits = heel::ResourceLimits::builder()
             .max_memory_bytes(memory_bytes)
@@ -57,6 +58,15 @@ impl WindowsSandbox {
         if let Some(data) = data {
             builder = builder.writable(data);
         }
+        // A script interpreter lives outside the package (Python's stdlib and
+        // DLLs beside its executable), so grant the resolved program's own
+        // directory read+execute. Without this an AppContainer Python starts
+        // and immediately cannot import its standard library.
+        if let Ok(resolved) = which::which(program) {
+            if let Some(directory) = resolved.parent() {
+                builder = builder.readable(directory).executable(directory);
+            }
+        }
         let sandbox = Sandbox::with_config(builder.build())
             .await
             .map_err(|error| error.to_string())?;
@@ -71,8 +81,9 @@ impl WindowsSandbox {
         workspace: Option<&Path>,
         data: Option<&Path>,
         memory_bytes: u64,
+        program: &Path,
     ) -> Result<Self, String> {
-        futures_lite::future::block_on(Self::new(root, workspace, data, memory_bytes))
+        futures_lite::future::block_on(Self::new(root, workspace, data, memory_bytes, program))
     }
 
     /// Spawn one child with piped stdio and the caller's environment.
@@ -139,8 +150,14 @@ mod tests {
         std::fs::create_dir_all(&outside).expect("outside");
         std::fs::write(root.join("payload.txt"), b"inside").expect("payload");
 
-        let sandbox = WindowsSandbox::new_blocking(&root, Some(&workspace), None, 64 * 1024 * 1024)
-            .expect("sandbox");
+        let sandbox = WindowsSandbox::new_blocking(
+            &root,
+            Some(&workspace),
+            None,
+            64 * 1024 * 1024,
+            Path::new("cmd"),
+        )
+        .expect("sandbox");
 
         let read = futures_lite::future::block_on(sandbox.output(
             "cmd",

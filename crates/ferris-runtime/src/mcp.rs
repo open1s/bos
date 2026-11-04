@@ -801,7 +801,10 @@ impl McpCore {
     }
 
     #[cfg(windows)]
-    fn sandbox(&self) -> Result<Arc<crate::windows_sandbox::WindowsSandbox>, ExtensionError> {
+    fn sandbox(
+        &self,
+        program: &Path,
+    ) -> Result<Arc<crate::windows_sandbox::WindowsSandbox>, ExtensionError> {
         let mut slot = self
             .sandbox
             .lock()
@@ -815,6 +818,7 @@ impl McpCore {
                 None,
                 None,
                 self.memory_bytes,
+                program,
             )
             .map_err(|message| ExtensionError::Runtime {
                 extension: self.extension.to_string(),
@@ -929,7 +933,7 @@ impl McpCore {
         })?);
         #[cfg(windows)]
         let mut child = {
-            let sandbox = self.sandbox()?;
+            let sandbox = self.sandbox(&program)?;
             let mut envs: Vec<(String, String)> = Vec::new();
             for key in ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"] {
                 if let Some(value) = std::env::var_os(key) {

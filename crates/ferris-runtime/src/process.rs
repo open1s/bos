@@ -1184,12 +1184,11 @@ impl ProcessRuntime {
         }
     }
 
-    /// Start with two bounded retries; a failed handshake leaves no tool side
-    /// effect, so retrying the transport is safe. Delays are 100ms and 250ms.
     /// The AppContainer this runtime's children run in, created once.
     #[cfg(windows)]
     async fn sandbox(
         &self,
+        program: &Path,
     ) -> Result<std::sync::Arc<crate::windows_sandbox::WindowsSandbox>, ExtensionError> {
         let mut slot = self.appcontainer.lock().await;
         if let Some(sandbox) = slot.as_ref() {
@@ -1201,6 +1200,7 @@ impl ProcessRuntime {
                 self.workspace.as_deref(),
                 self.data_root.as_deref(),
                 self.memory_bytes,
+                program,
             )
             .await
             .map_err(|message| ExtensionError::Runtime {
@@ -1212,6 +1212,8 @@ impl ProcessRuntime {
         Ok(sandbox)
     }
 
+    /// Start with two bounded retries; a failed handshake leaves no tool side
+    /// effect, so retrying the transport is safe. Delays are 100ms and 250ms.
     async fn start_with_retry(&self) -> Result<ProcessSession, ExtensionError> {
         let mut last = None;
         for delay in [0_u64, 100, 250] {
@@ -1345,7 +1347,7 @@ impl ProcessRuntime {
                         .to_string(),
                 });
             }
-            let sandbox = self.sandbox().await?;
+            let sandbox = self.sandbox(&program).await?;
             let mut envs = vec![("BSH_IPC_TOKEN".to_string(), token.clone())];
             for key in ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"] {
                 if let Some(value) = std::env::var_os(key) {
