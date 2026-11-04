@@ -25,7 +25,7 @@ impl<A: ReActApp> ReActEngine<A> {
                     "elapsed_ms": 0,
                 }));
             }
-            let result = self.tools.call(name, input).await;
+            let result = self.tools.call_with_call_id(name, input, &cid).await;
             if result.is_ok() {
                 self.run_manager.complete(&cid);
             } else {

@@ -31,6 +31,9 @@ use ferris_core::types::{ContributionId, ExtensionError, ExtensionId, RuntimeKin
 /// The largest request or result body the bridge accepts.
 const MAX_BRIDGE_BODY: usize = 8 * 1024 * 1024;
 
+/// The largest number of event subscriptions one plugin may hold.
+const MAX_SUBSCRIPTIONS: usize = 16;
+
 /// Extism call lifecycle. Only the thread holding the plugin mutex may move
 /// IDLE to RUNNING; cancellation can therefore only target an active call.
 const CALL_IDLE: u8 = 0;
@@ -61,7 +64,9 @@ struct Bridge {
     publishes: Vec<String>,
     subscribes: Vec<String>,
     config: String,
-    subscriptions: Mutex<Vec<Subscription>>,
+    /// topic -> subscription, so a repeated subscribe is idempotent and the
+    /// ceiling is visible without scanning filters.
+    subscriptions: Mutex<Vec<(String, Subscription)>>,
     events_out: Mutex<Vec<ExtensionEvent>>,
     /// Shared lifecycle state; the bridge rejects operations after cancellation.
     call_state: Arc<AtomicU8>,
@@ -97,6 +102,17 @@ impl Bridge {
         let canonical_ancestor = ancestor.canonicalize().map_err(|error| error.to_string())?;
         if !canonical_ancestor.starts_with(&canonical_workspace) {
             return Err("path escapes the workspace".to_string());
+        }
+        // The ancestor walk resolves parents; an existing leaf still has to be
+        // checked itself, because fs::read/write follow a final symlink.
+        if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+            if metadata.file_type().is_symlink() {
+                return Err("the final path component is a symlink".to_string());
+            }
+            let canonical = path.canonicalize().map_err(|error| error.to_string())?;
+            if !canonical.starts_with(&canonical_workspace) {
+                return Err("path escapes the workspace".to_string());
+            }
         }
         Ok(path)
     }
@@ -154,7 +170,13 @@ impl Bridge {
                     },
                 )
                 .map_err(|error| error.to_string())?;
+                let metadata = std::fs::metadata(&path).map_err(|error| error.to_string())?;
+                if metadata.len() > MAX_BRIDGE_BODY as u64 {
+                    return Err("file is too large".to_string());
+                }
                 let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
+                // The file can grow between stat and read; the second check
+                // keeps the allocation bounded in that race.
                 if bytes.len() > MAX_BRIDGE_BODY {
                     return Err("file is too large".to_string());
                 }
@@ -405,15 +427,28 @@ impl Bridge {
                 }
                 let filter = EventFilter::from_topics(&[topic.to_string()])
                     .map_err(|error| error.to_string())?;
+                let mut subscriptions = self
+                    .subscriptions
+                    .lock()
+                    .map_err(|_| "subscription lock is poisoned".to_string())?;
+                // A plugin that subscribes twice to one topic gets the same
+                // id, not a second queue that doubles every delivery.
+                if let Some((_, subscription)) =
+                    subscriptions.iter().find(|(existing, _)| existing == topic)
+                {
+                    return Ok(json!(subscription.id()));
+                }
+                if subscriptions.len() >= MAX_SUBSCRIPTIONS {
+                    return Err(format!(
+                        "the extension already holds {MAX_SUBSCRIPTIONS} event subscriptions"
+                    ));
+                }
                 let subscription = self
                     .events
                     .subscribe(filter, 64)
                     .map_err(|error| error.to_string())?;
                 let id = subscription.id();
-                self.subscriptions
-                    .lock()
-                    .map_err(|_| "subscription lock is poisoned".to_string())?
-                    .push(subscription);
+                subscriptions.push((topic.to_string(), subscription));
                 Ok(json!(id))
             }
             other => Err(format!("unknown host operation {other:?}")),
@@ -423,7 +458,7 @@ impl Bridge {
     fn take_events(&self) -> Vec<ExtensionEvent> {
         let mut drained = Vec::new();
         if let Ok(subscriptions) = self.subscriptions.lock() {
-            for subscription in subscriptions.iter() {
+            for (_, subscription) in subscriptions.iter() {
                 while let Some(event) = subscription.try_recv() {
                     drained.push(event);
                 }
@@ -729,6 +764,23 @@ impl ExtismRuntime {
     pub fn contributions(&self) -> DeclarativeContributions {
         DeclarativeContributions::default()
     }
+
+    /// Enforce the manifest output ceiling on a declarative reply.
+    fn bounded_output(&self, value: &Value) -> Result<(), ExtensionError> {
+        let bytes = serde_json::to_vec(value)
+            .map(|bytes| bytes.len())
+            .unwrap_or(0);
+        if bytes as u64 > self.output_bytes {
+            return Err(ExtensionError::Limit {
+                extension: self.extension.to_string(),
+                message: format!(
+                    "plugin reply is {bytes} bytes; the ceiling is {}",
+                    self.output_bytes
+                ),
+            });
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -763,6 +815,15 @@ impl Runtime for ExtismRuntime {
                 message: "Extism cancel-handle lock is poisoned".to_string(),
             })?;
         *cancel_handle = None;
+        // Subscriptions and queued outbound events belong to the plugin that
+        // just went away. Keeping them would double each delivery after a
+        // reactivation and let a dead plugin's queue leak into the next one.
+        if let Ok(mut subscriptions) = self.bridge.subscriptions.lock() {
+            subscriptions.clear();
+        }
+        if let Ok(mut events) = self.bridge.events_out.lock() {
+            events.clear();
+        }
         Ok(())
     }
 
@@ -883,17 +944,23 @@ impl Runtime for ExtismRuntime {
     }
 
     async fn command(&self, id: &str, arguments: Value) -> Result<Value, ExtensionError> {
-        self.call::<_, Value>("bsh_command", &json!({"id": id, "arguments": arguments}))?
+        let value = self
+            .call::<_, Value>("bsh_command", &json!({"id": id, "arguments": arguments}))?
             .ok_or_else(|| ExtensionError::NotFound {
                 id: format!("{}::{id}", self.extension),
-            })
+            })?;
+        self.bounded_output(&value)?;
+        Ok(value)
     }
 
     async fn panel(&self, id: &str) -> Result<Value, ExtensionError> {
-        self.call::<_, Value>("bsh_panel", &json!({"id": id}))?
+        let value = self
+            .call::<_, Value>("bsh_panel", &json!({"id": id}))?
             .ok_or_else(|| ExtensionError::NotFound {
                 id: format!("{}::{id}", self.extension),
-            })
+            })?;
+        self.bounded_output(&value)?;
+        Ok(value)
     }
 
     async fn pump(&self) -> Result<(), ExtensionError> {
@@ -939,7 +1006,15 @@ impl Runtime for ExtismRuntime {
                 path: self.component.clone(),
                 message: error.to_string(),
             })?;
-            let _ = plugin.call::<&str, String>("bsh_event", text.as_str());
+            if let Err(error) = plugin.call::<&str, String>("bsh_event", text.as_str()) {
+                // Event delivery is best effort, but it must not be silent: a
+                // failing callback is how a guest stops receiving its queue.
+                log::warn!(
+                    target: "bsh::extension",
+                    "{}: event delivery failed: {error}",
+                    self.extension
+                );
+            }
         }
         Ok(())
     }

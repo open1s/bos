@@ -49,6 +49,11 @@ pub trait AsyncTool: Send + Sync {
     }
     /// Run the tool with JSON input.
     async fn run(&self, input: &Value) -> Result<Value, ToolError>;
+    /// Run the tool with the engine's call id, so `cancel(call_id)` can target
+    /// exactly this invocation. Tools that do not need it keep the default.
+    async fn run_with_call_id(&self, input: &Value, _call_id: &str) -> Result<Value, ToolError> {
+        self.run(input).await
+    }
     /// JSON schema for the tool arguments.
     fn json_schema(&self) -> Value {
         serde_json::json!({})
@@ -82,6 +87,18 @@ pub trait AsyncTool: Send + Sync {
         let _ = input;
         Err(ToolError::Failed("Streaming not supported".to_string()))
     }
+    /// Run the tool and stream partial output under the engine's call id, so
+    /// dropping the stream cancels exactly this invocation.
+    async fn run_streaming_with_call_id(
+        &self,
+        input: &Value,
+        _call_id: &str,
+    ) -> Result<
+        std::pin::Pin<Box<dyn futures::Stream<Item = Result<String, ToolError>> + Send>>,
+        ToolError,
+    > {
+        self.run_streaming(input).await
+    }
 }
 
 /// A tool of either the sync or async flavor.
@@ -98,6 +115,14 @@ impl ToolVariant {
         match self {
             Self::Sync(tool) => tool.run(input),
             Self::Async(tool) => tool.run(input).await,
+        }
+    }
+
+    /// Run the wrapped tool with the engine's call id.
+    pub async fn run_with_call_id(&self, input: &Value, call_id: &str) -> Result<Value, ToolError> {
+        match self {
+            Self::Sync(tool) => tool.run(input),
+            Self::Async(tool) => tool.run_with_call_id(input, call_id).await,
         }
     }
 
@@ -211,6 +236,20 @@ impl ToolRegistry {
     pub async fn call(&self, name: &str, input: &Value) -> Result<Value, ToolError> {
         if let Some(tool) = self.tools.get(name) {
             tool.run(input).await
+        } else {
+            Err(ToolError::NotFound(name.to_string()))
+        }
+    }
+
+    /// Call a tool by name, telling a cancelable tool which call id is running.
+    pub async fn call_with_call_id(
+        &self,
+        name: &str,
+        input: &Value,
+        call_id: &str,
+    ) -> Result<Value, ToolError> {
+        if let Some(tool) = self.tools.get(name) {
+            tool.run_with_call_id(input, call_id).await
         } else {
             Err(ToolError::NotFound(name.to_string()))
         }

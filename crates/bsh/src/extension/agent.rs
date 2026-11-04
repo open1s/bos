@@ -89,9 +89,16 @@ pub(crate) struct ContributionLease {
     /// package (it may be gone), so the parsed content travels with the lease.
     skills: Vec<agent::skills::SkillContent>,
     active: Arc<AtomicBool>,
+    calls: Arc<CallTracker>,
 }
 
 impl ContributionLease {
+    /// Signal every in-flight call owned by this lease. The calls observe the
+    /// token on their next poll and return a cancellation error.
+    pub(crate) fn cancel_in_flight(&self) {
+        self.calls.cancel_all();
+    }
+
     /// Revoke this extension's tools, prompts, skills, commands and panels.
     /// Returns the number of contributions removed from the build.
     pub(crate) fn revoke(
@@ -100,6 +107,13 @@ impl ContributionLease {
         registry: &mut agent::plugins::PluginRegistry,
     ) -> usize {
         self.active.store(false, Ordering::SeqCst);
+        self.cancel_in_flight();
+        // The call future observes its token within one poll interval; wait
+        // briefly so a revoked tool cannot keep writing after this returns.
+        let calls = Arc::clone(&self.calls);
+        crate::extension::block_on_tokio(async move {
+            calls.wait_empty(Duration::from_secs(2)).await;
+        });
         let tools = agent.remove_live_async_tools(&self.tools);
         let prompts = self
             .prompt_sections
@@ -113,6 +127,7 @@ impl ContributionLease {
 
     /// Remove only the live overlay pieces, keeping commands/panels in place.
     pub(crate) fn suspend_live(&self, agent: &agent::Agent) -> usize {
+        self.cancel_in_flight();
         let tools = agent.remove_live_async_tools(&self.tools);
         let prompts = self
             .prompt_sections
@@ -150,7 +165,11 @@ impl ContributionLease {
     /// Bind the lease's liveness to the owning Fiber.
     pub(crate) fn attach_to_fiber(&self, fiber: &mut Fiber) {
         let active = Arc::clone(&self.active);
-        fiber.own(move || active.store(false, Ordering::SeqCst));
+        let calls = Arc::clone(&self.calls);
+        fiber.own(move || {
+            active.store(false, Ordering::SeqCst);
+            calls.cancel_all();
+        });
     }
 
     /// Names of the async tools owned by this lease.
@@ -171,10 +190,14 @@ impl ferris_sdk::ContributionLease for ContributionLease {
         host: &mut dyn ferris_sdk::LeaseHost,
     ) -> Result<(), ferris_sdk::ExtError> {
         self.active.store(false, Ordering::SeqCst);
+        self.calls.cancel_all();
         host.remove_tools(&self.owner, &self.tools);
         host.remove_prompts(&self.owner, &self.prompt_sections);
         host.remove_skills(&self.owner, &self.skill_paths);
         host.remove_registry_owner(&self.owner);
+        // Cancellation is a signal; wait, bounded, for the calls to actually
+        // leave before reporting the lease revoked.
+        self.calls.wait_empty(Duration::from_secs(2)).await;
         Ok(())
     }
 }
@@ -193,13 +216,129 @@ pub(crate) struct ExtensionTool {
     max_output_bytes: u64,
     dispatch: Arc<ferris_sdk::composable::dispatch::EventDispatcher>,
     qualified: String,
-    cancelled: Arc<AtomicBool>,
+    calls: Arc<CallTracker>,
     active: Arc<AtomicBool>,
+}
+
+/// The in-flight calls of one installed extension tool, keyed by call id.
+///
+/// A single shared cancellation flag cannot isolate two overlapping calls:
+/// cancelling one would cancel both, and a later call would clear the other
+/// cancellation. Each invocation owns a token here; a lease revocation
+/// signals every token and then waits for the calls to drain.
+#[derive(Default)]
+pub(crate) struct CallTracker {
+    calls: std::sync::Mutex<std::collections::HashMap<String, Arc<AtomicBool>>>,
+    changed: tokio::sync::Notify,
+}
+
+impl CallTracker {
+    fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Register a token for one call id.
+    fn begin(&self, call_id: &str) -> Arc<AtomicBool> {
+        let token = Arc::new(AtomicBool::new(false));
+        if let Ok(mut calls) = self.calls.lock() {
+            calls.insert(call_id.to_string(), Arc::clone(&token));
+        }
+        token
+    }
+
+    /// Remove a finished call and wake a drain waiter.
+    fn finish(&self, call_id: &str) {
+        if let Ok(mut calls) = self.calls.lock() {
+            calls.remove(call_id);
+        }
+        self.changed.notify_waiters();
+    }
+
+    /// Signal one call. Returns false when the call already finished.
+    fn cancel(&self, call_id: &str) -> bool {
+        let token = self
+            .calls
+            .lock()
+            .ok()
+            .and_then(|calls| calls.get(call_id).cloned());
+        match token {
+            Some(token) => {
+                token.store(true, Ordering::SeqCst);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// How many other calls are still running beside this call id.
+    fn others_in_flight(&self, call_id: &str) -> usize {
+        self.calls
+            .lock()
+            .map(|calls| calls.keys().filter(|id| id.as_str() != call_id).count())
+            .unwrap_or(0)
+    }
+
+    /// Signal every in-flight call. Used when the lease is revoked.
+    fn cancel_all(&self) {
+        if let Ok(calls) = self.calls.lock() {
+            for token in calls.values() {
+                token.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    fn in_flight(&self) -> usize {
+        self.calls.lock().map(|calls| calls.len()).unwrap_or(0)
+    }
+
+    /// Wait, bounded, for every call to leave the tracker.
+    async fn wait_empty(&self, grace: Duration) {
+        let deadline = tokio::time::Instant::now() + grace;
+        loop {
+            let notified = self.changed.notified();
+            if self.in_flight() == 0 {
+                return;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// Removes a call from its tracker even when the invocation returns early.
+struct CallGuard {
+    calls: Arc<CallTracker>,
+    id: String,
+}
+
+impl Drop for CallGuard {
+    fn drop(&mut self) {
+        self.calls.finish(&self.id);
+    }
+}
+
+/// Signals a streaming call when its consumer drops the stream.
+struct CancelOnDrop {
+    tool: ExtensionTool,
+    id: String,
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.tool.cancel(&self.id);
+    }
 }
 
 /// The progress events one tool may emit in a one-second window.
 const PROGRESS_PER_WINDOW: u32 = 200;
 const PROGRESS_WINDOW: Duration = Duration::from_secs(1);
+
+/// Streaming items buffered for a reader that has not polled yet.
+const STREAM_QUEUE: usize = 64;
+
+/// The largest single progress chunk forwarded to a stream.
+const MAX_PROGRESS_BYTES: usize = 16 * 1024;
 
 /// A fixed-window limiter for progress chunks, so a chatty guest cannot turn a
 /// tool call into an unbounded stream of model-visible messages.
@@ -268,15 +407,17 @@ impl ExtensionTool {
             events,
             workspace,
             active,
+            CallTracker::new(),
             crate::extension::dispatcher(),
         )
     }
 
-    /// Build a tool against an explicit hook dispatcher.
+    /// Build a tool against an explicit hook dispatcher and call tracker.
     ///
     /// Production uses the process-wide dispatcher; tests inject a private one
     /// so a `tool.after` interceptor registered by one case cannot observe (or
     /// rewrite) another case's calls.
+    #[allow(clippy::too_many_arguments)]
     fn with_dispatcher(
         contributed: &Contributed,
         descriptor: ToolDescriptor,
@@ -284,6 +425,7 @@ impl ExtensionTool {
         events: Arc<EventBus>,
         workspace: Option<PathBuf>,
         active: Arc<AtomicBool>,
+        calls: Arc<CallTracker>,
         dispatch: Arc<ferris_sdk::composable::dispatch::EventDispatcher>,
     ) -> Self {
         let qualified = contributed.extension.qualify(&descriptor.id);
@@ -299,7 +441,7 @@ impl ExtensionTool {
             max_output_bytes: contributed.max_output_bytes,
             dispatch,
             qualified,
-            cancelled: Arc::new(AtomicBool::new(false)),
+            calls,
             active,
         }
     }
@@ -341,8 +483,16 @@ impl react::tool::registry::AsyncTool for ExtensionTool {
         true
     }
 
-    fn cancel(&self, _call_id: &str) {
-        self.cancelled.store(true, Ordering::SeqCst);
+    fn cancel(&self, call_id: &str) {
+        if !self.calls.cancel(call_id) {
+            // The call already finished; there is nothing to signal.
+            return;
+        }
+        // A shared runtime must keep serving the other calls, so only stop it
+        // when this was its last in-flight call.
+        if self.calls.others_in_flight(call_id) > 0 {
+            return;
+        }
         let runtime = Arc::clone(&self.runtime);
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
@@ -352,7 +502,15 @@ impl react::tool::registry::AsyncTool for ExtensionTool {
     }
 
     async fn run(&self, arguments: &Value) -> Result<Value, agent::tools::ToolError> {
-        self.invoke(arguments, None).await
+        self.invoke(arguments, None, None).await
+    }
+
+    async fn run_with_call_id(
+        &self,
+        arguments: &Value,
+        call_id: &str,
+    ) -> Result<Value, agent::tools::ToolError> {
+        self.invoke(arguments, None, Some(call_id)).await
     }
 
     async fn run_streaming(
@@ -362,23 +520,53 @@ impl react::tool::registry::AsyncTool for ExtensionTool {
         std::pin::Pin<Box<dyn Stream<Item = Result<String, agent::tools::ToolError>> + Send>>,
         agent::tools::ToolError,
     > {
+        let call_id = uuid::Uuid::new_v4().to_string();
+        self.run_streaming_with_call_id(input, &call_id).await
+    }
+
+    async fn run_streaming_with_call_id(
+        &self,
+        input: &Value,
+        call_id: &str,
+    ) -> Result<
+        std::pin::Pin<Box<dyn Stream<Item = Result<String, agent::tools::ToolError>> + Send>>,
+        agent::tools::ToolError,
+    > {
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        // The consumer-facing queue is bounded: a stalled reader must not let
+        // progress messages accumulate without limit.
         let (stream_tx, stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<Result<String, agent::tools::ToolError>>();
+            tokio::sync::mpsc::channel::<Result<String, agent::tools::ToolError>>(STREAM_QUEUE);
         let tool = self.clone();
         let input = input.clone();
+        let id = call_id.to_string();
         tokio::spawn(async move {
             let progress_stream = stream_tx.clone();
+            let max_progress = tool.max_output_bytes;
             let forward = tokio::spawn(async move {
                 let mut window = ProgressWindow::new();
+                let mut forwarded = 0u64;
                 while let Some(value) = progress_rx.recv().await {
                     if !window.allow() {
                         continue;
                     }
-                    let _ = progress_stream.send(Ok(value.to_string()));
+                    let text = value.to_string();
+                    // One oversized chunk is dropped rather than copied, and
+                    // the whole stream is held to the call output budget.
+                    if text.len() > MAX_PROGRESS_BYTES {
+                        continue;
+                    }
+                    let bytes = text.len() as u64;
+                    if forwarded.saturating_add(bytes) > max_progress {
+                        continue;
+                    }
+                    forwarded = forwarded.saturating_add(bytes);
+                    if progress_stream.try_send(Ok(text)).is_err() {
+                        break;
+                    }
                 }
             });
-            let result = tool.invoke(&input, Some(progress_tx)).await;
+            let result = tool.invoke(&input, Some(progress_tx), Some(&id)).await;
             let _ = forward.await;
             match result {
                 Ok(value) => {
@@ -386,16 +574,24 @@ impl react::tool::registry::AsyncTool for ExtensionTool {
                         Value::String(text) => text,
                         other => serde_json::to_string(&other).unwrap_or_default(),
                     };
-                    let _ = stream_tx.send(Ok(text));
+                    let _ = stream_tx.send(Ok(text)).await;
                 }
                 Err(error) => {
-                    let _ = stream_tx.send(Err(error));
+                    let _ = stream_tx.send(Err(error)).await;
                 }
             }
         });
+        // Dropping the returned stream cancels the invocation, and it only
+        // stops the runtime when the call was still running.
+        let guard = CancelOnDrop {
+            tool: self.clone(),
+            id: call_id.to_string(),
+        };
         Ok(Box::pin(futures::stream::unfold(
-            stream_rx,
-            |mut receiver| async move { receiver.recv().await.map(|item| (item, receiver)) },
+            (stream_rx, guard),
+            |(mut receiver, guard)| async move {
+                receiver.recv().await.map(|item| (item, (receiver, guard)))
+            },
         )))
     }
 }
@@ -405,13 +601,21 @@ impl ExtensionTool {
         &self,
         arguments: &Value,
         progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+        call_id: Option<&str>,
     ) -> Result<Value, agent::tools::ToolError> {
         if !self.active.load(Ordering::SeqCst) {
             return Err(agent::tools::ToolError::Failed(
                 "extension contribution has been revoked".to_string(),
             ));
         }
-        self.cancelled.store(false, Ordering::SeqCst);
+        let call_id = call_id
+            .map(str::to_string)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let token = self.calls.begin(&call_id);
+        let _guard = CallGuard {
+            calls: Arc::clone(&self.calls),
+            id: call_id,
+        };
         let started = std::time::Instant::now();
         let correlation = uuid::Uuid::new_v4().to_string();
         let arguments = self
@@ -464,7 +668,7 @@ impl ExtensionTool {
                 &context,
             ),
         };
-        let cancel = Arc::clone(&self.cancelled);
+        let cancel = Arc::clone(&token);
         let cancelled = async move {
             while !cancel.load(Ordering::SeqCst) {
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -486,6 +690,15 @@ impl ExtensionTool {
                     millis: self.timeout_ms,
                 }),
             },
+        };
+        // The result and the cancellation can become ready together; a
+        // cancelled call must not report a value the caller already abandoned.
+        let outcome = match outcome {
+            Ok(_) if token.load(Ordering::SeqCst) => Err(ExtensionError::Runtime {
+                extension: self.owner.to_string(),
+                message: "cancelled".to_string(),
+            }),
+            other => other,
         };
         match outcome {
             Ok(result) => {
@@ -613,14 +826,17 @@ pub(crate) fn install_with_lease(
     let mut installed_tools = Vec::new();
     let mut installed_handles = Vec::new();
     let active = Arc::new(AtomicBool::new(true));
+    let calls = CallTracker::new();
     for descriptor in &contributed.tools {
-        let tool = ExtensionTool::new_with_liveness(
+        let tool = ExtensionTool::with_dispatcher(
             contributed,
             descriptor.clone(),
             Arc::clone(&policy),
             Arc::clone(&events),
             workspace.clone(),
             Arc::clone(&active),
+            Arc::clone(&calls),
+            crate::extension::dispatcher(),
         );
         let name = tool.name().to_string();
         let handle: Arc<dyn react::tool::registry::AsyncTool> = Arc::new(tool);
@@ -724,6 +940,7 @@ pub(crate) fn install_with_lease(
         skill_paths,
         skills,
         active,
+        calls,
     };
     (
         PluginInfo {
@@ -931,6 +1148,7 @@ mod tests {
             EventBus::new(),
             None,
             Arc::new(AtomicBool::new(true)),
+            CallTracker::new(),
             Arc::clone(&dispatch),
         );
         (tool, dispatch)
@@ -1158,5 +1376,262 @@ mod tests {
             .expect_err("an over-budget result is an error item")
             .to_string();
         assert!(message.contains("ceiling is 32"), "{message}");
+    }
+
+    struct BlockingRuntime {
+        started: Arc<tokio::sync::Semaphore>,
+        release: Arc<tokio::sync::Notify>,
+        cancels: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Runtime for BlockingRuntime {
+        fn kind(&self) -> RuntimeKind {
+            RuntimeKind::Builtin
+        }
+
+        async fn tools(&self) -> Result<Vec<ToolDescriptor>, ExtensionError> {
+            Ok(Vec::new())
+        }
+
+        async fn call_tool(
+            &self,
+            _name: &str,
+            arguments: Value,
+            _context: &CallContext,
+        ) -> Result<Value, ExtensionError> {
+            self.started.add_permits(1);
+            self.release.notified().await;
+            Ok(arguments)
+        }
+
+        async fn cancel(&self) -> Result<(), ExtensionError> {
+            self.cancels.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn tool_with(
+        scratch: &Scratch,
+        runtime: Arc<dyn Runtime>,
+        calls: Arc<CallTracker>,
+        max_output_bytes: u64,
+    ) -> Arc<ExtensionTool> {
+        let mut contributed = contributed(vec![], TrustLevel::Builtin);
+        contributed.runtime = runtime;
+        contributed.max_output_bytes = max_output_bytes;
+        Arc::new(ExtensionTool::with_dispatcher(
+            &contributed,
+            contributed.tools[0].clone(),
+            policy(scratch),
+            EventBus::new(),
+            None,
+            Arc::new(AtomicBool::new(true)),
+            calls,
+            Arc::new(ferris_sdk::composable::dispatch::EventDispatcher::new()),
+        ))
+    }
+
+    fn blocking_tool(
+        scratch: &Scratch,
+        calls: Arc<CallTracker>,
+    ) -> (
+        Arc<ExtensionTool>,
+        Arc<tokio::sync::Semaphore>,
+        Arc<tokio::sync::Notify>,
+        Arc<AtomicUsize>,
+    ) {
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let cancels = Arc::new(AtomicUsize::new(0));
+        let runtime = Arc::new(BlockingRuntime {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+            cancels: Arc::clone(&cancels),
+        });
+        (
+            tool_with(scratch, runtime, calls, 1024 * 1024),
+            started,
+            release,
+            cancels,
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_one_call_leaves_a_sibling_running() {
+        let scratch = Scratch::new("per-call-cancel");
+        let (tool, started, release, cancels) = blocking_tool(&scratch, CallTracker::new());
+        let a = {
+            let tool = Arc::clone(&tool);
+            tokio::spawn(async move {
+                react::tool::registry::AsyncTool::run_with_call_id(
+                    &*tool,
+                    &serde_json::json!({"n": 1}),
+                    "a",
+                )
+                .await
+            })
+        };
+        started.acquire().await.expect("a started").forget();
+        let b = {
+            let tool = Arc::clone(&tool);
+            tokio::spawn(async move {
+                react::tool::registry::AsyncTool::run_with_call_id(
+                    &*tool,
+                    &serde_json::json!({"n": 2}),
+                    "b",
+                )
+                .await
+            })
+        };
+        started.acquire().await.expect("b started").forget();
+        tool.cancel("a");
+        let error = tokio::time::timeout(Duration::from_secs(1), a)
+            .await
+            .expect("a returns")
+            .expect("a join")
+            .expect_err("a is cancelled");
+        assert!(error.to_string().contains("cancelled"), "{error}");
+        assert!(!b.is_finished(), "cancelling a must not cancel b");
+        assert_eq!(
+            cancels.load(Ordering::SeqCst),
+            0,
+            "a shared runtime must keep serving b"
+        );
+        release.notify_waiters();
+        let result = tokio::time::timeout(Duration::from_secs(1), b)
+            .await
+            .expect("b returns")
+            .expect("b join")
+            .expect("b completes");
+        assert_eq!(result["n"], 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lease_revocation_cancels_an_in_flight_call() {
+        let scratch = Scratch::new("lease-cancel");
+        let calls = CallTracker::new();
+        let (tool, started, _release, _cancels) = blocking_tool(&scratch, Arc::clone(&calls));
+        let lease = ContributionLease {
+            owner: "com.example.tool".to_string(),
+            tools: vec![tool.name().to_string()],
+            tool_handles: vec![tool.clone() as Arc<dyn react::tool::registry::AsyncTool>],
+            prompt_sections: Vec::new(),
+            skill_paths: Vec::new(),
+            skills: Vec::new(),
+            active: Arc::clone(&tool.active),
+            calls: Arc::clone(&calls),
+        };
+        let call = {
+            let tool = Arc::clone(&tool);
+            tokio::spawn(async move {
+                react::tool::registry::AsyncTool::run_with_call_id(
+                    &*tool,
+                    &serde_json::json!({}),
+                    "lease",
+                )
+                .await
+            })
+        };
+        started.acquire().await.expect("call started").forget();
+        lease.cancel_in_flight();
+        let error = tokio::time::timeout(Duration::from_secs(1), call)
+            .await
+            .expect("call returns")
+            .expect("call join")
+            .expect_err("the revoked call is cancelled");
+        assert!(error.to_string().contains("cancelled"), "{error}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_a_stream_cancels_its_call() {
+        let scratch = Scratch::new("stream-drop");
+        let (tool, started, _release, cancels) = blocking_tool(&scratch, CallTracker::new());
+        let stream = react::tool::registry::AsyncTool::run_streaming_with_call_id(
+            &*tool,
+            &serde_json::json!({}),
+            "stream-drop",
+        )
+        .await
+        .expect("stream");
+        started.acquire().await.expect("call started").forget();
+        drop(stream);
+        for _ in 0..20 {
+            if cancels.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            cancels.load(Ordering::SeqCst),
+            1,
+            "dropping the stream must cancel the only in-flight call"
+        );
+    }
+
+    struct FloodRuntime;
+
+    #[async_trait]
+    impl Runtime for FloodRuntime {
+        fn kind(&self) -> RuntimeKind {
+            RuntimeKind::Builtin
+        }
+
+        async fn tools(&self) -> Result<Vec<ToolDescriptor>, ExtensionError> {
+            Ok(Vec::new())
+        }
+
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: Value,
+            _context: &CallContext,
+        ) -> Result<Value, ExtensionError> {
+            Ok(Value::Null)
+        }
+
+        async fn call_tool_progress(
+            &self,
+            _name: &str,
+            _arguments: Value,
+            _context: &CallContext,
+            progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+        ) -> Result<ferris_sdk::host_runtime::ToolResult, ExtensionError> {
+            if let Some(sender) = progress {
+                for _ in 0..500 {
+                    let _ = sender.send(serde_json::json!({"text": "x".repeat(100)}));
+                }
+            }
+            Ok(ferris_sdk::host_runtime::ToolResult::text("done"))
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_progress_is_held_to_the_output_budget() {
+        use futures::StreamExt as _;
+
+        let scratch = Scratch::new("stream-budget");
+        let tool = tool_with(&scratch, Arc::new(FloodRuntime), CallTracker::new(), 1_000);
+        let mut stream =
+            react::tool::registry::AsyncTool::run_streaming(&*tool, &serde_json::json!({}))
+                .await
+                .expect("stream");
+        // Let the producer run while nobody reads: the queue stays bounded.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut items = Vec::new();
+        while let Some(item) = stream.next().await {
+            items.push(item.expect("item"));
+        }
+        let progress: Vec<&String> = items
+            .iter()
+            .filter(|item| item.as_str() != "done")
+            .collect();
+        let bytes: usize = progress.iter().map(|item| item.len()).sum();
+        assert!(bytes <= 1_000, "progress used {bytes} bytes");
+        assert!(
+            progress.iter().all(|item| item.len() <= MAX_PROGRESS_BYTES),
+            "a single progress chunk exceeded the cap"
+        );
+        assert_eq!(items.last().map(String::as_str), Some("done"));
     }
 }
