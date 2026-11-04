@@ -1870,6 +1870,10 @@ for line in sys.stdin:
         continue
     elif method == "tools/list":
         result = {"tools": [{"name": "probe", "description": "Probe filesystem isolation", "inputSchema": {"type": "object", "properties": {}}}]}
+    elif method == "resources/list":
+        result = {"resources": []}
+    elif method == "prompts/list":
+        result = {"prompts": []}
     elif method == "tools/call":
         try:
             with open(probe, "w", encoding="utf-8") as handle:
