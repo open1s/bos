@@ -9173,6 +9173,9 @@ impl Shell {
     /// search has its own pane here (the local tool, its endpoint, key and
     /// budget), Agent loop and Shell have theirs, and Subagent has no pane in
     /// this deployment, so that row is omitted rather than linked nowhere.
+    /// Tools and skills joins them with Policy: it is the inventory the Web
+    /// search row's switch sits in, and without a row here that pane had no
+    /// entry at all - only the `--settings=tools` deep link reached it.
     fn builtin_setting_rows(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let lang = self.state.lang;
         let mut rows = Vec::new();
@@ -9183,6 +9186,14 @@ impl Shell {
                 "settings.webToolsDescription",
                 "web-search",
                 IconName::Globe,
+                theme::accent(),
+            ),
+            (
+                "tools",
+                "settings.tools",
+                "settings.toolsHint",
+                "tools",
+                IconName::ListChecks,
                 theme::accent(),
             ),
             (

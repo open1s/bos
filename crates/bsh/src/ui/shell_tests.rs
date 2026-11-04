@@ -7934,6 +7934,7 @@ fn the_plugins_pane_has_the_reference_shape(cx: &mut TestAppContext) {
         "plugins-page-info",
         "builtin-settings-header",
         "builtin-setting-web-search",
+        "builtin-setting-tools",
         "builtin-setting-agent-loop",
         "builtin-setting-shell",
         "experimental-plugins-header",
@@ -7971,6 +7972,7 @@ fn a_builtin_plugin_setting_row_navigates_to_its_pane(cx: &mut TestAppContext) {
 
     for (selector, pane) in [
         ("builtin-setting-web-search", "web-search"),
+        ("builtin-setting-tools", "tools"),
         ("builtin-setting-agent-loop", "agent-loop"),
         ("builtin-setting-shell", "shell"),
     ] {

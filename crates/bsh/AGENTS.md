@@ -3807,7 +3807,9 @@ plus the Vault, and the only door was Extensions > Built-in plugin settings, an
 inventory. `NAV` gains a `web-search` cell between Models and Extensions - the
 position a reader looks for the model-facing thing - and the Tools pane's Web
 search row gains a `Configure` link beside its switch, because that row is
-where the tool is switched. The CLI's `--help` SECTION list now matches
+where the tool is switched. Tools and skills also joins the built-in rows,
+because the pane that Configure link lives in had no entry of its own - only the
+`--settings=tools` deep link reached it. The CLI's `--help` SECTION list now matches
 `SECTIONS`; it listed a `presentation` that does not exist and omitted
 `web-search`, `policy` and `plugins`.
 

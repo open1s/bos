@@ -5978,9 +5978,9 @@ mod tests {
         }
     }
 
-    /// The preset's OWN grant is what offers search: even with the workspace
-    /// switch off, Standard still hands the agent the tool, because its
-    /// declaration is `web_search = true` rather than an inherited default.
+    /// Standard STATES its own grant, but a declaration cannot overrule the
+    /// reader: with the workspace switch off, the tool is gone even though
+    /// Standard declares `web_search = true`; with the switch on, it is offered.
     #[test]
     fn the_standard_preset_states_its_own_search_grant() {
         let root = scratch("preset-standard-search");
@@ -5989,8 +5989,15 @@ mod tests {
         settings.workspace.agent.web_tools_enabled = false;
         let built = build(&settings);
         assert!(
+            !tool_names(&built).iter().any(|name| name == "web_search"),
+            "Standard's grant cannot re-offer the tool the reader switched off"
+        );
+
+        settings.workspace.agent.web_tools_enabled = true;
+        let built = build(&settings);
+        assert!(
             tool_names(&built).iter().any(|name| name == "web_search"),
-            "Standard's own grant survives the workspace switch"
+            "and with the switch on, Standard's stated grant is what offers it"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -11552,12 +11559,11 @@ verdict := {"allow": false, "rule": "require-sandbox", "reason": "this workspace
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A preset's own search grant decides whether the LOCAL tool is
-    /// registered, the same precedence the hosted switch used: `false` withdraws
-    /// the tool even with the workspace switch on, and `true` offers it even
-    /// with the workspace switch off.
+    /// The preset and the workspace switch INTERSECT: `false` withdraws the
+    /// local tool even with the switch on, and `true` cannot re-offer it while
+    /// the switch is off. Only both agreeing offers search.
     #[test]
-    fn a_presets_search_grant_decides_the_local_tool() {
+    fn a_presets_search_grant_intersects_the_workspace_switch() {
         let root = scratch("preset-web-search");
         let mut settings = rooted(&root);
         settings.workspace.agent.web_tools_enabled = true;
@@ -11590,8 +11596,16 @@ verdict := {"allow": false, "rule": "require-sandbox", "reason": "this workspace
         settings.workspace.agent.web_tools_enabled = false;
         let built = build(&settings);
         assert!(
+            !tool_names(&built).iter().any(|name| name == "web_search"),
+            "the preset's grant cannot re-offer a tool the reader switched off"
+        );
+
+        // Both agreeing is the one state that offers it.
+        settings.workspace.agent.web_tools_enabled = true;
+        let built = build(&settings);
+        assert!(
             tool_names(&built).iter().any(|name| name == "web_search"),
-            "the preset's own grant offers the tool against the switch"
+            "the switch and the preset both grant it"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
