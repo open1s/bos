@@ -150,16 +150,29 @@ else
 fi
 
 # Zip after stapling so the ticket travels with the bundle.
-ditto -c -k --sequesterRsrc --keepParent "$app" "$zip_path"
+if ! ditto -c -k --sequesterRsrc --keepParent "$app" "$zip_path"; then
+  echo "package-macos: ditto failed; free space: $(df -h "$out" | tail -1)" >&2
+  exit 1
+fi
 
 stage="$work/dmg"
 mkdir -p "$stage"
 cp -R "$app" "$stage/BSH.app"
 ln -s /Applications "$stage/Applications"
 
-hdiutil create -quiet -volname "BSH $core_version" \
-  -srcfolder "$stage" -ov -format UDZO "$dmg_path" >/dev/null
-hdiutil verify "$dmg_path" >/dev/null
+# hdiutil writes some failures on stdout, so -quiet plus a redirect made a
+# failed dmg look like a silent exit 1. Keep the output and report it.
+if ! output="$(hdiutil create -volname "BSH $core_version" \
+    -srcfolder "$stage" -ov -format UDZO "$dmg_path" 2>&1)"; then
+  echo "package-macos: hdiutil create failed: $output" >&2
+  echo "package-macos: free space: $(df -h "$out" | tail -1)" >&2
+  exit 1
+fi
+if ! output="$(hdiutil verify "$dmg_path" 2>&1)"; then
+  echo "package-macos: hdiutil verify failed: $output" >&2
+  exit 1
+fi
+echo "package-macos: dmg verified"
 
 if [[ -n "$identity" ]]; then
   codesign --force --timestamp --sign "$identity" "$dmg_path"
