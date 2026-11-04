@@ -147,7 +147,7 @@ struct HostState {
     next_subscription: u64,
     deadline: Instant,
     cancelled: Arc<AtomicBool>,
-    progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+    progress: Option<tokio::sync::mpsc::Sender<Value>>,
 }
 
 /// Map a guest-reported host error back onto the platform error.
@@ -694,7 +694,7 @@ impl self::bsh::extension::host::Host for HostState {
             return;
         }
         if let Some(sender) = &self.progress {
-            let _ = sender.send(serde_json::json!({
+            let _ = sender.try_send(serde_json::json!({
                 "progress": value,
                 "total": total,
             }));
@@ -984,7 +984,7 @@ impl WasmRuntime {
         name: &str,
         arguments: Value,
         context: &CallContext,
-        progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+        progress: Option<tokio::sync::mpsc::Sender<Value>>,
     ) -> Result<Value, ExtensionError> {
         if self.stopped.load(Ordering::Relaxed) {
             return Err(ExtensionError::Runtime {
@@ -1224,7 +1224,7 @@ impl Runtime for WasmRuntime {
         name: &str,
         arguments: Value,
         context: &CallContext,
-        progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+        progress: Option<tokio::sync::mpsc::Sender<Value>>,
     ) -> Result<ToolResult, ExtensionError> {
         off_worker(|| self.run_tool(name, arguments, context, progress)).map(ToolResult::from_value)
     }
@@ -1365,7 +1365,7 @@ mod tests {
             None,
             5000,
         );
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(32);
         let echoed = runtime
             .call_tool_progress("echo", serde_json::json!({"x": 1}), &context, Some(sender))
             .await
@@ -1552,7 +1552,7 @@ mod tests {
             None,
             60_000,
         );
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(32);
         let call = {
             let runtime = Arc::clone(&runtime);
             let context = context.clone();

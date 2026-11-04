@@ -131,7 +131,7 @@ impl WorkflowRuntime {
         workflow: &WorkflowFile,
         input: Value,
         context: &CallContext,
-        progress: Option<&tokio::sync::mpsc::UnboundedSender<Value>>,
+        progress: Option<&tokio::sync::mpsc::Sender<Value>>,
     ) -> Result<Value, ExtensionError> {
         let mut outputs = serde_json::Map::new();
         for step in &workflow.steps {
@@ -280,7 +280,7 @@ impl Runtime for WorkflowRuntime {
         name: &str,
         arguments: Value,
         context: &CallContext,
-        progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+        progress: Option<tokio::sync::mpsc::Sender<Value>>,
     ) -> Result<ToolResult, ExtensionError> {
         if let Some(workflow) = self.workflows.get(name) {
             return self

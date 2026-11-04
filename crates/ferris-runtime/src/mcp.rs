@@ -195,7 +195,7 @@ impl Session {
         method: &str,
         params: Value,
         timeout_ms: u64,
-        progress: Option<&tokio::sync::mpsc::UnboundedSender<Value>>,
+        progress: Option<&tokio::sync::mpsc::Sender<Value>>,
     ) -> Result<Value, ExtensionError> {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
@@ -351,7 +351,7 @@ impl Session {
 fn validate_response(
     value: &Value,
     expected_id: u64,
-    progress: Option<&tokio::sync::mpsc::UnboundedSender<Value>>,
+    progress: Option<&tokio::sync::mpsc::Sender<Value>>,
 ) -> Result<Option<Value>, ExtensionError> {
     let object = value
         .as_object()
@@ -372,7 +372,7 @@ fn validate_response(
         if let Some(sender) = progress {
             if object.get("method").and_then(Value::as_str) == Some("notifications/progress") {
                 if let Some(params) = object.get("params") {
-                    let _ = sender.send(params.clone());
+                    let _ = sender.try_send(params.clone());
                 }
             }
         }
@@ -1436,7 +1436,7 @@ impl McpCore {
         &self,
         name: &str,
         arguments: Value,
-        progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+        progress: Option<tokio::sync::mpsc::Sender<Value>>,
         timeout_ms: u64,
     ) -> Result<Value, ExtensionError> {
         if self.cancelled.load(Ordering::SeqCst) {
@@ -1632,7 +1632,7 @@ impl Runtime for McpRuntime {
         name: &str,
         arguments: Value,
         context: &CallContext,
-        progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+        progress: Option<tokio::sync::mpsc::Sender<Value>>,
     ) -> Result<ToolResult, ExtensionError> {
         self.call(name, arguments, context, progress)
             .await
@@ -1712,7 +1712,7 @@ impl McpRuntime {
         name: &str,
         arguments: Value,
         context: &CallContext,
-        progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+        progress: Option<tokio::sync::mpsc::Sender<Value>>,
     ) -> Result<Value, ExtensionError> {
         let _gate = self.call_gate.lock().await;
         self.core.ensure_running()?;
@@ -2101,7 +2101,7 @@ required = ["process.execute"]
             None,
             5000,
         );
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(32);
         let result = runtime
             .call_tool_progress("echo", serde_json::json!({"x": 1}), &context, Some(sender))
             .await

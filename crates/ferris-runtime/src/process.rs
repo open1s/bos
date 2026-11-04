@@ -113,7 +113,7 @@ impl ProcessSession {
         params: Value,
         timeout_ms: u64,
         extension: &ExtensionId,
-        progress: Option<&tokio::sync::mpsc::UnboundedSender<Value>>,
+        progress: Option<&tokio::sync::mpsc::Sender<Value>>,
     ) -> Result<Value, ExtensionError> {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
@@ -184,7 +184,7 @@ impl ProcessSession {
                     if let Some(sender) = progress {
                         if value.get("method").and_then(Value::as_str) == Some("$/progress") {
                             if let Some(params) = value.get("params") {
-                                let _ = sender.send(params.clone());
+                                let _ = sender.try_send(params.clone());
                             }
                         }
                     }
@@ -1122,7 +1122,7 @@ impl ProcessRuntime {
         name: &str,
         arguments: Value,
         context: &CallContext,
-        progress: Option<&tokio::sync::mpsc::UnboundedSender<Value>>,
+        progress: Option<&tokio::sync::mpsc::Sender<Value>>,
     ) -> Result<Value, ExtensionError> {
         if !self.tools.iter().any(|tool| tool.id.as_str() == name) {
             return Err(ExtensionError::NotFound {
@@ -1648,7 +1648,7 @@ impl Runtime for ProcessRuntime {
         name: &str,
         arguments: Value,
         context: &CallContext,
-        progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+        progress: Option<tokio::sync::mpsc::Sender<Value>>,
     ) -> Result<ToolResult, ExtensionError> {
         self.call_tool_inner(name, arguments, context, progress.as_ref())
             .await
@@ -1682,6 +1682,7 @@ impl Runtime for ProcessRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
     use std::process::Stdio;
     #[cfg(unix)]
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2578,7 +2579,7 @@ done
         .expect("server");
         let runtime = ProcessRuntime::new(&manifest(), &scratch.0).expect("runtime");
         let context = CallContext::new(manifest().id().clone(), "progress", None, 2000);
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(32);
         let result = runtime
             .call_tool_progress("echo", serde_json::json!({"x": 1}), &context, Some(sender))
             .await

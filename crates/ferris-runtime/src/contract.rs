@@ -322,7 +322,7 @@ pub trait Runtime: Send + Sync {
         name: &str,
         arguments: Value,
         context: &CallContext,
-        progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+        progress: Option<tokio::sync::mpsc::Sender<Value>>,
     ) -> Result<ToolResult, ExtensionError> {
         let _ = progress;
         self.call_tool_result(name, arguments, context).await
@@ -652,7 +652,7 @@ impl Runtime for LazyRuntime {
         name: &str,
         arguments: Value,
         context: &CallContext,
-        progress: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+        progress: Option<tokio::sync::mpsc::Sender<Value>>,
     ) -> Result<ToolResult, ExtensionError> {
         self.ensure().await?;
         self.inner

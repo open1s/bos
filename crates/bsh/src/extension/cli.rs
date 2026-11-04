@@ -1558,7 +1558,7 @@ fn command_mock(args: &[String]) -> Result<i32, String> {
             let context =
                 ferris_sdk::host_runtime::CallContext::new(id.clone(), "mock", None, 30_000);
             let (progress_tx, mut progress_rx) =
-                tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+                tokio::sync::mpsc::channel::<serde_json::Value>(32);
             let printer = tokio::spawn(async move {
                 while let Some(value) = progress_rx.recv().await {
                     eprintln!("progress: {value}");

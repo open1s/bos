@@ -540,6 +540,47 @@ impl ferris_sdk::LeaseHost for BshLeaseHost<'_> {
     }
 }
 
+/// Combine the Fiber and lease cleanup results without losing either.
+fn combine_unload<T>(
+    fiber: Result<T, ferris_sdk::composable::FiberTransitionError>,
+    lease: Result<(), String>,
+) -> Result<T, UnloadError> {
+    match (fiber, lease) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(fiber), Ok(())) => Err(UnloadError::Fiber(fiber)),
+        (Ok(_), Err(lease)) => Err(UnloadError::Lease(lease)),
+        (Err(fiber), Err(lease)) => Err(UnloadError::Both { fiber, lease }),
+    }
+}
+
+/// The two cleanup failures an activation unload can have, kept separate.
+#[derive(Debug)]
+pub(crate) enum UnloadError {
+    Fiber(ferris_sdk::composable::FiberTransitionError),
+    Lease(String),
+    Both {
+        fiber: ferris_sdk::composable::FiberTransitionError,
+        lease: String,
+    },
+}
+
+impl std::fmt::Display for UnloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fiber(error) => write!(f, "fiber disposal failed: {error}"),
+            Self::Lease(error) => write!(f, "lease cleanup failed: {error}"),
+            Self::Both { fiber, lease } => {
+                write!(
+                    f,
+                    "fiber disposal failed: {fiber}; lease cleanup failed: {lease}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for UnloadError {}
+
 impl AppliedExtension {
     /// Publish a typed value only when this extension declared the matching
     /// service name and visibility scope in its manifest.
@@ -628,14 +669,17 @@ impl AppliedExtension {
         mut self,
         agent: &mut ::agent::Agent,
         registry: &mut ::agent::plugins::PluginRegistry,
-    ) -> Result<usize, ferris_sdk::composable::FiberTransitionError> {
-        self.fiber.unload()?;
-        if let Some(activation) = self.activation.take() {
+    ) -> Result<usize, UnloadError> {
+        let fiber = self.fiber.unload();
+        let lease = if let Some(activation) = self.activation.take() {
             let mut host = BshLeaseHost { agent, registry };
-            let _ = super::block_on_tokio_scoped(activation.unload_leases(&mut host));
-            return Ok(0);
-        }
-        Ok(self.lease.revoke(agent, registry))
+            super::block_on_tokio_scoped(activation.unload_leases(&mut host))
+                .map_err(|error| error.to_string())
+        } else {
+            let _ = self.lease.revoke(agent, registry);
+            Ok(())
+        };
+        combine_unload(fiber, lease)
     }
 
     /// Revoke this activation, awaiting async effect cleanups.
@@ -643,15 +687,17 @@ impl AppliedExtension {
         mut self,
         agent: &mut ::agent::Agent,
         registry: &mut ::agent::plugins::PluginRegistry,
-    ) -> Result<DisposalReport, ferris_sdk::composable::FiberTransitionError> {
-        let report = self.fiber.dispose_async().await?;
-        if let Some(activation) = self.activation.take() {
+    ) -> Result<DisposalReport, UnloadError> {
+        let fiber = self.fiber.dispose_async().await;
+        let lease = if let Some(activation) = self.activation.take() {
             let mut host = BshLeaseHost { agent, registry };
-            let _ = super::block_on_tokio_scoped(activation.unload_leases(&mut host));
-            return Ok(report);
-        }
-        let _ = self.lease.revoke(agent, registry);
-        Ok(report)
+            super::block_on_tokio_scoped(activation.unload_leases(&mut host))
+                .map_err(|error| error.to_string())
+        } else {
+            let _ = self.lease.revoke(agent, registry);
+            Ok(())
+        };
+        combine_unload(fiber, lease)
     }
 
     /// The composition context attached to this activation.
@@ -990,6 +1036,31 @@ fn start_warm(runtimes: Vec<(String, Arc<dyn Runtime>)>) -> WarmStart {
         wake,
         done,
         thread: Some(thread),
+    }
+}
+
+/// What happened to the runtimes a rebuild or shutdown replaced.
+#[derive(Debug, Default)]
+pub(crate) struct ShutdownReport {
+    completed: Vec<String>,
+    failed: Vec<(String, String)>,
+    timed_out: Vec<String>,
+}
+
+impl ShutdownReport {
+    fn is_clean(&self) -> bool {
+        self.failed.is_empty() && self.timed_out.is_empty()
+    }
+
+    fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        for (id, error) in &self.failed {
+            parts.push(format!("{id} failed: {error}"));
+        }
+        for id in &self.timed_out {
+            parts.push(format!("{id} timed out"));
+        }
+        parts.join("; ")
     }
 }
 
@@ -1368,39 +1439,68 @@ impl ExtensionHost {
 
     /// Runtimes a replacement package set no longer uses, deduplicated.
     fn superseded_runtimes(
-        previous: impl Iterator<Item = Arc<dyn Runtime>>,
+        previous: impl Iterator<Item = (String, Arc<dyn Runtime>)>,
         current: &[Arc<dyn Runtime>],
-    ) -> Vec<Arc<dyn Runtime>> {
+    ) -> Vec<(String, Arc<dyn Runtime>)> {
         let live: std::collections::HashSet<*const ()> = current
             .iter()
             .map(|runtime| Arc::as_ptr(runtime) as *const ())
             .collect();
         let mut seen: std::collections::HashSet<*const ()> = std::collections::HashSet::new();
         let mut superseded = Vec::new();
-        for runtime in previous {
+        for (id, runtime) in previous {
             let pointer = Arc::as_ptr(&runtime) as *const ();
             if !live.contains(&pointer) && seen.insert(pointer) {
-                superseded.push(runtime);
+                superseded.push((id, runtime));
             }
         }
         superseded
     }
 
     /// Stop runtimes together, bounded so one hung child cannot block a rebuild.
-    fn stop_runtimes(runtimes: Vec<Arc<dyn Runtime>>) {
+    fn stop_runtimes(runtimes: Vec<(String, Arc<dyn Runtime>)>) -> ShutdownReport {
+        super::block_on_tokio(Self::stop_runtimes_async(runtimes))
+    }
+
+    /// The async half of [Self::stop_runtimes]; shutdown() awaits it directly.
+    async fn stop_runtimes_async(runtimes: Vec<(String, Arc<dyn Runtime>)>) -> ShutdownReport {
+        let mut report = ShutdownReport::default();
         if runtimes.is_empty() {
-            return;
+            return report;
         }
-        super::block_on_tokio(async move {
-            let stops = runtimes.into_iter().map(|runtime| async move {
-                let _ = runtime.shutdown().await;
-            });
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                futures::future::join_all(stops),
-            )
-            .await;
+        let ids: Vec<String> = runtimes.iter().map(|(id, _)| id.clone()).collect();
+        let (done_tx, mut done_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(String, Result<(), String>)>();
+        let stops = runtimes.into_iter().map(|(id, runtime)| {
+            let done = done_tx.clone();
+            async move {
+                let result = runtime.shutdown().await.map_err(|error| error.to_string());
+                let _ = done.send((id, result));
+            }
         });
+        let timed_out = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            futures::future::join_all(stops),
+        )
+        .await
+        .is_err();
+        drop(done_tx);
+        while let Ok((id, result)) = done_rx.try_recv() {
+            match result {
+                Ok(()) => report.completed.push(id),
+                Err(error) => report.failed.push((id, error)),
+            }
+        }
+        if timed_out {
+            report.timed_out = ids
+                .into_iter()
+                .filter(|id| {
+                    !report.completed.contains(id)
+                        && !report.failed.iter().any(|(failed, _)| failed == id)
+                })
+                .collect();
+        }
+        report
     }
 
     fn rebuild(&mut self) -> Result<(), ExtensionError> {
@@ -1655,10 +1755,24 @@ impl ExtensionHost {
             .filter_map(|entry| entry.runtime.clone())
             .collect();
         let superseded = Self::superseded_runtimes(
-            previous.values().filter_map(|entry| entry.runtime.clone()),
+            previous.values().filter_map(|entry| {
+                entry
+                    .runtime
+                    .clone()
+                    .map(|runtime| (entry.package.id().to_string(), runtime))
+            }),
             &current,
         );
-        Self::stop_runtimes(superseded);
+        let report = Self::stop_runtimes(superseded);
+        if !report.is_clean() {
+            let summary = report.summary();
+            log::warn!(
+                target: "bsh::extension",
+                "rebuild left superseded runtimes pending: {summary}"
+            );
+            self.issues
+                .push(format!("runtime cleanup pending: {summary}"));
+        }
         let mut languages = Vec::new();
         let mut integrations = Vec::new();
         for entry in self.loaded.values().filter(|entry| entry.applied) {
@@ -1949,6 +2063,7 @@ impl ExtensionHost {
                 themes: contributions.themes.clone(),
                 timeout_ms: entry.package.manifest.resources.execution_ms(),
                 max_output_bytes: entry.package.manifest.resources.output_bytes(),
+                max_concurrent_calls: entry.package.manifest.resources.concurrent_calls() as usize,
             };
             infos.push(contribution::install(
                 agent,
@@ -2027,6 +2142,7 @@ impl ExtensionHost {
                 themes: contributions.themes.clone(),
                 timeout_ms: entry.package.manifest.resources.execution_ms(),
                 max_output_bytes: entry.package.manifest.resources.output_bytes(),
+                max_concurrent_calls: entry.package.manifest.resources.concurrent_calls() as usize,
             };
             let sink = Arc::new(super::framework::HostContributionSink::new(
                 Arc::clone(&self.policy),
@@ -2507,23 +2623,28 @@ impl ExtensionHost {
         self.pump_generation.fetch_add(1, Ordering::SeqCst);
         // Stop activation before stopping the runtimes it might be driving.
         self.stop_warm_startup();
-        let runtimes: Vec<Arc<dyn Runtime>> = self
+        let runtimes: Vec<(String, Arc<dyn Runtime>)> = self
             .loaded
             .values()
-            .filter_map(|entry| entry.runtime.clone())
+            .filter_map(|entry| {
+                entry
+                    .runtime
+                    .clone()
+                    .map(|runtime| (entry.package.id().to_string(), runtime))
+            })
             .collect();
         self.loaded.clear();
         // Stop them together: sequential shutdown paid every process's
         // one-second kill deadline in turn, so a machine with four process
         // packages hung the closing window for four seconds.
-        let stops = runtimes.into_iter().map(|runtime| async move {
-            let _ = runtime.shutdown().await;
-        });
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            futures::future::join_all(stops),
-        )
-        .await;
+        let report = Self::stop_runtimes_async(runtimes).await;
+        if !report.is_clean() {
+            log::warn!(
+                target: "bsh::extension",
+                "host shutdown left runtimes pending: {}",
+                report.summary()
+            );
+        }
         if let Ok(mut slot) = bus_slot().write() {
             *slot = None;
         }
@@ -4638,6 +4759,110 @@ tools = ["echo"]
             "a cancelled activation must be shut back down, not published"
         );
     }
+    #[test]
+    fn unload_errors_keep_fiber_and_lease_failures_separate() {
+        let fiber = ferris_sdk::composable::FiberTransitionError {
+            from: ferris_sdk::composable::FiberState::Disposed,
+            to: ferris_sdk::composable::FiberState::Active,
+        };
+        let both = combine_unload::<()>(Err(fiber), Err("lease failed".to_string()))
+            .expect_err("both failures must surface");
+        assert!(matches!(both, UnloadError::Both { .. }), "{both:?}");
+        assert!(both.to_string().contains("lease failed"), "{both}");
+        let lease_only = combine_unload::<()>(Ok(()), Err("lease failed".to_string()))
+            .expect_err("lease failure must surface");
+        assert!(
+            matches!(lease_only, UnloadError::Lease(_)),
+            "{lease_only:?}"
+        );
+        let fiber_only =
+            combine_unload::<()>(Err(fiber), Ok(())).expect_err("fiber failure must surface");
+        assert!(
+            matches!(fiber_only, UnloadError::Fiber(_)),
+            "{fiber_only:?}"
+        );
+    }
+    struct FailingShutdown;
+
+    #[async_trait::async_trait]
+    impl Runtime for FailingShutdown {
+        fn kind(&self) -> RuntimeKind {
+            RuntimeKind::Builtin
+        }
+
+        async fn tools(&self) -> Result<Vec<ToolDescriptor>, ExtensionError> {
+            Ok(Vec::new())
+        }
+
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: Value,
+            _context: &CallContext,
+        ) -> Result<Value, ExtensionError> {
+            Ok(Value::Null)
+        }
+
+        async fn shutdown(&self) -> Result<(), ExtensionError> {
+            Err(ExtensionError::Runtime {
+                extension: "com.example.fail".to_string(),
+                message: "shutdown failed".to_string(),
+            })
+        }
+    }
+
+    struct HangingShutdown;
+
+    #[async_trait::async_trait]
+    impl Runtime for HangingShutdown {
+        fn kind(&self) -> RuntimeKind {
+            RuntimeKind::Builtin
+        }
+
+        async fn tools(&self) -> Result<Vec<ToolDescriptor>, ExtensionError> {
+            Ok(Vec::new())
+        }
+
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: Value,
+            _context: &CallContext,
+        ) -> Result<Value, ExtensionError> {
+            Ok(Value::Null)
+        }
+
+        async fn shutdown(&self) -> Result<(), ExtensionError> {
+            futures::future::pending::<()>().await;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_shutdown_report_names_failures_and_timeouts() {
+        let stopped = Arc::new(AtomicUsize::new(0));
+        let runtimes: Vec<(String, Arc<dyn Runtime>)> = vec![
+            (
+                "ok".to_string(),
+                Arc::new(CountShutdown(Arc::clone(&stopped))) as Arc<dyn Runtime>,
+            ),
+            (
+                "err".to_string(),
+                Arc::new(FailingShutdown) as Arc<dyn Runtime>,
+            ),
+            (
+                "hang".to_string(),
+                Arc::new(HangingShutdown) as Arc<dyn Runtime>,
+            ),
+        ];
+        let report = ExtensionHost::stop_runtimes(runtimes);
+        assert_eq!(report.completed, vec!["ok".to_string()]);
+        assert_eq!(report.failed.len(), 1);
+        assert!(report.failed[0].1.contains("shutdown failed"));
+        assert_eq!(report.timed_out, vec!["hang".to_string()]);
+        assert!(!report.is_clean());
+        assert_eq!(stopped.load(Ordering::SeqCst), 1);
+    }
     struct CountShutdown(Arc<AtomicUsize>);
 
     #[async_trait::async_trait]
@@ -4671,15 +4896,16 @@ tools = ["echo"]
         let kept: Arc<dyn Runtime> = Arc::new(CountShutdown(Arc::clone(&stopped)));
         let replaced: Arc<dyn Runtime> = Arc::new(CountShutdown(Arc::clone(&stopped)));
         let previous = vec![
-            Arc::clone(&kept),
-            Arc::clone(&replaced),
-            Arc::clone(&replaced),
+            ("kept".to_string(), Arc::clone(&kept)),
+            ("replaced".to_string(), Arc::clone(&replaced)),
+            ("replaced".to_string(), Arc::clone(&replaced)),
         ];
         let current = vec![Arc::clone(&kept)];
         let superseded = ExtensionHost::superseded_runtimes(previous.into_iter(), &current);
         assert_eq!(superseded.len(), 1, "duplicates are stopped once");
-        assert!(Arc::ptr_eq(&superseded[0], &replaced));
-        ExtensionHost::stop_runtimes(superseded);
+        assert!(Arc::ptr_eq(&superseded[0].1, &replaced));
+        let report = ExtensionHost::stop_runtimes(superseded);
+        assert!(report.is_clean(), "{}", report.summary());
         assert_eq!(stopped.load(Ordering::SeqCst), 1);
         assert_eq!(
             stopped.load(Ordering::SeqCst),
