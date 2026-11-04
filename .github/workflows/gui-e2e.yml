@@ -24,13 +24,32 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install the webview, its driver, and a virtual display
+        # The same library set the release job installs: bsh links xkbcommon-x11,
+        # Wayland/X11, fontconfig and the audio/XDO stack, and the linker fails
+        # with "unable to find library -lxkbcommon-x11" when one is missing.
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev \
             libjavascriptcoregtk-4.1-dev \
+            libsoup-3.0-dev \
             libgtk-3-dev \
             librsvg2-dev \
+            libgdk-pixbuf-2.0-dev \
+            libglib2.0-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libwayland-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libssl-dev \
+            libasound2-dev \
+            libxdo-dev \
             webkit2gtk-driver \
             xvfb
 
