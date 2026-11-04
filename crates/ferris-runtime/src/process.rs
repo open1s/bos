@@ -13,9 +13,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 #[cfg(not(windows))]
 use std::process::Stdio;
-#[cfg(unix)]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
