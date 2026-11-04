@@ -517,7 +517,9 @@ pub fn load_tool_descriptors(
 /// per process rather than one per call.
 pub struct LazyRuntime {
     inner: Arc<dyn Runtime>,
-    activated: tokio::sync::OnceCell<()>,
+    /// Whether the inner runtime is currently activated. A plain bool under an
+    /// async mutex (rather than a OnceCell) lets deactivation reopen the gate.
+    activated: tokio::sync::Mutex<bool>,
     failures: AtomicU32,
 }
 
@@ -526,7 +528,7 @@ impl LazyRuntime {
     pub fn new(inner: Arc<dyn Runtime>) -> Self {
         Self {
             inner,
-            activated: tokio::sync::OnceCell::new(),
+            activated: tokio::sync::Mutex::new(false),
             failures: AtomicU32::new(0),
         }
     }
@@ -544,13 +546,16 @@ impl LazyRuntime {
             let delay = Duration::from_millis(50 * (1 << shift)).min(Duration::from_millis(400));
             tokio::time::sleep(delay).await;
         }
-        let result = self
-            .activated
-            .get_or_try_init(|| async { self.inner.activate().await })
-            .await
-            .map(|_| ());
+        let mut activated = self.activated.lock().await;
+        if *activated {
+            return Ok(());
+        }
+        let result = self.inner.activate().await;
         match &result {
-            Ok(()) => self.failures.store(0, Ordering::Relaxed),
+            Ok(()) => {
+                *activated = true;
+                self.failures.store(0, Ordering::Relaxed);
+            }
             Err(_) => {
                 self.failures.fetch_add(1, Ordering::Relaxed);
             }
@@ -594,7 +599,12 @@ impl Runtime for LazyRuntime {
     }
 
     async fn deactivate(&self) -> Result<(), ExtensionError> {
-        self.inner.deactivate().await
+        let result = self.inner.deactivate().await;
+        // Clear the gate even when deactivation failed: the next activate must
+        // be allowed to try again rather than silently reusing a dead runtime.
+        let mut activated = self.activated.lock().await;
+        *activated = false;
+        result
     }
 
     async fn shutdown(&self) -> Result<(), ExtensionError> {
@@ -816,5 +826,56 @@ tools = ["echo", "greet"]
         assert!(runtime.activate().await.is_err());
         runtime.activate().await.expect("third attempt succeeds");
         assert_eq!(inner.attempts.load(Ordering::Relaxed), 3);
+    }
+
+    struct CountingRuntime {
+        activations: AtomicU32,
+        deactivations: AtomicU32,
+    }
+
+    #[async_trait::async_trait]
+    impl Runtime for CountingRuntime {
+        fn kind(&self) -> RuntimeKind {
+            RuntimeKind::Builtin
+        }
+
+        async fn activate(&self) -> Result<(), ExtensionError> {
+            self.activations.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn deactivate(&self) -> Result<(), ExtensionError> {
+            self.deactivations.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn tools(&self) -> Result<Vec<ToolDescriptor>, ExtensionError> {
+            Ok(Vec::new())
+        }
+
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: Value,
+            _context: &CallContext,
+        ) -> Result<Value, ExtensionError> {
+            Ok(Value::Null)
+        }
+    }
+
+    #[tokio::test]
+    async fn lazy_activation_reopens_after_deactivation() {
+        let inner = Arc::new(CountingRuntime {
+            activations: AtomicU32::new(0),
+            deactivations: AtomicU32::new(0),
+        });
+        let runtime = LazyRuntime::new(inner.clone());
+        runtime.activate().await.expect("first activation");
+        runtime.activate().await.expect("cached activation");
+        assert_eq!(inner.activations.load(Ordering::Relaxed), 1);
+        runtime.deactivate().await.expect("deactivate");
+        assert_eq!(inner.deactivations.load(Ordering::Relaxed), 1);
+        runtime.activate().await.expect("reactivation");
+        assert_eq!(inner.activations.load(Ordering::Relaxed), 2);
     }
 }

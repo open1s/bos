@@ -115,6 +115,8 @@ pub enum PlanError {
     GroupCycle(String),
     /// A dependency is not in the expanded plan.
     MissingDependency { entry: String, dependency: String },
+    /// An enabled entry depends on an entry the profile disabled.
+    DisabledDependency { entry: String, dependency: String },
     /// A dependency cycle exists.
     DependencyCycle(Vec<String>),
     /// Two enabled entries own the same contribution id.
@@ -139,6 +141,12 @@ impl fmt::Display for PlanError {
             Self::GroupCycle(id) => write!(f, "profile group cycle at {id}"),
             Self::MissingDependency { entry, dependency } => {
                 write!(f, "{entry} depends on missing entry {dependency}")
+            }
+            Self::DisabledDependency { entry, dependency } => {
+                write!(
+                    f,
+                    "{entry} is enabled but depends on disabled entry {dependency}"
+                )
             }
             Self::DependencyCycle(members) => {
                 write!(f, "profile dependency cycle: {}", members.join(" -> "))
@@ -300,7 +308,12 @@ fn order_entries(entries: &BTreeMap<String, PlanEntry>) -> Result<Vec<String>, P
                 });
             }
             if !enabled.contains(dependency) {
-                continue;
+                // Treating a disabled dependency as satisfied activated a
+                // package whose required service was never mounted.
+                return Err(PlanError::DisabledDependency {
+                    entry: (*id).clone(),
+                    dependency: dependency.clone(),
+                });
             }
             *indegree.get_mut(*id).expect("inserted above") += 1;
             dependents
@@ -608,8 +621,8 @@ mod tests {
     }
 
     #[test]
-    fn a_disabled_dependency_does_not_create_an_edge() {
-        let plan = parse(
+    fn an_enabled_entry_cannot_depend_on_a_disabled_entry() {
+        let error = parse(
             r#"
             [[entry]]
             id = "a"
@@ -620,7 +633,14 @@ mod tests {
             enabled = false
             "#,
         )
-        .expect("plan");
-        assert_eq!(plan.order, vec!["a"]);
+        .expect_err("a disabled dependency is not satisfied");
+        assert!(
+            matches!(
+                error,
+                PlanError::DisabledDependency { ref entry, ref dependency }
+                    if entry == "a" && dependency == "b"
+            ),
+            "{error}"
+        );
     }
 }

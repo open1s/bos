@@ -19,25 +19,80 @@ pub const MAX_VALUE_BYTES: usize = 8 * 1024 * 1024;
 /// The largest number of files a namespace may hold.
 pub const MAX_FILES: usize = 10_000;
 
+/// The largest total size a namespace may hold.
+pub const MAX_NAMESPACE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// A handle to one extension's data namespace.
 #[derive(Debug, Clone)]
 pub struct ExtensionStorage {
     root: PathBuf,
     id: ExtensionId,
+    max_bytes: u64,
 }
 
 impl ExtensionStorage {
     /// Open the namespace for `id` below `data_root`.
     pub fn open(data_root: &Path, id: &ExtensionId) -> Result<Self, ExtensionError> {
+        std::fs::create_dir_all(data_root).map_err(|source| ExtensionError::Io {
+            path: data_root.to_path_buf(),
+            source,
+        })?;
+        let canonical_data = data_root
+            .canonicalize()
+            .map_err(|source| ExtensionError::Io {
+                path: data_root.to_path_buf(),
+                source,
+            })?;
         let root = data_root.join(id.as_str());
-        std::fs::create_dir_all(&root).map_err(|source| ExtensionError::Io {
+        // Reject a namespace root that is itself a symlink before anything
+        // creates or writes through it; a planted link would escape the data
+        // root despite every key-level check.
+        match std::fs::symlink_metadata(&root) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(ExtensionError::Corrupt {
+                    path: root,
+                    message: "the storage namespace root is a symlink".to_string(),
+                });
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(ExtensionError::Corrupt {
+                    path: root,
+                    message: "the storage namespace root is not a directory".to_string(),
+                });
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&root).map_err(|source| ExtensionError::Io {
+                    path: root.clone(),
+                    source,
+                })?;
+            }
+            Err(source) => {
+                return Err(ExtensionError::Io { path: root, source });
+            }
+        }
+        let canonical_root = root.canonicalize().map_err(|source| ExtensionError::Io {
             path: root.clone(),
             source,
         })?;
+        if !canonical_root.starts_with(&canonical_data) {
+            return Err(ExtensionError::Corrupt {
+                path: root,
+                message: "the storage namespace escapes the data root".to_string(),
+            });
+        }
         Ok(Self {
             root,
             id: id.clone(),
+            max_bytes: MAX_NAMESPACE_BYTES,
         })
+    }
+
+    /// Override the namespace size ceiling (tests only).
+    #[cfg(test)]
+    fn with_max_bytes(mut self, max_bytes: u64) -> Self {
+        self.max_bytes = max_bytes;
+        self
     }
 
     /// The namespace root.
@@ -165,7 +220,34 @@ impl ExtensionStorage {
                 message: format!("namespace holds more than {MAX_FILES} files"),
             });
         }
+        let existing = std::fs::metadata(&path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let delta = (bytes.len() as u64).saturating_sub(existing);
+        if delta > 0 && self.namespace_bytes().saturating_add(delta) > self.max_bytes {
+            return Err(ExtensionError::Limit {
+                extension: self.id.to_string(),
+                message: format!("namespace would exceed its {} byte budget", self.max_bytes),
+            });
+        }
         super::package::write_atomic(&path, bytes)
+    }
+
+    /// The total bytes stored in the namespace.
+    fn namespace_bytes(&self) -> u64 {
+        let mut total = 0u64;
+        for entry in walkdir::WalkDir::new(&self.root)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            if entry.file_type().is_file() {
+                if let Ok(metadata) = entry.metadata() {
+                    total = total.saturating_add(metadata.len());
+                }
+            }
+        }
+        total
     }
 
     /// Whether the namespace already holds the maximum number of files.
@@ -374,5 +456,33 @@ mod tests {
         storage.write("a.txt", b"a").expect("write");
         storage.purge().expect("purge");
         assert!(!storage.root().exists());
+    }
+
+    #[test]
+    fn a_symlinked_namespace_root_is_refused() {
+        let scratch = Scratch::new("symlink-root");
+        let outside = scratch.0.with_extension("outside");
+        std::fs::create_dir_all(&outside).expect("outside");
+        let id = ExtensionId::parse("com.example.storage").expect("id");
+        std::os::unix::fs::symlink(&outside, scratch.0.join(id.as_str())).expect("symlink");
+        let error = ExtensionStorage::open(&scratch.0, &id).expect_err("symlinked root");
+        match error {
+            ExtensionError::Corrupt { message, .. } => {
+                assert!(message.contains("symlink"), "{message}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn the_namespace_byte_budget_is_enforced() {
+        let scratch = Scratch::new("quota");
+        let storage = storage(&scratch).with_max_bytes(8);
+        storage.write("a.bin", b"12345678").expect("at quota");
+        assert!(storage.write("b.bin", b"9").is_err(), "over quota");
+        // Replacing a value within the budget is allowed.
+        storage.write("a.bin", b"1234").expect("shrinks");
+        storage.write("a.bin", b"12345678").expect("restores");
     }
 }

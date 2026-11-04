@@ -317,7 +317,15 @@ impl ExtensionManager {
                 data_root,
             })
             .await?;
-        let lease = contributions.apply(id, listed, agent, registry).await?;
+        let lease = match contributions.apply(id, listed, agent, registry).await {
+            Ok(lease) => lease,
+            Err(error) => {
+                // The runtime already started; a failed contribution must not
+                // leave it running behind an error nobody can unload.
+                let _ = runtime.shutdown().await;
+                return Err(error);
+            }
+        };
         let leases: Vec<Box<dyn ContributionLease>> = vec![lease];
         Ok(Activation {
             extension: id.to_string(),
@@ -359,6 +367,11 @@ impl ExtensionManager {
                 message: error.to_string(),
                 details: serde_json::Value::Null,
             })?;
+            if !self.store.state_of(&id).enabled {
+                // A persisted disable must keep the package out of the plan:
+                // planning it anyway started code the reader turned off.
+                continue;
+            }
             let version = self
                 .store
                 .active_version(&id)
@@ -381,6 +394,25 @@ impl ExtensionManager {
                     details: serde_json::Value::Null,
                 })?;
             manifests.push(manifest);
+        }
+        let included: std::collections::BTreeSet<String> = manifests
+            .iter()
+            .map(|manifest| manifest.id().as_str().to_string())
+            .collect();
+        for manifest in &manifests {
+            for dependency in manifest.dependencies.keys() {
+                if !included.contains(dependency.as_str()) {
+                    return Err(ExtError {
+                        code: ErrorCode::Package,
+                        message: format!(
+                            "{} is enabled but depends on {}, which is disabled or not installed",
+                            manifest.id(),
+                            dependency
+                        ),
+                        details: serde_json::Value::Null,
+                    });
+                }
+            }
         }
         let plan =
             crate::composable::plan_service_dependencies(&manifests).map_err(|error| ExtError {
@@ -415,10 +447,18 @@ impl Activation {
     ///
     /// Used when the host owns a shared runtime across several agent builds.
     pub async fn unload_leases(self, host: &mut dyn LeaseHost) -> Result<(), ExtError> {
+        let mut first = None;
         for lease in self.leases.into_iter().rev() {
-            lease.revoke(host).await?;
+            if let Err(error) = lease.revoke(host).await {
+                if first.is_none() {
+                    first = Some(error);
+                }
+            }
         }
-        Ok(())
+        match first {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// Revoke the leases and shut the runtime down.
@@ -427,10 +467,23 @@ impl Activation {
     }
 
     async fn shutdown(self, host: &mut dyn LeaseHost) -> Result<(), ExtError> {
+        let mut first = None;
         for lease in self.leases.into_iter().rev() {
-            lease.revoke(host).await?;
+            if let Err(error) = lease.revoke(host).await {
+                if first.is_none() {
+                    first = Some(error);
+                }
+            }
         }
-        self.runtime.shutdown().await
+        if let Err(error) = self.runtime.shutdown().await {
+            if first.is_none() {
+                first = Some(error);
+            }
+        }
+        match first {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 
@@ -480,10 +533,18 @@ impl ActivationSet {
 
     /// Shut down in reverse activation order, revoking every contribution.
     pub async fn unload(mut self, host: &mut dyn LeaseHost) -> Result<(), ExtError> {
+        let mut first = None;
         while let Some(activation) = self.activations.pop() {
-            activation.shutdown(host).await?;
+            if let Err(error) = activation.shutdown(host).await {
+                if first.is_none() {
+                    first = Some(error);
+                }
+            }
         }
-        Ok(())
+        match first {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 
@@ -704,5 +765,95 @@ mod tests {
         assert_eq!(installed.id, "com.example.hello");
         let plan = manager.plan().expect("plan");
         assert!(plan.order.iter().any(|id| id == "com.example.hello"));
+    }
+
+    #[test]
+    fn a_disabled_package_is_not_planned() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let host = Arc::new(DemoHost {
+            root: root.path().to_path_buf(),
+            capabilities: CapabilityRegistry::default(),
+            contracts: ServiceContractRegistry::default(),
+        });
+        let manager = ExtensionManager::open(host).expect("manager");
+        let example =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/extensions/hello");
+        manager.install(&example).expect("install");
+        manager
+            .set_enabled("com.example.hello", false)
+            .expect("disable");
+        assert!(
+            manager.plan().expect("plan").order.is_empty(),
+            "a persisted disable must keep the package out of the activation plan"
+        );
+    }
+
+    struct ShutdownRuntime(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl crate::Runtime for ShutdownRuntime {
+        fn kind(&self) -> &str {
+            "shutdown"
+        }
+
+        async fn start(
+            &self,
+            _ctx: &crate::RuntimeContext,
+        ) -> Result<Vec<crate::Contribution>, ExtError> {
+            Ok(Vec::new())
+        }
+
+        async fn invoke(
+            &self,
+            _contribution: &crate::ContributionRef,
+            _input: serde_json::Value,
+            _ctx: &crate::InvokeContext,
+        ) -> Result<serde_json::Value, ExtError> {
+            Ok(serde_json::Value::Null)
+        }
+
+        async fn shutdown(&self) -> Result<(), ExtError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct FailingLease;
+
+    #[async_trait::async_trait]
+    impl crate::ContributionLease for FailingLease {
+        async fn revoke(&self, _host: &mut dyn crate::LeaseHost) -> Result<(), ExtError> {
+            Err(ExtError {
+                code: ErrorCode::Contribution,
+                message: "boom".to_string(),
+                details: serde_json::Value::Null,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failing_lease_still_shuts_the_runtime_down() {
+        let shutdowns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let revoked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let activation = Activation {
+            extension: "com.example.a".to_string(),
+            version: "1.0.0".to_string(),
+            runtime: Arc::new(ShutdownRuntime(Arc::clone(&shutdowns))),
+            leases: vec![
+                Box::new(MockLease(Arc::clone(&revoked))),
+                Box::new(FailingLease),
+            ],
+        };
+        let error = activation
+            .shutdown(&mut TestHost)
+            .await
+            .expect_err("the lease failed");
+        assert!(error.message.contains("boom"), "{}", error.message);
+        assert_eq!(revoked.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            shutdowns.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a failed lease must not skip runtime shutdown"
+        );
     }
 }

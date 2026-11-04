@@ -743,7 +743,8 @@ impl ExtensionStore {
     ///
     /// A *missing* record means "never configured", which is enabled. A state
     /// document that cannot be read is different: falling back to the default
-    /// would silently re-enable every package the reader had disabled.
+    /// would silently re-enable every package the reader had disabled, so an
+    /// unreadable document reports every package as disabled instead.
     pub fn state_of(&self, id: &ExtensionId) -> ExtensionState {
         match self.read_state() {
             Ok(state) => state
@@ -751,7 +752,10 @@ impl ExtensionStore {
                 .get(id.as_str())
                 .cloned()
                 .unwrap_or_default(),
-            Err(_) => ExtensionState::default(),
+            Err(_) => ExtensionState {
+                enabled: false,
+                ..ExtensionState::default()
+            },
         }
     }
 
@@ -1416,5 +1420,23 @@ id = "echo"
         store.set_enabled(&id, false).expect("disable");
         let reopened = ExtensionStore::open(scratch.0.join("store")).expect("reopen");
         assert!(!reopened.state_of(&id).enabled);
+    }
+
+    #[test]
+    fn an_unreadable_state_document_disables_packages() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = ExtensionStore::open(root.path()).expect("store");
+        let id = ExtensionId::parse("com.example.hello").expect("id");
+        assert!(
+            store.state_of(&id).enabled,
+            "a missing record means enabled"
+        );
+        std::fs::create_dir_all(store.state_path().parent().expect("state root"))
+            .expect("state root");
+        std::fs::write(store.state_path(), "this is not = [ toml").expect("corrupt state");
+        assert!(
+            !store.state_of(&id).enabled,
+            "an unreadable state document must fail closed"
+        );
     }
 }
