@@ -85,6 +85,8 @@ struct Session {
     next_id: u64,
     /// Optional capabilities the server advertised at initialize time.
     capabilities: ServerCapabilities,
+    /// Set when the server announces a catalog list change.
+    catalog_dirty: Arc<AtomicBool>,
 }
 
 impl Session {
@@ -156,6 +158,13 @@ impl Session {
                     extension: "mcp".to_string(),
                     message: format!("response is not JSON: {error}"),
                 })?;
+            if value
+                .get("method")
+                .and_then(Value::as_str)
+                .is_some_and(|method| method.ends_with("/list_changed"))
+            {
+                self.catalog_dirty.store(true, Ordering::SeqCst);
+            }
             if let Some(result) = validate_response(&value, id, progress)? {
                 return Ok(result);
             }
@@ -180,6 +189,21 @@ impl Session {
                 path: PathBuf::from("<mcp stdin>"),
                 source: error,
             })
+    }
+
+    /// Drain queued notifications outside a request and mark a list change.
+    fn drain_notifications(&mut self) {
+        while let Ok(bytes) = self.lines.try_recv() {
+            if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+                if value
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .is_some_and(|method| method.ends_with("/list_changed"))
+                {
+                    self.catalog_dirty.store(true, Ordering::SeqCst);
+                }
+            }
+        }
     }
 
     fn close(&mut self) {
@@ -424,6 +448,8 @@ struct McpCore {
     watchdog: Mutex<Option<crate::process::MemoryWatchdog>>,
     cancelled: AtomicBool,
     stopped: AtomicBool,
+    /// Set by notifications/*/list_changed; the next catalog read rediscovers.
+    catalog_dirty: Arc<AtomicBool>,
 }
 
 /// The MCP runtime for one server package.
@@ -548,6 +574,7 @@ impl McpCore {
             watchdog: Mutex::new(None),
             cancelled: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
+            catalog_dirty: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -574,10 +601,20 @@ impl McpCore {
 
     fn catalog(&self) -> Result<std::sync::MutexGuard<'_, Option<Catalog>>, ExtensionError> {
         self.ensure_running()?;
+        // A list_changed notification that arrived while the runtime was idle
+        // is still queued; drain it before deciding whether the cache is fresh.
+        if let Ok(mut slot) = self.session.lock() {
+            if let Some(session) = slot.as_mut() {
+                session.drain_notifications();
+            }
+        }
         let mut catalog = self.catalog.lock().map_err(|_| ExtensionError::Corrupt {
             path: self.root.clone(),
             message: "MCP catalog lock is poisoned".to_string(),
         })?;
+        if self.catalog_dirty.swap(false, Ordering::SeqCst) {
+            *catalog = None;
+        }
         if catalog.is_none() {
             *catalog = Some(self.discover()?);
         }
@@ -585,7 +622,17 @@ impl McpCore {
     }
 
     fn discover(&self) -> Result<Catalog, ExtensionError> {
-        let mut session = self.start()?;
+        // Reuse the live session when there is one: a list_changed refresh must
+        // re-read the catalog from the running server, not spawn a second one.
+        let existing = self
+            .session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let mut session = match existing {
+            Some(session) => session,
+            None => self.start()?,
+        };
         let discovered = self.read_catalog(&mut session);
         match discovered {
             Ok(catalog) => {
@@ -784,6 +831,7 @@ impl McpCore {
             lines,
             next_id: 1,
             capabilities: ServerCapabilities::default(),
+            catalog_dirty: Arc::clone(&self.catalog_dirty),
         };
         let initialized = session.request(
             "initialize",
@@ -1322,7 +1370,10 @@ impl Runtime for McpRuntime {
     }
 
     async fn activate(&self) -> Result<(), ExtensionError> {
-        self.descriptors().map(|_| ())
+        // Discovery performs a process spawn, handshake and synchronous stdio
+        // exchange. Running it inline on an executor worker starved the
+        // reactor; the blocking pool keeps the worker free.
+        self.discovery_off_worker().await
     }
 
     async fn deactivate(&self) -> Result<(), ExtensionError> {
@@ -1350,7 +1401,7 @@ impl Runtime for McpRuntime {
     }
 
     async fn tools(&self) -> Result<Vec<ToolDescriptor>, ExtensionError> {
-        self.descriptors()
+        self.tools_off_worker().await
     }
 
     async fn call_tool(
@@ -1397,6 +1448,30 @@ impl Runtime for McpRuntime {
 }
 
 impl McpRuntime {
+    /// Run blocking catalog discovery on the blocking pool.
+    async fn discovery_off_worker(&self) -> Result<(), ExtensionError> {
+        let core = Arc::clone(&self.core);
+        let extension = self.core.extension.to_string();
+        tokio::task::spawn_blocking(move || core.descriptors().map(|_| ()))
+            .await
+            .map_err(|error| ExtensionError::Runtime {
+                extension,
+                message: format!("MCP discovery task failed: {error}"),
+            })?
+    }
+
+    /// Run blocking catalog discovery on the blocking pool and return tools.
+    async fn tools_off_worker(&self) -> Result<Vec<ToolDescriptor>, ExtensionError> {
+        let core = Arc::clone(&self.core);
+        let extension = self.core.extension.to_string();
+        tokio::task::spawn_blocking(move || core.descriptors())
+            .await
+            .map_err(|error| ExtensionError::Runtime {
+                extension,
+                message: format!("MCP discovery task failed: {error}"),
+            })?
+    }
+
     /// Close the session and invalidate the catalog. The caller owns the
     /// lifecycle gate, so no exchange can start while this runs.
     fn deactivate_locked(&self) -> Result<(), ExtensionError> {
