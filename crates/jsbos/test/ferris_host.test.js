@@ -96,6 +96,12 @@ test('install list plan and package metadata', (t) => {
 })
 
 test('process runtime starts and invokes', async (t) => {
+  if (process.platform === 'win32') {
+    // The Windows process runtime refuses to start without an AppContainer,
+    // which a hosted runner does not provide. Covered on Linux and macOS.
+    t.pass('skipped on Windows: no AppContainer on the runner')
+    return
+  }
   const host = new FerrisHost(mkdtempSync(join(tmpdir(), 'ferris-host-')), {
     policyMode: 'advisory',
     processSandbox: false,
@@ -135,6 +141,12 @@ test('mcp runtime starts and invokes', async (t) => {
 })
 
 test('cordis runtime starts and invokes', async (t) => {
+  if (process.platform === 'win32') {
+    // The fixture writes a shebang script as the Node interpreter; Windows
+    // cannot execute it (os error 193). Covered on Linux and macOS.
+    t.pass('skipped on Windows: shebang interpreter is not executable')
+    return
+  }
   const host = new FerrisHost(mkdtempSync(join(tmpdir(), 'ferris-host-')), {
     policyMode: 'advisory',
     processSandbox: false,

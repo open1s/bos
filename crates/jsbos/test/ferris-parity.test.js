@@ -7,10 +7,13 @@ import { dirname, join } from 'node:path'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const root = join(here, '..')
-const jsSrc = readFileSync(join(root, 'index.js'), 'utf8')
-const jsDts = readFileSync(join(root, 'jsbos.d.ts'), 'utf8')
-const pyFerris = readFileSync(join(root, '..', 'nbos', 'src', 'ferris.rs'), 'utf8')
-const pyHost = readFileSync(join(root, '..', 'nbos', 'src', 'ferris_host.rs'), 'utf8')
+// A Windows checkout has CRLF line endings, and the source searches below
+// look for "\n" between an attribute and its impl.
+const read = (path) => readFileSync(path, 'utf8').replace(/\r\n/g, '\n')
+const jsSrc = read(join(root, 'index.js'))
+const jsDts = read(join(root, 'jsbos.d.ts'))
+const pyFerris = read(join(root, '..', 'nbos', 'src', 'ferris.rs'))
+const pyHost = read(join(root, '..', 'nbos', 'src', 'ferris_host.rs'))
 
 function jsClassMembers(src, className, indent = '  ') {
   const members = new Set()
