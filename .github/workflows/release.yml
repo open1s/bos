@@ -424,7 +424,25 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
         run: bash scripts/ci/release-notes.sh "$VERSION" > "$RUNNER_TEMP/release-notes.md"
 
+      # A manual dispatch starts from a branch ref, and action-gh-release then
+      # tries to retarget the existing release (and its tag) at that commit,
+      # which the workflow token cannot do: it failed with "Resource not
+      # accessible by integration". The CLI uploads the files to the tag that
+      # already exists and edits only the notes.
+      - name: Publish the release assets (dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          gh release upload "$tag" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          gh release edit "$tag" --notes-file "$RUNNER_TEMP/release-notes.md" \
+            --repo "$GITHUB_REPOSITORY"
+
       - uses: softprops/action-gh-release@v2
+        if: github.event_name != 'workflow_dispatch'
         with:
           tag_name: v${{ needs.prepare.outputs.version }}
           name: BSH ${{ needs.prepare.outputs.version }}
