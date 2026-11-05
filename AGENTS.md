@@ -17,6 +17,7 @@ crates/
 ├── qserde/         # rkyv archive support used by the bus wire format
 ├── qserde_derive/  # Derive macros for qserde
 ├── react/          # ReAct engine, LLM integration
+├── ferris-bindings/# Host-neutral helpers shared by the Python/JS Ferris bindings
 └── resource/       # Standalone resource subsystem + `rex` CLI (no dependents)
 ```
 ---
@@ -151,8 +152,8 @@ const result = await agent.ask('What is 2+2?');
 - Set `RUST_LOG=debug` for tracing output
 - Current green baselines:
   - Rust (excluding the binding crates): 443 passed, 0 failed, 8 ignored
-  - Python (`cd crates/nbos && pytest -m "not llm"`): 250 passed, 4 deselected
-  - JS (`cd crates/jsbos && npx ava`): 109 tests (13 parity, 3 native-binding, 21 API-doc, 9 content, 14 memory, 13 agentic)
+  - Python (`cd crates/nbos && pytest -m "not llm"`): 272 passed, 4 deselected
+  - JS (`cd crates/jsbos && npx ava`): 135 tests (13 parity, 3 native-binding, 21 API-doc, 9 content, 14 memory, 13 agentic, 6 ferris, 16 ferris-host, 4 ferris-parity)
 
 ---
 ## Key Patterns

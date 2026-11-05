@@ -3440,6 +3440,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferris-bindings"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "ferris-sdk",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "ferris-core"
 version = "0.1.0"
 dependencies = [
@@ -6095,6 +6105,8 @@ dependencies = [
  "async-trait",
  "bus",
  "config",
+ "ferris-bindings",
+ "ferris-sdk",
  "futures",
  "logging",
  "napi",
@@ -7108,6 +7120,8 @@ dependencies = [
  "async-trait",
  "bus",
  "config",
+ "ferris-bindings",
+ "ferris-sdk",
  "futures",
  "logging",
  "pyo3",

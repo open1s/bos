@@ -107,6 +107,9 @@ mod agent;
 mod bus;
 mod caller;
 mod config;
+mod ferris;
+#[cfg(feature = "ferris-host")]
+mod ferris_host;
 mod goal;
 mod hooks;
 mod jobs;
@@ -124,6 +127,9 @@ pub use agent::{Agent, AgentCallableServer, AgentConfig, AgentRpcClient, JsFallb
 pub use bus::{Bus, BusConfig, Session};
 pub use caller::{Callable, Caller};
 pub use config::ConfigLoader;
+pub use ferris::{FerrisManifest, FerrisManifestBuilder, NativeFerrisHarness};
+#[cfg(feature = "ferris-host")]
+pub use ferris_host::NativeFerrisHost;
 pub use goal::{Goal, GoalBlockedReason, GoalStore};
 pub use hooks::{HookContextData, HookDecision, HookEvent, HookRegistry};
 pub use jobs::JobRegistry;

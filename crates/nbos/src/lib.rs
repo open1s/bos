@@ -14,6 +14,9 @@ mod agent;
 mod bus;
 mod caller;
 mod config;
+mod ferris;
+#[cfg(feature = "ferris-host")]
+mod ferris_host;
 mod goal;
 mod hooks;
 mod jobs;
@@ -38,6 +41,9 @@ pub use agent::{
 pub use bus::{PyBus, PyBusConfig};
 pub use caller::{PyCallable, PyCaller};
 pub use config::PyConfigLoader;
+pub use ferris::{PyFerrisHarness, PyFerrisManifest, PyFerrisManifestBuilder};
+#[cfg(feature = "ferris-host")]
+pub use ferris_host::PyFerrisHost;
 pub use goal::{PyGoal, PyGoalStore};
 pub use hooks::{PyHookContext, PyHookDecision, PyHookEvent, PyHookRegistry};
 pub use jobs::PyJobRegistry;
@@ -89,6 +95,11 @@ fn nbos_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTokenBudgetReport>()?;
     m.add_class::<PyBudgetStatus>()?;
     m.add_class::<PyFallbackProvider>()?;
+    m.add_class::<PyFerrisHarness>()?;
+    m.add_class::<PyFerrisManifest>()?;
+    m.add_class::<PyFerrisManifestBuilder>()?;
+    #[cfg(feature = "ferris-host")]
+    m.add_class::<PyFerrisHost>()?;
     m.add_class::<PyGoal>()?;
     m.add_class::<PyGoalStore>()?;
     m.add_class::<PyJobRegistry>()?;

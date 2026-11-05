@@ -317,6 +317,11 @@ jobs:
       - name: Lint
         run: cargo clippy -p jsbos -p nbos --all-targets -- -D warnings
 
+      # The default build enables the full Ferris host (wasmtime + Extism).
+      # Keep the authoring-only configuration compiling too.
+      - name: Check authoring-only build
+        run: cargo check -p jsbos -p nbos --no-default-features
+
       # nbos is a pyo3 extension with no Rust unit tests; jsbos carries the two
       # async-tool tests below it.
       - name: Test

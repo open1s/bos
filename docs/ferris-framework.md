@@ -11,6 +11,12 @@ binary parses a 2.0 manifest with no BSH dependency, and the SDK carries unit
 tests for its author runtime adapter. The author guide is
 [ferris-sdk.md](ferris-sdk.md).
 
+Python and JavaScript can author in-process extensions through the same SDK
+contract and can host packages; see [ferris-bindings.md](ferris-bindings.md).
+The bindings expose manifest validation, the Extension start/invoke/shutdown
+harness, and a full package host (install, plan, activate, invoke, policy) over
+the standard runtimes.
+
 BSH imports Ferris through `ferris-sdk` only: `crates/bsh/Cargo.toml` has one
 Ferris dependency, `ferris-sdk` with the `host-runtime` feature, and BSH source
 uses `ferris_sdk::*` and `ferris_sdk::host_runtime::*`. The SDK host facade

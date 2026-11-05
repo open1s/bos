@@ -579,7 +579,7 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { Agent, AgentCallableServer, AgentRpcClient, Bus, Callable, Caller, ConfigLoader, Goal, GoalStore, HookRegistry, JobRegistry, McpClient, PluginRegistry, PluginToolCallInfo, Publisher, Query, Queryable, Subscriber, BudgetStatus, estimateTokens, HookDecision, HookEvent, initTracing, logTestMessage, PluginStage, renderTemplate, version, withMemory } = nativeBinding
+const { Agent, AgentCallableServer, AgentRpcClient, Bus, Callable, Caller, ConfigLoader, FerrisManifest, FerrisManifestBuilder, Goal, GoalStore, HookRegistry, JobRegistry, McpClient, NativeFerrisHarness, NativeFerrisHost, PluginRegistry, PluginToolCallInfo, Publisher, Query, Queryable, Subscriber, BudgetStatus, estimateTokens, HookDecision, HookEvent, initTracing, logTestMessage, PluginStage, renderTemplate, version, withMemory } = nativeBinding
 export { Agent }
 export { AgentCallableServer }
 export { AgentRpcClient }
@@ -587,11 +587,15 @@ export { Bus }
 export { Callable }
 export { Caller }
 export { ConfigLoader }
+export { FerrisManifest }
+export { FerrisManifestBuilder }
 export { Goal }
 export { GoalStore }
 export { HookRegistry }
 export { JobRegistry }
 export { McpClient }
+export { NativeFerrisHarness }
+export { NativeFerrisHost }
 export { PluginRegistry }
 export { PluginToolCallInfo }
 export { Publisher }

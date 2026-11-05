@@ -22,6 +22,10 @@ const {
   Goal,
   GoalStore,
   JobRegistry,
+  NativeFerrisHarness,
+  FerrisManifest,
+  FerrisManifestBuilder,
+  NativeFerrisHost,
   renderTemplate,
   withMemory,
   estimateTokens,
@@ -2099,6 +2103,259 @@ class Memory {
   }
 }
 
+// FerrisHarness adapts the native callback convention. NAPI's threadsafe
+// functions deliver (error, payload); the wrapper presents the SDK-shaped
+// single-argument callbacks documented for JavaScript.
+class FerrisHarness {
+  constructor(manifest, root, start, invoke, shutdown = null) {
+    this._inner = new NativeFerrisHarness(
+      manifest,
+      root,
+      (err, ctx) => {
+        if (err) throw err;
+        return start(ctx);
+      },
+      (err, call) => {
+        if (err) throw err;
+        return invoke(call);
+      },
+      shutdown
+        ? (err) => {
+            if (err) throw err;
+            return shutdown();
+          }
+        : null,
+    );
+  }
+
+  start() {
+    return this._inner.start();
+  }
+
+  invoke(id, input) {
+    return this._inner.invoke(id, input);
+  }
+
+  invokeContribution(kind, id, input) {
+    return this._inner.invokeContribution(kind, id, input);
+  }
+
+  shutdown() {
+    return this._inner.shutdown();
+  }
+
+  manifest() {
+    return this._inner.manifest();
+  }
+
+  get runtimeKind() {
+    return this._inner.runtimeKind;
+  }
+
+  get root() {
+    return this._inner.root;
+  }
+}
+
+// FerrisHost adapts NAPI's (error, payload) callback convention and presents
+// the SDK-shaped single-argument/host-options API documented for JavaScript.
+class FerrisHost {
+  constructor(root, options = {}) {
+    if (typeof NativeFerrisHost !== 'function') {
+      throw new Error(
+        'FerrisHost is not built; rebuild @open1s/jsbos with the ferris-host feature',
+      );
+    }
+    this._inner = new NativeFerrisHost(
+      root,
+      options.workspace ?? null,
+      options.trust ?? null,
+      options.policyMode ?? null,
+      options.onContributions
+        ? (err, payload) => {
+            if (err) throw err;
+            return options.onContributions(payload);
+          }
+        : null,
+      options.onRevoke
+        ? (err, payload) => {
+            if (err) throw err;
+            return options.onRevoke(payload);
+          }
+        : null,
+      options.processSandbox ?? null,
+    );
+  }
+
+  get root() {
+    return this._inner.root;
+  }
+
+  registerExtension(manifest, root, start, invoke, shutdown = null) {
+    return this._inner.registerExtension(
+      manifest,
+      root,
+      (err, ctx) => {
+        if (err) throw err;
+        return start(ctx);
+      },
+      (err, call) => {
+        if (err) throw err;
+        return invoke(call);
+      },
+      shutdown
+        ? (err) => {
+            if (err) throw err;
+            return shutdown();
+          }
+        : null,
+    );
+  }
+
+  installed() {
+    return this._inner.installed();
+  }
+
+  install(source) {
+    return this._inner.install(source);
+  }
+
+  installPackage(source, origin = null) {
+    return this._inner.installPackage(source, origin);
+  }
+
+  uninstall(id, purgeData = false) {
+    return this._inner.uninstall(id, purgeData);
+  }
+
+  setEnabled(id, enabled) {
+    return this._inner.setEnabled(id, enabled);
+  }
+
+  versions(id) {
+    return this._inner.versions(id);
+  }
+
+  activeVersion(id) {
+    return this._inner.activeVersion(id);
+  }
+
+  activate(id, version) {
+    return this._inner.activate(id, version);
+  }
+
+  rollback(id) {
+    return this._inner.rollback(id);
+  }
+
+  clearFailure(id) {
+    return this._inner.clearFailure(id);
+  }
+
+  quarantine(id, reason) {
+    return this._inner.quarantine(id, reason);
+  }
+
+  packageRoot(id, version) {
+    return this._inner.packageRoot(id, version);
+  }
+
+  plan() {
+    return this._inner.plan();
+  }
+
+  apply() {
+    return this._inner.apply();
+  }
+
+  reload() {
+    return this._inner.reload();
+  }
+
+  unload() {
+    return this._inner.unload();
+  }
+
+  invoke(extension, kind, id, input) {
+    return this._inner.invoke(extension, kind, id, input);
+  }
+
+  contributions() {
+    return this._inner.contributions();
+  }
+
+  grant(extension, capability, scope = null, note = null) {
+    return this._inner.grant(extension, capability, scope, note);
+  }
+
+  revokeGrant(extension, capability) {
+    return this._inner.revokeGrant(extension, capability);
+  }
+
+  grants(extension) {
+    return this._inner.grants(extension);
+  }
+
+  auditDegraded() {
+    return this._inner.auditDegraded();
+  }
+
+  subscribeEvents(topics, callback) {
+    return this._inner.subscribeEvents(topics, (err, event) => {
+      if (err) throw err;
+      return callback(event);
+    });
+  }
+
+  unsubscribeEvents(id) {
+    return this._inner.unsubscribeEvents(id);
+  }
+
+  publishEvent(topic, payload) {
+    return this._inner.publishEvent(topic, payload);
+  }
+
+  /**
+   * Register every applied tool contribution on an AgentBuilder or started
+   * Agent. The tool callback forwards to the owning extension runtime.
+   */
+  async registerAgentTools(agent) {
+    const registered = [];
+    for (const [extension, entries] of Object.entries(this.contributions())) {
+      for (const contribution of entries) {
+        if (contribution.kind !== 'tool') continue;
+        const payload = contribution.payload || {};
+        const schema = payload.input_schema || {};
+        const name = contribution.id;
+        const td = new ToolDef(
+          name,
+          payload.description || name,
+          (args) => this.invoke(extension, 'tool', name, args),
+          schema.properties || {},
+          schema,
+        );
+        if (agent?._tools?.add) agent._tools.add(td);
+        if (agent?._inner?.addTool) {
+          await agent._inner.addTool(
+            td.name,
+            td.description,
+            JSON.stringify(td.parameters),
+            JSON.stringify(td.schema),
+            async (err, args) => {
+              if (err) throw err;
+              return td.callback(args);
+            },
+            false,
+            null,
+          );
+        }
+        registered.push({ extension, name });
+      }
+    }
+    return registered;
+  }
+}
+
 export * from './jsbos.js';
 
 export {
@@ -2132,6 +2389,10 @@ export {
   Goal,
   GoalStore,
   JobRegistry,
+  FerrisHarness,
+  FerrisManifest,
+  FerrisManifestBuilder,
+  FerrisHost,
   renderTemplate,
   withMemory,
   estimateTokens,

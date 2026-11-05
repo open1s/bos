@@ -44,6 +44,9 @@ from nbos_native import (
     AgentRpcClient,
     BudgetStatus,
     FallbackProvider,
+    FerrisHarness,
+    FerrisManifest,
+    FerrisManifestBuilder,
     Goal,
     GoalStore,
     JobRegistry,
@@ -79,6 +82,81 @@ from nbos_native import (
     render_template,
     with_memory,
 )
+
+# FerrisHost is only present when the native module was built with the
+# ferris-host feature (the default). Keep the authoring-only build importable.
+try:
+    from nbos_native import FerrisHost as _NativeFerrisHost
+except ImportError:  # pragma: no cover - authoring-only native build
+
+    class FerrisHost:  # type: ignore[no-redef]
+        """Unavailable in a native build compiled without ferris-host."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            raise RuntimeError(
+                "FerrisHost is not built; rebuild nbos with the ferris-host feature"
+            )
+
+else:
+
+    class FerrisHost:  # type: ignore[no-redef]
+        """Ferris host with Python-side agent integration helpers."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self._inner = _NativeFerrisHost(*args, **kwargs)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._inner, name)
+
+        def __repr__(self) -> str:
+            return repr(self._inner)
+
+        async def register_agent_tools(self, agent: Any) -> list[dict[str, str]]:
+            """Register every applied tool contribution on an Agent/AgentBuilder."""
+            import json
+
+            from nbos.tool import ToolDef
+
+            registered: list[dict[str, str]] = []
+            tools = getattr(agent, "_tools", None)
+            inner = getattr(agent, "_inner", None)
+            for extension, entries in self._inner.contributions().items():
+                for contribution in entries:
+                    if contribution.get("kind") != "tool":
+                        continue
+                    payload = contribution.get("payload") or {}
+                    schema = payload.get("input_schema") or {}
+                    name = contribution["id"]
+
+                    async def call(args: dict, _extension=extension, _name=name) -> Any:
+                        return await self._inner.invoke(
+                            _extension, "tool", _name, args
+                        )
+
+                    td = ToolDef(
+                        name=name,
+                        description=payload.get("description") or name,
+                        callback=call,
+                        parameters=schema.get("properties", {}),
+                        schema=schema,
+                    )
+                    if tools is not None and hasattr(tools, "add"):
+                        tools.add(td)
+                    if inner is not None and hasattr(inner, "add_tool"):
+                        from nbos_native import PythonTool
+
+                        await inner.add_tool(
+                            PythonTool(
+                                name=td.name,
+                                description=td.description,
+                                parameters=json.dumps(td.parameters),
+                                schema=json.dumps(td.schema),
+                                callback=td.callback,
+                            )
+                        )
+                    registered.append({"extension": extension, "name": name})
+            return registered
+
 
 # The native (pyo3) bus classes keep their plain exported names; the high
 # level wrappers returned by BusManager are available under the *_Wrapper aliases.
@@ -158,6 +236,10 @@ __all__ = [
     "GoalStore",
     "JobRegistry",
     "FallbackProvider",
+    "FerrisHarness",
+    "FerrisHost",
+    "FerrisManifest",
+    "FerrisManifestBuilder",
     "render_template",
     "with_memory",
     "estimate_tokens",

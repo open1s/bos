@@ -249,6 +249,75 @@ export declare class ConfigLoader {
   reloadSync(): string
 }
 
+/** A parsed, validated schema-2.0 extension manifest. */
+export declare class FerrisManifest {
+  /** Parse and validate a `extension.toml` document. */
+  static parse(text: string): FerrisManifest
+  /** The canonical TOML document. */
+  toToml(): string
+  /** The manifest as a plain JSON object. */
+  toJSON(): any
+  /** The extension id. */
+  get id(): string
+  /** The runtime kind the manifest asks for. */
+  get runtimeKind(): string
+}
+
+/**
+ * A chainable builder for a schema-2.0 manifest.
+ *
+ * Every method returns a new builder, so calls compose in JavaScript and
+ * Python without a second native object per step.
+ */
+export declare class FerrisManifestBuilder {
+  /** Start a manifest with the required identity fields. */
+  constructor(id: string, name: string, version: string, description: string)
+  /** Set the host version range. */
+  host(requirement: string): FerrisManifestBuilder
+  /** Set the extension API range. */
+  extensionApi(requirement: string): FerrisManifestBuilder
+  /** Set the runtime kind. */
+  runtime(kind: string): FerrisManifestBuilder
+  /** Set one opaque runtime configuration value. */
+  runtimeConfig(key: string, value: any): FerrisManifestBuilder
+  /** Require one capability. */
+  capability(capability: string): FerrisManifestBuilder
+  /** Declare one contribution with an optional JSON payload. */
+  contribution(kind: string, id: string, payload?: any | undefined | null): FerrisManifestBuilder
+  /** Add one author. */
+  author(author: string): FerrisManifestBuilder
+  /** Set the SPDX license expression. */
+  license(license: string): FerrisManifestBuilder
+  /** Set the source repository URL. */
+  repository(repository: string): FerrisManifestBuilder
+  /** Set the project homepage URL. */
+  homepage(homepage: string): FerrisManifestBuilder
+  /** Add one dependency requirement. */
+  dependency(id: string, requirement: string): FerrisManifestBuilder
+  /** Declare one provided service from a JSON spec. */
+  provide(spec: any): FerrisManifestBuilder
+  /** Declare one required service from a JSON spec. */
+  require(spec: any): FerrisManifestBuilder
+  /** Set the memory ceiling in MiB. */
+  maxMemoryMb(value: number): FerrisManifestBuilder
+  /** Set the one-call wall-clock ceiling in milliseconds. */
+  maxExecutionMs(value: number): FerrisManifestBuilder
+  /** Set the concurrent-call ceiling. */
+  maxConcurrentCalls(value: number): FerrisManifestBuilder
+  /** Set the per-result output ceiling in bytes. */
+  maxOutputBytes(value: number): FerrisManifestBuilder
+  /** Set the WASM table element ceiling. */
+  maxTableElements(value: number): FerrisManifestBuilder
+  /** Set the package-relative configuration schema path. */
+  configurationSchema(path: string): FerrisManifestBuilder
+  /** Set the default configuration values. */
+  configurationDefaults(value: any): FerrisManifestBuilder
+  /** Set the startup policy: on-startup, on-demand, on-workspace-open, manual. */
+  startup(policy: string): FerrisManifestBuilder
+  /** Validate and build the manifest. */
+  build(): FerrisManifest
+}
+
 /**
  * A durable working goal.
  *
@@ -378,6 +447,110 @@ export declare class McpClient {
   listResources(): Promise<Array<any>>
   /** Read a resource by URI. */
   readResource(uri: string): Promise<any>
+}
+
+/**
+ * An in-process Ferris extension harness.
+ *
+ * This is the JavaScript equivalent of the SDK's `TestHarness`: it starts the
+ * extension, returns its contributions, and forwards `invoke` calls. It does
+ * not install or activate packages; that is the host runtime surface.
+ */
+export declare class NativeFerrisHarness {
+  /**
+   * Build a harness around JavaScript extension callbacks.
+   *
+   * `start(ctx)` receives the start context and returns an array of
+   * `{ kind, id, payload }` contributions. `invoke(call)` receives
+   * `{ contribution, input, context }` and returns the call result.
+   */
+  constructor(manifest: string, root: string, start: JsCall, invoke: JsCall, shutdown?: JsCall | undefined | null)
+  /** Start the extension and return its contributions. */
+  start(): Promise<any>
+  /** Invoke a contribution id as a tool. */
+  invoke(id: string, input: any): Promise<any>
+  /** Invoke a contribution with an explicit kind. */
+  invokeContribution(kind: string, id: string, input: any): Promise<any>
+  /** Shut the extension down. */
+  shutdown(): Promise<void>
+  /** The manifest as a plain JSON object. */
+  manifest(): any
+  /** The runtime kind the manifest asks for. */
+  get runtimeKind(): string
+  /** The package root handed to the extension. */
+  get root(): string
+}
+
+/**
+ * A Ferris package store and runtime host.
+ *
+ * The host owns one canonical store rooted at `root`, installs packages into
+ * it, plans them in dependency order, and activates the standard runtimes.
+ * Contributions are exposed as JSON and invocations are forwarded to the
+ * owning runtime.
+ */
+export declare class NativeFerrisHost {
+  /** Open a host over `root`. */
+  constructor(root: string, workspace?: string | undefined | null, trust?: string | undefined | null, policyMode?: string | undefined | null, onContributions?: JsCall | undefined | null, onRevoke?: JsCall | undefined | null, processSandbox?: boolean | undefined | null)
+  /** The canonical store root. */
+  get root(): string
+  /** Installed id/version pairs, sorted by id and version. */
+  installed(): Array<any>
+  /** Install one package tree and return its identity. */
+  install(source: string): any
+  /** Install one package tree with an explicit source label. */
+  installPackage(source: string, origin?: string | undefined | null): any
+  /** Remove one installed extension, optionally purging its data. */
+  uninstall(id: string, purgeData?: boolean | undefined | null): void
+  /** Enable or disable one installed extension. */
+  setEnabled(id: string, enabled: boolean): void
+  /** Every installed version of one extension, ascending. */
+  versions(id: string): Array<string>
+  /** The active version of one extension. */
+  activeVersion(id: string): string | null
+  /** Activate one installed version. */
+  activate(id: string, version: string): void
+  /** Activate the version before the current one. */
+  rollback(id: string): string
+  /** Clear a persisted failure for one extension. */
+  clearFailure(id: string): void
+  /** Move one extension's code to quarantine. */
+  quarantine(id: string, reason: string): string
+  /** The canonical package root for one installed version. */
+  packageRoot(id: string, version: string): string
+  /** Resolve installed packages into an activation order. */
+  plan(): Array<string>
+  /** Start every planned package and return the applied contributions. */
+  apply(): Promise<any>
+  /** Re-apply the current plan (unload, then start again). */
+  reload(): Promise<any>
+  /** Shut down every activation and revoke its contributions. */
+  unload(): Promise<void>
+  /**
+   * Register an in-process JavaScript extension as a linked package.
+   *
+   * The extension starts immediately and its contributions are recorded. It
+   * is not part of the installed store or the dependency plan.
+   */
+  registerExtension(manifest: string, root: string, start: JsCall, invoke: JsCall, shutdown?: JsCall | undefined | null): Promise<any>
+  /** Invoke one contribution on a started extension. */
+  invoke(extension: string, kind: string, id: string, input: any): Promise<any>
+  /** Every applied contribution, keyed by extension id. */
+  contributions(): any
+  /** Grant one capability to an extension. */
+  grant(extension: string, capability: string, scope?: string | undefined | null, note?: string | undefined | null): void
+  /** Revoke one capability grant. */
+  revokeGrant(extension: string, capability: string): boolean
+  /** Every grant for one extension, as JSON. */
+  grants(extension: string): any
+  /** The first audit persistence failure, if any. */
+  auditDegraded(): string | null
+  /** Subscribe to host events. The callback receives one event object. */
+  subscribeEvents(topics: Array<string>, callback: JsCall): number
+  /** Cancel one event subscription. */
+  unsubscribeEvents(id: number): boolean
+  /** Publish one host event to subscribed extensions. */
+  publishEvent(topic: string, payload: any): any
 }
 
 /** Registry of agent plugins. */

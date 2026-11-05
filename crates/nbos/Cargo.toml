@@ -14,10 +14,17 @@ repository = "https://github.com/open1s/bos"
 name = "nbos_native"
 crate-type = ["cdylib"]
 
+[features]
+default = ["ferris-host"]
+# Full Ferris host: package manager plus the standard process/WASM/MCP runtimes.
+ferris-host = ["ferris-bindings/host", "ferris-sdk/host-runtime"]
+
 [dependencies]
 agent = { path = "../agent" }
 bus = { path = "../bus" }
 config = { path = "../config" }
+ferris-bindings = { path = "../ferris-bindings" }
+ferris-sdk = { path = "../ferris-sdk", features = ["tokio"] }
 logging = { path = "../logging" }
 react = { path = "../react" }
 serde_json = { workspace = true }

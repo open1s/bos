@@ -580,6 +580,7 @@ struct McpCore {
     sandbox: Mutex<Option<Arc<crate::windows_sandbox::WindowsSandbox>>>,
     cancelled: AtomicBool,
     stopped: AtomicBool,
+    sandbox: AtomicBool,
     /// Set by notifications/*/list_changed; the next catalog read rediscovers.
     catalog_dirty: Arc<AtomicBool>,
 }
@@ -627,6 +628,13 @@ impl McpRuntime {
             )?),
             call_gate: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// Disable the platform OS sandbox for this runtime. This is a
+    /// development escape hatch for hosts whose nested sandbox cannot start.
+    pub fn with_sandbox(self, enabled: bool) -> Self {
+        self.core.sandbox.store(enabled, Ordering::SeqCst);
+        self
     }
 
     /// The tool descriptors the server advertised.
@@ -719,6 +727,7 @@ impl McpCore {
             sandbox: Mutex::new(None),
             cancelled: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
+            sandbox: AtomicBool::new(true),
             catalog_dirty: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -891,13 +900,14 @@ impl McpCore {
         // MCP is also an arbitrary package-controlled child process. Reuse
         // the platform sandbox used by ProcessRuntime; a missing sandbox binary
         // or failed profile must never fall back to direct execution.
-        let mut command = if cfg!(target_os = "linux") {
+        let sandboxed = self.sandbox.load(Ordering::SeqCst);
+        let mut command = if sandboxed && cfg!(target_os = "linux") {
             let mut command = Command::new("bwrap");
             command.args(crate::process::linux_bwrap_plan(
                 &self.root, None, None, &program, &self.args,
             ));
             command
-        } else if cfg!(target_os = "macos") {
+        } else if sandboxed && cfg!(target_os = "macos") {
             let mut command = Command::new("/usr/bin/sandbox-exec");
             command
                 .arg("-p")
@@ -944,7 +954,7 @@ impl McpCore {
             source,
         })?);
         #[cfg(windows)]
-        let mut child = {
+        let mut child = if sandboxed {
             let sandbox = self.sandbox(&program)?;
             let mut envs: Vec<(String, String)> = Vec::new();
             for key in ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"] {
@@ -964,6 +974,11 @@ impl McpCore {
                 message,
             })?;
             McpChild::Sandbox(child)
+        } else {
+            McpChild::Std(command.spawn().map_err(|source| ExtensionError::Io {
+                path: program.clone(),
+                source,
+            })?)
         };
         let stdin = child.take_stdin().ok_or_else(|| ExtensionError::Protocol {
             extension: self.extension.to_string(),

@@ -20,7 +20,12 @@ Python and the app.
 - **Plugin System** — Extend LLM requests/responses and tool execution
 - **MCP Client** — Connect to [Model Context Protocol](https://modelcontextprotocol.io/) servers
 - **Bash Tool** — Execute shell commands with workspace isolation
-- **Skills** — Register agent capabilities from directory files
+- **Skills** — Register capabilities from directory files or inline
+- **Plans and Goals** — A shared working plan, durable goals, and the `update_plan`/`get_goal` tools
+- **Background Jobs** — A `JobRegistry` plus `job_output`/`job_kill` for detached processes
+- **Steering** — Queue a message into the running turn's next step
+- **Prompt Templates** — `renderTemplate`, `withMemory` and `estimateTokens` from the Rust core
+- **Ferris Extensions** — Implement the Ferris SDK `Extension` interface in JavaScript with `FerrisHarness`, or install and run packages with `FerrisHost`
 
 ## Installation
 

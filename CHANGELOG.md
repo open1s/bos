@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- **Ferris SDK bindings**: `nbos` and `jsbos` expose `FerrisManifest`,
+  `FerrisHarness` and `FerrisHost`. A Python or JavaScript object can
+  implement the Ferris SDK `Extension` interface (manifest +
+  start/invoke/shutdown callbacks) and run in process through the Rust
+  `ExtensionRuntime`. `FerrisHost` adds the full package host: install, list,
+  versions, enable/disable, rollback, quarantine, dependency-ordered plan,
+  activation of the declarative/process/MCP/Cordis/Extism/WASM runtimes,
+  contribution collection, invocation, policy grants and audit. The host also
+  accepts contribution/revocation callbacks, exposes event subscription and
+  publication, and can register an in-process language extension as a linked
+  package. A chainable `FerrisManifestBuilder` covers the full schema-2.0
+  builder. The host is enabled by default through the `ferris-host` Cargo
+  feature; build with `--no-default-features` for the authoring-only addon.
+  Hardened after review: unknown grant scopes are refused instead of silently
+  becoming `any`, contribution leases are token-scoped so a stale lease cannot
+  delete a replacement's entry, a rejected contribution callback leaves no
+  phantom entry, replacing a linked extension tears the old runtime down, and
+  event subscription ids are no longer truncated. `registerAgentTools` /
+  `register_agent_tools` registers applied tool contributions on an agent, and
+  MCP/Cordis runtime coverage was added. Host assembly now lives in the shared
+  `ferris-bindings` crate so Python and JavaScript cannot drift. See
+  `docs/ferris-bindings.md`.
 - **Python/JS bindings**: catch up with the agent-runtime surface that landed
   with builtin tools 2.0. Both bindings now expose the working plan
   (`planItems`/`setPlan`/`clearPlan`/`addPlanTool`), durable goals
