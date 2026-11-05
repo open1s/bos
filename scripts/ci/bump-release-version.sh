@@ -66,8 +66,8 @@ perl -pi -e "s/!== '[0-9][^']*'/!== '\$ENV{VERSION}'/g; s/expected [0-9][^ ]* bu
 # pyproject.toml.
 perl -pi -e "s/^__version__ = \"[^\"]*\"/__version__ = \"\$ENV{VERSION}\"/" "$nbos_package"
 
-perl -pi -e "s/^(# @open1s\/jsbos — v).*/\1\$ENV{VERSION}/" "$jsbos_readme"
-perl -pi -e "s/^(# nbos — v).*/\1\$ENV{VERSION}/" "$nbos_readme"
+perl -pi -e 's/^# \@open1s\/jsbos .*/# \@open1s\/jsbos — v$ENV{VERSION}/' "$jsbos_readme"
+perl -pi -e 's/^# nbos .*/# nbos — v$ENV{VERSION}/' "$nbos_readme"
 
 # The lock records every workspace member's version; cargo is the authority.
 if command -v cargo >/dev/null 2>&1; then
