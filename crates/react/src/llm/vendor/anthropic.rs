@@ -470,9 +470,6 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
             }
         }
 
-        let request_bytes = serde_json::to_vec(&body)
-            .map(|body| body.len() as u64)
-            .unwrap_or(0);
         let builder = self
             .client
             .post(&url)
@@ -486,8 +483,8 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
             "POST",
             &url,
             request.request_id.as_deref(),
-            request_bytes,
-            builder.send(),
+            self.client.as_ref(),
+            builder,
         )
         .await
         .map_err(|e| {

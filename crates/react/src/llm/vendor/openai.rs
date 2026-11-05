@@ -422,9 +422,16 @@ impl OpenAiVendor {
             .client
             .get(&url)
             .header("Authorization", format!("Bearer {}", self.api_key));
-        let response = super::tap::traced_send("llm.models", "GET", &url, None, 0, builder.send())
-            .await
-            .map_err(|e| LlmError::Http(e.to_string()))?;
+        let response = super::tap::traced_send(
+            "llm.models",
+            "GET",
+            &url,
+            None,
+            self.client.as_ref(),
+            builder,
+        )
+        .await
+        .map_err(|e| LlmError::Http(e.to_string()))?;
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
@@ -515,9 +522,6 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
         log_request(&openai_req);
 
         let t1 = std::time::Instant::now();
-        let request_bytes = serde_json::to_vec(&openai_req)
-            .map(|body| body.len() as u64)
-            .unwrap_or(0);
         let builder = client
             .post(&url)
             .header("Authorization", format!("Bearer {}", api_key))
@@ -528,8 +532,8 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
             "POST",
             &url,
             request.request_id.as_deref(),
-            request_bytes,
-            builder.send(),
+            client.as_ref(),
+            builder,
         )
         .await
         .map_err(|e| {
@@ -633,9 +637,6 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
 
         log_request(&openai_req);
 
-        let request_bytes = serde_json::to_vec(&openai_req)
-            .map(|body| body.len() as u64)
-            .unwrap_or(0);
         let builder = client
             .post(&url)
             .header("Authorization", format!("Bearer {}", api_key))
@@ -647,8 +648,8 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
             "POST",
             &url,
             request.request_id.as_deref(),
-            request_bytes,
-            builder.send(),
+            client.as_ref(),
+            builder,
         )
         .await
         .map_err(|e| {
@@ -668,9 +669,6 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                 && openai_req.stream_options.take().is_some()
             {
                 log::warn!("provider rejected stream_options; retrying without usage reporting");
-                let request_bytes = serde_json::to_vec(&openai_req)
-                    .map(|body| body.len() as u64)
-                    .unwrap_or(0);
                 let builder = client
                     .post(&url)
                     .header("Authorization", format!("Bearer {}", api_key))
@@ -682,8 +680,8 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                     "POST",
                     &url,
                     request.request_id.as_deref(),
-                    request_bytes,
-                    builder.send(),
+                    client.as_ref(),
+                    builder,
                 )
                 .await
                 .map_err(|e| {

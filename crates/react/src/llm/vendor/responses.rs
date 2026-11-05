@@ -889,9 +889,6 @@ impl ResponsesTransport {
             }
         }
 
-        let request_bytes = serde_json::to_vec(&responses_req)
-            .map(|body| body.len() as u64)
-            .unwrap_or(0);
         let builder = self
             .client
             .post(&url)
@@ -903,8 +900,8 @@ impl ResponsesTransport {
             "POST",
             &url,
             request.request_id.as_deref(),
-            request_bytes,
-            builder.send(),
+            self.client.as_ref(),
+            builder,
         )
         .await
         .map_err(|e| {
@@ -950,9 +947,6 @@ impl ResponsesTransport {
 
         let url = format!("{}/responses", self.endpoint);
 
-        let request_bytes = serde_json::to_vec(&responses_req)
-            .map(|body| body.len() as u64)
-            .unwrap_or(0);
         let builder = self
             .client
             .post(&url)
@@ -965,8 +959,8 @@ impl ResponsesTransport {
             "POST",
             &url,
             request.request_id.as_deref(),
-            request_bytes,
-            builder.send(),
+            self.client.as_ref(),
+            builder,
         )
         .await
         .map_err(|e| {

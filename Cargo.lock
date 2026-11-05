@@ -9426,6 +9426,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "bus",
+ "bytes",
  "config",
  "dashmap",
  "futures",

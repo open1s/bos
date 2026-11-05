@@ -38,21 +38,46 @@ pub(crate) fn install_http_tap() {
                 if !ferris_sdk::host_runtime::hook::attached() {
                     return;
                 }
-                let mut event = ferris_sdk::host_runtime::hooks::http_exchange(
-                    exchange.label,
-                    &exchange.method,
-                    &exchange.url,
-                    exchange.status,
-                    exchange.request_bytes,
-                    exchange.response_bytes,
-                    exchange.content_type.as_deref(),
-                    exchange.ttfb_ms,
-                    exchange.total_ms,
-                    exchange.error.as_deref(),
+                // The tap already masked credential header values; a body is
+                // masked here because a prompt can carry a key of its own.
+                let request_headers: Vec<(String, String)> = exchange
+                    .request_headers
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                let response_headers: Vec<(String, String)> = exchange
+                    .response_headers
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                let request_body = exchange
+                    .request_body
+                    .as_deref()
+                    .map(ferris_sdk::host_runtime::hooks::redact_payload);
+                let response_body = exchange
+                    .response_body
+                    .as_deref()
+                    .map(ferris_sdk::host_runtime::hooks::redact_payload);
+                let event = ferris_sdk::host_runtime::hooks::http_exchange_event(
+                    ferris_sdk::host_runtime::hooks::HttpEvent {
+                        source: exchange.label,
+                        method: &exchange.method,
+                        url: &exchange.url,
+                        status: exchange.status,
+                        request_id: exchange.request_id.as_deref(),
+                        request_bytes: exchange.request_bytes,
+                        response_bytes: exchange.response_bytes,
+                        content_type: exchange.content_type.as_deref(),
+                        ttfb_ms: exchange.ttfb_ms,
+                        total_ms: exchange.total_ms,
+                        error: exchange.error.as_deref(),
+                        request_headers: &request_headers,
+                        response_headers: &response_headers,
+                        request_body: request_body.as_deref(),
+                        response_body: response_body.as_deref(),
+                        body_truncated: exchange.body_truncated,
+                    },
                 );
-                if let Some(request_id) = exchange.request_id.as_deref() {
-                    event["request_id"] = serde_json::Value::String(request_id.to_string());
-                }
                 ferris_sdk::host_runtime::hooks::observe("http.exchange", event);
             },
         )));

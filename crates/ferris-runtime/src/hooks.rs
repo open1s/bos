@@ -130,11 +130,93 @@ fn take_batch() -> Vec<(&'static str, Value)> {
     queue.events.drain(..count).collect()
 }
 
-/// Build one HTTP exchange observation.
+/// One HTTP exchange as the host observed it.
 ///
-/// Header values and bodies are deliberately absent: this layer records the
-/// shape of the exchange (status, sizes, timing), and capturing a body is a
-/// separate, explicit decision.
+/// The headers and the bodies are optional and bounded: a host that captures
+/// nothing still publishes the shape, and a host that captures a body publishes
+/// at most what its cap allows. Secret header VALUES are masked before they get
+/// here; a body is passed through [redact] so a credential inside a payload is
+/// masked too.
+#[derive(Default)]
+pub struct HttpEvent<'a> {
+    /// What made the call, for example "llm".
+    pub source: &'a str,
+    /// HTTP method.
+    pub method: &'a str,
+    /// Full URL.
+    pub url: &'a str,
+    /// Status code, when a response arrived.
+    pub status: Option<u16>,
+    /// Correlation id of the model request.
+    pub request_id: Option<&'a str>,
+    /// Request body bytes.
+    pub request_bytes: u64,
+    /// Response body bytes.
+    pub response_bytes: u64,
+    /// Response content type.
+    pub content_type: Option<&'a str>,
+    /// Time to response headers.
+    pub ttfb_ms: u64,
+    /// Time to the send call returning.
+    pub total_ms: u64,
+    /// Transport error, when the call failed.
+    pub error: Option<&'a str>,
+    /// Request headers, already masked.
+    pub request_headers: &'a [(String, String)],
+    /// Response headers, already masked.
+    pub response_headers: &'a [(String, String)],
+    /// Request body, cut at the host cap.
+    pub request_body: Option<&'a str>,
+    /// Response body, cut at the host cap.
+    pub response_body: Option<&'a str>,
+    /// Whether either body was cut.
+    pub body_truncated: bool,
+}
+
+/// Build one HTTP exchange observation with headers and payloads.
+pub fn http_exchange_event(event: HttpEvent<'_>) -> Value {
+    let parsed = event.url.split_once("://").map(|(scheme, rest)| {
+        let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        let host = host.rsplit('@').next().unwrap_or(host);
+        let host = host.split(':').next().unwrap_or(host);
+        let path = rest
+            .find('/')
+            .map(|index| rest[index..].split(['?', '#']).next().unwrap_or("/"))
+            .unwrap_or("/");
+        (scheme.to_string(), host.to_string(), path.to_string())
+    });
+    let headers = |pairs: &[(String, String)]| {
+        let mut map = serde_json::Map::new();
+        for (name, value) in pairs {
+            map.insert(name.clone(), Value::String(value.clone()));
+        }
+        Value::Object(map)
+    };
+    json!({
+        "source": event.source,
+        "request_id": event.request_id,
+        "method": event.method,
+        "host": parsed.as_ref().map(|(_, host, _)| host.as_str()),
+        "path": parsed.as_ref().map(|(_, _, path)| path.as_str()),
+        "status": event.status,
+        "request_bytes": event.request_bytes,
+        "response_bytes": event.response_bytes,
+        "content_type": event.content_type,
+        "ttfb_ms": event.ttfb_ms,
+        "total_ms": event.total_ms,
+        "error": event.error,
+        "request_headers": headers(event.request_headers),
+        "response_headers": headers(event.response_headers),
+        "request_body": event.request_body,
+        "response_body": event.response_body,
+        "body_truncated": event.body_truncated,
+    })
+}
+
+/// Build one HTTP exchange observation from metadata alone.
+///
+/// The shape-only form the sandbox runtimes report: they have no body to hand
+/// the host, so the payload fields stay absent rather than empty.
 #[allow(clippy::too_many_arguments)]
 pub fn http_exchange(
     source: &str,
@@ -148,39 +230,40 @@ pub fn http_exchange(
     total_ms: u64,
     error: Option<&str>,
 ) -> Value {
-    let parsed = url.split_once("://").map(|(scheme, rest)| {
-        let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
-        let host = host.rsplit('@').next().unwrap_or(host);
-        let host = host.split(':').next().unwrap_or(host);
-        let path = rest
-            .find('/')
-            .map(|index| rest[index..].split(['?', '#']).next().unwrap_or("/"))
-            .unwrap_or("/");
-        (scheme.to_string(), host.to_string(), path.to_string())
-    });
-    json!({
-        "source": source,
-        "request_id": Value::Null,
-        "method": method,
-        "host": parsed.as_ref().map(|(_, host, _)| host.as_str()),
-        "path": parsed.as_ref().map(|(_, _, path)| path.as_str()),
-        "status": status,
-        "request_bytes": request_bytes,
-        "response_bytes": response_bytes,
-        "content_type": content_type,
-        "ttfb_ms": ttfb_ms,
-        "total_ms": total_ms,
-        "error": error,
+    http_exchange_event(HttpEvent {
+        source,
+        method,
+        url,
+        status,
+        request_bytes,
+        response_bytes,
+        content_type,
+        ttfb_ms,
+        total_ms,
+        error,
+        ..Default::default()
     })
 }
 
 /// Redact credentials and bound one hook field before it leaves the host.
 pub fn redact(raw: &str) -> String {
+    redact_bounded(raw, 8 * 1024)
+}
+
+/// Redact one PAYLOAD field: the same masking, with room for a body.
+///
+/// A metadata value is a sentence; a body is a request. The 8 KiB metadata cap
+/// would cut a prompt in half, so a payload gets the tap's own cap.
+pub fn redact_payload(raw: &str) -> String {
+    redact_bounded(raw, 32 * 1024)
+}
+
+fn redact_bounded(raw: &str, cap: usize) -> String {
     let mut text = raw.to_string();
     for marker in ["sk-", "ghp_", "Bearer "] {
         text = mask_after(&text, marker);
     }
-    text.chars().take(8 * 1024).collect()
+    text.chars().take(cap).collect()
 }
 
 fn mask_after(text: &str, marker: &str) -> String {
@@ -232,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn an_http_exchange_carries_shape_not_bodies() {
+    fn a_shape_only_exchange_omits_the_payload_it_never_had() {
         let event = http_exchange(
             "com.example.source",
             "POST",
@@ -248,7 +331,54 @@ mod tests {
         assert_eq!(event["host"], "api.example.com");
         assert_eq!(event["path"], "/v1/chat");
         assert_eq!(event["status"], 200);
-        assert!(event.get("headers").is_none());
-        assert!(event.get("body").is_none());
+        assert_eq!(
+            event["request_body"],
+            Value::Null,
+            "a runtime with no body reports none rather than an empty string"
+        );
+        assert_eq!(
+            event["request_headers"].as_object().map(|map| map.len()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn an_http_exchange_carries_headers_and_bodies_when_it_has_them() {
+        let request_headers = vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            ("authorization".to_string(), "[redacted]".to_string()),
+        ];
+        let response_headers = vec![("content-type".to_string(), "text/event-stream".to_string())];
+        let body = redact_payload("{\"prompt\":\"hello\"}");
+        let event = http_exchange_event(HttpEvent {
+            source: "llm",
+            method: "POST",
+            url: "https://api.example.com/v1/chat?key=secret",
+            status: Some(200),
+            request_id: Some("req-1"),
+            request_bytes: 20,
+            response_bytes: 40,
+            content_type: Some("text/event-stream"),
+            ttfb_ms: 12,
+            total_ms: 400,
+            error: None,
+            request_headers: &request_headers,
+            response_headers: &response_headers,
+            request_body: Some(&body),
+            response_body: Some("data: {}\n\n"),
+            body_truncated: false,
+        });
+        assert_eq!(event["request_id"], "req-1");
+        assert_eq!(event["request_headers"]["authorization"], "[redacted]");
+        assert_eq!(
+            event["response_headers"]["content-type"],
+            "text/event-stream"
+        );
+        assert_eq!(event["request_body"], body);
+        assert!(event["response_body"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("data"));
+        assert_eq!(event["body_truncated"], false);
     }
 }

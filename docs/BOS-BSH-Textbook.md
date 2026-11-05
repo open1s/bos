@@ -2418,7 +2418,7 @@ and no manifest field enables them.
 | `model.response` | BOS `AfterLlmCall` | usage, response type/text, request_id | cost, latency, answer shape |
 | `tool.before` | BOS `BeforeToolCall` | tool name, call id, arguments | audit, redaction review |
 | `tool.after` | BOS `AfterToolCall` | tool name, call id, result | audit, error analysis |
-| `http.exchange` | WASM/Extism `fetch`; built-in LLM vendor tap | status, sizes, TTFB, request_id | wire-level capture |
+| `http.exchange` | WASM/Extism `fetch`; built-in LLM vendor tap | status, sizes, TTFB, request_id, headers, bounded bodies (vendor tap) | wire-level capture |
 
 ## 22.2 What observe guarantees
 
@@ -2665,11 +2665,19 @@ capped at 8 KiB by the host before delivery.
   "path": "/chat/completions",
   "status": 200,
   "request_bytes": 1834,
-  "response_bytes": 0,
+  "response_bytes": 512,
   "content_type": "text/event-stream",
   "ttfb_ms": 430,
   "total_ms": 438,
-  "error": null
+  "error": null,
+  "request_headers": {
+    "authorization": "[redacted]",
+    "content-type": "application/json"
+  },
+  "response_headers": {"content-type": "text/event-stream"},
+  "request_body": "{\"model\":\"glm-5.3-flash\",\"messages\":[...]}",
+  "response_body": "data: {\"id\":\"chatcmpl-...\"}\n\n",
+  "body_truncated": false
 }
 ```
 
@@ -2677,8 +2685,17 @@ capped at 8 KiB by the host before delivery.
   WASM/Extism `fetch`;
 - `request_id` joins the model observations; it is `null` for an extension
   fetch that is not a model call;
-- `response_bytes` is `content-length` when present, often 0 for a stream;
-- no headers, no body; URL query is not copied into `path`.
+- `response_bytes` is `content-length` when present, else the captured length;
+- the header maps are lowercased, repeated names are joined with `", "`, and a
+  secret header value (`authorization`, `x-api-key`, `cookie`, `set-cookie`,
+  `proxy-authorization`, `x-goog-api-key`) reads `[redacted]` — masked at
+  capture, so no caller can publish it by accident;
+- `request_body` and `response_body` are cut at 32 KiB each and
+  `body_truncated` says whether either was; a body is also passed through
+  `redact()` before delivery;
+- the vendor tap fills both bodies; a WASM/Extism `fetch` reports the shape
+  only, and its body fields stay `null`;
+- URL query is not copied into `path`.
 
 ## 24.6 Limits and redaction
 
@@ -2687,6 +2704,7 @@ capped at 8 KiB by the host before delivery.
 | queue | 1024 events |
 | batch | 64 |
 | field | 8 KiB |
+| payload (request or response body) | 32 KiB |
 | worker poll | 50 ms |
 | retries | none; a failed call is logged |
 
