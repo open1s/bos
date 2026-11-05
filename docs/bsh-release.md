@@ -72,8 +72,12 @@ jj git push --tag v1.1.1       # starts all three pipelines
 ```
 
 Only a tag of the form `vX.Y.Z` releases. A push to `main` runs the tests but
-never publishes; the three pipelines refuse a tag whose name is not
-`vMAJOR.MINOR.PATCH` and whose value does not match every manifest.
+never publishes. `scripts/ci/release-precondition.sh` runs first in all three
+pipelines: it requires the tag to be `vMAJOR.MINOR.PATCH` and to match the
+Cargo, jsbos, nbos and Python versions. When either check fails it warns and
+sets `should_release=false`, so the build and publish jobs are **skipped** -
+the run goes green with no artifacts rather than publishing a partial or
+mismatched set.
 
 The tag starts three pipelines: this one publishes the BSH installers, the
 `jsbos` pipeline publishes `@open1s/jsbos` to npm, and the `nbos` pipeline

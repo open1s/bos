@@ -21,54 +21,28 @@ jobs:
     name: Detect a release tag
     runs-on: ubuntu-latest
     outputs:
-      is_release: ${{ steps.check.outputs.is_release }}
+      should_release: ${{ steps.check.outputs.should_release }}
     steps:
       - uses: actions/checkout@v6
 
-      # Release tags look like v1.1.1. GitHub's tag globs cannot express
-      # that, so the form is enforced here.
-      - name: Require a vX.Y.Z tag
-        if: github.ref_type == 'tag'
+      # A release happens only when a vX.Y.Z tag matches every manifest. Any
+      # other run skips publishing (pull requests and dispatches still build),
+      # so a mismatched tag can never publish a partial set.
+      - id: check
+        name: Check the release precondition
         shell: bash
-        run: |
-          if ! printf '%s' "$GITHUB_REF_NAME" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "::error::release tags must look like v1.1.1 (got $GITHUB_REF_NAME)"
-            exit 1
-          fi
-
-      # A vX.Y.Z tag releases the installers, npm and PyPI together; fail the
-      # push when the manifests disagree instead of publishing part of a set.
-      - name: Check the manifests agree with the tag
         env:
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
-        shell: bash
-        run: |
-          if [ "$REF_TYPE" = "tag" ]; then
-            bash scripts/ci/check-release-versions.sh "${REF_NAME#v}"
-          else
-            bash scripts/ci/check-release-versions.sh
-          fi
-
-      # Only a vX.Y.Z tag releases. A push to main must never publish to
-      # PyPI; pull requests and manual runs still build so the pipeline
-      # smoke-tests itself, but the publish job requires a tag.
-      - id: check
-        name: Check the release tag
-        shell: bash
-        run: |
-          if [ "${{ github.ref_type }}" != "tag" ]; then
-            echo "Not a tag; nothing to release."
-            echo "is_release=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "is_release=true" >> "$GITHUB_OUTPUT"
+          EVENT_NAME: ${{ github.event_name }}
+        run: bash scripts/ci/release-precondition.sh
 
   build:
     name: Build bindings for ${{ matrix.target }}
     needs: release
-    # The workflow only runs for tags, pull requests and manual dispatches, so
-    # the build is always wanted; only publish is gated on a release tag.
+    # Pull requests and dispatches still build (a dry run); a tag releases
+    # only when the precondition passes.
+    if: needs.release.outputs.should_release == 'true' || github.event_name != 'push'
     strategy:
       fail-fast: false
       matrix:
@@ -147,7 +121,7 @@ jobs:
     needs: [release, build, test]
     runs-on: ubuntu-latest
     if: >-
-      needs.release.outputs.is_release == 'true'
+      needs.release.outputs.should_release == 'true'
       && github.event_name == 'push' && github.ref_type == 'tag'
     steps:
       - uses: actions/checkout@v6

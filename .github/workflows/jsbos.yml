@@ -23,47 +23,26 @@ jobs:
     name: Detect a release tag
     runs-on: ubuntu-latest
     outputs:
-      is_release: ${{ steps.check.outputs.is_release }}
+      should_release: ${{ steps.check.outputs.should_release }}
     steps:
       - uses: actions/checkout@v6
 
-      # A vX.Y.Z tag releases the installers, npm and PyPI together; fail the
-      # push when the manifests disagree instead of publishing part of a set.
-      - name: Check the manifests agree with the tag
-        env:
-          REF_TYPE: ${{ github.ref_type }}
-          REF_NAME: ${{ github.ref_name }}
-        shell: bash
-        run: |
-          if [ "$REF_TYPE" = "tag" ]; then
-            bash scripts/ci/check-release-versions.sh "${REF_NAME#v}"
-          else
-            bash scripts/ci/check-release-versions.sh
-          fi
-
-      # Only a vX.Y.Z tag releases. A push to main must never publish,
-      # and the exact form is checked here because GitHub's tag globs cannot
-      # express a semver.
+      # A release happens only when a vX.Y.Z tag matches every manifest; when
+      # it does not, the jobs below are skipped instead of publishing a
+      # partial or mismatched set.
       - id: check
-        name: Check the release tag
+        name: Check the release precondition
         shell: bash
         env:
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
-        run: |
-          if [ "$REF_TYPE" != "tag" ]; then
-            echo "Not a tag; nothing to release."
-            echo "is_release=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if ! printf '%s' "$REF_NAME" | grep -qE '^v[0-9]+[.][0-9]+[.][0-9]+([-+][0-9A-Za-z.-]+)?$'; then
-            echo "::error::release tags must look like vX.Y.Z (got $REF_NAME)"
-            exit 1
-          fi
-          echo "is_release=true" >> "$GITHUB_OUTPUT"
+          EVENT_NAME: ${{ github.event_name }}
+        run: bash scripts/ci/release-precondition.sh
 
   build:
     name: Build bindings for ${{ matrix.target }}
+    needs: release
+    if: needs.release.outputs.should_release == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -237,7 +216,7 @@ jobs:
       - build
       - test-macos-windows
       - test-linux
-    if: needs.release.outputs.is_release == 'true'
+    if: needs.release.outputs.should_release == 'true'
     defaults:
       run:
         working-directory: ./crates/jsbos

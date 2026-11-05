@@ -48,13 +48,28 @@ jobs:
     name: Resolve the release version
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.version.outputs.version }}
+      version: ${{ steps.gate.outputs.version }}
+      should_release: ${{ steps.gate.outputs.should_release }}
       publish: ${{ steps.version.outputs.publish }}
       prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v6
+
+      # Release only when a vX.Y.Z tag matches every manifest. Otherwise the
+      # run is skipped with a warning - no artifacts, no failure - instead of
+      # building a set that cannot agree with the tag.
+      - name: Check the release precondition
+        id: gate
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: bash scripts/ci/release-precondition.sh
+
       - name: Resolve and validate the version
         id: version
+        if: steps.gate.outputs.should_release == 'true'
         env:
           EVENT_NAME: ${{ github.event_name }}
           TAG: ${{ github.ref_name }}
@@ -65,6 +80,7 @@ jobs:
       # The same tag also releases npm and PyPI, so all three manifests must
       # carry the version the tag names.
       - name: Check the manifests agree with the tag
+        if: steps.gate.outputs.should_release == 'true'
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: bash scripts/ci/check-release-versions.sh "$VERSION"
@@ -72,6 +88,7 @@ jobs:
   verify:
     name: Test the tagged tree
     needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 240
     steps:
@@ -135,6 +152,7 @@ jobs:
   build:
     name: Package ${{ matrix.platform }}
     needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 240
     # GitHub's free arm64 runners are periodically preempted mid-build (three
@@ -357,7 +375,9 @@ jobs:
   release:
     name: Publish the GitHub release
     needs: [prepare, verify, build]
-    if: needs.prepare.outputs.publish == 'true'
+    if: >-
+      needs.prepare.outputs.should_release == 'true'
+      && needs.prepare.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write

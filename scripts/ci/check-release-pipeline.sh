@@ -85,6 +85,9 @@ done
 # --- The scripts the workflow calls exist ----------------------------------
 for script in \
   resolve-release-version.sh \
+  release-precondition.sh \
+  check-release-versions.sh \
+  bump-release-version.sh \
   package-macos.sh \
   package-linux.sh \
   package-windows.ps1 \
