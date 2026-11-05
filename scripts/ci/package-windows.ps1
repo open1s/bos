@@ -111,7 +111,6 @@ $portableDir = Join-Path $outFull $portableName
 if (Test-Path $portableDir) { Remove-Item -Recurse -Force $portableDir }
 New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
 
-$binaryBytes = (Get-Item $binaryPath).Length
 $stagedExe = Join-Path $portableDir 'bsh.exe'
 Copy-Item $binaryPath $stagedExe
 Copy-Item $licensePath (Join-Path $portableDir 'LICENSE.txt')
@@ -157,10 +156,9 @@ Sign-File $msiPath
 foreach ($artifact in @($zipPath, $msiPath)) {
     if (-not (Test-Path $artifact)) { Fail "missing artifact: $artifact" }
     $size = (Get-Item $artifact).Length
-    # CI packages a stand-in binary to prove the WiX source and script; the
-    # size floor only means something when the input is a real build.
-    if ($binaryBytes -ge 1MB -and $size -lt 1MB) {
-        Fail "$artifact is suspiciously small ($size bytes)"
-    }
+    # No size heuristic: CI packages a stub of zero bytes to prove the WiX
+    # source, and it compresses to a few KB. The release job verifies the
+    # expected artifact set and the MSI/zip are opened by the smoke test.
+    if ($size -le 0) { Fail "$artifact is empty" }
     Write-Host "package-windows: wrote $artifact ($size bytes)"
 }

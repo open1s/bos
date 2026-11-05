@@ -172,7 +172,7 @@ jobs:
           Get-ChildItem target\ci-package |
             Where-Object { $_.Extension -in '.msi', '.zip' } |
             ForEach-Object {
-              if ($_.Length -lt 1MB) { throw "$($_.Name) is suspiciously small" }
+              if ($_.Length -le 0) { throw "$($_.Name) is empty" }
               Write-Host "packaged $($_.Name) ($($_.Length) bytes)"
             }
 
