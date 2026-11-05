@@ -19,6 +19,12 @@ const {
   HookEvent,
   HookDecision,
   HookRegistry,
+  Goal,
+  GoalStore,
+  JobRegistry,
+  renderTemplate,
+  withMemory,
+  estimateTokens,
 } = jsbos;
 
 const DEFAULT_MODEL = 'nvidia/meta/llama-3.1-8b-instruct';
@@ -606,6 +612,10 @@ class AgentBuilder {
     this._mcpServers = [];
     this._memory = options.memory || null;
     this._recallLimit = options.memoryRecallLimit || 5;
+    this._deferredTools = [];
+    this._deferredPrefixes = [];
+    this._planTool = false;
+    this._promptSections = [];
     this._config = {
       name: options.name || 'assistant',
       model: options.model || DEFAULT_MODEL,
@@ -615,8 +625,17 @@ class AgentBuilder {
       temperature: options.temperature ?? 0.7,
       timeoutSecs: options.timeoutSecs || 120,
       maxTokens: options.maxTokens,
+      maxSteps: options.maxSteps,
       apiMode: options.apiMode || 'chat',
       reasoningEffort: options.reasoningEffort,
+      personaComplete: options.personaComplete,
+      compactionInputTokens: options.compactionInputTokens,
+      toolOutputCap: options.toolOutputCap,
+      parallelToolCalls: options.parallelToolCalls,
+      webSearch: options.webSearch,
+      contextBudget: options.contextBudget,
+      skillCatalogue: options.skillCatalogue,
+      fallbacks: options.fallbacks ? [...options.fallbacks] : [],
     };
   }
 
@@ -636,6 +655,19 @@ class AgentBuilder {
     if (config.maxTokens) this._config.maxTokens = config.maxTokens;
     if (config.apiMode) this._config.apiMode = config.apiMode;
     if (config.reasoningEffort) this._config.reasoningEffort = config.reasoningEffort;
+    if (config.maxSteps !== undefined) this._config.maxSteps = config.maxSteps;
+    if (config.personaComplete !== undefined) this._config.personaComplete = config.personaComplete;
+    if (config.compactionInputTokens !== undefined) {
+      this._config.compactionInputTokens = config.compactionInputTokens;
+    }
+    if (config.toolOutputCap !== undefined) this._config.toolOutputCap = config.toolOutputCap;
+    if (config.parallelToolCalls !== undefined) {
+      this._config.parallelToolCalls = config.parallelToolCalls;
+    }
+    if (config.webSearch !== undefined) this._config.webSearch = config.webSearch;
+    if (config.contextBudget !== undefined) this._config.contextBudget = config.contextBudget;
+    if (config.skillCatalogue !== undefined) this._config.skillCatalogue = config.skillCatalogue;
+    if (Array.isArray(config.fallbacks)) this._config.fallbacks = [...config.fallbacks];
     if (config.circuitBreaker) {
       this._config.circuitBreakerMaxFailures = config.circuitBreaker.maxFailures;
       this._config.circuitBreakerCooldownSecs = config.circuitBreaker.cooldownSecs;
@@ -697,6 +729,101 @@ class AgentBuilder {
     return this;
   }
 
+  maxSteps(steps) {
+    this._config.maxSteps = steps;
+    return this;
+  }
+
+  personaComplete(complete = true) {
+    this._config.personaComplete = complete;
+    return this;
+  }
+
+  compactionInputTokens(tokens) {
+    this._config.compactionInputTokens = tokens;
+    return this;
+  }
+
+  toolOutputCap(bytes) {
+    this._config.toolOutputCap = bytes;
+    return this;
+  }
+
+  parallelToolCalls(enabled = true) {
+    this._config.parallelToolCalls = enabled;
+    return this;
+  }
+
+  webSearch(enabled = true) {
+    this._config.webSearch = enabled;
+    return this;
+  }
+
+  contextBudget(tokens) {
+    if (tokens === undefined) {
+      return this._inner ? this._inner.contextBudget() : this._config.contextBudget ?? 0;
+    }
+    this._config.contextBudget = tokens;
+    if (this._inner) this._inner.setContextBudget(tokens);
+    return this;
+  }
+
+  setContextBudget(tokens) {
+    return this.contextBudget(tokens);
+  }
+
+  skillCatalogue(enabled) {
+    if (enabled === undefined) {
+      return this._inner ? this._inner.skillCatalogue() : !!this._config.skillCatalogue;
+    }
+    this._config.skillCatalogue = enabled;
+    if (this._inner) this._inner.setSkillCatalogue(enabled);
+    return this;
+  }
+
+  setSkillCatalogue(enabled = true) {
+    return this.skillCatalogue(enabled);
+  }
+
+  fallback(baseUrl, model, apiKey = '') {
+    this._config.fallbacks = [...(this._config.fallbacks || []), { baseUrl, model, apiKey }];
+    return this;
+  }
+
+  deferTool(name) {
+    if (this._inner) {
+      this._inner.deferTool(name);
+    } else {
+      this._deferredTools.push(name);
+    }
+    return this;
+  }
+
+  deferToolPrefix(prefix) {
+    if (this._inner) {
+      this._inner.deferToolPrefix(prefix);
+    } else {
+      this._deferredPrefixes.push(prefix);
+    }
+    return this;
+  }
+
+  isDeferredTool(name) {
+    if (this._inner) return this._inner.isDeferredTool(name);
+    return this._deferredTools.includes(name)
+      || this._deferredPrefixes.some((prefix) => name.startsWith(prefix));
+  }
+
+  hasDeferredTools() {
+    if (this._inner) return this._inner.hasDeferredTools();
+    return this._deferredTools.length > 0 || this._deferredPrefixes.length > 0;
+  }
+
+  planTool(enabled = true) {
+    this._planTool = enabled;
+    return this;
+  }
+
   withMemory(memory, limit = 5) {
     this._memory = memory;
     this._recallLimit = limit;
@@ -722,8 +849,8 @@ class AgentBuilder {
     return this.tools(...tools);
   }
 
-  bash(name = 'bash', workspaceRoot = null) {
-    this._config._bashTool = { name, workspaceRoot };
+  bash(name = 'bash', workspaceRoot = null, jobs = null, session = null) {
+    this._config._bashTool = { name, workspaceRoot, jobs, session };
     return this;
   }
 
@@ -776,8 +903,8 @@ class AgentBuilder {
     return this;
   }
 
-  skill(name, content) {
-    this._skills.push({ name, content });
+  skill(name, content, description = name, path = null) {
+    this._skills.push({ name, content, description, path });
     return this;
   }
 
@@ -821,7 +948,12 @@ class AgentBuilder {
     }
 
     if (this._config._bashTool) {
-      await this._inner.addBashTool(this._config._bashTool.name, this._config._bashTool.workspaceRoot);
+      await this._inner.addBashTool(
+        this._config._bashTool.name,
+        this._config._bashTool.workspaceRoot ?? null,
+        this._config._bashTool.jobs ?? null,
+        this._config._bashTool.session ?? null,
+      );
     }
 
     for (const h of this._hooks) {
@@ -835,7 +967,27 @@ class AgentBuilder {
     for (const s of this._skills) {
       if (s.dirPath) {
         await this._inner.registerSkillsFromDir(s.dirPath);
+      } else {
+        this._inner.registerSkill(
+          s.name,
+          s.description || s.name,
+          s.content,
+          s.path ?? null,
+        );
       }
+    }
+
+    for (const name of this._deferredTools) {
+      this._inner.deferTool(name);
+    }
+    for (const prefix of this._deferredPrefixes) {
+      this._inner.deferToolPrefix(prefix);
+    }
+    if (this._planTool) {
+      this._inner.addPlanTool();
+    }
+    for (const section of this._promptSections) {
+      this._inner.addLivePromptSection(section);
     }
 
     for (const m of this._mcpServers) {
@@ -982,6 +1134,110 @@ class AgentBuilder {
   async listMcpPrompts() {
     return this._inner.listMcpPrompts();
   }
+
+  _requireAgent(action) {
+    if (!this._inner) throw new Error(`Agent not started; call start() before ${action}`);
+    return this._inner;
+  }
+
+  planItems() {
+    return this._requireAgent('planItems()').planItems();
+  }
+
+  setPlan(items) {
+    this._requireAgent('setPlan()').setPlan(items);
+    return this;
+  }
+
+  clearPlan() {
+    this._requireAgent('clearPlan()').clearPlan();
+    return this;
+  }
+
+  addPlanTool() {
+    if (!this._inner) {
+      this._planTool = true;
+      return true;
+    }
+    return this._inner.addPlanTool();
+  }
+
+  steer(content, ticket) {
+    return this._requireAgent('steer()').steer(content, ticket);
+  }
+
+  steerDepth() {
+    return this._requireAgent('steerDepth()').steerDepth();
+  }
+
+  takeUndeliveredSteers() {
+    return this._requireAgent('takeUndeliveredSteers()').takeUndeliveredSteers();
+  }
+
+  removeTools(names) {
+    return this._requireAgent('removeTools()').removeTools(names);
+  }
+
+  addLivePromptSection(section) {
+    if (this._inner) {
+      this._inner.addLivePromptSection(section);
+    } else {
+      this._promptSections.push(section);
+    }
+    return this;
+  }
+
+  removeLivePromptSection(section) {
+    if (this._inner) return this._inner.removeLivePromptSection(section);
+    const before = this._promptSections.length;
+    this._promptSections = this._promptSections.filter((entry) => entry !== section);
+    return this._promptSections.length !== before;
+  }
+
+  registerSkill(name, description, content, path = null) {
+    if (this._inner) {
+      this._inner.registerSkill(name, description, content, path);
+    } else {
+      this._skills.push({ name, description, content, path });
+    }
+    return this;
+  }
+
+  removeSkillsByNames(names) {
+    if (this._inner) return this._inner.removeSkillsByNames(names);
+    const before = this._skills.length;
+    this._skills = this._skills.filter((skill) => !names.includes(skill.name));
+    return before - this._skills.length;
+  }
+
+  listSkills() {
+    if (this._inner) return this._inner.listSkills();
+    return this._skills
+      .filter((skill) => !skill.dirPath)
+      .map((skill) => ({
+        name: skill.name,
+        description: skill.description || skill.name,
+        category: 'other',
+        path: skill.path || `.bos/skills/${skill.name}/SKILL.md`,
+        directory: skill.path || `.bos/skills/${skill.name}`,
+        user_only: false,
+        instructions: skill.content,
+      }));
+  }
+
+  addGoalTools(store) {
+    return this._requireAgent('addGoalTools()').addGoalTools(store);
+  }
+
+  addJobTools(jobs, session = 'default') {
+    return this._requireAgent('addJobTools()').addJobTools(jobs, session);
+  }
+
+  async addBashTool(name = 'bash', workspaceRoot = null, jobs = null, session = null) {
+    await this._requireAgent('addBashTool()').addBashTool(name, workspaceRoot, jobs, session);
+    return this;
+  }
+
 }
 
 class AgentWrapperClass {
@@ -1102,6 +1358,112 @@ class AgentWrapperClass {
   resetMetrics() {
     this._inner.resetPerfMetrics();
   }
+
+  planItems() {
+    return this._inner.planItems();
+  }
+
+  setPlan(items) {
+    this._inner.setPlan(items);
+    return this;
+  }
+
+  clearPlan() {
+    this._inner.clearPlan();
+    return this;
+  }
+
+  addPlanTool() {
+    return this._inner.addPlanTool();
+  }
+
+  steer(content, ticket) {
+    return this._inner.steer(content, ticket);
+  }
+
+  steerDepth() {
+    return this._inner.steerDepth();
+  }
+
+  takeUndeliveredSteers() {
+    return this._inner.takeUndeliveredSteers();
+  }
+
+  deferTool(name) {
+    this._inner.deferTool(name);
+    return this;
+  }
+
+  deferToolPrefix(prefix) {
+    this._inner.deferToolPrefix(prefix);
+    return this;
+  }
+
+  isDeferredTool(name) {
+    return this._inner.isDeferredTool(name);
+  }
+
+  hasDeferredTools() {
+    return this._inner.hasDeferredTools();
+  }
+
+  removeTools(names) {
+    return this._inner.removeTools(names);
+  }
+
+  addLivePromptSection(section) {
+    this._inner.addLivePromptSection(section);
+    return this;
+  }
+
+  removeLivePromptSection(section) {
+    return this._inner.removeLivePromptSection(section);
+  }
+
+  registerSkill(name, description, content, path = null) {
+    this._inner.registerSkill(name, description, content, path);
+    return this;
+  }
+
+  removeSkillsByNames(names) {
+    return this._inner.removeSkillsByNames(names);
+  }
+
+  listSkills() {
+    return this._inner.listSkills();
+  }
+
+  contextBudget() {
+    return this._inner.contextBudget();
+  }
+
+  setContextBudget(tokens) {
+    this._inner.setContextBudget(tokens);
+    return this;
+  }
+
+  skillCatalogue() {
+    return this._inner.skillCatalogue();
+  }
+
+  setSkillCatalogue(enabled) {
+    this._inner.setSkillCatalogue(enabled);
+    return this;
+  }
+
+  addGoalTools(store) {
+    return this._inner.addGoalTools(store);
+  }
+
+  addJobTools(jobs, session = 'default') {
+    return this._inner.addJobTools(jobs, session);
+  }
+
+  async addBashTool(name = 'bash', workspaceRoot = null, jobs = null, session = null) {
+    await this._inner.addBashTool(name, workspaceRoot, jobs, session);
+    return this;
+  }
+
 }
 
 class BusManager {
@@ -1767,4 +2129,10 @@ export {
   Content,
   ContentPart,
   Memory,
+  Goal,
+  GoalStore,
+  JobRegistry,
+  renderTemplate,
+  withMemory,
+  estimateTokens,
 };

@@ -14,7 +14,9 @@ mod agent;
 mod bus;
 mod caller;
 mod config;
+mod goal;
 mod hooks;
+mod jobs;
 mod llm_usage;
 mod logging;
 mod mcp;
@@ -22,6 +24,7 @@ mod plugin;
 mod publisher;
 mod query;
 mod subscriber;
+mod template;
 mod utils;
 
 use logging::{init_tracing, log_test_message};
@@ -29,13 +32,15 @@ use logging::{init_tracing, log_test_message};
 //AI NOT ALLOW TO REMOVE
 #[allow(unused)]
 pub use agent::{
-    PyAgent, PyAgentCallableServer, PyAgentConfig, PyAgentRpcClient, PyLlmMessage, PyPythonTool,
-    PyStreamIterator,
+    PyAgent, PyAgentCallableServer, PyAgentConfig, PyAgentRpcClient, PyFallbackProvider,
+    PyLlmMessage, PyPythonTool, PyStreamIterator,
 };
 pub use bus::{PyBus, PyBusConfig};
 pub use caller::{PyCallable, PyCaller};
 pub use config::PyConfigLoader;
+pub use goal::{PyGoal, PyGoalStore};
 pub use hooks::{PyHookContext, PyHookDecision, PyHookEvent, PyHookRegistry};
+pub use jobs::PyJobRegistry;
 pub use llm_usage::{
     PyBudgetStatus, PyLlmUsage, PyPromptTokensDetails, PyTokenBudgetReport, PyTokenUsage,
 };
@@ -83,6 +88,11 @@ fn nbos_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTokenUsage>()?;
     m.add_class::<PyTokenBudgetReport>()?;
     m.add_class::<PyBudgetStatus>()?;
+    m.add_class::<PyFallbackProvider>()?;
+    m.add_class::<PyGoal>()?;
+    m.add_class::<PyGoalStore>()?;
+    m.add_class::<PyJobRegistry>()?;
+    template::register(m)?;
     m.add_function(wrap_pyfunction!(init_tracing, m)?)?;
     m.add_function(wrap_pyfunction!(log_test_message, m)?)?;
     Ok(())

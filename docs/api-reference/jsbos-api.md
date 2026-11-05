@@ -101,6 +101,41 @@ new AgentBuilder(bus, options = {})
 | `mcp(ns, cmd, args)` | Add MCP server (process) | `AgentBuilder` |
 | `mcpHttp(ns, url)` | Add MCP server (HTTP) | `AgentBuilder` |
 | `withMemory(memory, limit)` | Recall up to `limit` items from a `Memory` store on each text run | `AgentBuilder` |
+| `maxSteps(steps)` | Set the maximum ReAct steps | `AgentBuilder` |
+| `personaComplete(complete)` | Use the system prompt as the whole prompt | `AgentBuilder` |
+| `compactionInputTokens(tokens)` | Cap one compaction request's input | `AgentBuilder` |
+| `toolOutputCap(bytes)` | Cap the text one tool result may add to the context | `AgentBuilder` |
+| `parallelToolCalls(enabled)` | Run one response's tool calls concurrently | `AgentBuilder` |
+| `webSearch(enabled)` | Offer the provider's hosted web-search tool | `AgentBuilder` |
+| `contextBudget(tokens)` / `setContextBudget(tokens)` | Set (or with no argument read) the send-side context budget | `AgentBuilder` |
+| `skillCatalogue(enabled)` / `setSkillCatalogue(enabled)` | Read or choose catalogue vs on-demand search | `AgentBuilder` |
+| `fallback(baseUrl, model, apiKey)` | Append an alternate endpoint tried after a provider failure | `AgentBuilder` |
+| `deferTool(name)` | Keep a tool out of the advertised array; it stays callable | `AgentBuilder` |
+| `deferToolPrefix(prefix)` | Keep every tool whose name starts with `prefix` out of the array | `AgentBuilder` |
+| `isDeferredTool(name)` | Whether a tool is withheld from the advertised array | `boolean` |
+| `hasDeferredTools()` | Whether any registered tool is withheld | `boolean` |
+| `planTool(enabled)` | Register the `update_plan` tool at start | `AgentBuilder` |
+
+#### Runtime Control Methods
+
+| Method | Description | Returns |
+|--------|-------------|---------|
+| `planItems()` | Snapshot the working plan | `Array<{text, status}>` |
+| `setPlan(items)` | Replace the working plan; an empty list clears it | `AgentBuilder` |
+| `clearPlan()` | Forget the whole working plan | `AgentBuilder` |
+| `addPlanTool()` | Register the `update_plan` tool | `boolean` |
+| `steer(content, ticket)` | Queue a message for the running turn's next step | `boolean` |
+| `steerDepth()` | Number of steered messages waiting | `number` |
+| `takeUndeliveredSteers()` | Take back steered messages no step delivered | `number[]` |
+| `removeTools(names)` | Remove asynchronous tools by name | `number` |
+| `addLivePromptSection(section)` | Append a live extension prompt fragment | `AgentBuilder` |
+| `removeLivePromptSection(section)` | Remove one live extension prompt fragment | `boolean` |
+| `registerSkill(name, description, content, path)` | Register an inline skill | `AgentBuilder` |
+| `removeSkillsByNames(names)` | Remove skills by name | `number` |
+| `listSkills()` | Snapshot every registered skill | `Array<object>` |
+| `addGoalTools(store)` | Register `get_goal`/`update_goal` against a `GoalStore` | `number` |
+| `addJobTools(jobs, session)` | Register `job_output`/`job_kill` against a `JobRegistry` | `number` |
+| `addBashTool(name, workspaceRoot, jobs, session)` | Register a sandboxed bash tool | `Promise<AgentBuilder>` |
 
 #### Execution Methods
 
@@ -160,6 +195,25 @@ High-level agent wrapper. Created via `AgentBuilder.start()`.
 | `listMcpResources(namespace)` | List MCP resources, optionally scoped to one namespace | `Promise<Array>` |
 | `listMcpPrompts()` | List MCP prompts | `Promise<Array>` |
 | `resetMetrics()` | Reset performance metrics | `void` |
+| `planItems()` | Snapshot the working plan | `Array<{text, status}>` |
+| `setPlan(items)` | Replace the working plan | `AgentWrapperClass` |
+| `clearPlan()` | Forget the whole working plan | `AgentWrapperClass` |
+| `addPlanTool()` | Register the `update_plan` tool | `boolean` |
+| `steer(content, ticket)` | Queue a message for the running turn | `boolean` |
+| `steerDepth()` | Number of steered messages waiting | `number` |
+| `takeUndeliveredSteers()` | Take back steered messages no step delivered | `number[]` |
+| `deferTool(name)` / `deferToolPrefix(prefix)` | Withhold a tool from the advertised array | `AgentWrapperClass` |
+| `isDeferredTool(name)` / `hasDeferredTools()` | Deferral projections | `boolean` |
+| `removeTools(names)` | Remove asynchronous tools by name | `number` |
+| `addLivePromptSection(section)` / `removeLivePromptSection(section)` | Live prompt fragments | `AgentWrapperClass \| boolean` |
+| `registerSkill(name, description, content, path)` | Register an inline skill | `AgentWrapperClass` |
+| `removeSkillsByNames(names)` | Remove skills by name | `number` |
+| `listSkills()` | Snapshot every registered skill | `Array<object>` |
+| `contextBudget()` / `setContextBudget(tokens)` | Read or set the context budget | `number \| AgentWrapperClass` |
+| `skillCatalogue()` / `setSkillCatalogue(enabled)` | Read or choose catalogue vs search | `boolean \| AgentWrapperClass` |
+| `addGoalTools(store)` | Register `get_goal`/`update_goal` | `number` |
+| `addJobTools(jobs, session)` | Register `job_output`/`job_kill` | `number` |
+| `addBashTool(name, workspaceRoot, jobs, session)` | Register a sandboxed bash tool | `Promise<AgentWrapperClass>` |
 
 #### Properties
 
@@ -757,6 +811,204 @@ into a prompt.
 | `memory.recallBlock(query, limit)` | Prompt preamble of the best matches, or `""` |
 | `memory.save(path)` | Write every item as JSON lines; returns the count |
 | `Memory.load(path)` | New store from a JSON-lines file written by `save` |
+
+## Goal / GoalStore
+
+A goal is the durable objective a session pursues; the plan answers "what steps
+are left", the goal answers "what is all of this for". Both are native classes
+and mirror the Python binding exactly.
+
+### Goal
+
+| Member | Description |
+|--------|-------------|
+| `Goal.create(objective, maxRounds)` | Create an active, armed goal (blank objectives throw) |
+| `Goal.fromJSON(json)` | Restore a goal from its snapshot |
+| `goal.toJSON()` | The goal as a plain object |
+| `goal.objective` / `goal.state` / `goal.rounds` / `goal.maxRounds` | Durable fields |
+| `goal.activation` / `goal.blockedReason` | Continuation flag and blocker |
+| `goal.remaining` / `goal.canAdvance` / `goal.exhausted` | Round-cap projections |
+| `goal.advance()` / `goal.pause()` / `goal.resume()` / `goal.complete()` | Phase transitions |
+| `goal.block(code, message)` | Stop on a lower-kebab-case policy code |
+| `goal.arm()` / `goal.disarm()` / `goal.sanitize()` | Continuation and bounds |
+
+### GoalStore
+
+Seed a store with the session's goal, hand it to `agent.addGoalTools(store)`,
+and apply `takeSettle()` when the turn ends.
+
+| Member | Description |
+|--------|-------------|
+| `new GoalStore(goal)` | Seed a store from a `Goal` |
+| `store.snapshot()` | The goal as the model sees it now |
+| `store.complete()` / `store.block(code, message)` | Record a settle transition |
+| `store.takeSettle()` | Take the recorded transition, if any |
+| `store.hasSettle()` | Whether a transition still waits for the host |
+
+## JobRegistry
+
+The live roster of background jobs. Share one instance between the bash tool
+that spawns jobs, the job tools that read them, and the host that draws the
+list.
+
+| Member | Description |
+|--------|-------------|
+| `new JobRegistry(jobCap, outputCap)` | Create a bounded roster |
+| `jobs.list(session)` | Every job started by `session`, oldest first |
+| `jobs.get(id)` | One job's metadata, or `null` |
+| `jobs.output(id, maxBytes)` | Captured output, or `null` |
+| `jobs.kill(id)` | Stop a running job |
+| `jobs.wait(id, timeoutMs)` | Wait for settlement, then return metadata |
+| `jobs.runningCount(session)` / `jobs.settledCount(session)` | Roster counts |
+| `jobs.clearSettled(session)` | Drop settled jobs |
+| `jobs.version()` | Counter that changes on every roster change |
+
+## Ferris SDK
+
+Ferris is the BOS extension framework. These classes bind the SDK's authoring
+surface: a JavaScript object supplies the same `start`/`invoke`/`shutdown`
+callbacks a Rust `Extension` implements, and `FerrisHarness` runs it in process
+exactly like the Rust `TestHarness`.
+
+This is the authoring/runtime harness, not the package manager. Installing,
+activating and isolating untrusted packages through the Ferris runtimes is a
+separate host surface.
+
+### FerrisManifest
+
+| Member | Description |
+|--------|-------------|
+| `FerrisManifest.parse(toml)` | Parse and validate an `extension.toml` schema-2.0 document |
+| `manifest.id` | The extension id |
+| `manifest.runtimeKind` | The runtime kind the manifest asks for |
+| `manifest.toToml()` | The canonical TOML document |
+| `manifest.toJSON()` | The manifest as a plain object |
+
+### FerrisManifestBuilder
+
+Chainable schema-2.0 manifest builder. Every method returns a new builder.
+
+| Member | Description |
+|--------|-------------|
+| `new FerrisManifestBuilder(id, name, version, description)` | Start a manifest |
+| `host(req)` / `extensionApi(req)` | Compatibility ranges |
+| `runtime(kind)` / `runtimeConfig(key, value)` | Runtime selection and opaque config |
+| `capability(cap)` | Require one capability |
+| `contribution(kind, id, payload)` | Declare one contribution with an optional JSON payload |
+| `author` / `license` / `repository` / `homepage` | Identity metadata |
+| `dependency(id, requirement)` | Dependency requirement |
+| `provide(spec)` / `require(spec)` | Service declarations from JSON specs |
+| `maxMemoryMb` / `maxExecutionMs` / `maxConcurrentCalls` / `maxOutputBytes` / `maxTableElements` | Resource ceilings |
+| `configurationSchema(path)` / `configurationDefaults(value)` | Configuration block |
+| `startup(policy)` | `on-startup`, `on-demand`, `on-workspace-open`, `manual` |
+| `build()` | Validate and return a `FerrisManifest` |
+
+```javascript
+const manifest = new FerrisManifestBuilder('com.example.echo', 'Echo', '1.0.0', 'Echo')
+  .runtime('declarative')
+  .capability('agent.tools.register')
+  .contribution('tool', 'echo', { description: 'Echo' })
+  .startup('on-demand')
+  .build();
+```
+
+### FerrisHarness
+
+| Member | Description |
+|--------|-------------|
+| `new FerrisHarness(manifest, root, start, invoke, shutdown)` | Build a harness from a TOML manifest and callbacks |
+| `harness.start()` | Run `start(ctx)` and return its contributions |
+| `harness.invoke(id, input)` | Invoke a contribution id as a tool |
+| `harness.invokeContribution(kind, id, input)` | Invoke with an explicit kind |
+| `harness.shutdown()` | Run `shutdown()` |
+| `harness.manifest()` | The manifest as a plain object |
+| `harness.runtimeKind` / `harness.root` | Runtime kind and package root |
+
+Callbacks receive one plain object and may be sync or async:
+
+```javascript
+const harness = new FerrisHarness(
+  manifestToml,
+  '/tmp/echo',
+  async (ctx) => [{ kind: 'tool', id: 'echo', payload: { description: 'Echo' } }],
+  async (call) => call.input, // { contribution, input, context }
+  async () => {},
+);
+
+const contributions = await harness.start();
+await harness.invoke('echo', { text: 'hi' });
+await harness.shutdown();
+```
+
+### FerrisHost
+
+The full Ferris package host. It owns a canonical store, installs packages,
+plans them in dependency order, activates the standard runtimes, exposes
+contributions as JSON, and forwards invocations. Host activation is explicit:
+nothing starts until `apply()`.
+
+| Member | Description |
+|--------|-------------|
+| `new FerrisHost(root, options)` | Open a host; options: `workspace`, `trust`, `policyMode`, `onContributions`, `onRevoke`, `processSandbox` |
+| `host.root` | Canonical store root |
+| `host.install(source)` | Install a package tree and return `{ id, version }` |
+| `host.installPackage(source, origin)` | Install with `installed`, `development` or `builtin` origin |
+| `host.installed()` | Installed `{ id, version }` pairs |
+| `host.uninstall(id, purgeData)` | Remove an extension, optionally purging its data |
+| `host.versions(id)` / `host.activeVersion(id)` | Version list and active version |
+| `host.activate(id, version)` / `host.rollback(id)` | Switch the active version |
+| `host.setEnabled(id, enabled)` | Enable or disable without uninstalling |
+| `host.clearFailure(id)` / `host.quarantine(id, reason)` | Lifecycle recovery |
+| `host.packageRoot(id, version)` | Canonical package directory |
+| `host.plan()` | Activation order (dependency first) |
+| `host.apply()` | Start every planned package; returns applied contributions keyed by extension |
+| `host.reload()` | Unload and re-apply the current plan |
+| `host.unload()` | Revoke contributions and shut down every runtime |
+| `host.contributions()` | Applied contributions as JSON |
+| `host.invoke(extension, kind, id, input)` | Invoke one contribution on a started runtime |
+| `host.registerExtension(manifest, root, start, invoke, shutdown)` | Register an in-process JS extension as a linked package |
+| `host.subscribeEvents(topics, callback)` / `host.unsubscribeEvents(id)` | Host event subscription and cancellation |
+| `host.publishEvent(topic, payload)` | Publish a host event; returns `{ delivered, dropped }` |
+| `await host.registerAgentTools(agent)` | Register applied tool contributions on an Agent/AgentBuilder |
+| `host.grant(extension, capability, scope, note)` | Persist a capability grant; an unknown scope is an error |
+| `host.revokeGrant(extension, capability)` | Remove a grant |
+| `host.grants(extension)` | Every grant for one extension |
+| `host.auditDegraded()` | First audit persistence failure, or `null` |
+
+Runtimes: declarative, process, MCP, Cordis, Extism and WebAssembly Component.
+`builtin` manifests are refused because no host-linked builtin is registered.
+
+```javascript
+const { FerrisHost } = require('@open1s/jsbos');
+
+const host = new FerrisHost('/tmp/ferris-store', '/tmp/workspace');
+host.install('/path/to/package');
+host.plan();
+const contributions = await host.apply();
+const result = await host.invoke('com.example.echo', 'tool', 'echo', { x: 1 });
+await host.unload();
+```
+
+## Prompt Templates
+
+| Function | Description |
+|----------|-------------|
+| `renderTemplate(template, variables)` | Substitute `{{name}}` placeholders from a string object |
+| `withMemory(template, memory)` | Place a recalled-memory block, honouring `{{memory}}` |
+| `estimateTokens(text)` | Estimate tokens with the agent's own heuristic |
+
+```javascript
+import { Goal, GoalStore, JobRegistry, renderTemplate } from '@open1s/jsbos';
+
+const goal = Goal.create('Ship the release');
+const store = new GoalStore(goal);
+agent.addGoalTools(store);
+
+const jobs = new JobRegistry();
+agent.addJobTools(jobs, 'default');
+
+const prompt = renderTemplate('You are {{role}}.', { role: 'a reviewer' });
+```
 
 ## Best Practices
 

@@ -188,6 +188,10 @@ class AgentBuilder:
         self._plugins: list[dict] = []
         self._skills: list[dict] = []
         self._mcp_servers: list[dict] = []
+        self._prompt_sections: list[str] = []
+        self._plan_tool = False
+        self._deferred_tools: list[str] = []
+        self._deferred_prefixes: list[str] = []
 
         opts = options or {}
         self._memory = opts.get("memory")
@@ -206,6 +210,28 @@ class AgentBuilder:
             self._config.api_mode = opts["api_mode"]
         if "reasoning_effort" in opts and opts["reasoning_effort"] is not None:
             self._config.reasoning_effort = opts["reasoning_effort"]
+        if opts.get("max_steps") is not None:
+            self._config.max_steps = opts["max_steps"]
+        if opts.get("persona_complete") is not None:
+            self._config.persona_complete = bool(opts["persona_complete"])
+        if opts.get("compaction_input_tokens") is not None:
+            self._config.compaction_input_tokens = opts["compaction_input_tokens"]
+        if opts.get("tool_output_cap") is not None:
+            self._config.tool_output_cap = opts["tool_output_cap"]
+        if opts.get("parallel_tool_calls") is not None:
+            self._config.parallel_tool_calls = bool(opts["parallel_tool_calls"])
+        if opts.get("web_search") is not None:
+            self._config.web_search = bool(opts["web_search"])
+        if opts.get("context_budget") is not None:
+            self._config.context_budget = opts["context_budget"]
+        if opts.get("skill_catalogue") is not None:
+            self._config.skill_catalogue = bool(opts["skill_catalogue"])
+        for provider in opts.get("fallbacks") or []:
+            self._config.add_fallback(
+                provider["base_url"],
+                provider["model"],
+                provider.get("api_key", ""),
+            )
 
         if opts.get("rate_limit_capacity"):
             self._config.rate_limit_capacity = opts["rate_limit_capacity"]
@@ -260,6 +286,68 @@ class AgentBuilder:
 
     def with_reasoning_effort(self, effort: str) -> "AgentBuilder":
         self._config.reasoning_effort = effort
+        return self
+
+    def with_max_steps(self, steps: int) -> "AgentBuilder":
+        """Set the maximum ReAct steps before a run is stopped."""
+        self._config.max_steps = steps
+        return self
+
+    def with_persona_complete(self, complete: bool = True) -> "AgentBuilder":
+        """Use the system prompt as the WHOLE prompt, with no appended guidance."""
+        self._config.persona_complete = complete
+        return self
+
+    def with_compaction_input_tokens(self, tokens: int) -> "AgentBuilder":
+        """Cap one compaction (summarizer) request's input."""
+        self._config.compaction_input_tokens = tokens
+        return self
+
+    def with_tool_output_cap(self, bytes_cap: int) -> "AgentBuilder":
+        """Cap the text one tool result may add to the model context."""
+        self._config.tool_output_cap = bytes_cap
+        return self
+
+    def with_parallel_tool_calls(self, enabled: bool = True) -> "AgentBuilder":
+        """Run one response's tool calls concurrently instead of one at a time."""
+        self._config.parallel_tool_calls = enabled
+        return self
+
+    def with_web_search(self, enabled: bool = True) -> "AgentBuilder":
+        """Offer the provider's hosted web-search tool (Responses protocol only)."""
+        self._config.web_search = enabled
+        return self
+
+    def with_context_budget(self, tokens: int) -> "AgentBuilder":
+        """Set the send-side history ceiling for mid-turn compaction."""
+        self._config.context_budget = tokens
+        return self
+
+    def with_skill_catalogue(self, enabled: bool = True) -> "AgentBuilder":
+        """Advertise skills as a catalogue instead of searching them."""
+        self._config.skill_catalogue = enabled
+        return self
+
+    def with_fallback(
+        self, base_url: str, model: str, api_key: str = ""
+    ) -> "AgentBuilder":
+        """Append an alternate endpoint tried when the primary provider fails."""
+        self._config.add_fallback(base_url, model, api_key)
+        return self
+
+    def with_plan_tool(self, enabled: bool = True) -> "AgentBuilder":
+        """Register the update_plan tool when the agent starts."""
+        self._plan_tool = enabled
+        return self
+
+    def defer_tool(self, name: str) -> "AgentBuilder":
+        """Keep a tool out of the advertised array; it stays callable."""
+        self._deferred_tools.append(name)
+        return self
+
+    def defer_tool_prefix(self, prefix: str) -> "AgentBuilder":
+        """Keep every tool whose name starts with the prefix out of the array."""
+        self._deferred_prefixes.append(prefix)
         return self
 
     def with_memory(self, memory: Memory, limit: int = 5) -> "AgentBuilder":
@@ -333,6 +421,28 @@ class AgentBuilder:
             self._config.api_mode = config["api_mode"]
         if config.get("reasoning_effort"):
             self._config.reasoning_effort = config["reasoning_effort"]
+        if config.get("max_steps") is not None:
+            self._config.max_steps = config["max_steps"]
+        if config.get("persona_complete") is not None:
+            self._config.persona_complete = bool(config["persona_complete"])
+        if config.get("compaction_input_tokens") is not None:
+            self._config.compaction_input_tokens = config["compaction_input_tokens"]
+        if config.get("tool_output_cap") is not None:
+            self._config.tool_output_cap = config["tool_output_cap"]
+        if config.get("parallel_tool_calls") is not None:
+            self._config.parallel_tool_calls = bool(config["parallel_tool_calls"])
+        if config.get("web_search") is not None:
+            self._config.web_search = bool(config["web_search"])
+        if config.get("context_budget") is not None:
+            self._config.context_budget = config["context_budget"]
+        if config.get("skill_catalogue") is not None:
+            self._config.skill_catalogue = bool(config["skill_catalogue"])
+        for provider in config.get("fallbacks") or []:
+            self._config.add_fallback(
+                provider["base_url"],
+                provider["model"],
+                provider.get("api_key", ""),
+            )
         if config.get("circuit_breaker"):
             cb = config["circuit_breaker"]
             self.with_circuit_breaker(cb["max_failures"], cb.get("cooldown_secs", 30))
@@ -371,8 +481,22 @@ class AgentBuilder:
         self._skills.append({"dir_path": dir_path})
         return self
 
-    def skill(self, name: str, content: str) -> "AgentBuilder":
-        self._skills.append({"name": name, "content": content})
+    def skill(
+        self,
+        name: str,
+        content: str,
+        description: str | None = None,
+        path: str | None = None,
+    ) -> "AgentBuilder":
+        """Register an inline skill (no SKILL.md file needed)."""
+        self._skills.append(
+            {
+                "name": name,
+                "content": content,
+                "description": description or name,
+                "path": path,
+            }
+        )
         return self
 
     def with_mcp(self, namespace: str, command: str, args: list[str]) -> "AgentBuilder":
@@ -383,8 +507,24 @@ class AgentBuilder:
         self._mcp_servers.append({"namespace": namespace, "url": url, "type": "http"})
         return self
 
-    def with_bash(self, name: str = "bash", workspace_root: str | None = None) -> "AgentBuilder":
-        self._config._bash_tool = {"name": name, "workspace_root": workspace_root}
+    def with_bash(
+        self,
+        name: str = "bash",
+        workspace_root: str | None = None,
+        jobs: object | None = None,
+        session: str | None = None,
+    ) -> "AgentBuilder":
+        """Add a sandboxed bash tool.
+
+        Pass jobs and session to enable run_in_background and route the
+        resulting jobs into that JobRegistry.
+        """
+        self._config._bash_tool = {
+            "name": name,
+            "workspace_root": workspace_root,
+            "jobs": jobs,
+            "session": session,
+        }
         return self
 
     async def start(self) -> "Agent":
@@ -405,7 +545,12 @@ class AgentBuilder:
 
         if hasattr(self._config, "_bash_tool"):
             bash_cfg = self._config._bash_tool
-            await self._inner.add_bash_tool(bash_cfg["name"], bash_cfg.get("workspace_root"))
+            await self._inner.add_bash_tool(
+                bash_cfg["name"],
+                bash_cfg.get("workspace_root"),
+                bash_cfg.get("jobs"),
+                bash_cfg.get("session"),
+            )
 
         for event_name, callback in self._hooks:
             self._inner.register_hook(HookEvent(event_name), callback)
@@ -423,6 +568,22 @@ class AgentBuilder:
         for s in self._skills:
             if "dir_path" in s:
                 await self._inner.register_skills_from_dir(s["dir_path"])
+            else:
+                self._inner.register_skill(
+                    s["name"],
+                    s.get("description") or s["name"],
+                    s["content"],
+                    s.get("path"),
+                )
+
+        for name in self._deferred_tools:
+            self._inner.defer_tool(name)
+        for prefix in self._deferred_prefixes:
+            self._inner.defer_tool_prefix(prefix)
+        if self._plan_tool:
+            self._inner.add_plan_tool()
+        for section in self._prompt_sections:
+            self._inner.add_live_prompt_section(section)
 
         for m in self._mcp_servers:
             if m["type"] == "process":
@@ -575,6 +736,129 @@ class Agent:
     async def list_mcp_prompts(self) -> list[dict]:
         """List prompts exposed by connected MCP servers."""
         return await self._inner.list_mcp_prompts()
+
+    def plan_items(self) -> list[dict]:
+        """Snapshot the agent's working plan as {text, status} items."""
+        return self._inner.plan_items()
+
+    def set_plan(self, items: list[dict]) -> "Agent":
+        """Replace the working plan; an empty list clears it."""
+        self._inner.set_plan(items)
+        return self
+
+    def clear_plan(self) -> "Agent":
+        """Forget the whole working plan."""
+        self._inner.clear_plan()
+        return self
+
+    def add_plan_tool(self) -> bool:
+        """Register the update_plan tool against this agent's plan store."""
+        return self._inner.add_plan_tool()
+
+    def steer(self, content: str, ticket: int) -> bool:
+        """Queue a message for the running turn's next step."""
+        return self._inner.steer(content, ticket)
+
+    def steer_depth(self) -> int:
+        """Number of steered messages waiting for the running turn."""
+        return self._inner.steer_depth()
+
+    def take_undelivered_steers(self) -> list[int]:
+        """Take back every steered message no step ever delivered."""
+        return self._inner.take_undelivered_steers()
+
+    def defer_tool(self, name: str) -> "Agent":
+        """Keep a tool out of the advertised array; it stays callable."""
+        self._inner.defer_tool(name)
+        return self
+
+    def defer_tool_prefix(self, prefix: str) -> "Agent":
+        """Keep every tool whose name starts with the prefix out of the array."""
+        self._inner.defer_tool_prefix(prefix)
+        return self
+
+    def is_deferred_tool(self, name: str) -> bool:
+        """Whether a tool is withheld from the advertised array."""
+        return self._inner.is_deferred_tool(name)
+
+    def has_deferred_tools(self) -> bool:
+        """Whether any registered tool is withheld from the advertised array."""
+        return self._inner.has_deferred_tools()
+
+    def remove_tools(self, names: list[str]) -> int:
+        """Remove asynchronous tools by name; returns how many were removed."""
+        return self._inner.remove_tools(names)
+
+    def add_live_prompt_section(self, section: str) -> "Agent":
+        """Append a live extension prompt fragment."""
+        self._inner.add_live_prompt_section(section)
+        return self
+
+    def remove_live_prompt_section(self, section: str) -> bool:
+        """Remove one live extension prompt fragment."""
+        return self._inner.remove_live_prompt_section(section)
+
+    def register_skill(
+        self,
+        name: str,
+        description: str,
+        content: str,
+        path: str | None = None,
+    ) -> "Agent":
+        """Register an inline skill (no SKILL.md file needed)."""
+        self._inner.register_skill(name, description, content, path)
+        return self
+
+    def remove_skills_by_names(self, names: list[str]) -> int:
+        """Remove skills by name from the build's list and the live overlay."""
+        return self._inner.remove_skills_by_names(names)
+
+    def list_skills(self) -> list[dict]:
+        """Snapshot every registered skill."""
+        return self._inner.list_skills()
+
+    def context_budget(self, tokens: int | None = None):
+        """Read, or with tokens set, the send-side context budget."""
+        if tokens is None:
+            return self._inner.context_budget()
+        self._inner.set_context_budget(tokens)
+        return self
+
+    def set_context_budget(self, tokens: int) -> "Agent":
+        """Set the send-side history ceiling for mid-turn compaction."""
+        self._inner.set_context_budget(tokens)
+        return self
+
+    def skill_catalogue(self, enabled: bool | None = None):
+        """Read, or with enabled choose, catalogue vs on-demand search."""
+        if enabled is None:
+            return self._inner.skill_catalogue()
+        self._inner.set_skill_catalogue(enabled)
+        return self
+
+    def set_skill_catalogue(self, enabled: bool) -> "Agent":
+        """Choose between the skill catalogue and on-demand find_skill."""
+        self._inner.set_skill_catalogue(enabled)
+        return self
+
+    def add_goal_tools(self, store: object) -> int:
+        """Register the get_goal and update_goal tools against a store."""
+        return self._inner.add_goal_tools(store)
+
+    def add_job_tools(self, jobs: object, session: str = "default") -> int:
+        """Register the job_output and job_kill tools against a roster."""
+        return self._inner.add_job_tools(jobs, session)
+
+    async def add_bash_tool(
+        self,
+        name: str = "bash",
+        workspace_root: str | None = None,
+        jobs: object | None = None,
+        session: str | None = None,
+    ) -> "Agent":
+        """Register a sandboxed bash tool, optionally routing background jobs."""
+        await self._inner.add_bash_tool(name, workspace_root, jobs, session)
+        return self
 
 
 class BrainOS(AbstractAsyncContextManager):

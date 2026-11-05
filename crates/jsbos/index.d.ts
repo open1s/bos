@@ -21,6 +21,64 @@ export declare class Agent {
   listTools(): Array<string>
   /** List registered async tool names. */
   listAsyncTools(): Array<string>
+  /** Snapshot the agent's working plan as `{ text, status }` items. */
+  planItems(): any
+  /** Replace the working plan; an empty list clears it. */
+  setPlan(items: any): void
+  /** Forget the whole working plan. */
+  clearPlan(): void
+  /**
+   * Register the `update_plan` tool against this agent's plan store.
+   *
+   * Returns false when the tool was already registered.
+   */
+  addPlanTool(): boolean
+  /** Queue a message for the running turn's next step, tagged with `ticket`. */
+  steer(content: string, ticket: number): boolean
+  /** Number of steered messages waiting for the running turn. */
+  steerDepth(): number
+  /** Take back every steered message no step ever delivered. */
+  takeUndeliveredSteers(): Array<number>
+  /** Keep `name` out of the advertised tool array; it stays callable. */
+  deferTool(name: string): void
+  /** Keep every tool whose name starts with `prefix` out of the advertised array. */
+  deferToolPrefix(prefix: string): void
+  /** Whether a tool is withheld from the advertised array. */
+  isDeferredTool(name: string): boolean
+  /** Whether any registered tool is withheld from the advertised array. */
+  hasDeferredTools(): boolean
+  /** Remove asynchronous tools by name; returns how many were removed. */
+  removeTools(names: Array<string>): number
+  /** Append a live extension prompt fragment. */
+  addLivePromptSection(section: string): void
+  /** Remove one live extension prompt fragment. */
+  removeLivePromptSection(section: string): boolean
+  /** Register an inline skill (no `SKILL.md` file needed). */
+  registerSkill(name: string, description: string, instructions: string, path?: string | undefined | null): void
+  /** Remove skills by name from the build's list and the live overlay. */
+  removeSkillsByNames(names: Array<string>): number
+  /** Snapshot every registered skill as JSON. */
+  listSkills(): any
+  /** The send-side context budget in tokens (0 disables mid-turn compaction). */
+  contextBudget(): number
+  /** Set the send-side context budget; refusals leave the agent unchanged. */
+  setContextBudget(tokens: number): void
+  /** Whether skills are advertised as a catalogue instead of searched. */
+  skillCatalogue(): boolean
+  /** Choose between the skill catalogue and on-demand `find_skill`. */
+  setSkillCatalogue(enabled: boolean): void
+  /**
+   * Register the `get_goal` and `update_goal` tools against `store`.
+   *
+   * Returns how many tools were registered: 0 when both already exist.
+   */
+  addGoalTools(store: GoalStore): number
+  /**
+   * Register the `job_output` and `job_kill` tools against `jobs`.
+   *
+   * Returns how many tools were registered: 0 when both already exist.
+   */
+  addJobTools(jobs: JobRegistry, session: string): number
   /** Register `hook` for `event`. */
   registerHook(event: HookEvent, callback: ((err: Error | null, arg: HookContextData) => unknown)): void
   /** Register `plugin` with the agent. */
@@ -33,8 +91,13 @@ export declare class Agent {
   isRunning(): boolean
   /** Register a tool implemented in JavaScript. */
   addTool(name: string, description: string, parameters: string, schema: string, callback: ((err: Error | null, arg: JSAny) => unknown), cancelable: boolean, cancelCallback?: (((err: Error | null, arg: string) => unknown)) | undefined | null): Promise<string>
-  /** Register a sandboxed bash tool. */
-  addBashTool(name: string, workspaceRoot?: string | undefined | null): Promise<void>
+  /**
+   * Register a sandboxed bash tool.
+   *
+   * Pass `jobs` and `session` to enable `run_in_background` and route the
+   * resulting jobs into that registry.
+   */
+  addBashTool(name: string, workspaceRoot?: string | undefined | null, jobs?: JobRegistry | undefined | null, session?: string | undefined | null): Promise<void>
   /** Register skills discovered in `dir_path`. */
   registerSkillsFromDir(dirPath: string): Promise<void>
   /** Add a stdio MCP server. */
@@ -184,12 +247,115 @@ export declare class ConfigLoader {
   reloadSync(): string
 }
 
+/**
+ * A durable working goal.
+ *
+ * Every field is sanitized on construction, so a host can pass whatever a
+ * person typed and still get a value every other host can render.
+ */
+export declare class Goal {
+  /** Create an active, armed goal. Throws when the objective is blank. */
+  static create(objective: string, maxRounds?: number | undefined | null): Goal
+  /** Restore a goal from its JSON snapshot. */
+  static fromJSON(json: string): Goal
+  /** The goal as a plain JSON object. */
+  toJSON(): any
+  /** What the work is for, as one statement. */
+  get objective(): string
+  /** One of `active`, `paused`, `completed` or `blocked`. */
+  get state(): string
+  /** Rounds spent pursuing the goal. */
+  get rounds(): number
+  /** The round cap. */
+  get maxRounds(): number
+  /** `armed` or `disarmed`. */
+  get activation(): string
+  /** The blocker, only while the goal is blocked. */
+  get blockedReason(): GoalBlockedReason | null
+  /** Rounds left before the cap. */
+  get remaining(): number
+  /** Whether another round may be counted right now. */
+  get canAdvance(): boolean
+  /** Whether every round has been spent. */
+  get exhausted(): boolean
+  /** The largest objective this binding accepts, in characters. */
+  get maxObjective(): number
+  /** The largest blocked explanation this binding accepts, in characters. */
+  get maxReason(): number
+  /** Count one round; false when the goal may not advance. */
+  advance(): boolean
+  /** Stop pursuing, keeping the option to resume. */
+  pause(): boolean
+  /** Take up a stopped goal again. */
+  resume(): boolean
+  /** Mark the objective achieved. */
+  complete(): boolean
+  /** Stop on a concrete condition; the code must be lower-kebab-case. */
+  block(code: string, message: string): boolean
+  /** Allow automatic continuation without changing the phase. */
+  arm(): boolean
+  /** Drop continuation authority without changing the phase. */
+  disarm(): void
+  /** Re-apply the field bounds and consistency rules in place. */
+  sanitize(): void
+}
+
+/**
+ * The goal handle one running turn's tools write to.
+ *
+ * A host seeds it with the session's current goal, hands it to
+ * `Agent.addGoalTools`, and applies `takeSettle` when the turn ends.
+ */
+export declare class GoalStore {
+  /** Seed a store from `goal`. */
+  constructor(goal: Goal)
+  /** The goal as the model sees it now. */
+  snapshot(): Goal | null
+  /** Mark the objective achieved. */
+  complete(): boolean
+  /** Record a blocker; the code must be lower-kebab-case. */
+  block(code: string, message: string): boolean
+  /** Take the transition the model recorded, if any. */
+  takeSettle(): any | null
+  /** Whether a settle transition is still waiting for the host. */
+  hasSettle(): boolean
+}
+
 /** Registry of agent hooks. */
 export declare class HookRegistry {
   /** Create an empty registry. */
   constructor()
   /** Register `callback` for `event`. */
   register(event: HookEvent, callback: ((err: Error | null, arg: HookContextData) => unknown)): Promise<void>
+}
+
+/**
+ * The live roster of background jobs.
+ *
+ * Share one instance between the bash tool that spawns jobs, the job tools
+ * that read them, and the host that draws the list.
+ */
+export declare class JobRegistry {
+  /** Create a roster with bounded job and output capacities. */
+  constructor(jobCap?: number | undefined | null, outputCap?: number | undefined | null)
+  /** Every job started by `session`, oldest first. */
+  list(session: string): Array<any>
+  /** One job's metadata, or null when the roster no longer holds it. */
+  get(id: string): any | null
+  /** The captured output of one job, or null when it is not on the roster. */
+  output(id: string, maxBytes?: number | undefined | null): any | null
+  /** Stop a running job; false when it already settled or is unknown. */
+  kill(id: string): boolean
+  /** Wait up to `timeout_ms` for a job to settle, then return its metadata. */
+  wait(id: string, timeoutMs: number): Promise<any | null>
+  /** Number of jobs from `session` that are still running. */
+  runningCount(session: string): number
+  /** Number of settled jobs from `session`. */
+  settledCount(session: string): number
+  /** Drop every settled job from `session`; returns how many were dropped. */
+  clearSettled(session: string): number
+  /** A counter that changes whenever the roster changes. */
+  version(): number
 }
 
 /** A client for a Model Context Protocol server. */
@@ -332,6 +498,22 @@ export interface AgentConfig {
   rateLimitRetryBackoffSecs?: number
   /** Whether to wait automatically when rate limited. */
   rateLimitAutoWait?: boolean
+  /** Whether `systemPrompt` is the whole prompt (no appended guidance). */
+  personaComplete?: boolean
+  /** Token ceiling for one compaction (summarizer) request. */
+  compactionInputTokens?: number
+  /** The most text one tool result may add to the model context (0 = default). */
+  toolOutputCap?: number
+  /** Run one response's tool calls concurrently. */
+  parallelToolCalls?: boolean
+  /** Offer the model the provider's hosted web-search tool. */
+  webSearch?: boolean
+  /** Alternate endpoints tried in order when the primary fails. */
+  fallbacks?: Array<JsFallbackProvider>
+  /** Send-side history ceiling for mid-turn compaction (0 disables it). */
+  contextBudget?: number
+  /** Advertise skills as a catalogue instead of searching them. */
+  skillCatalogue?: boolean
 }
 
 /** Status of a token budget. */
@@ -356,6 +538,17 @@ export interface BusConfig {
   listen?: Array<string>
   /** Peer endpoint for peer mode. */
   peer?: string
+}
+
+/** Estimate the token count of `text` with the agent's own heuristic. */
+export declare function estimateTokens(text: string): number
+
+/** Why a blocked goal stopped: a stable policy code plus an explanation. */
+export interface GoalBlockedReason {
+  /** The policy-owned lower-kebab-case code. */
+  code: string
+  /** The human-readable explanation. */
+  message: string
 }
 
 /** Context passed to a hook. */
@@ -404,6 +597,16 @@ export interface JsContent {
   url?: string
   base64?: string
   name?: string
+}
+
+/** One alternate LLM endpoint a run falls back to. */
+export interface JsFallbackProvider {
+  /** LLM API base URL of the fallback endpoint. */
+  baseUrl: string
+  /** API key for the fallback endpoint (empty when it needs none). */
+  apiKey: string
+  /** Model identifier in `vendor/model` form. */
+  model: string
 }
 
 /** Token usage reported by an LLM provider. */
@@ -537,6 +740,15 @@ export interface PromptTokensDetails {
   cachedTokens?: number
 }
 
+/**
+ * Substitute `{{name}}` placeholders in `template`.
+ *
+ * Whitespace inside the braces is ignored. An unknown variable or an
+ * unclosed `{{` is an error, so a typo is reported instead of shipped
+ * literally into a prompt.
+ */
+export declare function renderTemplate(template: string, variables: any): string
+
 export interface StopOptions {
   clearSession?: boolean
 }
@@ -565,6 +777,14 @@ export interface TokenUsage {
 
 /** Return the binding version. */
 export declare function version(): string
+
+/**
+ * Place a recalled-memory block into a system prompt.
+ *
+ * `{{memory}}` is replaced in place when present; otherwise the block is
+ * appended after a blank line. A null or empty block leaves the prompt alone.
+ */
+export declare function withMemory(template: string, memory?: string | undefined | null): string
 
 /* High-level API types (tsc auto-generated from index.js) */
 export * from "./jsbos.js";
@@ -602,6 +822,10 @@ export class AgentBuilder {
     _mcpServers: any[];
     _memory: any;
     _recallLimit: any;
+    _deferredTools: any[];
+    _deferredPrefixes: any[];
+    _planTool: boolean;
+    _promptSections: any[];
     _config: {
         name: any;
         model: any;
@@ -611,8 +835,17 @@ export class AgentBuilder {
         temperature: any;
         timeoutSecs: any;
         maxTokens: any;
+        maxSteps: any;
         apiMode: any;
         reasoningEffort: any;
+        personaComplete: any;
+        compactionInputTokens: any;
+        toolOutputCap: any;
+        parallelToolCalls: any;
+        webSearch: any;
+        contextBudget: any;
+        skillCatalogue: any;
+        fallbacks: any[];
     };
     name(name: any): this;
     withConfig(config: any): this;
@@ -626,11 +859,27 @@ export class AgentBuilder {
     maxTokens(tokens: any): this;
     apiMode(mode: any): this;
     reasoningEffort(effort: any): this;
+    maxSteps(steps: any): this;
+    personaComplete(complete?: boolean): this;
+    compactionInputTokens(tokens: any): this;
+    toolOutputCap(bytes: any): this;
+    parallelToolCalls(enabled?: boolean): this;
+    webSearch(enabled?: boolean): this;
+    contextBudget(tokens: any): any;
+    setContextBudget(tokens: any): any;
+    skillCatalogue(enabled: any): boolean | this;
+    setSkillCatalogue(enabled?: boolean): boolean | this;
+    fallback(baseUrl: any, model: any, apiKey?: string): this;
+    deferTool(name: any): this;
+    deferToolPrefix(prefix: any): this;
+    isDeferredTool(name: any): boolean;
+    hasDeferredTools(): boolean;
+    planTool(enabled?: boolean): this;
     withMemory(memory: any, limit?: number): this;
     tools(...tools: any[]): this;
     register(...tools: any[]): this;
     withTools(...tools: any[]): this;
-    bash(name?: string, workspaceRoot?: null): this;
+    bash(name?: string, workspaceRoot?: null, jobs?: null, session?: null): this;
     circuitBreaker(maxFailures: any, cooldownSecs?: number): this;
     rateLimit(capacity: any, windowSecs?: number, maxRetries?: number): this;
     resilience(config: any): this;
@@ -638,7 +887,7 @@ export class AgentBuilder {
     hooks(hooks: any): this;
     plugin(nameOrObj: any, handlers?: {}): this;
     plugins(...plugins: any[]): this;
-    skill(name: any, content: any): this;
+    skill(name: any, content: any, description?: any, path?: null): this;
     skillsDir(dirPath: any): this;
     mcp(namespace: any, command: any, args: any): this;
     mcpHttp(namespace: any, url: any): this;
@@ -662,6 +911,23 @@ export class AgentBuilder {
     listMcpTools(): Promise<any[]>;
     listMcpResources(namespace: any): Promise<any[]>;
     listMcpPrompts(): Promise<any[]>;
+    _requireAgent(action: any): jsbos.Agent;
+    planItems(): any;
+    setPlan(items: any): this;
+    clearPlan(): this;
+    addPlanTool(): boolean;
+    steer(content: any, ticket: any): boolean;
+    steerDepth(): number;
+    takeUndeliveredSteers(): number[];
+    removeTools(names: any): number;
+    addLivePromptSection(section: any): this;
+    removeLivePromptSection(section: any): boolean;
+    registerSkill(name: any, description: any, content: any, path?: null): this;
+    removeSkillsByNames(names: any): number;
+    listSkills(): any;
+    addGoalTools(store: any): number;
+    addJobTools(jobs: any, session?: string): number;
+    addBashTool(name?: string, workspaceRoot?: null, jobs?: null, session?: null): Promise<this>;
 }
 export function tool(descriptionOrOptions: any, maybeOptions?: {}): (target: any, propertyKey: any, descriptor: any) => any;
 export class ToolDef {
@@ -931,4 +1197,62 @@ export class Memory {
     recallBlock(query: any, limit?: number): string;
     toJSON(): any[];
 }
+export const Goal: typeof jsbos.Goal;
+export const GoalStore: typeof jsbos.GoalStore;
+export const JobRegistry: typeof jsbos.JobRegistry;
+export class FerrisHarness {
+    constructor(manifest: any, root: any, start: any, invoke: any, shutdown?: null);
+    _inner: any;
+    start(): any;
+    invoke(id: any, input: any): any;
+    invokeContribution(kind: any, id: any, input: any): any;
+    shutdown(): any;
+    manifest(): any;
+    get runtimeKind(): any;
+    get root(): any;
+}
+export const FerrisManifest: any;
+export const FerrisManifestBuilder: any;
+export class FerrisHost {
+    constructor(root: any, options?: {});
+    _inner: any;
+    get root(): any;
+    registerExtension(manifest: any, root: any, start: any, invoke: any, shutdown?: null): any;
+    installed(): any;
+    install(source: any): any;
+    installPackage(source: any, origin?: null): any;
+    uninstall(id: any, purgeData?: boolean): any;
+    setEnabled(id: any, enabled: any): any;
+    versions(id: any): any;
+    activeVersion(id: any): any;
+    activate(id: any, version: any): any;
+    rollback(id: any): any;
+    clearFailure(id: any): any;
+    quarantine(id: any, reason: any): any;
+    packageRoot(id: any, version: any): any;
+    plan(): any;
+    apply(): any;
+    reload(): any;
+    unload(): any;
+    invoke(extension: any, kind: any, id: any, input: any): any;
+    contributions(): any;
+    grant(extension: any, capability: any, scope?: null, note?: null): any;
+    revokeGrant(extension: any, capability: any): any;
+    grants(extension: any): any;
+    auditDegraded(): any;
+    subscribeEvents(topics: any, callback: any): any;
+    unsubscribeEvents(id: any): any;
+    publishEvent(topic: any, payload: any): any;
+    /**
+     * Register every applied tool contribution on an AgentBuilder or started
+     * Agent. The tool callback forwards to the owning extension runtime.
+     */
+    registerAgentTools(agent: any): Promise<{
+        extension: string;
+        name: any;
+    }[]>;
+}
+export const renderTemplate: typeof jsbos.renderTemplate;
+export const withMemory: typeof jsbos.withMemory;
+export const estimateTokens: typeof jsbos.estimateTokens;
 export { jsbos };

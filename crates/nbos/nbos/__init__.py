@@ -16,6 +16,8 @@ Usage:
         result = await agent.ask("What is 2+2?")
 """
 
+from typing import Any
+
 from nbos.core import (
     BrainOS,
     Agent,
@@ -41,6 +43,10 @@ from nbos_native import (
     AgentPlugin,
     AgentRpcClient,
     BudgetStatus,
+    FallbackProvider,
+    Goal,
+    GoalStore,
+    JobRegistry,
     Bus,
     BusConfig,
     Callable,
@@ -68,7 +74,10 @@ from nbos_native import (
     TokenUsage,
     ToolCallWrapper,
     ToolResultWrapper,
+    estimate_tokens,
     init_tracing as InitTracing,
+    render_template,
+    with_memory,
 )
 
 # The native (pyo3) bus classes keep their plain exported names; the high
@@ -145,6 +154,13 @@ __all__ = [
     "ContentPart",
     "Memory",
     "Binary",
+    "Goal",
+    "GoalStore",
+    "JobRegistry",
+    "FallbackProvider",
+    "render_template",
+    "with_memory",
+    "estimate_tokens",
 ]
 # Keep in sync with pyproject.toml; tests/test_public_api.py enforces this.
 __version__ = "4.0.1"

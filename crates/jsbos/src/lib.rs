@@ -107,7 +107,9 @@ mod agent;
 mod bus;
 mod caller;
 mod config;
+mod goal;
 mod hooks;
+mod jobs;
 mod jsany;
 mod llm_usage;
 mod mcp;
@@ -116,12 +118,15 @@ mod plugin;
 mod publisher;
 mod query;
 mod subscriber;
+mod template;
 
-pub use agent::{Agent, AgentCallableServer, AgentConfig, AgentRpcClient};
+pub use agent::{Agent, AgentCallableServer, AgentConfig, AgentRpcClient, JsFallbackProvider};
 pub use bus::{Bus, BusConfig, Session};
 pub use caller::{Callable, Caller};
 pub use config::ConfigLoader;
+pub use goal::{Goal, GoalBlockedReason, GoalStore};
 pub use hooks::{HookContextData, HookDecision, HookEvent, HookRegistry};
+pub use jobs::JobRegistry;
 pub use llm_usage::{BudgetStatus, LlmUsage, PromptTokensDetails, TokenBudgetReport, TokenUsage};
 pub use mcp::McpClient;
 pub use plugin::{
@@ -131,6 +136,7 @@ pub use plugin::{
 pub use publisher::Publisher;
 pub use query::{Query, Queryable};
 pub use subscriber::Subscriber;
+pub use template::{estimate_tokens, render_template, with_memory};
 
 pub use perf::PerfSnapshot;
 

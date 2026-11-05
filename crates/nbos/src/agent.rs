@@ -419,7 +419,42 @@ impl AsyncTool for PyPythonToolWrapper {
     }
 }
 
-#[pyclass(name = "AgentConfig", skip_from_py_object)]
+/// One alternate LLM endpoint a run falls back to.
+#[pyclass(name = "FallbackProvider", skip_from_py_object)]
+#[derive(Clone)]
+pub struct PyFallbackProvider {
+    /// LLM API base URL of the fallback endpoint.
+    #[pyo3(get, set)]
+    pub base_url: String,
+    /// API key for the fallback endpoint (empty when it needs none).
+    #[pyo3(get, set)]
+    pub api_key: String,
+    /// Model identifier in `vendor/model` form.
+    #[pyo3(get, set)]
+    pub model: String,
+}
+
+#[pymethods]
+impl PyFallbackProvider {
+    #[new]
+    #[pyo3(signature = (base_url, model, api_key = String::new()))]
+    fn new(base_url: String, model: String, api_key: String) -> Self {
+        Self {
+            base_url,
+            api_key,
+            model,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "FallbackProvider(base_url={:?}, model={:?})",
+            self.base_url, self.model
+        )
+    }
+}
+
+#[pyclass(name = "AgentConfig", skip_from_py_object, dict)]
 #[derive(Clone)]
 /// Configuration for a Python agent.
 pub struct PyAgentConfig {
@@ -477,6 +512,29 @@ pub struct PyAgentConfig {
     /// Whether to wait automatically when rate limited.
     #[pyo3(get, set)]
     pub rate_limit_auto_wait: Option<bool>,
+    /// Whether `system_prompt` is the whole prompt (no appended guidance).
+    #[pyo3(get, set)]
+    pub persona_complete: bool,
+    /// Token ceiling for one compaction (summarizer) request.
+    #[pyo3(get, set)]
+    pub compaction_input_tokens: usize,
+    /// The most text one tool result may add to the model context (0 = default).
+    #[pyo3(get, set)]
+    pub tool_output_cap: usize,
+    /// Run one response's tool calls concurrently.
+    #[pyo3(get, set)]
+    pub parallel_tool_calls: bool,
+    /// Offer the model the provider's hosted web-search tool.
+    #[pyo3(get, set)]
+    pub web_search: bool,
+    /// Alternate endpoints tried in order when the primary fails.
+    pub fallbacks: Vec<PyFallbackProvider>,
+    /// Send-side history ceiling for mid-turn compaction (0 disables it).
+    #[pyo3(get, set)]
+    pub context_budget: Option<usize>,
+    /// Advertise skills as a catalogue instead of searching them.
+    #[pyo3(get, set)]
+    pub skill_catalogue: Option<bool>,
 }
 
 impl Default for PyAgentConfig {
@@ -501,6 +559,14 @@ impl Default for PyAgentConfig {
             rate_limit_max_retries: None,
             rate_limit_retry_backoff_secs: None,
             rate_limit_auto_wait: None,
+            persona_complete: false,
+            compaction_input_tokens: c.compaction_input_tokens,
+            tool_output_cap: c.tool_output_cap,
+            parallel_tool_calls: c.parallel_tool_calls,
+            web_search: c.web_search,
+            fallbacks: Vec::new(),
+            context_budget: None,
+            skill_catalogue: None,
         }
     }
 }
@@ -543,22 +609,28 @@ impl From<PyAgentConfig> for AgentConfig {
             base_url: value.base_url,
             api_key: value.api_key,
             system_prompt: value.system_prompt,
-            // The Python surface has no complete-persona flag yet; a host sets
-            // it on the AgentConfig it builds directly.
-            persona_complete: false,
+            persona_complete: value.persona_complete,
             temperature: value.temperature,
             max_tokens: value.max_tokens,
             timeout_secs: value.timeout_secs,
             max_steps: value.max_steps,
-            compaction_input_tokens: agent::AgentConfig::default().compaction_input_tokens,
-            tool_output_cap: 0,
-            parallel_tool_calls: false,
-            web_search: false,
+            compaction_input_tokens: value.compaction_input_tokens,
+            tool_output_cap: value.tool_output_cap,
+            parallel_tool_calls: value.parallel_tool_calls,
+            web_search: value.web_search,
             api_mode: value.api_mode,
             reasoning_effort: value.reasoning_effort,
             circuit_breaker,
             rate_limit,
-            fallbacks: Vec::new(),
+            fallbacks: value
+                .fallbacks
+                .into_iter()
+                .map(|provider| agent::FallbackProvider {
+                    base_url: provider.base_url,
+                    api_key: provider.api_key,
+                    model: provider.model,
+                })
+                .collect(),
         }
     }
 }
@@ -623,6 +695,37 @@ impl PyAgentConfig {
             cfg.reasoning_effort = Some(v);
         }
         cfg
+    }
+
+    /// Append an alternate endpoint tried when the primary provider fails.
+    #[pyo3(signature = (base_url, model, api_key = String::new()))]
+    fn add_fallback(&mut self, base_url: String, model: String, api_key: String) {
+        self.fallbacks.push(PyFallbackProvider {
+            base_url,
+            api_key,
+            model,
+        });
+    }
+
+    /// Drop every alternate endpoint.
+    fn clear_fallbacks(&mut self) {
+        self.fallbacks.clear();
+    }
+
+    /// The alternates as plain dictionaries.
+    fn fallback_list(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let values: Vec<serde_json::Value> = self
+            .fallbacks
+            .iter()
+            .map(|provider| {
+                serde_json::json!({
+                    "base_url": provider.base_url,
+                    "api_key": provider.api_key,
+                    "model": provider.model,
+                })
+            })
+            .collect();
+        json_to_py(py, &serde_json::Value::Array(values))
     }
 }
 
@@ -733,6 +836,10 @@ impl PyAgentCallableServer {
 pub struct PyAgent {
     /// The underlying agent.
     pub inner: std::sync::Arc<Mutex<Agent>>,
+    /// A clone a run currently owns, so mid-turn steering reaches the run.
+    pub running: std::sync::Arc<Mutex<Option<Agent>>>,
+    /// Messages steered while no turn was running, delivered to the next one.
+    pub pending_steers: std::sync::Arc<Mutex<Vec<agent::SteerMessage>>>,
     /// Stored MCP clients for restart/health_status operations
     pub mcp_clients: std::sync::Arc<Mutex<Vec<std::sync::Arc<agent::mcp::McpClient>>>>,
     /// Hook registry for extensibility
@@ -741,6 +848,73 @@ pub struct PyAgent {
     pub is_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Set by stop() to suppress the next call (cooperative, matching jsbos).
     pub stop_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl PyAgent {
+    /// Clone the stored agent for a run, carrying every queued steer into it.
+    fn take_run_agent(&self) -> PyResult<Agent> {
+        let (agent, leftovers) = {
+            let guard = self
+                .inner
+                .lock()
+                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+            // A clone gets its own mailbox, so messages left on the stored
+            // agent's mailbox travel with the run explicitly.
+            let leftovers = guard.steers().take();
+            (guard.clone(), leftovers)
+        };
+        let mut refused = Vec::new();
+        for message in leftovers {
+            if !agent.steer(message.content.clone(), message.ticket) {
+                refused.push(message);
+            }
+        }
+        let pending = {
+            let mut queue = self
+                .pending_steers
+                .lock()
+                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Steer queue poisoned"))?;
+            std::mem::take(&mut *queue)
+        };
+        for message in pending {
+            if !agent.steer(message.content.clone(), message.ticket) {
+                refused.push(message);
+            }
+        }
+        if !refused.is_empty() {
+            if let Ok(mut queue) = self.pending_steers.lock() {
+                queue.extend(refused);
+            }
+        }
+        {
+            let mut slot = self
+                .running
+                .lock()
+                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+            *slot = Some(agent.clone());
+        }
+        Ok(agent)
+    }
+
+    /// Replace a stored agent with a builder-style clone, carrying queued steers.
+    fn replace_stored(guard: &mut Agent, change: impl FnOnce(Agent) -> Agent) {
+        let pending = guard.steers().take();
+        let next = change(guard.clone());
+        for message in pending {
+            next.steer(message.content, message.ticket);
+        }
+        *guard = next;
+    }
+
+    /// Publish a finished run's state back to the stored agent.
+    fn finish_run(inner: &Mutex<Agent>, running: &Mutex<Option<Agent>>, agent: &Agent) {
+        if let Ok(mut guard) = inner.lock() {
+            *guard = agent.clone();
+        }
+        if let Ok(mut slot) = running.lock() {
+            *slot = None;
+        }
+    }
 }
 
 #[pymethods]
@@ -752,6 +926,8 @@ impl PyAgent {
         config: PyRef<'py, PyAgentConfig>,
     ) -> PyResult<Self> {
         let mut cfg: AgentConfig = config.clone().into();
+        let context_budget = config.context_budget;
+        let skill_catalogue = config.skill_catalogue;
         agent::agent::config::apply_model_defaults(&mut cfg);
         let py_hooks = crate::hooks::PyHookRegistry::create();
 
@@ -761,10 +937,18 @@ impl PyAgent {
         llm.register_vendor(vendor_name, vendor);
         let llm = std::sync::Arc::new(llm);
 
-        let agent = Agent::new(cfg, llm);
+        let mut agent = Agent::new(cfg, llm);
+        if let Some(tokens) = context_budget {
+            agent = agent.with_context_budget(tokens);
+        }
+        if let Some(catalogue) = skill_catalogue {
+            agent = agent.with_skill_catalogue(catalogue);
+        }
 
         Ok(Self {
             inner: std::sync::Arc::new(Mutex::new(agent)),
+            running: Default::default(),
+            pending_steers: Default::default(),
             mcp_clients: Default::default(),
             hooks: std::sync::Arc::new(Mutex::new(py_hooks)),
             is_running: Default::default(),
@@ -780,6 +964,8 @@ impl PyAgent {
         _bus: PyRef<'py, PyBus>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let mut cfg: AgentConfig = config.clone().into();
+        let context_budget = config.context_budget;
+        let skill_catalogue = config.skill_catalogue;
         agent::agent::config::apply_model_defaults(&mut cfg);
         let bus_inner = _bus.inner.clone();
         drop(_bus);
@@ -795,13 +981,21 @@ impl PyAgent {
 
             let session = crate::utils::session_from_bus(bus_inner).await;
             let bus = bus::Bus::new(session);
-            let agent = Agent::new(cfg, llm).with_bus(bus);
+            let mut agent = Agent::new(cfg, llm).with_bus(bus);
+            if let Some(tokens) = context_budget {
+                agent = agent.with_context_budget(tokens);
+            }
+            if let Some(catalogue) = skill_catalogue {
+                agent = agent.with_skill_catalogue(catalogue);
+            }
 
             Python::attach(|py| -> PyResult<Py<PyAny>> {
                 let py_agent = Py::new(
                     py,
                     PyAgent {
                         inner: std::sync::Arc::new(Mutex::new(agent)),
+                        running: Default::default(),
+                        pending_steers: Default::default(),
                         mcp_clients: Default::default(),
                         hooks: std::sync::Arc::new(Mutex::new(py_hooks)),
                         is_running: Default::default(),
@@ -898,18 +1092,15 @@ impl PyAgent {
             );
         }
         let task_content = py_value_to_content(task.bind(py))?;
-        let agent = {
-            let guard = self
-                .inner
-                .lock()
-                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
-            guard.clone()
-        };
+        let agent = self.take_run_agent()?;
         self.is_running.store(true, Ordering::SeqCst);
         let is_running = self.is_running.clone();
+        let inner = self.inner.clone();
+        let running = self.running.clone();
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
         pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
             let out = agent.react(task_content).await;
+            PyAgent::finish_run(&inner, &running, &agent);
             is_running.store(false, Ordering::SeqCst);
             out.map_err(to_py_runtime_error)
         })
@@ -932,18 +1123,15 @@ impl PyAgent {
             );
         }
         let task_content = py_value_to_content(task.bind(py))?;
-        let agent = {
-            let guard = self
-                .inner
-                .lock()
-                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
-            guard.clone()
-        };
+        let agent = self.take_run_agent()?;
         self.is_running.store(true, Ordering::SeqCst);
         let is_running = self.is_running.clone();
+        let inner = self.inner.clone();
+        let running = self.running.clone();
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
         pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
             let out = agent.run_simple(task_content).await;
+            PyAgent::finish_run(&inner, &running, &agent);
             is_running.store(false, Ordering::SeqCst);
             out.map_err(to_py_runtime_error)
         })
@@ -958,12 +1146,21 @@ impl PyAgent {
         self.stop_flag.store(true, Ordering::SeqCst);
         self.is_running.store(false, Ordering::SeqCst);
         if clear_session {
-            let mut guard = self
-                .inner
-                .lock()
-                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
-            guard.stop();
-            guard.session_mut().clear();
+            {
+                let mut guard = self.inner.lock().map_err(|_| {
+                    pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned")
+                })?;
+                guard.stop();
+                guard.session_mut().clear();
+            }
+            // The run owns a clone and publishes it back when it ends, so the
+            // clear has to reach that clone too or the write-back would undo it.
+            if let Ok(mut running) = self.running.lock() {
+                if let Some(agent) = running.as_mut() {
+                    agent.stop();
+                    agent.session_mut().clear();
+                }
+            }
         }
         Ok(was_running)
     }
@@ -999,17 +1196,14 @@ impl PyAgent {
             );
         }
         let task_content = py_value_to_content(task.bind(py))?;
-        let agent = self.inner.clone();
+        let agent_clone = self.take_run_agent()?;
         self.is_running.store(true, Ordering::SeqCst);
         let is_running = self.is_running.clone();
+        let inner = self.inner.clone();
+        let running = self.running.clone();
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
 
         pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
-            let agent_clone = agent
-                .lock()
-                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?
-                .clone();
-
             let (tx, rx) = mpsc::channel::<Result<String, String>>(32);
 
             tokio::spawn(async move {
@@ -1051,6 +1245,8 @@ impl PyAgent {
                         break;
                     }
                 }
+                drop(token_stream);
+                PyAgent::finish_run(&inner, &running, &agent_clone);
                 is_running.store(false, Ordering::SeqCst);
             });
 
@@ -1120,6 +1316,54 @@ impl PyAgent {
                 .clone()
                 .map(serde_json::Value::String)
                 .unwrap_or(serde_json::Value::Null),
+        );
+        map.insert(
+            "persona_complete".to_string(),
+            serde_json::Value::Bool(cfg.persona_complete),
+        );
+        map.insert(
+            "max_steps".to_string(),
+            serde_json::Value::Number(cfg.max_steps.into()),
+        );
+        map.insert(
+            "compaction_input_tokens".to_string(),
+            serde_json::Value::Number(cfg.compaction_input_tokens.into()),
+        );
+        map.insert(
+            "tool_output_cap".to_string(),
+            serde_json::Value::Number(cfg.tool_output_cap.into()),
+        );
+        map.insert(
+            "parallel_tool_calls".to_string(),
+            serde_json::Value::Bool(cfg.parallel_tool_calls),
+        );
+        map.insert(
+            "web_search".to_string(),
+            serde_json::Value::Bool(cfg.web_search),
+        );
+        map.insert(
+            "context_budget".to_string(),
+            serde_json::Value::Number(guard.context_budget().into()),
+        );
+        map.insert(
+            "skill_catalogue".to_string(),
+            serde_json::Value::Bool(guard.skill_catalogue()),
+        );
+        map.insert(
+            "fallbacks".to_string(),
+            serde_json::to_value(
+                cfg.fallbacks
+                    .iter()
+                    .map(|provider| {
+                        serde_json::json!({
+                            "base_url": provider.base_url,
+                            "api_key": provider.api_key,
+                            "model": provider.model,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(to_py_runtime_error)?,
         );
 
         json_to_py(py, &serde_json::to_value(map).map_err(to_py_runtime_error)?)
@@ -1202,6 +1446,342 @@ impl PyAgent {
         } else {
             Ok(Vec::new())
         }
+    }
+
+    /// Snapshot the agent's working plan as `{ text, status }` items.
+    fn plan_items(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        json_to_py(
+            py,
+            &serde_json::to_value(guard.plan_items()).map_err(to_py_runtime_error)?,
+        )
+    }
+
+    /// Replace the working plan; an empty list clears it.
+    fn set_plan(&self, items: &Bound<'_, PyAny>) -> PyResult<()> {
+        let items: Vec<agent::tools::PlanItem> =
+            serde_json::from_value(py_to_json(items)?).map_err(to_py_runtime_error)?;
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        guard.set_plan(items);
+        Ok(())
+    }
+
+    /// Forget the whole working plan.
+    fn clear_plan(&self) -> PyResult<()> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        guard.set_plan(Vec::new());
+        Ok(())
+    }
+
+    /// Register the `update_plan` tool against this agent's plan store.
+    ///
+    /// Returns False when the tool was already registered.
+    fn add_plan_tool(&self) -> PyResult<bool> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        let tool = std::sync::Arc::new(agent::tools::PlanTool::new(guard.plan()));
+        match guard.try_add_tool(tool) {
+            Ok(()) => Ok(true),
+            Err(agent::ToolError::Failed(message)) if message.starts_with("duplicate tool") => {
+                Ok(false)
+            }
+            Err(error) => Err(to_py_runtime_error(error)),
+        }
+    }
+
+    /// Queue a message for the running turn's next step, tagged with `ticket`.
+    fn steer(&self, content: String, ticket: u64) -> PyResult<bool> {
+        let running = self
+            .running
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        if let Some(agent) = running.as_ref() {
+            return Ok(agent.steer(Content::Text(content), ticket));
+        }
+        drop(running);
+        let mut queue = self
+            .pending_steers
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Steer queue poisoned"))?;
+        if queue.len() >= agent::MAX_STEER_DEPTH {
+            return Ok(false);
+        }
+        queue.push(agent::SteerMessage {
+            content: Content::Text(content),
+            ticket,
+        });
+        Ok(true)
+    }
+
+    /// Number of steered messages waiting for the running turn.
+    fn steer_depth(&self) -> PyResult<u32> {
+        let running = self
+            .running
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        let depth = match running.as_ref() {
+            Some(agent) => agent.steers().depth(),
+            None => {
+                let queue = self.pending_steers.lock().map_err(|_| {
+                    pyo3::exceptions::PyRuntimeError::new_err("Steer queue poisoned")
+                })?;
+                queue.len()
+            }
+        };
+        Ok(depth.min(u32::MAX as usize) as u32)
+    }
+
+    /// Take back every steered message no step ever delivered.
+    fn take_undelivered_steers(&self) -> PyResult<Vec<u64>> {
+        let running = self
+            .running
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        if let Some(agent) = running.as_ref() {
+            return Ok(agent.take_undelivered_steers());
+        }
+        drop(running);
+        let mut queue = self
+            .pending_steers
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Steer queue poisoned"))?;
+        let tickets: Vec<u64> = queue.iter().map(|message| message.ticket).collect();
+        queue.clear();
+        Ok(tickets)
+    }
+
+    /// Keep `name` out of the advertised tool array; it stays callable.
+    fn defer_tool(&self, name: String) -> PyResult<()> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        Self::replace_stored(&mut guard, |agent| agent.defer_tool(name));
+        Ok(())
+    }
+
+    /// Keep every tool whose name starts with `prefix` out of the advertised array.
+    fn defer_tool_prefix(&self, prefix: String) -> PyResult<()> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        Self::replace_stored(&mut guard, |agent| agent.defer_tool_prefix(prefix));
+        Ok(())
+    }
+
+    /// Whether a tool is withheld from the advertised array.
+    fn is_deferred_tool(&self, name: String) -> PyResult<bool> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        Ok(guard.is_deferred_tool(&name))
+    }
+
+    /// Whether any registered tool is withheld from the advertised array.
+    fn has_deferred_tools(&self) -> PyResult<bool> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        Ok(guard.has_deferred_tools())
+    }
+
+    /// Remove asynchronous tools by name; returns how many were removed.
+    fn remove_tools(&self, names: Vec<String>) -> PyResult<u32> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        Ok(guard.remove_async_tools(&names).min(u32::MAX as usize) as u32)
+    }
+
+    /// Append a live extension prompt fragment.
+    fn add_live_prompt_section(&self, section: String) -> PyResult<()> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        guard.add_live_prompt_section(section);
+        Ok(())
+    }
+
+    /// Remove one live extension prompt fragment.
+    fn remove_live_prompt_section(&self, section: String) -> PyResult<bool> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        Ok(guard.remove_live_prompt_section(&section))
+    }
+
+    /// Register an inline skill (no `SKILL.md` file needed).
+    #[pyo3(signature = (name, description, instructions, path = None))]
+    fn register_skill(
+        &self,
+        name: String,
+        description: String,
+        instructions: String,
+        path: Option<String>,
+    ) -> PyResult<()> {
+        let directory =
+            std::path::PathBuf::from(path.unwrap_or_else(|| format!(".bos/skills/{name}")));
+        let skill = agent::skills::SkillContent {
+            metadata: agent::skills::SkillMetadata::new(
+                name,
+                description,
+                directory.join("SKILL.md"),
+            ),
+            instructions,
+            skill_dir: directory,
+        };
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        guard.register_skill_content(skill);
+        Ok(())
+    }
+
+    /// Remove skills by name from the build's list and the live overlay.
+    fn remove_skills_by_names(&self, names: Vec<String>) -> PyResult<u32> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        Ok(guard.remove_skills_by_names(&names).min(u32::MAX as usize) as u32)
+    }
+
+    /// Snapshot every registered skill as JSON.
+    fn list_skills(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        let skills: Vec<serde_json::Value> = guard
+            .all_skills()
+            .into_iter()
+            .map(|skill| {
+                serde_json::json!({
+                    "name": skill.metadata.name,
+                    "description": skill.metadata.description,
+                    "category": skill.metadata.category.as_str(),
+                    "path": skill.metadata.path.to_string_lossy(),
+                    "directory": skill.skill_dir.to_string_lossy(),
+                    "user_only": skill.metadata.user_only,
+                    "instructions": skill.instructions,
+                })
+            })
+            .collect();
+        json_to_py(py, &serde_json::Value::Array(skills))
+    }
+
+    /// The send-side context budget in tokens (0 disables mid-turn compaction).
+    fn context_budget(&self) -> PyResult<usize> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        Ok(guard.context_budget())
+    }
+
+    /// Set the send-side context budget.
+    fn set_context_budget(&self, tokens: usize) -> PyResult<()> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        Self::replace_stored(&mut guard, |agent| agent.with_context_budget(tokens));
+        Ok(())
+    }
+
+    /// Whether skills are advertised as a catalogue instead of searched.
+    fn skill_catalogue(&self) -> PyResult<bool> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        Ok(guard.skill_catalogue())
+    }
+
+    /// Choose between the skill catalogue and on-demand `find_skill`.
+    fn set_skill_catalogue(&self, enabled: bool) -> PyResult<()> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        Self::replace_stored(&mut guard, |agent| agent.with_skill_catalogue(enabled));
+        Ok(())
+    }
+
+    /// Register the `get_goal` and `update_goal` tools against `store`.
+    ///
+    /// Returns how many tools were registered: 0 when both already exist.
+    fn add_goal_tools(&self, store: PyRef<'_, crate::goal::PyGoalStore>) -> PyResult<u32> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        let mut registered = 0u32;
+        for tool in [
+            std::sync::Arc::new(agent::tools::GetGoalTool::new(store.inner.clone()))
+                as std::sync::Arc<dyn agent::tools::Tool>,
+            std::sync::Arc::new(agent::tools::UpdateGoalTool::new(store.inner.clone())),
+        ] {
+            match guard.try_add_tool(tool) {
+                Ok(()) => registered += 1,
+                Err(agent::ToolError::Failed(message)) if message.starts_with("duplicate tool") => {
+                }
+                Err(error) => return Err(to_py_runtime_error(error)),
+            }
+        }
+        Ok(registered)
+    }
+
+    /// Register the `job_output` and `job_kill` tools against `jobs`.
+    ///
+    /// Returns how many tools were registered: 0 when both already exist.
+    #[pyo3(signature = (jobs, session = "default".to_string()))]
+    fn add_job_tools(
+        &self,
+        jobs: PyRef<'_, crate::jobs::PyJobRegistry>,
+        session: String,
+    ) -> PyResult<u32> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        let mut registered = 0u32;
+        for tool in [
+            std::sync::Arc::new(
+                agent::tools::JobTool::reader("job_output")
+                    .with_jobs(jobs.inner.clone(), session.clone()),
+            ) as std::sync::Arc<dyn agent::tools::Tool>,
+            std::sync::Arc::new(
+                agent::tools::JobTool::stopper("job_kill")
+                    .with_jobs(jobs.inner.clone(), session.clone()),
+            ),
+        ] {
+            match guard.try_add_tool(tool) {
+                Ok(()) => registered += 1,
+                Err(agent::ToolError::Failed(message)) if message.starts_with("duplicate tool") => {
+                }
+                Err(error) => return Err(to_py_runtime_error(error)),
+            }
+        }
+        Ok(registered)
     }
 
     /// Performance metrics collected across LLM calls (timings in microseconds).
@@ -1378,20 +1958,31 @@ impl PyAgent {
         })
     }
 
+    /// Register a sandboxed bash tool.
+    ///
+    /// Pass `jobs` and `session` to enable `run_in_background` and route the
+    /// resulting jobs into that registry.
+    #[pyo3(signature = (name, workspace_root = None, jobs = None, session = None))]
     fn add_bash_tool<'py>(
         &self,
         py: Python<'py>,
         name: String,
         workspace_root: Option<String>,
+        jobs: Option<PyRef<'py, crate::jobs::PyJobRegistry>>,
+        session: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let jobs = jobs.map(|registry| registry.inner.clone());
         let agent = self.inner.clone();
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
         pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
-            let tool = if let Some(root) = workspace_root {
+            let mut tool = if let Some(root) = workspace_root {
                 agent::BashTool::new(&name).with_workspace(&root)
             } else {
                 agent::BashTool::new(&name)
             };
+            if let Some(jobs) = jobs {
+                tool = tool.with_jobs(jobs, session.unwrap_or_else(|| "default".to_string()));
+            }
             let mut guard = agent
                 .lock()
                 .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;

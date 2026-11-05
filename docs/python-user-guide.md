@@ -759,6 +759,203 @@ the store, and a blank query returns the most recent items. A
 `Memory(max_items=N)` (or `with_max_items(N)`) cap evicts the oldest
 items on overflow. Multimodal `Content` is passed through without recall.
 
+## Plans, Goals, Jobs and Steering
+
+These controls cover the long-running parts of a session: the working plan, the
+durable goal, background processes, and mid-turn messages.
+
+### Plans
+
+The agent owns one plan store. Register the built-in update_plan tool so the
+model can maintain it, then render plan_items() in your UI:
+
+    from nbos import AgentBuilder
+
+    agent = await AgentBuilder(None).with_plan_tool().start()
+    agent.add_plan_tool()               # explicit alternative
+    agent.set_plan([{"text": "write tests", "status": "in_progress"}])
+    print(agent.plan_items())
+    agent.clear_plan()
+
+### Goals
+
+A goal outlives a turn. Seed a GoalStore for the current turn, register the
+get_goal/update_goal tools, and settle the store when the turn ends:
+
+    from nbos import Goal, GoalStore
+
+    goal = Goal.create("Ship the 4.1 release")
+    store = GoalStore(goal)
+    agent.add_goal_tools(store)
+
+    # ... run the turn ...
+
+    settle = store.take_settle()   # None, {"type": "complete"} or blocked
+    if settle and settle["type"] == "complete":
+        goal.complete()
+
+Goal also supports pause, resume, advance, block, arm, disarm, to_json and
+Goal.from_json.
+
+### Steering
+
+steer(content, ticket) queues a message for the RUNNING turn's next step.
+take_undelivered_steers() returns the tickets of messages no step reached, so a
+host can put them back in its own queue.
+
+    agent.steer("Also check the changelog.", 12)
+    agent.steer_depth()                 # queued messages
+    agent.take_undelivered_steers()     # [12] after a turn that ended early
+
+Messages steered while no turn is running are delivered to the next turn.
+
+### Background jobs
+
+Share one JobRegistry between the bash tool that spawns jobs and the job tools
+that read them. Passing jobs to with_bash() enables run_in_background on the
+shell tool.
+
+    from nbos import AgentBuilder, JobRegistry
+
+    jobs = JobRegistry()
+    agent = await (
+        AgentBuilder(None)
+        .with_bash("bash", os.getcwd(), jobs, "default")
+        .start()
+    )
+    agent.add_job_tools(jobs, "default")
+
+    for job in jobs.list("default"):
+        print(job["id"], job["status"])
+    tail = jobs.output(job_id)
+    jobs.wait(job_id, 5000)
+    jobs.kill(job_id)
+
+### Deferred tools, live skills and prompt sections
+
+defer_tool(name) / defer_tool_prefix(prefix) keep a tool out of the advertised
+array while leaving it callable through find_tool/call_tool.
+register_skill adds an inline skill with no SKILL.md file, and
+add_live_prompt_section appends a host-owned prompt fragment.
+
+    agent.defer_tool("mcp_search").defer_tool_prefix("mcp_")
+    agent.register_skill("reviewer", "Review code", "Read the diff first.")
+    agent.add_live_prompt_section("Stay terse.")
+    agent.list_skills()
+
+### Prompt templates
+
+    from nbos import render_template, with_memory, estimate_tokens
+
+    render_template("You are {{role}}.", {"role": "a reviewer"})
+    with_memory("You are a reviewer.\n\n{{memory}}", "Remember: tea.")
+    estimate_tokens("one two three")
+
+## Ferris Extensions
+
+Ferris is the BOS extension framework. The binding lets you implement the SDK's
+Extension interface in Python and run it in process. A manifest is still a
+schema-2.0 extension.toml; the callbacks supply the same start/invoke/shutdown
+steps a Rust extension implements.
+
+    from nbos import FerrisHarness, FerrisManifest
+
+    manifest = """
+    schema_version = "2.0"
+
+    [extension]
+    id = "com.example.echo"
+    name = "Echo"
+    version = "1.0.0"
+    description = "Echoes its input"
+
+    [compatibility]
+    host = ">=3.0.0"
+    extension_api = ">=1.0.0"
+
+    [runtime]
+    kind = "builtin"
+
+    [capabilities]
+    required = ["agent.tools.register"]
+
+    [[contribution]]
+    kind = "tool"
+    id = "echo"
+    """
+
+    async def start(ctx):
+        return [{"kind": "tool", "id": "echo", "payload": {"description": "Echo"}}]
+
+    async def invoke(call):
+        return call["input"]  # {"contribution", "input", "context"}
+
+    harness = FerrisHarness(manifest, "/tmp/echo-extension", start, invoke)
+    contributions = await harness.start()
+    result = await harness.invoke("echo", {"text": "hi"})
+    await harness.shutdown()
+
+FerrisManifest.parse(toml) validates a manifest without running anything and
+exposes id, runtime_kind, to_toml() and to_json(). Callbacks may be sync or
+async. This harness runs code in the host process; for untrusted packages use
+the Ferris process/WASM runtimes through a host that enforces capabilities.
+
+A manifest can also be built without hand-writing TOML:
+
+    from nbos import FerrisManifestBuilder
+
+    manifest = (
+        FerrisManifestBuilder("com.example.echo", "Echo", "1.0.0", "Echo")
+        .runtime("declarative")
+        .capability("agent.tools.register")
+        .contribution("tool", "echo", {"description": "Echo"})
+        .startup("on-demand")
+        .build()
+    )
+
+### Installing and running packages
+
+FerrisHost is the package host. It installs into a canonical store, plans in
+dependency order, activates the standard runtimes and exposes contributions.
+
+    from nbos import FerrisHost
+
+    host = FerrisHost("/tmp/ferris-store", "/tmp/workspace")
+    host.install("/path/to/package")
+    host.plan()                        # dependency-first ids
+    contributions = await host.apply()
+    result = await host.invoke("com.example.echo", "tool", "echo", {"x": 1})
+    await host.unload()
+
+Hosts default to policy_mode="enforce"; grant what a package needs first:
+
+    host.grant("com.example.echo", "process.execute", "program:node")
+
+Use set_enabled, uninstall, versions, activate, rollback, package_root and
+quarantine for lifecycle. Contributions are data; `register_agent_tools`
+registers tools on an agent, while prompts/skills/context remain yours to place.
+
+Host options add callbacks and event hooks:
+
+    host = FerrisHost(
+        "/tmp/ferris-store",
+        workspace="/tmp/workspace",
+        on_contributions=lambda payload: register(payload),
+        on_revoke=lambda payload: unregister(payload),
+    )
+    subscription = host.subscribe_events(["agent.*"], lambda event: print(event))
+    host.publish_event("agent.started", {"ok": True})
+    host.unsubscribe_events(subscription)
+
+A Python extension can also be registered as an in-process linked package:
+
+    await host.register_extension(manifest.to_toml(), "/tmp/linked", start, invoke)
+
+After `apply()`, register the applied tools on an agent with
+`register_agent_tools`; each tool forwards to the owning runtime:
+
+    registered = await host.register_agent_tools(agent)
+
 ## API Reference
 
 For the complete API reference, see [Python API Reference](./api-reference/nbos-api.md).

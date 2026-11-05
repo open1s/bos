@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+- **Python/JS bindings**: catch up with the agent-runtime surface that landed
+  with builtin tools 2.0. Both bindings now expose the working plan
+  (`planItems`/`setPlan`/`clearPlan`/`addPlanTool`), durable goals
+  (`Goal`, `GoalStore`, goal tools), mid-turn steering, deferred tools
+  (`deferTool`/`deferToolPrefix`), live prompt sections, inline skills, and
+  background jobs (`JobRegistry`, job tools, job-aware bash). Agent config
+  gains `personaComplete`, `compactionInputTokens`, `toolOutputCap`,
+  `parallelToolCalls`, `webSearch`, `contextBudget`, `skillCatalogue` and
+  `fallbacks`.
+- **Python bindings**: a run now writes its state back to the stored agent, so
+  conversation history survives across calls and steering reaches the running
+  turn. Inline skills declared with `skill(name, content)` are registered
+  instead of silently ignored, and `with_bash` works (the config object
+  accepts dynamic attributes).
+- **Templates**: both bindings expose `renderTemplate`/`render_template`,
+  `withMemory`/`with_memory` and `estimateTokens`/`estimate_tokens` from
+  `react::template` and the agent context estimator.
+
 ## v4.0.1 (2026-11-04)
 
 **Breaking**: extension manifest 2.0 is now the only schema the host accepts, so

@@ -166,6 +166,19 @@ pub struct StopOptions {
 }
 
 #[napi(object)]
+/// One alternate LLM endpoint a run falls back to.
+pub struct JsFallbackProvider {
+  /// LLM API base URL of the fallback endpoint.
+  #[napi(js_name = "baseUrl")]
+  pub base_url: String,
+  /// API key for the fallback endpoint (empty when it needs none).
+  #[napi(js_name = "apiKey")]
+  pub api_key: String,
+  /// Model identifier in `vendor/model` form.
+  pub model: String,
+}
+
+#[napi(object)]
 /// Configuration for an agent.
 pub struct AgentConfig {
   /// Agent name.
@@ -219,6 +232,29 @@ pub struct AgentConfig {
   /// Whether to wait automatically when rate limited.
   #[napi(js_name = "rateLimitAutoWait")]
   pub rate_limit_auto_wait: Option<bool>,
+  /// Whether `systemPrompt` is the whole prompt (no appended guidance).
+  #[napi(js_name = "personaComplete")]
+  pub persona_complete: Option<bool>,
+  /// Token ceiling for one compaction (summarizer) request.
+  #[napi(js_name = "compactionInputTokens")]
+  pub compaction_input_tokens: Option<i64>,
+  /// The most text one tool result may add to the model context (0 = default).
+  #[napi(js_name = "toolOutputCap")]
+  pub tool_output_cap: Option<i64>,
+  /// Run one response's tool calls concurrently.
+  #[napi(js_name = "parallelToolCalls")]
+  pub parallel_tool_calls: Option<bool>,
+  /// Offer the model the provider's hosted web-search tool.
+  #[napi(js_name = "webSearch")]
+  pub web_search: Option<bool>,
+  /// Alternate endpoints tried in order when the primary fails.
+  pub fallbacks: Option<Vec<JsFallbackProvider>>,
+  /// Send-side history ceiling for mid-turn compaction (0 disables it).
+  #[napi(js_name = "contextBudget")]
+  pub context_budget: Option<i64>,
+  /// Advertise skills as a catalogue instead of searching them.
+  #[napi(js_name = "skillCatalogue")]
+  pub skill_catalogue: Option<bool>,
 }
 
 impl Default for AgentConfig {
@@ -243,6 +279,14 @@ impl Default for AgentConfig {
       rate_limit_max_retries: None,
       rate_limit_retry_backoff_secs: None,
       rate_limit_auto_wait: None,
+      persona_complete: None,
+      compaction_input_tokens: None,
+      tool_output_cap: None,
+      parallel_tool_calls: None,
+      web_search: None,
+      fallbacks: None,
+      context_budget: None,
+      skill_catalogue: None,
     }
   }
 }
@@ -281,6 +325,12 @@ impl AgentConfig {
         "rateLimitRetryBackoffSecs",
         self.rate_limit_retry_backoff_secs.is_some_and(|v| v < 0),
       ),
+      (
+        "compactionInputTokens",
+        self.compaction_input_tokens.is_some_and(|v| v < 0),
+      ),
+      ("toolOutputCap", self.tool_output_cap.is_some_and(|v| v < 0)),
+      ("contextBudget", self.context_budget.is_some_and(|v| v < 0)),
     ];
 
     for (name, is_negative) in negative {
@@ -336,22 +386,32 @@ impl From<AgentConfig> for agent::AgentConfig {
       base_url: value.base_url,
       api_key: value.api_key,
       system_prompt: value.system_prompt,
-      // The JS surface has no complete-persona flag yet; a host sets it on the
-      // AgentConfig it builds directly.
-      persona_complete: false,
+      persona_complete: value.persona_complete.unwrap_or(false),
       temperature: value.temperature as f32,
       max_tokens: max_tokens_converted,
       timeout_secs: value.timeout_secs as u64,
       max_steps: value.max_steps.unwrap_or(10) as usize,
-      compaction_input_tokens: agent::AgentConfig::default().compaction_input_tokens,
-      tool_output_cap: 0,
-      parallel_tool_calls: false,
-      web_search: false,
+      compaction_input_tokens: value
+        .compaction_input_tokens
+        .map(|v| v as usize)
+        .unwrap_or_else(|| agent::AgentConfig::default().compaction_input_tokens),
+      tool_output_cap: value.tool_output_cap.map(|v| v as usize).unwrap_or(0),
+      parallel_tool_calls: value.parallel_tool_calls.unwrap_or(false),
+      web_search: value.web_search.unwrap_or(false),
       api_mode: value.api_mode.unwrap_or_else(|| "chat".to_string()),
       reasoning_effort: value.reasoning_effort,
       circuit_breaker,
       rate_limit,
-      fallbacks: Vec::new(),
+      fallbacks: value
+        .fallbacks
+        .unwrap_or_default()
+        .into_iter()
+        .map(|provider| agent::FallbackProvider {
+          base_url: provider.base_url,
+          api_key: provider.api_key,
+          model: provider.model,
+        })
+        .collect(),
     }
   }
 }
@@ -381,12 +441,29 @@ fn busy_error(action: &str) -> Error {
   )
 }
 
+/// Replace an agent with a builder-style clone, carrying queued steers over.
+///
+/// `Agent::defer_tool`, `with_context_budget` and `with_skill_catalogue`
+/// consume the agent, and `Agent::clone` gives a fresh steer mailbox. A host
+/// that steered before changing policy would lose those messages, so they are
+/// drained from the old mailbox and pushed into the replacement.
+fn replace_agent(guard: &mut agent::Agent, change: impl FnOnce(agent::Agent) -> agent::Agent) {
+  let pending = guard.steers().take();
+  let next = change(guard.clone());
+  for message in pending {
+    next.steer(message.content, message.ticket);
+  }
+  *guard = next;
+}
+
 #[napi]
 impl Agent {
   #[napi(factory)]
   /// Create an agent from `config`.
   pub async fn create(config: AgentConfig) -> Result<Self> {
     config.validate()?;
+    let context_budget = config.context_budget;
+    let skill_catalogue = config.skill_catalogue;
     let mut cfg: agent::AgentConfig = config.into();
     agent::agent::config::apply_model_defaults(&mut cfg);
 
@@ -395,7 +472,13 @@ impl Agent {
     let (vendor_name, vendor) = agent::agent::agentic::build_vendor(&cfg);
     llm_provider.register_vendor(vendor_name, vendor);
 
-    let agent = agent::Agent::new(cfg, Arc::new(llm_provider));
+    let mut agent = agent::Agent::new(cfg, Arc::new(llm_provider));
+    if let Some(tokens) = context_budget {
+      agent = agent.with_context_budget(tokens as usize);
+    }
+    if let Some(catalogue) = skill_catalogue {
+      agent = agent.with_skill_catalogue(catalogue);
+    }
 
     Ok(Agent {
       inner: Arc::new(RwLock::new(agent)),
@@ -414,6 +497,8 @@ impl Agent {
     _bus: &External<Arc<crate::Session>>,
   ) -> Result<Self> {
     config.validate()?;
+    let context_budget = config.context_budget;
+    let skill_catalogue = config.skill_catalogue;
     let mut cfg: agent::AgentConfig = config.into();
     agent::agent::config::apply_model_defaults(&mut cfg);
 
@@ -424,7 +509,13 @@ impl Agent {
 
     let session = _bus.as_ref().clone();
     let bus = bus::Bus::new(session);
-    let agent = agent::Agent::new(cfg, Arc::new(llm_provider)).with_bus(bus);
+    let mut agent = agent::Agent::new(cfg, Arc::new(llm_provider)).with_bus(bus);
+    if let Some(tokens) = context_budget {
+      agent = agent.with_context_budget(tokens as usize);
+    }
+    if let Some(catalogue) = skill_catalogue {
+      agent = agent.with_skill_catalogue(catalogue);
+    }
 
     Ok(Agent {
       inner: Arc::new(RwLock::new(agent)),
@@ -504,11 +595,24 @@ impl Agent {
         "model": cfg.model,
         "base_url": cfg.base_url,
         "system_prompt": cfg.system_prompt,
+        "persona_complete": cfg.persona_complete,
         "temperature": cfg.temperature,
         "max_tokens": cfg.max_tokens,
         "timeout_secs": cfg.timeout_secs,
+        "max_steps": cfg.max_steps,
+        "compaction_input_tokens": cfg.compaction_input_tokens,
+        "tool_output_cap": cfg.tool_output_cap,
+        "parallel_tool_calls": cfg.parallel_tool_calls,
+        "web_search": cfg.web_search,
         "api_mode": cfg.api_mode,
         "reasoning_effort": cfg.reasoning_effort,
+        "context_budget": guard.context_budget(),
+        "skill_catalogue": guard.skill_catalogue(),
+        "fallbacks": cfg.fallbacks.iter().map(|provider| serde_json::json!({
+            "base_url": provider.base_url,
+            "api_key": provider.api_key,
+            "model": provider.model,
+        })).collect::<Vec<_>>(),
     }))
   }
 
@@ -540,6 +644,283 @@ impl Agent {
     } else {
       Ok(Vec::new())
     }
+  }
+
+  #[napi]
+  /// Snapshot the agent's working plan as `{ text, status }` items.
+  pub fn plan_items(&self) -> serde_json::Value {
+    let guard = self.inner.blocking_read();
+    serde_json::to_value(guard.plan_items()).unwrap_or(serde_json::Value::Array(Vec::new()))
+  }
+
+  #[napi]
+  /// Replace the working plan; an empty list clears it.
+  pub fn set_plan(&self, items: serde_json::Value) -> Result<()> {
+    let items: Vec<agent::tools::PlanItem> = serde_json::from_value(items).map_err(|error| {
+      Error::new(
+        napi::Status::InvalidArg,
+        format!("invalid plan items: {error}"),
+      )
+    })?;
+    let guard = self.inner.blocking_read();
+    guard.set_plan(items);
+    Ok(())
+  }
+
+  #[napi]
+  /// Forget the whole working plan.
+  pub fn clear_plan(&self) {
+    let guard = self.inner.blocking_read();
+    guard.set_plan(Vec::new());
+  }
+
+  #[napi]
+  /// Register the `update_plan` tool against this agent's plan store.
+  ///
+  /// Returns false when the tool was already registered.
+  pub fn add_plan_tool(&self) -> Result<bool> {
+    let mut guard = self
+      .inner
+      .try_write()
+      .map_err(|_| busy_error("register the plan tool"))?;
+    let tool = std::sync::Arc::new(agent::tools::PlanTool::new(guard.plan()));
+    match guard.try_add_tool(tool) {
+      Ok(()) => Ok(true),
+      Err(agent::ToolError::Failed(message)) if message.starts_with("duplicate tool") => Ok(false),
+      Err(error) => Err(Error::new(napi::Status::GenericFailure, error.to_string())),
+    }
+  }
+
+  #[napi]
+  /// Queue a message for the running turn's next step, tagged with `ticket`.
+  pub fn steer(&self, content: String, ticket: i64) -> Result<bool> {
+    let ticket = u64::try_from(ticket)
+      .map_err(|_| Error::new(napi::Status::InvalidArg, "ticket must be non-negative"))?;
+    let guard = self.inner.blocking_read();
+    Ok(guard.steer(react::llm::Content::Text(content), ticket))
+  }
+
+  #[napi]
+  /// Number of steered messages waiting for the running turn.
+  pub fn steer_depth(&self) -> u32 {
+    let guard = self.inner.blocking_read();
+    guard.steers().depth().min(u32::MAX as usize) as u32
+  }
+
+  #[napi]
+  /// Take back every steered message no step ever delivered.
+  pub fn take_undelivered_steers(&self) -> Vec<i64> {
+    let guard = self.inner.blocking_read();
+    guard
+      .take_undelivered_steers()
+      .into_iter()
+      .map(|ticket| ticket.min(i64::MAX as u64) as i64)
+      .collect()
+  }
+
+  #[napi]
+  /// Keep `name` out of the advertised tool array; it stays callable.
+  pub fn defer_tool(&self, name: String) -> Result<()> {
+    let mut guard = self
+      .inner
+      .try_write()
+      .map_err(|_| busy_error("defer a tool"))?;
+    replace_agent(&mut guard, |agent| agent.defer_tool(name));
+    Ok(())
+  }
+
+  #[napi]
+  /// Keep every tool whose name starts with `prefix` out of the advertised array.
+  pub fn defer_tool_prefix(&self, prefix: String) -> Result<()> {
+    let mut guard = self
+      .inner
+      .try_write()
+      .map_err(|_| busy_error("defer tools by prefix"))?;
+    replace_agent(&mut guard, |agent| agent.defer_tool_prefix(prefix));
+    Ok(())
+  }
+
+  #[napi]
+  /// Whether a tool is withheld from the advertised array.
+  pub fn is_deferred_tool(&self, name: String) -> bool {
+    self.inner.blocking_read().is_deferred_tool(&name)
+  }
+
+  #[napi]
+  /// Whether any registered tool is withheld from the advertised array.
+  pub fn has_deferred_tools(&self) -> bool {
+    self.inner.blocking_read().has_deferred_tools()
+  }
+
+  #[napi]
+  /// Remove asynchronous tools by name; returns how many were removed.
+  pub fn remove_tools(&self, names: Vec<String>) -> Result<u32> {
+    let mut guard = self
+      .inner
+      .try_write()
+      .map_err(|_| busy_error("remove tools"))?;
+    Ok(guard.remove_async_tools(&names).min(u32::MAX as usize) as u32)
+  }
+
+  #[napi]
+  /// Append a live extension prompt fragment.
+  pub fn add_live_prompt_section(&self, section: String) {
+    self.inner.blocking_read().add_live_prompt_section(section);
+  }
+
+  #[napi]
+  /// Remove one live extension prompt fragment.
+  pub fn remove_live_prompt_section(&self, section: String) -> bool {
+    self
+      .inner
+      .blocking_read()
+      .remove_live_prompt_section(&section)
+  }
+
+  #[napi]
+  /// Register an inline skill (no `SKILL.md` file needed).
+  pub fn register_skill(
+    &self,
+    name: String,
+    description: String,
+    instructions: String,
+    path: Option<String>,
+  ) -> Result<()> {
+    let directory = std::path::PathBuf::from(path.unwrap_or_else(|| format!(".bos/skills/{name}")));
+    let skill = agent::skills::SkillContent {
+      metadata: agent::skills::SkillMetadata::new(name, description, directory.join("SKILL.md")),
+      instructions,
+      skill_dir: directory,
+    };
+    let mut guard = self
+      .inner
+      .try_write()
+      .map_err(|_| busy_error("register a skill"))?;
+    guard.register_skill_content(skill);
+    Ok(())
+  }
+
+  #[napi]
+  /// Remove skills by name from the build's list and the live overlay.
+  pub fn remove_skills_by_names(&self, names: Vec<String>) -> Result<u32> {
+    let mut guard = self
+      .inner
+      .try_write()
+      .map_err(|_| busy_error("remove skills"))?;
+    Ok(guard.remove_skills_by_names(&names).min(u32::MAX as usize) as u32)
+  }
+
+  #[napi]
+  /// Snapshot every registered skill as JSON.
+  pub fn list_skills(&self) -> serde_json::Value {
+    let guard = self.inner.blocking_read();
+    let skills: Vec<serde_json::Value> = guard
+      .all_skills()
+      .into_iter()
+      .map(|skill| {
+        serde_json::json!({
+            "name": skill.metadata.name,
+            "description": skill.metadata.description,
+            "category": skill.metadata.category.as_str(),
+            "path": skill.metadata.path.to_string_lossy(),
+            "directory": skill.skill_dir.to_string_lossy(),
+            "user_only": skill.metadata.user_only,
+            "instructions": skill.instructions,
+        })
+      })
+      .collect();
+    serde_json::Value::Array(skills)
+  }
+
+  #[napi]
+  /// The send-side context budget in tokens (0 disables mid-turn compaction).
+  pub fn context_budget(&self) -> u32 {
+    self
+      .inner
+      .blocking_read()
+      .context_budget()
+      .min(u32::MAX as usize) as u32
+  }
+
+  #[napi]
+  /// Set the send-side context budget; refusals leave the agent unchanged.
+  pub fn set_context_budget(&self, tokens: i64) -> Result<()> {
+    let tokens = usize::try_from(tokens)
+      .map_err(|_| Error::new(napi::Status::InvalidArg, "tokens must be non-negative"))?;
+    let mut guard = self
+      .inner
+      .try_write()
+      .map_err(|_| busy_error("set the context budget"))?;
+    replace_agent(&mut guard, |agent| agent.with_context_budget(tokens));
+    Ok(())
+  }
+
+  #[napi]
+  /// Whether skills are advertised as a catalogue instead of searched.
+  pub fn skill_catalogue(&self) -> bool {
+    self.inner.blocking_read().skill_catalogue()
+  }
+
+  #[napi]
+  /// Choose between the skill catalogue and on-demand `find_skill`.
+  pub fn set_skill_catalogue(&self, enabled: bool) -> Result<()> {
+    let mut guard = self
+      .inner
+      .try_write()
+      .map_err(|_| busy_error("set the skill catalogue"))?;
+    replace_agent(&mut guard, |agent| agent.with_skill_catalogue(enabled));
+    Ok(())
+  }
+
+  #[napi]
+  /// Register the `get_goal` and `update_goal` tools against `store`.
+  ///
+  /// Returns how many tools were registered: 0 when both already exist.
+  pub fn add_goal_tools(&self, store: &crate::goal::GoalStore) -> Result<u32> {
+    let mut guard = self
+      .inner
+      .try_write()
+      .map_err(|_| busy_error("register goal tools"))?;
+    let mut registered = 0u32;
+    for tool in [
+      std::sync::Arc::new(agent::tools::GetGoalTool::new(store.inner.clone()))
+        as std::sync::Arc<dyn agent::tools::Tool>,
+      std::sync::Arc::new(agent::tools::UpdateGoalTool::new(store.inner.clone())),
+    ] {
+      match guard.try_add_tool(tool) {
+        Ok(()) => registered += 1,
+        Err(agent::ToolError::Failed(message)) if message.starts_with("duplicate tool") => {}
+        Err(error) => return Err(Error::new(napi::Status::GenericFailure, error.to_string())),
+      }
+    }
+    Ok(registered)
+  }
+
+  #[napi]
+  /// Register the `job_output` and `job_kill` tools against `jobs`.
+  ///
+  /// Returns how many tools were registered: 0 when both already exist.
+  pub fn add_job_tools(&self, jobs: &crate::jobs::JobRegistry, session: String) -> Result<u32> {
+    let mut guard = self
+      .inner
+      .try_write()
+      .map_err(|_| busy_error("register job tools"))?;
+    let mut registered = 0u32;
+    for tool in [
+      std::sync::Arc::new(
+        agent::tools::JobTool::reader("job_output").with_jobs(jobs.inner.clone(), session.clone()),
+      ) as std::sync::Arc<dyn agent::tools::Tool>,
+      std::sync::Arc::new(
+        agent::tools::JobTool::stopper("job_kill").with_jobs(jobs.inner.clone(), session.clone()),
+      ),
+    ] {
+      match guard.try_add_tool(tool) {
+        Ok(()) => registered += 1,
+        Err(agent::ToolError::Failed(message)) if message.starts_with("duplicate tool") => {}
+        Err(error) => return Err(Error::new(napi::Status::GenericFailure, error.to_string())),
+      }
+    }
+    Ok(registered)
   }
 
   #[napi]
@@ -696,12 +1077,25 @@ impl Agent {
 
   #[napi]
   /// Register a sandboxed bash tool.
-  pub async fn add_bash_tool(&self, name: String, workspace_root: Option<String>) -> Result<()> {
-    let tool = if let Some(root) = workspace_root {
+  ///
+  /// Pass `jobs` and `session` to enable `run_in_background` and route the
+  /// resulting jobs into that registry.
+  pub async fn add_bash_tool(
+    &self,
+    name: String,
+    workspace_root: Option<String>,
+    jobs: Option<&crate::jobs::JobRegistry>,
+    session: Option<String>,
+  ) -> Result<()> {
+    let jobs = jobs.map(|registry| registry.inner.clone());
+    let mut tool = if let Some(root) = workspace_root {
       BashTool::new(&name).with_workspace(&root)
     } else {
       BashTool::new(&name)
     };
+    if let Some(jobs) = jobs {
+      tool = tool.with_jobs(jobs, session.unwrap_or_else(|| "default".to_string()));
+    }
     let mut guard = self.inner.write().await;
     guard
       .try_add_tool(std::sync::Arc::new(tool))

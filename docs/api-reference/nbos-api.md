@@ -115,8 +115,20 @@ AgentBuilder(bus, options=None)
 | `skill(name, content)` | Add inline skill | `AgentBuilder` |
 | `with_mcp(ns, cmd, args)` | Add MCP server (process) | `AgentBuilder` |
 | `with_mcp_http(ns, url)` | Add MCP server (HTTP) | `AgentBuilder` |
-| `with_bash(name, workspace_root)` | Add bash tool | `AgentBuilder` |
+| `with_bash(name, workspace_root, jobs=None, session=None)` | Add bash tool, optionally routing background jobs | `AgentBuilder` |
 | `with_memory(memory, limit=5)` | Recall up to `limit` items from a `Memory` store on each text run | `AgentBuilder` |
+| `with_max_steps(steps)` | Set the maximum ReAct steps | `AgentBuilder` |
+| `with_persona_complete(complete=True)` | Use the system prompt as the whole prompt | `AgentBuilder` |
+| `with_compaction_input_tokens(tokens)` | Cap one compaction request's input | `AgentBuilder` |
+| `with_tool_output_cap(bytes_cap)` | Cap the text one tool result may add to the context | `AgentBuilder` |
+| `with_parallel_tool_calls(enabled=True)` | Run one response's tool calls concurrently | `AgentBuilder` |
+| `with_web_search(enabled=True)` | Offer the provider's hosted web-search tool | `AgentBuilder` |
+| `with_context_budget(tokens)` | Set the send-side history ceiling for mid-turn compaction | `AgentBuilder` |
+| `with_skill_catalogue(enabled=True)` | Advertise skills as a catalogue instead of searching | `AgentBuilder` |
+| `with_fallback(base_url, model, api_key="")` | Append an alternate endpoint tried after a provider failure | `AgentBuilder` |
+| `with_plan_tool(enabled=True)` | Register the `update_plan` tool at start | `AgentBuilder` |
+| `defer_tool(name)` | Keep a tool out of the advertised array; it stays callable | `AgentBuilder` |
+| `defer_tool_prefix(prefix)` | Keep every tool whose name starts with `prefix` out of the array | `AgentBuilder` |
 
 #### Execution Methods
 
@@ -161,6 +173,30 @@ High-level agent wrapper with fluent API. Created via `BrainOS.agent()` or `Agen
 | `react(task)` | Run with ReAct reasoning | `str` |
 | `stream(task)` | Stream response tokens | `AsyncIterator` |
 | `reset_metrics()` | Reset the collected performance metrics | `Agent` |
+| `plan_items()` | Snapshot the working plan as `{text, status}` items | `list[dict]` |
+| `set_plan(items)` | Replace the working plan; an empty list clears it | `Agent` |
+| `clear_plan()` | Forget the whole working plan | `Agent` |
+| `add_plan_tool()` | Register the `update_plan` tool | `bool` |
+| `steer(content, ticket)` | Queue a message for the running turn's next step | `bool` |
+| `steer_depth()` | Number of steered messages waiting | `int` |
+| `take_undelivered_steers()` | Take back steered messages no step delivered | `list[int]` |
+| `defer_tool(name)` | Keep a tool out of the advertised array; it stays callable | `Agent` |
+| `defer_tool_prefix(prefix)` | Keep every tool whose name starts with `prefix` out of the array | `Agent` |
+| `is_deferred_tool(name)` | Whether a tool is withheld from the advertised array | `bool` |
+| `has_deferred_tools()` | Whether any registered tool is withheld | `bool` |
+| `remove_tools(names)` | Remove asynchronous tools by name | `int` |
+| `add_live_prompt_section(section)` | Append a live extension prompt fragment | `Agent` |
+| `remove_live_prompt_section(section)` | Remove one live extension prompt fragment | `bool` |
+| `register_skill(name, description, content, path=None)` | Register an inline skill | `Agent` |
+| `remove_skills_by_names(names)` | Remove skills by name | `int` |
+| `list_skills()` | Snapshot every registered skill | `list[dict]` |
+| `context_budget(tokens=None)` | Read or set the send-side context budget | `int \| Agent` |
+| `set_context_budget(tokens)` | Set the send-side context budget | `Agent` |
+| `skill_catalogue(enabled=None)` | Read or choose catalogue vs on-demand search | `bool \| Agent` |
+| `set_skill_catalogue(enabled)` | Choose catalogue vs on-demand search | `Agent` |
+| `add_goal_tools(store)` | Register `get_goal`/`update_goal` against a `GoalStore` | `int` |
+| `add_job_tools(jobs, session="default")` | Register `job_output`/`job_kill` against a `JobRegistry` | `int` |
+| `add_bash_tool(name="bash", workspace_root=None, jobs=None, session=None)` | Register a sandboxed bash tool | `Agent` |
 
 #### Properties
 
@@ -338,6 +374,23 @@ config.timeout_secs = 120
 | `circuit_breaker_max_failures` | 5 | Failures before open circuit |
 | `circuit_breaker_cooldown_secs` | 30 | Seconds before half-open |
 
+#### Agent Behaviour Fields
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `persona_complete` | `False` | Treat `system_prompt` as the whole prompt (no appended guidance) |
+| `max_steps` | 10 | Maximum ReAct steps before a run is stopped |
+| `compaction_input_tokens` | 24000 | Token ceiling for one compaction request |
+| `tool_output_cap` | 0 | Bytes one tool result may add (0 keeps the engine default) |
+| `parallel_tool_calls` | `False` | Run one response's tool calls concurrently |
+| `web_search` | `False` | Offer the provider's hosted web-search tool (Responses only) |
+| `context_budget` | `None` | Send-side history ceiling for mid-turn compaction |
+| `skill_catalogue` | `None` | Advertise skills as a catalogue instead of searching |
+| `fallbacks` | `[]` | Alternates added with `add_fallback(base_url, model, api_key="")` |
+
+`AgentConfig.fallback_list()` returns the configured alternates as plain
+dictionaries; `clear_fallbacks()` drops them.
+
 ---
 
 ## PyAgent (Native Agent)
@@ -353,7 +406,7 @@ The native Rust-backed agent class from `nbos_native`.
 | `react(task)` | Run ReAct reasoning |
 | `stream(task)` | Stream tokens |
 | `add_tool(tool)` | Register PythonTool |
-| `add_bash_tool(name, workspace_root)` | Add bash tool |
+| `add_bash_tool(name, workspace_root, jobs=None, session=None)` | Add bash tool, optionally routing background jobs |
 | `add_mcp_server(ns, cmd, args)` | Add MCP server (process) |
 | `add_mcp_server_http(ns, url)` | Add MCP server (HTTP) |
 | `register_hook(event, callback)` | Register lifecycle hook |
@@ -726,6 +779,207 @@ agent = brain.agent("assistant").with_plugins(plugin)
 | `LlmResponseWrapper` | LLM response interceptor - fields: `response_type`, `content`, `tool_name`, `tool_args`, `tool_id` |
 | `ToolCallWrapper` | Tool call interceptor - fields: `name`, `args`, `id` |
 | `ToolResultWrapper` | Tool result interceptor - fields: `result`, `success`, `error` |
+
+---
+
+## Goal / GoalStore
+
+A goal is the durable objective a session pursues; the plan answers "what steps
+are left", the goal answers "what is all of this for". Both classes mirror the
+JavaScript binding exactly.
+
+#### Goal
+
+| Method / Property | Description |
+|-------------------|-------------|
+| `Goal.create(objective, max_rounds=None)` | Create an active, armed goal (blank objectives raise) |
+| `Goal.from_json(json)` | Restore a goal from its snapshot |
+| `to_json()` | The goal as a plain dictionary |
+| `objective` \| `state` \| `rounds` \| `max_rounds` | Durable fields |
+| `activation` \| `blocked_reason` | Continuation flag and blocker |
+| `remaining` \| `can_advance` \| `exhausted` | Round-cap projections |
+| `advance()` \| `pause()` \| `resume()` \| `complete()` | Phase transitions |
+| `block(code, message)` | Stop on a lower-kebab-case policy code |
+| `arm()` \| `disarm()` \| `sanitize()` | Continuation and bounds |
+
+#### GoalStore
+
+Seed a store with the session's goal, hand it to `Agent.add_goal_tools`, and
+apply `take_settle()` when the turn ends.
+
+| Method | Description |
+|--------|-------------|
+| `GoalStore(goal)` | Seed a store from a `Goal` |
+| `snapshot()` | The goal as the model sees it now |
+| `complete()` / `block(code, message)` | Record a settle transition |
+| `take_settle()` | Take the recorded transition, if any |
+| `has_settle()` | Whether a transition still waits for the host |
+
+## JobRegistry
+
+The live roster of background jobs. Share one instance between the bash tool
+that spawns jobs, the job tools that read them, and the host that draws the
+list.
+
+| Method | Description |
+|--------|-------------|
+| `JobRegistry(job_cap=None, output_cap=None)` | Create a bounded roster |
+| `list(session)` | Every job started by `session`, oldest first |
+| `get(id)` | One job's metadata, or `None` |
+| `output(id, max_bytes=None)` | Captured output, or `None` |
+| `kill(id)` | Stop a running job |
+| `wait(id, timeout_ms=0)` | Wait for settlement, then return metadata |
+| `running_count(session)` / `settled_count(session)` | Roster counts |
+| `clear_settled(session)` | Drop settled jobs |
+| `version()` | Counter that changes on every roster change |
+
+## Ferris SDK
+
+Ferris is the BOS extension framework. These classes bind the SDK's authoring
+surface: a Python object supplies the same start/invoke/shutdown callbacks a
+Rust Extension implements, and FerrisHarness runs it in process exactly like the
+Rust TestHarness.
+
+This is the authoring/runtime harness, not the package manager. Installing,
+activating and isolating untrusted packages through the Ferris runtimes is a
+separate host surface.
+
+### FerrisManifest
+
+| Member | Description |
+|--------|-------------|
+| `FerrisManifest.parse(toml)` | Parse and validate an extension.toml schema-2.0 document |
+| `manifest.id` | The extension id |
+| `manifest.runtime_kind` | The runtime kind the manifest asks for |
+| `manifest.to_toml()` | The canonical TOML document |
+| `manifest.to_json()` | The manifest as a plain dictionary |
+
+### FerrisManifestBuilder
+
+Chainable schema-2.0 manifest builder. Every method returns a new builder.
+
+| Member | Description |
+|--------|-------------|
+| `FerrisManifestBuilder(id, name, version, description)` | Start a manifest |
+| `host(req)` / `extension_api(req)` | Compatibility ranges |
+| `runtime(kind)` / `runtime_config(key, value)` | Runtime selection and opaque config |
+| `capability(cap)` | Require one capability |
+| `contribution(kind, id, payload=None)` | Declare one contribution with an optional payload |
+| `author` / `license` / `repository` / `homepage` | Identity metadata |
+| `dependency(id, requirement)` | Dependency requirement |
+| `provide(spec)` / `require(spec)` | Service declarations from dictionaries |
+| `max_memory_mb` / `max_execution_ms` / `max_concurrent_calls` / `max_output_bytes` / `max_table_elements` | Resource ceilings |
+| `configuration_schema(path)` / `configuration_defaults(value)` | Configuration block |
+| `startup(policy)` | `on-startup`, `on-demand`, `on-workspace-open`, `manual` |
+| `build()` | Validate and return a `FerrisManifest` |
+
+```python
+manifest = (
+    FerrisManifestBuilder("com.example.echo", "Echo", "1.0.0", "Echo")
+    .runtime("declarative")
+    .capability("agent.tools.register")
+    .contribution("tool", "echo", {"description": "Echo"})
+    .startup("on-demand")
+    .build()
+)
+```
+
+### FerrisHarness
+
+| Member | Description |
+|--------|-------------|
+| `FerrisHarness(manifest, root, start, invoke, shutdown=None)` | Build a harness from a TOML manifest and callbacks |
+| `harness.start()` | Run start(ctx) and return its contributions |
+| `harness.invoke(id, input)` | Invoke a contribution id as a tool |
+| `harness.invoke_contribution(kind, id, input)` | Invoke with an explicit kind |
+| `harness.shutdown()` | Run shutdown() |
+| `harness.manifest()` | The parsed manifest |
+| `harness.runtime_kind` / `harness.root` | Runtime kind and package root |
+
+Callbacks receive one dictionary and may be sync or async:
+
+```python
+async def start(ctx):
+    return [{"kind": "tool", "id": "echo", "payload": {"description": "Echo"}}]
+
+async def invoke(call):
+    return call["input"]  # {contribution, input, context}
+
+harness = FerrisHarness(manifest_toml, "/tmp/echo", start, invoke)
+contributions = await harness.start()
+await harness.invoke("echo", {"text": "hi"})
+await harness.shutdown()
+```
+
+### FerrisHost
+
+The full Ferris package host. It owns a canonical store, installs packages,
+plans them in dependency order, activates the standard runtimes, exposes
+contributions as dictionaries, and forwards invocations. Nothing starts until
+apply() is called.
+
+| Member | Description |
+|--------|-------------|
+| `FerrisHost(root, workspace=None, trust=None, policy_mode=None, on_contributions=None, on_revoke=None, process_sandbox=None)` | Open a host; policy mode is `enforce` (default) or `advisory`; `process_sandbox=False` is a development-only escape hatch |
+| `host.root` | Canonical store root |
+| `host.install(source)` | Install a package tree and return `{id, version}` |
+| `host.install_package(source, origin=None)` | Install with `installed`, `development` or `builtin` origin |
+| `host.installed()` | Installed `{id, version}` pairs |
+| `host.uninstall(id, purge_data=False)` | Remove an extension, optionally purging its data |
+| `host.versions(id)` / `host.active_version(id)` | Version list and active version |
+| `host.activate(id, version)` / `host.rollback(id)` | Switch the active version |
+| `host.set_enabled(id, enabled)` | Enable or disable without uninstalling |
+| `host.clear_failure(id)` / `host.quarantine(id, reason)` | Lifecycle recovery |
+| `host.package_root(id, version)` | Canonical package directory |
+| `host.plan()` | Activation order (dependency first) |
+| `host.apply()` | Start every planned package; returns applied contributions |
+| `host.reload()` | Unload and re-apply the current plan |
+| `host.unload()` | Revoke contributions and shut down every runtime |
+| `host.contributions()` | Applied contributions as a dictionary |
+| `host.invoke(extension, kind, id, input)` | Invoke one contribution on a started runtime |
+| `host.register_extension(manifest, root, start, invoke, shutdown=None)` | Register an in-process Python extension as a linked package |
+| `host.subscribe_events(topics, callback)` / `host.unsubscribe_events(id)` | Host event subscription and cancellation |
+| `host.publish_event(topic, payload)` | Publish a host event; returns `{delivered, dropped}` |
+| `await host.register_agent_tools(agent)` | Register applied tool contributions on an Agent/AgentBuilder |
+| `host.grant(extension, capability, scope=None, note=None)` | Persist a capability grant; an unknown scope is an error |
+| `host.revoke_grant(extension, capability)` | Remove a grant |
+| `host.grants(extension)` | Every grant for one extension |
+| `host.audit_degraded()` | First audit persistence failure, or `None` |
+
+Runtimes: declarative, process, MCP, Cordis, Extism and WebAssembly Component.
+`builtin` manifests are refused because no host-linked builtin is registered.
+
+```python
+from nbos import FerrisHost
+
+host = FerrisHost("/tmp/ferris-store", "/tmp/workspace")
+host.install("/path/to/package")
+host.plan()
+contributions = await host.apply()
+result = await host.invoke("com.example.echo", "tool", "echo", {"x": 1})
+await host.unload()
+```
+
+## Prompt Templates
+
+| Function | Description |
+|----------|-------------|
+| `render_template(template, variables)` | Substitute `{{name}}` placeholders from a string mapping |
+| `with_memory(template, memory=None)` | Place a recalled-memory block, honouring `{{memory}}` |
+| `estimate_tokens(text)` | Estimate tokens with the agent's own heuristic |
+
+```python
+from nbos import Goal, GoalStore, JobRegistry, render_template
+
+goal = Goal.create("Ship the release")
+store = GoalStore(goal)
+agent.add_goal_tools(store)
+
+jobs = JobRegistry()
+agent.add_job_tools(jobs, session="default")
+
+prompt = render_template("You are {{role}}.", {"role": "a reviewer"})
+```
 
 ---
 

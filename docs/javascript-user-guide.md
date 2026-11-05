@@ -833,6 +833,223 @@ the store, and a blank query returns the most recent items. A
 `new Memory(maxItems)` (or `withMaxItems(n)`) cap evicts the oldest
 items on overflow.
 
+## Plans, Goals, Jobs and Steering
+
+These controls cover the long-running parts of a session: the working plan, the
+durable goal, background processes, and mid-turn messages.
+
+### Plans
+
+The agent owns one plan store. Register the built-in `update_plan` tool so the
+model can maintain it, then render `planItems()` in your UI:
+
+```javascript
+const agent = await new AgentBuilder(null, { apiKey, baseUrl, model })
+  .planTool()
+  .start();
+
+agent.addPlanTool();               // explicit alternative to .planTool()
+agent.setPlan([{ text: 'write tests', status: 'in_progress' }]);
+console.log(agent.planItems());
+agent.clearPlan();
+```
+
+### Goals
+
+A goal outlives a turn. Seed a `GoalStore` for the current turn, register the
+`get_goal`/`update_goal` tools, and settle the store when the turn ends:
+
+```javascript
+const { Goal, GoalStore } = require('@open1s/jsbos');
+
+const goal = Goal.create('Ship the 4.1 release');
+const store = new GoalStore(goal);
+agent.addGoalTools(store);
+
+// ... run the turn ...
+
+const settle = store.takeSettle(); // null, { type: 'complete' } or { type: 'blocked', code, message }
+if (settle?.type === 'complete') goal.complete();
+```
+
+`Goal` also supports `pause`, `resume`, `advance`, `block`, `arm`, `disarm`,
+`toJSON` and `Goal.fromJSON`.
+
+### Steering
+
+`steer(content, ticket)` queues a message for the RUNNING turn's next step.
+`takeUndeliveredSteers()` returns the tickets of messages no step reached, so a
+host can put them back in its own queue.
+
+```javascript
+agent.steer('Also check the changelog.', 12);
+agent.steerDepth();                 // queued messages
+agent.takeUndeliveredSteers();      // [12] after a turn that ended early
+```
+
+### Background jobs
+
+Share one `JobRegistry` between the bash tool that spawns jobs and the job
+tools that read them. Passing `jobs` to `bash()` enables
+`run_in_background` on the shell tool.
+
+```javascript
+const { JobRegistry } = require('@open1s/jsbos');
+
+const jobs = new JobRegistry();
+const agent = await new AgentBuilder(null, { apiKey, baseUrl, model })
+  .bash('bash', process.cwd(), jobs, 'default')
+  .start();
+agent.addJobTools(jobs, 'default');
+
+for (const job of jobs.list('default')) console.log(job.id, job.status);
+const tail = jobs.output(id);
+await jobs.wait(id, 5000);
+jobs.kill(id);
+```
+
+### Deferred tools, live skills and prompt sections
+
+`deferTool(name)` / `deferToolPrefix(prefix)` keep a tool out of the advertised
+array while leaving it callable through `find_tool`/`call_tool`.
+`registerSkill` adds an inline skill with no `SKILL.md` file, and
+`addLivePromptSection` appends a host-owned prompt fragment.
+
+```javascript
+agent.deferTool('mcp_search').deferToolPrefix('mcp_');
+agent.registerSkill('reviewer', 'Review code', 'Read the diff first.');
+agent.addLivePromptSection('Stay terse.');
+agent.listSkills();
+```
+
+### Prompt templates
+
+```javascript
+const { renderTemplate, withMemory, estimateTokens } = require('@open1s/jsbos');
+renderTemplate('You are {{role}}.', { role: 'a reviewer' });
+withMemory('You are a reviewer.\n\n{{memory}}', 'Remember: tea.');
+estimateTokens('one two three');
+```
+
+## Ferris Extensions
+
+Ferris is the BOS extension framework. The binding lets you implement the SDK's
+`Extension` interface in JavaScript and run it in process. A manifest is still a
+schema-2.0 `extension.toml`; the callbacks supply the same start/invoke/shutdown
+steps a Rust extension implements.
+
+```javascript
+const { FerrisHarness, FerrisManifest } = require('@open1s/jsbos');
+
+const manifest = `
+schema_version = "2.0"
+
+[extension]
+id = "com.example.echo"
+name = "Echo"
+version = "1.0.0"
+description = "Echoes its input"
+
+[compatibility]
+host = ">=3.0.0"
+extension_api = ">=1.0.0"
+
+[runtime]
+kind = "builtin"
+
+[capabilities]
+required = ["agent.tools.register"]
+
+[[contribution]]
+kind = "tool"
+id = "echo"
+`;
+
+const harness = new FerrisHarness(
+  manifest,
+  '/tmp/echo-extension',
+  async (ctx) => [{ kind: 'tool', id: 'echo', payload: { description: 'Echo' } }],
+  async (call) => call.input, // { contribution, input, context }
+);
+
+const contributions = await harness.start();
+const result = await harness.invoke('echo', { text: 'hi' });
+await harness.shutdown();
+```
+
+`FerrisManifest.parse(toml)` validates a manifest without running anything and
+exposes `id`, `runtimeKind`, `toToml()` and `toJSON()`. Callbacks may be sync or
+async. This harness runs code in the host process; for untrusted packages use
+the Ferris process/WASM runtimes through a host that enforces capabilities.
+
+A manifest can also be built without hand-writing TOML:
+
+```javascript
+const { FerrisManifestBuilder } = require('@open1s/jsbos');
+const manifest = new FerrisManifestBuilder('com.example.echo', 'Echo', '1.0.0', 'Echo')
+  .runtime('declarative')
+  .capability('agent.tools.register')
+  .contribution('tool', 'echo', { description: 'Echo' })
+  .startup('on-demand')
+  .build();
+```
+
+### Installing and running packages
+
+`FerrisHost` is the package host. It installs into a canonical store, plans in
+dependency order, activates the standard runtimes and exposes contributions.
+
+```javascript
+const { FerrisHost } = require('@open1s/jsbos');
+
+const host = new FerrisHost('/tmp/ferris-store', '/tmp/workspace');
+host.install('/path/to/package');
+host.plan();                        // dependency-first ids
+const contributions = await host.apply();
+const result = await host.invoke('com.example.echo', 'tool', 'echo', { x: 1 });
+await host.unload();
+```
+
+Hosts default to `policyMode: 'enforce'`; grant what a package needs first:
+
+```javascript
+host.grant('com.example.echo', 'process.execute', 'program:node');
+```
+
+Use `setEnabled`, `uninstall`, `versions`, `activate`, `rollback`,
+`packageRoot` and `quarantine` for lifecycle. Contributions are data;
+`registerAgentTools` registers tools on an agent, while prompts/skills/context
+remain yours to place.
+
+Host options add callbacks and event hooks:
+
+```javascript
+const host = new FerrisHost('/tmp/ferris-store', {
+  workspace: '/tmp/workspace',
+  onContributions: ({ extension, contributions }) => { /* register */ },
+  onRevoke: ({ extension, contributions }) => { /* unregister */ },
+});
+
+const subscription = host.subscribeEvents(['agent.*'], (event) => {
+  console.log(event.event_type, event.payload);
+});
+host.publishEvent('agent.started', { ok: true });
+host.unsubscribeEvents(subscription);
+```
+
+A JavaScript extension can also be registered as an in-process linked package:
+
+```javascript
+await host.registerExtension(manifestToml, '/tmp/linked', start, invoke);
+```
+
+After `apply()`, register the applied tools on an agent with
+`registerAgentTools`; each tool forwards to the owning runtime:
+
+```javascript
+const tools = await host.registerAgentTools(agent);
+```
+
 ## API Reference
 
 For the complete API reference, see [JavaScript API Reference](./api-reference/jsbos-api.md).
