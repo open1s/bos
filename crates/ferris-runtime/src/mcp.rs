@@ -83,87 +83,42 @@ struct WriteRequest {
     done: std::sync::mpsc::SyncSender<std::io::Result<()>>,
 }
 
-/// One live MCP server.
-/// One spawned MCP server: a std child on Unix, or an AppContainer child on
-/// Windows. The runtime only needs id, piped stdio, kill and wait.
-enum McpChild {
-    #[cfg_attr(windows, allow(dead_code))]
-    Std(Child),
-    #[cfg(windows)]
-    Sandbox(heel::Child),
-}
+/// One spawned MCP server. The runtime only needs id, piped stdio, kill and
+/// wait, all of which the standard-library child already exposes.
+struct McpChild(Child);
 
 impl McpChild {
-    #[cfg_attr(windows, allow(dead_code))]
     fn id(&self) -> u32 {
-        match self {
-            Self::Std(child) => child.id(),
-            #[cfg(windows)]
-            Self::Sandbox(child) => child.id(),
-        }
+        self.0.id()
     }
 
     fn take_stdin(&mut self) -> Option<Box<dyn std::io::Write + Send>> {
-        match self {
-            Self::Std(child) => child
-                .stdin
-                .take()
-                .map(|stdin| Box::new(stdin) as Box<dyn std::io::Write + Send>),
-            #[cfg(windows)]
-            Self::Sandbox(child) => child
-                .take_stdin()
-                .map(|stdin| Box::new(stdin) as Box<dyn std::io::Write + Send>),
-        }
+        self.0
+            .stdin
+            .take()
+            .map(|stdin| Box::new(stdin) as Box<dyn std::io::Write + Send>)
     }
 
     fn take_stdout(&mut self) -> Option<Box<dyn std::io::Read + Send>> {
-        match self {
-            Self::Std(child) => child
-                .stdout
-                .take()
-                .map(|stdout| Box::new(stdout) as Box<dyn std::io::Read + Send>),
-            #[cfg(windows)]
-            Self::Sandbox(child) => child
-                .take_stdout()
-                .map(|stdout| Box::new(stdout) as Box<dyn std::io::Read + Send>),
-        }
+        self.0
+            .stdout
+            .take()
+            .map(|stdout| Box::new(stdout) as Box<dyn std::io::Read + Send>)
     }
 
     fn take_stderr(&mut self) -> Option<Box<dyn std::io::Read + Send>> {
-        match self {
-            Self::Std(child) => child
-                .stderr
-                .take()
-                .map(|stderr| Box::new(stderr) as Box<dyn std::io::Read + Send>),
-            #[cfg(windows)]
-            Self::Sandbox(child) => child
-                .take_stderr()
-                .map(|stderr| Box::new(stderr) as Box<dyn std::io::Read + Send>),
-        }
+        self.0
+            .stderr
+            .take()
+            .map(|stderr| Box::new(stderr) as Box<dyn std::io::Read + Send>)
     }
 
     fn kill(&mut self) {
-        match self {
-            Self::Std(child) => {
-                let _ = child.kill();
-            }
-            #[cfg(windows)]
-            Self::Sandbox(child) => {
-                let _ = child.kill();
-            }
-        }
+        let _ = self.0.kill();
     }
 
     fn wait(&mut self) {
-        match self {
-            Self::Std(child) => {
-                let _ = child.wait();
-            }
-            #[cfg(windows)]
-            Self::Sandbox(child) => {
-                let _ = futures_lite::future::block_on(child.wait());
-            }
-        }
+        let _ = self.0.wait();
     }
 }
 
@@ -573,14 +528,8 @@ struct McpCore {
     /// RSS sampler bound to the child's start-time identity (#38 / #109).
     #[cfg(unix)]
     watchdog: Mutex<Option<crate::process::MemoryWatchdog>>,
-    /// The AppContainer every server child is launched into. Created on first
-    /// spawn; a failure to create it is fatal, never a direct-exec fallback.
-    /// heel's job object carries the memory ceiling and kill-on-close.
-    #[cfg(windows)]
-    appcontainer: Mutex<Option<Arc<crate::windows_sandbox::WindowsSandbox>>>,
     cancelled: AtomicBool,
     stopped: AtomicBool,
-    sandbox: AtomicBool,
     /// Set by notifications/*/list_changed; the next catalog read rediscovers.
     catalog_dirty: Arc<AtomicBool>,
 }
@@ -628,13 +577,6 @@ impl McpRuntime {
             )?),
             call_gate: tokio::sync::Mutex::new(()),
         })
-    }
-
-    /// Disable the platform OS sandbox for this runtime. This is a
-    /// development escape hatch for hosts whose nested sandbox cannot start.
-    pub fn with_sandbox(self, enabled: bool) -> Self {
-        self.core.sandbox.store(enabled, Ordering::SeqCst);
-        self
     }
 
     /// The tool descriptors the server advertised.
@@ -723,11 +665,8 @@ impl McpCore {
             child: Mutex::new(None),
             #[cfg(unix)]
             watchdog: Mutex::new(None),
-            #[cfg(windows)]
-            appcontainer: Mutex::new(None),
             cancelled: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
-            sandbox: AtomicBool::new(true),
             catalog_dirty: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -821,35 +760,6 @@ impl McpCore {
         Err(last.expect("a start attempt ran"))
     }
 
-    #[cfg(windows)]
-    fn sandbox(
-        &self,
-        program: &Path,
-    ) -> Result<Arc<crate::windows_sandbox::WindowsSandbox>, ExtensionError> {
-        let mut slot = self
-            .appcontainer
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(sandbox) = slot.as_ref() {
-            return Ok(Arc::clone(sandbox));
-        }
-        let sandbox = Arc::new(
-            crate::windows_sandbox::WindowsSandbox::new_blocking(
-                &self.root,
-                None,
-                None,
-                self.memory_bytes,
-                program,
-            )
-            .map_err(|message| ExtensionError::Runtime {
-                extension: self.extension.to_string(),
-                message,
-            })?,
-        );
-        *slot = Some(Arc::clone(&sandbox));
-        Ok(sandbox)
-    }
-
     fn start(&self) -> Result<Session, ExtensionError> {
         self.ensure_running()?;
         let program = if is_allowlisted_command(&self.entry) {
@@ -897,33 +807,11 @@ impl McpCore {
                 },
             )?;
         }
-        // MCP is also an arbitrary package-controlled child process. Reuse
-        // the platform sandbox used by ProcessRuntime; a missing sandbox binary
-        // or failed profile must never fall back to direct execution.
-        let sandboxed = self.sandbox.load(Ordering::SeqCst);
-        let mut command = if sandboxed && cfg!(target_os = "linux") {
-            let mut command = Command::new("bwrap");
-            command.args(crate::process::linux_bwrap_plan(
-                &self.root, None, None, &program, &self.args,
-            ));
-            command
-        } else if sandboxed && cfg!(target_os = "macos") {
-            let mut command = Command::new("/usr/bin/sandbox-exec");
-            command
-                .arg("-p")
-                .arg(crate::process::sandbox_profile(&self.root, None, None))
-                .arg(&program)
-                // The profile and the program are sandbox-exec's own arguments;
-                // the package's argument vector belongs to the program it execs.
-                // Passing only the program ran it with no arguments, so an MCP
-                // server whose entry needs a script path never answered.
-                .args(&self.args);
-            command
-        } else {
-            let mut command = Command::new(&program);
-            command.args(&self.args);
-            command
-        };
+        // The MCP server is a ferris runtime too: it controls its own
+        // confinement, so it is launched directly rather than through an OS
+        // sandbox. The process.execute grant above is the host's gate.
+        let mut command = Command::new(&program);
+        command.args(&self.args);
         // Apply the same Unix RLIMIT and process-group ceilings as
         // ProcessRuntime. Windows remains a documented limitation until
         // Job Object enforcement is implemented.
@@ -946,40 +834,10 @@ impl McpCore {
         for (key, value) in &self.env {
             command.env(key, value);
         }
-        #[cfg(windows)]
-        let _ = command;
-        #[cfg(not(windows))]
-        let mut child = McpChild::Std(command.spawn().map_err(|source| ExtensionError::Io {
-            path: program,
+        let mut child = McpChild(command.spawn().map_err(|source| ExtensionError::Io {
+            path: program.clone(),
             source,
         })?);
-        #[cfg(windows)]
-        let mut child = if sandboxed {
-            let sandbox = self.sandbox(&program)?;
-            let mut envs: Vec<(String, String)> = Vec::new();
-            for key in ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"] {
-                if let Some(value) = std::env::var_os(key) {
-                    envs.push((key.to_string(), value.to_string_lossy().into_owned()));
-                }
-            }
-            for (key, value) in &self.env {
-                envs.push((key.clone(), value.clone()));
-            }
-            let entry = program.to_string_lossy().into_owned();
-            let child = futures_lite::future::block_on(
-                sandbox.spawn(&entry, &self.args, &self.root, &envs),
-            )
-            .map_err(|message| ExtensionError::Runtime {
-                extension: self.extension.to_string(),
-                message,
-            })?;
-            McpChild::Sandbox(child)
-        } else {
-            McpChild::Std(command.spawn().map_err(|source| ExtensionError::Io {
-                path: program.clone(),
-                source,
-            })?)
-        };
         let stdin = child.take_stdin().ok_or_else(|| ExtensionError::Protocol {
             extension: self.extension.to_string(),
             message: "MCP stdin was not piped".to_string(),
@@ -1855,7 +1713,7 @@ mod tests {
         let mut command = Command::new("sleep");
         command.arg("30");
         let child = command.spawn().expect("long-running child");
-        let child = Arc::new(Mutex::new(McpChild::Std(child)));
+        let child = Arc::new(Mutex::new(McpChild(child)));
         terminate_child_handle(&child);
         // wait() blocks until the killed child is reaped; a regression that
         // failed to terminate would hang this test rather than pass it.
@@ -1864,27 +1722,27 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn the_linux_mcp_child_cannot_write_outside_its_package_root() {
+    async fn the_linux_mcp_child_controls_its_own_filesystem() {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .expect("CI runner HOME is set");
-        let root = home.join(format!("bsh-mcp-sandbox-package-{}", std::process::id()));
-        let probe = home.join(format!("bsh-mcp-sandbox-probe-{}", std::process::id()));
+        let root = home.join(format!("bsh-mcp-package-{}", std::process::id()));
+        let probe = home.join(format!("bsh-mcp-probe-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_file(&probe);
         std::fs::create_dir_all(&root).expect("package root");
         let server = r#"import json, os, sys, resource
-probe = os.path.join(os.environ["HOME"], "bsh-mcp-sandbox-probe-PID")
+probe = os.path.join(os.environ["HOME"], "bsh-mcp-probe-PID")
 for line in sys.stdin:
     request = json.loads(line)
     method = request.get("method")
     rid = request.get("id")
     if method == "initialize":
-        result = {"protocolVersion": "2024-11-05", "capabilities": {"resources": {}, "prompts": {}}, "serverInfo": {"name": "sandbox-test", "version": "1"}}
+        result = {"protocolVersion": "2024-11-05", "capabilities": {"resources": {}, "prompts": {}}, "serverInfo": {"name": "mcp-test", "version": "1"}}
     elif method == "notifications/initialized":
         continue
     elif method == "tools/list":
-        result = {"tools": [{"name": "probe", "description": "Probe filesystem isolation", "inputSchema": {"type": "object", "properties": {}}}]}
+        result = {"tools": [{"name": "probe", "description": "Probe filesystem access", "inputSchema": {"type": "object", "properties": {}}}]}
     elif method == "resources/list":
         result = {"resources": []}
     elif method == "prompts/list":
@@ -1911,10 +1769,10 @@ for line in sys.stdin:
             r#"
 schema_version = "1.0"
 [extension]
-id = "com.example.mcp-sandbox"
-name = "MCP Sandbox"
+id = "com.example.mcp-probe"
+name = "MCP Probe"
 version = "1.0.0"
-description = "Linux MCP sandbox integration test"
+description = "Linux MCP integration test"
 [compatibility]
 bsh = ">=3.0.0, <4.0.0"
 extension_api = "^1.0"
@@ -1994,7 +1852,7 @@ required = ["process.execute"]
         let child = command.spawn().expect("long-running child");
         assert!(cancelled_runtime
             .core
-            .register_child(McpChild::Std(child))
+            .register_child(McpChild(child))
             .is_err());
         assert!(
             cancelled_runtime
@@ -2029,7 +1887,7 @@ required = ["process.execute"]
         let child = command.spawn().expect("late child");
         assert!(cancelled_runtime
             .core
-            .register_child(McpChild::Std(child))
+            .register_child(McpChild(child))
             .is_err());
         assert!(
             cancelled_runtime
@@ -2052,16 +1910,16 @@ required = ["process.execute"]
         .expect("runtime");
         let tools = runtime.descriptors().expect("MCP inventory");
         assert!(tools.iter().any(|tool| tool.id.as_str() == "probe"));
-        let context = CallContext::new(manifest.id().clone(), "sandbox", None, 5000);
+        let context = CallContext::new(manifest.id().clone(), "mcp", None, 5000);
         let result = runtime
             .call_tool("probe", json!({}), &context)
             .await
-            .expect("sandboxed MCP call");
+            .expect("MCP call");
         let text = result["content"][0]["text"]
             .as_str()
             .expect("MCP probe returns text");
         let values: Vec<&str> = text.split('|').collect();
-        assert_eq!(values.first(), Some(&"blocked"));
+        assert_eq!(values.first(), Some(&"wrote"));
         assert_eq!(
             values.get(1).and_then(|value| value.parse::<u64>().ok()),
             Some(256 * 1024 * 1024),
@@ -2077,7 +1935,11 @@ required = ["process.execute"]
             Some(256),
             "MCP child must inherit RLIMIT_NOFILE"
         );
-        assert!(!probe.exists(), "MCP must not write into the host HOME");
+        assert!(
+            probe.exists(),
+            "a ferris MCP child writes where its package writes"
+        );
+        let _ = std::fs::remove_file(&probe);
         runtime.shutdown().await.expect("shutdown");
         let _ = std::fs::remove_dir_all(&root);
     }

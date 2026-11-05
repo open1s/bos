@@ -180,10 +180,10 @@ ferris_sdk::Runtime                (describe + invoke)
   contributions and can call `onContributions` / `onRevoke`; the caller still
   registers tools/prompts/skills with its own agent. There is no automatic
   language-side lease that removes them.
-- **Process sandboxing is on by default.** `processSandbox: false` (JS) /
-  `process_sandbox=False` (Python) disables the platform sandbox for process
-  and MCP runtimes; it exists for hosts whose nested sandbox cannot start. It
-  is a development escape hatch, not a security boundary.
+- **Process sandboxing is not applied.** Ferris process and MCP runtimes
+  control their own confinement, so the host launches the child directly.
+  `processSandbox` (JS) / `process_sandbox` (Python) is retained for API
+  compatibility and no longer changes behavior; it is not a security boundary.
 - **Binary size.** The host build links `wasmtime` and `extism`, so the addon is
   much larger than the authoring-only build. Measured on macOS arm64 release:
   19.4 MB before Ferris, 25 MB for the authoring-only build, 45 MB for the full
@@ -231,8 +231,8 @@ ferris_sdk::Runtime                (describe + invoke)
   shutdown.
 - `crates/nbos/tests/test_ferris_host.py`: the host matrix, including the same
   runtime coverage.
-- MCP and Cordis are covered end-to-end with `process_sandbox=False` in this
-  environment; the default sandbox remains the production path.
+- MCP and Cordis are covered end-to-end; process and MCP children are
+  unconfined by design, while Cordis runs through the Node bridge.
 
 ## Recommendation
 

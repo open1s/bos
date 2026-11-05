@@ -1618,7 +1618,7 @@ $BSH ext config com.example.hello set '{"greeting":"hi"}' --root /tmp/hello-root
 |---|---|
 | Extism | `storage_get` / `storage_set` / `storage_list` 桥操作 |
 | WASM | WIT 的 `storage-get` / `storage-set` / `storage-list` |
-| process | 自己的代码 + 被沙箱允许的数据目录（没有宿主存储 API） |
+| process | 自己的代码 + 数据目录（没有宿主存储 API，也没有操作系统沙箱） |
 | Cordis | 通过桥暴露的宿主调用（以桥实现为准） |
 
 存储能力是 `extension.storage`（低风险）。键名要自己命名空间化（例如
@@ -4958,7 +4958,7 @@ UI 文档：
 | `builtin-template` | — | 仅 README，不是可安装包 |
 
 运行前先 `bsh ext validate examples/extensions/<name>`；进程类示例需要
-`process.execute`，mock 也受平台沙箱影响。
+`process.execute`；ferris 进程不套操作系统沙箱。
 
 ---
 

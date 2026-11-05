@@ -11,7 +11,6 @@ use std::collections::{BTreeMap, VecDeque};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-#[cfg(not(windows))]
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -20,7 +19,6 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
-#[cfg(not(windows))]
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
@@ -44,53 +42,27 @@ pub const HANDSHAKE_MS: u64 = 10_000;
 /// The shutdown deadline.
 pub const SHUTDOWN_MS: u64 = 1_000;
 
-/// One live child process.
-#[cfg(not(windows))]
-type ProcessChild = Child;
-#[cfg(windows)]
-type ProcessChild = heel::Child;
-
-#[cfg(not(windows))]
-type ProcessStdin = ChildStdin;
-#[cfg(windows)]
-type ProcessStdin = tokio::fs::File;
-
-#[cfg(not(windows))]
-type ProcessStdout = ChildStdout;
-#[cfg(windows)]
-type ProcessStdout = tokio::fs::File;
-
 struct ProcessSession {
-    child: ProcessChild,
-    stdin: ProcessStdin,
-    stdout: BufReader<ProcessStdout>,
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
     next_id: u64,
     token: String,
 }
 
 /// Kill the session child through the platform handle.
-fn start_kill(child: &mut ProcessChild) {
-    #[cfg(not(windows))]
+fn start_kill(child: &mut Child) {
     let _ = child.start_kill();
-    #[cfg(windows)]
-    let _ = child.kill();
 }
 
 /// Wait for the session child, ignoring the exit status.
-async fn wait_child(child: &mut ProcessChild) {
+async fn wait_child(child: &mut Child) {
     let _ = child.wait().await;
 }
 
 /// The child pid, when the platform handle exposes one.
-fn child_id(child: &ProcessChild) -> Option<u32> {
-    #[cfg(not(windows))]
-    {
-        child.id()
-    }
-    #[cfg(windows)]
-    {
-        Some(child.id())
-    }
+fn child_id(child: &Child) -> Option<u32> {
+    child.id()
 }
 
 impl ProcessSession {
@@ -262,7 +234,7 @@ impl ProcessSession {
 /// Attach the child's recent stderr to a protocol failure.
 ///
 /// "process closed stdout before answering" is true but not actionable; the
-/// line the interpreter or sandbox printed on stderr is what names the cause.
+/// line the interpreter printed on stderr is what names the cause.
 fn with_stderr_tail(error: ExtensionError, tail: &StdMutex<VecDeque<String>>) -> ExtensionError {
     let lines = {
         let tail = tail.lock().expect("stderr tail lock");
@@ -496,164 +468,6 @@ fn process_rss_bytes(pid: u32) -> Option<u64> {
     None
 }
 
-/// A bubblewrap plan that gives the child a private namespace, a read-only
-/// root, and writable binds only for the package, workspace, data and temp.
-///
-/// Kept platform-independent so the argument plan is testable on macOS even
-/// though it is only executed on Linux.
-pub fn linux_bwrap_plan(
-    root: &Path,
-    workspace: Option<&Path>,
-    data_root: Option<&Path>,
-    program: &Path,
-    args: &[String],
-) -> Vec<String> {
-    let mut plan = vec![
-        "--die-with-parent".to_string(),
-        // Keep the network namespace private; process extensions do not
-        // implicitly inherit host network access.
-        "--unshare-all".to_string(),
-        "--ro-bind".to_string(),
-        "/".to_string(),
-        "/".to_string(),
-        "--proc".to_string(),
-        "/proc".to_string(),
-        "--dev".to_string(),
-        "/dev".to_string(),
-        // The read-only root is a runtime filesystem view, not a source of
-        // host-user data. Hide common credential/config locations.
-        "--tmpfs".to_string(),
-        "/home".to_string(),
-        "--tmpfs".to_string(),
-        "/root".to_string(),
-        "--tmpfs".to_string(),
-        "/run".to_string(),
-        "--tmpfs".to_string(),
-        "/tmp".to_string(),
-    ];
-    // Bubblewrap mount and chdir arguments must be absolute. Package roots
-    // commonly arrive as relative paths from `bsh ext mock` and development CLI.
-    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let mut writable = vec![root.clone()];
-    if let Some(workspace) = workspace {
-        writable.push(
-            workspace
-                .canonicalize()
-                .unwrap_or_else(|_| workspace.to_path_buf()),
-        );
-    }
-    if let Some(data_root) = data_root {
-        writable.push(
-            data_root
-                .canonicalize()
-                .unwrap_or_else(|_| data_root.to_path_buf()),
-        );
-    }
-    // Mount parent directories before children so nested writable mounts do
-    // not hide one another (for example, a package inside the workspace).
-    writable.sort_by_key(|path| path.components().count());
-    writable.dedup();
-
-    let mut bound = Vec::<PathBuf>::new();
-    let mut created_hidden_dirs = Vec::<PathBuf>::new();
-    let hidden_roots = [
-        Path::new("/tmp"),
-        Path::new("/home"),
-        Path::new("/root"),
-        Path::new("/run"),
-    ];
-    for path in writable {
-        if hidden_roots.contains(&path.as_path())
-            || bound.iter().any(|parent| path.starts_with(parent))
-        {
-            continue;
-        }
-
-        // Recreate mount destinations below tmpfs-hidden roots. This permits
-        // an explicitly declared package/workspace without exposing sibling
-        // files from the host user's home directory.
-        if let Some(hidden_root) = hidden_roots
-            .iter()
-            .find(|hidden_root| path.starts_with(*hidden_root) && path.as_path() != **hidden_root)
-        {
-            if let Ok(relative) = path.strip_prefix(*hidden_root) {
-                let mut destination = hidden_root.to_path_buf();
-                for component in relative.components() {
-                    if let std::path::Component::Normal(name) = component {
-                        destination.push(name);
-                        if !created_hidden_dirs.contains(&destination) {
-                            plan.push("--dir".to_string());
-                            plan.push(destination.display().to_string());
-                            created_hidden_dirs.push(destination.clone());
-                        }
-                    }
-                }
-            }
-        }
-
-        plan.push("--bind".to_string());
-        plan.push(path.display().to_string());
-        plan.push(path.display().to_string());
-        bound.push(path);
-    }
-    // A tmpfs hides these roots but is still writable, so a child could create
-    // files under its host HOME path. The sandbox promises writes only inside
-    // the package, workspace, data root and temp: remount the hidden roots
-    // read-only after the explicit binds, which remain writable as separate
-    // mounts underneath them.
-    for hidden in ["/home", "/root", "/run"] {
-        plan.push("--remount-ro".to_string());
-        plan.push(hidden.to_string());
-    }
-    plan.push("--chdir".to_string());
-    plan.push(root.display().to_string());
-    plan.push(program.display().to_string());
-    plan.extend(args.iter().cloned());
-    plan
-}
-
-/// A macOS profile that allows reads everywhere and writes only inside the
-/// package, the open workspace, temp and device nodes.
-///
-/// This is a filesystem profile, not a network sandbox: the process protocol
-/// has no host network bridge, so network policy for a process package remains
-/// the capability decision that authorized spawning it.
-pub fn sandbox_profile(root: &Path, workspace: Option<&Path>, data_root: Option<&Path>) -> String {
-    let mut profile = "(version 1)(allow default)(deny file-write*)(allow file-write*".to_string();
-    let mut paths: Vec<PathBuf> = vec![
-        root.canonicalize().unwrap_or_else(|_| root.to_path_buf()),
-        PathBuf::from("/tmp"),
-        PathBuf::from("/private/tmp"),
-        PathBuf::from("/dev"),
-        PathBuf::from("/private/dev"),
-    ];
-    if let Some(workspace) = workspace {
-        paths.push(
-            workspace
-                .canonicalize()
-                .unwrap_or_else(|_| workspace.to_path_buf()),
-        );
-    }
-    if let Some(data_root) = data_root {
-        paths.push(
-            data_root
-                .canonicalize()
-                .unwrap_or_else(|_| data_root.to_path_buf()),
-        );
-    }
-    for path in paths {
-        let escaped = path.display().to_string().replace('"', "\\\"");
-        profile.push_str(&format!(" (subpath \"{escaped}\")"));
-    }
-    profile.push(')');
-    // The Linux plan uses --unshare-all, which includes the network namespace;
-    // macOS has no equivalent, so deny network explicitly to keep the two
-    // platforms' process sandboxes comparable. A future network-capable
-    // process runtime must add a scoped allow rather than relying on this one.
-    profile.push_str("(deny network*)");
-    profile
-}
-
 /// The child-side hook that installs the manifest's resource ceilings.
 ///
 /// RLIMIT_AS bounds virtual address space (not RSS), RLIMIT_NOFILE limits
@@ -746,7 +560,6 @@ fn rlimit_hook(
 }
 
 /// Apply the manifest's resource ceilings to a tokio command.
-#[cfg(not(windows))]
 pub(super) fn configure_process_limits(command: &mut Command, memory: u64, cpu: u64) {
     #[cfg(unix)]
     {
@@ -975,7 +788,6 @@ pub struct ProcessRuntime {
     workspace: Option<PathBuf>,
     data_root: Option<PathBuf>,
     policy: Option<(Arc<PolicyEngine>, TrustLevel)>,
-    sandbox: bool,
     child_pid: AtomicU32,
     /// Terminal shutdown; unlike deactivate, this cannot be reversed.
     stopped: AtomicBool,
@@ -984,11 +796,6 @@ pub struct ProcessRuntime {
     /// Bound to the spawned child's identity and cancelled on every stop path.
     #[cfg(unix)]
     watchdog: StdMutex<Option<MemoryWatchdog>>,
-    /// The AppContainer child processes run in. Created on first spawn; a
-    /// failure is fatal, never a direct-exec fallback.
-    #[cfg(windows)]
-    appcontainer:
-        tokio::sync::Mutex<Option<std::sync::Arc<crate::windows_sandbox::WindowsSandbox>>>,
 }
 
 impl ProcessRuntime {
@@ -1054,21 +861,12 @@ impl ProcessRuntime {
             workspace: None,
             data_root: None,
             policy: None,
-            // Process extensions are untrusted code: require the platform OS sandbox by default.
-            // On Linux, a missing/unsupported bubblewrap must fail the spawn rather than fall back.
-            sandbox: cfg!(any(
-                target_os = "linux",
-                target_os = "macos",
-                target_os = "windows"
-            )),
             child_pid: AtomicU32::new(0),
             stopped: AtomicBool::new(false),
             session: Mutex::new(None),
             subscriptions: std::sync::Mutex::new(Vec::new()),
             #[cfg(unix)]
             watchdog: StdMutex::new(None),
-            #[cfg(windows)]
-            appcontainer: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -1111,21 +909,15 @@ impl ProcessRuntime {
         self
     }
 
-    /// Attach the workspace a sandboxed child may write inside.
+    /// Attach the workspace the package's tools operate on.
     pub fn with_workspace(mut self, workspace: Option<PathBuf>) -> Self {
         self.workspace = workspace;
         self
     }
 
-    /// Attach the package data namespace a sandboxed child may write inside.
+    /// Attach the package data namespace.
     pub fn with_data_root(mut self, data_root: Option<PathBuf>) -> Self {
         self.data_root = data_root;
-        self
-    }
-
-    /// Disable or enable the platform process sandbox (tests may opt out).
-    pub fn with_sandbox(mut self, sandbox: bool) -> Self {
-        self.sandbox = sandbox;
         self
     }
 
@@ -1222,34 +1014,6 @@ impl ProcessRuntime {
         }
     }
 
-    /// The AppContainer this runtime's children run in, created once.
-    #[cfg(windows)]
-    async fn sandbox(
-        &self,
-        program: &Path,
-    ) -> Result<std::sync::Arc<crate::windows_sandbox::WindowsSandbox>, ExtensionError> {
-        let mut slot = self.appcontainer.lock().await;
-        if let Some(sandbox) = slot.as_ref() {
-            return Ok(std::sync::Arc::clone(sandbox));
-        }
-        let sandbox = std::sync::Arc::new(
-            crate::windows_sandbox::WindowsSandbox::new(
-                &self.root,
-                self.workspace.as_deref(),
-                self.data_root.as_deref(),
-                self.memory_bytes,
-                program,
-            )
-            .await
-            .map_err(|message| ExtensionError::Runtime {
-                extension: self.extension.to_string(),
-                message,
-            })?,
-        );
-        *slot = Some(std::sync::Arc::clone(&sandbox));
-        Ok(sandbox)
-    }
-
     /// Start with two bounded retries; a failed handshake leaves no tool side
     /// effect, so retrying the transport is safe. Delays are 100ms and 250ms.
     async fn start_with_retry(&self) -> Result<ProcessSession, ExtensionError> {
@@ -1313,9 +1077,8 @@ impl ProcessRuntime {
                 },
             )?;
         }
-        // bwrap --bind requires its source to exist; the per-extension data
-        // directory is created on first write, which may be later than the
-        // first process spawn. Create it before building the sandbox plan.
+        // The package data root is created before spawn so a package that
+        // writes there at startup does not race its own first write.
         if let Some(data_root) = &self.data_root {
             std::fs::create_dir_all(data_root).map_err(|source| ExtensionError::Io {
                 path: data_root.clone(),
@@ -1323,104 +1086,38 @@ impl ProcessRuntime {
             })?;
         }
         let token = uuid::Uuid::new_v4().to_string();
-        #[cfg(not(windows))]
-        let mut child = {
-            let mut wrapped = false;
-            let mut command = if self.sandbox && cfg!(target_os = "linux") {
-                wrapped = true;
-                let mut command = Command::new("bwrap");
-                command.args(linux_bwrap_plan(
-                    &self.root,
-                    self.workspace.as_deref(),
-                    self.data_root.as_deref(),
-                    &program,
-                    &self.args,
-                ));
-                command
-            } else if self.sandbox && cfg!(target_os = "macos") {
-                let mut command = Command::new("/usr/bin/sandbox-exec");
-                command
-                    .arg("-p")
-                    .arg(sandbox_profile(
-                        &self.root,
-                        self.workspace.as_deref(),
-                        self.data_root.as_deref(),
-                    ))
-                    .arg(&program);
-                command
-            } else {
-                Command::new(&program)
-            };
-            configure_process_limits(&mut command, self.memory_bytes, self.cpu_seconds);
-            if !wrapped {
-                command.args(&self.args);
-            }
-            command
-                .current_dir(&self.root)
-                .env_clear()
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true);
-            command.env("BSH_IPC_TOKEN", &token);
-            for key in ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"] {
-                if let Some(value) = std::env::var_os(key) {
-                    command.env(key, value);
-                }
-            }
-            for (key, value) in &self.env {
+        let mut command = Command::new(&program);
+        configure_process_limits(&mut command, self.memory_bytes, self.cpu_seconds);
+        command.args(&self.args);
+        command
+            .current_dir(&self.root)
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        command.env("BSH_IPC_TOKEN", &token);
+        for key in ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"] {
+            if let Some(value) = std::env::var_os(key) {
                 command.env(key, value);
             }
-            command.spawn().map_err(|source| ExtensionError::Io {
-                path: program.clone(),
-                source,
-            })?
-        };
-        #[cfg(windows)]
-        let mut child = {
-            if !self.sandbox {
-                return Err(ExtensionError::Runtime {
-                    extension: self.extension.to_string(),
-                    message: "the Windows process runtime requires the AppContainer sandbox"
-                        .to_string(),
-                });
-            }
-            let sandbox = self.sandbox(&program).await?;
-            let mut envs = vec![("BSH_IPC_TOKEN".to_string(), token.clone())];
-            for key in ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"] {
-                if let Some(value) = std::env::var_os(key) {
-                    envs.push((key.to_string(), value.to_string_lossy().into_owned()));
-                }
-            }
-            for (key, value) in &self.env {
-                envs.push((key.clone(), value.clone()));
-            }
-            sandbox
-                .spawn(&program.to_string_lossy(), &self.args, &self.root, &envs)
-                .await
-                .map_err(|message| ExtensionError::Runtime {
-                    extension: self.extension.to_string(),
-                    message,
-                })?
-        };
+        }
+        for (key, value) in &self.env {
+            command.env(key, value);
+        }
+        let mut child = command.spawn().map_err(|source| ExtensionError::Io {
+            path: program.clone(),
+            source,
+        })?;
         if let Some(pid) = child_id(&child) {
             self.child_pid.store(pid, Ordering::Relaxed);
             #[cfg(unix)]
             self.start_watchdog(pid);
         }
-        #[cfg(not(windows))]
         let stdin = child.stdin.take().ok_or_else(|| ExtensionError::Protocol {
             extension: self.extension.to_string(),
             message: "child stdin was not piped".to_string(),
         })?;
-        #[cfg(windows)]
-        let stdin = tokio::fs::File::from_std(child.take_stdin().ok_or_else(|| {
-            ExtensionError::Protocol {
-                extension: self.extension.to_string(),
-                message: "the AppContainer child exposed no stdin".to_string(),
-            }
-        })?);
-        #[cfg(not(windows))]
         let stdout = child
             .stdout
             .take()
@@ -1428,18 +1125,8 @@ impl ProcessRuntime {
                 extension: self.extension.to_string(),
                 message: "child stdout was not piped".to_string(),
             })?;
-        #[cfg(windows)]
-        let stdout = tokio::fs::File::from_std(child.take_stdout().ok_or_else(|| {
-            ExtensionError::Protocol {
-                extension: self.extension.to_string(),
-                message: "the AppContainer child exposed no stdout".to_string(),
-            }
-        })?);
         let stderr_tail = Arc::new(StdMutex::new(VecDeque::<String>::new()));
-        #[cfg(not(windows))]
         let stderr = child.stderr.take();
-        #[cfg(windows)]
-        let stderr = child.take_stderr().map(tokio::fs::File::from_std);
         if let Some(stderr) = stderr {
             let extension = self.extension.clone();
             let tail = Arc::clone(&stderr_tail);
@@ -1935,131 +1622,6 @@ mod tests {
         assert!(success.is_ok());
     }
 
-    #[test]
-    fn the_macos_profile_denies_writes_outside_declared_roots() {
-        let profile = sandbox_profile(Path::new("/pkg"), None, None);
-        assert!(profile.contains("(deny file-write*)"));
-        assert!(profile.contains("(deny network*)"));
-        assert!(profile.contains("(subpath \"/pkg\")"));
-        assert!(profile.contains("(subpath \"/tmp\")"));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn the_macos_sandbox_denies_network_access() {
-        if std::process::Command::new("python3")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            return;
-        }
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
-        let port = listener.local_addr().expect("address").port();
-        let profile = sandbox_profile(Path::new("/tmp"), None, None);
-        let script = format!(
-            "import socket; s=socket.socket(); s.settimeout(1); s.connect(('127.0.0.1',{port}))"
-        );
-        let output = std::process::Command::new("/usr/bin/sandbox-exec")
-            .arg("-p")
-            .arg(&profile)
-            .arg("python3")
-            .arg("-c")
-            .arg(script)
-            .output()
-            .expect("sandbox-exec");
-        assert!(
-            !output.status.success(),
-            "the child reached the network inside the sandbox: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn the_linux_plan_recreates_only_declared_roots_under_hidden_home() {
-        let plan = linux_bwrap_plan(
-            Path::new("/home/alice/projects/plugin"),
-            Some(Path::new("/home/alice/workspace")),
-            None,
-            Path::new("/home/alice/projects/plugin/server"),
-            &[],
-        );
-        let hidden_home = plan
-            .iter()
-            .position(|item| item == "/home")
-            .expect("home is hidden");
-        let home_plugin_dir = plan
-            .iter()
-            .position(|item| item == "/home/alice/projects/plugin")
-            .expect("declared package mount point is recreated");
-        let package_bind = plan
-            .iter()
-            .enumerate()
-            .skip(home_plugin_dir)
-            .find(|(_, item)| *item == "--bind")
-            .map(|(index, _)| index)
-            .expect("package bind");
-        assert!(hidden_home < home_plugin_dir);
-        assert!(home_plugin_dir < package_bind);
-        assert!(!plan.iter().any(|item| item == "/home/alice/.ssh"));
-    }
-
-    #[test]
-    fn the_linux_plan_creates_tmpfs_targets_before_binding_temp_roots() {
-        let plan = linux_bwrap_plan(
-            Path::new("/tmp/bsh-package"),
-            Some(Path::new("/tmp/bsh-package/workspace")),
-            None,
-            Path::new("/tmp/bsh-package/server"),
-            &[],
-        );
-        let dir = plan
-            .iter()
-            .position(|item| item == "--dir")
-            .expect("tmpfs target dir");
-        let bind = plan
-            .iter()
-            .position(|item| item == "--bind")
-            .expect("package bind");
-        assert!(dir < bind, "the package destination must exist before bind");
-        // The package root is bound writable; the nested workspace is covered
-        // by that bind, so one bind is the correct plan.
-        assert_eq!(
-            plan.iter().filter(|item| item.as_str() == "--bind").count(),
-            1
-        );
-    }
-
-    #[test]
-    fn the_linux_plan_binds_only_writable_roots_and_appends_the_command() {
-        let plan = linux_bwrap_plan(
-            Path::new("/pkg"),
-            Some(Path::new("/work")),
-            Some(Path::new("/data")),
-            Path::new("/pkg/server"),
-            &["--flag".to_string()],
-        );
-        assert!(plan.contains(&"--unshare-all".to_string()));
-        assert!(
-            !plan.contains(&"--share-net".to_string()),
-            "the sandbox must not rejoin the host network namespace"
-        );
-        for hidden in ["/home", "/root", "/run"] {
-            let index = plan
-                .iter()
-                .position(|item| item == hidden)
-                .expect("hidden root");
-            assert_eq!(plan[index - 1], "--tmpfs");
-        }
-        assert_eq!(
-            plan.iter().filter(|item| item.as_str() == "--bind").count(),
-            3
-        );
-        assert_eq!(plan[plan.len() - 2], "/pkg/server");
-        assert_eq!(plan[plan.len() - 1], "--flag");
-    }
-
     #[cfg(unix)]
     struct Scratch(PathBuf);
 
@@ -2067,13 +1629,6 @@ mod tests {
     impl Scratch {
         fn new(label: &str) -> Self {
             let index = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            // Linux replaces /tmp with a private tmpfs in the process sandbox.
-            // Keep the package root elsewhere so the explicit writable bind remains visible.
-            #[cfg(target_os = "linux")]
-            let base = std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(std::env::temp_dir);
-            #[cfg(not(target_os = "linux"))]
             let base = std::env::temp_dir();
             let path = base.join(format!(
                 "bsh-ext-process-{label}-{}-{index}",
@@ -2229,107 +1784,6 @@ events = ["workspace.changed"]
         tokio::time::sleep(Duration::from_millis(100)).await;
         let logged = std::fs::read_to_string(scratch.0.join("events.log")).expect("events log");
         assert!(logged.contains("workspace.changed"), "{logged}");
-        runtime.shutdown().await.expect("shutdown");
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn the_linux_sandbox_denies_a_write_outside_the_package() {
-        let scratch = Scratch::new("linux-sandbox");
-        std::fs::write(
-            scratch.0.join("tools/echo.json"),
-            r#"{"description":"Echo","input_schema":{"type":"object"}}"#,
-        )
-        .expect("tool");
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .expect("CI runner HOME is set");
-        let probe = home.join(format!(
-            "bsh-ext-linux-sandbox-probe-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&probe);
-        std::fs::write(
-            scratch.0.join("server.sh"),
-            r#"while IFS= read -r line; do
-  case "$line" in
-    *'"initialize"'*) printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"1.0","token":"%s"}}\n' "$BSH_IPC_TOKEN" ;;
-    *'"tools/call"'*)
-      if echo x > "$HOME/bsh-ext-linux-sandbox-probe-PID" 2>/dev/null; then
-        echo '{"jsonrpc":"2.0","id":2,"result":{"blocked":false}}'
-      else
-        echo '{"jsonrpc":"2.0","id":2,"result":{"blocked":true}}'
-      fi
-      ;;
-  esac
-done
-"#
-            .replace("PID", &std::process::id().to_string()),
-        )
-        .expect("server");
-        let runtime = ProcessRuntime::new(&manifest(), &scratch.0).expect("runtime");
-        assert!(
-            runtime.sandbox,
-            "Linux process sandbox must be enabled by default"
-        );
-        let context = CallContext::new(manifest().id().clone(), "linux-sandbox", None, 2000);
-        let result = runtime
-            .call_tool("echo", json!({}), &context)
-            .await
-            .expect("sandboxed call");
-        assert_eq!(
-            result["blocked"], true,
-            "HOME is outside writable sandbox mounts"
-        );
-        assert!(
-            !probe.exists(),
-            "the extension must not write into the host HOME"
-        );
-        runtime.shutdown().await.expect("shutdown");
-    }
-
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn the_macos_sandbox_denies_a_write_outside_the_package() {
-        let scratch = Scratch::new("sandbox");
-        std::fs::write(
-            scratch.0.join("tools/echo.json"),
-            r#"{"description":"Echo","input_schema":{"type":"object"}}"#,
-        )
-        .expect("tool");
-        let probe = std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_default()
-            .join(format!("bsh-ext-sandbox-probe-{}", std::process::id()));
-        let _ = std::fs::remove_file(&probe);
-        std::fs::write(
-            scratch.0.join("server.sh"),
-            r#"while IFS= read -r line; do
-  case "$line" in
-    *'"initialize"'*) printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"1.0","token":"%s"}}\n' "$BSH_IPC_TOKEN" ;;
-    *'"tools/call"'*)
-      if echo x > "$HOME/bsh-ext-sandbox-probe-PID" 2>/dev/null; then
-        echo '{"jsonrpc":"2.0","id":2,"result":{"blocked":false}}'
-      else
-        echo '{"jsonrpc":"2.0","id":2,"result":{"blocked":true}}'
-      fi
-      ;;
-  esac
-done
-"#
-            .replace("PID", &std::process::id().to_string()),
-        )
-        .expect("server");
-        let runtime = ProcessRuntime::new(&manifest(), &scratch.0)
-            .expect("runtime")
-            .with_sandbox(true);
-        let context = CallContext::new(manifest().id().clone(), "sandbox", None, 2000);
-        let result = runtime
-            .call_tool("echo", json!({}), &context)
-            .await
-            .expect("call");
-        assert_eq!(result["blocked"], true);
-        assert!(!probe.exists());
         runtime.shutdown().await.expect("shutdown");
     }
 

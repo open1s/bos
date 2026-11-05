@@ -499,8 +499,11 @@ fixtures live under crates/ferris-core/testdata/legacy and are intentionally 1.x
 ## 9. Security limits
 
 - Capability checks are per call and scoped; registration is not authorization.
-- Process and MCP children are sandboxed by the runtime; platform gaps are tracked
-  separately and are not implied by this document.
+- Process and MCP children are **not** OS-sandboxed on any platform: a ferris
+  runtime controls its own confinement, so `process.execute` is a trust
+  decision about the package, not a container. `network.http` still gates
+  host-mediated HTTP calls and tools, but the host does not intercept sockets a
+  child opens for itself.
 - Package paths, contribution sizes, manifest size, UI document depth, event rates
   and storage writes are bounded.
 - Service discovery, event delivery and plugin mounting never grant filesystem,

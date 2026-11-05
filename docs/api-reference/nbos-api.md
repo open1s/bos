@@ -920,7 +920,7 @@ apply() is called.
 
 | Member | Description |
 |--------|-------------|
-| `FerrisHost(root, workspace=None, trust=None, policy_mode=None, on_contributions=None, on_revoke=None, process_sandbox=None)` | Open a host; policy mode is `enforce` (default) or `advisory`; `process_sandbox=False` is a development-only escape hatch |
+| `FerrisHost(root, workspace=None, trust=None, policy_mode=None, on_contributions=None, on_revoke=None, process_sandbox=None)` | Open a host; policy mode is `enforce` (default) or `advisory`; `process_sandbox` is retained for API compatibility and no longer changes behavior |
 | `host.root` | Canonical store root |
 | `host.install(source)` | Install a package tree and return `{id, version}` |
 | `host.install_package(source, origin=None)` | Install with `installed`, `development` or `builtin` origin |

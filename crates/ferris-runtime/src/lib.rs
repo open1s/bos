@@ -25,8 +25,6 @@ pub mod mcp;
 pub mod process;
 #[cfg(all(test, windows))]
 mod windows_job;
-#[cfg(windows)]
-mod windows_sandbox;
 
 #[cfg(feature = "wasm")]
 #[allow(missing_docs)] // bindgen generates the WIT world types.

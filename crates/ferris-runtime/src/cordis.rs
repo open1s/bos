@@ -1,7 +1,7 @@
 //! The Cordis / DeepSeek Harness runtime.
 //!
 //! A Cordis package's payload is a JavaScript apply(ctx, config) entry. This
-//! runtime executes it in the existing sandboxed Node bridge, maps the
+//! runtime executes it in the existing capability-gated Node bridge, maps the
 //! registrations it announces to BSH contributions, and proxies tool calls back
 //! over the bridge protocol. The bridge is a subprocess: it does not gain
 //! in-process access to the host.

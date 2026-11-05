@@ -1476,6 +1476,8 @@ fn command_mock(args: &[String]) -> Result<i32, String> {
                 ProcessRuntime::new(&package.manifest, &path)
                     .map_err(|error| error.to_string())?
                     .with_config(config.clone())
+                    .with_policy(std::sync::Arc::clone(&policy), TrustLevel::Local)
+                    .with_data_root(Some(data_root.clone()))
                     .with_events(
                         std::sync::Arc::clone(&events),
                         &package.manifest.contributes.events,

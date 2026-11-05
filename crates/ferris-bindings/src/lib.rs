@@ -191,7 +191,9 @@ mod host {
         pub trust: TrustLevel,
         /// Terminal used by Cordis host calls.
         pub terminal: Arc<dyn TerminalService>,
-        /// Whether process packages get the platform OS sandbox.
+        /// Historical switch for the platform OS sandbox. Ferris runtimes are
+        /// no longer OS-sandboxed, so this no longer changes behavior; it stays
+        /// for API compatibility with the bindings.
         pub process_sandbox: bool,
     }
 
@@ -237,8 +239,7 @@ mod host {
                         .with_events(
                             Arc::clone(&self.options.events),
                             &manifest.contributes.events,
-                        )
-                        .with_sandbox(false);
+                        );
                 return Ok(Arc::new(
                     ferris_sdk::host_runtime::adapter::LegacyAdapter::new(
                         manifest.id().clone(),
@@ -261,8 +262,7 @@ mod host {
                     code: ferris_sdk::ErrorCode::Runtime,
                     message: error.to_string(),
                     details: serde_json::Value::Null,
-                })?
-                .with_sandbox(false);
+                })?;
                 return Ok(Arc::new(
                     ferris_sdk::host_runtime::adapter::LegacyAdapter::new(
                         manifest.id().clone(),

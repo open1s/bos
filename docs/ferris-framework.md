@@ -90,8 +90,8 @@ scripts/ci/check-ferris-independence.sh plus the smoke crate.
   plan diff with per-activation cancel/revoke.
 - One manager per root with internal serialization and a cross-process lock.
 - Canonical store layout under the host-provided root.
-- SDK ships a secure default process sandbox; hosts may replace it but must not
-  silently disable it.
+- Ferris process and MCP runtimes control their own confinement and spawn
+  directly; the host does not apply an OS sandbox.
 - Core is runtime-agnostic; Tokio is confined to standard runtime features.
 - Ed25519 signing/verification and the trust-store format live in the SDK.
 - The resolver is service-aware (package DAG + provider/consumer edges).
