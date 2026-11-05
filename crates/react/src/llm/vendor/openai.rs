@@ -363,7 +363,9 @@ impl OpenAiVendor {
             },
         );
 
-        let max_tokens = req.max_tokens.unwrap_or(12800);
+        let max_tokens = req
+            .max_tokens
+            .unwrap_or(crate::llm::vendor::DEFAULT_COMPLETION_CAP);
 
         OpenAiRequest {
             model: req.model.clone(),
@@ -717,6 +719,10 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
             // parsed the structured tool calls (measured: `<｜DSML｜ calls>`
             // reached the transcript as prose).
             let mut special = crate::llm::vendor::SpecialTokenFilter::default();
+            // The same markup leaks into the reasoning channel, and a model
+            // that reads its own transcript would re-learn it there. A separate
+            // filter keeps the two streams' held tails independent.
+            let mut special_reasoning = crate::llm::vendor::SpecialTokenFilter::default();
             // A transport chunk may split a multi-byte character; keep the
             // incomplete tail and decode it with the next chunk.
             let mut utf8_tail: Vec<u8> = Vec::new();
@@ -734,13 +740,17 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                                 for choice in chat.choices {
                                     if let Some(content) = &choice.delta.reasoning_content {
                                         if !content.is_empty() {
-                                            first_token.get_or_insert_with(|| started.elapsed());
-                                            on_chunk.as_ref().inspect(|cb| cb(content));
-                                            let _ = tx
-                                                .send(Ok(StreamToken::ReasoningContent(
-                                                    content.clone(),
-                                                )))
-                                                .await;
+                                            let cleaned = special_reasoning.push(content);
+                                            if !cleaned.is_empty() {
+                                                first_token
+                                                    .get_or_insert_with(|| started.elapsed());
+                                                on_chunk.as_ref().inspect(|cb| cb(&cleaned));
+                                                let _ = tx
+                                                    .send(Ok(StreamToken::ReasoningContent(
+                                                        cleaned,
+                                                    )))
+                                                    .await;
+                                            }
                                         }
                                     }
                                     if let Some(content) = &choice.delta.content {
@@ -833,6 +843,19 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                                     }))
                                     .await;
                             }
+                            // The Done signal ends the stream, so a held
+                            // partial span is flushed here too: it is the
+                            // model's last words, not a marker.
+                            let text_tail = special.finish();
+                            if !text_tail.is_empty() {
+                                let _ = tx.send(Ok(StreamToken::Text(text_tail))).await;
+                            }
+                            let reasoning_tail = special_reasoning.finish();
+                            if !reasoning_tail.is_empty() {
+                                let _ = tx
+                                    .send(Ok(StreamToken::ReasoningContent(reasoning_tail)))
+                                    .await;
+                            }
                             log_stream_result(started, first_token, last_usage.as_ref());
                             let _ = tx.send(Ok(StreamToken::Done)).await;
                             return;
@@ -850,6 +873,12 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
             let tail = special.finish();
             if !tail.is_empty() {
                 let _ = tx.send(Ok(StreamToken::Text(tail))).await;
+            }
+            let reasoning_tail = special_reasoning.finish();
+            if !reasoning_tail.is_empty() {
+                let _ = tx
+                    .send(Ok(StreamToken::ReasoningContent(reasoning_tail)))
+                    .await;
             }
             for (name, args_val, id) in acc.drain() {
                 let _ = tx

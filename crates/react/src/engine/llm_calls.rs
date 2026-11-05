@@ -124,27 +124,66 @@ impl<A: ReActApp> ReActEngine<A> {
     where
         A::Session: ReactSession,
     {
-        let result = if let Some(resilience) = &self.resilience {
-            resilience.acquire().await.map_err(ReactError::from)?;
-            resilience.check_circuit().map_err(ReactError::from)?;
+        // The same retry contract as `call_llm`: a provider that answers 429 or
+        // 503 before the stream opens is transient, and the streaming path is
+        // the one the interactive turn uses. Measured: a quota 429 failed the
+        // turn in 1.5 s, six times in a row, while the retry loop sat unused on
+        // the non-streaming path.
+        let max_retries = self
+            .resilience
+            .as_ref()
+            .map(|r| r.rate_limit_config().max_retries)
+            .unwrap_or(3);
+        let backoff = self
+            .resilience
+            .as_ref()
+            .map(|r| r.rate_limit_config().retry_backoff)
+            .unwrap_or(std::time::Duration::from_millis(500));
 
-            self.llm
-                .stream_complete(persona.clone(), request, session, context)
-                .await
-        } else {
-            self.llm
-                .stream_complete(persona.clone(), request, session, context)
-                .await
-        };
+        let mut attempt = 0u32;
+        loop {
+            let result = if let Some(resilience) = &self.resilience {
+                resilience.acquire().await.map_err(ReactError::from)?;
+                resilience.check_circuit().map_err(ReactError::from)?;
 
-        // Record outcome in circuit breaker so it learns from actual LLM results
-        if let Some(ref resilience) = self.resilience {
-            match &result {
-                Ok(_) => resilience.record_success(),
-                Err(_) => resilience.record_failure(),
+                self.llm
+                    .stream_complete(persona.clone(), request.clone(), session, context)
+                    .await
+            } else {
+                self.llm
+                    .stream_complete(persona.clone(), request.clone(), session, context)
+                    .await
+            };
+
+            // Record outcome in circuit breaker so it learns from actual LLM results
+            if let Some(ref resilience) = self.resilience {
+                match &result {
+                    Ok(_) => resilience.record_success(),
+                    Err(_) => resilience.record_failure(),
+                }
+            }
+
+            match result {
+                // A stream that opened is returned as-is: a failure AFTER it
+                // opens is reported through the stream, where a retry would
+                // duplicate the text already shown.
+                Ok(stream) => return Ok(stream),
+                Err(error) => {
+                    if !Self::is_transient_error(&error) || attempt >= max_retries {
+                        return Err(ReactError::from(error));
+                    }
+                    attempt += 1;
+                    // The same exponential backoff `call_llm` uses, so both
+                    // paths wait the same way on the same provider.
+                    let factor = 1u32.checked_shl(attempt - 1).unwrap_or(u32::MAX).min(6);
+                    let delay = backoff * factor;
+                    info!("[TIMING] call_llm_stream retrying after {:?}", delay);
+                    match &self.resilience {
+                        Some(resilience) => resilience.backoff(delay).await,
+                        None => tokio::time::sleep(delay).await,
+                    }
+                }
             }
         }
-
-        result.map_err(ReactError::from)
     }
 }

@@ -1900,6 +1900,54 @@ fn the_plan_store_lands_on_the_session(cx: &mut TestAppContext) {
     assert_eq!(after.len(), 1, "the saved copy is what the panel reads now");
 }
 
+/// A turn that never writes a plan keeps the one the reader is following.
+///
+/// A build starts with an empty store and the finished turn writes that store
+/// back onto the session, so a turn that never calls the plan tool used to
+/// erase the saved plan: measured, six items to none over one long turn.
+#[gpui::test]
+fn a_turn_that_never_touches_the_plan_keeps_it(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = AppState::with_store(scratch_store("todo-plan-survives"));
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let id = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .active_id
+            .clone()
+            .expect("an active session")
+    });
+
+    // Turn one writes the plan, and the finished turn saves it.
+    let store = PlanStore::new();
+    store.replace(vec![plan_item("Step one", PlanStatus::Completed)]);
+    cx.update(|_, cx| {
+        shell.update(cx, |shell, _cx| shell.state.attach_plan(&id, store));
+    });
+    cx.update(|_, cx| shell.update(cx, |shell, _cx| shell.state.finish_plan(&id)));
+
+    // Turn two starts from a fresh build and never calls the plan tool.
+    cx.update(|_, cx| {
+        shell.update(cx, |shell, _cx| {
+            shell.state.attach_plan(&id, PlanStore::new())
+        });
+    });
+    let live = cx.update(|_, cx| shell.read(cx).state.plan_items(&id));
+    assert_eq!(live.len(), 1, "the saved plan seeds the new turn");
+    cx.update(|_, cx| shell.update(cx, |shell, _cx| shell.state.finish_plan(&id)));
+    let after = cx.update(|_, cx| shell.read(cx).state.plan_items(&id));
+    assert_eq!(
+        after.len(),
+        1,
+        "a turn that ignores the plan does not erase it"
+    );
+}
+
 #[gpui::test]
 fn header_panel_toggle_click_flips_the_sidebar(cx: &mut TestAppContext) {
     init_test_app(cx);
@@ -12007,8 +12055,8 @@ fn the_context_meter_opens_the_measured_breakdown_panel(cx: &mut TestAppContext)
     );
     assert_eq!(
         cx.update(|_, cx| shell.read(cx).state.context_percent()),
-        Some(50),
-        "16384 of the 32768 budget reads 50%"
+        Some(25),
+        "16384 of the 65536 budget reads 25%"
     );
     cx.simulate_click(trigger.center(), Modifiers::default());
     cx.update(|window, cx| window.draw(cx).clear(cx));

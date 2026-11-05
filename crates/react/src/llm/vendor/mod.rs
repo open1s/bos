@@ -76,6 +76,15 @@ pub(crate) fn stream_error(e: reqwest::Error) -> crate::llm::LlmError {
     LlmError::Other(message)
 }
 
+/// The completion cap an OpenAI-compatible request gets when it names none.
+///
+/// It lives here, not inline in the vendor, because the ENGINE has to read the
+/// same number: a stream carries no `finish_reason`, so the only way to tell a
+/// reply that stopped at the cap from one that finished is to compare the
+/// reported completion count with the cap the request actually carried. A
+/// private literal in the vendor made that comparison impossible.
+pub const DEFAULT_COMPLETION_CAP: u32 = 12_800;
+
 /// Whether full wire bodies are opted into the log.
 ///
 /// The full payload of every request and response used to ride the log for
@@ -105,6 +114,66 @@ pub(crate) fn wire_bodies_enabled() -> bool {
 pub(crate) struct SpecialTokenFilter {
     /// Text held back because it may still become a marker.
     held: String,
+}
+
+/// The plain closing tags the tool-protocol dialects use.
+///
+/// A gateway that turns a model's native tool markup into OpenAI `tool_calls`
+/// can leave the CLOSING half in `content`, because the openers are consumed
+/// with the call: measured, a transcript carried `</parameter></invoke>` after
+/// the calls had already run. The bar-marked openers are handled as spans; these
+/// are the plain closers that follow them, and they are wire markup rather than
+/// the model's words.
+const PROTOCOL_CLOSERS: &[&str] = &[
+    "parameter",
+    "invoke",
+    "function_calls",
+    "function_results",
+    "tool_calls",
+    "tool_call",
+    "antml:parameter",
+    "antml:invoke",
+    "result",
+    "results",
+];
+
+/// The byte length of a protocol closer at `text`'s start, when one is complete.
+fn protocol_closer_len(text: &str) -> Option<usize> {
+    let rest = text.strip_prefix("</")?;
+    // `</｜DSML｜ parameter>` and its halfwidth twin: no prose starts with `</|`.
+    if rest.starts_with('|') || rest.starts_with('｜') {
+        return text.find('>').map(|end| end + 1);
+    }
+    let name_end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == ':' || c == '_' || c == '-'))
+        .unwrap_or(rest.len());
+    let name = &rest[..name_end];
+    rest.get(name_end..)?.strip_prefix('>')?;
+    PROTOCOL_CLOSERS.contains(&name).then_some(name_end + 3)
+}
+
+/// Whether `text` may still become a protocol closer once more arrives.
+///
+/// A transport chunk can split `</parameter>` anywhere; holding the partial
+/// span keeps half a tag out of the reader's transcript.
+fn could_start_closer(text: &str) -> bool {
+    if text.contains('>') {
+        return false;
+    }
+    let Some(rest) = text.strip_prefix("</") else {
+        return false;
+    };
+    if rest.is_empty() {
+        return true;
+    }
+    if rest.starts_with('|') || rest.starts_with('｜') {
+        return true;
+    }
+    let name_end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == ':' || c == '_' || c == '-'))
+        .unwrap_or(rest.len());
+    let partial = &rest[..name_end];
+    partial.is_empty() || PROTOCOL_CLOSERS.iter().any(|tag| tag.starts_with(partial))
 }
 
 impl SpecialTokenFilter {
@@ -143,6 +212,16 @@ impl SpecialTokenFilter {
                         return out;
                     }
                 },
+                // A closing tag of the same dialect: `</invoke>`, or the
+                // bar-marked `</｜DSML｜ parameter>`.
+                Some('/') if protocol_closer_len(tail).is_some() => {
+                    rest = &tail[protocol_closer_len(tail).expect("just matched")..];
+                }
+                // A closer split across chunks: hold it rather than print half.
+                Some('/') if could_start_closer(tail) => {
+                    self.held = tail.to_string();
+                    return out;
+                }
                 Some(_) => {
                     out.push('<');
                     rest = &tail[1..];
@@ -267,6 +346,41 @@ mod tests {
         out.push_str(&filter.push("ML｜ calls> after"));
         out.push_str(&filter.finish());
         assert_eq!(out, "before  after");
+    }
+
+    /// The closing half of the dialect is wire markup too. Measured: a
+    /// transcript carried `</parameter></invoke>` as prose after the calls had
+    /// already run, because only the bar-marked openers were stripped.
+    #[test]
+    fn a_plain_protocol_closer_is_dropped() {
+        assert_eq!(
+            super::strip_special_tokens("before </parameter></invoke> after"),
+            "before  after"
+        );
+        assert_eq!(
+            super::strip_special_tokens("x</｜DSML｜ parameter>y</｜DSML｜ invoke>"),
+            "xy"
+        );
+    }
+
+    /// A closer split across transport chunks is held and dropped whole.
+    #[test]
+    fn a_closer_split_across_chunks_is_dropped_once_closed() {
+        let mut filter = super::SpecialTokenFilter::default();
+        let mut out = filter.push("x</inv");
+        out.push_str(&filter.push("oke>y"));
+        out.push_str(&filter.finish());
+        assert_eq!(out, "xy");
+    }
+
+    /// Ordinary markup the model writes ON PURPOSE still reaches the reader:
+    /// only the known protocol tags are stripped.
+    #[test]
+    fn ordinary_markup_survives() {
+        assert_eq!(
+            super::strip_special_tokens("<div class=\"a\">x</div></p>"),
+            "<div class=\"a\">x</div></p>"
+        );
     }
 
     /// An ordinary '<' is text, not the start of a marker.

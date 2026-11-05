@@ -117,6 +117,18 @@ pub(crate) fn run(args: &[String]) -> i32 {
         println!("{USAGE}");
         return 2;
     };
+    // `bsh ext <command> --help` used to hand the flag to the command as its
+    // path argument: measured, `bsh ext validate --help` answered
+    // "--help/extension.toml: No such file or directory" and `bsh ext new
+    // --help` refused it as an extension id. A help request is about the
+    // command, so it is answered before the command parses its arguments.
+    if rest[1..]
+        .iter()
+        .any(|arg| arg == "--help" || arg == "-h" || arg == "help")
+    {
+        print!("{}", command_usage(&command));
+        return 0;
+    }
     let result = match command.as_str() {
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
@@ -180,6 +192,23 @@ pub(crate) fn run(args: &[String]) -> i32 {
             1
         }
     }
+}
+
+/// The usage text for one command: its own line, or the whole block.
+///
+/// One `USAGE` literal stays the single source, so a documented command cannot
+/// drift from the command the dispatcher runs.
+fn command_usage(command: &str) -> String {
+    let header = format!("  {command}");
+    for line in USAGE.lines() {
+        let Some(rest) = line.strip_prefix(&header) else {
+            continue;
+        };
+        if rest.starts_with(' ') {
+            return format!("bsh ext {command}\n\n{line}\n");
+        }
+    }
+    format!("{USAGE}\n")
 }
 
 fn config(root: Option<PathBuf>) -> HostConfig {
@@ -1931,6 +1960,35 @@ fn command_reproduce(args: &[String], root: Option<PathBuf>) -> Result<i32, Stri
 #[cfg(test)]
 mod tests {
     use super::command_package;
+
+    /// A help request reaches the command it is about. Measured cost of the
+    /// old behaviour: a model probing the CLI spent two calls on
+    /// "--help/extension.toml: No such file or directory" and
+    /// "invalid extension id \"--help\"".
+    #[test]
+    fn a_subcommand_help_request_names_that_command() {
+        let usage = super::command_usage("validate");
+        assert!(usage.starts_with("bsh ext validate"), "{usage}");
+        assert!(usage.contains("validate <path>"), "{usage}");
+
+        let unknown = super::command_usage("no-such-command");
+        assert!(
+            unknown.contains("Commands:") && unknown.contains("bsh ext <command>"),
+            "an unknown command still gets the whole block: {unknown}"
+        );
+
+        // The guard runs before the command parses its arguments, so the flag
+        // is never handed on as a path or an id.
+        assert_eq!(
+            super::run(&["validate".to_string(), "--help".to_string()]),
+            0
+        );
+        assert_eq!(
+            super::run(&["new".to_string(), "-h".to_string()]),
+            0,
+            "the short flag is answered the same way"
+        );
+    }
 
     #[test]
     fn the_mock_host_runs_one_tool() {

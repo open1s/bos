@@ -49,6 +49,36 @@ pub const STEP_GUARD_NOTE: &str = "You have reached this turn's step budget, so 
 /// asks for the two things a harness can act on: a tool call, or an answer.
 pub const EMPTY_ANSWER_NOTE: &str = "Your last reply contained no text and no tool call. Do not think further: call a tool now, or answer the reader in plain text.";
 
+/// What the model is told when the output cap cut its reply short.
+///
+/// A provider caps the reply at the request's `max_tokens`; a reasoning model
+/// spends that budget thinking and returns `finish_reason: "length"` with little
+/// or no answer. Treating that as the answer is what turned one measured turn
+/// into fifteen minutes and one sentence, so the turn continues instead: the
+/// partial work is already in the session, and this note asks for the next part
+/// without repeating it.
+pub const TRUNCATED_NOTE: &str = "Your last reply was cut off by the output limit. Continue from exactly where you stopped: do not repeat what you already wrote, do not re-plan, and if you were still thinking, act now - call a tool or answer the reader in plain text.";
+
+/// How many continuations one turn may spend on a cut-off reply.
+///
+/// A model that only ever thinks would otherwise reach the cap forever; two
+/// continuations is enough for an answer split across the limit and keeps the
+/// turn bounded.
+const TRUNCATION_LIMIT: usize = 2;
+
+/// Whether a reply stopped at the output cap rather than finishing.
+///
+/// The streaming path never sees `finish_reason`, so it compares the reported
+/// completion count with the cap the request asked for: a provider that enforced
+/// the cap reports exactly that count. A provider that reports no usage leaves
+/// this false, which keeps the pre-existing behaviour instead of guessing.
+fn cut_short(max_tokens: Option<u32>, completion_tokens: Option<u32>) -> bool {
+    match (max_tokens, completion_tokens) {
+        (Some(cap), Some(used)) if cap > 0 => used >= cap,
+        _ => false,
+    }
+}
+
 /// What the model is told when the same tool failure repeats three times.
 ///
 /// A harness cannot fix an environment that keeps refusing the same call, and
@@ -303,6 +333,9 @@ impl<A: ReActApp> ReActEngine<A> {
         // One directed retry when a step comes back empty (see
         // EMPTY_ANSWER_NOTE); a second blank reply ends the turn.
         let mut nudged = false;
+        // Continuations spent on a reply the output cap cut short (see
+        // TRUNCATED_NOTE); a turn that only ever thinks stays bounded.
+        let mut truncations = 0usize;
         let mut repeated = RepeatedFailure::default();
         'turn: loop {
             if self.max_steps.is_some_and(|bound| steps >= bound) {
@@ -622,6 +655,15 @@ skill_dir: {}
                         }
 
                         let finish = choice.finish_reason.as_deref();
+                        // A reply the output cap cut off is not an answer:
+                        // continue it, bounded, instead of reporting a
+                        // fragment. The partial text is already in the
+                        // session, so the note asks for the next part only.
+                        if finish == Some("length") && !closing && truncations < TRUNCATION_LIMIT {
+                            truncations += 1;
+                            session.push(LlmMessage::user_text(TRUNCATED_NOTE));
+                            continue 'turn;
+                        }
                         if finish.is_some() && finish != Some("tool_calls") {
                             if !recorded {
                                 session.push(LlmMessage::assistant(thought.clone()));
@@ -907,6 +949,8 @@ skill_dir: {}
             let mut closing = false;
             // One directed retry when a step streams nothing at all.
             let mut nudged = false;
+            // Continuations spent on a reply the output cap cut short.
+            let mut truncations = 0usize;
             // The same failed call three times closes the loop and asks for a
             // report instead of paying one more round.
             let mut repeated = RepeatedFailure::default();
@@ -964,6 +1008,10 @@ skill_dir: {}
                 let mut saw_tool_call = false;
                 // Whether the words collected so far already reached the session.
                 let mut recorded = false;
+                // The completion count the provider reported for THIS step: a
+                // stream carries no finish_reason, so this is what tells a
+                // capped reply from a finished one.
+                let mut step_completion: Option<u32> = None;
 
                 while let Some(item) = llm_stream.next().await {
                     match item {
@@ -994,6 +1042,7 @@ skill_dir: {}
                             )
                             .with_cached(cached);
                             self.token_counter.update_from_response(token_usage);
+                            step_completion = Some(usage.completion_tokens);
                             yield Ok(StreamToken::Usage(usage));
                         }
                         Ok(StreamToken::Done) => {
@@ -1162,6 +1211,23 @@ skill_dir: {}
                     if !recorded {
                         session.push(LlmMessage::assistant(full_response.clone()));
                     }
+                }
+
+                // A step that stopped at the output cap is continued rather
+                // than reported as the answer. The cap is the one the request
+                // actually carried, which is not always the engine's own field:
+                // the vendor supplies the default.
+                let cap = request
+                    .max_tokens
+                    .unwrap_or(crate::llm::vendor::DEFAULT_COMPLETION_CAP);
+                if cut_short(Some(cap), step_completion)
+                    && !closing
+                    && !saw_tool_call
+                    && truncations < TRUNCATION_LIMIT
+                {
+                    truncations += 1;
+                    session.push(LlmMessage::user_text(TRUNCATED_NOTE));
+                    continue;
                 }
 
                 if !saw_tool_call {

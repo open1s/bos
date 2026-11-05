@@ -363,8 +363,11 @@ wording, so the view owns the copy:
 - The preset supplies exactly one thing: `plugins`, the complete mounted set.
   It carries no model, no system prompt and no step cap, so it cannot collide
   with the workspace's agent configuration at all.
-- `reasoning_effort` resolves model-node first, workspace second: the node
-  describes the model, the workspace says what it wants *here*.
+- `reasoning_effort` resolves from the COMPOSER first: the workspace value the
+  effort menu in the input box writes wins, and the model node's declared effort
+  is the fallback for a workspace that has expressed no choice. The reader's pick
+  is the one value a menu can visibly change, so it must be the value the request
+  carries. (`resolve.rs` already works this way; this line had it backwards.)
 - `skills_dir` is workspace then global then `~/.bos/skills`; `memory_path`
   is workspace then `~/.bos/bsh/memory.jsonl`.
 - A declaration **replaces** a shipped preset of the same id outright; it does

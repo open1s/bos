@@ -2438,7 +2438,21 @@ impl AppState {
     ///
     /// The store is shared with the `update_plan` tool, so the panel can read
     /// a running turn's plan live instead of waiting for the turn to end.
+    ///
+    /// A build starts with an EMPTY store and [`Self::finish_plan`] writes that
+    /// store back onto the session, so attaching it raw erased a plan the turn
+    /// never touched: measured, a long turn that never called `update_plan`
+    /// took the session's six items to none. The session's saved copy seeds an
+    /// empty store; a store the model already wrote is left alone, so an
+    /// explicit clear stays a clear.
     pub(crate) fn attach_plan(&mut self, id: &str, store: PlanStore) {
+        if store.items().is_empty() {
+            if let Some(saved) = self.store.session(id).map(|session| session.plan.clone()) {
+                if !saved.is_empty() {
+                    store.replace(saved);
+                }
+            }
+        }
         self.plans.insert(id.to_string(), store);
     }
 

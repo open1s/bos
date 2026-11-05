@@ -155,10 +155,20 @@ impl Default for AgentSection {
             bash_enabled: true,
             file_tools_enabled: true,
             web_tools_enabled: true,
-            parallel_tool_calls: false,
+            // Concurrent dispatch is what the prompt already tells the model to
+            // ask for ("batch every independent call into one message"), and the
+            // reference runs a batch concurrently. Shipping the opposite made
+            // the batching rule buy nothing: measured, every call of a batch ran
+            // one after another.
+            parallel_tool_calls: true,
             memory_enabled: true,
             max_tokens: None,
-            context_budget: 32768,
+            // The reply reserve is subtracted from this ceiling before the
+            // compaction trigger is computed, so a 32k budget with a 12.8k cap
+            // left only ~19k usable and compacted in the middle of a research
+            // turn (measured: 86 items folded, 85 s of summarizer). The shipped
+            // ceiling has to pay for the reply it reserves.
+            context_budget: 65536,
             max_steps: 0,
             shell_timeout_secs: 300,
             tool_output_cap: 16384,
@@ -241,6 +251,28 @@ permission = "read-only"
 [disabled]
 extensions = ["plan"]
 "#;
+
+    /// The shipped agent defaults have to pay for the reply they reserve.
+    ///
+    /// The compaction trigger is `budget - output_reserve - headroom`, so a
+    /// 32k ceiling with a 12.8k cap left only ~19k usable and compacted in the
+    /// middle of a research turn. A default that cannot hold its own reserve is
+    /// a defect, not a preference.
+    #[test]
+    fn the_shipped_agent_defaults_leave_room_for_the_reply() {
+        let agent = AgentSection::default();
+        assert!(
+            agent.parallel_tool_calls,
+            "a batch the prompt asks for must run concurrently"
+        );
+        let reserve = agent.max_tokens.unwrap_or(12_800) as usize;
+        assert!(
+            agent.context_budget > reserve * 2,
+            "the ceiling ({} tokens) must be more than twice the reply reserve ({} tokens)",
+            agent.context_budget,
+            reserve
+        );
+    }
 
     #[test]
     fn a_zero_temperature_is_a_value_not_a_sentinel() {

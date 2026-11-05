@@ -6112,7 +6112,10 @@ mod tests {
     /// The agent-loop switch reaches the agent config, not just the file.
     #[test]
     fn the_parallel_switch_reaches_the_agent_config() {
-        let off = bare();
+        // The shipped default is ON (a batch the prompt asks for should run
+        // concurrently), so "off" has to be stated to test the off arm.
+        let mut off = bare();
+        off.workspace.agent.parallel_tool_calls = false;
         assert!(!build(&off).agent.config().parallel_tool_calls);
         let mut on = bare();
         on.workspace.agent.parallel_tool_calls = true;

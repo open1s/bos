@@ -70,6 +70,9 @@ impl LlmClient<LlmSession, LlmContext> for AlwaysRateLimited {
         _session: &mut LlmSession,
         _context: &mut LlmContext,
     ) -> Result<TokenStream, LlmError> {
+        // Counted: the streaming test asserts how many attempts the engine made,
+        // and a fixture that failed silently would let a broken retry pass.
+        self.calls.fetch_add(1, Ordering::SeqCst);
         Err(LlmError::RateLimited)
     }
 }
@@ -102,6 +105,55 @@ async fn call_llm_retries_exactly_max_retries_times() {
 
     let result = engine
         .call_llm(
+            None,
+            LlmRequest::new("test-model"),
+            &mut LlmSession::default(),
+            &mut LlmContext::default(),
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(react::ReactError::Llm(LlmError::RateLimited))
+    ));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        4,
+        "one initial attempt plus max_retries (3) retries"
+    );
+}
+
+/// The streaming path carries the same retry contract.
+///
+/// The interactive turn streams, and the retry loop used to exist only on the
+/// non-streaming path: measured, a quota 429 failed the turn in 1.5 s, six
+/// times in a row, while `call_llm`'s backoff sat unused beside it.
+#[tokio::test]
+async fn call_llm_stream_retries_exactly_max_retries_times() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let resilience = ReActResilience::new(ResilienceConfig {
+        circuit_breaker: CircuitBreakerConfig {
+            max_failures: 100,
+            cooldown: Duration::from_secs(1),
+        },
+        rate_limiter: RateLimiterConfig {
+            capacity: 100,
+            window: Duration::from_secs(60),
+            max_retries: 3,
+            retry_backoff: Duration::from_millis(1),
+            auto_wait: false,
+        },
+    });
+    let engine = ReActEngineBuilder::<TestApp>::new()
+        .llm(Box::new(AlwaysRateLimited {
+            calls: Arc::clone(&calls),
+        }))
+        .resilience(resilience)
+        .build()
+        .expect("engine builds");
+
+    let result = engine
+        .call_llm_stream(
             None,
             LlmRequest::new("test-model"),
             &mut LlmSession::default(),

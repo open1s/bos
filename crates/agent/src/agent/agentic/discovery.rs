@@ -339,6 +339,65 @@ impl Catalogue<'_> {
         out
     }
 
+    /// Every withheld tool's name, sorted.
+    fn names(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for registry in [self.registry, self.live].into_iter().flatten() {
+            for (name, tool) in registry.iter() {
+                if self.is_withheld(name, tool.deferred(), registry.is_mcp_tool(name)) {
+                    out.push(name.clone());
+                }
+            }
+            for name in registry.async_tool_names() {
+                let is_withheld = registry.get_async(&name).is_some_and(|tool| {
+                    self.is_withheld(&name, tool.deferred(), registry.is_mcp_tool(&name))
+                });
+                if is_withheld {
+                    out.push(name);
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// The registered name a reader's word refers to, when that is unambiguous.
+    ///
+    /// A skill or a command names a tool the way its author says it - "call
+    /// design" - while the registry exposes the package's tool under a namespace
+    /// prefix ("extdev__design"). An exact-match-only lookup turns that into a
+    /// wasted round trip: the model asks for a name that exists, is told it does
+    /// not, and has to search for it. A bare word resolves to the one withheld
+    /// tool whose last segment is that word; two candidates stay unresolved,
+    /// because guessing one would run the wrong tool.
+    fn resolve(&self, requested: &str) -> Option<String> {
+        let requested = requested.trim();
+        if requested.is_empty() {
+            return None;
+        }
+        let names = self.names();
+        if names.iter().any(|name| name == requested) {
+            return Some(requested.to_string());
+        }
+        let mut hit: Option<&String> = None;
+        for name in &names {
+            if name == requested {
+                continue;
+            }
+            let last = name.rsplit("__").next().unwrap_or(name);
+            let mcp_last = name.rsplit('_').next().unwrap_or(name);
+            if last != requested && mcp_last != requested {
+                continue;
+            }
+            if hit.is_some() {
+                return None;
+            }
+            hit = Some(name);
+        }
+        hit.cloned()
+    }
+
     fn get(&self, name: &str) -> Lookup {
         for registry in [self.registry, self.live].into_iter().flatten() {
             let found = registry
@@ -385,7 +444,14 @@ pub fn find_tool(
 
 /// One search: an exact name, a ranked query, or the whole list of names.
 fn search(catalogue: &Catalogue<'_>, args: &Value) -> Value {
-    if let Some(name) = args.get("name").and_then(Value::as_str) {
+    if let Some(requested) = args.get("name").and_then(Value::as_str) {
+        // A bare word a skill uses ("design") is resolved to the unique
+        // namespaced tool it names ("extdev__design"); the answer always
+        // carries the registered name, so the follow-up call_tool runs.
+        let canonical = catalogue
+            .resolve(requested)
+            .unwrap_or_else(|| requested.to_string());
+        let name = canonical.as_str();
         return match catalogue.get(name) {
             Lookup::Withheld(description, schema) => json!({
                 "name": name,
@@ -400,9 +466,32 @@ fn search(catalogue: &Catalogue<'_>, args: &Value) -> Value {
                     "'{name}' is already in your tool list - call it directly, without call_tool."
                 ),
             }),
-            Lookup::Missing => json!({
-                "error": format!("No tool named '{name}'. Search by what you need instead."),
-            }),
+            Lookup::Missing => {
+                // A near miss is the second wasted round trip: name what does
+                // exist, so the model can correct itself in the same step.
+                let names = catalogue.names();
+                let needle = requested.to_ascii_lowercase();
+                let near: Vec<&str> = names
+                    .iter()
+                    .filter(|candidate| {
+                        let candidate = candidate.to_ascii_lowercase();
+                        needle.len() > 2
+                            && (candidate.contains(&needle) || needle.contains(candidate.as_str()))
+                    })
+                    .map(String::as_str)
+                    .take(8)
+                    .collect();
+                if near.is_empty() {
+                    json!({
+                        "error": format!("No tool named '{requested}'. Search by what you need instead."),
+                    })
+                } else {
+                    json!({
+                        "error": format!("No tool named '{requested}'. Search by what you need instead."),
+                        "near_names": near,
+                    })
+                }
+            }
         };
     }
 
@@ -1092,6 +1181,57 @@ mod tests {
         let result = search(&catalogue, &json!({"name": "alpha"}));
         assert_eq!(result["name"], "alpha");
         assert_eq!(result["parameters"]["type"], "object");
+    }
+
+    /// A skill or command names a tool the way its author says it, so a bare
+    /// word has to reach the package's namespaced tool. Measured: a packaged
+    /// skill said "call design", the registry held `extdev__design`, and the
+    /// exact-match lookup spent a round trip answering "no tool named 'design'".
+    #[test]
+    fn a_bare_word_resolves_to_the_namespaced_tool_it_names() {
+        let registry = registry_with(&[("extdev__design", "Design an extension")]);
+        let catalogue = Catalogue {
+            registry: Some(&registry),
+            live: None,
+            withheld: Withheld::default(),
+        };
+        let result = search(&catalogue, &json!({"name": "design"}));
+        assert_eq!(
+            result["name"], "extdev__design",
+            "the answer carries the name call_tool can run: {result}"
+        );
+        assert!(result["hint"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("extdev__design"));
+    }
+
+    /// Two tools whose last segment is the same word stay unresolved: picking
+    /// one would run a tool the model did not ask for.
+    #[test]
+    fn an_ambiguous_bare_word_does_not_guess() {
+        let registry = registry_with(&[("alpha__status", "one"), ("beta__status", "two")]);
+        let catalogue = Catalogue {
+            registry: Some(&registry),
+            live: None,
+            withheld: Withheld::default(),
+        };
+        let result = search(&catalogue, &json!({"name": "status"}));
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("No tool"),
+            "an ambiguous word is not resolved: {result}"
+        );
+        let near: Vec<&str> = result["near_names"]
+            .as_array()
+            .map(|names| names.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        assert!(
+            near.contains(&"alpha__status") && near.contains(&"beta__status"),
+            "both candidates are named instead: {result}"
+        );
     }
 
     /// A shortlisted tool comes back with the JSON Schema the call has to
