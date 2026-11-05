@@ -468,9 +468,12 @@ mod tests {
         assert_eq!(a.realm_for("clock"), Some("a"));
     }
 
-    #[test]
+    // A Tokio test, not a plain one: dropping the Context runs async cleanup
+    // through tokio::time::timeout, which panics with "there is no reactor
+    // running" when the benchmark is run outside a runtime.
+    #[tokio::test]
     #[ignore = "release benchmark; run with --release --ignored"]
-    fn gold_standard_release_inherited_lookup_budget() {
+    async fn gold_standard_release_inherited_lookup_budget() {
         let registry = Arc::new(ServiceRegistry::new());
         let root = Context::root(Arc::clone(&registry), Scope::Host);
         root.provide("clock", Arc::new(1_u64));
