@@ -577,7 +577,7 @@ struct McpCore {
     /// spawn; a failure to create it is fatal, never a direct-exec fallback.
     /// heel's job object carries the memory ceiling and kill-on-close.
     #[cfg(windows)]
-    sandbox: Mutex<Option<Arc<crate::windows_sandbox::WindowsSandbox>>>,
+    appcontainer: Mutex<Option<Arc<crate::windows_sandbox::WindowsSandbox>>>,
     cancelled: AtomicBool,
     stopped: AtomicBool,
     sandbox: AtomicBool,
@@ -724,7 +724,7 @@ impl McpCore {
             #[cfg(unix)]
             watchdog: Mutex::new(None),
             #[cfg(windows)]
-            sandbox: Mutex::new(None),
+            appcontainer: Mutex::new(None),
             cancelled: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             sandbox: AtomicBool::new(true),
@@ -827,7 +827,7 @@ impl McpCore {
         program: &Path,
     ) -> Result<Arc<crate::windows_sandbox::WindowsSandbox>, ExtensionError> {
         let mut slot = self
-            .sandbox
+            .appcontainer
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(sandbox) = slot.as_ref() {
