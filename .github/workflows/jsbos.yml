@@ -56,7 +56,7 @@ jobs:
             echo "is_release=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if ! printf '%s' "$REF_NAME" | grep -qE '^v[0-9]+\\.[0-9]+\\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
+          if ! printf '%s' "$REF_NAME" | grep -qE '^v[0-9]+[.][0-9]+[.][0-9]+([-+][0-9A-Za-z.-]+)?$'; then
             echo "::error::release tags must look like vX.Y.Z (got $REF_NAME)"
             exit 1
           fi
