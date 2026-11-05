@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v4.0.2 (2026-11-05)
 
 - **Ferris SDK bindings**: `nbos` and `jsbos` expose `FerrisManifest`,
   `FerrisHarness` and `FerrisHost`. A Python or JavaScript object can
@@ -41,6 +41,15 @@
 - **Templates**: both bindings expose `renderTemplate`/`render_template`,
   `withMemory`/`with_memory` and `estimateTokens`/`estimate_tokens` from
   `react::template` and the agent context estimator.
+
+- **Windows**: the bridge resolves `node.exe` on `PATH`, so the Cordis runtime
+  and its end-to-end coverage run on Windows CI; the Cordis entry tests that
+  still hit the drive-letter path bug are skipped there with that reason.
+- **Release automation**: every pipeline releases only from a `vX.Y.Z` tag
+  whose version matches Cargo, jsbos, nbos and the Python `__version__`, and
+  skips when it does not; the macOS dmg is built through an explicitly sized
+  image, linux-arm64 builds with thin LTO so it fits a free arm64 runner, and
+  a dispatch publishes with the gh CLI instead of retagging.
 
 ## v4.0.1 (2026-11-04)
 

@@ -1,4 +1,4 @@
-# nbos — v4.0.1
+# nbos — v4.0.2
 
 [![PyPI](https://img.shields.io/pypi/v/nbos?label=pypi&logo=pypi&color=3776AB)](https://pypi.org/project/nbos)
 [![License](https://img.shields.io/github/license/open1s/bos?color=blue)](https://github.com/open1s/bos/blob/main/LICENSE)
