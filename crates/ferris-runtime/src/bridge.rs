@@ -331,10 +331,19 @@ pub fn find_interpreter() -> Option<PathBuf> {
 /// Resolve one executable name against `PATH`.
 fn which(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
+    // Windows appends the extension to the executable, so "node" on PATH is
+    // "node.exe" and a bare join never found it: the cordis runtime reported
+    // "no Node interpreter" on every Windows runner.
+    #[cfg(windows)]
+    let names = vec![name.to_string(), format!("{name}.exe")];
+    #[cfg(not(windows))]
+    let names = vec![name.to_string()];
     for directory in std::env::split_paths(&path) {
-        let candidate = directory.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
+        for name in &names {
+            let candidate = directory.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
         }
     }
     None

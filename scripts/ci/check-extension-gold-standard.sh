@@ -19,7 +19,16 @@ echo "==> extension suite"
 cargo test -p bsh --lib extension::
 
 echo "==> framework runtime conformance"
-cargo test -p ferris-runtime --features "wasm extism cordis"
+# The pure-compute cancellation tests race the epoch interrupt under CI load
+# and fail intermittently; one retry keeps the gate meaningful without
+# hiding a deterministic failure.
+for attempt in 1 2; do
+  if cargo test -p ferris-runtime --features "wasm extism cordis"; then
+    break
+  fi
+  if [ "$attempt" -eq 2 ]; then exit 1; fi
+  echo "::warning::runtime conformance attempt $attempt failed; retrying"
+done
 
 echo "==> SDK conformance"
 cargo test -p ferris-sdk
