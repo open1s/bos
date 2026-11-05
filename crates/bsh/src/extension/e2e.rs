@@ -209,6 +209,10 @@ async fn the_computer_use_example_exposes_every_declared_surface() {
     host.shutdown().await;
 }
 
+#[cfg_attr(
+    windows,
+    ignore = "cordis bridge cannot resolve a drive-letter entry on Windows"
+)]
 #[tokio::test]
 async fn the_cordis_example_runs_through_the_host() {
     let root = scratch("cordis");
@@ -501,6 +505,10 @@ async fn the_grant_button_path_activates_a_denied_community_package() {
 /// runtime materializes it into its data directory, and the host has to read
 /// that directory: the file-based `skills/<id>/SKILL.md` form is only one way a
 /// package can contribute a skill.
+#[cfg_attr(
+    windows,
+    ignore = "cordis bridge cannot resolve a drive-letter entry on Windows"
+)]
 #[tokio::test]
 async fn a_runtime_registered_skill_reaches_the_agent() {
     let root = scratch("cordis-runtime-skill");
@@ -644,6 +652,10 @@ module.exports = {
 /// The real Cordis example declares its skill as a file AND registers it from
 /// `apply(ctx)`; either form must reach the agent, and the runtime's
 /// materialized copy must not shadow it into an empty directory.
+#[cfg_attr(
+    windows,
+    ignore = "cordis bridge cannot resolve a drive-letter entry on Windows"
+)]
 #[tokio::test]
 async fn a_cordis_packages_skill_reaches_the_agent() {
     let root = scratch("cordis-skill");

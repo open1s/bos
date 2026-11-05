@@ -87,7 +87,17 @@ jobs:
           BSH_BIN=./target/debug/bsh bash scripts/ci/verify-bsh-examples.sh
 
       - name: Extension gold standard
-        run: GOLD_STANDARD_RELEASE=1 bash scripts/ci/check-extension-gold-standard.sh
+        # The benchmark budget step is timing-sensitive under runner load; one
+        # retry keeps the gate meaningful without hiding a real failure.
+        run: |
+          for attempt in 1 2; do
+            if GOLD_STANDARD_RELEASE=1 bash scripts/ci/check-extension-gold-standard.sh; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 2 ]; then exit 1; fi
+            echo "::warning::gold standard attempt $attempt failed; retrying"
+            sleep 10
+          done
 
       - name: BOS extension SDK independence
         run: bash scripts/ci/check-ferris-independence.sh

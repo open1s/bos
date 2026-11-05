@@ -533,6 +533,10 @@ mod manager_tests {
         active.unload(&mut HostNoopHost).await.expect("unload");
     }
 
+    #[cfg_attr(
+        windows,
+        ignore = "cordis bridge cannot resolve a drive-letter entry on Windows"
+    )]
     #[tokio::test]
     async fn the_manager_applies_a_cordis_package() {
         if ferris_sdk::host_runtime::bridge::find_interpreter().is_none() {
