@@ -67,7 +67,8 @@ jobs:
   build:
     name: Build bindings for ${{ matrix.target }}
     needs: release
-    if: needs.release.outputs.is_release == 'true'
+    # The workflow only runs for tags, pull requests and manual dispatches, so
+    # the build is always wanted; only publish is gated on a release tag.
     strategy:
       fail-fast: false
       matrix:
