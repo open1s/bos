@@ -71,6 +71,10 @@ jj git push                    # the release commit onto main
 jj git push --tag v1.1.1       # starts all three pipelines
 ```
 
+Only a tag of the form `vX.Y.Z` releases. A push to `main` runs the tests but
+never publishes; the three pipelines refuse a tag whose name is not
+`vMAJOR.MINOR.PATCH` and whose value does not match every manifest.
+
 The tag starts three pipelines: this one publishes the BSH installers, the
 `jsbos` pipeline publishes `@open1s/jsbos` to npm, and the `nbos` pipeline
 publishes `nbos` to PyPI. `check-release-versions.sh` runs in all three gates,

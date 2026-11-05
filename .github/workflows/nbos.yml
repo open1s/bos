@@ -1,11 +1,10 @@
 name: nbos pipeline
 
 on:
+  # Tags only: main pushes are tested by the rust workflow, not published.
   push:
-    branches:
-      - main
     tags:
-      - "v*"
+      - "v[0-9]*"
   workflow_dispatch:
   pull_request:
 
@@ -19,12 +18,23 @@ concurrency:
 
 jobs:
   release:
-    name: Detect a version commit
+    name: Detect a release tag
     runs-on: ubuntu-latest
     outputs:
       is_release: ${{ steps.check.outputs.is_release }}
     steps:
       - uses: actions/checkout@v6
+
+      # Release tags look like v1.1.1. GitHub's tag globs cannot express
+      # that, so the form is enforced here.
+      - name: Require a vX.Y.Z tag
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          if ! printf '%s' "$GITHUB_REF_NAME" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::release tags must look like v1.1.1 (got $GITHUB_REF_NAME)"
+            exit 1
+          fi
 
       # A vX.Y.Z tag releases the installers, npm and PyPI together; fail the
       # push when the manifests disagree instead of publishing part of a set.
@@ -40,23 +50,19 @@ jobs:
             bash scripts/ci/check-release-versions.sh
           fi
 
-      # A push only builds wheels for a bare x.y.z commit; pull requests and
-      # manual runs always build so the pipeline still smoke-tests them. The
-      # publish job consumes this flag, so a non-release push skips the
-      # expensive matrix instead of failing it.
+      # Only a vX.Y.Z tag releases. A push to main must never publish to
+      # PyPI; pull requests and manual runs still build so the pipeline
+      # smoke-tests itself, but the publish job requires a tag.
       - id: check
-        name: Check version commit
+        name: Check the release tag
         shell: bash
         run: |
-          msg=$(git log -1 --pretty=%B)
-          if [ "${{ github.event_name }}" != "push" ] \
-            || [ "${{ github.ref_type }}" = "tag" ] \
-            || echo "$msg" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "is_release=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "Not a version commit. Commit: $msg"
+          if [ "${{ github.ref_type }}" != "tag" ]; then
+            echo "Not a tag; nothing to release."
             echo "is_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          echo "is_release=true" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build bindings for ${{ matrix.target }}
@@ -140,8 +146,8 @@ jobs:
     needs: [release, build, test]
     runs-on: ubuntu-latest
     if: >-
-      needs.release.outputs.is_release == 'true' && github.event_name == 'push'
-      && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+      needs.release.outputs.is_release == 'true'
+      && github.event_name == 'push' && github.ref_type == 'tag'
     steps:
       - uses: actions/checkout@v6
 

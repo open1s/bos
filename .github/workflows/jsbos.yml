@@ -6,11 +6,10 @@ env:
   CARGO_INCREMENTAL: '1'
 
 on:
+  # Tags only: main pushes are tested by the rust workflow, not published.
   push:
-    branches:
-      - main
     tags:
-      - "v*"
+      - "v[0-9]*"
 
 permissions:
   contents: read
@@ -21,7 +20,7 @@ concurrency:
 
 jobs:
   release:
-    name: Detect a version commit
+    name: Detect a release tag
     runs-on: ubuntu-latest
     outputs:
       is_release: ${{ steps.check.outputs.is_release }}
@@ -42,20 +41,26 @@ jobs:
             bash scripts/ci/check-release-versions.sh
           fi
 
-      # Publishing builds npm packages and creates a GitHub release, so it must
-      # only run for a version commit or a version tag. Gating the job keeps a
-      # normal push from touching the registry or an existing release.
+      # Only a vX.Y.Z tag releases. A push to main must never publish,
+      # and the exact form is checked here because GitHub's tag globs cannot
+      # express a semver.
       - id: check
-        name: Check version commit
+        name: Check the release tag
         shell: bash
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          subject=$(git log -1 --pretty=%s)
-          if [ "${{ github.ref_type }}" = "tag" ] || echo "$subject" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "is_release=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "Not a version commit. Commit: $subject"
+          if [ "$REF_TYPE" != "tag" ]; then
+            echo "Not a tag; nothing to release."
             echo "is_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          if ! printf '%s' "$REF_NAME" | grep -qE '^v[0-9]+\\.[0-9]+\\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
+            echo "::error::release tags must look like vX.Y.Z (got $REF_NAME)"
+            exit 1
+          fi
+          echo "is_release=true" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build bindings for ${{ matrix.target }}
