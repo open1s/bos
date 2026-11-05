@@ -13,9 +13,9 @@ name: release
 # and Windows binaries are unsigned. See docs/bsh-release.md.
 
 on:
+  # Tags only: a main push must not start a release build (prepare rejects a
+  # branch as a version and the run would fail noisily on every commit).
   push:
-    branches:
-      - main
     tags:
       - "v*"
   workflow_dispatch:
