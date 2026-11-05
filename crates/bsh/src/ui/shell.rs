@@ -2832,14 +2832,16 @@ impl Shell {
     /// out (the token is ordinary text then), but the reader is told why
     /// nothing loaded instead of watching the model discuss a name it cannot
     /// read.
-    pub(crate) fn warn_unresolved_skill(&mut self, text: &str, session: &str) {
+    pub(crate) fn warn_unresolved_skill(&mut self, text: &str) {
         let Some(name) = crate::skill_invocation::leading_skill_name(text) else {
             return;
         };
-        let known = self
-            .state
-            .effective_in(session)
-            .enabled_skills()
+        // Use the same merged catalogue the slash palette offers. A package's
+        // SKILL.md is loaded by the agent build, not by the settings scan, so
+        // checking only `enabled_skills()` reports a live extension skill as
+        // missing even though the palette lists it and the turn can load it.
+        let known = super::slash_palette::slash_skills(&self.state)
+            .iter()
             .any(|skill| skill.name == name);
         if known {
             return;
@@ -2900,9 +2902,7 @@ impl Shell {
         // out loud: the palette only offers enabled ones, so a hand-typed
         // gesture naming a switched-off or missing skill would otherwise
         // travel as prose and look like the skill simply did nothing.
-        if let Some(id) = self.state.active_id.clone() {
-            self.warn_unresolved_skill(&text, &id);
-        }
+        self.warn_unresolved_skill(&text);
         self.warn_unresolved_command(&text);
         // Measured: the reference queues a submission while its session is
         // already running instead of opening a second turn over the same
@@ -3007,7 +3007,7 @@ impl Shell {
         let Some(queued) = self.state.take_queued(id, seq) else {
             return;
         };
-        self.warn_unresolved_skill(&queued.text, id);
+        self.warn_unresolved_skill(&queued.text);
         self.warn_unresolved_command(&queued.text);
         let plan = self.state.plan_mode(id);
         let request = self.request_text(&queued.text, plan);

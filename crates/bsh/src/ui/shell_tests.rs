@@ -22279,6 +22279,46 @@ fn the_slash_menu_offers_a_packages_skill(cx: &mut TestAppContext) {
     );
 }
 
+/// A skill the agent build loaded is a real skill even when the settings scan
+/// never saw it. The unresolved-skill notice must read the same merged
+/// catalogue the slash palette offers, or a live extension skill looks missing
+/// while the turn loads it correctly.
+#[gpui::test]
+fn an_extension_skill_does_not_warn_as_missing(cx: &mut TestAppContext) {
+    let root = skills_scratch("slash-extension-skill-notice");
+    let (harness, cx) = slash_shell(cx, "slash-extension-skill-notice", root, 2);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.state
+                .record_agent_skills(vec![crate::state::AgentSkillRow {
+                    name: "extdev".to_string(),
+                    description: "Extension DevKit".to_string(),
+                    user_only: false,
+                }]);
+            this.state.notice = None;
+            this.warn_unresolved_skill("/extdev package the extension");
+        });
+    });
+    assert!(
+        cx.update(|_, cx| shell.read(cx).state.notice.is_none()),
+        "a package skill the build loaded is not reported as missing"
+    );
+
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.state.notice = None;
+            this.warn_unresolved_skill("/not-a-skill do it");
+        });
+    });
+    let notice = cx.update(|_, cx| shell.read(cx).state.notice.clone().unwrap_or_default());
+    assert!(
+        notice.contains("not-a-skill"),
+        "a genuinely unknown name still warns: {notice}"
+    );
+}
+
 /// Every row the palette lists as a Command maps to a handler that exists, and
 /// each handler's effect is read back from the state it changed.
 #[gpui::test]
