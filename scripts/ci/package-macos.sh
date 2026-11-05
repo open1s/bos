@@ -155,24 +155,49 @@ if ! ditto -c -k --sequesterRsrc --keepParent "$app" "$zip_path"; then
   exit 1
 fi
 
-stage="$work/dmg"
+# Build the dmg through an explicitly sized read-write image. hdiutil's
+# -srcfolder sizes the temporary volume from the folder it walks, and on the
+# runners that estimate came out too small: the copy died inside the mounted
+# volume with "No space left on device" while the host had 33 GiB free. A size
+# from the bundle plus generous slack removes the guess.
+app_mb="$(du -sm "$app" | cut -f1)"
+size_mb=$((app_mb * 2 + 256))
+rw_dmg="$work/BSH-rw.dmg"
+stage="$work/mnt"
 mkdir -p "$stage"
-cp -R "$app" "$stage/BSH.app"
+
+if ! output="$(hdiutil create -size "${size_mb}m" -fs HFS+ \
+    -volname "BSH $core_version" "$rw_dmg" 2>&1)"; then
+  echo "package-macos: hdiutil create (rw) failed: $output" >&2
+  exit 1
+fi
+if ! output="$(hdiutil attach "$rw_dmg" -nobrowse -mountpoint "$stage" 2>&1)"; then
+  echo "package-macos: hdiutil attach failed: $output" >&2
+  exit 1
+fi
+
+# ditto, not cp: it preserves the code signature's resource forks and xattrs.
+if ! ditto "$app" "$stage/BSH.app"; then
+  hdiutil detach "$stage" -force >/dev/null 2>&1 || true
+  echo "package-macos: ditto into the image failed" >&2
+  exit 1
+fi
 ln -s /Applications "$stage/Applications"
 
-# hdiutil writes some failures on stdout, so -quiet plus a redirect made a
-# failed dmg look like a silent exit 1. Keep the output and report it.
-if ! output="$(hdiutil create -volname "BSH $core_version" \
-    -srcfolder "$stage" -ov -format UDZO "$dmg_path" 2>&1)"; then
-  echo "package-macos: hdiutil create failed: $output" >&2
-  echo "package-macos: free space: $(df -h "$out" | tail -1)" >&2
+if ! output="$(hdiutil detach "$stage" 2>&1)"; then
+  echo "package-macos: hdiutil detach failed: $output" >&2
+  hdiutil detach "$stage" -force >/dev/null 2>&1 || true
+  exit 1
+fi
+if ! output="$(hdiutil convert "$rw_dmg" -format UDZO -o "$dmg_path" 2>&1)"; then
+  echo "package-macos: hdiutil convert failed: $output" >&2
   exit 1
 fi
 if ! output="$(hdiutil verify "$dmg_path" 2>&1)"; then
   echo "package-macos: hdiutil verify failed: $output" >&2
   exit 1
 fi
-echo "package-macos: dmg verified"
+echo "package-macos: dmg verified ($app_mb MiB app, ${size_mb} MiB image)"
 
 if [[ -n "$identity" ]]; then
   codesign --force --timestamp --sign "$identity" "$dmg_path"

@@ -117,6 +117,14 @@ jobs:
         with:
           version: 0.16.0
 
+      # The Cordis runtime spawns Node, so the e2e tests that activate a cordis
+      # package fail without it ("no Node interpreter ... is not implemented
+      # in this build").
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
       - name: Test extension runtime and policy
         run: >-
           cargo test -p bsh --lib extension::
