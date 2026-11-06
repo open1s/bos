@@ -154,6 +154,19 @@ impl WorkspaceRuntime {
         input: serde_json::Value,
         context: &crate::context::InvocationContext,
     ) -> Result<CapabilityOutput, CapabilityError> {
+        // A Workspace is an authority boundary, not just a capability
+        // lookup table. Do not let a context minted for another Workspace
+        // borrow this runtime's provider bindings.
+        if context.workspace != self.workspace {
+            return Err(CapabilityError::Denied {
+                reason: format!(
+                    "invocation context belongs to workspace {}, not {}",
+                    context.workspace, self.workspace
+                ),
+                policy: None,
+            });
+        }
+
         let Some(dispatch) = self.capabilities.get(id) else {
             return Err(CapabilityError::NotFound {
                 capability: id.clone(),
