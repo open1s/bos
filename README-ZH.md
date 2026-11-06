@@ -43,7 +43,7 @@
 
 **BOS 是一个以 Rust 为核心，用于构建、组合和运行分布式 AI Agent 系统的平台基础。**
 
-BSH 是 BOS 面向用户和 Agent 系统运营者的核心产品。它不只是一个桌面 Agent 工作空间，而是一个**分布式、可组合的 Agent 与 Capability 平台**。
+BSH 是 BOS 面向用户和 Agent 系统运营者的核心产品，也是**分布式、可组合的 Agent 与 Capability 平台**这一产品方向的承载者。它不只是一个桌面 Agent 工作空间；BSH 正在演进为 AI 原生的能力容器，将 Agent、工具、扩展、模型、上下文和资源组合成面向特定任务的工作空间。
 
 单个 BSH 节点首先是一个 Capability Container：可以将 Agent、工具、扩展、模型、上下文和资源按需装配为面向特定任务的工作空间。多个独立 BSH 节点进一步组成 Federation，使 Agent 和 Capability 能够跨机器发现、委派和组合，同时保留各节点独立的 Runtime 与安全边界。
 
@@ -70,11 +70,11 @@ BSH 有两个相互补充的核心角色。
 
 <p align="center"><img src="docs/assets/diagrams/bsh-platform-value.svg" alt="BOS 与 BSH 的价值：Rust 原生基础、可组合工作空间和自治节点联邦协作。" width="100%"></p>
 
-BSH 将 BOS 的底层能力转化为可运营的工作环境：按任务装配能力，在受治理的 Workspace 中执行，通过扩展持续增强，并在需要协作时连接独立节点。
+BSH 正在将 BOS 的底层能力演进为可运营的工作环境：按任务装配能力，在受治理的 Workspace 中执行，通过扩展持续增强，并在需要协作时连接独立节点。
 
 ### 1. 可组合的 Capability Container
 
-一个 BSH 节点只装配当前用途真正需要的能力。每个 Workspace 都可以获得经过裁剪的 Capability View，而不是把节点上安装的全部工具暴露给每一个 Agent。
+在 BSH 2.0 目标架构中，一个节点只装配当前用途真正需要的能力。每个 Workspace 都将获得经过裁剪的 Capability View，而不是把节点上安装的全部工具暴露给每一个 Agent。
 
 一个 Composition 可以包含：
 
