@@ -100,6 +100,32 @@ Federation is not a shared super-process. A coordinator may help with rendezvous
 
 > **Implementation status:** BOS already provides the Rust runtime, agent/tool execution, messaging foundations, BSH desktop host, Ferris extension framework and MCP integration. The full BSH composition and federation model is the platform's architectural direction and is being developed in stages. Do not interpret the target federation capabilities above as a claim that every feature is already generally available.
 
+## What can you build with BSH?
+
+BSH is designed around **purpose-built workspaces**, not one universal agent with every tool enabled. The following scenarios show how the same BOS foundation can be composed for different jobs. They are illustrative composition blueprints, not claims that these exact presets ship out of the box.
+
+### Research Workspace
+
+<p align="center"><img src="docs/assets/diagrams/scenario-research-workspace.svg" alt="Research workspace blueprint combining a research agent, project sources, document tools, analysis capabilities and evidence-led outputs." width="100%"></p>
+
+Bring a research brief, project documents and selected source integrations together with an agent and analysis tools. The workspace can be configured to collect evidence, extract information, compare findings and produce a structured report. Source search and specialist analysis integrations are supplied by the tools and extensions configured for that workspace.
+
+### Software Engineering Workspace
+
+<p align="center"><img src="docs/assets/diagrams/scenario-software-engineering-workspace.svg" alt="Software engineering workspace blueprint combining repository context, an engineering agent, file tools, terminal, browser and extensions." width="100%"></p>
+
+Give a coding agent the repository context and a focused toolset: file discovery and batch reads, structured edits, terminal operations, browser access and relevant extensions. BSH's desktop already provides the operator surfaces — editor, diffs, terminal and browser — while dedicated tools and execution policies govern what the agent can do. A developer remains responsible for reviewing changes and test results.
+
+### Distributed Multi-Agent Workspace
+
+<p align="center"><img src="docs/assets/diagrams/scenario-distributed-multi-agent.svg" alt="Target distributed multi-agent scenario with a requester node delegating bounded tasks to autonomous research and engineering provider nodes." width="100%"></p>
+
+A coordinating workspace can delegate bounded research or engineering tasks to specialist agents hosted by other BSH nodes, then combine their results. Each node keeps its own runtime, secrets, policies and audit trail; remote work requires explicit authorization at both ends.
+
+<blockquote>
+  **Roadmap status:** the distributed scenario illustrates the BSH Federation target architecture. Node enrollment, discovery, remote capability invocation and cross-node delegation are being developed in stages; this is not a claim that the complete workflow is currently available.
+</blockquote>
+
 ## Architecture
 
 BOS separates the shared execution foundation, local composition and cross-node collaboration.
