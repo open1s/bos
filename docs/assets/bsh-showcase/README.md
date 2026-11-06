@@ -25,3 +25,28 @@ All four files are existing PNG layout placeholders. The README links to these e
 ## Status
 
 The four gallery assets are placeholders and must be replaced with genuine captures before they are presented as real application UI. The product hero is a separate conceptual illustration.
+
+## Capture workflow (macOS development build)
+
+The repository's BSH UI workflow documents launching the raw binary for section-specific captures. From the repository root, after building the app:
+
+```bash
+pkill -f "BSH.app" || true
+pkill -f target/debug/bsh || true
+sleep 2
+nohup ./target/debug/bsh > /tmp/bsh_ui.log 2>&1 & disown
+sleep 6
+pgrep -fl target/debug/bsh
+```
+
+Use the app's own navigation to reach each real screen. If the local OCU setup is available, the documented capture call is:
+
+```bash
+ocu call get_app_state --args '{"app":"bsh","text_limit":200}'
+```
+
+Save the returned screenshot payload as the matching PNG file in this directory. If OCU is unavailable, use macOS screenshot capture manually. Confirm the image shows the actual running BSH process; do not recreate UI elements in an image editor.
+
+Before committing, inspect all four captures at full resolution and remove credentials, tokens, personal paths, private repository names, account identifiers and unrelated desktop content. Keep the app window size and visual theme consistent. Verify each image opens and that the README renders all four images.
+
+The command above is a capture recipe from the repository's development notes, not a claim that the binary or OCU is available in every environment. Confirm the process is running before capture; if launch fails, resolve the build/runtime issue rather than substituting a concept image.
