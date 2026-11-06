@@ -327,6 +327,24 @@ impl Effective {
 
 /// The harness data directory.
 pub(crate) fn dir() -> PathBuf {
+    dir_under(std::env::var_os("BSH_HOME"))
+}
+
+/// The data directory for a given override, or the default.
+///
+/// `BSH_HOME` points one process at its own data directory: settings, sessions,
+/// identity, peers, logs, and browser state all follow it, so several instances
+/// can run on one host without sharing a lock. A relative path is taken as
+/// written; an empty value is ignored rather than turning into the cwd.
+fn dir_under(override_root: Option<std::ffi::OsString>) -> PathBuf {
+    if let Some(root) = override_root {
+        if !root.is_empty() {
+            // A quoted `BSH_HOME=~/a` reaches the process with the tilde still
+            // in it; expand it here so both spellings mean the same directory.
+            let root = root.to_string_lossy();
+            return PathBuf::from(shellexpand::tilde(&root).into_owned());
+        }
+    }
     PathBuf::from(shellexpand::tilde("~/.bos/bsh").into_owned())
 }
 
@@ -1096,6 +1114,22 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
+    /// The override replaces the default outright, and an empty value does not
+    /// turn the data directory into the process cwd.
+    #[test]
+    fn a_data_directory_override_is_honoured() {
+        use std::ffi::OsString;
+
+        assert_eq!(
+            super::dir_under(Some(OsString::from("/tmp/bsh-instance-a"))),
+            std::path::PathBuf::from("/tmp/bsh-instance-a")
+        );
+        assert_eq!(
+            super::dir_under(Some(OsString::new())),
+            super::dir_under(None)
+        );
+    }
+
     use super::global::{self, GlobalSettings, ModelEntry};
     use super::mcp::{McpRefusal, McpScope, McpServer, McpTransport};
     use super::workspace::WorkspaceSettings;

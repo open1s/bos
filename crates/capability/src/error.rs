@@ -57,6 +57,18 @@ pub enum CapabilityError {
         /// Why it is unavailable.
         reason: String,
     },
+    /// The peer's discovery record is not current enough to trust.
+    #[error("discovery record not current: {reason}")]
+    StaleDiscovery {
+        /// Which freshness rule failed.
+        reason: String,
+    },
+    /// This message was already accepted from the same sender.
+    #[error("duplicate message: {message}")]
+    Duplicate {
+        /// Which message was a duplicate.
+        message: String,
+    },
     /// A quota or rate limit refused it.
     #[error("capability rate limited")]
     RateLimited {

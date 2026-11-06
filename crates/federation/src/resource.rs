@@ -138,34 +138,126 @@ pub enum ResourceError {
         /// What is wrong.
         message: String,
     },
+    /// The lease state could not be persisted.
+    #[error("the lease store could not be written: {message}")]
+    Storage {
+        /// The I/O failure.
+        message: String,
+    },
 }
 
 /// The authoritative leases this Node granted.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LeaseStore {
     leases: BTreeMap<LeaseId, ResourceLease>,
+    /// When set, every mutation is written here before it is acknowledged.
+    #[serde(skip)]
+    path: Option<std::path::PathBuf>,
 }
 
 impl LeaseStore {
-    /// An empty store.
+    /// An empty, in-memory store.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Load a store from a persistence file, dropping leases that expired.
+    ///
+    /// A missing file is an empty store. Revoked leases are absent by
+    /// construction (revocation rewrites the file), so recovery never revives
+    /// one.
+    pub fn open(path: impl Into<std::path::PathBuf>) -> std::io::Result<Self> {
+        let path = path.into();
+        let mut store = match std::fs::read_to_string(&path) {
+            Ok(text) => Self::from_json(&text)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::new(),
+            Err(error) => return Err(error),
+        };
+        let now = capability::unix_ms();
+        let before = store.leases.len();
+        store
+            .leases
+            .retain(|_, lease| lease.expires_at_ms.is_none_or(|expiry| expiry > now));
+        store.path = Some(path);
+        if store.leases.len() != before {
+            store.persist().map_err(|error| {
+                std::io::Error::other(error.to_string())
+            })?;
+        }
+        Ok(store)
+    }
+
+    /// Point an in-memory store at a persistence file without loading it.
+    pub fn with_persistence(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.path = Some(path.into());
+        self
+    }
+
+    /// Parse a store from its file contents.
+    pub fn from_json(text: &str) -> std::io::Result<Self> {
+        serde_json::from_str(text)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
+    /// Serialize the store for its persistence file.
+    pub fn to_json(&self) -> std::io::Result<String> {
+        serde_json::to_string_pretty(self)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
+    /// Write the store atomically, private to the account.
+    pub fn save(&self) -> std::io::Result<()> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let temp = path.with_extension("json.tmp");
+        std::fs::write(&temp, self.to_json()?)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600));
+        }
+        std::fs::rename(&temp, path)
+    }
+
+    fn persist(&self) -> Result<(), ResourceError> {
+        self.save().map_err(|error| ResourceError::Storage {
+            message: error.to_string(),
+        })
+    }
+
     /// Grant a lease. A duplicate id is refused.
+    ///
+    /// The new lease is written before this returns; a write failure rolls the
+    /// in-memory grant back and fails the call.
     pub fn grant(&mut self, lease: ResourceLease) -> Result<(), ResourceError> {
         if self.leases.contains_key(&lease.id) {
             return Err(ResourceError::Invalid {
                 message: format!("lease {} already exists", lease.id),
             });
         }
-        self.leases.insert(lease.id.clone(), lease);
+        let id = lease.id.clone();
+        self.leases.insert(id.clone(), lease);
+        if let Err(error) = self.persist() {
+            self.leases.remove(&id);
+            return Err(error);
+        }
         Ok(())
     }
 
-    /// Revoke a lease.
-    pub fn revoke(&mut self, id: &LeaseId) -> bool {
-        self.leases.remove(id).is_some()
+    /// Revoke a lease. The removal is persisted before it is acknowledged.
+    pub fn revoke(&mut self, id: &LeaseId) -> Result<bool, ResourceError> {
+        let Some(lease) = self.leases.remove(id) else {
+            return Ok(false);
+        };
+        if let Err(error) = self.persist() {
+            self.leases.insert(id.clone(), lease);
+            return Err(error);
+        }
+        Ok(true)
     }
 
     /// One lease.
@@ -220,8 +312,19 @@ impl LeaseStore {
         bytes: u64,
     ) -> Result<(), ResourceError> {
         self.authorize(id, holder, now_ms, bytes)?;
+        let previous = self
+            .leases
+            .get(id)
+            .map(|lease| lease.used_bytes)
+            .unwrap_or_default();
         if let Some(lease) = self.leases.get_mut(id) {
             lease.used_bytes = lease.used_bytes.saturating_add(bytes);
+        }
+        if let Err(error) = self.persist() {
+            if let Some(lease) = self.leases.get_mut(id) {
+                lease.used_bytes = previous;
+            }
+            return Err(error);
         }
         Ok(())
     }

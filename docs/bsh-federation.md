@@ -100,6 +100,48 @@ unencrypted session.
 A node that cannot start is logged and the app runs without federation: a
 broken peer configuration must never keep the window from opening.
 
+## Running a delegation
+
+A delegation can ask the target to run one capability. Put the request in
+`result_contract` as JSON:
+
+```json
+{ "capability": "builtin/read_file", "input": { "path": "notes.txt" } }
+```
+
+Only the peer that submitted a delegation may read or cancel it: the record
+stores the authenticated submitter, a sub-delegation inherits the parent's
+owner, and any other trusted peer is refused (a revoked submitter is refused
+before ownership is even considered).
+
+After it accepts, the target transitions the record to `running`, invokes the
+capability on its own workspace runtime, and settles it as `succeeded` (the
+serialized output is the record's result) or `failed` (the error is the
+record's error). Three limits keep this safe:
+
+- the capability must be named in the delegation's `capabilities`; a contract
+  outside that list fails instead of escalating;
+- the node must actually serve it (configure `[federation] expose`), otherwise
+  the record fails with `this Node serves no capabilities`;
+- a cancel that wins the race before execution starts means the task does not
+  run.
+
+An objective with no structured contract is recorded and left `accepted`: bsh
+has no language-model executor, so a prose task is queued, not pretended.
+
+## Delegations survive a restart
+
+The delegations a node accepts are written to `delegations.json` beside
+`peers.json` in the node's data directory, after each inbound change, with one
+writer at a time. A restarted node reloads them, so a caller asking for status
+still gets the accepted record instead of `delegation_not_found`. The file is
+written 0600. A malformed file is logged and the node starts with an empty store
+rather than refusing to run.
+
+Resource leases are live stream state, not records: a restart ends the streams
+and the peer re-opens them. They are deliberately not written to disk, since a
+lease naming a stream that no longer exists would be a lie.
+
 ## Ingress bounds
 
 The transport buffers at most 1024 inbound frames (and 256 announcements)
@@ -107,6 +149,83 @@ ahead of the router. A full queue drops the frame and logs the first drop and
 every 1024th after it: a peer that sends faster than the node routes cannot grow
 the process without bound. Announcements are periodic presence, so a dropped one
 is replaced by the next tick; a dropped invoke fails like any unreachable frame.
+
+## Stream checksums and limits
+
+The producer hashes each chunk into an incremental SHA-256 and finalizes it when
+the stream closes, so memory stays bounded by the chunk rather than the resource
+length; the hex digest is byte-for-byte the old wire value. At most 128 streams
+run concurrently per Node and one stream may last ten minutes; both limits end
+the stream with an `error` rather than growing without bound. Stream frames are
+routed inline (not through handler admission) so a `close` can never overtake a
+chunk and a chunk is never dropped to satisfy a handler budget.
+
+## Replay protection
+
+Every inbound frame except a result is admitted through a replay cache keyed by
+`(sender, message_id)` and, when the frame carries one, `(sender, kind,
+idempotency_key)`: a caller-supplied key is never trusted as globally unique. A
+duplicate of a request gets a typed `duplicate` refusal without running the
+provider again; a duplicate resource message is dropped. Each rejection is
+audited as `replay/duplicate`.
+
+An entry lives until the envelope that carried it expires, so the cache never
+forgets a frame while it is still replayable. Storage is bounded at 4096 entries
+with the oldest evicted. The cache is in memory: a restart forgets it, so the
+residual window is a restart inside the envelope's lifetime (60 seconds by
+default). That is the documented policy; envelopes are short-lived on purpose.
+
+## Discovery freshness
+
+A discovery record is current for five minutes (`DISCOVERY_TTL_MS`). A consumer
+checks the signature, the expiry, and the issue time (a record more than
+60 seconds ahead of the local clock is future-dated). It also remembers the
+newest publication it accepted from each peer: an older record is a replay and
+is refused, while an equal timestamp is the same catalogue and stays
+idempotent. A failed check surfaces as `CapabilityError::StaleDiscovery` from
+`discover`, and an announcement that fails it is dropped by the pane's
+discovery cache. bsh keeps no offline catalogue for composition: a peer whose
+announcements stop disappears after the freshness window instead of being used
+as if it were current.
+
+## Resource streams belong to one peer
+
+An inbound stream records the peer it was opened with, the lease, the next
+expected chunk sequence, and whether it is still open. Every stream message is
+checked against that state before it reaches the consumer:
+
+- another trusted peer that knows the lease id is rejected and audited;
+- a duplicate or out-of-order chunk is rejected without advancing the stream;
+- `close` and `error` are accepted once, then the stream is closed to further
+  messages (a later chunk is rejected);
+- `open`/`credit` are not valid inbound data for a caller-owned stream.
+
+The queue between routing and the consumer is bounded at 32 messages and
+applies backpressure, and the stream's entry is removed exactly once when it
+settles or the reader drops it. On the provider side, a lease already open for
+one peer cannot be taken over by another, and credit from a peer that does not
+own the stream is refused.
+
+## Deadlines and cancellation
+
+Every invoke carries the caller's absolute deadline (`deadline_ms`) inside the
+signed request. The target converts it to a local monotonic deadline, so the
+effective budget can only shrink across hops, and refuses immediately when the
+deadline has already passed. Each in-flight invocation is registered with a
+cancellation token; when the caller times out or its future is dropped, it
+sends a signed, idempotent `invoke_cancel` for that correlation. The target
+cancels the matching token only when the cancellation comes from the peer that
+owns the invocation, and a duplicate or late cancel is acknowledged without
+effect. A cooperative provider sees `context.cancelled()`.
+
+## Handler admission
+
+A bounded inbox is not enough: every accepted invoke, delegation, discovery,
+and resource message used to spawn its own task. Dispatch now takes an admission
+permit first: 64 handlers in flight per Node and 8 per peer. A request beyond
+either bound is refused with a retryable `rate_limited` outcome (50 ms) instead
+of spawning; a permit is released on success, failure, panic, or abort. The
+constants are `MAX_IN_FLIGHT_HANDLERS` and `MAX_IN_FLIGHT_PER_PEER`.
 
 ## How a node is named
 
@@ -129,24 +248,28 @@ short id until it is enrolled again.
 
 Each node needs its own data directory and its own transport endpoint. The data
 directory lock is per directory, so two nodes that share one are refused by
-design; a per-node `HOME` gives every node its own settings, identity, peer
-store, lock, and audit log. Give each node a distinct listen port and point the
+design; `BSH_HOME` gives every instance its own settings, sessions, identity,
+peer store, lock, and log. Give each node a distinct listen port and point the
 others at it:
 
 ```toml
-# Instance A — ~/bsh-a/.bos/bsh/settings.toml, launched with HOME=~/bsh-a
+# ~/bsh-a/settings.toml, launched with BSH_HOME=~/bsh-a
 [federation]
 enabled = true
 listen = ["tcp/127.0.0.1:7447"]
 ```
 
 ```toml
-# Instance B — HOME=~/bsh-b
+# ~/bsh-b/settings.toml, launched with BSH_HOME=~/bsh-b
 [federation]
 enabled = true
 listen = ["tcp/127.0.0.1:7448"]
 endpoints = ["tcp/127.0.0.1:7447"]
 ```
+
+`BSH_HOME` is also what the `bsh federation` CLI uses, so managing instance B is
+`BSH_HOME=~/bsh-b bsh federation status`. Without it every instance shares
+`~/.bos/bsh`, and the second one is refused by the directory lock.
 
 Both nodes publish on the shared announce key (`bsh/v1/announce`) and, once
 their transports are connected, each lists the other under **Discovered peers**

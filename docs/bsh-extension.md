@@ -496,6 +496,19 @@ The migration maps:
 All shipped examples and the bsh ext new scaffold are already 2.0. Legacy test
 fixtures live under crates/ferris-core/testdata/legacy and are intentionally 1.x.
 
+
+## Network egress
+
+`network.http` grants are public-egress grants. For every hop (the initial URL
+and each redirect) the host is resolved once, **every** returned address is
+classified, and the validated addresses are pinned into the client so a second
+DNS lookup cannot swap in a private answer (DNS rebinding). Loopback, private,
+link-local, CGNAT, multicast, unspecified, broadcast, documentation and
+benchmark ranges are refused by default - including a hostname that mixes a
+public and a private answer. The one explicit exception is a grant that names
+the destination as a literal IP (for example `domain:127.0.0.1` for a local test
+server): that is the separate, address-scoped private-network grant. TLS
+verification and the HTTP `Host` header still use the URL hostname.
 ## 9. Security limits
 
 - Capability checks are per call and scoped; registration is not authorization.

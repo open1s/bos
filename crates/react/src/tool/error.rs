@@ -12,6 +12,14 @@ pub enum ToolError {
     /// The tool ran but failed.
     #[error("Tool execution failed: {0}")]
     Failed(String),
+    /// More than one registered tool matches the bare name.
+    #[error("Tool name {name} is ambiguous: {candidates:?}")]
+    Ambiguous {
+        /// The bare name the caller asked for.
+        name: String,
+        /// Sorted, fully qualified candidate names.
+        candidates: Vec<String>,
+    },
     /// The arguments were rejected.
     #[error("Invalid input: {0}")]
     InvalidInput(String),

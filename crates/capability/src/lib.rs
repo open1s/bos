@@ -24,6 +24,7 @@ pub mod context;
 pub mod descriptor;
 pub mod error;
 pub mod id;
+pub mod lock;
 pub mod proposal;
 pub mod provider;
 pub mod snapshot;
@@ -55,4 +56,6 @@ pub use provider::{
 };
 pub use snapshot::{CapabilitySnapshot, CompositionSnapshot, SnapshotOrigin};
 pub use transport::{unix_ms, FederationMessage, FederationTransport, MessageId, PeerSession};
-pub use workspace::{remote_provider_id, WorkspaceError, WorkspaceRuntime};
+pub use workspace::{
+    remote_provider_id, WorkspaceError, WorkspaceLifecycle, WorkspaceRuntime, WorkspaceState,
+};

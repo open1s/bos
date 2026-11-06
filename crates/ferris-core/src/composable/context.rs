@@ -285,6 +285,49 @@ impl Context {
             .acquire_in_realm(scope, self.realm_for(name), name)
     }
 
+    /// Resolve one exact contract at one exact scope, passing the authorizer.
+    pub fn acquire_contract_at<T>(
+        &self,
+        scope: &Scope,
+        name: &str,
+        contract: &str,
+        requirement: &semver::VersionReq,
+    ) -> Option<ServiceLease<T>>
+    where
+        T: Any + Send + Sync,
+    {
+        if !self.authorized(scope, name) {
+            return None;
+        }
+        self.inner
+            .services
+            .acquire_contract(scope, name, contract, requirement)
+    }
+
+    /// Provide one exact contract into this context's scope.
+    pub fn provide_contract<T>(
+        &self,
+        name: &str,
+        contract: &str,
+        version: semver::Version,
+        service: Arc<T>,
+    ) -> ServiceToken
+    where
+        T: Any + Send + Sync,
+    {
+        self.inner
+            .services
+            .provide_with_contract(
+                self.inner.scope.clone(),
+                self.realm_for(name),
+                name,
+                contract,
+                version,
+                service,
+            )
+            .0
+    }
+
     pub fn provide<T>(&self, name: &str, service: Arc<T>) -> ServiceToken
     where
         T: Any + Send + Sync,

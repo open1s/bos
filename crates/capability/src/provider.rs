@@ -151,6 +151,18 @@ pub trait CapabilityProvider: Send + Sync {
     /// Everything this provider currently offers.
     async fn describe(&self) -> Result<Vec<CapabilityDescriptor>, CapabilityError>;
 
+    /// Prepare this provider for calls. Called once per workspace activation,
+    /// in dependency order. The default does nothing.
+    async fn activate(&self) -> Result<(), CapabilityError> {
+        Ok(())
+    }
+
+    /// Release this provider's resources. Called once per activation, in
+    /// reverse dependency order. The default does nothing.
+    async fn deactivate(&self) -> Result<(), CapabilityError> {
+        Ok(())
+    }
+
     /// Invoke one capability.
     async fn invoke(&self, call: CapabilityCall<'_>) -> Result<CapabilityOutput, CapabilityError>;
 

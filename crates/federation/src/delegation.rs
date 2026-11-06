@@ -11,6 +11,7 @@
 //! manufacture authority.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use capability::{CapabilityId, NodeId};
 use serde::{Deserialize, Serialize};
@@ -97,6 +98,13 @@ pub struct DelegationRequest {
 /// The authoritative record of one delegation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DelegationRecord {
+    /// The authenticated peer that submitted the request.
+    ///
+    /// Absent on records written before ownership was recorded; those are
+    /// owner-only operations nobody can prove, so status and cancel refuse
+    /// them rather than guessing.
+    #[serde(default)]
+    pub origin: Option<NodeId>,
     /// The request as accepted into the store.
     pub request: DelegationRequest,
     /// Current state.
@@ -158,9 +166,13 @@ pub enum DelegationError {
 }
 
 /// The authoritative delegation records.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DelegationStore {
     records: BTreeMap<DelegationId, DelegationRecord>,
+    /// A monotonic count of successful mutations, so a writer can tell whether
+    /// its file is stale without comparing every record.
+    #[serde(default)]
+    revision: u64,
 }
 
 impl DelegationStore {
@@ -173,6 +185,16 @@ impl DelegationStore {
     pub fn create(
         &mut self,
         request: DelegationRequest,
+        now_ms: u64,
+    ) -> Result<DelegationId, DelegationError> {
+        self.create_for(request, None, now_ms)
+    }
+
+    /// Record a new delegation and its authenticated submitter.
+    pub fn create_for(
+        &mut self,
+        request: DelegationRequest,
+        origin: Option<NodeId>,
         now_ms: u64,
     ) -> Result<DelegationId, DelegationError> {
         if request.objective.trim().is_empty() {
@@ -189,6 +211,7 @@ impl DelegationStore {
         self.records.insert(
             id.clone(),
             DelegationRecord {
+                origin,
                 request,
                 state: DelegationState::Created,
                 updated_at_ms: now_ms,
@@ -196,6 +219,7 @@ impl DelegationStore {
                 error: None,
             },
         );
+        self.revision += 1;
         Ok(id)
     }
 
@@ -204,6 +228,18 @@ impl DelegationStore {
         &mut self,
         parent: &DelegationId,
         request: DelegationRequest,
+        now_ms: u64,
+    ) -> Result<DelegationId, DelegationError> {
+        self.delegate_for(parent, request, None, now_ms)
+    }
+
+    /// Record a sub-delegation, inheriting the parent's owner so the chain
+    /// cannot change hands halfway down.
+    pub fn delegate_for(
+        &mut self,
+        parent: &DelegationId,
+        request: DelegationRequest,
+        origin: Option<NodeId>,
         now_ms: u64,
     ) -> Result<DelegationId, DelegationError> {
         let parent_record = self
@@ -245,7 +281,8 @@ impl DelegationStore {
         if request.allow_sub_delegation && !parent_record.request.allow_sub_delegation {
             request.allow_sub_delegation = false;
         }
-        self.create(request, now_ms)
+        let origin = parent_record.origin.clone().or(origin);
+        self.create_for(request, origin, now_ms)
     }
 
     /// Move one delegation to a new state.
@@ -268,6 +305,7 @@ impl DelegationStore {
         }
         record.state = to;
         record.updated_at_ms = now_ms;
+        self.revision += 1;
         Ok(())
     }
 
@@ -342,6 +380,47 @@ impl DelegationStore {
         }
         chain.reverse();
         chain
+    }
+
+    /// The mutation counter, for a writer deciding whether its file is stale.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Read a store from its persistence file; a missing file is empty.
+    pub fn load(path: &Path) -> std::io::Result<Self> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => Self::from_json(&text),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::new()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Parse a store, refusing a file that is not a store.
+    pub fn from_json(text: &str) -> std::io::Result<Self> {
+        serde_json::from_str(text)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
+    /// Serialize the store for its persistence file.
+    pub fn to_json(&self) -> std::io::Result<String> {
+        serde_json::to_string_pretty(self)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
+    /// Write the store atomically, private to the account.
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let temp = path.with_extension("json.tmp");
+        std::fs::write(&temp, self.to_json()?)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600));
+        }
+        std::fs::rename(&temp, path)
     }
 }
 

@@ -74,8 +74,14 @@ fn a_conforming_proposal_resolves_at_the_catalogue_version() {
         "requirements": [{ "capability": "builtin/read_file", "version": "^1.0", "remote": "forbidden" }]
     });
 
-    let plan =
-        compose(&proposal, &catalogue, &scope(&catalogue), &policy(&allowed)).expect("a plan");
+    let plan = compose(
+        &proposal,
+        &catalogue,
+        &[],
+        &scope(&catalogue),
+        &policy(&allowed),
+    )
+    .expect("a plan");
 
     assert_eq!(plan.capabilities.len(), 1);
     assert_eq!(
@@ -91,7 +97,7 @@ fn an_unknown_capability_is_refused_before_validation() {
         "requirements": [{ "capability": "builtin/ghost" }]
     });
 
-    let error = parse(&proposal, &catalogue).unwrap_err();
+    let error = parse(&proposal, &catalogue, &[]).unwrap_err();
 
     assert!(matches!(error, ComposeError::UnknownCapability(ref name) if name == "builtin/ghost"));
 }
@@ -103,7 +109,7 @@ fn an_unknown_field_is_refused() {
         "requirements": [{ "capability": "builtin/read_file", "permissions": ["net.egress"] }]
     });
 
-    let error = parse(&proposal, &catalogue).unwrap_err();
+    let error = parse(&proposal, &catalogue, &[]).unwrap_err();
 
     assert!(matches!(error, ComposeError::Json(_)), "{error:?}");
 }
@@ -111,7 +117,7 @@ fn an_unknown_field_is_refused() {
 #[test]
 fn an_empty_requirement_list_is_refused() {
     let catalogue = catalogue();
-    let error = parse(&json!({ "requirements": [] }), &catalogue).unwrap_err();
+    let error = parse(&json!({ "requirements": [] }), &catalogue, &[]).unwrap_err();
     assert!(matches!(error, ComposeError::Empty));
 }
 
@@ -122,7 +128,7 @@ fn a_bad_version_range_is_refused() {
         "requirements": [{ "capability": "builtin/read_file", "version": "not-a-range" }]
     });
 
-    let error = parse(&proposal, &catalogue).unwrap_err();
+    let error = parse(&proposal, &catalogue, &[]).unwrap_err();
 
     assert!(
         matches!(error, ComposeError::InvalidVersion { .. }),
@@ -138,8 +144,14 @@ fn a_risk_above_the_ceiling_is_refused_by_the_gate() {
         "requirements": [{ "capability": "builtin/write_file" }]
     });
 
-    let error = compose(&proposal, &catalogue, &scope(&catalogue), &policy(&allowed))
-        .expect_err("too risky");
+    let error = compose(
+        &proposal,
+        &catalogue,
+        &[],
+        &scope(&catalogue),
+        &policy(&allowed),
+    )
+    .expect_err("too risky");
 
     assert!(matches!(
         error,
@@ -155,8 +167,14 @@ fn a_remote_binding_is_refused_when_the_host_forbids_it() {
         "requirements": [{ "capability": "builtin/read_file", "remote": "allowed" }]
     });
 
-    let error = compose(&proposal, &catalogue, &scope(&catalogue), &policy(&allowed))
-        .expect_err("remote is forbidden");
+    let error = compose(
+        &proposal,
+        &catalogue,
+        &[],
+        &scope(&catalogue),
+        &policy(&allowed),
+    )
+    .expect_err("remote is forbidden");
 
     assert!(matches!(
         error,
@@ -171,7 +189,7 @@ fn a_peer_binding_parses_to_a_required_remote() {
         "requirements": [{ "capability": "builtin/read_file", "remote": "peer:peer-a" }]
     });
 
-    let spec = parse(&proposal, &catalogue).expect("a spec");
+    let spec = parse(&proposal, &catalogue, &[]).expect("a spec");
 
     assert!(matches!(
         spec.requirements[0].remote,

@@ -76,11 +76,7 @@ pub fn federation_cli(args: &[String]) -> i32 {
 
 /// Launch the BOS Harness desktop window. Blocks until the window closes.
 pub fn run() {
-    let dir = dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".bos")
-        .join("bsh")
-        .join("log");
+    let dir = settings::dir().join("log");
     std::fs::create_dir_all(&dir).ok();
     logging::auto_init_tracing_in(dir, "bsh");
     // A previous SIGKILL can leave Chromium behind; clean it before the next

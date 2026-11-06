@@ -1,9 +1,70 @@
 use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::mpsc::RecvTimeoutError;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use super::{Tool, ToolError};
 use react::tool::registry::AsyncTool;
+
+/// The most async tools one synchronous adapter may run at once.
+const MAX_CONCURRENT_ASYNC_TOOLS: usize = 8;
+
+/// How long a synchronous caller waits for one of those slots.
+const ASYNC_ADMISSION_WAIT: Duration = Duration::from_millis(50);
+
+/// The default finite wait for a synchronous async-tool call.
+const DEFAULT_ASYNC_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Slots shared by clones of one registry.
+#[derive(Default)]
+struct AsyncSlots {
+    in_use: Mutex<usize>,
+    ready: Condvar,
+}
+
+impl AsyncSlots {
+    fn acquire(self: &Arc<Self>, wait: Duration) -> Option<AsyncSlot> {
+        let mut in_use = self
+            .in_use
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let deadline = Instant::now() + wait;
+        while *in_use >= MAX_CONCURRENT_ASYNC_TOOLS {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            let (guard, timeout) = self
+                .ready
+                .wait_timeout(in_use, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            in_use = guard;
+            if timeout.timed_out() && *in_use >= MAX_CONCURRENT_ASYNC_TOOLS {
+                return None;
+            }
+        }
+        *in_use += 1;
+        Some(AsyncSlot {
+            slots: Arc::clone(self),
+        })
+    }
+}
+
+/// One held slot; dropped by the worker when the tool future ends, not by the
+/// caller on timeout, so a stuck tool keeps consuming its admission slot.
+struct AsyncSlot {
+    slots: Arc<AsyncSlots>,
+}
+
+impl Drop for AsyncSlot {
+    fn drop(&mut self) {
+        if let Ok(mut in_use) = self.slots.in_use.lock() {
+            *in_use = in_use.saturating_sub(1);
+        }
+        self.slots.ready.notify_one();
+    }
+}
 
 /// A registry of synchronous and asynchronous tools, addressed by name.
 pub struct ToolRegistry {
@@ -11,6 +72,8 @@ pub struct ToolRegistry {
     async_tools: HashMap<String, Arc<dyn AsyncTool>>,
     schema_cache: DashMap<String, serde_json::Value>,
     mcp_tool_names: HashSet<String>,
+    slots: Arc<AsyncSlots>,
+    async_timeout: Duration,
 }
 
 impl Clone for ToolRegistry {
@@ -20,6 +83,8 @@ impl Clone for ToolRegistry {
             async_tools: self.async_tools.clone(),
             schema_cache: DashMap::new(),
             mcp_tool_names: self.mcp_tool_names.clone(),
+            slots: Arc::clone(&self.slots),
+            async_timeout: self.async_timeout,
         }
     }
 }
@@ -32,6 +97,8 @@ impl ToolRegistry {
             async_tools: HashMap::new(),
             schema_cache: DashMap::new(),
             mcp_tool_names: HashSet::new(),
+            slots: Arc::new(AsyncSlots::default()),
+            async_timeout: DEFAULT_ASYNC_TIMEOUT,
         }
     }
 
@@ -179,19 +246,34 @@ impl ToolRegistry {
     /// [Self::execute] consults this only after both exact registries miss, so
     /// the suffix can never take a call away from a sync tool with that exact
     /// name.
-    fn find_async_tool(&self, name: &str) -> Option<Arc<dyn AsyncTool>> {
-        // Try exact match first
+    fn find_async_tool(&self, name: &str) -> Result<Option<Arc<dyn AsyncTool>>, ToolError> {
+        // Exact match always wins.
         if let Some(tool) = self.async_tools.get(name) {
-            return Some(tool.clone());
+            return Ok(Some(tool.clone()));
         }
-        // Try suffix match - key might be "mcp_hello_add" when name is "hello_add"
-        // Check if key ends with name directly or with "_name"
-        for (async_name, async_tool) in self.async_tools.iter() {
-            if async_name.ends_with(name) || async_name.ends_with(&format!("_{}", name)) {
-                return Some(async_tool.clone());
+        // The suffix fallback is for a model naming the bare tool an MCP server
+        // exposes. Two servers may expose the same bare name; picking whichever
+        // the HashMap yields first would route a call by insertion order, so an
+        // ambiguous suffix is refused and the candidates are listed.
+        let suffix = format!("_{name}");
+        let mut candidates: Vec<(&String, &Arc<dyn AsyncTool>)> = self
+            .async_tools
+            .iter()
+            .filter(|(async_name, _)| async_name.ends_with(name) || async_name.ends_with(&suffix))
+            .collect();
+        match candidates.len() {
+            0 => Ok(None),
+            1 => Ok(Some(candidates.remove(0).1.clone())),
+            _ => {
+                let mut names: Vec<String> =
+                    candidates.iter().map(|(name, _)| (*name).clone()).collect();
+                names.sort();
+                Err(ToolError::Ambiguous {
+                    name: name.to_string(),
+                    candidates: names,
+                })
             }
         }
-        None
     }
 
     /// Execute a tool by name, validating arguments against its schema.
@@ -221,10 +303,10 @@ impl ToolRegistry {
         }
         // The suffix match is the MCP bare-name fallback, so it is consulted
         // only after both exact maps missed.
-        if let Some(tool) = self.find_async_tool(name) {
-            return self.run_async(tool, args);
+        match self.find_async_tool(name)? {
+            Some(tool) => self.run_async(tool, args),
+            None => Err(ToolError::NotFound(name.to_string())),
         }
-        Err(ToolError::NotFound(name.to_string()))
     }
 
     /// Validate one async tool's arguments and run it to completion.
@@ -239,26 +321,61 @@ impl ToolRegistry {
             cached
         } else {
             let schema = tool.json_schema();
-            self.schema_cache.insert(registry_name, schema.clone());
+            self.schema_cache
+                .insert(registry_name.clone(), schema.clone());
             schema
         };
         super::validate_args(&schema, args)?;
 
+        // A synchronous caller cannot await, so it runs the future on one
+        // worker thread and waits for a finite time. Admission is bounded: a
+        // stuck tool keeps its slot until its future actually ends, so repeated
+        // timeouts cannot grow thread count without bound.
+        let slot = self.slots.acquire(ASYNC_ADMISSION_WAIT).ok_or_else(|| {
+            ToolError::Failed(format!(
+                "async tool executor is saturated ({MAX_CONCURRENT_ASYNC_TOOLS} in flight)"
+            ))
+        })?;
         let args = args.clone();
+        let worker_name = format!("tool-{registry_name}");
         let (tx, rx) = std::sync::mpsc::channel();
 
-        std::thread::spawn(move || {
-            let result = match tokio::runtime::Builder::new_current_thread().build() {
-                Ok(rt) => rt.block_on(tool.run(&args)),
-                Err(e) => Err(ToolError::Failed(format!(
-                    "Failed to create tool runtime: {e}"
-                ))),
-            };
-            let _ = tx.send(result);
-        });
+        std::thread::Builder::new()
+            .name(worker_name)
+            .spawn(move || {
+                let _slot = slot;
+                let result = match tokio::runtime::Builder::new_current_thread().build() {
+                    Ok(rt) => rt.block_on(tool.run(&args)),
+                    Err(e) => Err(ToolError::Failed(format!(
+                        "Failed to create tool runtime: {e}"
+                    ))),
+                };
+                let _ = tx.send(result);
+            })
+            .map_err(|error| {
+                ToolError::Failed(format!("Failed to start async tool worker: {error}"))
+            })?;
 
-        rx.recv()
-            .map_err(|e| ToolError::Failed(format!("Async tool thread failed: {e}")))?
+        match rx.recv_timeout(self.async_timeout) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => Err(ToolError::Timeout(format!(
+                "async tool {registry_name} did not finish within {:?}",
+                self.async_timeout
+            ))),
+            Err(RecvTimeoutError::Disconnected) => Err(ToolError::Failed(
+                "async tool worker exited without a result".to_string(),
+            )),
+        }
+    }
+
+    /// Set the finite wait a synchronous caller gives an async tool.
+    ///
+    /// The timeout is a wait bound, not cancellation: the worker keeps running
+    /// (and keeps its admission slot) until the tool future ends. Async-native
+    /// callers use the react registry and never pass through this adapter.
+    pub fn with_async_timeout(mut self, timeout: Duration) -> Self {
+        self.async_timeout = timeout;
+        self
     }
 
     /// Validate one synchronous tool's arguments and run it.
@@ -435,6 +552,131 @@ mod mcp_projection_tests {
         }
     }
 
+    /// An async tool that never resolves, to exercise wait bounds.
+    struct Never;
+
+    #[async_trait]
+    impl AsyncTool for Never {
+        fn name(&self) -> &str {
+            "never"
+        }
+
+        fn description(&self) -> String {
+            "never finishes".to_string()
+        }
+
+        fn json_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+
+        async fn run(&self, _input: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
+            std::future::pending().await
+        }
+    }
+
+    /// A stuck tool is waited for finitely, and each timed-out call keeps its
+    /// admission slot, so a later call is refused instead of spawning more.
+    #[test]
+    fn a_stuck_async_tool_times_out_and_saturates() {
+        let mut registry = ToolRegistry::new().with_async_timeout(Duration::from_millis(40));
+        registry.register_async(Arc::new(Never)).unwrap();
+
+        for _ in 0..MAX_CONCURRENT_ASYNC_TOOLS {
+            let error = registry
+                .execute("never", &serde_json::json!({}))
+                .expect_err("the tool never finishes");
+            assert!(
+                matches!(error, ToolError::Timeout(_)),
+                "the wait is finite: {error:?}"
+            );
+        }
+
+        let error = registry
+            .execute("never", &serde_json::json!({}))
+            .expect_err("the executor is saturated");
+        assert!(error.to_string().contains("saturated"), "{error}");
+    }
+
+    /// A panicking worker is reported as a failed call and releases its slot.
+    #[test]
+    fn a_panicking_async_tool_is_reported() {
+        struct Panics;
+
+        #[async_trait]
+        impl AsyncTool for Panics {
+            fn name(&self) -> &str {
+                "panics"
+            }
+
+            fn description(&self) -> String {
+                "panics".to_string()
+            }
+
+            fn json_schema(&self) -> serde_json::Value {
+                serde_json::json!({ "type": "object" })
+            }
+
+            async fn run(
+                &self,
+                _input: &serde_json::Value,
+            ) -> Result<serde_json::Value, ToolError> {
+                panic!("tool panic");
+            }
+        }
+
+        let mut registry = ToolRegistry::new().with_async_timeout(Duration::from_millis(500));
+        registry.register_async(Arc::new(Panics)).unwrap();
+        let error = registry
+            .execute("panics", &serde_json::json!({}))
+            .expect_err("the worker panicked");
+        assert!(
+            error.to_string().contains("exited without a result"),
+            "{error}"
+        );
+    }
+    /// A single MCP-style suffix still resolves the bare name.
+    #[test]
+    fn one_mcp_suffix_match_still_resolves() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .register_async(Arc::new(NamedAsync("mcp_hello_add")))
+            .unwrap();
+        let output = registry
+            .execute("add", &serde_json::json!({}))
+            .expect("one suffix match");
+        assert_eq!(output["ran"], "async");
+    }
+
+    /// Two servers exposing the same bare name are an ambiguity, never an
+    /// insertion-order choice, and the candidate list is sorted.
+    #[test]
+    fn colliding_suffixes_are_ambiguous_in_every_order() {
+        for order in [
+            ["mcp_files_read_file", "mcp_git_read_file"],
+            ["mcp_git_read_file", "mcp_files_read_file"],
+        ] {
+            let mut registry = ToolRegistry::new();
+            for name in order {
+                registry.register_async(Arc::new(NamedAsync(name))).unwrap();
+            }
+            let error = registry
+                .execute("read_file", &serde_json::json!({}))
+                .expect_err("two candidates must not dispatch");
+            match error {
+                ToolError::Ambiguous { name, candidates } => {
+                    assert_eq!(name, "read_file");
+                    assert_eq!(
+                        candidates,
+                        vec![
+                            "mcp_files_read_file".to_string(),
+                            "mcp_git_read_file".to_string(),
+                        ]
+                    );
+                }
+                other => panic!("expected ambiguity, got {other:?}"),
+            }
+        }
+    }
     /// A call by an exact tool name must reach that tool. An MCP server's
     /// `{namespace}_{tool}` registration used to win the call through the suffix
     /// match, so a server tool named `read_file` silently replaced the built-in

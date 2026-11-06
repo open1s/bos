@@ -117,7 +117,11 @@ pub fn prompt(catalogue: &Catalogue, goal: &str) -> String {
 /// Parsing is deliberately strict: an unknown field is an error, so a model
 /// cannot smuggle a setting the host never reads. Authority is checked by
 /// [`compose`], not here.
-pub fn parse(value: &Value, catalogue: &Catalogue) -> Result<CompositionSpec, ComposeError> {
+pub fn parse(
+    value: &Value,
+    catalogue: &Catalogue,
+    peers: &[capability::composition::PeerCatalogue],
+) -> Result<CompositionSpec, ComposeError> {
     let raw: RawProposal = serde_json::from_value(value.clone())
         .map_err(|error| ComposeError::Json(error.to_string()))?;
     if raw.requirements.is_empty() {
@@ -134,7 +138,12 @@ pub fn parse(value: &Value, catalogue: &Catalogue) -> Result<CompositionSpec, Co
                     value: requirement.capability.clone(),
                     message: error.to_string(),
                 })?;
-        if catalogue.get(&id).is_none() {
+        // A remote-only capability is offered by an allowlisted peer, not by
+        // this host's catalogue; the proposal gate still decides whether the
+        // model may name it.
+        if catalogue.get(&id).is_none()
+            && !peers.iter().any(|peer| peer.catalogue.get(&id).is_some())
+        {
             return Err(ComposeError::UnknownCapability(requirement.capability));
         }
         let version = match requirement.version {
@@ -168,10 +177,11 @@ pub fn parse(value: &Value, catalogue: &Catalogue) -> Result<CompositionSpec, Co
 pub fn compose(
     value: &Value,
     catalogue: &Catalogue,
+    peers: &[capability::composition::PeerCatalogue],
     scope: &LocalScope,
     policy: &ProposalPolicy<'_>,
 ) -> Result<ResolvedComposition, ComposeError> {
-    let spec = parse(value, catalogue)?;
-    let approved = approve(&spec, catalogue, policy)?;
-    Ok(resolve_approved(approved, catalogue, &[], scope)?)
+    let spec = parse(value, catalogue, peers)?;
+    let approved = approve(&spec, catalogue, peers, policy)?;
+    Ok(resolve_approved(approved, catalogue, peers, scope)?)
 }

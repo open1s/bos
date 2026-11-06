@@ -245,3 +245,49 @@ fn an_unknown_delegation_is_an_error() {
     assert!(matches!(error, DelegationError::Unknown { .. }));
     assert!(store.record(&DelegationId::new("missing")).is_none());
 }
+
+/// The authenticated submitter is recorded, and a sub-delegation inherits the
+/// parent's owner rather than taking on the sub-delegating peer's identity.
+#[test]
+fn ownership_is_recorded_and_inherited() {
+    let mut store = DelegationStore::new();
+    let owner = node("node:owner");
+    let other = node("node:other");
+
+    let mut parent = request("d-parent", vec![capability("read_file")], true);
+    parent.target = node("node:builder");
+    store
+        .create_for(parent, Some(owner.clone()), 100)
+        .expect("created");
+
+    store
+        .transition(
+            &DelegationId::new("d-parent"),
+            DelegationState::Accepted,
+            105,
+        )
+        .expect("the parent is active");
+
+    let mut child = request("d-child", vec![capability("read_file")], false);
+    child.parent = Some(DelegationId::new("d-parent"));
+    child.target = node("node:builder");
+    store
+        .delegate_for(&DelegationId::new("d-parent"), child, Some(other), 110)
+        .expect("sub-delegated");
+
+    assert_eq!(
+        store
+            .record(&DelegationId::new("d-parent"))
+            .expect("parent")
+            .origin,
+        Some(owner.clone())
+    );
+    assert_eq!(
+        store
+            .record(&DelegationId::new("d-child"))
+            .expect("child")
+            .origin,
+        Some(owner),
+        "the child keeps the parent's owner"
+    );
+}

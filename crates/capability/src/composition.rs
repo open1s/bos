@@ -17,12 +17,13 @@ use crate::catalogue::Catalogue;
 use crate::descriptor::CapabilityDescriptor;
 use crate::id::{CapabilityId, NodeId, ProviderId, WorkspaceId};
 use semver::{Version, VersionReq};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::time::Duration;
 
 /// A composition's stable id.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct CompositionId(String);
 
 impl CompositionId {
@@ -44,7 +45,7 @@ impl fmt::Display for CompositionId {
 }
 
 /// A grant a peer relationship carries.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GrantRef(String);
 
 impl GrantRef {
@@ -66,7 +67,7 @@ impl fmt::Display for GrantRef {
 }
 
 /// One peer the composition may use, and the grant it runs under.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerRef {
     /// The peer Node.
     pub node: NodeId,
@@ -89,7 +90,7 @@ impl PeerRef {
 }
 
 /// How one requirement may be satisfied.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RemotePolicy {
     /// Local only. A peer is never consulted.
     Forbidden,
@@ -100,7 +101,7 @@ pub enum RemotePolicy {
 }
 
 /// One thing the composition needs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityRequirement {
     /// The capability asked for.
     pub id: CapabilityId,
@@ -137,7 +138,7 @@ impl CapabilityRequirement {
 }
 
 /// The budgets a workspace applies to the resolved plan.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Budgets {
     /// Most invocations in flight at once.
     pub max_concurrent_invocations: u16,
@@ -155,7 +156,7 @@ impl Default for Budgets {
 }
 
 /// A declarative composition: what is needed, and where it may run.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompositionSpec {
     /// Stable id.
     pub id: CompositionId,
@@ -267,7 +268,7 @@ impl LocalScope {
 }
 
 /// Where a resolved capability executes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Binding {
     /// In this Node, through the named provider.
     Local {
@@ -313,6 +314,8 @@ pub struct ResolvedComposition {
     pub capabilities: Vec<ResolvedCapability>,
     /// Optional requirements that could not be satisfied.
     pub skipped: Vec<CapabilityId>,
+    /// The effective execution budgets this plan was resolved with.
+    pub budgets: Budgets,
 }
 
 impl ResolvedComposition {
@@ -429,10 +432,25 @@ pub fn resolve_host(
         workspace: scope.workspace.clone(),
         capabilities,
         skipped,
+        budgets: spec.budgets.clone(),
     })
 }
 
 fn validate(spec: &CompositionSpec) -> Result<(), CompositionError> {
+    if spec.budgets.max_concurrent_invocations == 0 {
+        return Err(CompositionError::Invalid {
+            message: "max_concurrent_invocations must be at least 1".to_string(),
+        });
+    }
+    if spec
+        .budgets
+        .default_timeout
+        .is_some_and(|timeout| timeout.is_zero())
+    {
+        return Err(CompositionError::Invalid {
+            message: "default_timeout must be greater than zero".to_string(),
+        });
+    }
     let mut ids = BTreeSet::new();
     for requirement in &spec.requirements {
         if !ids.insert(requirement.id.clone()) {
@@ -484,6 +502,12 @@ fn resolve_one(
     match &requirement.remote {
         RemotePolicy::Forbidden => missing(requirement),
         RemotePolicy::Allowed => {
+            // Every allowlisted peer is a candidate. A peer that publishes the
+            // capability but cannot satisfy the version, or holds no grant,
+            // must not stop the scan: a later peer may be usable. The first
+            // usable peer in spec order wins; authorization is never weakened.
+            let mut version_error: Option<CompositionError> = None;
+            let mut grant_error: Option<CompositionError> = None;
             for peer in &spec.peers {
                 let Some(catalogue) = catalogue_of(peers, &peer.node) else {
                     continue;
@@ -491,11 +515,16 @@ fn resolve_one(
                 let Some(descriptor) = catalogue.get(&requirement.id) else {
                     continue;
                 };
-                check_version(requirement, descriptor)?;
-                let grant = peer
-                    .grant
-                    .clone()
-                    .ok_or_else(|| missing_grant(peer, requirement))?;
+                if let Err(error) = check_version(requirement, descriptor) {
+                    version_error.get_or_insert(error);
+                    continue;
+                }
+                let Some(grant) = peer.grant.clone() else {
+                    // Authorization outranks a version mismatch in the report:
+                    // a peer that holds no grant is a stronger refusal.
+                    grant_error.get_or_insert_with(|| missing_grant(peer, requirement));
+                    continue;
+                };
                 return Ok(Some(ResolvedCapability {
                     descriptor: descriptor.clone(),
                     binding: Binding::Remote {
@@ -504,7 +533,14 @@ fn resolve_one(
                     },
                 }));
             }
-            missing(requirement)
+            if !requirement.required {
+                return Ok(None);
+            }
+            Err(grant_error
+                .or(version_error)
+                .unwrap_or_else(|| CompositionError::Missing {
+                    capability: requirement.id.clone(),
+                }))
         }
         RemotePolicy::Required(node) => {
             let peer = spec

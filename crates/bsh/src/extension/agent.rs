@@ -951,12 +951,114 @@ fn context_matches(
     let Some(workspace) = workspace else {
         return false;
     };
-    context.scope.iter().any(|pattern| {
-        let joined = workspace.join(pattern);
-        glob::glob(&joined.to_string_lossy())
-            .ok()
-            .is_some_and(|mut matches| matches.any(|entry| entry.is_ok()))
-    })
+    context
+        .scope
+        .iter()
+        .any(|pattern| scope_matches(workspace, pattern))
+}
+
+/// Entries one scope walk may inspect before it gives up.
+///
+/// The open workspace can be a dependency-heavy repository with hundreds of
+/// thousands of files, or the filesystem root itself, and a recursive wildcard
+/// gives a scope no natural end. These scopes are evaluated while the launch
+/// agent is built and again for every turn, so the walk is bounded: a project a
+/// context describes is far below this budget, and the glob tool's own walk has
+/// already pruned the build, dependency and hidden trees that make the count
+/// large.
+const SCOPE_WALK_BUDGET: usize = 20_000;
+
+/// Whether one scope glob matches the open workspace.
+///
+/// A literal path is one existence check. A pattern walks the glob tool's own
+/// tree - hidden, ignored and build/dependency entries never enter it - seeded
+/// by the literal directories in front of the first wildcard. A walk that cannot
+/// finish within [SCOPE_WALK_BUDGET] entries reports no match instead of
+/// freezing its caller.
+fn scope_matches(workspace: &std::path::Path, pattern: &str) -> bool {
+    scope_matches_within(workspace, pattern, SCOPE_WALK_BUDGET)
+}
+
+/// [scope_matches] with the entry budget named, so a test can prove the bound.
+fn scope_matches_within(workspace: &std::path::Path, pattern: &str, budget: usize) -> bool {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return false;
+    }
+    // A package may write the scope as an absolute path, or with the workspace
+    // already in front of a relative one; both name the same tree. A scope
+    // outside the workspace can never match it.
+    let relative = match std::path::Path::new(pattern).strip_prefix(workspace) {
+        Ok(relative) => scope_text(relative).into_owned(),
+        Err(_) if std::path::Path::new(pattern).is_absolute() => return false,
+        Err(_) => pattern.to_string(),
+    };
+    // Split at the first wildcard: the literal directories seed the walk, and
+    // the rest becomes the matcher, so a pattern under a literal base never
+    // scans a tree outside it and a base that is gone is one failed is_dir
+    // check rather than a walk of the workspace.
+    let mut prefix = PathBuf::new();
+    let mut rest: Vec<&str> = Vec::new();
+    let mut wildcard = false;
+    for component in relative.split('/') {
+        let literal = !component.is_empty()
+            && !component
+                .chars()
+                .any(|character| matches!(character, '*' | '?' | '['));
+        if !wildcard && literal {
+            prefix.push(component);
+        } else {
+            wildcard = true;
+            rest.push(component);
+        }
+    }
+    if !wildcard {
+        return workspace.join(&prefix).exists();
+    }
+    let base = workspace.join(&prefix);
+    if !base.is_dir() {
+        return false;
+    }
+    let Ok(matcher) = glob::Pattern::new(&rest.join("/")) else {
+        return false;
+    };
+    // The glob crate forces a literal separator (a star stops at a slash);
+    // matching a path by hand has to ask for the same rule.
+    let options = glob::MatchOptions {
+        require_literal_separator: true,
+        ..glob::MatchOptions::new()
+    };
+    let mut seen = 0usize;
+    for entry in crate::glob::build_walker(&base, false).build().flatten() {
+        if entry.depth() == 0 {
+            continue;
+        }
+        if seen >= budget {
+            log::debug!(
+                "extension scope {pattern:?} under {} stopped after {budget} entries",
+                workspace.display()
+            );
+            return false;
+        }
+        seen += 1;
+        let Ok(path) = entry.path().strip_prefix(&base) else {
+            continue;
+        };
+        if matcher.matches_with(&scope_text(path), options) {
+            return true;
+        }
+    }
+    false
+}
+
+/// One path as the scope matcher reads it: forward slashes on every platform.
+fn scope_text(path: &std::path::Path) -> std::borrow::Cow<'_, str> {
+    let text = path.to_string_lossy();
+    if std::path::MAIN_SEPARATOR == '/' {
+        text
+    } else {
+        std::borrow::Cow::Owned(text.replace(std::path::MAIN_SEPARATOR, "/"))
+    }
 }
 
 pub(crate) fn install(
@@ -1185,6 +1287,74 @@ mod tests {
         assert!(!context_matches(&context, Some(&scratch.0)));
         context.scope.clear();
         assert!(context_matches(&context, None));
+    }
+
+    /// Build output, hidden directories and ignored trees are not evidence
+    /// that a workspace is the kind of project a context describes.
+    #[test]
+    fn a_context_scope_walks_only_project_files() {
+        let scratch = Scratch::new("context-scope-policy");
+        for tree in ["target/docs", ".hidden/docs", "generated/docs"] {
+            std::fs::create_dir_all(scratch.0.join(tree)).expect("tree");
+            std::fs::write(scratch.0.join(tree).join("design.md"), "").expect("file");
+        }
+        std::fs::write(scratch.0.join(".gitignore"), "generated/\n").expect("gitignore");
+        let context = ferris_sdk::host_runtime::declarative::TextContribution {
+            id: ferris_sdk::types::ContributionId::parse("scoped").expect("id"),
+            description: "Scoped".to_string(),
+            text: "Text".to_string(),
+            scope: vec!["**/docs/design.md".to_string()],
+        };
+        assert!(
+            !context_matches(&context, Some(&scratch.0)),
+            "a build tree, a hidden directory and a gitignored tree are not a match"
+        );
+        std::fs::create_dir_all(scratch.0.join("docs")).expect("docs");
+        std::fs::write(scratch.0.join("docs/design.md"), "").expect("design");
+        assert!(context_matches(&context, Some(&scratch.0)));
+    }
+
+    /// A walk that runs out of budget reports no match instead of freezing the
+    /// build that asked, which is what keeps a `**` scope over a large (or
+    /// root) workspace from hiding the window.
+    #[test]
+    fn a_scope_walk_is_bounded() {
+        let scratch = Scratch::new("context-scope-budget");
+        std::fs::create_dir_all(scratch.0.join("docs")).expect("docs");
+        std::fs::write(scratch.0.join("docs/design.md"), "").expect("design");
+        assert!(scope_matches_within(
+            &scratch.0,
+            "**/docs/design.md",
+            SCOPE_WALK_BUDGET
+        ));
+        assert!(
+            !scope_matches_within(&scratch.0, "**/docs/design.md", 0),
+            "an exhausted walk stops rather than blocking its caller"
+        );
+    }
+
+    /// The literal directories in front of the first wildcard seed the walk, so
+    /// an absent base is one failed directory check, not a scan of the workspace.
+    #[test]
+    fn a_scope_seeds_its_walk_with_its_literal_directories() {
+        let scratch = Scratch::new("context-scope-prefix");
+        std::fs::create_dir_all(scratch.0.join("docs")).expect("docs");
+        std::fs::write(scratch.0.join("docs/design.md"), "").expect("design");
+        assert!(scope_matches(&scratch.0, "docs/design.md"));
+        assert!(!scope_matches(&scratch.0, "docs/other.md"));
+        std::fs::create_dir_all(scratch.0.join("packages/p")).expect("package");
+        std::fs::write(scratch.0.join("packages/p/extension.toml"), "").expect("manifest");
+        assert!(scope_matches(&scratch.0, "packages/**/extension.toml"));
+        assert!(
+            !scope_matches(&scratch.0, "missing/**/extension.toml"),
+            "a base that is not a directory cannot match"
+        );
+        let absolute = scratch.0.join("docs/design.md");
+        assert!(scope_matches(&scratch.0, &absolute.to_string_lossy()));
+        assert!(
+            !scope_matches(&scratch.0, "/definitely/not/here/**/*.md"),
+            "a scope outside the workspace cannot match it"
+        );
     }
     struct Scratch(PathBuf);
 

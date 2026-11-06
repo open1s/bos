@@ -1407,7 +1407,7 @@ test pins it. Gaps are named rather than implied.
 | 006 | Autonomy: dual authorization, denials name the side | service::invoke, serve; CapabilityError::Denied | service tests (caller/provider refusals) | none known |
 | 007 | Remote composition: remote is a binding, never a local provider | composition::Binding::Remote, RemoteCapabilityProvider, bsh attach_remote_tools | federation remote_provider, bsh caps attach test | no local fallback by construction |
 | 008 | Two layers, one Capability Model, separate authority | one CompositionSpec/resolve; SnapshotOrigin; workspace id per Node | capability composition, snapshot, bsh compose | Knowledge Federation is not implemented; delegation/lease state is process-local; see GAP-FED-001/004/005 |
-| 009 | Zenoh, JSON, one endpoint, resource streams on the protocol | federation::zenoh, service resource path; bus::TlsConfig for transport TLS | zenoh_transport, resource, resource_wire, bus TLS tests | TLS settings are exposed, rendered, and validated by Zenoh, and a TLS listener without usable material fails instead of opening plaintext; handshake unverified here. Production security profile still incomplete; see GAP-FED-003. The ingress queue is bounded (1024 frames, 256 announcements) with drop-and-log overflow, and the peer store is written 0600 |
+| 009 | Zenoh, JSON, one endpoint, resource streams on the protocol | federation::zenoh, service resource path; bus::TlsConfig for transport TLS | zenoh_transport, resource, resource_wire, bus TLS tests | TLS settings are exposed, rendered, and validated by Zenoh, and a TLS listener without usable material fails instead of opening plaintext; handshake unverified here. Production security profile still incomplete; see GAP-FED-003. The ingress queue is bounded (1024 frames, 256 announcements) with drop-and-log overflow, the peer store is written 0600, and accepted delegations persist to delegations.json across restarts; a structured result_contract executes on the target's runtime (scope-checked, cancel-aware) and settles the record, delegation status/cancel are owner-only, handler dispatch is admitted at 64 global / 8 per peer with a retryable refusal, invocations carry an absolute deadline plus a scoped, idempotent remote cancel, resource streams are peer-bound with ordered, bounded delivery, discovery records expire after five minutes with clock-skew and replay rejection, inbound frames are deduplicated by sender-scoped message/idempotency keys, envelopes are recipient- and result-peer-bound, and resource checksums are incremental |
 
 ### 30.2 Local composition (section 28)
 
@@ -1481,7 +1481,7 @@ passes:
 | Suite | Result |
 | --- | --- |
 | capability (unit tests + doctests) | 31 passed |
-| federation | 79 passed |
+| federation | 106 passed |
 | agent | 570 passed, 0 failed |
 | bsh caps::tests | 146 passed, 1 ignored |
 | bsh extension::e2e | 15 passed |

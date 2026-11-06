@@ -281,6 +281,16 @@ There is also a real loopback Zenoh transport test in `crates/federation/tests/z
 4. On restart, recover active tasks as recoverable/unknown and reconcile with providers; do not blindly replay side effects.
 5. Persist lease expiry and ensure expired leases cannot resume.
 
+**Status: delegations persisted; leases deliberately not.** `DelegationStore` is
+now serializable and carries a revision; `FederationNode::with_delegation_persistence`
+loads `delegations.json` at start, and the handler task writes it atomically
+(0600, one writer) after each inbound change. A restart test proves an accepted
+delegation still answers status. Leases are live stream state: a restart ends the
+streams, so persisting a lease would name a stream that no longer exists; the
+guide says the peer re-opens instead. Still owed: a schema version, idempotency
+records, and an explicit recovery policy for a record left `running` at crash
+(unreachable today because the bsh node has no executor).
+
 **Acceptance**
 - Restart tests recover terminal state and classify interrupted in-flight work.
 - Duplicate message/retry tests do not duplicate non-idempotent side effects.

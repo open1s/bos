@@ -304,3 +304,211 @@ async fn an_unknown_delegation_is_not_found() {
         "{error:?}"
     );
 }
+
+/// The target's accepted delegation outlives its process: a restart reloads the
+/// store from the data directory and still answers status.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delegation_survives_the_target_restarting() {
+    let root = std::env::temp_dir().join(format!("bsh-delegation-restart-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("a scratch directory");
+    let path = root.join("delegations.json");
+
+    let network = Arc::new(InMemoryNetwork::new());
+    let caller_identity = identity(51);
+    let target_identity = identity(52);
+    let caller_id = caller_identity.node_id();
+    let target_id = target_identity.node_id();
+
+    let (caller_transport, caller_inbox) = network.join(caller_id.clone());
+    let (target_transport, target_inbox) = network.join(target_id.clone());
+    let caller = Arc::new(FederationNode::new(
+        caller_identity,
+        Arc::new(caller_transport),
+    ));
+    let target = Arc::new(
+        FederationNode::new(target_identity.clone(), Arc::new(target_transport))
+            .with_delegation_persistence(&path),
+    );
+    let caller_task = caller.start(caller_inbox);
+    let target_task = target.start(target_inbox);
+
+    let now = capability::unix_ms();
+    {
+        let store = caller.peers();
+        let mut peers = store.write().expect("peers");
+        peers.enroll(target_id.clone(), now, None);
+        peers
+            .grant(&target_id, capability("read_file"), now, None)
+            .expect("granted");
+    }
+    {
+        let store = target.peers();
+        let mut peers = store.write().expect("peers");
+        peers.enroll(caller_id.clone(), now, None);
+        peers
+            .grant(&caller_id, capability("read_file"), now, None)
+            .expect("granted");
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let record = caller
+        .delegate(
+            &target_id,
+            request(
+                "d-restart",
+                &target_id,
+                vec![capability("read_file")],
+                false,
+            ),
+            &context(),
+        )
+        .await
+        .expect("accepted");
+    assert_eq!(record.state, DelegationState::Accepted);
+
+    // The serve loop persists after the handler returns.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(path.is_file(), "the store was written");
+    target_task.abort();
+    drop(target);
+
+    // A new process, same identity, same data directory.
+    let (target_transport, target_inbox) = network.join(target_id.clone());
+    let target = Arc::new(
+        FederationNode::new(target_identity, Arc::new(target_transport))
+            .with_delegation_persistence(&path),
+    );
+    let target_task = target.start(target_inbox);
+    target
+        .peers()
+        .write()
+        .expect("peers")
+        .enroll(caller_id.clone(), capability::unix_ms(), None);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let status = caller
+        .delegation_status(&target_id, &DelegationId::new("d-restart"), &context())
+        .await
+        .expect("the restarted target answers");
+    assert_eq!(status.state, DelegationState::Accepted);
+    assert_eq!(status.request.objective, "verify the change");
+    assert_eq!(
+        status.origin,
+        Some(caller_id),
+        "ownership is part of the persisted record"
+    );
+
+    caller_task.abort();
+    target_task.abort();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A delegation belongs to the peer that submitted it: another trusted peer
+/// cannot read it or cancel it by knowing the id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn another_peer_cannot_read_or_cancel_a_delegation() {
+    let network = Arc::new(InMemoryNetwork::new());
+    let owner_identity = identity(71);
+    let stranger_identity = identity(72);
+    let target_identity = identity(73);
+    let owner_id = owner_identity.node_id();
+    let stranger_id = stranger_identity.node_id();
+    let target_id = target_identity.node_id();
+
+    let (owner_transport, owner_inbox) = network.join(owner_id.clone());
+    let (stranger_transport, stranger_inbox) = network.join(stranger_id.clone());
+    let (target_transport, target_inbox) = network.join(target_id.clone());
+    let owner = Arc::new(FederationNode::new(
+        owner_identity,
+        Arc::new(owner_transport),
+    ));
+    let stranger = Arc::new(FederationNode::new(
+        stranger_identity,
+        Arc::new(stranger_transport),
+    ));
+    let target = Arc::new(FederationNode::new(
+        target_identity,
+        Arc::new(target_transport),
+    ));
+    let tasks = vec![
+        owner.start(owner_inbox),
+        stranger.start(stranger_inbox),
+        target.start(target_inbox),
+    ];
+
+    let now = capability::unix_ms();
+    {
+        let store = target.peers();
+        let mut peers = store.write().expect("peers");
+        peers.enroll(owner_id.clone(), now, None);
+        peers.enroll(stranger_id.clone(), now, None);
+        peers
+            .grant(&owner_id, capability("echo"), now, None)
+            .expect("granted");
+        peers
+            .grant(&stranger_id, capability("echo"), now, None)
+            .expect("granted");
+    }
+    for caller in [&owner, &stranger] {
+        let store = caller.peers();
+        let mut peers = store.write().expect("peers");
+        peers.enroll(target_id.clone(), now, None);
+        peers
+            .grant(&target_id, capability("echo"), now, None)
+            .expect("granted");
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let record = owner
+        .delegate(
+            &target_id,
+            request("d-owned", &target_id, vec![capability("echo")], false),
+            &context(),
+        )
+        .await
+        .expect("the target accepts");
+    assert_eq!(record.origin, Some(owner_id.clone()));
+    assert_eq!(record.state, DelegationState::Accepted);
+
+    let status = stranger
+        .delegation_status(&target_id, &DelegationId::new("d-owned"), &context())
+        .await;
+    assert!(
+        matches!(status, Err(CapabilityError::Denied { .. })),
+        "a stranger cannot read it: {status:?}"
+    );
+
+    let cancel = stranger
+        .cancel_delegation(&target_id, &DelegationId::new("d-owned"), &context())
+        .await;
+    assert!(
+        matches!(cancel, Err(CapabilityError::Denied { .. })),
+        "a stranger cannot cancel it: {cancel:?}"
+    );
+    let still = owner
+        .delegation_status(&target_id, &DelegationId::new("d-owned"), &context())
+        .await
+        .expect("the owner still reads it");
+    assert_eq!(still.state, DelegationState::Accepted);
+
+    let cancelled = owner
+        .cancel_delegation(&target_id, &DelegationId::new("d-owned"), &context())
+        .await
+        .expect("the owner cancels");
+    assert_eq!(cancelled.state, DelegationState::Cancelled);
+
+    // Revoking the owner on the target ends the relationship, ownership or not.
+    target.peers().write().expect("peers").revoke(&owner_id);
+    let after_revoke = owner
+        .delegation_status(&target_id, &DelegationId::new("d-owned"), &context())
+        .await;
+    assert!(
+        matches!(after_revoke, Err(CapabilityError::Denied { .. })),
+        "a revoked owner is refused: {after_revoke:?}"
+    );
+
+    for task in tasks {
+        task.abort();
+    }
+}

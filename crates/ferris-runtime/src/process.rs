@@ -48,6 +48,9 @@ struct ProcessSession {
     stdout: BufReader<ChildStdout>,
     next_id: u64,
     token: String,
+    /// The group id, captured while the handle exists.
+    #[cfg(unix)]
+    pid: u32,
 }
 
 /// Kill the session child through the platform handle.
@@ -65,7 +68,42 @@ fn child_id(child: &Child) -> Option<u32> {
     child.id()
 }
 
+impl Drop for ProcessSession {
+    fn drop(&mut self) {
+        // A discarded session (timeout, broken exchange, cancellation) takes
+        // the same group-termination path as an explicit shutdown.
+        self.terminate();
+    }
+}
+
 impl ProcessSession {
+    /// Terminate the direct child and its process group.
+    ///
+    /// Explicit shutdown and Drop share this one contract: a timed-out or
+    /// broken exchange discards the session, and dropping it must not leave the
+    /// child's descendants behind. On Unix the child called setpgid(0, 0), so
+    /// the captured pid is the group id. While the child is still alive its pid
+    /// cannot be recycled, so the group is safe to signal; once it exited, the
+    /// group is signalled only when no live process owns that pid.
+    fn terminate(&mut self) {
+        #[cfg(unix)]
+        if self.pid != 0 {
+            let exited = self.child.try_wait().ok().flatten().is_some();
+            let owned = if exited {
+                child_identity(self.pid).is_none()
+            } else {
+                true
+            };
+            if owned {
+                // SAFETY: this session spawned the group leader.
+                unsafe {
+                    libc::killpg(self.pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+        }
+        start_kill(&mut self.child);
+    }
+
     async fn request(
         &mut self,
         method: &str,
@@ -1163,6 +1201,8 @@ impl ProcessRuntime {
             });
         }
         let mut session = ProcessSession {
+            #[cfg(unix)]
+            pid: child_id(&child).unwrap_or(0),
             child,
             stdin,
             stdout: BufReader::new(stdout),
@@ -1230,17 +1270,7 @@ impl ProcessRuntime {
             session.request("shutdown", json!({}), SHUTDOWN_MS, &self.extension),
         )
         .await;
-        // The child called setpgid(0, 0) in pre_exec, so its pid is the group
-        // id. Signal the whole group: a language server's grandchildren would
-        // otherwise survive the parent and keep the workspace busy.
-        #[cfg(unix)]
-        if let Some(pid) = child_id(&session.child) {
-            // SAFETY: pid is the group leader this runtime spawned.
-            unsafe {
-                libc::killpg(pid as libc::pid_t, libc::SIGKILL);
-            }
-        }
-        start_kill(&mut session.child);
+        session.terminate();
         wait_child(&mut session.child).await;
         self.child_pid.store(0, Ordering::Relaxed);
     }
@@ -1848,6 +1878,170 @@ max_execution_ms = 500
         runtime.shutdown().await.expect("shutdown");
     }
 
+    #[cfg(unix)]
+    fn process_is_alive(pid: u32) -> bool {
+        // SAFETY: signal 0 only probes existence.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+
+    #[cfg(unix)]
+    async fn wait_until_gone(pids: &[u32]) {
+        for _ in 0..100 {
+            if pids.iter().all(|pid| !process_is_alive(*pid)) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        let alive: Vec<u32> = pids
+            .iter()
+            .copied()
+            .filter(|pid| process_is_alive(*pid))
+            .collect();
+        panic!("processes survived the session: {alive:?}");
+    }
+
+    #[cfg(unix)]
+    fn pids_written(scratch: &Scratch) -> Vec<u32> {
+        let text = std::fs::read_to_string(scratch.0.join("pids.txt")).expect("pids");
+        text.split_whitespace()
+            .filter_map(|pid| pid.parse().ok())
+            .collect()
+    }
+
+    /// A call that times out discards the session; dropping it must kill the
+    /// descendant the extension spawned, not only the direct child.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timed_out_session_kills_its_descendants() {
+        let scratch = Scratch::new("timeout-group");
+        std::fs::write(
+            scratch.0.join("tools/echo.json"),
+            r#"{"description":"Echo","input_schema":{"type":"object"}}"#,
+        )
+        .expect("tool");
+        std::fs::write(
+            scratch.0.join("server.py"),
+            r#"import json, os, subprocess, sys, time
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": "1.0", "token": request.get("params", {}).get("token")}
+    elif method == "tools/call":
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        with open("pids.txt", "a") as log:
+            log.write(f"{os.getpid()} {child.pid}\n")
+        time.sleep(10)
+        result = {"ok": True}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": request.get("id"), "result": result}), flush=True)
+"#,
+        )
+        .expect("server");
+        let manifest = Manifest::parse(
+            r#"
+schema_version = "1.0"
+[extension]
+id = "com.example.process"
+name = "Process"
+version = "1.0.0"
+description = "A process package"
+[compatibility]
+bsh = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+[runtime]
+kind = "process"
+entry = "python3"
+args = ["server.py"]
+[capabilities]
+required = ["process.execute"]
+[contributes]
+tools = ["echo"]
+[resources]
+max_execution_ms = 500
+"#,
+            &scratch.0.join("extension.toml"),
+        )
+        .expect("manifest");
+        let runtime = ProcessRuntime::new(&manifest, &scratch.0).expect("runtime");
+        let context = CallContext::new(manifest.id().clone(), "timeout-group", None, 5000);
+
+        let error = runtime
+            .call_tool("echo", json!({}), &context)
+            .await
+            .expect_err("the manifest ceiling wins");
+        assert_eq!(error.category(), "timeout");
+        let pids = pids_written(&scratch);
+        assert_eq!(pids.len(), 2, "parent and descendant were recorded");
+        wait_until_gone(&pids).await;
+        runtime.shutdown().await.expect("shutdown");
+    }
+
+    /// The direct child may exit before its descendant; the group is still
+    /// terminated when the discarded session is dropped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_descendant_survives_a_parent_exit_only_until_the_drop() {
+        let scratch = Scratch::new("orphan-group");
+        std::fs::write(
+            scratch.0.join("tools/echo.json"),
+            r#"{"description":"Echo","input_schema":{"type":"object"}}"#,
+        )
+        .expect("tool");
+        std::fs::write(
+            scratch.0.join("server.py"),
+            r#"import json, os, subprocess, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": "1.0", "token": request.get("params", {}).get("token")}
+        print(json.dumps({"jsonrpc": "2.0", "id": request.get("id"), "result": result}), flush=True)
+    elif method == "tools/call":
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        with open("pids.txt", "a") as log:
+            log.write(f"{child.pid}\n")
+            log.flush()
+        os._exit(0)
+"#,
+        )
+        .expect("server");
+        let manifest = Manifest::parse(
+            r#"
+schema_version = "1.0"
+[extension]
+id = "com.example.process"
+name = "Process"
+version = "1.0.0"
+description = "A process package"
+[compatibility]
+bsh = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+[runtime]
+kind = "process"
+entry = "python3"
+args = ["server.py"]
+[capabilities]
+required = ["process.execute"]
+[contributes]
+tools = ["echo"]
+"#,
+            &scratch.0.join("extension.toml"),
+        )
+        .expect("manifest");
+        let runtime = ProcessRuntime::new(&manifest, &scratch.0).expect("runtime");
+        let context = CallContext::new(manifest.id().clone(), "orphan-group", None, 5000);
+
+        let _error = runtime
+            .call_tool("echo", json!({}), &context)
+            .await
+            .expect_err("the child exited without a reply");
+        let pids = pids_written(&scratch);
+        assert_eq!(pids.len(), 1, "the descendant pid was recorded");
+        wait_until_gone(&pids).await;
+        runtime.shutdown().await.expect("shutdown");
+    }
     #[cfg(unix)]
     #[tokio::test]
     async fn a_process_memory_ceiling_kills_a_runaway_child() {

@@ -10,7 +10,8 @@ use std::collections::BTreeSet;
 
 use crate::catalogue::Catalogue;
 use crate::composition::{
-    resolve_host, CompositionError, CompositionSpec, LocalScope, PeerCatalogue,
+    resolve_host, CapabilityRequirement, CompositionError, CompositionSpec, LocalScope,
+    PeerCatalogue, RemotePolicy,
 };
 use crate::descriptor::Risk;
 use crate::id::CapabilityId;
@@ -57,6 +58,12 @@ pub enum ProposalError {
         /// The capability.
         capability: CapabilityId,
     },
+    /// A remote-only capability whose allowlisted providers hold no grant.
+    #[error("the proposal asks for {capability}, which no allowlisted peer is granted to provide")]
+    Ungranted {
+        /// The capability.
+        capability: CapabilityId,
+    },
 }
 
 /// A proposal that failed either the host gate or the resolver.
@@ -74,6 +81,7 @@ pub enum ProposalRejection {
 pub fn validate_proposal(
     spec: &CompositionSpec,
     catalogue: &Catalogue,
+    peers: &[PeerCatalogue],
     policy: &ProposalPolicy<'_>,
 ) -> Result<(), ProposalError> {
     if !policy.allow_remote && !spec.peers.is_empty() {
@@ -90,10 +98,18 @@ pub fn validate_proposal(
                 capability: requirement.id.clone(),
             });
         }
-        let Some(descriptor) = catalogue.get(&requirement.id) else {
-            return Err(ProposalError::Unknown {
+        if !policy.allow_remote && requirement.remote != RemotePolicy::Forbidden {
+            return Err(ProposalError::Remote {
                 capability: requirement.id.clone(),
             });
+        }
+        let descriptor = match proposed_descriptor(requirement, spec, catalogue, peers)? {
+            Some(descriptor) => descriptor,
+            None => {
+                return Err(ProposalError::Unknown {
+                    capability: requirement.id.clone(),
+                })
+            }
         };
         if descriptor.risk > policy.max_risk {
             return Err(ProposalError::Risk {
@@ -102,14 +118,50 @@ pub fn validate_proposal(
                 ceiling: policy.max_risk,
             });
         }
-        if !policy.allow_remote && requirement.remote != crate::composition::RemotePolicy::Forbidden
-        {
-            return Err(ProposalError::Remote {
-                capability: requirement.id.clone(),
-            });
-        }
     }
     Ok(())
+}
+
+/// The descriptor the resolver would use for this requirement, without
+/// resolving: local first (unless the requirement names a peer), then the
+/// allowlisted peers in spec order, skipping a version mismatch and a missing
+/// grant. A peer outside the spec's peer list is never a candidate, so the
+/// proposal cannot widen the allowlist.
+fn proposed_descriptor<'a>(
+    requirement: &CapabilityRequirement,
+    spec: &CompositionSpec,
+    catalogue: &'a Catalogue,
+    peers: &'a [PeerCatalogue],
+) -> Result<Option<&'a crate::descriptor::CapabilityDescriptor>, ProposalError> {
+    if !matches!(requirement.remote, RemotePolicy::Required(_)) {
+        if let Some(descriptor) = catalogue.get(&requirement.id) {
+            return Ok(Some(descriptor));
+        }
+    }
+    let mut saw_version_match = false;
+    for peer in &spec.peers {
+        let Some(candidate) = peers
+            .iter()
+            .find(|candidate| candidate.node == peer.node)
+            .and_then(|candidate| candidate.catalogue.get(&requirement.id))
+        else {
+            continue;
+        };
+        if !requirement.version.matches(&candidate.version) {
+            continue;
+        }
+        saw_version_match = true;
+        if peer.grant.is_none() {
+            continue;
+        }
+        return Ok(Some(candidate));
+    }
+    if saw_version_match {
+        return Err(ProposalError::Ungranted {
+            capability: requirement.id.clone(),
+        });
+    }
+    Ok(None)
 }
 
 /// A proposal the host has approved.
@@ -138,9 +190,10 @@ impl<'a> ApprovedComposition<'a> {
 pub fn approve<'a>(
     spec: &'a CompositionSpec,
     catalogue: &Catalogue,
+    peers: &[PeerCatalogue],
     policy: &ProposalPolicy<'_>,
 ) -> Result<ApprovedComposition<'a>, ProposalError> {
-    validate_proposal(spec, catalogue, policy)?;
+    validate_proposal(spec, catalogue, peers, policy)?;
     Ok(ApprovedComposition { spec })
 }
 
@@ -164,6 +217,6 @@ pub fn resolve_proposal(
     scope: &LocalScope,
     policy: &ProposalPolicy<'_>,
 ) -> Result<crate::composition::ResolvedComposition, ProposalRejection> {
-    let approved = approve(spec, local, policy)?;
+    let approved = approve(spec, local, peers, policy)?;
     Ok(resolve_approved(approved, local, peers, scope)?)
 }

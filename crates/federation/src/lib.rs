@@ -41,5 +41,9 @@ pub use resource::{
     checksum, LeaseId, LeaseStore, ResourceError, ResourceLease, ResourceStreamMessage,
     StreamReceiver, StreamSender,
 };
-pub use service::{FederationNode, RemoteStream, ResourceSource, STREAM_CHUNK};
+pub use service::{
+    AdmissionLimits, FederationNode, RemoteStream, ResourceSource, MAX_CONCURRENT_STREAMS,
+    MAX_IN_FLIGHT_CONTROL, MAX_IN_FLIGHT_CONTROL_PER_PEER, MAX_IN_FLIGHT_HANDLERS,
+    MAX_IN_FLIGHT_PER_PEER, MAX_RESOURCE_STREAMS, MAX_STREAM_DURATION, STREAM_CHUNK,
+};
 pub use zenoh::{inbox_key, node_key, Inbox, ZenohTransport};

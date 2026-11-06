@@ -352,7 +352,13 @@ pub(crate) fn apply_announce(
     let Ok(record) = serde_json::from_value::<DiscoveryRecord>(envelope.payload.clone()) else {
         return false;
     };
-    if record.node != envelope.sender || &record.node == own || !record.verify() {
+    if record.node != envelope.sender || &record.node == own {
+        return false;
+    }
+    let known = discovered
+        .get(&record.node)
+        .map(|current| current.published_at_ms);
+    if record.check(now_ms, known).is_err() {
         return false;
     }
     discovered.insert(record.node.clone(), record);
@@ -598,6 +604,14 @@ pub(crate) fn node_runtime(
     Ok((runtime, descriptors))
 }
 
+/// The delegation file beside the peer store, in the node's data directory.
+fn delegation_store_path(peers_path: &std::path::Path) -> PathBuf {
+    peers_path
+        .parent()
+        .map(|dir| dir.join("delegations.json"))
+        .unwrap_or_else(|| PathBuf::from("delegations.json"))
+}
+
 async fn build(
     settings: crate::settings::Settings,
     identity_path: PathBuf,
@@ -649,6 +663,7 @@ async fn build(
         audit,
         Some(lock),
         runtime,
+        Some(delegation_store_path(&peers_path)),
         advertise,
         Some(crate::federation::resolve_node_name(
             settings.global.federation.node_name.as_deref(),
@@ -666,6 +681,7 @@ pub(crate) fn assemble(
     audit: Option<PathBuf>,
     lock: Option<crate::federation_lock::DataDirLock>,
     runtime: Option<Arc<WorkspaceRuntime>>,
+    delegations: Option<PathBuf>,
     advertise: Vec<agent::capability::CapabilityDescriptor>,
     node_name: Option<String>,
 ) -> FederationRuntime {
@@ -674,6 +690,9 @@ pub(crate) fn assemble(
         .with_peer_store(Arc::new(RwLock::new(peers)));
     if let Some(runtime) = runtime {
         node = node.with_runtime(runtime);
+    }
+    if let Some(path) = delegations {
+        node = node.with_delegation_persistence(path);
     }
     if let Some(path) = audit {
         node = node.with_audit(Arc::new(crate::federation_audit::FileAudit::new(path)));
@@ -825,6 +844,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             vec![descriptor.clone()],
             Some("alpha".to_string()),
         );
@@ -834,6 +854,7 @@ mod tests {
             PeerStore::new(),
             Arc::new(b_transport),
             b_inbox,
+            None,
             None,
             None,
             None,
@@ -949,6 +970,7 @@ mod tests {
             None,
             None,
             Some(Arc::clone(&runtime)),
+            None,
             advertise,
             Some("provider".to_string()),
         );
@@ -961,6 +983,7 @@ mod tests {
             PeerStore::new(),
             Arc::new(caller_transport),
             caller_inbox,
+            None,
             None,
             None,
             None,
@@ -1020,6 +1043,52 @@ mod tests {
         let refused = node_runtime(&settings);
 
         assert!(refused.is_err(), "the shell is never exposed");
+    }
+
+    #[test]
+    fn a_replayed_older_announcement_is_ignored() {
+        use agent::capability::{CapabilityDescriptor, CapabilityKind, VersionSource, Visibility};
+
+        let identity = NodeIdentity::from_seed([65u8; 32]);
+        let own = NodeIdentity::from_seed([66u8; 32]).node_id();
+        let descriptor = CapabilityDescriptor::new(
+            "builtin/read_file".parse().expect("an id"),
+            CapabilityKind::Tool,
+            Version::new(1, 0, 0),
+            VersionSource::Declared,
+        )
+        .with_visibility(Visibility::Public);
+
+        let first = DiscoveryRecord::publish_named(
+            &identity,
+            Some("peer".into()),
+            vec![descriptor.clone()],
+        );
+        std::thread::sleep(Duration::from_millis(2));
+        let second =
+            DiscoveryRecord::publish_named(&identity, Some("peer".into()), vec![descriptor]);
+        assert!(first.published_at_ms < second.published_at_ms);
+
+        let frame = |record: &DiscoveryRecord| {
+            let message =
+                FederationMessage::new("announce", serde_json::to_vec(record).expect("bytes"));
+            Envelope::seal(&message, &identity, &own)
+                .expect("sealed")
+                .encode()
+                .expect("encoded")
+        };
+
+        let mut map = BTreeMap::new();
+        assert!(apply_announce(&mut map, &own, &frame(&second), unix_ms()));
+        assert!(
+            !apply_announce(&mut map, &own, &frame(&first), unix_ms()),
+            "the older record is a replay"
+        );
+        assert_eq!(map.len(), 1);
+        assert_eq!(
+            map.values().next().expect("a record").published_at_ms,
+            second.published_at_ms
+        );
     }
     #[test]
     fn stopping_a_node_that_is_not_running_reports_false() {
@@ -1132,6 +1201,7 @@ mod tests {
                 },
             }],
             skipped: Vec::new(),
+            budgets: agent::capability::composition::Budgets::default(),
         };
         let peer_runtime = Arc::new(
             WorkspaceRuntime::instantiate(provider_plan, &[echo]).expect("a peer runtime"),
@@ -1151,6 +1221,7 @@ mod tests {
             PeerStore::new(),
             Arc::new(transport),
             inbox,
+            None,
             None,
             None,
             None,
@@ -1447,6 +1518,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Vec::new(),
             Some("test node".to_string()),
         );
@@ -1550,6 +1622,7 @@ mod tests {
                 },
             }],
             skipped: Vec::new(),
+            budgets: agent::capability::composition::Budgets::default(),
         };
         let provider_runtime = Arc::new(
             WorkspaceRuntime::instantiate(provider_plan, &[provider]).expect("a peer runtime"),
@@ -1568,6 +1641,7 @@ mod tests {
             PeerStore::new(),
             Arc::new(transport),
             inbox,
+            None,
             None,
             None,
             None,
@@ -1666,6 +1740,7 @@ mod tests {
             PeerStore::new(),
             Arc::new(transport),
             inbox,
+            None,
             None,
             None,
             None,

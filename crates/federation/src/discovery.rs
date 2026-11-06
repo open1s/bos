@@ -11,6 +11,35 @@ use serde::{Deserialize, Serialize};
 
 use crate::identity::{self, NodeIdentity};
 
+/// How long a discovery record stays current after it is published.
+pub const DISCOVERY_TTL_MS: u64 = 300_000;
+
+/// How far ahead of the local clock a publisher may be before its record is
+/// treated as future-dated.
+pub const DISCOVERY_CLOCK_SKEW_MS: u64 = 60_000;
+
+/// Why a discovery record is not current enough to trust.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DiscoveryError {
+    /// The record is past its expiry.
+    #[error("the discovery record is expired")]
+    Expired,
+    /// The record claims a time beyond the allowed clock skew.
+    #[error("the discovery record is dated in the future")]
+    FutureDated,
+    /// A newer record from this peer was already accepted.
+    #[error("the discovery record is stale: {published_ms} is older than {known_ms}")]
+    Stale {
+        /// The record's publication time.
+        published_ms: u64,
+        /// The newest publication this consumer already accepted.
+        known_ms: u64,
+    },
+    /// The signature does not verify.
+    #[error("the discovery record's signature does not verify")]
+    Invalid,
+}
+
 /// What one Node publishes about its capabilities.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DiscoveryRecord {
@@ -24,6 +53,12 @@ pub struct DiscoveryRecord {
     pub name: Option<String>,
     /// When it was published, in milliseconds since the Unix epoch.
     pub published_at_ms: u64,
+    /// When the record stops being current, in milliseconds since the epoch.
+    ///
+    /// A record is never trusted past this instant. A record written before
+    /// expiry existed decodes as 0 and is therefore already stale.
+    #[serde(default)]
+    pub expires_at_ms: u64,
     /// Public descriptors only.
     pub descriptors: Vec<CapabilityDescriptor>,
     /// Base64 Ed25519 signature over the canonical form.
@@ -48,10 +83,12 @@ impl DiscoveryRecord {
         let name = name
             .map(|name| name.trim().to_string())
             .filter(|name| !name.is_empty());
+        let published_at_ms = unix_ms();
         let mut record = Self {
             node: identity.node_id(),
             name,
-            published_at_ms: unix_ms(),
+            published_at_ms,
+            expires_at_ms: published_at_ms.saturating_add(DISCOVERY_TTL_MS),
             descriptors: descriptors
                 .into_iter()
                 .filter(|descriptor| descriptor.visibility == Visibility::Public)
@@ -60,6 +97,32 @@ impl DiscoveryRecord {
         };
         record.signature = identity.sign(&record.canonical());
         record
+    }
+
+    /// Check signature, issue time, expiry, and rollback against the newest
+    /// publication this consumer already accepted from that peer.
+    ///
+    /// An older record is a replay and is refused; an equal timestamp is the
+    /// same catalogue, so a repeated query stays idempotent.
+    pub fn check(&self, now_ms: u64, known_ms: Option<u64>) -> Result<(), DiscoveryError> {
+        if !self.verify() {
+            return Err(DiscoveryError::Invalid);
+        }
+        if self.expires_at_ms <= now_ms {
+            return Err(DiscoveryError::Expired);
+        }
+        if self.published_at_ms > now_ms.saturating_add(DISCOVERY_CLOCK_SKEW_MS) {
+            return Err(DiscoveryError::FutureDated);
+        }
+        if let Some(known) = known_ms {
+            if self.published_at_ms < known {
+                return Err(DiscoveryError::Stale {
+                    published_ms: self.published_at_ms,
+                    known_ms: known,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Verify that the record was signed by the Node it names.
@@ -93,5 +156,72 @@ impl DiscoveryRecord {
         let mut unsigned = self.clone();
         unsigned.signature = String::new();
         serde_json::to_vec(&unsigned).expect("a discovery record serializes")
+    }
+}
+
+#[cfg(test)]
+mod freshness_tests {
+    use super::*;
+    use crate::identity::NodeIdentity;
+
+    fn record(identity: &NodeIdentity, published: u64, expires: u64) -> DiscoveryRecord {
+        let mut record = DiscoveryRecord::publish_named(identity, Some("peer".to_string()), vec![]);
+        record.published_at_ms = published;
+        record.expires_at_ms = expires;
+        record.signature = identity.sign(&record.canonical());
+        record
+    }
+
+    #[test]
+    fn a_current_record_passes() {
+        let identity = NodeIdentity::from_seed([21; 32]);
+        let now = unix_ms();
+        let record = record(&identity, now - 1_000, now + 1_000);
+        assert_eq!(record.check(now, None), Ok(()));
+        assert_eq!(
+            record.check(now, Some(now - 1_000)),
+            Ok(()),
+            "a repeat is idempotent"
+        );
+    }
+
+    #[test]
+    fn an_expired_record_is_refused() {
+        let identity = NodeIdentity::from_seed([22; 32]);
+        let now = unix_ms();
+        let record = record(&identity, now - 2_000, now - 1);
+        assert_eq!(record.check(now, None), Err(DiscoveryError::Expired));
+    }
+
+    #[test]
+    fn a_future_dated_record_is_refused() {
+        let identity = NodeIdentity::from_seed([23; 32]);
+        let now = unix_ms();
+        let future = now + DISCOVERY_CLOCK_SKEW_MS + 1_000;
+        let record = record(&identity, future, future + DISCOVERY_TTL_MS);
+        assert_eq!(record.check(now, None), Err(DiscoveryError::FutureDated));
+    }
+
+    #[test]
+    fn an_older_replay_is_refused() {
+        let identity = NodeIdentity::from_seed([24; 32]);
+        let now = unix_ms();
+        let record = record(&identity, now - 2_000, now + 1_000);
+        assert_eq!(
+            record.check(now, Some(now - 1_000)),
+            Err(DiscoveryError::Stale {
+                published_ms: now - 2_000,
+                known_ms: now - 1_000,
+            })
+        );
+    }
+
+    #[test]
+    fn a_tampered_record_is_invalid() {
+        let identity = NodeIdentity::from_seed([25; 32]);
+        let now = unix_ms();
+        let mut record = record(&identity, now - 1_000, now + 1_000);
+        record.name = Some("someone-else".to_string());
+        assert_eq!(record.check(now, None), Err(DiscoveryError::Invalid));
     }
 }

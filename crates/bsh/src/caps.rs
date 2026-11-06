@@ -5832,6 +5832,7 @@ mod tests {
                 },
             }],
             skipped: Vec::new(),
+            budgets: agent::capability::composition::Budgets::default(),
         };
         let peer_runtime =
             Arc::new(WorkspaceRuntime::instantiate(peer_plan, &[echo]).expect("a peer runtime"));
@@ -5849,6 +5850,7 @@ mod tests {
             PeerStore::new(),
             Arc::new(transport),
             inbox,
+            None,
             None,
             None,
             None,

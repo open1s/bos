@@ -232,5 +232,8 @@ fn classify(capability: &CapabilityId, error: ToolError, started: Instant) -> Ca
             partial: Some(Value::String(message)),
         },
         ToolError::Failed(message) => CapabilityError::ProviderFailed { message },
+        ToolError::Ambiguous { name, candidates } => CapabilityError::Invalid {
+            message: format!("tool {name} is ambiguous: {candidates:?}"),
+        },
     }
 }

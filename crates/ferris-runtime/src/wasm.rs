@@ -24,7 +24,7 @@ use wasmtime::{
 };
 
 use crate::contract::{CallContext, Runtime, ToolDescriptor, ToolResult};
-use ferris_core::capability::{CallScope, Capability, PolicyEngine};
+use ferris_core::capability::{CallScope, Capability, GrantScope, PolicyEngine};
 use ferris_core::events::{EventBus, EventFilter, ExtensionEvent, TopicPattern};
 use ferris_core::manifest::{validate_relative_path, Manifest, ResourcesSpec};
 use ferris_core::package::write_atomic;
@@ -277,6 +277,97 @@ impl HostState {
     }
 }
 
+/// Whether an address is outside the range public egress may reach.
+///
+/// The list is the SSRF-sensitive set: loopback, private, link-local, CGNAT,
+/// multicast, unspecified, broadcast, and the documentation/benchmark ranges.
+/// A literal-IP grant is the only way to allow one of them, and only for the
+/// exact address it names.
+fn is_prohibited_destination(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            let [a, b, c, _] = ip.octets();
+            ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || ip.is_multicast()
+                || ip.is_broadcast()
+                || ip.is_unspecified()
+                || a == 0
+                || (a == 100 && (64..=127).contains(&b))
+                || (a == 192 && b == 0 && c == 0)
+                || (a == 198 && (b == 18 || b == 19))
+                || a >= 240
+        }
+        std::net::IpAddr::V6(ip) => {
+            if let Some(v4) = ip.to_ipv4_mapped() {
+                return is_prohibited_destination(std::net::IpAddr::V4(v4));
+            }
+            let segments = ip.segments();
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || (segments[0] & 0xffc0) == 0xfe80
+                || (segments[0] & 0xfe00) == 0xfc00
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+        }
+    }
+}
+
+/// The literal address a grant names, when it names one.
+fn granted_literal(grant: &GrantScope) -> Option<std::net::IpAddr> {
+    match grant {
+        GrantScope::Domain(name) | GrantScope::DomainMethod(name, _) => name.parse().ok(),
+        _ => None,
+    }
+}
+
+/// Whether this destination is allowed for this URL host and grant.
+fn destination_allowed(ip: std::net::IpAddr, host: &str, grant: &GrantScope) -> bool {
+    if !is_prohibited_destination(ip) {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>().ok() == Some(ip) && granted_literal(grant) == Some(ip)
+}
+
+/// Resolve one hop and classify every answer before the request is sent.
+fn resolve_destination(
+    host: &str,
+    port: u16,
+    grant: &GrantScope,
+) -> Result<Vec<std::net::SocketAddr>, self::bsh::extension::types::HostError> {
+    use std::net::ToSocketAddrs as _;
+    let literal = host.parse::<std::net::IpAddr>().ok();
+    let addresses: Vec<std::net::SocketAddr> = if let Some(ip) = literal {
+        vec![std::net::SocketAddr::new(ip, port)]
+    } else {
+        (host, port)
+            .to_socket_addrs()
+            .map_err(|error| {
+                self::bsh::extension::types::HostError::Denied(format!(
+                    "cannot resolve {host}: {error}"
+                ))
+            })?
+            .collect()
+    };
+    if addresses.is_empty() {
+        return Err(self::bsh::extension::types::HostError::Denied(format!(
+            "{host} resolved to no addresses"
+        )));
+    }
+    // Every answer must be acceptable: a host that mixes a public and a
+    // private address is refused rather than silently using the public one.
+    for address in &addresses {
+        if !destination_allowed(address.ip(), host, grant) {
+            return Err(self::bsh::extension::types::HostError::Denied(format!(
+                "destination {} for {host} is not allowed",
+                address.ip()
+            )));
+        }
+    }
+    Ok(addresses)
+}
+
 impl self::bsh::extension::types::Host for HostState {}
 
 impl self::bsh::extension::host::Host for HostState {
@@ -433,14 +524,19 @@ impl self::bsh::extension::host::Host for HostState {
                 "only http and https are allowed".to_string(),
             ));
         }
-        self.authorize(
-            Capability::NetworkHttp,
-            CallScope {
-                domain: parsed.host_str().map(str::to_string),
-                method: Some(method.to_ascii_uppercase()),
-                ..CallScope::default()
-            },
-        )?;
+        let mut granted = self
+            .policy
+            .authorize_call(
+                self.extension.as_str(),
+                self.trust,
+                Capability::NetworkHttp,
+                &CallScope {
+                    domain: parsed.host_str().map(str::to_string),
+                    method: Some(method.to_ascii_uppercase()),
+                    ..CallScope::default()
+                },
+            )
+            .map_err(Self::host_error)?;
         if body.as_ref().is_some_and(|body| body.len() > MAX_HOST_BODY) {
             return Err(self::bsh::extension::types::HostError::Limited(
                 "request body is too large".to_string(),
@@ -470,14 +566,6 @@ impl self::bsh::extension::host::Host for HostState {
                 "the call deadline elapsed before the fetch".to_string(),
             ));
         }
-        let client = reqwest::blocking::Client::builder()
-            .timeout(remaining)
-            // Every redirect is followed by hand so each hop is authorized
-            // against its own host. reqwest's default policy would follow up
-            // to ten hops on the strength of the first authorization.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|error| self::bsh::extension::types::HostError::Runtime(error.to_string()))?;
         let requested_bytes = body.as_ref().map(|body| body.len() as u64).unwrap_or(0);
         let method_text = method.as_str().to_string();
         let started = Instant::now();
@@ -486,6 +574,36 @@ impl self::bsh::extension::host::Host for HostState {
         let mut current_body = body;
         let mut redirects = 0usize;
         let response = loop {
+            let host = current
+                .host_str()
+                .ok_or_else(|| {
+                    self::bsh::extension::types::HostError::Denied(
+                        "the URL has no host".to_string(),
+                    )
+                })?
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_string();
+            let port = current.port_or_known_default().ok_or_else(|| {
+                self::bsh::extension::types::HostError::Denied(
+                    "the URL has no default port".to_string(),
+                )
+            })?;
+            let addresses = resolve_destination(&host, port, &granted)?;
+            let mut builder = reqwest::blocking::Client::builder()
+                .timeout(remaining)
+                // Every redirect is followed by hand so each hop is authorized
+                // against its own host. reqwest's default policy would follow
+                // up to ten hops on the strength of the first authorization.
+                .redirect(reqwest::redirect::Policy::none());
+            if host.parse::<std::net::IpAddr>().is_err() {
+                // Pin the validated answers: a second DNS lookup at connect
+                // time could return a private address (DNS rebinding).
+                builder = builder.resolve_to_addrs(&host, &addresses);
+            }
+            let client = builder.build().map_err(|error| {
+                self::bsh::extension::types::HostError::Runtime(error.to_string())
+            })?;
             let mut request = client.request(current_method.clone(), current.clone());
             if let Some(body) = &current_body {
                 request = request.body(body.clone());
@@ -554,14 +672,19 @@ impl self::bsh::extension::host::Host for HostState {
             } else {
                 reqwest::Method::GET
             };
-            self.authorize(
-                Capability::NetworkHttp,
-                CallScope {
-                    domain: next.host_str().map(str::to_string),
-                    method: Some(next_method.as_str().to_ascii_uppercase()),
-                    ..CallScope::default()
-                },
-            )?;
+            granted = self
+                .policy
+                .authorize_call(
+                    self.extension.as_str(),
+                    self.trust,
+                    Capability::NetworkHttp,
+                    &CallScope {
+                        domain: next.host_str().map(str::to_string),
+                        method: Some(next_method.as_str().to_ascii_uppercase()),
+                        ..CallScope::default()
+                    },
+                )
+                .map_err(Self::host_error)?;
             if next_method == reqwest::Method::GET {
                 current_body = None;
             }
@@ -1478,6 +1601,97 @@ mod tests {
             other => panic!("unexpected error: {other:?}"),
         }
         let _ = std::fs::remove_file(&outside);
+    }
+
+    #[test]
+    fn sensitive_destination_ranges_are_prohibited() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        for text in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "255.255.255.255",
+            "198.18.0.1",
+            "::1",
+            "::",
+            "fe80::1",
+            "fc00::1",
+            "ff02::1",
+            "2001:db8::1",
+            "::ffff:127.0.0.1",
+        ] {
+            let ip: IpAddr = text.parse().expect("address");
+            assert!(is_prohibited_destination(ip), "{text} must be refused");
+        }
+
+        for text in ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"] {
+            let ip: IpAddr = text.parse().expect("address");
+            assert!(!is_prohibited_destination(ip), "{text} is public");
+        }
+
+        assert!(is_prohibited_destination(IpAddr::V6(
+            Ipv4Addr::new(192, 168, 0, 1).to_ipv6_mapped()
+        )));
+    }
+
+    #[test]
+    fn a_mixed_dns_answer_is_refused_but_an_explicit_literal_grant_is_not() {
+        use std::net::IpAddr;
+
+        let public: IpAddr = "8.8.8.8".parse().expect("public");
+        let private: IpAddr = "10.0.0.1".parse().expect("private");
+        let any = GrantScope::Any;
+        assert!(destination_allowed(public, "example.com", &any));
+        assert!(!destination_allowed(private, "example.com", &any));
+        assert!(!destination_allowed(private, "10.0.0.1", &any));
+
+        let literal = GrantScope::Domain("10.0.0.1".to_string());
+        assert!(destination_allowed(private, "10.0.0.1", &literal));
+        assert!(
+            !destination_allowed(private, "other.example", &literal),
+            "a literal grant does not extend to a hostname"
+        );
+
+        // The redirect hop uses the same resolver: a metadata address is
+        // refused even when the first hop was an allowed literal.
+        assert!(resolve_destination("169.254.169.254", 80, &GrantScope::Any).is_err());
+        assert!(
+            resolve_destination(
+                "127.0.0.1",
+                80,
+                &GrantScope::Domain("127.0.0.1".to_string())
+            )
+            .is_ok(),
+            "the explicit literal grant is the private-network grant"
+        );
+    }
+
+    #[test]
+    fn private_literal_urls_are_refused_without_an_explicit_grant() {
+        let workspace = scratch("private-egress");
+        for url in [
+            "http://127.0.0.1:9/",
+            "http://[::1]:9/",
+            "http://10.0.0.1:9/",
+            "http://169.254.169.254/latest/meta-data",
+        ] {
+            let mut state = host_state(&workspace, &[(Capability::NetworkHttp, GrantScope::Any)]);
+            let error = state
+                .fetch(url.to_string(), "GET".to_string(), None)
+                .expect_err("the address is not public");
+            match error {
+                self::bsh::extension::types::HostError::Denied(reason) => {
+                    assert!(reason.contains("not allowed"), "{url}: {reason}");
+                }
+                other => panic!("{url}: unexpected error: {other:?}"),
+            }
+        }
     }
 
     #[test]

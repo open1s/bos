@@ -107,6 +107,7 @@ fn echo_runtime(
             },
         }],
         skipped: Vec::new(),
+        budgets: capability::composition::Budgets::default(),
     };
     Arc::new(WorkspaceRuntime::instantiate(plan, &[provider]).expect("a runtime"))
 }

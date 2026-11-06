@@ -731,11 +731,14 @@ fn unknown_tool(name: &str, similar: &[String]) -> String {
 /// it.
 fn rejected_arguments(name: &str, error: &ToolError, schema: &Value) -> String {
     let mismatch = match error {
-        ToolError::SchemaMismatch { message } => message.as_str(),
+        ToolError::SchemaMismatch { message } => message.clone(),
+        ToolError::Ambiguous { name, candidates } => {
+            format!("{name} is ambiguous: {candidates:?}")
+        }
         ToolError::Failed(text)
         | ToolError::InvalidInput(text)
         | ToolError::NotFound(text)
-        | ToolError::Timeout(text) => text.as_str(),
+        | ToolError::Timeout(text) => text.clone(),
     };
     format!(
         "{name} rejected the arguments: {mismatch}. It expects {}. Pass those fields as args: {{\"name\": \"{name}\", \"args\": {{...}}}}.",
@@ -761,6 +764,13 @@ fn dispatch_failure(name: &str, error: ToolError, schema: &Value) -> ToolError {
         ToolError::Failed(text) => ToolError::Failed(format!("{name}: {text}")),
         ToolError::NotFound(text) => ToolError::NotFound(format!("{name}: {text}")),
         ToolError::Timeout(text) => ToolError::Timeout(format!("{name}: {text}")),
+        ToolError::Ambiguous {
+            name: ambiguous,
+            candidates,
+        } => ToolError::Ambiguous {
+            name: format!("{name}: {ambiguous}"),
+            candidates,
+        },
     }
 }
 

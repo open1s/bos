@@ -51,6 +51,10 @@ struct ServiceKey {
     scope: Scope,
     type_id: TypeId,
     realm: Option<String>,
+    /// The manifest contract this service implements. Two providers may share
+    /// a name and type while implementing different contracts; the key keeps
+    /// them apart instead of letting one silently replace the other.
+    contract: String,
 }
 
 /// A generation-specific ownership token for one provided service.
@@ -184,10 +188,13 @@ impl ServiceRetirement {
 /// cleanup from an older provider cannot accidentally remove its replacement.
 /// Subscribers receive bounded availability notifications and can re-query the
 /// registry for the current provider.
-type GenerationKey = (Scope, Option<String>, String);
+type GenerationKey = (Scope, Option<String>, String, String);
+
+/// One live provider: its generation, its value, and the contract version.
+type ServiceEntry = (u64, Arc<ServiceGeneration>, semver::Version);
 
 pub struct ServiceRegistry {
-    entries: RwLock<HashMap<ServiceKey, (u64, Arc<ServiceGeneration>)>>,
+    entries: RwLock<HashMap<ServiceKey, ServiceEntry>>,
     /// Generation index keyed by scope, realm and name. Each name keeps every
     /// concrete type currently registered under it, so revoking one type does
     /// not hide a different one that is still live.
@@ -259,7 +266,7 @@ impl ServiceRegistry {
         self.provide_with_retirement_in_realm(scope, None, name, service)
     }
 
-    /// Replace a provider in a named realm.
+    /// Replace a provider in a named realm (legacy typed API, no contract).
     pub fn provide_with_retirement_in_realm<T>(
         &self,
         scope: Scope,
@@ -270,11 +277,55 @@ impl ServiceRegistry {
     where
         T: Any + Send + Sync,
     {
+        self.provide_with_contract(
+            scope,
+            realm,
+            name,
+            "",
+            semver::Version::new(0, 0, 0),
+            service,
+        )
+    }
+
+    /// Provide a service under its manifest contract and semantic version.
+    ///
+    /// The contract is part of the registry key, so two providers that share a
+    /// name and Rust type but declare different contracts coexist instead of
+    /// replacing one another. The version is stored with the entry and checked
+    /// against a consumer's requirement at acquisition.
+    pub fn provide_contract<T>(
+        &self,
+        scope: Scope,
+        name: impl Into<String>,
+        contract: &str,
+        version: semver::Version,
+        service: Arc<T>,
+    ) -> ServiceToken
+    where
+        T: Any + Send + Sync,
+    {
+        self.provide_with_contract(scope, None, name, contract, version, service)
+            .0
+    }
+
+    pub(crate) fn provide_with_contract<T>(
+        &self,
+        scope: Scope,
+        realm: Option<&str>,
+        name: impl Into<String>,
+        contract: &str,
+        version: semver::Version,
+        service: Arc<T>,
+    ) -> (ServiceToken, Option<ServiceRetirement>)
+    where
+        T: Any + Send + Sync,
+    {
         let key = ServiceKey {
             name: name.into(),
             scope,
             type_id: TypeId::of::<T>(),
             realm: realm.map(str::to_owned),
+            contract: contract.to_string(),
         };
         let mut entries = self
             .entries
@@ -284,16 +335,21 @@ impl ServiceRegistry {
         // publish generations out of order.
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
         let new_generation = Arc::new(ServiceGeneration::new(service));
-        let previous = entries.insert(key.clone(), (generation, new_generation));
+        let previous = entries.insert(key.clone(), (generation, new_generation, version.clone()));
         if let Ok(mut generations) = self.generations.write() {
             generations
-                .entry((key.scope.clone(), key.realm.clone(), key.name.clone()))
+                .entry((
+                    key.scope.clone(),
+                    key.realm.clone(),
+                    key.name.clone(),
+                    key.contract.clone(),
+                ))
                 .or_default()
                 .insert(key.type_id, generation);
         }
         // Retire while holding the write lock. No new lease can race in after
         // the replacement becomes visible.
-        let retirement = previous.map(|(old_generation, owner)| {
+        let retirement = previous.map(|(old_generation, owner, _)| {
             owner.retire();
             ServiceRetirement {
                 generation: old_generation,
@@ -338,6 +394,7 @@ impl ServiceRegistry {
             scope: scope.clone(),
             type_id: TypeId::of::<T>(),
             realm: realm.map(str::to_owned),
+            contract: String::new(),
         };
         let entries = self.entries.read().ok()?;
         let service = entries.get(&key)?.1.value.clone();
@@ -355,7 +412,7 @@ impl ServiceRegistry {
         self.acquire_in_realm(scope, None, name)
     }
 
-    /// Acquire in one named isolation realm.
+    /// Acquire in one named isolation realm (legacy typed API, no contract).
     pub fn acquire_in_realm<T>(
         &self,
         scope: &Scope,
@@ -365,15 +422,50 @@ impl ServiceRegistry {
     where
         T: Any + Send + Sync,
     {
+        self.acquire_with_contract::<T>(scope, realm, name, "", &semver::VersionReq::STAR)
+    }
+
+    /// Acquire a provider of one named manifest contract and compatible version.
+    ///
+    /// A provider of the same name but a different contract is not a candidate,
+    /// and an incompatible version is refused even when the Rust type matches.
+    pub fn acquire_contract<T>(
+        &self,
+        scope: &Scope,
+        name: &str,
+        contract: &str,
+        requirement: &semver::VersionReq,
+    ) -> Option<ServiceLease<T>>
+    where
+        T: Any + Send + Sync,
+    {
+        self.acquire_with_contract::<T>(scope, None, name, contract, requirement)
+    }
+
+    fn acquire_with_contract<T>(
+        &self,
+        scope: &Scope,
+        realm: Option<&str>,
+        name: &str,
+        contract: &str,
+        requirement: &semver::VersionReq,
+    ) -> Option<ServiceLease<T>>
+    where
+        T: Any + Send + Sync,
+    {
         let key = ServiceKey {
             name: name.to_owned(),
             scope: scope.clone(),
             type_id: TypeId::of::<T>(),
             realm: realm.map(str::to_owned),
+            contract: contract.to_string(),
         };
         let entries = self.entries.read().ok()?;
-        let (generation, owner) = entries.get(&key)?;
+        let (generation, owner, version) = entries.get(&key)?;
         if !owner.accepting.load(Ordering::Acquire) {
+            return None;
+        }
+        if !requirement.matches(version) {
             return None;
         }
         owner.in_flight.fetch_add(1, Ordering::AcqRel);
@@ -417,6 +509,32 @@ impl ServiceRegistry {
         token
     }
 
+    /// Provide a service under its contract, revoked with its owning Fiber.
+    pub fn provide_owned_contract<T>(
+        self: &Arc<Self>,
+        scope: Scope,
+        name: impl Into<String>,
+        contract: &str,
+        version: semver::Version,
+        service: Arc<T>,
+        fiber: &mut Fiber,
+    ) -> ServiceToken
+    where
+        T: Any + Send + Sync,
+    {
+        let token = self
+            .provide_with_contract(scope, None, name, contract, version, service)
+            .0;
+        let registry = Arc::downgrade(self);
+        let cleanup_token = token.clone();
+        fiber.own(move || {
+            if let Some(registry) = registry.upgrade() {
+                registry.revoke(&cleanup_token);
+            }
+        });
+        token
+    }
+
     /// Remove a service only if the token still owns the current generation.
     /// Returns false for stale tokens and already-removed entries.
     pub fn revoke(&self, token: &ServiceToken) -> bool {
@@ -428,15 +546,16 @@ impl ServiceRegistry {
         let mut entries = self.entries.write().ok()?;
         if !entries
             .get(&token.key)
-            .is_some_and(|(generation, _)| *generation == token.generation)
+            .is_some_and(|(generation, _, _)| *generation == token.generation)
         {
             return None;
         }
-        let (generation, owner) = entries.remove(&token.key)?;
+        let (generation, owner, _) = entries.remove(&token.key)?;
         let name_key = (
             token.key.scope.clone(),
             token.key.realm.clone(),
             token.key.name.clone(),
+            token.key.contract.clone(),
         );
         let mut reported_generation = generation;
         let mut kind = ServiceChangeKind::Unavailable;
@@ -476,7 +595,11 @@ impl ServiceRegistry {
     pub fn has_name(&self, name: &str) -> bool {
         self.generations
             .read()
-            .map(|generations| generations.keys().any(|(_, _, service)| service == name))
+            .map(|generations| {
+                generations
+                    .keys()
+                    .any(|(_, _, service, contract)| service == name && contract.is_empty())
+            })
             .unwrap_or(false)
     }
 
@@ -490,7 +613,12 @@ impl ServiceRegistry {
         self.generations
             .read()
             .ok()?
-            .get(&(scope.clone(), realm.map(str::to_owned), name.to_owned()))
+            .get(&(
+                scope.clone(),
+                realm.map(str::to_owned),
+                name.to_owned(),
+                String::new(),
+            ))
             .and_then(|state| state.values().copied().max())
     }
 
@@ -1130,6 +1258,117 @@ mod tests {
         );
     }
 
+    #[test]
+    fn service_contracts_keep_same_name_and_type_apart() {
+        struct Search(&'static str);
+        let registry = ServiceRegistry::new();
+        let scope = Scope::Host;
+        let version = semver::Version::new(1, 2, 0);
+        registry.provide_contract(
+            scope.clone(),
+            "search",
+            "search-a",
+            version.clone(),
+            Arc::new(Search("a")),
+        );
+        registry.provide_contract(
+            scope.clone(),
+            "search",
+            "search-b",
+            version.clone(),
+            Arc::new(Search("b")),
+        );
+
+        let requirement = semver::VersionReq::parse("^1").expect("requirement");
+        let a = registry
+            .acquire_contract::<Search>(&scope, "search", "search-a", &requirement)
+            .expect("contract a");
+        let b = registry
+            .acquire_contract::<Search>(&scope, "search", "search-b", &requirement)
+            .expect("contract b");
+        assert_eq!((a.0, b.0), ("a", "b"));
+        assert!(
+            registry
+                .acquire_contract::<Search>(&scope, "search", "search-c", &requirement)
+                .is_none(),
+            "an unknown contract is not a candidate"
+        );
+    }
+
+    #[test]
+    fn a_service_version_must_satisfy_the_requirement() {
+        struct Search;
+        let registry = ServiceRegistry::new();
+        let scope = Scope::Host;
+        registry.provide_contract(
+            scope.clone(),
+            "search",
+            "search-a",
+            semver::Version::new(1, 2, 0),
+            Arc::new(Search),
+        );
+        let one = semver::VersionReq::parse("^1").expect("one");
+        let two = semver::VersionReq::parse("^2").expect("two");
+        assert!(registry
+            .acquire_contract::<Search>(&scope, "search", "search-a", &one)
+            .is_some());
+        assert!(
+            registry
+                .acquire_contract::<Search>(&scope, "search", "search-a", &two)
+                .is_none(),
+            "a matching type does not prove a matching version"
+        );
+    }
+
+    #[test]
+    fn replacing_one_contract_does_not_hide_another() {
+        struct Search(&'static str);
+        let registry = ServiceRegistry::new();
+        let scope = Scope::Host;
+        let first = registry.provide_contract(
+            scope.clone(),
+            "search",
+            "search-a",
+            semver::Version::new(1, 0, 0),
+            Arc::new(Search("a1")),
+        );
+        registry.provide_contract(
+            scope.clone(),
+            "search",
+            "search-b",
+            semver::Version::new(1, 0, 0),
+            Arc::new(Search("b")),
+        );
+        let second = registry.provide_contract(
+            scope.clone(),
+            "search",
+            "search-a",
+            semver::Version::new(2, 0, 0),
+            Arc::new(Search("a2")),
+        );
+        assert!(!registry.revoke(&first), "the old generation was replaced");
+        let two = semver::VersionReq::parse("^2").expect("two");
+        assert_eq!(
+            registry
+                .acquire_contract::<Search>(&scope, "search", "search-a", &two)
+                .expect("new a")
+                .0,
+            "a2"
+        );
+        assert_eq!(
+            registry
+                .acquire_contract::<Search>(
+                    &scope,
+                    "search",
+                    "search-b",
+                    &semver::VersionReq::parse("^1").expect("one")
+                )
+                .expect("b still live")
+                .0,
+            "b"
+        );
+        assert!(registry.revoke(&second));
+    }
     #[test]
     fn service_scope_isolation_is_strict() {
         let registry = ServiceRegistry::new();

@@ -69,6 +69,45 @@ fn granted(node_id: &str) -> PeerRef {
 }
 
 #[test]
+fn composition_budgets_survive_resolution() {
+    let local = catalogue(&[("builtin/read_file", "1.0.0")]);
+    let scope = LocalScope::admitting(workspace(), &local);
+    let budgets = capability::composition::Budgets {
+        max_concurrent_invocations: 3,
+        default_timeout: Some(std::time::Duration::from_millis(250)),
+    };
+    let mut spec = spec().with_requirement(requirement("builtin/read_file", "^1"));
+    spec.budgets = budgets.clone();
+
+    let resolved = resolve_host(&spec, &local, &[], &scope).expect("a plan");
+
+    assert_eq!(resolved.budgets, budgets);
+}
+
+#[test]
+fn zero_budgets_are_refused_before_resolution() {
+    let local = catalogue(&[("builtin/read_file", "1.0.0")]);
+    let scope = LocalScope::admitting(workspace(), &local);
+    let mut spec = spec().with_requirement(requirement("builtin/read_file", "^1"));
+    spec.budgets = capability::composition::Budgets {
+        max_concurrent_invocations: 0,
+        default_timeout: None,
+    };
+    assert!(matches!(
+        resolve_host(&spec, &local, &[], &scope).unwrap_err(),
+        CompositionError::Invalid { .. }
+    ));
+
+    spec.budgets = capability::composition::Budgets {
+        max_concurrent_invocations: 1,
+        default_timeout: Some(std::time::Duration::ZERO),
+    };
+    assert!(matches!(
+        resolve_host(&spec, &local, &[], &scope).unwrap_err(),
+        CompositionError::Invalid { .. }
+    ));
+}
+#[test]
 fn a_local_spec_resolves_entirely_inside_one_workspace() {
     let local = catalogue(&[("builtin/read_file", "1.2.0"), ("builtin/grep", "1.0.0")]);
     let scope = LocalScope::admitting(workspace(), &local);

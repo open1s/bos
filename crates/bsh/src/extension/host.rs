@@ -588,6 +588,8 @@ impl AppliedExtension {
         &mut self,
         scope: ferris_sdk::composable::Scope,
         name: &str,
+        contract: &str,
+        version: &semver::Version,
         service: Arc<T>,
     ) -> Option<ferris_sdk::composable::ServiceToken>
     where
@@ -603,6 +605,8 @@ impl AppliedExtension {
         }
         if !self.service_provides.iter().any(|declaration| {
             declaration.name == name
+                && declaration.contract == contract
+                && declaration.version == *version
                 && service_scope_matches(
                     &declaration.scope,
                     &scope,
@@ -613,9 +617,11 @@ impl AppliedExtension {
         }) {
             return None;
         }
-        Some(self.services.provide_owned(
+        Some(self.services.provide_owned_contract(
             scope,
             name.to_owned(),
+            contract,
+            version.clone(),
             service,
             // The activation Fiber owns the registration and revokes it on
             // unload, preventing service values from outliving their provider.
@@ -629,16 +635,19 @@ impl AppliedExtension {
         &self,
         scope: &ferris_sdk::composable::Scope,
         name: &str,
+        contract: &str,
+        requirement: &semver::VersionReq,
     ) -> Option<ferris_sdk::composable::ServiceLease<T>>
     where
         T: std::any::Any + Send + Sync,
     {
         self.service_requires
             .iter()
-            .any(|requirement| {
-                requirement.name == name
+            .any(|declared| {
+                declared.name == name
+                    && declared.contract == contract
                     && service_scope_matches(
-                        &requirement.scope,
+                        &declared.scope,
                         scope,
                         &self.extension_id,
                         self.workspace.as_deref(),
@@ -646,9 +655,9 @@ impl AppliedExtension {
                     )
             })
             .then(|| {
-                self.fiber
-                    .context()
-                    .and_then(|context| context.acquire_at(scope, name))
+                self.fiber.context().and_then(|context| {
+                    context.acquire_contract_at(scope, name, contract, requirement)
+                })
             })
             .flatten()
     }
