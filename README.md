@@ -43,7 +43,7 @@
 
 **BOS is a Rust-native foundation for building, composing and operating AI agents as a distributed system.**
 
-At its center is **BSH**: not merely a desktop agent workspace, but a **Distributed Composable Agent & Capability Platform**. A BSH node is a capability container: it assembles agents, tools, extensions, models, context and resources into purpose-built workspaces. Multiple independent BSH nodes can then be connected as a federation, allowing agents and capabilities to be discovered, delegated to and composed across machines—without collapsing their runtime or security boundaries.
+At its center is **BSH**: not merely a desktop agent workspace, but the product direction for a **Distributed Composable Agent & Capability Platform**. A BSH node is being evolved into an AI-native capability container that assembles agents, tools, extensions, models, context and resources into purpose-built workspaces. Multiple independent BSH nodes can then be connected as a federation, allowing agents and capabilities to be discovered, delegated to and composed across machines—without collapsing their runtime or security boundaries.
 
 BOS provides the shared execution foundation and developer interfaces. BSH turns that foundation into an environment for composing and operating local and distributed agent systems.
 
@@ -66,11 +66,11 @@ BSH has two complementary roles.
 
 <p align="center"><img src="docs/assets/diagrams/bsh-platform-value.svg" alt="BOS and BSH value proposition: Rust-native foundation, composable workspaces and federated autonomous nodes." width="100%"></p>
 
-BSH turns the BOS foundation into a practical operating environment: compose capabilities for a task, run them in a governed workspace, extend the platform, and connect independent nodes when collaboration requires it.
+BSH is evolving the BOS foundation into a practical operating environment: compose capabilities for a task, run them in a governed workspace, extend the platform, and connect independent nodes when collaboration requires it.
 
 ### 1. A composable capability container
 
-A BSH node assembles only the capabilities needed for a particular purpose. A workspace can receive a tailored capability view instead of exposing every installed tool to every agent.
+In the BSH 2.0 target model, a node assembles only the capabilities needed for a particular purpose. Each workspace receives a tailored capability view instead of exposing every installed tool to every agent.
 
 A composition may include:
 
