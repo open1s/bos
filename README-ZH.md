@@ -64,6 +64,10 @@ BOS 提供统一执行基础和多语言开发接口；BSH 则把这些能力组
 
 BSH 有两个相互补充的核心角色。
 
+<p align="center"><img src="docs/assets/diagrams/bsh-platform-value.svg" alt="BOS 与 BSH 的价值：Rust 原生基础、可组合工作空间和自治节点联邦协作。" width="100%"></p>
+
+BSH 将 BOS 的底层能力转化为可运营的工作环境：按任务装配能力，在受治理的 Workspace 中执行，通过扩展持续增强，并在需要协作时连接独立节点。
+
 ### 1. 可组合的 Capability Container
 
 一个 BSH 节点只装配当前用途真正需要的能力。每个 Workspace 都可以获得经过裁剪的 Capability View，而不是把节点上安装的全部工具暴露给每一个 Agent。
@@ -78,6 +82,8 @@ BSH 有两个相互补充的核心角色。
 - **Workflows** —— 可复用的任务组合与协同 Agent 活动。
 
 Composition 是平台的一等能力，不是 Agent Prompt 的附属行为。Composition Engine 独立于 ReAct/Agent 推理引擎。AI 可以提出装配方案，但最终由 Runtime 确定性地校验兼容性、依赖、权限和资源限制，再决定是否激活。
+
+<p align="center"><img src="docs/assets/diagrams/bsh-composable-workspace-visual.svg" alt="BSH 将 Agent、模型、工具、扩展、上下文和资源组合为经过验证的任务专属工作空间。" width="100%"></p>
 
 ### 2. 分布式 Agent 与 Capability 平台
 
@@ -94,6 +100,8 @@ Composition 是平台的一等能力，不是 Agent Prompt 的附属行为。Com
 
 Federation 不是把多个节点合并成一个超级进程。协调器可以辅助节点会合、发现或调度，但不取得 Peer 的执行控制权。远程 Capability 始终由远程节点提供，发现不代表信任。
 
+<p align="center"><img src="docs/assets/diagrams/bsh-federation-value.svg" alt="Federation 通过有边界的请求和双端独立授权连接自治 BSH 节点。" width="100%"></p>
+
 > **实现状态说明：** BOS 已具备 Rust Runtime、Agent/Tool 执行、消息通信基础、BSH 桌面宿主、Ferris 扩展框架和 MCP 集成。完整的 BSH Composition 与 Federation 模型是平台的目标架构，将分阶段实现。上面列出的目标 Federation 能力不代表所有功能已经正式可用。
 
 ## 总体架构
@@ -101,12 +109,14 @@ Federation 不是把多个节点合并成一个超级进程。协调器可以辅
 BOS 将共享执行基础、本地组合和跨节点协作分离。
 
 <p align="center">
-  <img src="docs/assets/diagrams/bos-platform-architecture.svg" alt="BOS 架构：Rust、Python、JavaScript 共享原生 Runtime，BSH 作为可组合 Agent 工作空间的宿主。" width="100%">
+  <img src="docs/assets/diagrams/bsh-distributed-platform.svg" alt="BSH 分布式平台：自治节点承载可组合工作空间，并通过 Federation 协作且保留独立信任边界。" width="100%">
 </p>
 
 ### 单节点架构
 
 在一个 BSH 节点内部，各子系统有明确的职责边界：
+
+<p align="center"><img src="docs/assets/diagrams/bsh-composable-node.svg" alt="单个 BSH 可组合节点的内部架构，从组合引擎、Workspace Runtime 到能力视图和 Provider。" width="100%"></p>
 
 | 子系统 | 职责 |
 |---|---|
@@ -149,6 +159,12 @@ Federation Protocol 与底层传输解耦。Zenoh 等传输可以作为实现基
 - **分布式通信基础。** Bus 为系统组件提供 Pub/Sub、Query/Response 和 RPC 模式。
 - **执行边界治理。** Capability 授权、Sandbox、资源限制和审计属于 Runtime 的职责。
 - **多语言互操作。** Rust、Python 和 JavaScript 接口使用同一套底层实现。
+
+## BOS 开发者基础
+
+BOS 将核心实现集中在 Rust 中，并通过 Rust、Python 和 JavaScript 接口向不同技术栈开放。BSH 则是构建在同一基础之上的操作与管理工作空间。
+
+<p align="center"><img src="docs/assets/diagrams/bos-developer-foundation.svg" alt="BOS 共享 Rust 原生基础，为 Rust、Python、JavaScript 集成和 BSH 应用提供能力。" width="100%"></p>
 
 ## 快速开始
 
