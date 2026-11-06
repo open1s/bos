@@ -17,6 +17,26 @@ pub(crate) fn dir() -> PathBuf {
     crate::settings::dir().join("federation")
 }
 
+/// The name a node shows to peers: the configured one, or the machine's name.
+///
+/// The host name is the useful default — a reader recognises the machine a peer
+/// runs on far better than the first eight characters of a public key.
+pub(crate) fn resolve_node_name(configured: Option<&str>) -> String {
+    if let Some(name) = configured.map(str::trim).filter(|name| !name.is_empty()) {
+        return name.to_string();
+    }
+    let host = hostname::get()
+        .ok()
+        .and_then(|host| host.into_string().ok())
+        .unwrap_or_default();
+    let host = host.trim().trim_end_matches(".local");
+    if host.is_empty() {
+        "bsh node".to_string()
+    } else {
+        host.to_string()
+    }
+}
+
 const USAGE: &str = "\
 bsh federation <command>
 
@@ -31,7 +51,12 @@ Identity and peers live in bsh's own directory; a peer id is a base64 Ed25519
 public key, which is what a peer prints as its node id.";
 
 /// Run one federation command against the files under `root`.
-pub(crate) fn command(args: &[String], root: &Path, out: &mut dyn Write) -> i32 {
+pub(crate) fn command(
+    args: &[String],
+    root: &Path,
+    name: Option<&str>,
+    out: &mut dyn Write,
+) -> i32 {
     let identity_path = root.join("node.key");
     let peers_path = root.join("peers.json");
     match args.first().map(String::as_str) {
@@ -42,6 +67,9 @@ pub(crate) fn command(args: &[String], root: &Path, out: &mut dyn Write) -> i32 
         Some("status") => match NodeIdentity::load_or_create(&identity_path) {
             Ok(identity) => {
                 let _ = writeln!(out, "node {}", identity.node_id());
+                if let Some(name) = name {
+                    let _ = writeln!(out, "name {name}");
+                }
                 let _ = writeln!(out, "identity {}", identity_path.display());
                 match PeerStore::load(&peers_path) {
                     Ok(store) => {
@@ -101,6 +129,12 @@ pub(crate) fn command(args: &[String], root: &Path, out: &mut dyn Write) -> i32 
             Err(error) => fail(out, &error.to_string()),
         },
         Some("enroll") => {
+            // Mutations take the data directory's writer lock: a running app
+            // owns it, and a CLI write behind its back would be lost.
+            let _lock = match crate::federation_lock::DataDirLock::acquire(root) {
+                Ok(lock) => lock,
+                Err(error) => return fail(out, &error),
+            };
             let node = match node_arg(args.get(1), out) {
                 Some(node) => node,
                 None => return 1,
@@ -119,6 +153,12 @@ pub(crate) fn command(args: &[String], root: &Path, out: &mut dyn Write) -> i32 
             }
         }
         Some("revoke") => {
+            // Mutations take the data directory's writer lock: a running app
+            // owns it, and a CLI write behind its back would be lost.
+            let _lock = match crate::federation_lock::DataDirLock::acquire(root) {
+                Ok(lock) => lock,
+                Err(error) => return fail(out, &error),
+            };
             let node = match node_arg(args.get(1), out) {
                 Some(node) => node,
                 None => return 1,
@@ -139,6 +179,12 @@ pub(crate) fn command(args: &[String], root: &Path, out: &mut dyn Write) -> i32 
             }
         }
         Some("grant") => {
+            // Mutations take the data directory's writer lock: a running app
+            // owns it, and a CLI write behind its back would be lost.
+            let _lock = match crate::federation_lock::DataDirLock::acquire(root) {
+                Ok(lock) => lock,
+                Err(error) => return fail(out, &error),
+            };
             let node = match node_arg(args.get(1), out) {
                 Some(node) => node,
                 None => return 1,
@@ -163,6 +209,12 @@ pub(crate) fn command(args: &[String], root: &Path, out: &mut dyn Write) -> i32 
             }
         }
         Some("revoke-grant") => {
+            // Mutations take the data directory's writer lock: a running app
+            // owns it, and a CLI write behind its back would be lost.
+            let _lock = match crate::federation_lock::DataDirLock::acquire(root) {
+                Ok(lock) => lock,
+                Err(error) => return fail(out, &error),
+            };
             let node = match node_arg(args.get(1), out) {
                 Some(node) => node,
                 None => return 1,
@@ -241,7 +293,7 @@ mod tests {
     fn run(root: &Path, args: &[&str]) -> (i32, String) {
         let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
         let mut out = Vec::new();
-        let code = command(&args, root, &mut out);
+        let code = command(&args, root, None, &mut out);
         (code, String::from_utf8(out).expect("utf8 output"))
     }
 
@@ -252,6 +304,17 @@ mod tests {
     #[test]
     fn status_creates_an_identity_and_reports_it() {
         let root = scratch("status");
+
+        let mut named = Vec::new();
+        let code = command(
+            &["status".to_string()],
+            &root,
+            Some("studio-mac"),
+            &mut named,
+        );
+        let named = String::from_utf8(named).expect("utf8 output");
+        assert_eq!(code, 0, "{named}");
+        assert!(named.contains("name studio-mac"), "{named}");
 
         let (code, output) = run(&root, &["status"]);
 
@@ -287,6 +350,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn mutations_refuse_while_the_app_holds_the_directory() {
+        let root = scratch("locked");
+        let _held = crate::federation_lock::DataDirLock::acquire(&root).expect("the app");
+
+        let (code, output) = run(&root, &["enroll", &peer()]);
+
+        assert_ne!(code, 0, "a CLI write behind a running app is refused");
+        assert!(output.contains("another BSH instance"), "{output}");
+
+        // Reading still works: status takes no writer lock.
+        let (code, _) = run(&root, &["status"]);
+        assert_eq!(code, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
     #[test]
     fn status_prunes_a_stale_process_file() {
         let root = scratch("prune");

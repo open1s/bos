@@ -445,6 +445,19 @@ pub(crate) struct AgentSkillRow {
     pub(crate) user_only: bool,
 }
 
+/// One enrolled peer as the settings pane reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FederationPeerView {
+    /// The Node id, full length; the pane shortens it for display.
+    pub(crate) node: String,
+    /// The name the peer gave when enrolled, if any.
+    pub(crate) name: Option<String>,
+    /// The trust state: pending, trusted, or revoked.
+    pub(crate) state: String,
+    /// How many grants the peer holds.
+    pub(crate) grants: usize,
+}
+
 /// Everything the shell renders from.
 pub(crate) struct AppState {
     /// Persisted sessions.
@@ -565,6 +578,8 @@ pub(crate) struct AppState {
     pub(crate) federation_recent: Vec<federation::FederationEvent>,
     /// Records written by the runtime, drained cheaply while rendering.
     pub(crate) federation_events: tokio::sync::broadcast::Receiver<federation::FederationEvent>,
+    /// Enrolled peers, read once at launch for the settings pane.
+    pub(crate) federation_peers: Vec<FederationPeerView>,
     /// A transient line of feedback.
     pub(crate) notice: Option<String>,
     /// Whether the usage pill's dialog is open.
@@ -847,6 +862,7 @@ impl AppState {
             trust_audit: std::collections::VecDeque::new(),
             federation_recent: Vec::new(),
             federation_events: crate::federation_audit::subscribe(),
+            federation_peers: Vec::new(),
             notice: None,
             stat_open: false,
             meter_open: false,
@@ -903,6 +919,29 @@ impl AppState {
             .settings
             .federation_audit_path()
             .map(|path| crate::federation_audit::load(&path, 5))
+            .unwrap_or_default();
+        // Enrolled peers, read once: the pane lists them without touching the
+        // peer store per frame. A missing or unreadable file is simply no list.
+        state.federation_peers = state
+            .settings
+            .federation_peers_path()
+            .and_then(|path| federation::PeerStore::load(&path).ok())
+            .map(|store| {
+                store
+                    .iter()
+                    .map(|record| FederationPeerView {
+                        node: record.node.to_string(),
+                        name: record.note.clone(),
+                        state: match record.state {
+                            federation::TrustState::Pending => "pending",
+                            federation::TrustState::Trusted => "trusted",
+                            federation::TrustState::Revoked => "revoked",
+                        }
+                        .to_string(),
+                        grants: record.grants.len(),
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
         // The vault lives beside the document this state writes, which is the
         // scratch store for a test and the bsh data directory for the app. It

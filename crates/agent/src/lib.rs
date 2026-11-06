@@ -4,6 +4,7 @@
 pub mod agent;
 pub mod bus;
 pub mod capabilities;
+pub mod composition;
 pub mod error;
 pub mod extensions;
 pub mod goal;

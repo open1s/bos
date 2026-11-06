@@ -447,13 +447,15 @@ impl Default for GlobalSettings {
 
 /// The federation node's persisted settings.
 ///
-/// Disabled by default: running a federation node opens a transport and
-/// answers peers, so it is an explicit choice. An empty path means the default
-/// under bsh's own directory, which is the one the `bsh federation` CLI writes.
-#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+/// Enabled by default: a node that only answers enrolled peers is harmless
+/// until a peer is enrolled and granted, and having it on means `bsh
+/// federation` and the right panel work out of the box. Set `enabled = false`
+/// to run the app without a node. An empty path means the default under bsh's
+/// own directory, which is the one the `bsh federation` CLI writes.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct FederationSection {
     /// Whether this app runs a federation node.
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub(crate) enabled: bool,
     /// Offer trusted peers' capabilities to the model as tools.
     #[serde(default)]
@@ -473,7 +475,58 @@ pub(crate) struct FederationSection {
     /// Zenoh mode; empty means peer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) mode: Option<String>,
+    /// CA bundle that verifies federation peers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tls_ca: Option<String>,
+    /// Certificate this node presents to peers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tls_cert: Option<String>,
+    /// Private key for the certificate above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tls_key: Option<String>,
+    /// Require peers to present a client certificate.
+    #[serde(default)]
+    pub(crate) tls_mtls: bool,
+    /// Check the peer certificate's name against the endpoint (default true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tls_verify_name: Option<bool>,
+    /// The name this node shows to peers; empty uses the machine's host name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) node_name: Option<String>,
+    /// Read-only capability ids this node exposes to granted peers.
+    ///
+    /// Empty by default: a node that answers peers must not expose a file
+    /// surface the reader did not choose. Supported: builtin/read_file,
+    /// builtin/read_files, builtin/glob, builtin/grep.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) expose: Vec<String>,
+    /// The directory the exposed file tools are confined to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) expose_root: Option<String>,
 }
+
+impl Default for FederationSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            include_remote_tools: false,
+            identity_path: None,
+            peers_path: None,
+            endpoints: Vec::new(),
+            listen: Vec::new(),
+            mode: None,
+            tls_ca: None,
+            tls_cert: None,
+            tls_key: None,
+            tls_mtls: false,
+            tls_verify_name: None,
+            node_name: None,
+            expose: Vec::new(),
+            expose_root: None,
+        }
+    }
+}
+
 /// The preset a fresh install selects.
 fn default_preset() -> String {
     "standard".to_string()
@@ -2129,6 +2182,66 @@ impl GlobalSettings {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_federation_node_is_on_by_default() {
+        let settings = crate::settings::Settings::default();
+        assert!(
+            settings.global.federation.enabled,
+            "the node is on out of the box"
+        );
+        assert!(
+            !settings.global.federation.include_remote_tools,
+            "but a peer's capabilities are still not offered without opting in"
+        );
+    }
+
+    #[test]
+    fn the_federation_section_reads_the_node_name() {
+        let section: FederationSection =
+            toml::from_str(r#"node_name = "studio-mac""#).expect("a federation section");
+        assert_eq!(section.node_name.as_deref(), Some("studio-mac"));
+
+        let absent: FederationSection = toml::from_str("").expect("a federation section");
+        assert_eq!(absent.node_name, None);
+    }
+
+    #[test]
+    fn the_federation_section_reads_exposed_capabilities() {
+        let section: FederationSection = toml::from_str(
+            r#"
+expose = ["builtin/read_file", "builtin/glob"]
+expose_root = "/tmp/root"
+"#,
+        )
+        .expect("a federation section");
+
+        assert_eq!(
+            section.expose,
+            vec!["builtin/read_file".to_string(), "builtin/glob".to_string()]
+        );
+        assert_eq!(section.expose_root.as_deref(), Some("/tmp/root"));
+    }
+    #[test]
+    fn the_federation_section_reads_tls_paths() {
+        let section: FederationSection = toml::from_str(
+            r#"
+enabled = true
+tls_ca = "/ca.pem"
+tls_cert = "/cert.pem"
+tls_key = "/key.pem"
+tls_mtls = true
+"#,
+        )
+        .expect("a federation section");
+
+        assert!(section.enabled);
+        assert_eq!(section.tls_ca.as_deref(), Some("/ca.pem"));
+        assert_eq!(section.tls_cert.as_deref(), Some("/cert.pem"));
+        assert_eq!(section.tls_key.as_deref(), Some("/key.pem"));
+        assert!(section.tls_mtls);
+        assert_eq!(section.tls_verify_name, None, "default is verify");
+    }
     use super::*;
     use std::collections::BTreeMap;
 

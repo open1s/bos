@@ -58,6 +58,7 @@ impl From<BusConfig> for bus::BusConfig {
       connect: value.connect,
       listen: value.listen,
       peer: value.peer.map(Some),
+      tls: None,
     }
   }
 }

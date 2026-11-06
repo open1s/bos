@@ -23,6 +23,20 @@ use crate::identity;
 /// The key expression prefix every federation frame lives under.
 pub const KEY_PREFIX: &str = "bsh/v1/node";
 
+/// The shared announcement key: presence and public descriptors, never writes.
+pub const ANNOUNCE_KEY: &str = "bsh/v1/announce";
+
+/// How many inbox frames the transport buffers ahead of the router.
+///
+/// A slow router must not let a sender grow the process without bound, so the
+/// queue is bounded and overflow is dropped and logged. A frame is one sealed
+/// message; the cap is far above any healthy burst.
+const INGRESS_CAPACITY: usize = 1024;
+
+/// The announcement queue is smaller: announcements are periodic presence, and
+/// losing one is the same as waiting for the next tick.
+const ANNOUNCE_CAPACITY: usize = 256;
+
 /// The Zenoh transport for one Node.
 #[derive(Clone)]
 pub struct ZenohTransport {
@@ -41,6 +55,47 @@ impl ZenohTransport {
         &self.node
     }
 
+    /// Publish one announcement frame to the shared announce key.
+    pub async fn announce(&self, frame: Vec<u8>) -> Result<(), CapabilityError> {
+        self.session
+            .put(ANNOUNCE_KEY, frame)
+            .await
+            .map_err(|error| CapabilityError::Unavailable {
+                reason: format!("cannot publish an announcement: {error}"),
+            })
+    }
+
+    /// Subscribe to announcements from every Node on this transport.
+    pub async fn subscribe_announce(&self) -> Result<Inbox, CapabilityError> {
+        let subscriber = self
+            .session
+            .declare_subscriber(ANNOUNCE_KEY)
+            .await
+            .map_err(|error| CapabilityError::Unavailable {
+                reason: format!("cannot subscribe to announcements: {error}"),
+            })?;
+        let (sender, receiver) = mpsc::channel(ANNOUNCE_CAPACITY);
+        tokio::spawn(async move {
+            let mut dropped = 0u64;
+            while let Ok(sample) = subscriber.recv_async().await {
+                let frame = sample.payload().to_bytes().to_vec();
+                match sender.try_send(frame) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        dropped += 1;
+                        if dropped == 1 || dropped.is_multiple_of(1024) {
+                            tracing::warn!(
+                                "federation: announcement queue is full; dropped {dropped} frame(s)"
+                            );
+                        }
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                }
+            }
+        });
+        Ok(Inbox { receiver })
+    }
+
     /// Subscribe to this Node's inbox.
     ///
     /// The returned inbox yields raw frames; decoding and verification happen
@@ -54,12 +109,22 @@ impl ZenohTransport {
             .map_err(|error| CapabilityError::Unavailable {
                 reason: format!("cannot subscribe to this Node's inbox: {error}"),
             })?;
-        let (sender, receiver) = mpsc::unbounded_channel();
+        let (sender, receiver) = mpsc::channel(INGRESS_CAPACITY);
         tokio::spawn(async move {
+            let mut dropped = 0u64;
             while let Ok(sample) = subscriber.recv_async().await {
                 let frame = sample.payload().to_bytes().to_vec();
-                if sender.send(frame).is_err() {
-                    break;
+                match sender.try_send(frame) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        dropped += 1;
+                        if dropped == 1 || dropped.is_multiple_of(1024) {
+                            tracing::warn!(
+                                "federation: inbox queue is full; dropped {dropped} frame(s)"
+                            );
+                        }
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
                 }
             }
         });
@@ -69,12 +134,12 @@ impl ZenohTransport {
 
 /// A Node's inbox as a stream of frames.
 pub struct Inbox {
-    receiver: mpsc::UnboundedReceiver<Vec<u8>>,
+    receiver: mpsc::Receiver<Vec<u8>>,
 }
 
 impl Inbox {
     /// Take the frame receiver, for a caller that routes frames itself.
-    pub fn into_receiver(self) -> mpsc::UnboundedReceiver<Vec<u8>> {
+    pub fn into_receiver(self) -> mpsc::Receiver<Vec<u8>> {
         self.receiver
     }
 
@@ -117,6 +182,14 @@ impl FederationTransport for ZenohTransport {
 
     async fn close(&self, _peer: &NodeId) -> Result<(), CapabilityError> {
         Ok(())
+    }
+
+    async fn announce(&self, frame: Vec<u8>) -> Result<(), CapabilityError> {
+        ZenohTransport::announce(self, frame).await
+    }
+
+    async fn subscribe_announce(&self) -> Result<Option<mpsc::Receiver<Vec<u8>>>, CapabilityError> {
+        Ok(Some(self.subscribe_announce().await?.into_receiver()))
     }
 }
 

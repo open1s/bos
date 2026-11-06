@@ -19917,6 +19917,310 @@ fn the_right_panel_offers_an_extensions_pane(cx: &mut TestAppContext) {
     );
 }
 
+/// The Federation card opens a pane that lists peers and offers the two
+/// actions the node needs; with no store it honestly shows the empty state.
+#[gpui::test]
+fn the_right_panel_offers_a_federation_pane(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("right-federation");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    shell.update(cx, |this, cx| {
+        this.right.open = true;
+        this.right.tab = Some(crate::ui::right_panel::RightTab::Federation);
+        this.reload_federation();
+        cx.notify();
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    assert!(
+        cx.debug_bounds("federation-pane").is_some(),
+        "the Federation tab opens its own pane"
+    );
+    assert!(
+        cx.debug_bounds("federation-enroll").is_some(),
+        "the pane offers Enroll"
+    );
+    assert!(
+        cx.debug_bounds("federation-grant").is_some(),
+        "the pane offers Grant"
+    );
+    assert!(
+        cx.debug_bounds("right-tab").is_some(),
+        "the strip names the open pane"
+    );
+    assert!(
+        cx.debug_bounds("federation-refresh").is_some(),
+        "the pane offers Refresh for a node that starts late"
+    );
+    assert!(
+        cx.debug_bounds("federation-node-start").is_some(),
+        "a stopped node offers Start"
+    );
+}
+
+/// Revoking a peer takes two presses: the first asks, the second acts, and
+/// Cancel leaves the store untouched.
+#[gpui::test]
+fn revoking_a_peer_asks_first(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("right-federation-confirm");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    shell.update(cx, |this, cx| {
+        this.right.open = true;
+        this.right.tab = Some(crate::ui::right_panel::RightTab::Federation);
+        this.right.federation.peers = vec![crate::ui::right_panel::FederationPeerRow {
+            node: "abcdefghijkl".to_string(),
+            name: Some("studio".to_string()),
+            state: "trusted".to_string(),
+            grants: Vec::new(),
+        }];
+        this.right.federation.loaded = true;
+        this.right.federation.confirm_revoke = None;
+        cx.notify();
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let revoke = cx
+        .debug_bounds("federation-revoke")
+        .expect("the row offers Revoke");
+    cx.simulate_click(revoke.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).right.federation.confirm_revoke.clone()),
+        Some("abcdefghijkl".to_string()),
+        "the first press asks"
+    );
+    assert!(
+        cx.debug_bounds("federation-revoke-confirm").is_some(),
+        "the confirmation control is on screen"
+    );
+
+    let cancel = cx
+        .debug_bounds("federation-revoke-cancel")
+        .expect("the confirmation offers Cancel");
+    cx.simulate_click(cancel.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.update(|_, cx| shell.read(cx).right.federation.confirm_revoke.clone())
+            .is_none(),
+        "Cancel clears the question"
+    );
+
+    let revoke = cx
+        .debug_bounds("federation-revoke")
+        .expect("the row offers Revoke again");
+    cx.simulate_click(revoke.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let confirm = cx
+        .debug_bounds("federation-revoke-confirm")
+        .expect("the confirmation is back");
+    cx.simulate_click(confirm.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.update(|_, cx| shell.read(cx).right.federation.confirm_revoke.clone())
+            .is_none(),
+        "the second press consumes the question"
+    );
+    assert!(
+        cx.update(|_, cx| shell.read(cx).right.federation.error.clone())
+            .is_some(),
+        "a build without a store reports why nothing changed"
+    );
+}
+
+/// The two switches persist their settings through the shell's settings file.
+#[gpui::test]
+fn the_federation_switches_write_the_settings(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("right-federation-switches");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    shell.update(cx, |this, cx| {
+        this.right.open = true;
+        this.right.tab = Some(crate::ui::right_panel::RightTab::Federation);
+        this.reload_federation();
+        cx.notify();
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let remote = cx
+        .debug_bounds("federation-remote-tools")
+        .expect("the remote-tools switch renders");
+    cx.simulate_click(remote.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.update(|_, cx| {
+            shell
+                .read(cx)
+                .state
+                .settings
+                .global
+                .federation
+                .include_remote_tools
+        }),
+        "the switch persists the opt-in"
+    );
+
+    let node = cx
+        .debug_bounds("federation-run-node")
+        .expect("the node switch renders");
+    cx.simulate_click(node.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        !cx.update(|_, cx| { shell.read(cx).state.settings.global.federation.enabled }),
+        "the switch turns the node off"
+    );
+}
+
+/// A discovered peer lists its advertised capabilities; a press selects one,
+/// and the selection survives into the pending map the enroll action reads.
+#[gpui::test]
+fn a_discovered_peer_offers_its_capabilities_for_selection(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("right-federation-discovered");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    shell.update(cx, |this, cx| {
+        this.right.open = true;
+        this.right.tab = Some(crate::ui::right_panel::RightTab::Federation);
+        this.right.federation.discovered = vec![crate::ui::right_panel::DiscoveredPeerRow {
+            node: "abcdefghijkl".to_string(),
+            name: Some("peer-b".to_string()),
+            capabilities: vec![("builtin/read_file".to_string(), "low".to_string())],
+        }];
+        this.right.federation.pending.clear();
+        cx.notify();
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    assert!(
+        cx.debug_bounds("federation-discovered-0").is_some(),
+        "the discovered peer renders"
+    );
+    let chip = cx
+        .debug_bounds("federation-choose-0-builtin/read_file")
+        .expect("the advertised capability is a selectable chip");
+    cx.simulate_click(chip.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let selected = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .right
+            .federation
+            .pending
+            .get("abcdefghijkl")
+            .cloned()
+            .unwrap_or_default()
+    });
+    assert!(
+        selected.contains("builtin/read_file"),
+        "the press selects exactly that capability"
+    );
+}
+
+/// Exposing a capability is a setting write, and the pane says it waits for a
+/// node restart.
+#[gpui::test]
+fn exposing_a_capability_writes_the_setting(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("right-federation-expose");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    shell.update(cx, |this, cx| {
+        this.right.open = true;
+        this.right.tab = Some(crate::ui::right_panel::RightTab::Federation);
+        cx.notify();
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let toggle = cx
+        .debug_bounds("federation-expose-0")
+        .expect("the read_file row is on screen");
+    cx.simulate_click(toggle.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let (exposed, notice) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (
+            shell.state.settings.global.federation.expose.clone(),
+            shell.right.federation.notice.clone(),
+        )
+    });
+    assert!(
+        exposed.iter().any(|id| id == "builtin/read_file"),
+        "the click adds the capability: {exposed:?}"
+    );
+    assert!(
+        notice.unwrap_or_default().contains("restart"),
+        "the reader is told a restart applies it"
+    );
+}
+/// Saving a name writes the setting and tells the reader what peers will see.
+#[gpui::test]
+fn saving_a_node_name_persists_it_and_reports_it(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("right-federation-name");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    shell.update(cx, |this, cx| {
+        this.right.open = true;
+        this.right.tab = Some(crate::ui::right_panel::RightTab::Federation);
+        cx.notify();
+    });
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.federation_name
+                .update(cx, |input, cx| input.set_value("studio-mac", window, cx));
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let save = cx
+        .debug_bounds("federation-name-save")
+        .expect("the save control is on screen");
+    cx.simulate_click(save.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let (name, notice) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (
+            shell.state.settings.global.federation.node_name.clone(),
+            shell.right.federation.notice.clone(),
+        )
+    });
+    assert_eq!(name.as_deref(), Some("studio-mac"));
+    assert!(
+        notice.unwrap_or_default().contains("studio-mac"),
+        "the notice names the node"
+    );
+}
 #[gpui::test]
 fn the_center_tab_renders_an_extensions_surface(cx: &mut TestAppContext) {
     init_test_app(cx);

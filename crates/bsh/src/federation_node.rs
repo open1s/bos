@@ -22,9 +22,16 @@ use agent::capability::{
 use agent::tools::ToolRegistry;
 use bus::{Bus, BusConfig};
 use federation::{
-    FederationNode, NodeIdentity, PeerStore, RemoteCapabilityProvider, ZenohTransport,
+    DiscoveryRecord, Envelope, FederationMessage, FederationNode, NodeIdentity, PeerStore,
+    RemoteCapabilityProvider, ZenohTransport,
 };
 use semver::{Version, VersionReq};
+
+/// How often a node re-announces presence and public descriptors.
+const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How long a discovered record stays listed without a fresh announcement.
+const DISCOVERY_STALE_MS: u64 = 30_000;
 
 /// One running federation endpoint and the state that must outlive it.
 pub(crate) struct FederationRuntime {
@@ -38,6 +45,25 @@ pub(crate) struct FederationRuntime {
     bus: Option<Bus>,
     #[allow(dead_code)]
     task: tokio::task::JoinHandle<()>,
+    /// The 30-second discovery refresher, stopped with the node.
+    #[allow(dead_code)]
+    refresher: tokio::task::JoinHandle<()>,
+    /// The announcement task: presence plus public descriptors, every interval.
+    #[allow(dead_code)]
+    announce_task: tokio::task::JoinHandle<()>,
+    /// Nodes seen on the announce key, excluding this one.
+    discovered: Arc<RwLock<BTreeMap<NodeId, DiscoveryRecord>>>,
+    /// This node's signing identity, kept for an on-demand announcement.
+    identity: NodeIdentity,
+    /// The transport announcements leave through.
+    announce_transport: Arc<dyn FederationTransport>,
+    /// Public descriptors this node announces.
+    advertise: Vec<agent::capability::CapabilityDescriptor>,
+    /// The name this node announces; an edit takes effect on the next frame.
+    node_name: Arc<RwLock<Option<String>>>,
+    /// The data directory's writer lock, held for the process's lifetime.
+    #[allow(dead_code)]
+    lock: Option<crate::federation_lock::DataDirLock>,
 }
 
 impl FederationRuntime {
@@ -56,6 +82,56 @@ impl FederationRuntime {
         &self.node_id
     }
 
+    /// The name this node shows to peers, when it has one.
+    pub(crate) fn node_name(&self) -> Option<String> {
+        self.node_name
+            .read()
+            .map(|name| name.clone())
+            .unwrap_or_default()
+    }
+
+    /// Rename this node; the next announcement carries the new name.
+    pub(crate) fn set_name(&self, name: Option<String>) {
+        if let Ok(mut slot) = self.node_name.write() {
+            *slot = name;
+        }
+    }
+
+    /// Nodes seen on the announce key, excluding this one.
+    pub(crate) fn announced_peers(&self) -> Vec<DiscoveryRecord> {
+        self.discovered
+            .read()
+            .map(|map| map.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Announce now on a worker, for a reader-triggered refresh.
+    pub(crate) fn reannounce(&self) {
+        let identity = self.identity.clone();
+        let transport = Arc::clone(&self.announce_transport);
+        let own = self.node_id.clone();
+        let advertise = self.advertise.clone();
+        let name = self.node_name();
+        std::thread::spawn(move || {
+            crate::extension::block_on_tokio(async move {
+                announce_once(&identity, &transport, &own, &advertise, name.as_deref()).await;
+            });
+        });
+    }
+
+    /// Announce immediately, for a test or a caller already on a runtime.
+    #[cfg(test)]
+    pub(crate) async fn announce_now(&self) {
+        let name = self.node_name();
+        announce_once(
+            &self.identity,
+            &self.announce_transport,
+            &self.node_id,
+            &self.advertise,
+            name.as_deref(),
+        )
+        .await;
+    }
     /// How many peers discovery has cached.
     pub(crate) fn discovered_peers(&self) -> usize {
         self.peer_capabilities
@@ -201,11 +277,86 @@ pub(crate) fn compose(
         remote,
     })
 }
-static RUNTIME: OnceLock<FederationRuntime> = OnceLock::new();
+static RUNTIME: OnceLock<std::sync::RwLock<Option<Arc<FederationRuntime>>>> = OnceLock::new();
+
+fn slot() -> &'static std::sync::RwLock<Option<Arc<FederationRuntime>>> {
+    RUNTIME.get_or_init(|| std::sync::RwLock::new(None))
+}
 
 /// The node this process runs, when settings enabled one.
-pub(crate) fn running() -> Option<&'static FederationRuntime> {
-    RUNTIME.get()
+pub(crate) fn running() -> Option<Arc<FederationRuntime>> {
+    slot()
+        .read()
+        .ok()
+        .and_then(|slot| slot.as_ref().map(Arc::clone))
+}
+
+/// Stop the node and release its data directory lock.
+///
+/// The peer store is on disk, so a stop loses no state; the next start (or the
+/// next launch) loads it again. Returns whether a node was running.
+pub(crate) fn stop() -> bool {
+    let taken = slot().write().ok().and_then(|mut slot| slot.take());
+    match taken {
+        Some(runtime) => {
+            runtime.task.abort();
+            runtime.refresher.abort();
+            runtime.announce_task.abort();
+            log::info!("federation node stopped");
+            true
+        }
+        None => false,
+    }
+}
+
+/// Publish one signed announcement over `transport`.
+async fn announce_once(
+    identity: &NodeIdentity,
+    transport: &Arc<dyn FederationTransport>,
+    own: &NodeId,
+    advertise: &[agent::capability::CapabilityDescriptor],
+    name: Option<&str>,
+) {
+    let record =
+        DiscoveryRecord::publish_named(identity, name.map(str::to_string), advertise.to_vec());
+    let Ok(payload) = serde_json::to_vec(&record) else {
+        return;
+    };
+    let message = FederationMessage::new("announce", payload);
+    let Ok(envelope) = Envelope::seal(&message, identity, own) else {
+        return;
+    };
+    if let Ok(frame) = envelope.encode() {
+        let _ = transport.announce(frame).await;
+    }
+}
+
+/// Apply one announcement frame. Returns whether the map changed.
+///
+/// The announcement is subject to the same envelope checks as any other frame:
+/// protocol, schema, signature, and expiry. On top of that the record must
+/// carry its own signature, must name the envelope's sender, and must not be
+/// this node. A failure is a silently ignored frame, never a state change.
+pub(crate) fn apply_announce(
+    discovered: &mut BTreeMap<NodeId, DiscoveryRecord>,
+    own: &NodeId,
+    frame: &[u8],
+    now_ms: u64,
+) -> bool {
+    let Ok(envelope) = Envelope::decode(frame) else {
+        return false;
+    };
+    if envelope.kind != "announce" || envelope.open(now_ms).is_err() {
+        return false;
+    }
+    let Ok(record) = serde_json::from_value::<DiscoveryRecord>(envelope.payload.clone()) else {
+        return false;
+    };
+    if record.node != envelope.sender || &record.node == own || !record.verify() {
+        return false;
+    }
+    discovered.insert(record.node.clone(), record);
+    true
 }
 
 /// Start the node once per process, when the settings enable it.
@@ -218,7 +369,7 @@ pub(crate) fn start_from_settings(settings: &crate::settings::Settings) -> bool 
     if !config.enabled {
         return false;
     }
-    if RUNTIME.get().is_some() {
+    if running().is_some() {
         return true;
     }
     let dir = crate::federation::dir();
@@ -232,14 +383,27 @@ pub(crate) fn start_from_settings(settings: &crate::settings::Settings) -> bool 
         .as_ref()
         .map(PathBuf::from)
         .unwrap_or_else(|| dir.join("peers.json"));
+    let tls = (config.tls_ca.is_some()
+        || config.tls_cert.is_some()
+        || config.tls_key.is_some()
+        || config.tls_mtls)
+        .then(|| bus::TlsConfig {
+            root_ca_certificate: config.tls_ca.clone(),
+            certificate: config.tls_cert.clone(),
+            private_key: config.tls_key.clone(),
+            enable_mtls: Some(config.tls_mtls),
+            verify_name_on_connect: Some(config.tls_verify_name.unwrap_or(true)),
+        });
     let bus_config = BusConfig {
         mode: config.mode.clone().unwrap_or_else(|| "peer".to_string()),
         connect: (!config.endpoints.is_empty()).then(|| config.endpoints.clone()),
         listen: (!config.listen.is_empty()).then(|| config.listen.clone()),
         peer: None,
+        tls,
     };
+    let settings_for_build = settings.clone();
     let started = crate::extension::block_on_tokio(async move {
-        build(identity_path, peers_path, bus_config).await
+        build(settings_for_build, identity_path, peers_path, bus_config).await
     });
     match started {
         Ok(runtime) => {
@@ -250,7 +414,9 @@ pub(crate) fn start_from_settings(settings: &crate::settings::Settings) -> bool 
                 .map(|store| store.iter().count())
                 .unwrap_or(0);
             log::info!("federation {} peers={peers}", runtime.status());
-            let _ = RUNTIME.set(runtime);
+            if let Ok(mut slot) = slot().write() {
+                *slot = Some(Arc::new(runtime));
+            }
             true
         }
         Err(error) => {
@@ -303,15 +469,154 @@ pub(crate) fn attach_remote_tools(
     }
     Ok(added)
 }
+
+/// Build the node's exposed capability runtime, if any are configured.
+///
+/// Only the read-only file tools are accepted: a node that answers strangers
+/// must not be handed the shell. The tools are confined to `expose_root`, and
+/// the exposed descriptors are made Public so discovery can publish them.
+pub(crate) fn node_runtime(
+    settings: &crate::settings::Settings,
+) -> Result<
+    (
+        Arc<WorkspaceRuntime>,
+        Vec<agent::capability::CapabilityDescriptor>,
+    ),
+    String,
+> {
+    use agent::capability::{CapabilityDescriptor, Visibility};
+    use agent::tools::{DeclaredTool, ToolRegistry};
+
+    let config = &settings.global.federation;
+    if config.expose.is_empty() {
+        return Err("no capabilities are exposed".to_string());
+    }
+    let root = config
+        .expose_root
+        .as_ref()
+        .map(PathBuf::from)
+        .ok_or_else(|| "expose_root is required when expose is set".to_string())?;
+    if !root.is_dir() {
+        return Err(format!("expose_root {} is not a directory", root.display()));
+    }
+    // The file tools compare a canonicalized target against this root, so the
+    // root itself must be canonical (on macOS /var is a symlink to /private).
+    let root = std::fs::canonicalize(&root).map_err(|error| {
+        format!(
+            "expose_root {} could not be resolved: {error}",
+            root.display()
+        )
+    })?;
+
+    let eff = settings.effective();
+    let policy = crate::caps::policy_for_effective(settings, &eff);
+    let session = "federation:node".to_string();
+    let preset = eff.preset_id.clone();
+    let mut registry = ToolRegistry::new();
+    for raw in &config.expose {
+        let id: agent::capability::CapabilityId = raw
+            .parse()
+            .map_err(|error| format!("invalid exposed capability id {raw:?}: {error}"))?;
+        let tool: Arc<dyn agent::tools::Tool> = match id.name() {
+            "glob" => Arc::new(DeclaredTool::new(
+                Arc::new(crate::caps::glob_tool(
+                    Some(root.clone()),
+                    true,
+                    Arc::clone(&policy),
+                    session.clone(),
+                    preset.clone(),
+                )),
+                crate::tool_metadata::declared("glob"),
+            )),
+            "grep" => Arc::new(DeclaredTool::new(
+                Arc::new(crate::caps::grep_tool(
+                    Some(root.clone()),
+                    true,
+                    Arc::clone(&policy),
+                    session.clone(),
+                    preset.clone(),
+                )),
+                crate::tool_metadata::declared("grep"),
+            )),
+            "read_file" => Arc::new(DeclaredTool::new(
+                Arc::new(crate::caps::read_file_tool(
+                    Some(root.clone()),
+                    true,
+                    Arc::clone(&policy),
+                    session.clone(),
+                    preset.clone(),
+                )),
+                crate::tool_metadata::declared("read_file"),
+            )),
+            "read_files" => Arc::new(DeclaredTool::new(
+                Arc::new(crate::caps::read_files_tool(
+                    Some(root.clone()),
+                    true,
+                    Arc::clone(&policy),
+                    session.clone(),
+                    preset.clone(),
+                )),
+                crate::tool_metadata::declared("read_files"),
+            )),
+            other => {
+                return Err(format!(
+                    "{other} is not a capability this node can expose; use read_file, read_files, glob, or grep"
+                ));
+            }
+        };
+        registry.register(tool).map_err(|error| error.to_string())?;
+    }
+
+    let catalogue = catalogue_from_registry(&registry).map_err(|error| error.to_string())?;
+    let workspace = WorkspaceId::new("ws:federation-node").map_err(|error| error.to_string())?;
+    let mut scope = LocalScope::new(workspace);
+    let mut spec = CompositionSpec::new(
+        "compose:federation-node",
+        Version::new(1, 0, 0),
+        "the capabilities this node exposes",
+    );
+    for id in catalogue.ids() {
+        scope.admit(id.clone());
+        spec = spec.with_requirement(CapabilityRequirement::new(id.clone(), VersionReq::STAR));
+    }
+    let plan = resolve_host(&spec, &catalogue, &[], &scope).map_err(|error| error.to_string())?;
+    let provider: Arc<dyn CapabilityProvider> =
+        Arc::new(NativeToolProvider::new(Arc::new(registry)));
+    let runtime = Arc::new(
+        WorkspaceRuntime::instantiate(plan.clone(), &[provider])
+            .map_err(|error| error.to_string())?,
+    );
+    let descriptors: Vec<CapabilityDescriptor> = plan
+        .capabilities
+        .iter()
+        .map(|capability| {
+            let mut descriptor = capability.descriptor.clone();
+            descriptor.visibility = Visibility::Public;
+            descriptor
+        })
+        .collect();
+    Ok((runtime, descriptors))
+}
+
 async fn build(
+    settings: crate::settings::Settings,
     identity_path: PathBuf,
     peers_path: PathBuf,
     config: BusConfig,
 ) -> Result<FederationRuntime, String> {
+    // One writer per directory: a second instance must not start a node whose
+    // in-memory peer store would diverge from this one's.
+    let directory = identity_path
+        .parent()
+        .map(|directory| directory.to_path_buf())
+        .unwrap_or_else(crate::federation::dir);
+    let lock = crate::federation_lock::DataDirLock::acquire(&directory)?;
     let identity =
         NodeIdentity::load_or_create(&identity_path).map_err(|error| error.to_string())?;
     let peers = PeerStore::load(&peers_path).map_err(|error| error.to_string())?;
-    let bus = Bus::from(config).await;
+    let bus = Bus::try_from(config)
+        .await
+        .map_err(|error| format!("the federation transport did not open: {error}"))?;
     let transport = ZenohTransport::new(bus.session(), identity.node_id());
     let inbox = transport
         .subscribe()
@@ -327,6 +632,14 @@ async fn build(
         // per-process file behind, and seven days is long enough to read it.
         let _ = crate::federation_audit::prune_stale(path, std::time::SystemTime::now());
     }
+    let (runtime, advertise) = match node_runtime(&settings) {
+        Ok((runtime, advertise)) => (Some(runtime), advertise),
+        Err(error) if !settings.global.federation.expose.is_empty() => {
+            log::warn!("federation: exposed capabilities were not built: {error}");
+            (None, Vec::new())
+        }
+        Err(_) => (None, Vec::new()),
+    };
     Ok(assemble(
         identity,
         peers,
@@ -334,19 +647,34 @@ async fn build(
         inbox.into_receiver(),
         Some(bus),
         audit,
+        Some(lock),
+        runtime,
+        advertise,
+        Some(crate::federation::resolve_node_name(
+            settings.global.federation.node_name.as_deref(),
+        )),
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn assemble(
     identity: NodeIdentity,
     peers: PeerStore,
     transport: Arc<dyn FederationTransport>,
-    inbox: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    inbox: tokio::sync::mpsc::Receiver<Vec<u8>>,
     bus: Option<Bus>,
     audit: Option<PathBuf>,
+    lock: Option<crate::federation_lock::DataDirLock>,
+    runtime: Option<Arc<WorkspaceRuntime>>,
+    advertise: Vec<agent::capability::CapabilityDescriptor>,
+    node_name: Option<String>,
 ) -> FederationRuntime {
-    let mut node =
-        FederationNode::new(identity, transport).with_peer_store(Arc::new(RwLock::new(peers)));
+    let announce_transport = Arc::clone(&transport);
+    let mut node = FederationNode::new(identity.clone(), transport)
+        .with_peer_store(Arc::new(RwLock::new(peers)));
+    if let Some(runtime) = runtime {
+        node = node.with_runtime(runtime);
+    }
     if let Some(path) = audit {
         node = node.with_audit(Arc::new(crate::federation_audit::FileAudit::new(path)));
     }
@@ -354,7 +682,7 @@ pub(crate) fn assemble(
     let node_id = node.node();
     let task = node.start(inbox);
     let peer_capabilities = Arc::new(RwLock::new(BTreeMap::new()));
-    {
+    let refresher = {
         let node = Arc::clone(&node);
         let cache = Arc::clone(&peer_capabilities);
         tokio::spawn(async move {
@@ -362,14 +690,74 @@ pub(crate) fn assemble(
                 refresh(&node, &cache).await;
                 tokio::time::sleep(Duration::from_secs(30)).await;
             }
-        });
-    }
+        })
+    };
+    let discovered = Arc::new(RwLock::new(BTreeMap::<NodeId, DiscoveryRecord>::new()));
+    let node_name = Arc::new(RwLock::new(node_name));
+    let announce_task = {
+        let transport = Arc::clone(&announce_transport);
+        let identity = identity.clone();
+        let discovered = Arc::clone(&discovered);
+        let own = node_id.clone();
+        let advertise = advertise.clone();
+        let name_slot = Arc::clone(&node_name);
+        tokio::spawn(async move {
+            let Some(mut frames) = (match transport.subscribe_announce().await {
+                Ok(frames) => frames,
+                Err(error) => {
+                    log::debug!("federation: announcements are unavailable: {error}");
+                    None
+                }
+            }) else {
+                return;
+            };
+            let mut tick = tokio::time::interval(ANNOUNCE_INTERVAL);
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {
+                        let name = name_slot
+                            .read()
+                            .map(|slot| slot.clone())
+                            .unwrap_or_default();
+                        announce_once(
+                            &identity,
+                            &transport,
+                            &own,
+                            &advertise,
+                            name.as_deref(),
+                        )
+                        .await;
+                        let now = unix_ms();
+                        if let Ok(mut map) = discovered.write() {
+                            map.retain(|_, record| {
+                                now.saturating_sub(record.published_at_ms) < DISCOVERY_STALE_MS
+                            });
+                        }
+                    }
+                    frame = frames.recv() => {
+                        let Some(frame) = frame else { break };
+                        if let Ok(mut map) = discovered.write() {
+                            apply_announce(&mut map, &own, &frame, unix_ms());
+                        }
+                    }
+                }
+            }
+        })
+    };
     FederationRuntime {
         node,
         node_id,
         peer_capabilities,
         bus,
         task,
+        refresher,
+        announce_task,
+        discovered,
+        identity,
+        announce_transport,
+        advertise,
+        node_name,
+        lock,
     }
 }
 
@@ -408,10 +796,242 @@ mod tests {
     use agent::capability::unix_ms;
     use federation::InMemoryNetwork;
 
+    /// Two nodes see each other on the announce key without any enrollment,
+    /// and neither lists itself.
+    #[tokio::test]
+    async fn two_nodes_discover_each_other_by_announcement() {
+        use agent::capability::{CapabilityDescriptor, CapabilityKind, VersionSource, Visibility};
+
+        let network = Arc::new(InMemoryNetwork::new());
+        let a_identity = NodeIdentity::from_seed([61u8; 32]);
+        let b_identity = NodeIdentity::from_seed([62u8; 32]);
+        let a_id = a_identity.node_id();
+        let b_id = b_identity.node_id();
+        let descriptor = CapabilityDescriptor::new(
+            "builtin/read_file".parse().expect("an id"),
+            CapabilityKind::Tool,
+            Version::new(1, 0, 0),
+            VersionSource::Declared,
+        )
+        .with_visibility(Visibility::Public);
+
+        let (a_transport, a_inbox) = network.join(a_id.clone());
+        let a = assemble(
+            a_identity,
+            PeerStore::new(),
+            Arc::new(a_transport),
+            a_inbox,
+            None,
+            None,
+            None,
+            None,
+            vec![descriptor.clone()],
+            Some("alpha".to_string()),
+        );
+        let (b_transport, b_inbox) = network.join(b_id.clone());
+        let b = assemble(
+            b_identity,
+            PeerStore::new(),
+            Arc::new(b_transport),
+            b_inbox,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Some("test node".to_string()),
+        );
+
+        // Let both announce listeners subscribe before the first frame.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        a.announce_now().await;
+
+        for _ in 0..100 {
+            if !b.announced_peers().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let seen = b.announced_peers();
+        assert_eq!(seen.len(), 1, "one peer announced");
+        assert_eq!(seen[0].node, a_id);
+        assert_eq!(
+            seen[0].name.as_deref(),
+            Some("alpha"),
+            "the announcement carries the node's name"
+        );
+        assert_eq!(seen[0].descriptors.len(), 1);
+        assert_eq!(seen[0].descriptors[0].id.to_string(), "builtin/read_file");
+
+        assert!(
+            a.announced_peers().iter().all(|record| record.node != a_id),
+            "a node never lists itself"
+        );
+    }
+
+    /// An announcement that is not signed by the node it names is ignored, and
+    /// so is a frame that is not an announcement at all.
+    #[tokio::test]
+    async fn a_forged_announcement_is_ignored() {
+        use agent::capability::{CapabilityDescriptor, CapabilityKind, VersionSource, Visibility};
+        use federation::DiscoveryRecord as Record;
+
+        let identity = NodeIdentity::from_seed([63u8; 32]);
+        let own = identity.node_id();
+        let stranger = NodeIdentity::from_seed([64u8; 32]);
+        let descriptor = CapabilityDescriptor::new(
+            "builtin/read_file".parse().expect("an id"),
+            CapabilityKind::Tool,
+            Version::new(1, 0, 0),
+            VersionSource::Declared,
+        )
+        .with_visibility(Visibility::Public);
+
+        let mut map = BTreeMap::new();
+
+        // A record signed by one node but naming another.
+        let mut forged = Record::publish(&identity, vec![descriptor.clone()]);
+        forged.node = stranger.node_id();
+        let message =
+            FederationMessage::new("announce", serde_json::to_vec(&forged).expect("bytes"));
+        let envelope = Envelope::seal(&message, &identity, &own).expect("sealed");
+        let frame = envelope.encode().expect("encoded");
+        assert!(!apply_announce(&mut map, &own, &frame, unix_ms()));
+        assert!(map.is_empty());
+
+        // A properly signed record whose envelope is not an announcement.
+        let record = Record::publish(&stranger, vec![descriptor]);
+        let message = FederationMessage::new("invoke", serde_json::to_vec(&record).expect("bytes"));
+        let envelope = Envelope::seal(&message, &stranger, &own).expect("sealed");
+        let frame = envelope.encode().expect("encoded");
+        assert!(!apply_announce(&mut map, &own, &frame, unix_ms()));
+        assert!(map.is_empty());
+    }
+
+    /// An exposed read-only capability is advertised Public and can actually
+    /// be invoked by a peer that holds a grant on both sides.
+    #[tokio::test]
+    async fn an_exposed_capability_is_invokable_by_a_granted_peer() {
+        use agent::capability::{
+            CapabilityId, InvocationContext, InvocationId, Principal, WorkspaceId,
+        };
+        use serde_json::json;
+
+        let root = std::env::temp_dir().join(format!("bsh-node-expose-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("a scratch root");
+        std::fs::write(root.join("a.txt"), b"hello from the node\n").expect("a file");
+
+        let mut settings = crate::settings::Settings::default();
+        let workspace = settings.note_workspace("expose", &root.to_string_lossy());
+        settings.global.general.active_workspace = workspace;
+        settings.global.federation.expose = vec!["builtin/read_file".to_string()];
+        settings.global.federation.expose_root = Some(root.to_string_lossy().to_string());
+
+        let (runtime, advertise) = node_runtime(&settings).expect("the node runtime");
+        assert_eq!(advertise.len(), 1);
+        assert_eq!(
+            advertise[0].visibility,
+            agent::capability::Visibility::Public,
+            "only a public descriptor may be announced"
+        );
+
+        let network = Arc::new(InMemoryNetwork::new());
+        let provider_identity = NodeIdentity::from_seed([81u8; 32]);
+        let provider_id = provider_identity.node_id();
+        let (provider_transport, provider_inbox) = network.join(provider_id.clone());
+        let provider = assemble(
+            provider_identity,
+            PeerStore::new(),
+            Arc::new(provider_transport),
+            provider_inbox,
+            None,
+            None,
+            None,
+            Some(Arc::clone(&runtime)),
+            advertise,
+            Some("provider".to_string()),
+        );
+
+        let caller_identity = NodeIdentity::from_seed([82u8; 32]);
+        let caller_id = caller_identity.node_id();
+        let (caller_transport, caller_inbox) = network.join(caller_id.clone());
+        let caller = assemble(
+            caller_identity,
+            PeerStore::new(),
+            Arc::new(caller_transport),
+            caller_inbox,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Some("test node".to_string()),
+        );
+
+        let capability: CapabilityId = "builtin/read_file".parse().expect("an id");
+        let now = unix_ms();
+        {
+            let peers = provider.node().peers();
+            let mut peers = peers.write().expect("peers");
+            peers.enroll(caller_id.clone(), now, None);
+            peers
+                .grant(&caller_id, capability.clone(), now, None)
+                .expect("granted");
+        }
+        {
+            let peers = caller.node().peers();
+            let mut peers = peers.write().expect("peers");
+            peers.enroll(provider_id.clone(), now, None);
+            peers
+                .grant(&provider_id, capability.clone(), now, None)
+                .expect("granted");
+        }
+
+        let context = InvocationContext::local(
+            InvocationId::new("inv:node-expose"),
+            Principal::Local {
+                session: "session".to_string(),
+                preset: "preset".to_string(),
+            },
+            WorkspaceId::new("ws:caller").expect("a workspace"),
+        );
+        let output = caller
+            .node()
+            .invoke(
+                &provider_id,
+                &capability,
+                json!({ "path": "a.txt" }),
+                &context,
+            )
+            .await
+            .expect("the peer reads the file");
+        let text = serde_json::to_string(&output).expect("the output serializes");
+        assert!(text.contains("hello from the node"), "{text}");
+    }
+
+    #[test]
+    fn an_expose_entry_the_node_cannot_serve_is_refused() {
+        let mut settings = crate::settings::Settings::default();
+        settings.global.federation.expose = vec!["builtin/bash".to_string()];
+        settings.global.federation.expose_root =
+            Some(std::env::temp_dir().to_string_lossy().to_string());
+
+        let refused = node_runtime(&settings);
+
+        assert!(refused.is_err(), "the shell is never exposed");
+    }
+    #[test]
+    fn stopping_a_node_that_is_not_running_reports_false() {
+        // No test in this binary starts the process-wide node through
+        // `start_from_settings`; the slot is empty here.
+        assert!(!crate::federation_node::stop());
+        assert!(crate::federation_node::running().is_none());
+    }
     #[test]
     fn a_disabled_setting_starts_no_node() {
-        let settings = crate::settings::Settings::default();
-        assert!(!settings.global.federation.enabled, "federation is opt-in");
+        let mut settings = crate::settings::Settings::default();
+        settings.global.federation.enabled = false;
         assert!(!start_from_settings(&settings));
     }
 
@@ -533,6 +1153,10 @@ mod tests {
             inbox,
             None,
             None,
+            None,
+            None,
+            Vec::new(),
+            Some("test node".to_string()),
         );
 
         let now = unix_ms();
@@ -821,6 +1445,10 @@ mod tests {
             inbox,
             None,
             None,
+            None,
+            None,
+            Vec::new(),
+            Some("test node".to_string()),
         );
 
         let now = unix_ms();
@@ -942,6 +1570,10 @@ mod tests {
             inbox,
             None,
             None,
+            None,
+            None,
+            Vec::new(),
+            Some("test node".to_string()),
         );
 
         let now = unix_ms();
@@ -1036,6 +1668,10 @@ mod tests {
             inbox,
             None,
             None,
+            None,
+            None,
+            Vec::new(),
+            Some("test node".to_string()),
         );
         assert_eq!(runtime.node().node(), node_id);
         assert!(!runtime.task.is_finished(), "the router is running");

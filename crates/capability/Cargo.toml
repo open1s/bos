@@ -8,10 +8,8 @@ license.workspace = true
 description = "Capability identity, descriptors, provider contract, and two-level composition"
 repository = "https://github.com/open1s/bos"
 
-[dev-dependencies]
-tokio.workspace = true
-
 [dependencies]
+tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 semver = { workspace = true, features = ["serde"] }

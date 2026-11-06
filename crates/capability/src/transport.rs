@@ -115,6 +115,24 @@ pub trait FederationTransport: Send + Sync {
 
     /// Close the session with a peer.
     async fn close(&self, peer: &NodeId) -> Result<(), CapabilityError>;
+
+    /// Publish an announcement to every Node sharing this transport.
+    ///
+    /// An announcement carries presence and public descriptors; it is not a
+    /// request and is never part of the invoke path. A transport that cannot
+    /// broadcast says so, and the runtime runs without discovery.
+    async fn announce(&self, _frame: Vec<u8>) -> Result<(), CapabilityError> {
+        Err(CapabilityError::Unavailable {
+            reason: "this transport cannot announce".to_string(),
+        })
+    }
+
+    /// Subscribe to announcements. `None` means the transport cannot broadcast.
+    async fn subscribe_announce(
+        &self,
+    ) -> Result<Option<tokio::sync::mpsc::Receiver<Vec<u8>>>, CapabilityError> {
+        Ok(None)
+    }
 }
 
 fn uuid_like() -> String {

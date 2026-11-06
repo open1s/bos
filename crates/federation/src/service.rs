@@ -54,6 +54,11 @@ pub struct FederationNode {
 }
 
 impl FederationNode {
+    /// The identity this node signs with.
+    pub fn identity(&self) -> &NodeIdentity {
+        &self.identity
+    }
+
     /// Build a node that can call peers and, when a runtime is attached, serve
     /// capabilities to them.
     pub fn new(identity: NodeIdentity, transport: Arc<dyn FederationTransport>) -> Self {
@@ -168,7 +173,7 @@ impl FederationNode {
     /// The task owns the inbox; dropping it closes the inbox and stops routing.
     pub fn start(
         &self,
-        mut inbox: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+        mut inbox: tokio::sync::mpsc::Receiver<Vec<u8>>,
     ) -> tokio::task::JoinHandle<()> {
         let identity = self.identity.clone();
         let transport = Arc::clone(&self.transport);

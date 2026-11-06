@@ -1,6 +1,7 @@
 # BSH Federation
 
-Status: implemented foundation, opt-in at every step. This guide describes what
+Status: implemented foundation. The node runs by default; every grant and every
+remote tool is opt-in. This guide describes what
 a BSH node does today, how to run one, and where the boundaries are. The design
 record is [bsh-2.0-architecture-rfc.md](bsh-2.0-architecture-rfc.md) (ADR-008 and
 ADR-009); the source-level analysis is
@@ -59,8 +60,14 @@ A peer id is the value the other node prints as `node ...` in its own
 
 ## Running a node
 
-Federation is off by default. Enabling it starts a node at launch, before the
-window, and keeps it for the life of the process:
+The node starts at launch, on its own thread, and keeps running for the life of
+the process. It is started beside the window rather than before it, so opening a
+Zenoh session never delays the first frame; the right panel's Refresh re-reads
+the node after it is up. Set `enabled = false` to run the app without one; a fresh install
+binds Zenoh's default peer endpoint, but nothing is shared until a peer is
+enrolled and granted. A settings file written by an earlier version that already
+contains `enabled = false` stays off: the written value is the reader's choice,
+so set it to `true` (or delete the line) to turn the node back on.
 
 ```toml
 [federation]
@@ -76,10 +83,107 @@ mode = "peer"
 
 # Offer trusted peers' capabilities to the model as tools.
 include_remote_tools = true
+
+# Transport TLS: the same identity is presented in both directions.
+tls_ca = "/etc/bsh/ca.pem"
+tls_cert = "/etc/bsh/node.pem"
+tls_key = "/etc/bsh/node-key.pem"
+tls_mtls = true            # require a client certificate from peers
+tls_verify_name = true     # default; set false only for lab endpoints
 ```
+
+A node that asks for TLS and cannot use it does not start: the generated Zenoh
+document is validated, a listener that cannot read its material is an error, and
+the failure is logged like any other startup failure. It never falls back to an
+unencrypted session.
 
 A node that cannot start is logged and the app runs without federation: a
 broken peer configuration must never keep the window from opening.
+
+## Ingress bounds
+
+The transport buffers at most 1024 inbound frames (and 256 announcements)
+ahead of the router. A full queue drops the frame and logs the first drop and
+every 1024th after it: a peer that sends faster than the node routes cannot grow
+the process without bound. Announcements are periodic presence, so a dropped one
+is replaced by the next tick; a dropped invoke fails like any unreachable frame.
+
+## How a node is named
+
+A node shows a display name instead of the first ten characters of its key. The
+default is the machine's host name (`devbook.local` becomes `devbook`); set your
+own with the **Node name** field in the Federation pane or in settings:
+
+```toml
+[federation]
+node_name = "studio-mac"
+```
+
+`bsh federation status` prints the same name above the node id. The name travels inside the signed discovery record, so a peer displays the name
+the node itself asserted, and a tampered name fails verification like any other
+signed field. The pane's status line, the peer rows and the revoke/enroll notices
+all use the same name; a peer enrolled before it had a name keeps showing its
+short id until it is enrolled again.
+
+## Several nodes on one host
+
+Each node needs its own data directory and its own transport endpoint. The data
+directory lock is per directory, so two nodes that share one are refused by
+design; a per-node `HOME` gives every node its own settings, identity, peer
+store, lock, and audit log. Give each node a distinct listen port and point the
+others at it:
+
+```toml
+# Instance A — ~/bsh-a/.bos/bsh/settings.toml, launched with HOME=~/bsh-a
+[federation]
+enabled = true
+listen = ["tcp/127.0.0.1:7447"]
+```
+
+```toml
+# Instance B — HOME=~/bsh-b
+[federation]
+enabled = true
+listen = ["tcp/127.0.0.1:7448"]
+endpoints = ["tcp/127.0.0.1:7447"]
+```
+
+Both nodes publish on the shared announce key (`bsh/v1/announce`) and, once
+their transports are connected, each lists the other under **Discovered peers**
+in the right panel, excluding itself. The list shows the capabilities the peer
+advertises; select the ones to grant and press **Enroll & grant**. No enrollment
+is implied by being discovered: a discovered peer cannot invoke anything until
+both sides hold a grant.
+
+Enrolling and granting are menus, not free-text fields: **Enroll a peer** lists
+the nodes discovery heard (the manual node-id field below it remains for a peer
+on another network), **Grant a capability** lists what the selected peer
+announced, and expiry is picked from **No expiry / 1 hour / 24 hours / 7 days /
+30 days**. A capability id can still be typed when a peer holds a granted-only
+capability it did not announce.
+
+A node advertises presence plus the read-only capabilities configured under
+`[federation] expose`, confined to `expose_root`:
+
+```toml
+[federation]
+enabled = true
+# Empty (the default) advertises and serves nothing.
+expose = ["builtin/read_file", "builtin/read_files", "builtin/glob", "builtin/grep"]
+expose_root = "/srv/shared-notes"
+```
+
+The same choice is in the Federation pane: **Exposed capabilities** carries one
+checkbox per read-only tool and a root field, and writes these settings directly.
+Supported ids are the four read-only file tools; any other id is refused when
+the node starts and the refusal is logged, so a typo cannot quietly expose the
+shell. An exposed capability is announced as a Public descriptor and is served
+from a read-only workspace confined to `expose_root`. Being discovered grants
+nothing: a peer must be enrolled and granted on both sides before it can call.
+Changing the set applies when the node restarts (the pane says so).
+
+The `bsh federation` CLI uses the same per-node directory, so run it with the
+same `HOME` (or set `identity_path`/`peers_path` in that node's settings).
 
 ## What a running node does
 
@@ -97,6 +201,36 @@ broken peer configuration must never keep the window from opening.
 `bsh federation status` prints `discovered_peers` and the composed
 `capabilities` / `remote_capabilities` counts when the app is running; the
 headless command reads the files, so it reports identity and grants only.
+
+## Right panel
+
+The right panel's **Federation** tab is the management surface: it lists enrolled
+peers with a shortened id, their trust state, and their grants, and offers the
+four actions the store supports: enroll a peer, grant a capability to the
+selected peer (with an optional expiry in minutes), revoke one grant, and revoke
+a peer. Revoking a peer takes two presses: the first asks, the second acts, and
+Cancel leaves the store untouched. The status line carries **Start** or **Stop** for the node itself. Start opens
+the transport on a worker thread, like the launch path, so a frame never waits
+for Zenoh; Stop aborts the router and discovery tasks and releases the data
+directory lock immediately (the peer store is on disk, so nothing is lost). The
+`enabled` switch still decides whether the node starts at launch.
+
+Two switches sit at the top: **Run a federation node** (the `enabled` setting;
+takes effect at the next launch) and **Offer peers' capabilities to the model**
+(`include_remote_tools`; takes effect at the next turn, and the node must be
+running). Both persist through the settings file. The pane validates ids and
+the expiry before they reach the store and reports the refusal in place. Refresh re-reads the node
+and the store, and re-announces this node, which is how a node that finished
+starting after the pane opened (or a peer that started late) appears without
+reopening it.
+
+With a running node the change is applied to the live peer store and saved; with
+no running node the peer store file is edited and the change applies at the next
+launch, which the pane states in its header. The header tells the two reasons
+apart: federation switched off in settings (`[federation] enabled = false`) and
+federation enabled but the node failed to start (the launch log has the reason,
+for example another instance holding the data directory lock). Revoking is a state change, not a
+deletion: the peer stays listed as revoked so the pane shows what happened.
 
 ## Security model
 
@@ -180,7 +314,9 @@ so the settings row follows new decisions without a relaunch.
   local binding wins for that id.
 - General settings shows a read-only federation line (off, or the node's id,
   discovered peers, remote capability count, how many delegations are active,
-  and the newest recorded decision). It does not offer controls:
+  and the newest recorded decision). Under it, up to five enrolled peers are
+  listed with a shortened id, their trust state, and their grant count, read
+  once at launch. It does not offer controls:
   enrollment and grants stay the CLI and the settings file, because a switch in
   a pane would be a permission decision dressed as a preference.
 - Resource streams and delegations are implemented at the protocol layer; the

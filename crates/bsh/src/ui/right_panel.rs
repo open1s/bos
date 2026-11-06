@@ -19,10 +19,12 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::diff::{Diff, DiffEvent, DiffFile, DiffMode, DiffState};
 use gpui_kit::component::input::{
     Editor, EditorState, Input, InputEvent, InputState, Textarea, TextareaState,
 };
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::Focusable;
 use gpui_kit::*;
@@ -30,7 +32,7 @@ use gpui_kit::*;
 use super::diff_pane::{self, DiffSource};
 use super::shell::{Shell, SideDrag};
 use super::terminal_view::TerminalView;
-use super::{hairline_left, handle_bar, icon, txt, DivExt, IconName};
+use super::{hairline_bottom, hairline_left, handle_bar, icon, txt, DivExt, IconName};
 use crate::browser::engine::cdp::PointerButton;
 use crate::files::{self, Kind};
 use crate::model::Role;
@@ -337,6 +339,8 @@ pub(crate) enum RightTab {
     Browser,
     /// Extension-contributed declarative panels.
     Extensions,
+    /// The federation node's peers and grants.
+    Federation,
 }
 
 impl RightTab {
@@ -348,6 +352,7 @@ impl RightTab {
             RightTab::Diff => "right.tab.diff",
             RightTab::Browser => "right.tab.browser",
             RightTab::Extensions => "right.tab.extensions",
+            RightTab::Federation => "right.tab.federation",
         }
     }
 
@@ -359,6 +364,7 @@ impl RightTab {
             RightTab::Diff => IconName::GitCompareArrows,
             RightTab::Browser => IconName::Globe,
             RightTab::Extensions => IconName::Puzzle,
+            RightTab::Federation => IconName::GitBranch,
         }
     }
 
@@ -372,16 +378,18 @@ impl RightTab {
             RightTab::Diff => "diff",
             RightTab::Browser => "browser",
             RightTab::Extensions => "extensions",
+            RightTab::Federation => "federation",
         }
     }
 
     /// Every pane the Start screen offers, in the order it lists them.
-    const ALL: [RightTab; 5] = [
+    const ALL: [RightTab; 6] = [
         RightTab::Files,
         RightTab::Diff,
         RightTab::Terminal,
         RightTab::Browser,
         RightTab::Extensions,
+        RightTab::Federation,
     ];
 }
 
@@ -410,8 +418,57 @@ pub(crate) struct RightPanel {
     pub(crate) terminal_view_subs: Vec<Subscription>,
     /// The comparison surface's own state: what it is showing, and how.
     pub(crate) diff: super::diff_pane::DiffView,
+    /// The federation pane's peers and drafts.
+    pub(crate) federation: FederationPane,
 }
 
+/// One enrolled peer as the federation pane lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FederationPeerRow {
+    /// The Node id, full length.
+    pub(crate) node: String,
+    /// The name the peer gave when it was enrolled, if any.
+    pub(crate) name: Option<String>,
+    /// The trust state: pending, trusted, or revoked.
+    pub(crate) state: String,
+    /// The capabilities the peer may invoke.
+    pub(crate) grants: Vec<String>,
+}
+
+/// One peer seen on the announce key, with the capabilities it advertises.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DiscoveredPeerRow {
+    /// The Node id.
+    pub(crate) node: String,
+    /// The name the peer announced, if any.
+    pub(crate) name: Option<String>,
+    /// Advertised capability ids and their risk classes.
+    pub(crate) capabilities: Vec<(String, String)>,
+}
+/// The federation pane's own state.
+#[derive(Default)]
+pub(crate) struct FederationPane {
+    /// The peers, in store order.
+    pub(crate) peers: Vec<FederationPeerRow>,
+    /// The peer the grant field applies to.
+    pub(crate) selected: Option<usize>,
+    /// Whether the list has been read since the pane opened.
+    pub(crate) loaded: bool,
+    /// The last failure, shown above the list.
+    pub(crate) error: Option<String>,
+    /// The last success, shown above the list.
+    pub(crate) notice: Option<String>,
+    /// The peer a revoke is waiting on a second press to confirm.
+    pub(crate) confirm_revoke: Option<String>,
+    /// Peers seen on the announce key, excluding this node.
+    pub(crate) discovered: Vec<DiscoveredPeerRow>,
+    /// Capabilities selected for a discovered peer, by node id.
+    pub(crate) pending: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    /// The capability chosen from the selected peer's menu.
+    pub(crate) grant_choice: Option<String>,
+    /// Grant expiry in minutes; zero means no expiry.
+    pub(crate) grant_expiry: u64,
+}
 /// The workspace browser's place in the tree, and the files open beside it.
 ///
 /// The pane holds three things at once: the expandable directory tree the
@@ -1022,6 +1079,7 @@ impl Shell {
             Some(RightTab::Terminal) => body.child(self.terminal_pane(cx)),
             Some(RightTab::Diff) => body.child(self.diff_pane(cx)),
             Some(RightTab::Browser) => body.child(self.browser_pane(cx)),
+            Some(RightTab::Federation) => body.child(self.federation_pane(cx)),
             Some(RightTab::Extensions) => body.child(match &self.right_extension_panels {
                 Some(view) => view.clone().into_any_element(),
                 None => div()
@@ -1038,6 +1096,1232 @@ impl Shell {
         }
     }
 
+    /// The federation pane: the node's peers, their grants, and the two
+    /// actions that change them (enroll a peer, grant a capability). Revoking
+    /// is per row. A running node is edited live; otherwise the peer store file
+    /// is edited and the change applies at the next launch.
+    fn federation_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let lang = self.state.lang;
+        let peers = self.right.federation.peers.clone();
+        let selected = self.right.federation.selected;
+        let error = self.right.federation.error.clone();
+        let notice = self.right.federation.notice.clone();
+        let confirming = self.right.federation.confirm_revoke.clone();
+        let discovered = self.right.federation.discovered.clone();
+        let pending = self.right.federation.pending.clone();
+        // The advertised risk class by (node, capability), so a granted chip
+        // carries the same dot its discovered chip did.
+        let grant_risks: std::collections::HashMap<(String, String), String> = discovered
+            .iter()
+            .flat_map(|row| {
+                let node = row.node.clone();
+                row.capabilities.iter().map(move |(capability, risk)| {
+                    ((node.clone(), capability.clone()), risk.clone())
+                })
+            })
+            .collect();
+        let runtime = crate::federation_node::running();
+
+        let mut pane = div()
+            .id("federation-pane")
+            .debug_selector(|| "federation-pane".to_string())
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(18.0))
+            .px(px(20.0))
+            .py(px(16.0))
+            .overflow_y_scroll();
+
+        // Header: a status dot, what the node is, and the two controls that
+        // act on the node itself. Actions live here, not on their own line.
+        let status = match &runtime {
+            Some(runtime) => crate::i18n::tr_args(
+                lang,
+                "right.federation.running",
+                &[
+                    (
+                        "node",
+                        runtime
+                            .node_name()
+                            .filter(|name| !name.trim().is_empty())
+                            .unwrap_or_else(|| short_node(runtime.node_id().as_str())),
+                    ),
+                    ("peers", runtime.announced_peers().len().to_string()),
+                ],
+            ),
+            None => federation_status_off(lang, self.state.settings.global.federation.enabled),
+        };
+        pane =
+            pane.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(div().w(px(6.0)).h(px(6.0)).rounded_full().bg(rgb(
+                        if runtime.is_some() {
+                            theme::success()
+                        } else {
+                            theme::faint()
+                        },
+                    )))
+                    .child(
+                        txt(
+                            status,
+                            12.0,
+                            if runtime.is_some() {
+                                theme::muted()
+                            } else {
+                                theme::faint()
+                            },
+                        )
+                        .flex_1()
+                        .min_w_0(),
+                    )
+                    .child(self.federation_small_button(
+                        "federation-refresh",
+                        lang.tr("right.federation.refresh"),
+                        cx,
+                        |this, cx| {
+                            this.reload_federation();
+                            cx.notify();
+                        },
+                    ))
+                    .child(if runtime.is_some() {
+                        self.federation_small_button(
+                            "federation-node-stop",
+                            lang.tr("right.federation.stop"),
+                            cx,
+                            |this, cx| {
+                                crate::federation_node::stop();
+                                this.reload_federation();
+                                cx.notify();
+                            },
+                        )
+                    } else {
+                        self.federation_small_button(
+                            "federation-node-start",
+                            lang.tr("right.federation.start"),
+                            cx,
+                            |this, cx| {
+                                std::thread::spawn(|| {
+                                    crate::federation_node::start_from_settings(
+                                        &crate::settings::Settings::load(),
+                                    );
+                                });
+                                this.right.federation.notice =
+                                    Some(this.state.lang.tr("right.federation.starting"));
+                                this.right.federation.error = None;
+                                cx.notify();
+                            },
+                        )
+                    }),
+            );
+
+        if let Some(error) = error {
+            pane = pane.child(self.federation_banner(error, false));
+        }
+        if let Some(notice) = notice {
+            pane = pane.child(self.federation_banner(notice, true));
+        }
+
+        // Node switches.
+        pane = pane.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(self.federation_switch_row(
+                    "federation-run-node",
+                    lang.tr("right.federation.runNode"),
+                    lang.tr("right.federation.runNodeHint"),
+                    self.state.settings.global.federation.enabled,
+                    cx,
+                    |settings, on| settings.global.federation.enabled = on,
+                ))
+                .child(self.federation_switch_row(
+                    "federation-remote-tools",
+                    lang.tr("right.federation.remoteTools"),
+                    lang.tr("right.federation.remoteToolsHint"),
+                    self.state.settings.global.federation.include_remote_tools,
+                    cx,
+                    |settings, on| settings.global.federation.include_remote_tools = on,
+                )),
+        );
+
+        // The name this node announces. Empty falls back to the machine name,
+        // which is the default a reader recognises.
+        pane = pane.child(self.federation_section_title(lang.tr("right.federation.nodeName")));
+        pane = pane.child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(self.federation_field(&self.federation_name, "federation-field-name", None))
+                .child(self.federation_small_button(
+                    "federation-name-save",
+                    lang.tr("right.federation.save"),
+                    cx,
+                    move |this, cx| {
+                        let raw = this.federation_name.read(cx).value().trim().to_string();
+                        let configured = if raw.is_empty() { None } else { Some(raw) };
+                        this.state.settings.global.federation.node_name = configured.clone();
+                        if let Err(error) = this.state.settings.save() {
+                            this.right.federation.error = Some(error.to_string());
+                            this.right.federation.notice = None;
+                            cx.notify();
+                            return;
+                        }
+                        let effective = crate::federation::resolve_node_name(configured.as_deref());
+                        if let Some(runtime) = crate::federation_node::running() {
+                            runtime.set_name(Some(effective.clone()));
+                            runtime.reannounce();
+                        }
+                        this.right.federation.notice = Some(crate::i18n::tr_args(
+                            lang,
+                            "right.federation.nameSaved",
+                            &[("node", effective)],
+                        ));
+                        this.right.federation.error = None;
+                        cx.notify();
+                    },
+                )),
+        );
+        pane = pane.child(txt(
+            lang.tr("right.federation.nodeNameHint"),
+            11.0,
+            theme::faint(),
+        ));
+
+        // Enrolled peers.
+        pane = pane.child(self.federation_section_title(format!(
+            "{} ({})",
+            lang.tr("right.federation.peers"),
+            peers.len()
+        )));
+        if peers.is_empty() {
+            pane = pane.child(self.federation_empty(lang.tr("right.federation.empty")));
+        }
+        for (index, peer) in peers.iter().enumerate() {
+            let good = peer.state == "trusted";
+            let mut row = div()
+                .id(SharedString::from(format!("federation-peer-{index}")))
+                .debug_selector(move || format!("federation-peer-{index}"))
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .py(px(10.0))
+                .px(px(8.0))
+                .rounded(px(theme::RADIUS_SM))
+                .when(selected == Some(index), |row| {
+                    row.bg(rgb(theme::selected_row()))
+                })
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.right.federation.selected = Some(index);
+                    this.right.federation.grant_choice = None;
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(
+                            txt(
+                                display_name(peer.name.as_deref(), &peer.node),
+                                13.0,
+                                theme::text(),
+                            )
+                            .font_weight(FontWeight::MEDIUM),
+                        )
+                        .when(peer.name.is_some(), |row| {
+                            row.child(txt(short_node(&peer.node), 11.0, theme::faint()))
+                        })
+                        .child(Self::federation_badge(
+                            lang.tr(match peer.state.as_str() {
+                                "trusted" => "right.federation.trusted",
+                                "pending" => "right.federation.pending",
+                                _ => "right.federation.revoked",
+                            }),
+                            good,
+                        ))
+                        .child(self.federation_copy_button(
+                            format!("federation-copy-{index}"),
+                            peer.node.clone(),
+                            cx,
+                        ))
+                        .child(div().flex_1())
+                        .child({
+                            let node_for_revoke = peer.node.clone();
+                            self.federation_small_button(
+                                "federation-revoke",
+                                lang.tr("right.federation.revoke"),
+                                cx,
+                                move |this, cx| {
+                                    this.right.federation.confirm_revoke =
+                                        Some(node_for_revoke.clone());
+                                    cx.notify();
+                                },
+                            )
+                        }),
+                );
+            if confirming.as_deref() == Some(peer.node.as_str()) {
+                let node_for_confirm = peer.node.clone();
+                let label_for_confirm = display_name(peer.name.as_deref(), &peer.node);
+                row = row.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
+                            txt(
+                                crate::i18n::tr_args(
+                                    lang,
+                                    "right.federation.confirmRevoke",
+                                    &[("node", short_node(&peer.node))],
+                                ),
+                                12.0,
+                                theme::error(),
+                            )
+                            .flex_1(),
+                        )
+                        .child(self.federation_small_button(
+                            "federation-revoke-confirm",
+                            lang.tr("right.federation.confirm"),
+                            cx,
+                            move |this, cx| {
+                                this.right.federation.confirm_revoke = None;
+                                let node = node_for_confirm.clone();
+                                let label = label_for_confirm.clone();
+                                this.apply_federation(
+                                    move |store| revoke_peer_action(store, &node, &label),
+                                    cx,
+                                );
+                            },
+                        ))
+                        .child(self.federation_small_button(
+                            "federation-revoke-cancel",
+                            lang.tr("right.federation.cancel"),
+                            cx,
+                            |this, cx| {
+                                this.right.federation.confirm_revoke = None;
+                                cx.notify();
+                            },
+                        )),
+                );
+            }
+            let mut grants = div().flex().flex_wrap().items_center().gap(px(4.0));
+            if peer.grants.is_empty() {
+                grants = grants.child(txt(
+                    lang.tr("right.federation.noGrants"),
+                    11.0,
+                    theme::faint(),
+                ));
+            }
+            for grant in &peer.grants {
+                let node = peer.node.clone();
+                let capability = grant.clone();
+                let dot = risk_color(
+                    grant_risks
+                        .get(&(peer.node.clone(), capability.clone()))
+                        .map(String::as_str),
+                );
+                let chip_id = format!("federation-grant-{index}-{capability}");
+                grants = grants.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0))
+                        .h(px(20.0))
+                        .px(px(7.0))
+                        .rounded(px(theme::RADIUS_SM))
+                        .bg(rgb(theme::hover()))
+                        .child(div().w(px(6.0)).h(px(6.0)).rounded_full().bg(rgb(dot)))
+                        .child(txt(capability.clone(), 11.0, theme::muted()))
+                        .child(
+                            div()
+                                .id(SharedString::from(chip_id.clone()))
+                                .debug_selector(move || chip_id.clone())
+                                .cursor_pointer()
+                                .child(txt("×", 11.0, theme::faint()))
+                                .on_click(cx.listener(move |this, _event, _window, cx| {
+                                    cx.stop_propagation();
+                                    let node = node.clone();
+                                    let capability = capability.clone();
+                                    this.apply_federation(
+                                        move |store| revoke_grant_action(store, &node, &capability),
+                                        cx,
+                                    );
+                                })),
+                        ),
+                );
+            }
+            row = row.child(grants);
+            pane = pane.child(hairline_bottom(row).border_color(rgb(theme::border_soft())));
+        }
+
+        // Enroll: a menu over what discovery heard, with manual entry as the
+        // fallback for a node on another network.
+        let shell = cx.entity();
+        pane = pane.child(self.federation_section_title(lang.tr("right.federation.enrollTitle")));
+        let enroll_trigger = {
+            let shell = shell.clone();
+            let discovered = discovered.clone();
+            Button::new("federation-enroll-menu")
+                .ghost()
+                .debug_selector(|| "federation-enroll-menu".to_string())
+                .h(px(34.0))
+                .w_full()
+                .rounded(px(theme::RADIUS_SM))
+                .bg(rgb(theme::page()))
+                .border_1()
+                .border_color(rgb(theme::border()))
+                .px(px(10.0))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .cursor_pointer()
+                .child(txt(lang.tr("right.federation.enrollMenu"), 12.0, theme::faint()).flex_1())
+                .child(icon(IconName::ChevronDown, 12.0, theme::faint()))
+                .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
+                    let mut menu = menu.min_w(px(300.0));
+                    if discovered.is_empty() {
+                        return menu.item(
+                            PopupMenuItem::new(lang.tr("right.federation.noDiscovered"))
+                                .disabled(true),
+                        );
+                    }
+                    for peer in discovered.iter() {
+                        let node = peer.node.clone();
+                        let name = peer.name.clone();
+                        let label = match name.as_deref() {
+                            Some(name) => format!("{name}  ·  {}", short_node(&node)),
+                            None => short_node(&node),
+                        };
+                        let shell = shell.clone();
+                        menu =
+                            menu.item(PopupMenuItem::new(label).on_click(move |_, _window, cx| {
+                                let node = node.clone();
+                                let name = name.clone();
+                                shell.update(cx, |this, cx| {
+                                    this.apply_federation(
+                                        move |store| {
+                                            enroll_and_grant(
+                                                store,
+                                                &node,
+                                                name.as_deref(),
+                                                &std::collections::BTreeSet::new(),
+                                            )
+                                        },
+                                        cx,
+                                    );
+                                });
+                            }));
+                    }
+                    menu
+                })
+        };
+        pane = pane.child(enroll_trigger);
+        pane = pane.child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(self.federation_field(
+                    &self.federation_enroll,
+                    "federation-field-enroll",
+                    None,
+                ))
+                .child(self.federation_small_button(
+                    "federation-enroll",
+                    lang.tr("right.federation.enroll"),
+                    cx,
+                    |this, cx| {
+                        let raw = this.federation_enroll.read(cx).value().to_string();
+                        this.apply_federation(move |store| enroll_peer(store, &raw), cx);
+                    },
+                )),
+        );
+        pane = pane.child(txt(
+            lang.tr("right.federation.enrollHint"),
+            11.0,
+            theme::faint(),
+        ));
+
+        // Discovered peers.
+        pane = pane.child(self.federation_section_title(lang.tr("right.federation.discovered")));
+        if discovered.is_empty() {
+            pane = pane.child(self.federation_empty(lang.tr("right.federation.discoveredEmpty")));
+        }
+        for (index, peer) in discovered.iter().enumerate() {
+            let selected_caps = pending.get(&peer.node).cloned().unwrap_or_default();
+            let low_caps: Vec<String> = peer
+                .capabilities
+                .iter()
+                .filter(|(_, risk)| risk == "low")
+                .map(|(capability, _)| capability.clone())
+                .collect();
+            let mut chips = div().flex().flex_wrap().gap(px(4.0));
+            if peer.capabilities.is_empty() {
+                chips = chips.child(txt(
+                    lang.tr("right.federation.noCaps"),
+                    11.0,
+                    theme::faint(),
+                ));
+            }
+            for (capability, risk) in &peer.capabilities {
+                let chosen = selected_caps.contains(capability);
+                // The risk class is the thing a reader needs before choosing,
+                // so it rides on the chip itself rather than in a legend.
+                let dot = risk_color(Some(risk.as_str()));
+                let node = peer.node.clone();
+                let capability = capability.clone();
+                let chip_id = format!("federation-choose-{index}-{capability}");
+                chips = chips.child(
+                    div()
+                        .id(SharedString::from(chip_id.clone()))
+                        .debug_selector(move || chip_id.clone())
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0))
+                        .h(px(22.0))
+                        .px(px(8.0))
+                        .rounded(px(theme::RADIUS_SM))
+                        .bg(rgb(if chosen {
+                            theme::accent_soft()
+                        } else {
+                            theme::hover()
+                        }))
+                        .cursor_pointer()
+                        .child(div().w(px(6.0)).h(px(6.0)).rounded_full().bg(rgb(dot)))
+                        .child(txt(
+                            capability.clone(),
+                            11.0,
+                            if chosen {
+                                theme::accent()
+                            } else {
+                                theme::muted()
+                            },
+                        ))
+                        .child(txt(
+                            if chosen { "✓" } else { "+" },
+                            11.0,
+                            if chosen {
+                                theme::accent()
+                            } else {
+                                theme::faint()
+                            },
+                        ))
+                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                            let set = this
+                                .right
+                                .federation
+                                .pending
+                                .entry(node.clone())
+                                .or_default();
+                            if !set.remove(&capability) {
+                                set.insert(capability.clone());
+                            }
+                            cx.notify();
+                        })),
+                );
+            }
+            let grants = selected_caps.clone();
+            let enroll_node = peer.node.clone();
+            let enroll_name = peer.name.clone();
+            pane = pane.child(
+                hairline_bottom(
+                    div()
+                        .id(SharedString::from(format!("federation-discovered-{index}")))
+                        .debug_selector(move || format!("federation-discovered-{index}"))
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.0))
+                        .py(px(10.0))
+                        .border_color(rgb(theme::border_soft()))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(
+                                    txt(
+                                        display_name(peer.name.as_deref(), &peer.node),
+                                        13.0,
+                                        theme::text(),
+                                    )
+                                    .font_weight(FontWeight::MEDIUM),
+                                )
+                                .when(peer.name.is_some(), |row| {
+                                    row.child(txt(short_node(&peer.node), 11.0, theme::faint()))
+                                })
+                                .child(self.federation_copy_button(
+                                    format!("federation-copy-discovered-{index}"),
+                                    peer.node.clone(),
+                                    cx,
+                                ))
+                                .child(div().flex_1())
+                                .when(!low_caps.is_empty(), |row| {
+                                    let node = peer.node.clone();
+                                    let lows = low_caps.clone();
+                                    row.child(self.federation_small_button(
+                                        format!("federation-choose-low-{index}"),
+                                        lang.tr("right.federation.lowRisk"),
+                                        cx,
+                                        move |this, cx| {
+                                            let set = this
+                                                .right
+                                                .federation
+                                                .pending
+                                                .entry(node.clone())
+                                                .or_default();
+                                            for capability in lows.iter() {
+                                                set.insert(capability.clone());
+                                            }
+                                            cx.notify();
+                                        },
+                                    ))
+                                })
+                                .child(self.federation_small_button(
+                                    "federation-enroll-grant",
+                                    if peer.capabilities.is_empty() {
+                                        lang.tr("right.federation.enroll")
+                                    } else {
+                                        lang.tr("right.federation.enrollGrant")
+                                    },
+                                    cx,
+                                    move |this, cx| {
+                                        let node = enroll_node.clone();
+                                        let name = enroll_name.clone();
+                                        let grants = grants.clone();
+                                        this.apply_federation(
+                                            move |store| {
+                                                enroll_and_grant(
+                                                    store,
+                                                    &node,
+                                                    name.as_deref(),
+                                                    &grants,
+                                                )
+                                            },
+                                            cx,
+                                        );
+                                    },
+                                )),
+                        )
+                        .child(chips),
+                )
+                .border_color(rgb(theme::border_soft())),
+            );
+        }
+
+        // Grant to the selected peer: the capability menu lists what that peer
+        // announced, and a typed id remains for anything it did not announce.
+        pane = pane.child(self.federation_section_title(lang.tr("right.federation.grantTitle")));
+        let target = selected.and_then(|index| peers.get(index).cloned());
+        let target_node = target.as_ref().map(|peer| peer.node.clone());
+        let grant_hint = match &target {
+            Some(peer) => crate::i18n::tr_args(
+                lang,
+                "right.federation.grantTo",
+                &[("node", display_name(peer.name.as_deref(), &peer.node))],
+            ),
+            None => lang.tr("right.federation.selectPeer"),
+        };
+        let missing_selection = lang.tr("right.federation.selectPeer");
+        pane = pane.child(txt(grant_hint, 11.0, theme::faint()));
+        let known_caps: Vec<(String, String)> = discovered
+            .iter()
+            .find(|row| Some(&row.node) == target.as_ref().map(|peer| &peer.node))
+            .map(|row| row.capabilities.clone())
+            .unwrap_or_default();
+        let chosen = self.right.federation.grant_choice.clone();
+        let chosen_label = chosen
+            .clone()
+            .unwrap_or_else(|| lang.tr("right.federation.capabilityMenu"));
+        let capability_trigger = {
+            let shell = shell.clone();
+            let caps = known_caps.clone();
+            let chosen = chosen.clone();
+            let has_choice = chosen.is_some();
+            Button::new("federation-capability-menu")
+                .ghost()
+                .debug_selector(|| "federation-capability-menu".to_string())
+                .h(px(34.0))
+                .w_full()
+                .rounded(px(theme::RADIUS_SM))
+                .bg(rgb(theme::page()))
+                .border_1()
+                .border_color(rgb(theme::border()))
+                .px(px(10.0))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .cursor_pointer()
+                .child(
+                    txt(
+                        chosen_label,
+                        12.0,
+                        if has_choice {
+                            theme::text()
+                        } else {
+                            theme::faint()
+                        },
+                    )
+                    .flex_1(),
+                )
+                .child(icon(IconName::ChevronDown, 12.0, theme::faint()))
+                .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
+                    let mut menu = menu.min_w(px(280.0));
+                    if caps.is_empty() {
+                        return menu.item(
+                            PopupMenuItem::new(lang.tr("right.federation.noKnownCaps"))
+                                .disabled(true),
+                        );
+                    }
+                    for (capability, risk) in caps.iter() {
+                        let pick = capability.clone();
+                        let shell = shell.clone();
+                        let label = format!("{capability}  ·  {risk}");
+                        menu = menu.item(
+                            PopupMenuItem::new(label)
+                                .checked(chosen.as_deref() == Some(capability.as_str()))
+                                .on_click(move |_, _window, cx| {
+                                    let pick = pick.clone();
+                                    shell.update(cx, |this, cx| {
+                                        this.right.federation.grant_choice = Some(pick);
+                                        cx.notify();
+                                    });
+                                }),
+                        );
+                    }
+                    menu
+                })
+        };
+        pane = pane.child(capability_trigger);
+        pane = pane.child(txt(
+            lang.tr("right.federation.customCapability"),
+            11.0,
+            theme::faint(),
+        ));
+        pane = pane.child(self.federation_field(
+            &self.federation_grant,
+            "federation-field-grant",
+            None,
+        ));
+
+        let minutes = self.right.federation.grant_expiry;
+        let expiry_trigger = {
+            let shell = shell.clone();
+            Button::new("federation-expiry-menu")
+                .ghost()
+                .debug_selector(|| "federation-expiry-menu".to_string())
+                .h(px(34.0))
+                .w(px(200.0))
+                .rounded(px(theme::RADIUS_SM))
+                .bg(rgb(theme::page()))
+                .border_1()
+                .border_color(rgb(theme::border()))
+                .px(px(10.0))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .cursor_pointer()
+                .child(txt(federation_expiry_label(lang, minutes), 12.0, theme::text()).flex_1())
+                .child(icon(IconName::ChevronDown, 12.0, theme::faint()))
+                .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
+                    let mut menu = menu.min_w(px(220.0));
+                    for pick in [0u64, 60, 1440, 10080, 43200] {
+                        let label = federation_expiry_label(lang, pick);
+                        let shell = shell.clone();
+                        menu =
+                            menu.item(PopupMenuItem::new(label).checked(minutes == pick).on_click(
+                                move |_, _window, cx| {
+                                    shell.update(cx, |this, cx| {
+                                        this.right.federation.grant_expiry = pick;
+                                        cx.notify();
+                                    });
+                                },
+                            ));
+                    }
+                    menu
+                })
+        };
+        pane = pane.child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(expiry_trigger)
+                .child(div().flex_1())
+                .child(self.federation_small_button(
+                    "federation-grant",
+                    lang.tr("right.federation.grant"),
+                    cx,
+                    move |this, cx| {
+                        let raw = this
+                            .right
+                            .federation
+                            .grant_choice
+                            .clone()
+                            .unwrap_or_else(|| {
+                                this.federation_grant.read(cx).value().trim().to_string()
+                            });
+                        if raw.is_empty() {
+                            this.right.federation.error =
+                                Some(lang.tr("right.federation.chooseCapability"));
+                            this.right.federation.notice = None;
+                            cx.notify();
+                            return;
+                        }
+                        let minutes = this.right.federation.grant_expiry;
+                        let expires_at_ms = (minutes > 0).then(|| {
+                            agent::capability::unix_ms()
+                                .saturating_add(minutes.saturating_mul(60_000))
+                        });
+                        let node = target_node.clone();
+                        let missing = missing_selection.clone();
+                        this.apply_federation(
+                            move |store| match node {
+                                Some(node) => grant_capability(store, &node, &raw, expires_at_ms),
+                                None => Err(missing),
+                            },
+                            cx,
+                        );
+                    },
+                )),
+        );
+
+        // What this node offers peers: only the read-only file tools, and only
+        // when the reader has chosen them.
+        pane = pane.child(self.federation_section_title(lang.tr("right.federation.exposeTitle")));
+        let exposed = self.state.settings.global.federation.expose.clone();
+        for (index, (id, label_key)) in [
+            ("builtin/read_file", "right.federation.exposeReadFile"),
+            ("builtin/read_files", "right.federation.exposeReadFiles"),
+            ("builtin/glob", "right.federation.exposeGlob"),
+            ("builtin/grep", "right.federation.exposeGrep"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let on = exposed.iter().any(|entry| entry == id);
+            let id_owned = id.to_string();
+            let selector = format!("federation-expose-{index}");
+            pane = pane.child(
+                div()
+                    .id(SharedString::from(selector.clone()))
+                    .debug_selector(move || selector.clone())
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .w(px(16.0))
+                            .h(px(16.0))
+                            .rounded(px(4.0))
+                            .border_1()
+                            .border_color(rgb(if on { theme::accent() } else { theme::border() }))
+                            .bg(rgb(if on { theme::accent() } else { theme::page() }))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(on, |box_| box_.child(icon(IconName::Check, 10.0, 0xffffff))),
+                    )
+                    .child(txt(lang.tr(label_key), 12.0, theme::muted()))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        let list = &mut this.state.settings.global.federation.expose;
+                        if let Some(position) = list.iter().position(|entry| entry == &id_owned) {
+                            list.remove(position);
+                        } else {
+                            list.push(id_owned.clone());
+                        }
+                        match this.state.settings.save() {
+                            Ok(()) => {
+                                this.right.federation.error = None;
+                                this.right.federation.notice =
+                                    Some(lang.tr("right.federation.exposeChanged"));
+                            }
+                            Err(error) => {
+                                this.right.federation.error = Some(error.to_string());
+                                this.right.federation.notice = None;
+                            }
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+        pane = pane.child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(self.federation_field(
+                    &self.federation_expose_root,
+                    "federation-field-expose-root",
+                    None,
+                ))
+                .child(self.federation_small_button(
+                    "federation-expose-save",
+                    lang.tr("right.federation.save"),
+                    cx,
+                    move |this, cx| {
+                        let raw = this
+                            .federation_expose_root
+                            .read(cx)
+                            .value()
+                            .trim()
+                            .to_string();
+                        this.state.settings.global.federation.expose_root =
+                            (!raw.is_empty()).then_some(raw);
+                        match this.state.settings.save() {
+                            Ok(()) => {
+                                this.right.federation.error = None;
+                                this.right.federation.notice =
+                                    Some(lang.tr("right.federation.exposeChanged"));
+                            }
+                            Err(error) => {
+                                this.right.federation.error = Some(error.to_string());
+                                this.right.federation.notice = None;
+                            }
+                        }
+                        cx.notify();
+                    },
+                )),
+        );
+        pane = pane.child(txt(
+            lang.tr("right.federation.exposeHint"),
+            11.0,
+            theme::faint(),
+        ));
+
+        pane
+    }
+
+    /// One section heading in the federation pane.
+    fn federation_section_title(&self, label: String) -> AnyElement {
+        txt(label, 12.0, theme::faint())
+            .font_weight(FontWeight::MEDIUM)
+            .into_any_element()
+    }
+
+    /// A copy control for a full node id: the row shows only the short form,
+    /// and enrolling the peer elsewhere needs the whole key.
+    fn federation_copy_button(
+        &self,
+        id: String,
+        node: String,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let lang = self.state.lang;
+        let selector = id.clone();
+        let label = lang.tr("right.federation.copyId");
+        let copy_node = node.clone();
+        div()
+            .id(SharedString::from(id))
+            .debug_selector(move || selector.clone())
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
+            .child(icon(IconName::Copy, 12.0, theme::faint()))
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                cx.stop_propagation();
+                cx.write_to_clipboard(ClipboardItem::new_string(copy_node.clone()));
+                this.right.federation.notice = Some(crate::i18n::tr_args(
+                    lang,
+                    "right.federation.idCopied",
+                    &[("node", short_node(&copy_node))],
+                ));
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    /// A bordered field: the referenced design puts an input in a 34px box,
+    /// not on the bare page, and so does this pane.
+    fn federation_field(
+        &self,
+        input: &Entity<InputState>,
+        id: &'static str,
+        width: Option<f32>,
+    ) -> AnyElement {
+        let mut field = div()
+            .id(SharedString::from(id))
+            .debug_selector(move || id.to_string())
+            .h(px(34.0))
+            .rounded(px(theme::RADIUS_SM))
+            .bg(rgb(theme::page()))
+            .border_1()
+            .border_color(rgb(theme::border()))
+            .px(px(10.0))
+            .flex()
+            .items_center();
+        field = match width {
+            Some(width) => field.w(px(width)),
+            None => field.w_full(),
+        };
+        field
+            .child(Input::new(input).appearance(false).w_full())
+            .into_any_element()
+    }
+
+    /// A small state badge: trusted gets the accent tint, everything else the
+    /// neutral one.
+    fn federation_badge(label: String, good: bool) -> AnyElement {
+        div()
+            .flex()
+            .items_center()
+            .h(px(18.0))
+            .px(px(6.0))
+            .rounded(px(999.0))
+            .bg(rgb(if good {
+                theme::accent_soft()
+            } else {
+                theme::hover()
+            }))
+            .child(txt(
+                label,
+                10.0,
+                if good {
+                    theme::accent()
+                } else {
+                    theme::faint()
+                },
+            ))
+            .into_any_element()
+    }
+
+    /// An empty-state line with the pane's leading glyph.
+    fn federation_empty(&self, label: String) -> AnyElement {
+        div()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .py(px(6.0))
+            .child(icon(IconName::Inbox, 14.0, theme::faint()))
+            .child(txt(label, 12.0, theme::faint()))
+            .into_any_element()
+    }
+
+    /// A one-line error or success banner.
+    fn federation_banner(&self, text: String, good: bool) -> AnyElement {
+        div()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .px(px(10.0))
+            .py(px(8.0))
+            .rounded(px(theme::RADIUS_SM))
+            .bg(rgb(theme::hover()))
+            .child(icon(
+                if good {
+                    IconName::Check
+                } else {
+                    IconName::TriangleAlert
+                },
+                12.0,
+                if good {
+                    theme::success()
+                } else {
+                    theme::error()
+                },
+            ))
+            .child(txt(
+                text,
+                12.0,
+                if good {
+                    theme::success()
+                } else {
+                    theme::error()
+                },
+            ))
+            .into_any_element()
+    }
+
+    /// One labelled switch in the federation pane: the label, the hint under
+    /// it, and the control, which persists the setting on press.
+    fn federation_switch_row(
+        &self,
+        id: &'static str,
+        label: String,
+        hint: String,
+        checked: bool,
+        cx: &mut Context<Self>,
+        set: fn(&mut crate::settings::Settings, bool),
+    ) -> AnyElement {
+        hairline_bottom(
+            div()
+                .py(px(8.0))
+                .flex()
+                .items_center()
+                .gap(px(12.0))
+                .border_color(rgb(theme::border_soft()))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(3.0))
+                        .flex_1()
+                        .min_w_0()
+                        .child(txt(label, 13.0, theme::text()).font_weight(FontWeight::MEDIUM))
+                        .child(txt(hint, 11.0, theme::faint())),
+                )
+                .child(self.switch(
+                    id,
+                    checked,
+                    true,
+                    move |this, on, cx| {
+                        set(&mut this.state.settings, on);
+                        match this.state.settings.save() {
+                            Ok(()) => {
+                                this.right.federation.notice =
+                                    Some(this.state.lang.tr("right.federation.saved"));
+                                this.right.federation.error = None;
+                            }
+                            Err(error) => {
+                                this.right.federation.error = Some(error.to_string());
+                                this.right.federation.notice = None;
+                            }
+                        }
+                        cx.notify();
+                    },
+                    cx,
+                )),
+        )
+        .into_any_element()
+    }
+    /// A small text button for the federation pane. Plain, because the kit's
+    /// Button cannot carry a debug selector and these rows are test targets.
+    fn federation_small_button(
+        &self,
+        id: impl Into<SharedString>,
+        label: String,
+        cx: &mut Context<Self>,
+        action: impl Fn(&mut Shell, &mut Context<Shell>) + 'static,
+    ) -> AnyElement {
+        let id = id.into();
+        let selector = id.to_string();
+        div()
+            .id(id)
+            .debug_selector(move || selector.clone())
+            .h(px(28.0))
+            .px(px(10.0))
+            .rounded(px(theme::RADIUS_SM))
+            .bg(rgb(theme::selected_row()))
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(theme::hover())))
+            .child(txt(label, theme::CHIP_SIZE, theme::text()))
+            .on_click(cx.listener(move |this, _event, _window, cx| action(this, cx)))
+            .into_any_element()
+    }
+
+    /// Read the peer list from the running node when there is one, otherwise
+    /// from the file, and keep the selection valid.
+    pub(crate) fn reload_federation(&mut self) {
+        self.reload_federation_with(true);
+    }
+
+    /// Re-read the node and the store without announcing; the discovery tick
+    /// uses this, so a quiet peer does not get a frame's worth of chatter.
+    pub(crate) fn reload_federation_quiet(&mut self) {
+        self.reload_federation_with(false);
+    }
+
+    fn reload_federation_with(&mut self, announce: bool) {
+        let runtime = crate::federation_node::running();
+        if announce {
+            if let Some(runtime) = &runtime {
+                // A refresh also says "still here", which is what makes a peer
+                // that started late appear on the other side without waiting
+                // for the next interval.
+                runtime.reannounce();
+            }
+        }
+        let rows = if let Some(runtime) = &runtime {
+            runtime
+                .node()
+                .peers()
+                .read()
+                .map(|store| federation_rows(&store))
+                .unwrap_or_default()
+        } else if let Some(path) = self.state.settings.federation_peers_path() {
+            federation::PeerStore::load(&path)
+                .map(|store| federation_rows(&store))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if let Some(selected) = self.right.federation.selected {
+            if selected >= rows.len() {
+                self.right.federation.selected = None;
+            }
+        }
+        self.right.federation.peers = rows;
+        self.right.federation.discovered = runtime
+            .as_ref()
+            .map(|runtime| {
+                runtime
+                    .announced_peers()
+                    .into_iter()
+                    .map(|record| DiscoveredPeerRow {
+                        node: record.node.to_string(),
+                        name: record.name.clone(),
+                        capabilities: record
+                            .descriptors
+                            .iter()
+                            .map(|descriptor| {
+                                (
+                                    descriptor.id.to_string(),
+                                    descriptor.risk.as_str().to_string(),
+                                )
+                            })
+                            .collect(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.right.federation.loaded = true;
+    }
+
+    /// Apply one change to the peer store and persist it.
+    fn apply_federation<F>(&mut self, apply: F, cx: &mut Context<Self>)
+    where
+        F: FnOnce(&mut federation::PeerStore) -> Result<String, String>,
+    {
+        let result = match crate::federation_node::running() {
+            Some(runtime) => match runtime.node().peers().write() {
+                Ok(mut store) => apply(&mut store).and_then(|notice| {
+                    if let Some(path) = self.state.settings.federation_peers_path() {
+                        store.save(&path).map_err(|error| error.to_string())?;
+                    }
+                    Ok(notice)
+                }),
+                Err(_) => Err("the peer store is poisoned".to_string()),
+            },
+            None => match self.state.settings.federation_peers_path() {
+                Some(path) => mutate_store_file(&path, apply),
+                None => Err("federation is not configured in this build".to_string()),
+            },
+        };
+        match result {
+            Ok(notice) => {
+                self.right.federation.notice = Some(notice);
+                self.right.federation.error = None;
+            }
+            Err(error) => {
+                self.right.federation.error = Some(error);
+                self.right.federation.notice = None;
+            }
+        }
+        self.reload_federation();
+        cx.notify();
+    }
     /// A pane that has not been built yet says so, rather than drawing an
     /// empty box the reader has to interpret.
     fn right_pane_placeholder(&self, tab: RightTab) -> impl IntoElement {
@@ -2020,6 +3304,7 @@ impl Shell {
             RightTab::Terminal => Some("\u{2325}`"),
             RightTab::Browser => Some("\u{2318}T"),
             RightTab::Extensions => None,
+            RightTab::Federation => None,
         };
         div()
             .id(SharedString::from(format!("right-card-{}", tab.key())))
@@ -2071,6 +3356,7 @@ impl Shell {
                                 RightTab::Terminal => "right.terminal.hint",
                                 RightTab::Browser => "right.browser.hint",
                                 RightTab::Extensions => "right.extensions.hint",
+                                RightTab::Federation => "right.federation.hint",
                             }),
                             theme::RIGHT_HINT_SIZE,
                             theme::faint(),
@@ -3734,6 +5020,9 @@ impl Shell {
     ) {
         self.right.open = true;
         self.right.tab = Some(tab);
+        if tab == RightTab::Federation {
+            self.reload_federation();
+        }
         if tab == RightTab::Terminal {
             if self.right.terminal.is_none() {
                 let cwd = self.state.workspace_root().unwrap_or_default();
@@ -6345,6 +7634,192 @@ pub(crate) fn frame_is_the_page(status: crate::browser::Status) -> bool {
     !matches!(status, crate::browser::Status::Empty)
 }
 
+/// Read, change, and save the peer store under the directory lock.
+///
+/// The UI edits the file only when no federation node is running; the lock
+/// still matters because the CLI, another instance, or a second window could
+/// be writing at the same time.
+pub(crate) fn mutate_store_file<F>(path: &Path, apply: F) -> Result<String, String>
+where
+    F: FnOnce(&mut federation::PeerStore) -> Result<String, String>,
+{
+    let directory = path
+        .parent()
+        .ok_or_else(|| "the peer store has no directory".to_string())?;
+    let _lock = crate::federation_lock::DataDirLock::acquire(directory)?;
+    let mut store = federation::PeerStore::load(path).unwrap_or_default();
+    let notice = apply(&mut store)?;
+    store.save(path).map_err(|error| error.to_string())?;
+    Ok(notice)
+}
+/// The pane's status line when no node runs: off is a setting, a failed start
+/// is a different fact, and the two must not read the same.
+pub(crate) fn federation_status_off(lang: crate::i18n::Lang, enabled: bool) -> String {
+    let key = if enabled {
+        "right.federation.failed"
+    } else {
+        "right.federation.off"
+    };
+    lang.tr(key)
+}
+
+/// The colour that stands for one risk class.
+fn risk_color(risk: Option<&str>) -> u32 {
+    match risk {
+        Some("low") => theme::success(),
+        Some("medium") => theme::warn(),
+        Some("high" | "critical") => theme::error(),
+        _ => theme::faint(),
+    }
+}
+
+/// The expiry preset's label.
+fn federation_expiry_label(lang: crate::i18n::Lang, minutes: u64) -> String {
+    match minutes {
+        0 => lang.tr("right.federation.noExpiry"),
+        60 => lang.tr("right.federation.oneHour"),
+        1440 => lang.tr("right.federation.oneDay"),
+        10080 => lang.tr("right.federation.oneWeek"),
+        43200 => lang.tr("right.federation.thirtyDays"),
+        other => format!("{other} min"),
+    }
+}
+
+/// The name a peer shows: the announced one, else the short id.
+fn display_name(name: Option<&str>, node: &str) -> String {
+    name.map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| short_node(node))
+}
+
+/// The short node id the panes show; the full id stays in the store and CLI.
+pub(crate) fn short_node(node: &str) -> String {
+    node.chars().take(10).collect()
+}
+
+/// Render a peer store into the pane's rows, in store order.
+pub(crate) fn federation_rows(store: &federation::PeerStore) -> Vec<FederationPeerRow> {
+    store
+        .iter()
+        .map(|record| FederationPeerRow {
+            node: record.node.to_string(),
+            name: record.note.clone(),
+            state: match record.state {
+                federation::TrustState::Pending => "pending",
+                federation::TrustState::Trusted => "trusted",
+                federation::TrustState::Revoked => "revoked",
+            }
+            .to_string(),
+            grants: record
+                .grants
+                .iter()
+                .map(|grant| grant.capability.to_string())
+                .collect(),
+        })
+        .collect()
+}
+
+/// Parse a peer id the way the CLI does: it must look like a Node's key.
+fn parse_peer(raw: &str) -> Result<agent::capability::NodeId, String> {
+    let raw = raw.trim();
+    let node = agent::capability::NodeId::new(raw).map_err(|error| error.to_string())?;
+    if !federation::identity::is_valid_node_id(&node) {
+        return Err("a peer id is the base64 public key a node prints as its id".to_string());
+    }
+    Ok(node)
+}
+
+/// Enroll one peer from the pane's field value.
+fn enroll_peer(store: &mut federation::PeerStore, raw: &str) -> Result<String, String> {
+    let node = parse_peer(raw)?;
+    store.enroll(node.clone(), agent::capability::unix_ms(), None);
+    Ok(format!("enrolled {}", short_node(node.as_str())))
+}
+
+/// Grant one capability to one peer.
+fn grant_capability(
+    store: &mut federation::PeerStore,
+    node: &str,
+    raw: &str,
+    expires_at_ms: Option<u64>,
+) -> Result<String, String> {
+    let node = parse_peer(node)?;
+    let capability: agent::capability::CapabilityId = raw
+        .trim()
+        .parse()
+        .map_err(|error| format!("invalid capability id: {error}"))?;
+    store
+        .grant(
+            &node,
+            capability.clone(),
+            agent::capability::unix_ms(),
+            expires_at_ms,
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(format!(
+        "granted {capability} to {}",
+        short_node(node.as_str())
+    ))
+}
+
+/// Enroll one discovered peer and grant exactly the capabilities chosen.
+fn enroll_and_grant(
+    store: &mut federation::PeerStore,
+    node: &str,
+    name: Option<&str>,
+    grants: &std::collections::BTreeSet<String>,
+) -> Result<String, String> {
+    let node_id = parse_peer(node)?;
+    let note = name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string);
+    store.enroll(node_id.clone(), agent::capability::unix_ms(), note);
+    for capability in grants {
+        let capability: agent::capability::CapabilityId = capability
+            .parse()
+            .map_err(|error| format!("invalid capability id: {error}"))?;
+        store
+            .grant(&node_id, capability, agent::capability::unix_ms(), None)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(format!(
+        "enrolled {} with {} grant(s)",
+        display_name(name, node),
+        grants.len()
+    ))
+}
+
+/// Revoke one peer and every grant it holds.
+fn revoke_peer_action(
+    store: &mut federation::PeerStore,
+    node: &str,
+    label: &str,
+) -> Result<String, String> {
+    let node = parse_peer(node)?;
+    let shown = display_name(Some(label), node.as_str());
+    if !store.revoke(&node) {
+        return Err(format!("{shown} is not enrolled"));
+    }
+    Ok(format!("peer {shown} revoked"))
+}
+
+/// Withdraw one capability from one peer.
+fn revoke_grant_action(
+    store: &mut federation::PeerStore,
+    node: &str,
+    capability: &str,
+) -> Result<String, String> {
+    let node = parse_peer(node)?;
+    let capability: agent::capability::CapabilityId = capability
+        .parse()
+        .map_err(|error| format!("invalid capability id: {error}"))?;
+    if !store.revoke_grant(&node, &capability) {
+        return Err(format!("the peer does not hold {capability}"));
+    }
+    Ok(format!("withdrew {capability}"))
+}
 /// Build the image the pane draws from one captured frame.
 ///
 /// The buffer was decoded AND channel-swapped on the engine's pump thread, so
@@ -6716,5 +8191,201 @@ mod tests {
         assert_eq!(typed_text(&control), None);
 
         assert_eq!(typed_text(&key("tab", Some("\t"))), None);
+    }
+}
+
+#[cfg(test)]
+mod federation_pane_tests {
+    use super::{
+        enroll_peer, federation_rows, grant_capability, revoke_grant_action, revoke_peer_action,
+        short_node,
+    };
+    use federation::{NodeIdentity, PeerStore};
+
+    fn peer() -> String {
+        NodeIdentity::from_seed([5u8; 32]).node_id().to_string()
+    }
+
+    #[test]
+    fn expiry_presets_are_labelled_in_words() {
+        use super::federation_expiry_label;
+        use crate::i18n::Lang;
+
+        assert_eq!(federation_expiry_label(Lang::En, 0), "No expiry");
+        assert_eq!(federation_expiry_label(Lang::En, 60), "1 hour");
+        assert_eq!(federation_expiry_label(Lang::En, 1440), "24 hours");
+        assert_eq!(federation_expiry_label(Lang::En, 10080), "7 days");
+        assert_eq!(federation_expiry_label(Lang::En, 43200), "30 days");
+        assert_eq!(federation_expiry_label(Lang::En, 45), "45 min");
+    }
+    #[test]
+    fn a_named_peer_shows_its_name_instead_of_the_key() {
+        use super::display_name;
+
+        assert_eq!(
+            display_name(Some("studio-mac"), "abcdefghijkl"),
+            "studio-mac"
+        );
+        assert_eq!(display_name(None, "abcdefghijkl"), "abcdefghij");
+        assert_eq!(
+            display_name(Some("   "), "abcdefghijkl"),
+            "abcdefghij",
+            "an empty name falls back to the id"
+        );
+    }
+
+    #[test]
+    fn short_node_keeps_ten_characters() {
+        assert_eq!(short_node("abcdefghijklmnop"), "abcdefghij");
+    }
+
+    #[test]
+    fn enroll_parses_a_real_node_id_and_rows_show_the_grant() {
+        let mut store = PeerStore::default();
+        let node = peer();
+
+        let notice = enroll_peer(&mut store, &node).expect("enrolled");
+        assert!(notice.contains(&short_node(&node)), "{notice}");
+        assert_eq!(federation_rows(&store).len(), 1);
+
+        let notice =
+            grant_capability(&mut store, &node, "builtin/read_file", None).expect("granted");
+        assert!(notice.contains("builtin/read_file"), "{notice}");
+        assert_eq!(
+            federation_rows(&store)[0].grants,
+            vec!["builtin/read_file".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_invalid_node_id_is_refused_before_it_reaches_the_store() {
+        let mut store = PeerStore::default();
+
+        assert!(enroll_peer(&mut store, "not-a-key").is_err());
+        assert!(store.iter().next().is_none(), "nothing was enrolled");
+    }
+
+    #[test]
+    fn an_invalid_capability_is_refused() {
+        let mut store = PeerStore::default();
+        let node = peer();
+        enroll_peer(&mut store, &node).expect("enrolled");
+
+        assert!(grant_capability(&mut store, &node, "not-a-capability", None).is_err());
+        assert!(federation_rows(&store)[0].grants.is_empty());
+    }
+
+    #[test]
+    fn a_grant_can_carry_an_expiry() {
+        let mut store = PeerStore::default();
+        let node = peer();
+        enroll_peer(&mut store, &node).expect("enrolled");
+        let expires = agent::capability::unix_ms() + 60_000;
+
+        grant_capability(&mut store, &node, "builtin/read_file", Some(expires)).expect("granted");
+
+        let record = store.iter().next().expect("the peer");
+        assert_eq!(record.grants[0].expires_at_ms, Some(expires));
+    }
+
+    #[test]
+    fn enrolling_a_discovered_peer_grants_only_the_chosen_capabilities() {
+        use super::enroll_and_grant;
+        use std::collections::BTreeSet;
+
+        let node = peer();
+        let grants: BTreeSet<String> =
+            ["builtin/read_file".to_string(), "builtin/glob".to_string()]
+                .into_iter()
+                .collect();
+        let mut store = PeerStore::default();
+
+        let notice =
+            enroll_and_grant(&mut store, &node, Some("studio"), &grants).expect("enrolled");
+        assert!(notice.contains("2 grant"), "{notice}");
+
+        let record = store.iter().next().expect("the peer");
+        let granted: BTreeSet<String> = record
+            .grants
+            .iter()
+            .map(|grant| grant.capability.to_string())
+            .collect();
+        assert_eq!(granted, grants);
+
+        let bad: BTreeSet<String> = ["not-a-capability".to_string()].into_iter().collect();
+        assert!(enroll_and_grant(&mut PeerStore::default(), &node, None, &bad).is_err());
+    }
+    #[test]
+    fn the_status_line_tells_off_apart_from_a_failed_start() {
+        use super::federation_status_off;
+        use crate::i18n::Lang;
+
+        let off = federation_status_off(Lang::En, false);
+        assert!(off.contains("off in settings"), "{off}");
+
+        let failed = federation_status_off(Lang::En, true);
+        assert!(failed.contains("enabled"), "{failed}");
+        assert!(failed.contains("launch log"), "{failed}");
+    }
+    #[test]
+    fn the_file_edit_path_reads_and_writes_under_the_lock() {
+        use super::mutate_store_file;
+
+        let root = std::env::temp_dir().join(format!("bsh-peer-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("a scratch directory");
+        let path = root.join("peers.json");
+        let node = peer();
+
+        let notice = mutate_store_file(&path, |store| enroll_peer(store, &node)).expect("enrolled");
+        assert!(notice.contains("enrolled"), "{notice}");
+
+        let store = federation::PeerStore::load(&path).expect("the store");
+        assert_eq!(store.iter().count(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_second_writer_cannot_edit_the_store_file() {
+        use super::mutate_store_file;
+
+        let root = std::env::temp_dir().join(format!("bsh-peer-locked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("a scratch directory");
+        let path = root.join("peers.json");
+        let _held = crate::federation_lock::DataDirLock::acquire(&root).expect("the first writer");
+
+        let refused = mutate_store_file(&path, |_store| Ok("changed".to_string()));
+
+        assert!(
+            refused.is_err(),
+            "the directory lock refuses a second writer"
+        );
+        assert!(!path.exists(), "nothing was written");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn revoking_a_grant_then_a_peer_is_reported() {
+        let mut store = PeerStore::default();
+        let node = peer();
+        enroll_peer(&mut store, &node).expect("enrolled");
+        grant_capability(&mut store, &node, "builtin/read_file", None).expect("granted");
+
+        revoke_grant_action(&mut store, &node, "builtin/read_file").expect("withdrawn");
+        assert!(federation_rows(&store)[0].grants.is_empty());
+        assert!(revoke_grant_action(&mut store, &node, "builtin/read_file").is_err());
+
+        // Revocation is a state, not a deletion: the row stays and reports
+        // "revoked", so the pane shows what happened.
+        revoke_peer_action(&mut store, &node, "studio").expect("revoked");
+        let rows = federation_rows(&store);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, "revoked");
+        assert!(rows[0].grants.is_empty());
+
+        let stranger = federation::NodeIdentity::from_seed([6u8; 32])
+            .node_id()
+            .to_string();
+        assert!(revoke_peer_action(&mut store, &stranger, "stranger").is_err());
     }
 }

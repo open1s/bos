@@ -308,6 +308,14 @@ pub(crate) struct Shell {
     pub(crate) policy_entry: Entity<InputState>,
     /// The browser pane's address bar.
     pub(crate) browser_url: Entity<InputState>,
+    /// The federation pane's node-name field.
+    pub(crate) federation_name: Entity<InputState>,
+    /// The federation pane's enroll field: a peer node id.
+    pub(crate) federation_enroll: Entity<InputState>,
+    /// The federation pane's grant field: a capability id.
+    pub(crate) federation_grant: Entity<InputState>,
+    /// The federation pane's expose-root field.
+    pub(crate) federation_expose_root: Entity<InputState>,
     /// The browser pane's view, rebuilt only when the browser changed.
     pub(crate) browser_pane: Option<crate::browser::PaneView>,
     /// The URL the address bar was last filled from, so a frame that did not
@@ -1292,6 +1300,37 @@ impl Shell {
             InputState::new(window, cx)
                 .placeholder(crate::i18n::tr(lang, "right.browser.urlPlaceholder"))
         });
+        let machine_name = crate::federation::resolve_node_name(
+            state.settings.global.federation.node_name.as_deref(),
+        );
+        let federation_name =
+            cx.new(|cx| InputState::new(window, cx).placeholder(machine_name.clone()));
+        let federation_enroll = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(crate::i18n::tr(lang, "right.federation.enrollPlaceholder"))
+        });
+        let federation_grant = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(crate::i18n::tr(lang, "right.federation.grantPlaceholder"))
+        });
+        let expose_root_value = state
+            .settings
+            .global
+            .federation
+            .expose_root
+            .clone()
+            .unwrap_or_default();
+        let federation_expose_root = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(crate::i18n::tr(
+                lang,
+                "right.federation.exposeRootPlaceholder",
+            ))
+        });
+        if !expose_root_value.is_empty() {
+            federation_expose_root.update(cx, |input, cx| {
+                input.set_value(expose_root_value.clone(), window, cx);
+            });
+        }
         let mcp_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "settings.mcpSearch"))
         });
@@ -1754,6 +1793,10 @@ impl Shell {
             plugin_search,
             policy_entry,
             browser_url,
+            federation_name,
+            federation_enroll,
+            federation_grant,
+            federation_expose_root,
             browser_pane: None,
             browser_shown_url: String::new(),
             browser_rev: 0,
@@ -2006,6 +2049,48 @@ impl Shell {
             }
         })
         .detach();
+
+        // Federation discovery tick: announcements arrive on the runtime's
+        // background task, so the pane has to notice them. It runs only while
+        // the Federation pane is on screen, and only re-renders on a change.
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(2))
+                .await;
+            let observed = this.update(cx, |this, cx| {
+                if !this.right.open
+                    || this.right.tab != Some(super::right_panel::RightTab::Federation)
+                {
+                    return false;
+                }
+                let before: Vec<String> = this
+                    .right
+                    .federation
+                    .discovered
+                    .iter()
+                    .map(|row| row.node.clone())
+                    .collect();
+                this.reload_federation_quiet();
+                let after: Vec<String> = this
+                    .right
+                    .federation
+                    .discovered
+                    .iter()
+                    .map(|row| row.node.clone())
+                    .collect();
+                if before == after {
+                    false
+                } else {
+                    cx.notify();
+                    true
+                }
+            });
+            if observed.is_err() {
+                break;
+            }
+        })
+        .detach();
+
         // The jobs clock: the reference re-renders its elapsed figures once a
         // second while the panel is open over a live job, and bsh needs the same
         // cadence to expire an armed stop inside its measured window.

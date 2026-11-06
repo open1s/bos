@@ -1407,7 +1407,7 @@ test pins it. Gaps are named rather than implied.
 | 006 | Autonomy: dual authorization, denials name the side | service::invoke, serve; CapabilityError::Denied | service tests (caller/provider refusals) | none known |
 | 007 | Remote composition: remote is a binding, never a local provider | composition::Binding::Remote, RemoteCapabilityProvider, bsh attach_remote_tools | federation remote_provider, bsh caps attach test | no local fallback by construction |
 | 008 | Two layers, one Capability Model, separate authority | one CompositionSpec/resolve; SnapshotOrigin; workspace id per Node | capability composition, snapshot, bsh compose | Knowledge Federation is not implemented; delegation/lease state is process-local; see GAP-FED-001/004/005 |
-| 009 | Zenoh, JSON, one endpoint, resource streams on the protocol | federation::zenoh, service resource path | zenoh_transport, resource, resource_wire | Production security profile is incomplete and ingress queue is unbounded; see GAP-FED-002/003 |
+| 009 | Zenoh, JSON, one endpoint, resource streams on the protocol | federation::zenoh, service resource path; bus::TlsConfig for transport TLS | zenoh_transport, resource, resource_wire, bus TLS tests | TLS settings are exposed, rendered, and validated by Zenoh, and a TLS listener without usable material fails instead of opening plaintext; handshake unverified here. Production security profile still incomplete; see GAP-FED-003. The ingress queue is bounded (1024 frames, 256 announcements) with drop-and-log overflow, and the peer store is written 0600 |
 
 ### 30.2 Local composition (section 28)
 
@@ -1417,7 +1417,7 @@ test pins it. Gaps are named rather than implied.
 | Workspace exposes only its resolved set | implemented foundation | LocalScope + resolver tests; dispatch context ownership hardening remains outstanding (GAP-COMP-004) |
 | Built-in, Ferris, and MCP capabilities in one model | implemented | built-in tools declare metadata; MCP tools declare network/medium/Unknown; extension (Ferris-runtime) tools declare medium/extension/Unknown and now enter the composition through the live overlay, which `merged_registry` folds into the plan and snapshot |
 | Snapshots capture versions and policy refs | implemented | capability/tests/snapshot.rs, bsh compositions.rs |
-| AI proposals cannot bypass validation | implemented as a gate | capability::proposal checks the host's approved ids, a risk ceiling, and remote policy, then returns an ApprovedComposition token that resolve_approved requires; the public resolver is named resolve_host, so no neutral resolve remains to call by accident (a compile_fail doctest pins that the token has no other constructor); tests pin that it refuses a spec the plain resolver would accept. No model-driven composer ships yet, so the gate is invoked by the host rather than by a pipeline |
+| AI proposals cannot bypass validation | implemented as a gate | capability::proposal checks the host's approved ids, a risk ceiling, and remote policy, then returns an ApprovedComposition token that resolve_approved requires; the public resolver is named resolve_host, so no neutral resolve remains to call by accident (a compile_fail doctest pins that the token has no other constructor); tests pin that it refuses a spec the plain resolver would accept. The producer now exists in agent::composition: prompt() renders the catalogue, parse() strictly parses the model JSON, and compose() runs parse -> approve -> resolve_approved with no variant that skips the gate. The host still supplies the model call; no automatic LLM invocation ships |
 
 ### 30.3 Federation (section 28)
 
@@ -1470,26 +1470,42 @@ test pins it. Gaps are named rather than implied.
   bsh-2.0-adapter-research.md.
 
 
-### 30.7 Verification run (2026-11-06)
+### 30.7 Verification run (2026-11-06, second pass)
+
+The first pass ran under a restricted file sandbox: the outer policy denied
+the nested sandbox-exec the shell tests need (`sandbox_apply: Operation not
+permitted`), so agent::tools::bash and the caps heel/network cases failed. The
+same suites were rerun under an unconfined policy, where every one of them
+passes:
 
 | Suite | Result |
 | --- | --- |
 | capability (unit tests + doctests) | 31 passed |
-| federation | 76 passed |
-| agent | 436 passed, 6 failed |
-| bsh caps::tests | 139 passed, 7 failed, 1 ignored |
-| bsh federation_node / federation_audit / compositions / export / settings / extension metadata | all passed |
+| federation | 79 passed |
+| agent | 570 passed, 0 failed |
+| bsh caps::tests | 146 passed, 1 ignored |
+| bsh extension::e2e | 15 passed |
+| bsh settings:: | 145 passed |
+| bus | 15 passed |
+| bsh right-panel federation UI + helpers | 13 passed |
+| bsh federation directory lock | 2 passed |
+| bsh federation node start/stop + discovery + exposure | 11 node tests passed |
+| bsh prompts:: | 7 passed |
+| bsh store:: | 20 passed |
+| bsh mcp:: | 21 passed |
+| bsh federation_node / federation_audit / federation CLI / compositions / export | 27 passed |
 | clippy (capability, federation, agent, bsh; all targets, -D warnings) | clean |
 | rustdoc (same four crates, -D warnings) | clean |
 | cargo fmt --check (same four crates) | clean |
 
-The thirteen failures are one environmental class: this host's outer sandbox
-denies the nested sandbox-exec the heel tests require (sandbox_apply:
-Operation not permitted). They live in agent::tools::bash and the caps
-heel/network cases, none in a path this work changed. The two composition
-tests that the live-overlay change did regress - the plan and the snapshot
-counted only the base registry - were found by this run and fixed: the turn's
-surface is the base registry plus the live overlay.
+The two composition tests that the live-overlay change regressed - the plan
+and the snapshot counted only the base registry, not the live overlay - were
+found by the first pass and fixed: the turn's surface is the base registry plus
+the live overlay.
+
+The whole bsh library suite was not run to completion inside the verification
+budget; the module runs above cover every module this work touched, and the
+remaining modules are unrelated to it.
 
 
 

@@ -180,3 +180,27 @@ fn a_record_round_trips_through_its_bytes() {
     assert!(decoded.find(&capability("grep")).is_some());
     assert!(decoded.find(&capability("missing")).is_none());
 }
+
+/// The store decides who may invoke what; it is written private to the account.
+#[cfg(unix)]
+#[test]
+fn the_peer_store_file_is_private() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = std::env::temp_dir().join(format!("bsh-peers-mode-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("a scratch directory");
+    let path = root.join("peers.json");
+
+    let mut store = PeerStore::new();
+    store.enroll(identity(7).node_id(), unix_ms(), None);
+    store.save(&path).expect("saved");
+
+    let mode = std::fs::metadata(&path)
+        .expect("the saved store")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "the peer store is owner-only");
+    let _ = std::fs::remove_dir_all(&root);
+}

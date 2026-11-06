@@ -16,6 +16,12 @@ use crate::identity::{self, NodeIdentity};
 pub struct DiscoveryRecord {
     /// The publishing Node.
     pub node: NodeId,
+    /// The human name the Node gives itself, when it has one.
+    ///
+    /// It is signed with the rest of the record, so a peer can show it without
+    /// inventing a claim about who published it. Absent on an older record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// When it was published, in milliseconds since the Unix epoch.
     pub published_at_ms: u64,
     /// Public descriptors only.
@@ -30,8 +36,21 @@ impl DiscoveryRecord {
     /// Descriptors that are not Public are dropped before signing: a record
     /// must not name a capability the issuer would not show to a stranger.
     pub fn publish(identity: &NodeIdentity, descriptors: Vec<CapabilityDescriptor>) -> Self {
+        Self::publish_named(identity, None, descriptors)
+    }
+
+    /// Build and sign a record that also carries the Node's display name.
+    pub fn publish_named(
+        identity: &NodeIdentity,
+        name: Option<String>,
+        descriptors: Vec<CapabilityDescriptor>,
+    ) -> Self {
+        let name = name
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty());
         let mut record = Self {
             node: identity.node_id(),
+            name,
             published_at_ms: unix_ms(),
             descriptors: descriptors
                 .into_iter()

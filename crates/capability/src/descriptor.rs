@@ -62,6 +62,16 @@ impl SideEffect {
 }
 
 impl Risk {
+    /// The stable lower-case name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Critical => "critical",
+        }
+    }
+
     /// Parse a lower-case risk class name.
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {

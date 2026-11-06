@@ -145,3 +145,29 @@ async fn a_tampered_record_stops_verifying() {
 
     assert!(!record.verify());
 }
+
+/// A display name rides inside the signed record, so a peer can present it
+/// without trusting an unsigned hint. An unnamed record still verifies, which
+/// is what keeps older peers readable.
+#[test]
+fn a_display_name_is_signed_with_the_record() {
+    let identity = identity(71);
+    let named = federation::DiscoveryRecord::publish_named(
+        &identity,
+        Some("  studio-mac  ".to_string()),
+        vec![descriptor("read_file", Visibility::Public)],
+    );
+    assert_eq!(named.name.as_deref(), Some("studio-mac"));
+    assert!(named.verify());
+
+    let mut tampered = named.clone();
+    tampered.name = Some("someone-else".to_string());
+    assert!(!tampered.verify(), "the name is covered by the signature");
+
+    let unnamed = federation::DiscoveryRecord::publish(
+        &identity,
+        vec![descriptor("read_file", Visibility::Public)],
+    );
+    assert_eq!(unnamed.name, None);
+    assert!(unnamed.verify());
+}

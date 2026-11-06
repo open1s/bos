@@ -248,6 +248,13 @@ impl PeerStore {
             path: temp.display().to_string(),
             source,
         })?;
+        // The store carries who may invoke what; keep it as private as the key
+        // rather than relying on the process umask.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600));
+        }
         std::fs::rename(&temp, path).map_err(|source| PeerError::Io {
             path: path.display().to_string(),
             source,

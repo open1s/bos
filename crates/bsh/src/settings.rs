@@ -729,6 +729,21 @@ impl Settings {
         Some(directory.join("audit.jsonl"))
     }
 
+    /// The federation peer store the runtime reads, when this build has one.
+    pub(crate) fn federation_peers_path(&self) -> Option<PathBuf> {
+        match self
+            .global
+            .federation
+            .peers_path
+            .as_ref()
+            .map(PathBuf::from)
+        {
+            Some(path) => Some(path),
+            None if cfg!(test) => None,
+            None => Some(crate::federation::dir().join("peers.json")),
+        }
+    }
+
     /// The admin-key vault's file.
     ///
     /// Beside the settings document, derived from 'save_root' rather than

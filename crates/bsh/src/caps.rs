@@ -1481,7 +1481,7 @@ fn build_agent_for_session_inner(
                 });
             match crate::federation_node::attach_remote_tools(
                 &agent,
-                federation,
+                &federation,
                 workspace,
                 agent::capability::Principal::Local {
                     session: session.to_string(),
@@ -3824,7 +3824,7 @@ fn glob_empty_hint(pattern: &str, root: &Path, include_ignored: bool) -> String 
 }
 
 /// glob - list the files under a root whose paths match a pattern.
-fn glob_tool(
+pub(crate) fn glob_tool(
     root: Option<PathBuf>,
     enforce: bool,
     policy: Arc<PolicySet>,
@@ -3912,7 +3912,7 @@ fn glob_tool(
 }
 
 /// grep - search file contents with a ripgrep regular expression.
-fn grep_tool(
+pub(crate) fn grep_tool(
     root: Option<PathBuf>,
     enforce: bool,
     policy: Arc<PolicySet>,
@@ -4071,7 +4071,7 @@ fn grep_tool(
 }
 
 /// read_file - read a UTF-8 file inside the workspace.
-fn read_file_tool(
+pub(crate) fn read_file_tool(
     root: Option<PathBuf>,
     enforce: bool,
     policy: Arc<PolicySet>,
@@ -4129,7 +4129,7 @@ fn read_file_tool(
 }
 
 /// read_files - read a bounded set of files with one model/tool round-trip.
-fn read_files_tool(
+pub(crate) fn read_files_tool(
     root: Option<PathBuf>,
     enforce: bool,
     policy: Arc<PolicySet>,
@@ -5851,6 +5851,10 @@ mod tests {
             inbox,
             None,
             None,
+            None,
+            None,
+            Vec::new(),
+            Some("test node".to_string()),
         );
         let now = agent::capability::unix_ms();
         {

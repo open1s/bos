@@ -21,6 +21,7 @@ pub(crate) mod export;
 pub(crate) mod extension;
 pub(crate) mod federation;
 pub(crate) mod federation_audit;
+mod federation_lock;
 mod federation_node;
 pub(crate) mod files;
 pub(crate) mod glob;
@@ -68,7 +69,9 @@ pub fn extension_cli(args: &[String]) -> i32 {
 /// before any window exists, and it is the same state a running node loads.
 pub fn federation_cli(args: &[String]) -> i32 {
     let mut out = std::io::stdout();
-    federation::command(args, &federation::dir(), &mut out)
+    let settings = settings::Settings::load();
+    let name = federation::resolve_node_name(settings.global.federation.node_name.as_deref());
+    federation::command(args, &federation::dir(), Some(&name), &mut out)
 }
 
 /// Launch the BOS Harness desktop window. Blocks until the window closes.
@@ -83,9 +86,15 @@ pub fn run() {
     // A previous SIGKILL can leave Chromium behind; clean it before the next
     // window, not only when the browser pane is first opened.
     browser::reap_orphans();
-    // Federation is opt-in and must never keep the window from opening: a node
+    // The federation node starts off the window's path: with the node on by
+    // default, opening a Zenoh session must not delay the first frame. A node
     // that cannot start is logged and the app runs without it.
-    crate::federation_node::start_from_settings(&crate::settings::Settings::load());
+    std::thread::Builder::new()
+        .name("bsh-federation".to_string())
+        .spawn(|| {
+            crate::federation_node::start_from_settings(&crate::settings::Settings::load());
+        })
+        .ok();
     ui::run(ui::Startup::from_args());
     // The window closed, so no plugin process may outlive it. A bridged plugin is
     // a child this app started; leaving it running would be a leaked process the

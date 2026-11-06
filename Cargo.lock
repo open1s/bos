@@ -1391,6 +1391,7 @@ dependencies = [
  "federation",
  "ferris-sdk",
  "flate2",
+ "fs2",
  "futures",
  "glob",
  "gpui-kit",
@@ -1398,6 +1399,7 @@ dependencies = [
  "gpui-pre",
  "gpui-webview",
  "grep",
+ "hostname",
  "ignore",
  "image",
  "lb-wry",
@@ -3471,6 +3473,7 @@ dependencies = [
  "sha2 0.11.1",
  "thiserror 2.0.21",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -3832,6 +3835,16 @@ dependencies = [
  "io-lifetimes 2.0.4",
  "rustix",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
 ]
 
 [[package]]

@@ -299,6 +299,14 @@ There is also a real loopback Zenoh transport test in `crates/federation/tests/z
 **Required change**
 - Replace the unbounded queue with a bounded channel.
 - Define queue-full behavior and metrics.
+
+**Status: fixed.** The inbox is a 1024-frame bounded channel and the announce
+channel holds 256. The Zenoh subscriber forwards with `try_send`; a full queue
+drops the frame and logs the first drop and every 1024th after it, so a slow
+router can no longer grow the process without bound. The in-memory transport is
+bounded too (1024) and blocks its sender when full, which a test pins. Resource
+streams keep the existing credit bound rather than an arbitrary queue cap:
+the receiver grants credit, and the producer sends within it.
 - Apply frame-size limits before expensive decode/verification.
 - Ensure the subscriber task exits cleanly when the consumer is dropped and that overload does not silently discard security-relevant messages.
 

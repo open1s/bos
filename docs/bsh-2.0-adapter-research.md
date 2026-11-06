@@ -729,7 +729,7 @@ none, so the catalogue records `VersionSource::Unknown` instead of inventing one
 declares the same. Extension (Ferris-runtime) tools declare medium risk, an `extension` side
 effect, `extension.call`, and Unknown version; because packages register them LIVE, the plan and
 snapshot read a merged registry (base + live overlay), and a test pins that a live tool reaches the
-composition. The capability registry itself stays opt-in. Model-authored compositions go through `capability::proposal`: approved ids only, a risk ceiling, no remote binding or peer when the host forbids it, and no unseen capability; `resolve_proposal` refuses a spec the host resolver would accept. The gate returns an `ApprovedComposition` token that `resolve_approved` requires; the only constructor is `approve`, pinned by a compile_fail doctest. The public host entry point is named `resolve_host`, so no neutral `resolve` remains for a model path to call by accident.
+composition. The capability registry itself stays opt-in. Model-authored compositions go through `capability::proposal`: approved ids only, a risk ceiling, no remote binding or peer when the host forbids it, and no unseen capability; `resolve_proposal` refuses a spec the host resolver would accept. The gate returns an `ApprovedComposition` token that `resolve_approved` requires; the only constructor is `approve`, pinned by a compile_fail doctest. The public host entry point is named `resolve_host`, so no neutral `resolve` remains for a model path to call by accident. The producer is `agent::composition`: `prompt` renders the catalogue, `parse` rejects unknown fields and unknown ids, and `compose` runs parse -> approve -> resolve_approved with no bypass.
 
 ### Slice 1 — Native provider behind a shim
 
@@ -772,7 +772,9 @@ peer is still served (`forged_expired_and_wrong_version_frames_are_dropped`), an
 peer leaves fails without a local fallback (`a_trusted_peer_capability_is_offered_as_a_tool`). Every
 invocation now leaves a record on each side that decided (`federation::audit`), and the bsh runtime
 writes them to a bounded `audit.jsonl` beside the identity; the record type cannot carry arguments
-or results. The audit export includes the newest 50 records as a `federation` array. Records cover
+or results. Transport TLS is configurable (`bus::TlsConfig`, emitted as `transport.link.tls`) and the
+federation node opens its session through `Bus::try_from`, so a TLS listener without usable material is a
+startup error rather than a silent plaintext session. The audit export includes the newest 50 records as a `federation` array. Records cover
 `invoke`, `delegate`, `delegation_status`, `delegation_cancel`, and resource opens today, with a
 `subject` naming the delegation or lease. A resource stream records its end once on EACH side
 (provider: quota, failure, completion; caller: close, error, or a dropped reader) with the bytes
@@ -780,7 +782,19 @@ moved, so the two byte counts can be compared. Discovery is recorded on both sid
 `bsh federation status` prints the five most recent decisions. The shell reads those five once at launch into
 `AppState.federation_recent`, so the General row can show the newest one without touching the log
 per frame; a successful write also broadcasts in-process and the shell drains that channel (a
-non-blocking receive) so the row follows new decisions while it runs. The sink writes a
+non-blocking receive) so the row follows new decisions while it runs. Under the row, up to five
+enrolled peers are listed (short id, trust state, grant count) from a launch-time PeerStore read. The
+right panel's Federation tab is the fuller surface: every peer with its grants, plus enroll, grant (with an optional
+expiry), revoke-grant, and revoke-peer actions (`ui/right_panel.rs`), applied live when a node runs
+and written to the store file otherwise; a peer revoke asks for a second press, and two switches write `enabled` and `include_remote_tools` through the settings file, and the status line can Start or Stop the node (Stop releases the data
+directory lock). One writer per data
+directory: the runtime holds `node.lock` for its lifetime, the CLI's mutating commands and the pane's
+file edits take it too, and the pane distinguishes "off in settings" from "enabled but failed to start".
+Nodes also announce themselves on `bsh/v1/announce` (signed presence + public descriptors, every ten
+seconds); the pane lists those discovered peers with their advertised capabilities, excludes itself,
+and grants only what the reader selects. A bsh node advertises the read-only capabilities configured under `[federation] expose` (read_file,
+read_files, glob, grep), served from a workspace confined to `expose_root`; anything else is
+refused at start. Without `expose` the list is empty and the discovered row says so. The sink writes a
 per-process `audit-<pid>.jsonl` so two instances sharing a data directory never compact each other's
 inode; readers merge the per-process files with the legacy log by event time.
 

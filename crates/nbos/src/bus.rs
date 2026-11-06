@@ -63,6 +63,7 @@ impl From<PyBusConfig> for BusConfig {
             connect: value.connect,
             listen: value.listen,
             peer: value.peer.map(Some),
+            tls: None,
         }
     }
 }

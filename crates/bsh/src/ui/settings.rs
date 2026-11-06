@@ -1843,7 +1843,7 @@ impl Shell {
     /// filled with brand-primary while checked and bordered in border-l3 while
     /// not. gpui-kit ships no Switch, so this is a hand-built `role="switch"`
     /// equivalent with the reference's own click rule (toggle on press).
-    fn switch<F>(
+    pub(crate) fn switch<F>(
         &self,
         id: impl Into<SharedString>,
         checked: bool,
@@ -2022,6 +2022,7 @@ impl Shell {
     fn federation_text(
         lang: crate::i18n::Lang,
         status: Option<(&str, usize, usize, usize)>,
+        enabled: bool,
         last: Option<(&str, &str)>,
     ) -> String {
         let value = match status {
@@ -2035,6 +2036,7 @@ impl Shell {
                     ("delegations", delegations.to_string()),
                 ],
             ),
+            None if enabled => tr(lang, "settings.general.federationFailed"),
             None => tr(lang, "settings.general.federationOff"),
         };
         let mut text = format!("{} · {}", tr(lang, "settings.general.federation"), value);
@@ -2054,6 +2056,55 @@ impl Shell {
         text
     }
 
+    /// One display line per enrolled peer, from the launch-time snapshot.
+    fn federation_peer_line(
+        lang: crate::i18n::Lang,
+        peer: &crate::state::FederationPeerView,
+    ) -> String {
+        let short: String = peer.node.chars().take(10).collect();
+        let name = peer
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(short.as_str())
+            .to_string();
+        let state = match peer.state.as_str() {
+            "trusted" => tr(lang, "settings.general.peerTrusted"),
+            "pending" => tr(lang, "settings.general.peerPending"),
+            _ => tr(lang, "settings.general.peerRevoked"),
+        };
+        tr_args(
+            lang,
+            "settings.general.federationPeer",
+            &[
+                ("node", name),
+                ("state", state),
+                ("grants", peer.grants.to_string()),
+            ],
+        )
+    }
+
+    /// The enrolled peers under the federation row; no peers means no block.
+    fn federation_peers_block(&self) -> Option<AnyElement> {
+        if self.state.federation_peers.is_empty() {
+            return None;
+        }
+        let lang = self.state.lang;
+        let mut column = div().flex().flex_col().gap(px(4.0)).py(px(8.0));
+        for peer in self.state.federation_peers.iter().take(5) {
+            column = column.child(txt(
+                Self::federation_peer_line(lang, peer),
+                12.0,
+                theme::faint(),
+            ));
+        }
+        Some(
+            hairline_bottom(column)
+                .debug_selector(|| String::from("general-item-federation-peers"))
+                .into_any_element(),
+        )
+    }
     /// A read-only line for the federation node, like the version row: it
     /// reports what the process is, not a control the reader could flip here.
     fn federation_row(&self) -> AnyElement {
@@ -2075,10 +2126,16 @@ impl Shell {
                         runtime.remote_capabilities(),
                         runtime.active_delegations(),
                     )),
+                    true,
                     last,
                 )
             }
-            None => Self::federation_text(lang, None, last),
+            None => Self::federation_text(
+                lang,
+                None,
+                self.state.settings.global.federation.enabled,
+                last,
+            ),
         };
         hairline_bottom(
             div()
@@ -2281,6 +2338,9 @@ impl Shell {
             self.current_version_row(),
             self.federation_row(),
         ];
+        if let Some(peers) = self.federation_peers_block() {
+            rows.push(peers);
+        }
         if self.shortcuts_open {
             rows.push(self.shortcuts_disclosure(cx));
         }
@@ -13511,18 +13571,48 @@ mod federation_tests {
     use super::Shell;
     use crate::i18n::Lang;
 
+    /// The peer line shortens the node id and reports the trust state and the
+    /// grant count, in both languages.
+    #[test]
+    fn the_peer_line_shortens_the_id_and_reports_grants() {
+        let trusted = crate::state::FederationPeerView {
+            node: "abcdefghijklmnop".to_string(),
+            name: None,
+            state: "trusted".to_string(),
+            grants: 2,
+        };
+        let line = Shell::federation_peer_line(Lang::En, &trusted);
+        assert!(line.contains("abcdefghij"), "{line}");
+        assert!(!line.contains("klmnop"), "the id is shortened: {line}");
+        assert!(line.contains("trusted"), "{line}");
+        assert!(line.contains('2'), "{line}");
+
+        let revoked = crate::state::FederationPeerView {
+            node: "peer-x".to_string(),
+            name: Some("studio-mac".to_string()),
+            state: "revoked".to_string(),
+            grants: 0,
+        };
+        let line = Shell::federation_peer_line(Lang::Zh, &revoked);
+        assert!(line.contains("已撤销"), "{line}");
+        assert!(line.contains("studio-mac"), "{line}");
+    }
     #[test]
     fn the_federation_row_names_the_node_or_that_it_is_off() {
-        let off = Shell::federation_text(Lang::En, None, None);
+        let off = Shell::federation_text(Lang::En, None, false, None);
         assert!(off.contains("Federation"), "{off}");
         assert!(off.contains("not running"), "{off}");
 
-        let on = Shell::federation_text(Lang::En, Some(("abc12345", 2, 7, 1)), None);
+        let on = Shell::federation_text(Lang::En, Some(("abc12345", 2, 7, 1)), true, None);
         assert!(on.contains("abc12345"), "{on}");
         assert!(on.contains('2') && on.contains('7'), "{on}");
         assert!(on.contains('1'), "the active delegation count: {on}");
 
-        let last = Shell::federation_text(Lang::En, None, Some(("resource", "quota_exceeded")));
+        let last =
+            Shell::federation_text(Lang::En, None, false, Some(("resource", "quota_exceeded")));
+
+        let enabled = Shell::federation_text(Lang::En, None, true, None);
+        assert!(enabled.contains("Enabled"), "{enabled}");
         assert!(last.contains("last:"), "{last}");
         assert!(last.contains("quota_exceeded"), "{last}");
     }

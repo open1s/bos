@@ -12,12 +12,24 @@ use capability::transport::{unix_ms, FederationTransport, PeerSession};
 use capability::{CapabilityError, DeliveryState, NodeId};
 use tokio::sync::mpsc;
 
-type Inbox = mpsc::UnboundedSender<Vec<u8>>;
+type Inbox = mpsc::Sender<Vec<u8>>;
+
+/// One Node's queue holds this many frames before a sender waits.
+const QUEUE_CAPACITY: usize = 1024;
 
 /// A set of Nodes that can reach each other in one process.
-#[derive(Default)]
 pub struct InMemoryNetwork {
     peers: Mutex<HashMap<NodeId, Inbox>>,
+    announce: tokio::sync::broadcast::Sender<Vec<u8>>,
+}
+
+impl Default for InMemoryNetwork {
+    fn default() -> Self {
+        Self {
+            peers: Mutex::new(HashMap::new()),
+            announce: tokio::sync::broadcast::channel(256).0,
+        }
+    }
 }
 
 impl InMemoryNetwork {
@@ -27,11 +39,8 @@ impl InMemoryNetwork {
     }
 
     /// Attach one Node and return its transport and its inbox.
-    pub fn join(
-        self: &Arc<Self>,
-        node: NodeId,
-    ) -> (InMemoryTransport, mpsc::UnboundedReceiver<Vec<u8>>) {
-        let (sender, receiver) = mpsc::unbounded_channel();
+    pub fn join(self: &Arc<Self>, node: NodeId) -> (InMemoryTransport, mpsc::Receiver<Vec<u8>>) {
+        let (sender, receiver) = mpsc::channel(QUEUE_CAPACITY);
         self.peers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -97,14 +106,64 @@ impl FederationTransport for InMemoryTransport {
                 delivered: DeliveryState::NotSent,
             });
         };
-        inbox.send(frame).map_err(|_| CapabilityError::Transport {
-            message: format!("peer {peer} is no longer receiving"),
-            delivered: DeliveryState::NotSent,
-        })?;
+        inbox
+            .send(frame)
+            .await
+            .map_err(|_| CapabilityError::Transport {
+                message: format!("peer {peer} is no longer receiving"),
+                delivered: DeliveryState::NotSent,
+            })?;
         Ok(DeliveryState::Sent)
     }
 
     async fn close(&self, _peer: &NodeId) -> Result<(), CapabilityError> {
         Ok(())
+    }
+
+    async fn announce(&self, frame: Vec<u8>) -> Result<(), CapabilityError> {
+        // Broadcast is best-effort by design: a network with no listeners has
+        // nowhere to send, and that is not a delivery failure of this frame.
+        let _ = self.network.announce.send(frame);
+        Ok(())
+    }
+
+    async fn subscribe_announce(&self) -> Result<Option<mpsc::Receiver<Vec<u8>>>, CapabilityError> {
+        let mut broadcast = self.network.announce.subscribe();
+        let (sender, receiver) = mpsc::channel(256);
+        tokio::spawn(async move {
+            while let Ok(frame) = broadcast.recv().await {
+                if sender.send(frame).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Some(receiver))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// A receiver that stops reading stops the sender at the queue bound; the
+    /// process does not grow without limit.
+    #[tokio::test]
+    async fn a_full_queue_blocks_the_sender_instead_of_growing() {
+        let network = Arc::new(InMemoryNetwork::new());
+        let peer = crate::identity::NodeIdentity::from_seed([91; 32]).node_id();
+        let (transport, receiver) = network.join(peer.clone());
+
+        for _ in 0..QUEUE_CAPACITY {
+            transport.send(&peer, vec![0]).await.expect("buffered");
+        }
+
+        let blocked =
+            tokio::time::timeout(Duration::from_millis(50), transport.send(&peer, vec![1])).await;
+        assert!(
+            blocked.is_err(),
+            "the queue must not grow past its capacity"
+        );
+        drop(receiver);
     }
 }
