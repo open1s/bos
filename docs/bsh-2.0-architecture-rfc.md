@@ -1387,7 +1387,7 @@ The strategic direction is therefore:
 
 **One Runtime, Composable Workspaces, Federated Capabilities, Independent Trust Boundaries.**
 
-This RFC establishes the target architecture. The next engineering step is a source-level Gap Analysis against the current BOS repository, followed by concrete crate/API boundaries and a migration plan. Implementation should proceed phase by phase, with build, regression, fault-injection, and security evidence at every gate.
+This RFC establishes the target architecture. The source-level review is recorded in [BSH 2.0 Composable & Federation Gap Analysis](bsh-2.0-composable-federation-gap-analysis.md), audited against the repository revision linked in that document. That review refines the implementation-status summary below: a domain primitive is not considered a complete runtime feature unless lifecycle, ownership, budgets, persistence, recovery, and fault behavior are also evidenced. Implementation should proceed phase by phase, with build, regression, fault-injection, and security evidence at every gate.
 
 ## 30. Implementation status (2026-11-06)
 
@@ -1400,21 +1400,21 @@ test pins it. Gaps are named rather than implied.
 | ADR | Decision | Implementation | Tests | Remaining gap |
 | --- | --- | --- | --- | --- |
 | 001 | Capability model: provider-qualified ids, descriptors, versions | crates/capability (id, descriptor, provider, error, context) | crates/capability/tests | none known |
-| 002 | Composition Engine ownership: capability is a leaf; agent adapts | crates/agent/src/capabilities (catalogue, native provider, shim) | agent tests: capabilities, native_provider, capability_tool | none known |
-| 003 | Execution: providers behind a trait, validation before dispatch | capability::provider, WorkspaceRuntime, NativeToolProvider | capability/tests/workspace, agent native_provider | none known |
+| 002 | Composition Engine ownership: independent of Agent/ReAct | crates/capability + Agent provider adapters | capability and agent tests | Domain ownership is independent; complete host-neutral orchestration/activation boundary remains to be completed |
+| 003 | Execution: hybrid provider implementations behind one contract | capability::provider, WorkspaceRuntime, NativeToolProvider | capability/tests/workspace, agent native_provider | WorkspaceRuntime is currently a dispatch container; lifecycle, budget enforcement and context ownership remain outstanding; see GAP-COMP-002/003/004 |
 | 004 | Topology: autonomous Nodes, independent kernels | federation::service, PeerStore per Node, no shared workspace | federation/tests/service, trust | none known |
 | 005 | Protocol: signed JSON envelope, explicit protocol and schema | federation::envelope | federation/tests (envelope, service, signing_vectors) | canonical form now specified and pinned (docs/federation-signing.md); no second implementation yet |
 | 006 | Autonomy: dual authorization, denials name the side | service::invoke, serve; CapabilityError::Denied | service tests (caller/provider refusals) | none known |
 | 007 | Remote composition: remote is a binding, never a local provider | composition::Binding::Remote, RemoteCapabilityProvider, bsh attach_remote_tools | federation remote_provider, bsh caps attach test | no local fallback by construction |
-| 008 | Two layers, one Capability Model, separate authority | one CompositionSpec/resolve; SnapshotOrigin; workspace id per Node | capability composition, snapshot, bsh compose | knowledge federation mode not implemented |
-| 009 | Zenoh, JSON, one endpoint, resource streams on the protocol | federation::zenoh, service resource path | zenoh_transport, resource, resource_wire | endpoint TLS/routing configuration not exposed |
+| 008 | Two layers, one Capability Model, separate authority | one CompositionSpec/resolve; SnapshotOrigin; workspace id per Node | capability composition, snapshot, bsh compose | Knowledge Federation is not implemented; delegation/lease state is process-local; see GAP-FED-001/004/005 |
+| 009 | Zenoh, JSON, one endpoint, resource streams on the protocol | federation::zenoh, service resource path | zenoh_transport, resource, resource_wire | Production security profile is incomplete and ingress queue is unbounded; see GAP-FED-002/003 |
 
 ### 30.2 Local composition (section 28)
 
 | Criterion | Status | Evidence or gap |
 | --- | --- | --- |
 | Declare, validate, resolve, instantiate | implemented | capability/tests/composition.rs, workspace.rs |
-| Workspace exposes only its authorized set | implemented | LocalScope + resolver tests |
+| Workspace exposes only its resolved set | implemented foundation | LocalScope + resolver tests; dispatch context ownership hardening remains outstanding (GAP-COMP-004) |
 | Built-in, Ferris, and MCP capabilities in one model | implemented | built-in tools declare metadata; MCP tools declare network/medium/Unknown; extension (Ferris-runtime) tools declare medium/extension/Unknown and now enter the composition through the live overlay, which `merged_registry` folds into the plan and snapshot |
 | Snapshots capture versions and policy refs | implemented | capability/tests/snapshot.rs, bsh compositions.rs |
 | AI proposals cannot bypass validation | implemented as a gate | capability::proposal checks the host's approved ids, a risk ceiling, and remote policy, then returns an ApprovedComposition token that resolve_approved requires; the public resolver is named resolve_host, so no neutral resolve remains to call by accident (a compile_fail doctest pins that the token has no other constructor); tests pin that it refuses a spec the plain resolver would accept. No model-driven composer ships yet, so the gate is invoked by the host rather than by a pipeline |
@@ -1491,3 +1491,24 @@ tests that the live-overlay change did regress - the plan and the snapshot
 counted only the base registry - were found by this run and fixed: the turn's
 surface is the base registry plus the live overlay.
 
+
+
+### 30.8 Source-level gap review
+
+The detailed, code-referenced review is maintained separately to keep this RFC readable:
+
+- [BSH 2.0 Composable & Federation Gap Analysis](bsh-2.0-composable-federation-gap-analysis.md)
+
+The review identifies the following implementation blockers beyond the domain-model foundation:
+
+- Reproducible composition artifact, registry snapshot and lockfile.
+- Budget propagation and enforcement at the Workspace dispatch boundary.
+- Transactional Workspace lifecycle and resource ownership.
+- Cross-Workspace invocation-context validation.
+- Dependency graph and deterministic activation order.
+- Complete AI Assembly pipeline beyond proposal validation.
+- Durable delegation/lease state and restart recovery.
+- Bounded federation ingress and a production transport security profile.
+- First-class Knowledge Federation and higher-level collaboration orchestration.
+
+These are not claims that the existing primitives are defective in isolation. They are the missing end-to-end guarantees needed before the corresponding BSH 2.0 product capabilities can be described as complete.
