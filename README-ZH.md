@@ -3,19 +3,18 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/bos-logo.png" alt="BOS — Rust 原生 AI Agent 平台" width="400">
+  <img src="docs/assets/bos-logo.png" alt="BOS — Rust 原生 Agent Runtime 与分布式平台" width="400">
 </p>
 
-<h1 align="center">BOS — Rust 原生 AI Agent 平台</h1>
+<h1 align="center">BOS — Brain Operating System</h1>
 
 <p align="center">
-  <strong>One Runtime. Multiple Interfaces. One Extensible Agent Workspace.</strong><br>
-  一个运行时，多种开发接口，一个可扩展的 Agent 工作空间。
+  <strong>分布式、可组合的 Agent 与 Capability 平台</strong>
 </p>
 
 <p align="center">
-  以统一的 Rust Runtime 为核心，通过 Rust、Python 和 JavaScript 接口构建 Agent，
-  并在原生 GPUI 桌面工作空间 BSH 中开发、使用和管理 Agent。
+  将 Agent、工具、运行时与资源组合成面向任务的工作空间。<br>
+  连接独立的 BSH 节点，让 Agent 跨机器、跨信任边界协同工作。
 </p>
 
 <p align="center">
@@ -27,10 +26,10 @@
 </p>
 
 <p align="center">
-  <a href="#快速开始">快速开始</a> ·
+  <a href="#bos-是什么">BOS 是什么</a> ·
+  <a href="#bsh-平台定位">BSH 平台定位</a> ·
   <a href="#总体架构">总体架构</a> ·
-  <a href="#bsh-agent-工作空间">BSH 工作空间</a> ·
-  <a href="#扩展平台">扩展平台</a> ·
+  <a href="#快速开始">快速开始</a> ·
   <a href="#文档">文档</a>
 </p>
 
@@ -38,62 +37,122 @@
 
 ## BOS 是什么？
 
-**BOS 是一个以共享 Rust 执行内核为基础的 AI Agent 平台。**
-你可以直接通过 Rust 使用 Runtime，通过 NBOS（Python）和 JSBOS（JavaScript）
-调用同一套底层实现，也可以在原生 GPUI 桌面工作空间 BSH 中开发和运行 Agent。
+**BOS 是一个以 Rust 为核心，用于构建、组合和运行分布式 AI Agent 系统的平台基础。**
 
-| 组成 | 定位 | 适用场景 |
-|---|---|---|
-| **BOS Runtime** | 共享的 Rust Agent 执行核心 | 将 Agent 能力嵌入应用和服务 |
-| **Rust** | Runtime 的原生开发接口 | 构建 Rust 应用与基础设施 |
-| **NBOS** | 同一 Runtime 的 Python 接口 | Python 应用、自动化和原型开发 |
-| **JSBOS** | 同一 Runtime 的 JavaScript / Node.js 接口 | Node.js 服务和 JavaScript 工具 |
-| **BSH** | 原生 GPUI Agent 工作空间 | 在统一桌面环境中开发、使用和管理 Agent |
-| **Extension Platform** | BSH 内部的扩展层 | 通过工具、命令、面板等能力定制工作空间 |
+BSH 是 BOS 面向用户和 Agent 系统运营者的核心产品。它不只是一个桌面 Agent 工作空间，而是一个**分布式、可组合的 Agent 与 Capability 平台**。
+
+单个 BSH 节点首先是一个 Capability Container：可以将 Agent、工具、扩展、模型、上下文和资源按需装配为面向特定任务的工作空间。多个独立 BSH 节点进一步组成 Federation，使 Agent 和 Capability 能够跨机器发现、委派和组合，同时保留各节点独立的 Runtime 与安全边界。
+
+BOS 提供统一执行基础和多语言开发接口；BSH 则把这些能力组织成可组合、可运营、可分布式协作的 Agent 平台。
+
+| 层次 | 职责 |
+|---|---|
+| **BOS Runtime** | Rust 原生 Agent 执行、工具分发、模型集成、消息通信与运行时治理 |
+| **BSH Node** | 可组合的能力容器，承载工作空间、Agent、扩展和本地资源 |
+| **Composition Engine** | 为任务或工作空间选择并装配 Capability，独立于 Agent 推理循环 |
+| **Ferris Extension Framework** | 管理扩展包、加载、生命周期和多种执行 Provider |
+| **Federation** | 连接独立 BSH 节点，提供经过明确授权的远程能力与 Agent 服务 |
+| **Rust / NBOS / JSBOS** | 访问同一套 BOS 实现的 Rust、Python 和 JavaScript 接口 |
+
+### 一句话理解平台
+
+**One Runtime. Composable Workspaces. Collaborative Agents. Federated Capabilities. Independent Trust Boundaries.**
+
+一个 Runtime、可组合的工作空间、协同工作的 Agent、联邦化的能力，以及相互独立的信任边界。
+
+## BSH 平台定位
+
+BSH 有两个相互补充的核心角色。
+
+### 1. 可组合的 Capability Container
+
+一个 BSH 节点只装配当前用途真正需要的能力。每个 Workspace 都可以获得经过裁剪的 Capability View，而不是把节点上安装的全部工具暴露给每一个 Agent。
+
+一个 Composition 可以包含：
+
+- **Agents** —— 面向任务的 Agent、专业角色和受委派的工作者。
+- **Tools & Skills** —— 内置工具、自定义工具、Skills 和 MCP 集成。
+- **Extensions** —— 由 Ferris 管理的宿主扩展与隔离扩展包。
+- **Models & Policies** —— 模型 Provider、路由选择、权限和执行约束。
+- **Context & Resources** —— 项目文件、记忆、服务以及显式授权的资源。
+- **Workflows** —— 可复用的任务组合与协同 Agent 活动。
+
+Composition 是平台的一等能力，不是 Agent Prompt 的附属行为。Composition Engine 独立于 ReAct/Agent 推理引擎。AI 可以提出装配方案，但最终由 Runtime 确定性地校验兼容性、依赖、权限和资源限制，再决定是否激活。
+
+### 2. 分布式 Agent 与 Capability 平台
+
+每个 BSH 安装都是一个自治节点。多个节点可以组成 Federation，在保留各自身份、Runtime、策略、密钥、文件和审计记录的前提下进行协作。
+
+目标 Federation 能力包括：
+
+- **节点与能力发现** —— 发现 Peer 以及它们主动发布的能力。
+- **远程 Capability 调用** —— 通过本地、受策略约束的接口调用远程能力。
+- **Agent 任务委派** —— 将边界明确的任务委派给其他节点上的 Agent，并接收结果。
+- **多 Agent 协作** —— 当任务需要分布式专业能力或资源时，跨节点协调多个 Agent。
+- **资源协作** —— 请求访问经过选择的服务或资源，而不是复制整个节点环境。
+- **独立治理** —— 请求方和提供方双端授权；任何一端都可以拒绝或撤销访问。
+
+Federation 不是把多个节点合并成一个超级进程。协调器可以辅助节点会合、发现或调度，但不取得 Peer 的执行控制权。远程 Capability 始终由远程节点提供，发现不代表信任。
+
+> **实现状态说明：** BOS 已具备 Rust Runtime、Agent/Tool 执行、消息通信基础、BSH 桌面宿主、Ferris 扩展框架和 MCP 集成。完整的 BSH Composition 与 Federation 模型是平台的目标架构，将分阶段实现。上面列出的目标 Federation 能力不代表所有功能已经正式可用。
 
 ## 总体架构
 
-BOS 将共享执行核心与开发者接口、桌面工作空间分离。Rust 应用、NBOS 和 JSBOS
-使用同一套原生 Runtime；BSH 是直接基于 BOS Crate 构建的 GPUI 原生应用。
-Extension Platform 扩展的是 BSH，而不是另建一套 Agent Runtime。
+BOS 将共享执行基础、本地组合和跨节点协作分离。
 
 <p align="center">
-  <img src="docs/assets/diagrams/bos-platform-architecture.svg" alt="BOS 总体架构：Rust、Python、JavaScript 接口和 BSH 共用 BOS Runtime，BSH Extension Platform 扩展桌面工作空间。" width="100%">
+  <img src="docs/assets/diagrams/bos-platform-architecture.svg" alt="BOS 架构：Rust、Python、JavaScript 共享原生 Runtime，BSH 作为可组合 Agent 工作空间的宿主。" width="100%">
 </p>
 
-Runtime 集成 Agent 编排、工具与技能分发、消息通信、模型适配和弹性治理。
-配置、遥测、记忆、能力控制及外部集成提供基础支撑。下图展示系统子系统、集成边界和协作关系，而不是按时间顺序执行的流程。
+### 单节点架构
+
+在一个 BSH 节点内部，各子系统有明确的职责边界：
+
+| 子系统 | 职责 |
+|---|---|
+| **Agent Runtime** | 运行 Agent 和推理循环，管理 Session，协调工具调用 |
+| **Capability System** | 描述可用操作，并管理对 Capability Provider 的访问 |
+| **Composition Engine** | 解析面向任务的组合方案，生成 Workspace Capability View |
+| **Workspace Runtime** | 激活和隔离 Composition，管理其上下文、资源与生命周期 |
+| **Ferris** | 管理扩展包、Provider、生命周期和执行边界 |
+| **Policy & Audit** | 执行授权、限制和可追踪的运行决策 |
+| **Bus & Adapters** | 为本地组件和外部系统提供消息通信与集成边界 |
+
+### Federation 架构
+
+Federation 连接节点，但不合并节点。
+
+| 平面 | 职责 |
+|---|---|
+| **Identity & Trust** | 节点身份、注册、信任建立、撤销和 Peer 认证 |
+| **Discovery & Control** | Peer 发现、Capability 公告、策略元数据和协调 |
+| **Delegation & Collaboration** | 有边界的任务委派、远程 Agent 交互、租约和任务状态 |
+| **Data & Execution** | 经授权的远程调用，以及最小化的任务输入和结果交换 |
+
+Federation Protocol 与底层传输解耦。Zenoh 等传输可以作为实现基础，但仅仅建立传输连接并不代表身份可信、访问已授权或双方已建立信任。
 
 ### BSH 扩展框架与 Agent 模型
 
-配套图展示 BSH 扩展框架的宿主边界，以及 Agent Runtime 所依赖的协作能力。扩展框架是集成在 BSH 中的子系统；Agent 模型由多个协作能力构成，并受统一的安全与运行时治理约束。
-
 <p align="center">
-  <img src="docs/assets/diagrams/bsh-extension-agent-model.svg" alt="BSH 扩展框架与 Agent 模型：宿主服务、扩展运行时、Agent Engine、上下文、工具、运行环境和治理能力。" width="100%">
+  <img src="docs/assets/diagrams/bsh-extension-agent-model.svg" alt="BSH 扩展框架与 Agent 执行模型：宿主服务、扩展运行时、Agent Engine、上下文、工具、运行环境和治理能力。" width="100%">
 </p>
 
-### Agent 执行模型
-
-ReAct 执行循环将模型推理与受策略约束的工具执行结合起来。工具结果会回到会话上下文，
-Agent 持续迭代，直到生成最终响应或达到配置的执行边界。
+扩展框架是集成在 BSH 中的子系统，通过明确契约向宿主提供能力，而不是另建一套 Agent Runtime。MCP 是集成协议和 Adapter，不是平台的标准 Capability 模型。
 
 ## 为什么选择 BOS？
 
-- **统一执行模型。** Rust、Python 和 JavaScript 接口共享同一套 Rust 实现，
-  不需要维护多套独立 Agent 引擎。
-- **Agent 编排。** 通过 ReAct 执行循环协调模型响应、工具调用、结果观察和生命周期 Hooks。
-- **模型互操作。** Provider 适配器支持 OpenAI 兼容接口、Anthropic、NVIDIA NIM、
-  Google AI 和 OpenRouter。
-- **MCP 集成。** 通过 stdio 或 HTTP 连接 MCP Server，使用其工具、资源和提示模板。
-- **多 Agent 通信。** 消息总线支持发布/订阅、请求/响应和 RPC。
-- **上下文复用。** 按需加载目录化 `SKILL.md` 技能，并支持内存或文件型记忆。
-- **运行治理。** 提供重试、限流、熔断、执行期限、指标和能力授权。
-- **工作空间扩展。** BSH 支持 Declarative、Process、WASM Component、Extism、
-  MCP 和 Built-in 等扩展类型。
+- **Rust 原生执行。** 原生应用和语言绑定共享同一套底层实现。
+- **面向组合设计。** 将 Agent、工具、扩展、模型、上下文和资源装配成面向任务的工作空间。
+- **Agent Runtime。** ReAct 执行协调模型响应、工具调用、结果观察和生命周期 Hooks。
+- **面向 LLM 的工具设计。** 通过工具契约、Schema 和有界输出，帮助模型更准确地选择和使用能力。
+- **可扩展执行。** Ferris 支持 Declarative、Process、WASM Component、Extism、MCP 和 Built-in 等 Provider。
+- **分布式通信基础。** Bus 为系统组件提供 Pub/Sub、Query/Response 和 RPC 模式。
+- **执行边界治理。** Capability 授权、Sandbox、资源限制和审计属于 Runtime 的职责。
+- **多语言互操作。** Rust、Python 和 JavaScript 接口使用同一套底层实现。
 
 ## 快速开始
 
-根据你的应用场景选择开发接口。
+根据应用场景选择开发接口。
 
 ### Python
 
@@ -176,20 +235,27 @@ BSH 需要 Rust 1.97+ 和 Zig 0.16（用于构建 Ghostty 终端集成）。
 macOS 也可以使用 `./crates/bsh/make-dev-app.sh` 打包开发版本。
 Linux 构建依赖见 [Rust workflow](.github/workflows/rust.yml)。
 
-## BSH Agent 工作空间
+### 安装 BSH
 
-**BSH 将 Agent 执行能力与日常开发工具整合到一个原生桌面工作空间。**
-它基于 GPUI 构建，并使用 BOS Runtime。
+预编译安装包发布在 [Releases](https://github.com/open1s/bos/releases)。
+各版本支持的平台和安装格式以 Release 说明为准，每个版本均附带
+`SHA256SUMS` 校验文件。
 
-- **工作区与会话** —— 组织项目和持久化对话。
+Tag 驱动的构建、签名和公证流程见
+[docs/bsh-release.md](docs/bsh-release.md)。
+
+## BSH 桌面环境
+
+BSH 提供基于 GPUI 的原生环境，用于开发、使用和运营 Agent。它也是本地工作空间以及未来分布式工作空间的操作界面。
+
+- **Workspace 与 Session** —— 组织项目和持久化对话。
 - **Agent 交互** —— 流式响应、任务计划、消息队列和可见的子 Agent 活动。
 - **集成终端** —— Ghostty 终端界面，并在命令执行前进行策略检查。
 - **浏览器面板** —— 在 Agent 工作空间中使用嵌入式 WebView。
 - **代码编辑器** —— 文件树、标签页、Diff 和 tree-sitter 语言语法。
 - **设置与凭据** —— Provider 配置和加密 Vault。
 - **双语界面** —— 中文与英文。
-- **扩展能力** —— 增加工具、命令、面板、提示词、上下文、技能、主题、
-  语言服务、Agent 角色、工作流、存储和 Hooks。
+- **扩展能力** —— 增加工具、命令、面板、提示词、上下文、技能、主题、语言服务、Agent 角色、工作流、存储和 Hooks。
 
 ### BSH 界面预览
 
@@ -205,20 +271,18 @@ Linux 构建依赖见 [Rust workflow](.github/workflows/rust.yml)。
 
 替换要求：[BSH 截图替换指南](docs/assets/bsh-showcase/README.md)。
 
-## 扩展平台
+## Ferris 扩展框架
 
-Extension Platform 是 BSH 的工作空间扩展层。扩展包通过
-`extension.toml` 描述；BSH 负责校验包内容、解析依赖、管理生命周期，
-并在扩展请求宿主能力时检查相应权限。
+[Ferris](crates/ferris-core/) 是 BSH 使用的扩展框架。它将扩展包和生命周期管理与宿主 Agent 推理引擎分离。BSH 通过明确的契约和权限检查，将扩展提供的功能适配为宿主 Capability。
 
-| 运行时 | 适用场景 |
+| Provider | 适用场景 |
 |---|---|
 | **Declarative** | JSON 定义的工具、面板、提示词和主题 |
 | **Process** | 通过 JSON-RPC 通信的现有程序和服务 |
 | **WASM Component** | 使用 WebAssembly Component Model 与 WIT 的可移植组件 |
 | **Extism** | 接入现有 Extism 插件 |
-| **MCP** | 复用 MCP Server |
-| **Built-in** | 集成到 BSH 的第一方 Rust 能力 |
+| **MCP** | 通过 Adapter 复用 MCP Server |
+| **Built-in** | 集成到宿主的第一方 Rust 能力 |
 
 创建并验证扩展：
 
@@ -236,13 +300,7 @@ bsh ext doctor
 - [WIT 接口](crates/bsh/wit/extension.wit)
 - [扩展示例](examples/extensions/)
 
-**安全说明：**扩展能力授权与操作系统级隔离是不同的控制层。
-实际执行能力因操作系统和扩展运行时而异。当前契约与限制请参阅
-[BSH 扩展平台](docs/bsh-extension.md) 和 [安全策略](SECURITY.md)。
-
-### 扩展包生命周期
-
-参见[生命周期与激活](docs/bsh-extension.md#4-lifecycle-and-activation)了解从 Manifest 校验、依赖解析、不可变版本安装到运行时激活的包路径。
+**安全说明：**扩展能力授权与操作系统级隔离是不同的控制层。实际执行能力因操作系统和扩展运行时而异。当前契约与限制请参阅 [BSH 扩展平台](docs/bsh-extension.md) 和 [安全策略](SECURITY.md)。
 
 ## 模型配置
 
@@ -269,15 +327,16 @@ model = "nvidia/your-model"
 
 | 资料 | 内容 |
 |---|---|
-| [BOS / BSH 实战手册](docs/BOS-BSH-Textbook.md) | Runtime、桌面工作空间与扩展平台的深入指南 |
-| [总体架构](ARCHITECTURE.md) | 组件职责与架构说明 |
+| [BOS / BSH 实战手册](docs/BOS-BSH-Textbook.md) | Runtime、桌面宿主与扩展框架的深入指南 |
+| [总体架构](ARCHITECTURE.md) | 当前组件职责与架构说明 |
 | [Rust 使用指南](docs/rust-user-guide.md) | 在 Rust 中嵌入和使用 BOS |
 | [Python 使用指南](docs/python-user-guide.md) | 在 Python 中使用 BOS |
 | [JavaScript 使用指南](docs/javascript-user-guide.md) | 在 Node.js / JavaScript 中使用 BOS |
-| [BSH 扩展平台](docs/bsh-extension.md) | Manifest、运行时、能力、CLI、安全与开发 |
+| [BSH 扩展平台](docs/bsh-extension.md) | Manifest、Provider、生命周期、Capability、CLI 与安全 |
 | [BSH 内置工具 2.0](docs/bsh-built-in-tools-2.0.md) | 面向 LLM 的工具契约、批量文件操作、输出预算与基准测试计划 |
 | [贡献者上手指南](ONBOARDING.md) | 配置开发环境 |
 | [设置](docs/bsh-settings-spec.md) · [终端策略](docs/bsh-terminal-policy.md) · [Hooks](docs/bsh-hook-system.md) | 子系统规范 |
+| [BSH 发布流程](docs/bsh-release.md) | 安装包、签名与发布工作流 |
 | [REX 指南](docs/rex-user-guide.md) · [诊断](docs/diagnostics.md) | 资源工具与故障排查 |
 | [Wiki](https://github.com/open1s/bos/wiki) · [更新日志](CHANGELOG.md) | 使用指南与版本记录 |
 
@@ -303,9 +362,8 @@ cd crates/jsbos && npm install && npx ava
 - [GitHub Issues](https://github.com/open1s/bos/issues)
 - [Good first issues](https://github.com/open1s/bos/labels/good%20first%20issue)
 
-如果 BOS 对你有帮助，欢迎给仓库点一个 Star，也欢迎分享你的项目和使用案例。
-真实反馈能帮助更多开发者发现 BOS，也能帮助项目确定后续方向。
+如果 BOS 对你有帮助，欢迎给仓库点一个 Star，也欢迎分享你的项目和使用案例。真实反馈能帮助更多开发者发现 BOS，也能帮助平台确定后续方向。
 
 ## License
 
-MIT OR Apache-2.0 · Version 3.0.2 · [Releases](https://github.com/open1s/bos/releases)
+MIT OR Apache-2.0 · [Releases](https://github.com/open1s/bos/releases)
