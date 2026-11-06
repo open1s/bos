@@ -18,6 +18,7 @@
 //! agent, no ferris, no UI. That is what lets the Composition Engine live above
 //! it without depending on a specific Agent implementation.
 
+pub mod assembly;
 pub mod catalogue;
 pub mod composition;
 pub mod context;

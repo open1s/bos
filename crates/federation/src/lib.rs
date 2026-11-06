@@ -18,6 +18,7 @@ pub mod delegation;
 pub mod discovery;
 pub mod envelope;
 pub mod identity;
+pub mod knowledge;
 pub mod memory;
 pub mod peers;
 pub mod provider;
@@ -34,6 +35,11 @@ pub use delegation::{
 pub use discovery::DiscoveryRecord;
 pub use envelope::{Envelope, EnvelopeError, PROTOCOL, SCHEMA_VERSION};
 pub use identity::{IdentityError, NodeIdentity};
+pub use knowledge::{
+    knowledge_hash, KnowledgeAudit, KnowledgeClass, KnowledgeError, KnowledgeItem, KnowledgeOrigin,
+    KnowledgePublication, KnowledgePurpose, KnowledgeQuery, KnowledgeResponse, KnowledgeService,
+    Provenance, KNOWLEDGE_PROTOCOL, KNOWLEDGE_SCHEMA, MAX_KNOWLEDGE_BYTES, MAX_KNOWLEDGE_ITEMS,
+};
 pub use memory::{InMemoryNetwork, InMemoryTransport};
 pub use peers::{Grant, PeerError, PeerRecord, PeerStore, TrustState};
 pub use provider::RemoteCapabilityProvider;

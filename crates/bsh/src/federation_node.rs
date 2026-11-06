@@ -692,6 +692,7 @@ pub(crate) fn assemble(
         node = node.with_runtime(runtime);
     }
     if let Some(path) = delegations {
+        node = node.with_lease_persistence(path.with_file_name("leases.json"));
         node = node.with_delegation_persistence(path);
     }
     if let Some(path) = audit {

@@ -180,9 +180,9 @@ impl LeaseStore {
             .retain(|_, lease| lease.expires_at_ms.is_none_or(|expiry| expiry > now));
         store.path = Some(path);
         if store.leases.len() != before {
-            store.persist().map_err(|error| {
-                std::io::Error::other(error.to_string())
-            })?;
+            store
+                .persist()
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
         }
         Ok(store)
     }

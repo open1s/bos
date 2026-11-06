@@ -103,13 +103,16 @@ pub fn validate_proposal(
                 capability: requirement.id.clone(),
             });
         }
-        let descriptor = match proposed_descriptor(requirement, spec, catalogue, peers)? {
-            Some(descriptor) => descriptor,
-            None => {
+        let descriptor = match proposed_descriptor(requirement, spec, catalogue, peers) {
+            Ok(Some(descriptor)) => descriptor,
+            Ok(None) if !requirement.required => continue,
+            Ok(None) => {
                 return Err(ProposalError::Unknown {
                     capability: requirement.id.clone(),
                 })
             }
+            Err(ProposalError::Ungranted { .. }) if !requirement.required => continue,
+            Err(error) => return Err(error),
         };
         if descriptor.risk > policy.max_risk {
             return Err(ProposalError::Risk {

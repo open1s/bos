@@ -291,3 +291,73 @@ fn ownership_is_recorded_and_inherited() {
         "the child keeps the parent's owner"
     );
 }
+
+#[test]
+fn an_interrupted_delegation_is_failed_at_startup_not_reset() {
+    let dir = std::env::temp_dir().join(format!("bos-delegation-recovery-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch");
+    let path = dir.join("delegations.json");
+
+    let mut store = DelegationStore::new();
+    store
+        .create(
+            request("d-interrupted", vec![capability("build")], false),
+            100,
+        )
+        .expect("created");
+    store
+        .transition(
+            &DelegationId::new("d-interrupted"),
+            DelegationState::Accepted,
+            110,
+        )
+        .expect("accepted");
+    store.save(&path).expect("saved");
+    drop(store);
+
+    let recovered = DelegationStore::load(&path).expect("loaded");
+    let record = recovered
+        .record(&DelegationId::new("d-interrupted"))
+        .expect("present");
+    assert_eq!(record.state, DelegationState::Failed);
+    assert!(
+        record
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("indeterminate")),
+        "{record:?}"
+    );
+    assert_ne!(record.state, DelegationState::Created);
+}
+
+#[test]
+fn a_terminal_delegation_survives_recovery() {
+    let dir = std::env::temp_dir().join(format!("bos-delegation-terminal-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch");
+    let path = dir.join("delegations.json");
+
+    let mut store = DelegationStore::new();
+    let id = DelegationId::new("d-done");
+    store
+        .create(request("d-done", vec![capability("build")], false), 100)
+        .expect("created");
+    store
+        .transition(&id, DelegationState::Accepted, 110)
+        .expect("accepted");
+    store
+        .transition(&id, DelegationState::Running, 120)
+        .expect("running");
+    store
+        .transition(&id, DelegationState::Succeeded, 130)
+        .expect("succeeded");
+    store.save(&path).expect("saved");
+    drop(store);
+
+    let recovered = DelegationStore::load(&path).expect("loaded");
+    assert_eq!(
+        recovered.record(&id).expect("present").state,
+        DelegationState::Succeeded
+    );
+}

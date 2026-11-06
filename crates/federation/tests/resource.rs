@@ -57,7 +57,7 @@ fn a_lease_is_bound_to_its_holder_and_its_deadline() {
 fn a_revoked_lease_is_unknown() {
     let mut store = LeaseStore::new();
     store.grant(lease("l-2", None, None)).expect("granted");
-    assert!(store.revoke(&LeaseId::new("l-2")));
+    assert!(store.revoke(&LeaseId::new("l-2")).expect("persisted"));
 
     let error = store
         .authorize(&LeaseId::new("l-2"), &node("node:reader"), 150, 1)
@@ -210,4 +210,68 @@ fn a_resumed_stream_starts_at_its_offset() {
     };
     receiver.accept(&chunk).expect("resumes at four");
     assert_eq!(receiver.resume_offset(), 8);
+}
+
+fn scratch(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("bos-lease-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch");
+    dir
+}
+
+#[test]
+fn a_grant_and_its_charge_survive_a_restart() {
+    let dir = scratch("restart");
+    let path = dir.join("leases.json");
+    let mut store = LeaseStore::open(&path).expect("open");
+    store
+        .grant(lease("l-persist", None, Some(16)))
+        .expect("granted");
+    let holder = node("node:reader");
+    store
+        .charge(&LeaseId::new("l-persist"), &holder, 150, 5)
+        .expect("charged");
+    drop(store);
+
+    let reopened = LeaseStore::open(&path).expect("reopen");
+    let lease = reopened.get(&LeaseId::new("l-persist")).expect("survived");
+    assert_eq!(lease.used_bytes, 5);
+    assert_eq!(lease.max_bytes, Some(16));
+
+    let mut reopened = reopened;
+    assert!(reopened
+        .revoke(&LeaseId::new("l-persist"))
+        .expect("revoked"));
+    drop(reopened);
+    let after = LeaseStore::open(&path).expect("reopen after revoke");
+    assert!(after.get(&LeaseId::new("l-persist")).is_none());
+}
+
+#[test]
+fn an_expired_lease_is_not_revived_at_startup() {
+    let dir = scratch("expiry");
+    let path = dir.join("leases.json");
+    let mut store = LeaseStore::open(&path).expect("open");
+    store
+        .grant(lease("l-expired", Some(100), Some(8)))
+        .expect("granted");
+    drop(store);
+
+    let reopened = LeaseStore::open(&path).expect("reopen");
+    assert!(reopened.get(&LeaseId::new("l-expired")).is_none());
+}
+
+#[test]
+fn a_storage_failure_fails_closed_and_rolls_back() {
+    let dir = scratch("failure");
+    let blocker = dir.join("blocker");
+    std::fs::write(&blocker, b"not a directory").expect("blocker");
+    let mut store = LeaseStore::new().with_persistence(blocker.join("leases.json"));
+
+    let error = store
+        .grant(lease("l-fail", None, None))
+        .expect_err("the write fails");
+
+    assert!(matches!(error, ResourceError::Storage { .. }), "{error:?}");
+    assert!(store.get(&LeaseId::new("l-fail")).is_none());
 }

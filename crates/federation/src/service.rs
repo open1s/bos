@@ -414,6 +414,26 @@ impl FederationNode {
         }
     }
 
+    /// Load and persistently bind the resource-lease store.
+    ///
+    /// Every later grant, revoke, and charge is written before it is
+    /// acknowledged; a startup load drops leases that already expired.
+    pub fn with_lease_persistence(self, path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        match LeaseStore::open(&path) {
+            Ok(store) => {
+                if let Ok(mut slot) = self.leases.write() {
+                    *slot = store;
+                }
+            }
+            Err(error) => tracing::warn!(
+                "federation: lease store {} was not loaded: {error}",
+                path.display()
+            ),
+        }
+        self
+    }
+
     /// Load and persist delegation records at `path`.
     ///
     /// A malformed file is reported and the node starts with an empty store

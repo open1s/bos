@@ -388,12 +388,47 @@ impl DelegationStore {
     }
 
     /// Read a store from its persistence file; a missing file is empty.
+    ///
+    /// Recovery is explicit: a delegation that was still Created, Accepted, or
+    /// Running when the process stopped is marked Failed with an indeterminate-
+    /// outcome reason. It is never silently returned to Created, and a terminal
+    /// delegation keeps its state. The rewritten file is saved before the store
+    /// is returned.
     pub fn load(path: &Path) -> std::io::Result<Self> {
         match std::fs::read_to_string(path) {
-            Ok(text) => Self::from_json(&text),
+            Ok(text) => {
+                let mut store = Self::from_json(&text)?;
+                if store.recover(capability::unix_ms()) > 0 {
+                    store.save(path)?;
+                }
+                Ok(store)
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::new()),
             Err(error) => Err(error),
         }
+    }
+
+    /// Mark every non-terminal delegation as failed after a restart.
+    ///
+    /// Returns how many records were changed. The outcome is deliberately
+    /// indeterminate rather than guessed: a completed call whose result was
+    /// never recorded must not be reported as success.
+    pub fn recover(&mut self, now_ms: u64) -> usize {
+        let mut changed = 0;
+        for record in self.records.values_mut() {
+            if record.state.is_terminal() {
+                continue;
+            }
+            record.state = DelegationState::Failed;
+            record.error =
+                Some("interrupted by a Node restart; the outcome is indeterminate".to_string());
+            record.updated_at_ms = now_ms;
+            changed += 1;
+        }
+        if changed > 0 {
+            self.revision += 1;
+        }
+        changed
     }
 
     /// Parse a store, refusing a file that is not a store.

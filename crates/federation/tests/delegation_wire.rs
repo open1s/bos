@@ -391,7 +391,16 @@ async fn a_delegation_survives_the_target_restarting() {
         .delegation_status(&target_id, &DelegationId::new("d-restart"), &context())
         .await
         .expect("the restarted target answers");
-    assert_eq!(status.state, DelegationState::Accepted);
+    // Recovery is explicit: an accepted task interrupted by a restart is
+    // indeterminate, not silently resumed or reset to Created.
+    assert_eq!(status.state, DelegationState::Failed);
+    assert!(
+        status
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("indeterminate")),
+        "{status:?}"
+    );
     assert_eq!(status.request.objective, "verify the change");
     assert_eq!(
         status.origin,
