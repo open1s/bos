@@ -373,6 +373,7 @@ model = "nvidia/your-model"
 |---|---|
 | [BOS / BSH 实战手册](docs/BOS-BSH-Textbook.md) | Runtime、桌面宿主与扩展框架的深入指南 |
 | [总体架构](ARCHITECTURE.md) | 当前组件职责与架构说明 |
+| [BSH 2.0 Workspace 验收规范](docs/bsh-2.0-e2e-acceptance.md) | 基于现有代码的差距分析、端到端演示场景与安全验收标准 |
 | [Rust 使用指南](docs/rust-user-guide.md) | 在 Rust 中嵌入和使用 BOS |
 | [Python 使用指南](docs/python-user-guide.md) | 在 Python 中使用 BOS |
 | [JavaScript 使用指南](docs/javascript-user-guide.md) | 在 Node.js / JavaScript 中使用 BOS |
