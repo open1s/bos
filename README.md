@@ -50,10 +50,10 @@ BOS provides the shared execution foundation and developer interfaces. BSH turns
 | Layer | Responsibility |
 |---|---|
 | **BOS Runtime** | Rust-native agent execution, tool dispatch, model integration, messaging and runtime controls |
-| **BSH Node** | A composable capability container that hosts workspaces, agents, extensions and local resources |
-| **Composition Engine** | Selects and assembles capability sets for a task or workspace, independently of the agent reasoning loop |
+| **BSH Node** | The desktop/runtime host for workspaces, agents, extensions and local resources; the full composable container is the BSH 2.0 target |
+| **Composition Engine** | Target subsystem: resolves, validates and activates task-specific capability sets independently of agent reasoning |
 | **Ferris Extension Framework** | Packages, loads and governs extensions across supported execution providers |
-| **Federation** | Connects independent BSH nodes and exposes explicitly authorized remote capabilities and agent services |
+| **Federation** | Target subsystem: connects independent nodes and exposes explicitly authorized remote capabilities and agent services |
 | **Rust / NBOS / JSBOS** | Native, Python and JavaScript interfaces to the shared BOS implementation |
 
 ### The platform in one sentence
@@ -148,10 +148,10 @@ Within one BSH node, the platform is organized around distinct responsibilities:
 |---|---|
 | **Agent Runtime** | Runs agents and reasoning loops, manages sessions and coordinates tool calls |
 | **Capability System** | Describes available operations and mediates access to providers |
-| **Composition Engine** | Resolves a task-specific composition and produces a workspace capability view |
-| **Workspace Runtime** | Activates and isolates a composition with its context, resources and lifecycle |
+| **Composition Engine** | Target: resolves a task-specific composition and produces a workspace capability view |
+| **Workspace Runtime** | Target: activates and governs a composition with its context, resources and lifecycle |
 | **Ferris** | Manages extension packages, providers, lifecycle and execution boundaries |
-| **Policy and Audit** | Enforces authorization, limits and traceable execution decisions |
+| **Policy and Audit** | Applies current authorization and execution controls; the unified composition-wide policy/audit model is a target |
 | **Bus and Adapters** | Provides messaging and integration seams for local and external systems |
 
 ### Federation architecture
