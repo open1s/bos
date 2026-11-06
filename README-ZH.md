@@ -52,10 +52,10 @@ BOS 提供统一执行基础和多语言开发接口；BSH 则把这些能力组
 | 层次 | 职责 |
 |---|---|
 | **BOS Runtime** | Rust 原生 Agent 执行、工具分发、模型集成、消息通信与运行时治理 |
-| **BSH Node** | 可组合的能力容器，承载工作空间、Agent、扩展和本地资源 |
-| **Composition Engine** | 为任务或工作空间选择并装配 Capability，独立于 Agent 推理循环 |
+| **BSH Node** | 承载工作空间、Agent、扩展和本地资源的桌面与运行时宿主；完整可组合容器是 BSH 2.0 的目标 |
+| **Composition Engine** | 目标子系统：独立于 Agent 推理，解析、校验并激活面向任务的 Capability 组合 |
 | **Ferris Extension Framework** | 管理扩展包、加载、生命周期和多种执行 Provider |
-| **Federation** | 连接独立 BSH 节点，提供经过明确授权的远程能力与 Agent 服务 |
+| **Federation** | 目标子系统：连接自治节点，并提供经过明确授权的远程能力与 Agent 服务 |
 | **Rust / NBOS / JSBOS** | 访问同一套 BOS 实现的 Rust、Python 和 JavaScript 接口 |
 
 ### 一句话理解平台
@@ -150,10 +150,10 @@ BOS 将共享执行基础、本地组合和跨节点协作分离。
 |---|---|
 | **Agent Runtime** | 运行 Agent 和推理循环，管理 Session，协调工具调用 |
 | **Capability System** | 描述可用操作，并管理对 Capability Provider 的访问 |
-| **Composition Engine** | 解析面向任务的组合方案，生成 Workspace Capability View |
-| **Workspace Runtime** | 激活和隔离 Composition，管理其上下文、资源与生命周期 |
+| **Composition Engine** | 目标：解析面向任务的组合方案，生成 Workspace Capability View |
+| **Workspace Runtime** | 目标：激活并治理 Composition，管理其上下文、资源与生命周期 |
 | **Ferris** | 管理扩展包、Provider、生命周期和执行边界 |
-| **Policy & Audit** | 执行授权、限制和可追踪的运行决策 |
+| **Policy & Audit** | 执行现有授权与运行控制；统一的组合级策略和审计模型仍是目标 |
 | **Bus & Adapters** | 为本地组件和外部系统提供消息通信与集成边界 |
 
 ### Federation 架构
