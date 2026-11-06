@@ -14,10 +14,14 @@ pub(crate) mod audit;
 pub(crate) mod browser;
 pub(crate) mod caps;
 pub(crate) mod command_invocation;
+pub(crate) mod compositions;
 pub(crate) mod context;
 mod editors;
 pub(crate) mod export;
 pub(crate) mod extension;
+pub(crate) mod federation;
+pub(crate) mod federation_audit;
+mod federation_node;
 pub(crate) mod files;
 pub(crate) mod glob;
 pub(crate) mod grep;
@@ -41,6 +45,7 @@ pub(crate) mod store;
 pub(crate) mod subagent;
 pub(crate) mod terminal;
 pub(crate) mod theme;
+pub(crate) mod tool_metadata;
 pub(crate) mod trash;
 pub(crate) mod ui;
 pub(crate) mod vault;
@@ -57,6 +62,15 @@ pub fn extension_cli(args: &[String]) -> i32 {
     extension::cli(args)
 }
 
+/// Run the federation management CLI, returning its exit code.
+///
+/// This is the headless surface for a node's identity and peer grants: it works
+/// before any window exists, and it is the same state a running node loads.
+pub fn federation_cli(args: &[String]) -> i32 {
+    let mut out = std::io::stdout();
+    federation::command(args, &federation::dir(), &mut out)
+}
+
 /// Launch the BOS Harness desktop window. Blocks until the window closes.
 pub fn run() {
     let dir = dirs::home_dir()
@@ -69,6 +83,9 @@ pub fn run() {
     // A previous SIGKILL can leave Chromium behind; clean it before the next
     // window, not only when the browser pane is first opened.
     browser::reap_orphans();
+    // Federation is opt-in and must never keep the window from opening: a node
+    // that cannot start is logged and the app runs without it.
+    crate::federation_node::start_from_settings(&crate::settings::Settings::load());
     ui::run(ui::Startup::from_args());
     // The window closed, so no plugin process may outlive it. A bridged plugin is
     // a child this app started; leaving it running would be a leaked process the

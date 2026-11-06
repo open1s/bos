@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use react::tool::registry::AsyncTool;
-use react::tool::{Tool, ToolError};
+use react::tool::{Tool, ToolError, ToolMetadata};
 
 use super::client::McpClient;
 
@@ -13,6 +13,7 @@ pub struct McpToolAdapter {
     mcp_tool_name: String,
     description: String,
     input_schema: serde_json::Value,
+    metadata: ToolMetadata,
 }
 
 impl McpToolAdapter {
@@ -30,8 +31,23 @@ impl McpToolAdapter {
             mcp_tool_name,
             description,
             input_schema,
+            metadata: mcp_tool_metadata(),
         }
     }
+}
+
+/// What an MCP tool declares about itself.
+///
+/// An MCP tool always reaches the network; the server decides what it does
+/// there. It carries no version of its own, so the catalogue records
+/// `Unknown` rather than inventing one. Risk and permissions are conservative
+/// because the declaration cannot be more specific than "a remote party runs
+/// this".
+pub fn mcp_tool_metadata() -> ToolMetadata {
+    ToolMetadata::new()
+        .with_risk("medium")
+        .with_side_effects(["network"])
+        .with_permissions(["net.egress"])
 }
 
 impl Tool for McpToolAdapter {
@@ -41,6 +57,10 @@ impl Tool for McpToolAdapter {
 
     fn description(&self) -> String {
         self.description.clone()
+    }
+
+    fn metadata(&self) -> Option<&ToolMetadata> {
+        Some(&self.metadata)
     }
 
     fn run(&self, args: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
@@ -73,6 +93,10 @@ impl AsyncTool for McpToolAdapter {
 
     fn description(&self) -> String {
         self.description.clone()
+    }
+
+    fn metadata(&self) -> Option<&ToolMetadata> {
+        Some(&self.metadata)
     }
 
     fn json_schema(&self) -> serde_json::Value {

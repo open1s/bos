@@ -135,6 +135,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "bus",
+ "capability",
  "config",
  "dashmap",
  "dirs 7.0.0",
@@ -147,6 +148,7 @@ dependencies = [
  "react",
  "regorus 0.14.0",
  "reqwest",
+ "semver",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1380,11 +1382,13 @@ dependencies = [
  "async-channel",
  "async-trait",
  "base64 0.23.1",
+ "bus",
  "chacha20poly1305",
  "config",
  "dirs 7.0.0",
  "ed25519-dalek",
  "extism",
+ "federation",
  "ferris-sdk",
  "flate2",
  "futures",
@@ -1602,6 +1606,18 @@ dependencies = [
  "rustix-linux-procfs",
  "windows-sys 0.61.2",
  "winx",
+]
+
+[[package]]
+name = "capability"
+version = "4.0.2"
+dependencies = [
+ "async-trait",
+ "semver",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]
@@ -3437,6 +3453,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e6853b52649d4ac5c0bd02320cddc5ba956bdb407c4b75a2c6b75bf51500f8c"
 dependencies = [
  "simd-adler32",
+]
+
+[[package]]
+name = "federation"
+version = "4.0.2"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "bus",
+ "capability",
+ "ed25519-dalek",
+ "rand 0.10.3",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]

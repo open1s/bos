@@ -560,6 +560,11 @@ pub(crate) struct AppState {
     /// its own small record beside the state it guards. Env values never enter
     /// it: only the command line, the package and its path.
     trust_audit: std::collections::VecDeque<TrustDecision>,
+    /// The last federation decisions, read once at launch and advanced by the
+    /// audit broadcast while the shell runs.
+    pub(crate) federation_recent: Vec<federation::FederationEvent>,
+    /// Records written by the runtime, drained cheaply while rendering.
+    pub(crate) federation_events: tokio::sync::broadcast::Receiver<federation::FederationEvent>,
     /// A transient line of feedback.
     pub(crate) notice: Option<String>,
     /// Whether the usage pill's dialog is open.
@@ -840,6 +845,8 @@ impl AppState {
             mcp: crate::mcp::McpPool::default(),
             browser: Arc::new(crate::browser::BrowserHandle::new()),
             trust_audit: std::collections::VecDeque::new(),
+            federation_recent: Vec::new(),
+            federation_events: crate::federation_audit::subscribe(),
             notice: None,
             stat_open: false,
             meter_open: false,
@@ -889,6 +896,14 @@ impl AppState {
                 workspace.root = scratch.clone();
             }
         }
+        // The last federation decisions, read once for the settings row: the
+        // pane must not touch the log per frame, and a launch-time read is
+        // enough to say what happened most recently.
+        state.federation_recent = state
+            .settings
+            .federation_audit_path()
+            .map(|path| crate::federation_audit::load(&path, 5))
+            .unwrap_or_default();
         // The vault lives beside the document this state writes, which is the
         // scratch store for a test and the bsh data directory for the app. It
         // starts LOCKED, whether or not the file exists.

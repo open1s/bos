@@ -17,6 +17,8 @@ path = "src/main.rs"
 
 [dependencies]
 ferris-sdk = { path = "../ferris-sdk", features = ["host-runtime"] }
+federation = { path = "../federation" }
+bus = { path = "../bus" }
 arrow =  { version = "60.0.0"}
 parquet = { version = "60.0.0", features = ["arrow"] }
 # One UI dependency: gpui-kit re-exports gpui, gpui-base, gpui-component and the

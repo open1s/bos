@@ -5339,6 +5339,11 @@ impl Drop for Shell {
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Non-blocking: a decision written since the last frame joins the
+        // settings row's tail. This is a channel receive, not disk I/O.
+        while let Ok(event) = self.state.federation_events.try_recv() {
+            crate::federation_audit::push_recent(&mut self.state.federation_recent, event);
+        }
         // The terminal is a native layer ABOVE everything GPUI paints, so its
         // presence is derived from the state that owns it rather than trusting
         // each path that switches tabs or opens a dialog to take it down: a

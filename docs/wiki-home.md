@@ -19,6 +19,7 @@ BOS 将共享的 Agent 执行核心与多语言接口、桌面工作空间结合
 | 将 Agent Runtime 集成到 Rust 应用 | 使用 BOS Rust crates |
 | 在桌面环境中开发和运行 Agent | 使用 [BSH](https://github.com/open1s/bos) |
 | 为工作空间添加能力 | 开发 [BSH 扩展](https://github.com/open1s/bos/blob/main/docs/bsh-extension.md) |
+| 在多个 BSH 之间共享能力 | 阅读 [BSH Federation](https://github.com/open1s/bos/blob/main/docs/bsh-federation.md) |
 
 ## 为什么选择 BOS？
 

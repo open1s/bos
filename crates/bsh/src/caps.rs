@@ -7,23 +7,41 @@
 //! Write confines the shell and the file tools to the active workspace, and Full
 //! access releases both.
 
+use std::cell::RefCell;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use agent::capabilities::{CapabilityTool, NativeToolProvider, ProxySource, ToolFacts};
+use agent::capability::{CapabilityProvider, WorkspaceRuntime};
 use agent::goal::Goal;
 use agent::memory::{FileMemory, MemoryStore};
 use agent::policy::{
     Action, EgressGate, EgressRuleSet, PolicyData, PolicyInput, PolicySet, PolicySource,
     SystemResolver, Target,
 };
-use agent::tools::{BashTool, FunctionTool, GetGoalTool, GoalStore, PlanTool, UpdateGoalTool};
+use agent::tools::{
+    BashTool, DeclaredAsyncTool, DeclaredTool, FunctionTool, GetGoalTool, GoalStore, PlanTool,
+    ToolMetadata, ToolRegistry, UpdateGoalTool,
+};
 use agent::{Agent, AgentConfig, ToolError};
 use futures::StreamExt;
 use log::warn;
+
+/// Declare this host's capability metadata on a built-in tool.
+///
+/// The wrapper changes nothing about execution; it attaches the risk, side
+/// effects, and permission scopes a capability catalogue reads. A name with no
+/// declaration is a wiring mistake and fails the build of the turn.
+fn declare(name: &str) -> agent::tools::ToolMetadata {
+    crate::tool_metadata::builtin_metadata(name)
+        .unwrap_or_else(|| panic!("built-in tool {name} has no declared metadata"))
+}
 
 use crate::plugins::{self, PluginInfo};
 use crate::settings::{Effective, Settings};
@@ -538,6 +556,11 @@ pub(crate) struct BuiltAgent {
     pub(crate) extension_activations: crate::extension::host::ActivationList,
     /// The service-change watcher for this build; aborted on drop.
     live_driver: LiveDriverGuard,
+    /// What this build actually composed: every capability, its exact version,
+    /// and whether it runs here or on a peer. Taken once, after every provider,
+    /// extension, and MCP tool is in place, so it records the build rather than
+    /// a plan that was hoped for.
+    pub(crate) snapshot: Option<Arc<agent::capability::CompositionSnapshot>>,
     /// Why the provider credential could not be resolved, if it could not.
     ///
     /// A locked vault is named here rather than silently handing the engine an
@@ -972,24 +995,30 @@ fn build_agent_for_session_inner(
             if let Some(reason) = crate::settings::resolve::sandbox_off_reason(&eff.sandbox) {
                 bash = bash.with_sandbox_reason(reason);
             }
-            shell_tools.push(Arc::new(bash));
+            shell_tools.push(Arc::new(DeclaredTool::new(Arc::new(bash), declare("bash"))));
         }
         // The job tools share the shell bundle but each has its own gate: a
         // preset that names only `job_output` gets exactly that tool, and a
         // policy that denies `job_kill` leaves the reader intact.
         if gates.output && !off_tool("job_output") {
-            shell_tools.push(Arc::new(
-                agent::tools::JobTool::reader("job_output")
-                    .with_policy(policy.clone(), session, preset.clone())
-                    .with_jobs(jobs.clone(), session),
-            ));
+            shell_tools.push(Arc::new(DeclaredTool::new(
+                Arc::new(
+                    agent::tools::JobTool::reader("job_output")
+                        .with_policy(policy.clone(), session, preset.clone())
+                        .with_jobs(jobs.clone(), session),
+                ),
+                declare("job_output"),
+            )));
         }
         if gates.kill && !off_tool("job_kill") {
-            shell_tools.push(Arc::new(
-                agent::tools::JobTool::stopper("job_kill")
-                    .with_policy(policy.clone(), session, preset.clone())
-                    .with_jobs(jobs.clone(), session),
-            ));
+            shell_tools.push(Arc::new(DeclaredTool::new(
+                Arc::new(
+                    agent::tools::JobTool::stopper("job_kill")
+                        .with_policy(policy.clone(), session, preset.clone())
+                        .with_jobs(jobs.clone(), session),
+                ),
+                declare("job_kill"),
+            )));
         }
         if !shell_tools.is_empty() {
             bundles.push(plugins::Bundle::new("shell", shell_tools));
@@ -1010,75 +1039,99 @@ fn build_agent_for_session_inner(
         let enforce_escape = is_confined(&permission);
         let mut files: Vec<Arc<dyn agent::tools::Tool>> = Vec::new();
         if !off_tool("glob") {
-            files.push(Arc::new(glob_tool(
-                files_root.clone(),
-                enforce_escape,
-                policy.clone(),
-                session.to_string(),
-                preset.clone(),
+            files.push(Arc::new(DeclaredTool::new(
+                Arc::new(glob_tool(
+                    files_root.clone(),
+                    enforce_escape,
+                    policy.clone(),
+                    session.to_string(),
+                    preset.clone(),
+                )),
+                declare("glob"),
             )));
         }
         if !off_tool("grep") {
-            files.push(Arc::new(grep_tool(
-                files_root.clone(),
-                enforce_escape,
-                policy.clone(),
-                session.to_string(),
-                preset.clone(),
+            files.push(Arc::new(DeclaredTool::new(
+                Arc::new(grep_tool(
+                    files_root.clone(),
+                    enforce_escape,
+                    policy.clone(),
+                    session.to_string(),
+                    preset.clone(),
+                )),
+                declare("grep"),
             )));
         }
         if !off_tool("read_file") {
-            files.push(Arc::new(read_file_tool(
-                files_root.clone(),
-                enforce_escape,
-                policy.clone(),
-                session.to_string(),
-                preset.clone(),
+            files.push(Arc::new(DeclaredTool::new(
+                Arc::new(read_file_tool(
+                    files_root.clone(),
+                    enforce_escape,
+                    policy.clone(),
+                    session.to_string(),
+                    preset.clone(),
+                )),
+                declare("read_file"),
             )));
         }
         if !off_tool("read_files") {
-            files.push(Arc::new(read_files_tool(
-                files_root.clone(),
-                enforce_escape,
-                policy.clone(),
-                session.to_string(),
-                preset.clone(),
+            files.push(Arc::new(DeclaredTool::new(
+                Arc::new(read_files_tool(
+                    files_root.clone(),
+                    enforce_escape,
+                    policy.clone(),
+                    session.to_string(),
+                    preset.clone(),
+                )),
+                declare("read_files"),
             )));
         }
         if writes && !off_tool("write_file") {
-            files.push(Arc::new(write_file_tool(
-                files_root.clone(),
-                enforce_escape,
-                policy.clone(),
-                session.to_string(),
-                preset.clone(),
+            files.push(Arc::new(DeclaredTool::new(
+                Arc::new(write_file_tool(
+                    files_root.clone(),
+                    enforce_escape,
+                    policy.clone(),
+                    session.to_string(),
+                    preset.clone(),
+                )),
+                declare("write_file"),
             )));
         }
         if writes && !off_tool("edit_file") {
-            files.push(Arc::new(edit_file_tool(
-                files_root.clone(),
-                enforce_escape,
-                policy.clone(),
-                session.to_string(),
-                preset.clone(),
+            files.push(Arc::new(DeclaredTool::new(
+                Arc::new(edit_file_tool(
+                    files_root.clone(),
+                    enforce_escape,
+                    policy.clone(),
+                    session.to_string(),
+                    preset.clone(),
+                )),
+                declare("edit_file"),
             )));
         }
         if writes && !off_tool("apply_patch") {
-            files.push(Arc::new(apply_patch_tool(
-                files_root.clone(),
-                enforce_escape,
-                policy.clone(),
-                session.to_string(),
-                preset.clone(),
+            files.push(Arc::new(DeclaredTool::new(
+                Arc::new(apply_patch_tool(
+                    files_root.clone(),
+                    enforce_escape,
+                    policy.clone(),
+                    session.to_string(),
+                    preset.clone(),
+                )),
+                declare("apply_patch"),
             )));
         }
         if !off_tool("list_dir") {
-            files.push(Arc::new(list_dir_tool(
-                files_root.clone(),
-                enforce_escape,
-                policy.clone(),
-                session.to_string(),
-                preset.clone(),
+            files.push(Arc::new(DeclaredTool::new(
+                Arc::new(list_dir_tool(
+                    files_root.clone(),
+                    enforce_escape,
+                    policy.clone(),
+                    session.to_string(),
+                    preset.clone(),
+                )),
+                declare("list_dir"),
             )));
         }
         if !files.is_empty() {
@@ -1086,7 +1139,10 @@ fn build_agent_for_session_inner(
         }
     }
     if !off_bundle("plan") && !off_tool("update_plan") {
-        let tool: Arc<dyn agent::tools::Tool> = Arc::new(PlanTool::new(agent.plan()));
+        let tool: Arc<dyn agent::tools::Tool> = Arc::new(DeclaredTool::new(
+            Arc::new(PlanTool::new(agent.plan())),
+            declare("update_plan"),
+        ));
         bundles.push(plugins::Bundle::new("plan", vec![tool]));
     }
 
@@ -1106,10 +1162,16 @@ fn build_agent_for_session_inner(
         let store = GoalStore::new(goal);
         let mut tools: Vec<Arc<dyn agent::tools::Tool>> = Vec::new();
         if !off_goal_tool("get_goal") {
-            tools.push(Arc::new(GetGoalTool::new(store.clone())));
+            tools.push(Arc::new(DeclaredTool::new(
+                Arc::new(GetGoalTool::new(store.clone())),
+                declare("get_goal"),
+            )));
         }
         if !off_goal_tool("update_goal") {
-            tools.push(Arc::new(UpdateGoalTool::new(store.clone())));
+            tools.push(Arc::new(DeclaredTool::new(
+                Arc::new(UpdateGoalTool::new(store.clone())),
+                declare("update_goal"),
+            )));
         }
         if !tools.is_empty() {
             goal_store = Some(store);
@@ -1194,8 +1256,11 @@ fn build_agent_for_session_inner(
         .cloned()
         .collect();
     if mcp_tools.len() > crate::mcp::MCP_GATEWAY_THRESHOLD {
-        let gateway = crate::mcp::McpGateway::new(mcp_tools.clone());
-        match agent.try_add_async_tool(Arc::new(gateway)) {
+        let gateway = Arc::new(DeclaredAsyncTool::new(
+            Arc::new(crate::mcp::McpGateway::new(mcp_tools.clone())),
+            declare("mcp_gateway"),
+        ));
+        match agent.try_add_async_tool(gateway) {
             Ok(()) => log::info!(
                 "mcp: {} tools behind one gateway (threshold {})",
                 mcp_tools.len(),
@@ -1404,6 +1469,42 @@ fn build_agent_for_session_inner(
     if !settings.workspace.disabled.skills.is_empty() {
         agent.remove_skills_by_names(&settings.workspace.disabled.skills);
     }
+    // A trusted peer's capabilities reach the model only when the reader asked
+    // for them. The node is a process singleton; a build with no running node
+    // (federation disabled, or the node failed to start) has no remote tools.
+    if settings.global.federation.enabled && settings.global.federation.include_remote_tools {
+        if let Some(federation) = crate::federation_node::running() {
+            let workspace = agent::capability::WorkspaceId::new(format!("ws:session:{session}"))
+                .unwrap_or_else(|_| {
+                    agent::capability::WorkspaceId::new("ws:session")
+                        .expect("a valid fallback workspace id")
+                });
+            match crate::federation_node::attach_remote_tools(
+                &agent,
+                federation,
+                workspace,
+                agent::capability::Principal::Local {
+                    session: session.to_string(),
+                    preset: preset.clone(),
+                },
+            ) {
+                Ok(0) => {}
+                Ok(count) => {
+                    log::info!("federation: {count} remote capabilities offered to the model")
+                }
+                Err(error) => log::warn!("federation remote tools were not attached: {error}"),
+            }
+        }
+    }
+    // The capability registry is opt-in: it rebuilds this turn's tools through
+    // the model (validation, descriptors, provider dispatch) instead of the
+    // raw registry. A failure keeps the raw registry, so the turn still runs.
+    if settings.global.general.capability_registry {
+        match compose_registry(&mut agent, session, &preset) {
+            Ok(count) => log::info!("capability registry composed {count} tools"),
+            Err(error) => log::warn!("capability registry kept the raw tools: {error}"),
+        }
+    }
     // The prompt names a tool only when the request actually carries it. This
     // runs after every attachment (bundles, MCP, extensions, browser, search,
     // subagent) and before the meter prices the request, so the two cannot
@@ -1444,6 +1545,14 @@ fn build_agent_for_session_inner(
             }),
         );
     }
+    // One record of what this build composed, taken here because every
+    // provider, extension, and MCP tool is now installed. The cache returns the
+    // same record for an unchanged surface, so the log is written once per
+    // distinct composition rather than once per send.
+    let (snapshot, composition_is_new) = match composition_for(&agent) {
+        Some((entry, fresh)) => (Some(Arc::clone(&entry.snapshot)), fresh),
+        None => (None, false),
+    };
     crate::extension::publish(
         crate::extension::topics::INSTRUCTION_BUILD,
         serde_json::json!({
@@ -1453,10 +1562,19 @@ fn build_agent_for_session_inner(
             "skills": agent.all_skills().len(),
             "schema_chars": schema_chars,
             "withheld_chars": withheld_chars,
+            "capabilities": snapshot
+                .as_ref()
+                .map_or(0, |snapshot| snapshot.capabilities.len()),
         }),
     );
+    if let (true, Some(snapshot), Some(path)) =
+        (composition_is_new, &snapshot, settings.compositions_path())
+    {
+        crate::compositions::record(&path, snapshot);
+    }
     let mut built = BuiltAgent {
         agent: Arc::new(agent),
+        snapshot,
         plugins,
         extension_activations: extension_activations.into(),
         live_driver: LiveDriverGuard(None),
@@ -1467,6 +1585,14 @@ fn build_agent_for_session_inner(
         goal: goal_store,
     };
     built.start_live_driver();
+    if let Some(snapshot) = &built.snapshot {
+        log::debug!(
+            "composition {} capabilities={} local={}",
+            snapshot.composition,
+            snapshot.capabilities.len(),
+            snapshot.is_local_only()
+        );
+    }
     built
 }
 
@@ -1626,6 +1752,223 @@ pub(crate) fn credential_error(
     provider_api_key(&eff, vault).1
 }
 
+/// The turn's tool set as a resolved capability plan.
+///
+/// The registry stays the authority for what this turn may call: this projects
+/// it through the capability model without changing what runs. It is the
+/// evidence that the model expresses the turn exactly - a tool the capability
+/// model cannot describe is a tool composition cannot govern.
+pub(crate) fn plan_for_registry(
+    agent: &Agent,
+) -> Result<agent::capability::composition::ResolvedComposition, String> {
+    use agent::capability::composition::{
+        resolve, CapabilityRequirement, CompositionSpec, LocalScope,
+    };
+    use agent::capability::id::WorkspaceId;
+    use semver::{Version, VersionReq};
+
+    let registry = agent.registry().ok_or("the agent has no tool registry")?;
+    let catalogue = agent::capabilities::catalogue_from_registry(registry)
+        .map_err(|error| error.to_string())?;
+    let workspace = WorkspaceId::new("ws:turn").map_err(|error| error.to_string())?;
+    let mut scope = LocalScope::new(workspace);
+    let mut spec = CompositionSpec::new(
+        "compose:turn",
+        Version::new(1, 0, 0),
+        "the tools this turn may call",
+    );
+    for id in catalogue.ids() {
+        scope.admit(id.clone());
+        spec = spec.with_requirement(CapabilityRequirement::new(id.clone(), VersionReq::STAR));
+    }
+    resolve(&spec, &catalogue, &[], &scope).map_err(|error| error.to_string())
+}
+
+/// One cached composition, keyed by the tool surface it was built from.
+struct CachedComposition {
+    key: u64,
+    plan: Arc<agent::capability::composition::ResolvedComposition>,
+    snapshot: Arc<agent::capability::CompositionSnapshot>,
+    /// The shim registry built for this surface and principal, when a build
+    /// asked for it. Reusing it keeps the capability-registry mode cheap on a
+    /// warm cache.
+    composed: Option<Arc<ToolRegistry>>,
+    /// The surface fingerprint mixed with the principal the shims were built
+    /// for: a shim carries the session and preset it reports, so a different
+    /// turn principal must not reuse it.
+    composed_key: u64,
+}
+
+thread_local! {
+    /// The last composition this thread built. A build normally runs on the
+    /// same thread as the previous one, so an unchanged tool surface reuses
+    /// the plan, the snapshot, and the log record instead of rebuilding them.
+    static COMPOSITION_CACHE: RefCell<Option<Arc<CachedComposition>>> = const { RefCell::new(None) };
+}
+
+/// A fingerprint of the exact tool surface: names, schemas, and declarations.
+///
+/// A schema or a declaration that changes without a name change invalidates the
+/// cache too, because the descriptor the engine would advertise changed.
+fn registry_fingerprint(registry: &ToolRegistry) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    let mut names = registry.list();
+    names.sort();
+    for name in names {
+        name.hash(&mut hasher);
+        if let Some(tool) = registry.get(&name) {
+            tool.json_schema().to_string().hash(&mut hasher);
+            hash_metadata(tool.metadata(), &mut hasher);
+        } else if let Some(tool) = registry.get_async(&name) {
+            tool.json_schema().to_string().hash(&mut hasher);
+            hash_metadata(tool.metadata(), &mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+fn hash_metadata(metadata: Option<&ToolMetadata>, hasher: &mut impl Hasher) {
+    if let Some(metadata) = metadata {
+        metadata.version.hash(hasher);
+        metadata.risk.hash(hasher);
+        metadata.side_effects.hash(hasher);
+        metadata.permissions.hash(hasher);
+        metadata.timeout_ms.hash(hasher);
+        metadata.max_output_bytes.hash(hasher);
+    }
+}
+
+/// Remember the shim registry a build made for this surface.
+fn cache_composed(key: u64, composed_key: u64, composed: Arc<ToolRegistry>) {
+    COMPOSITION_CACHE.with(|cache| {
+        let mut slot = cache.borrow_mut();
+        let Some(entry) = slot.as_ref() else {
+            return;
+        };
+        if entry.key != key {
+            return;
+        }
+        let plan = Arc::clone(&entry.plan);
+        let snapshot = Arc::clone(&entry.snapshot);
+        *slot = Some(Arc::new(CachedComposition {
+            key,
+            plan,
+            snapshot,
+            composed: Some(composed),
+            composed_key,
+        }));
+    });
+}
+
+fn principal_salt(session: &str, preset: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    session.hash(&mut hasher);
+    preset.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The composition for this tool surface, and whether it was just built.
+fn composition_for(agent: &Agent) -> Option<(Arc<CachedComposition>, bool)> {
+    let registry = agent.registry()?;
+    let key = registry_fingerprint(registry);
+    let cached = COMPOSITION_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .filter(|entry| entry.key == key)
+            .map(Arc::clone)
+    });
+    if let Some(entry) = cached {
+        return Some((entry, false));
+    }
+    let plan = plan_for_registry(agent).ok()?;
+    let snapshot = agent::capability::CompositionSnapshot::from_resolved(
+        &plan,
+        None,
+        agent::capability::unix_ms(),
+    );
+    let entry = Arc::new(CachedComposition {
+        key,
+        plan: Arc::new(plan),
+        snapshot: Arc::new(snapshot),
+        composed: None,
+        composed_key: 0,
+    });
+    COMPOSITION_CACHE.with(|cache| {
+        *cache.borrow_mut() = Some(Arc::clone(&entry));
+    });
+    Some((entry, true))
+}
+/// Rebuild this turn's registry through the capability model.
+///
+/// The raw tools are kept by the provider; the registry the engine sees holds
+/// one shim per capability, so every call is validated against the descriptor
+/// and dispatched through the same path a remote capability would take.
+fn compose_registry(agent: &mut Agent, session: &str, preset: &str) -> Result<usize, String> {
+    let registry = agent
+        .registry()
+        .ok_or("the agent has no tool registry")?
+        .clone();
+    let entry = composition_for(agent)
+        .ok_or("the composition could not be resolved")?
+        .0;
+    let wanted = entry.key ^ principal_salt(session, preset);
+    if let Some(composed) = entry
+        .composed
+        .as_ref()
+        .filter(|_| entry.composed_key == wanted)
+    {
+        let count = composed.list().len();
+        agent.set_registry((**composed).clone());
+        return Ok(count);
+    }
+    let plan = (*entry.plan).clone();
+    let provider: Arc<dyn CapabilityProvider> =
+        Arc::new(NativeToolProvider::new(Arc::clone(&registry)));
+    let runtime = Arc::new(
+        WorkspaceRuntime::instantiate(plan, &[provider]).map_err(|error| error.to_string())?,
+    );
+    let principal = agent::capability::Principal::Local {
+        session: session.to_string(),
+        preset: preset.to_string(),
+    };
+    let mut composed = ToolRegistry::new();
+    for descriptor in runtime.describe() {
+        let id = descriptor.id.clone();
+        let name = descriptor.surface.to_string();
+        let Some(mut tool) = CapabilityTool::new(Arc::clone(&runtime), &id, principal.clone())
+        else {
+            continue;
+        };
+        // Presentation facts belong to the replaced tool, not to the runtime:
+        // a deferred tool stays deferred, a skill stays a skill, and a
+        // dispatcher still names the tool it forwards to.
+        if let Some(raw) = registry.get(&name) {
+            tool = tool
+                .with_facts(ToolFacts {
+                    deferred: raw.deferred(),
+                    is_skill: raw.is_skill(),
+                    cancelable: raw.is_cancelable(),
+                })
+                .with_proxy(ProxySource::Sync(raw));
+        } else if let Some(raw) = registry.get_async(&name) {
+            tool = tool
+                .with_facts(ToolFacts {
+                    deferred: raw.deferred(),
+                    is_skill: raw.is_skill(),
+                    cancelable: raw.is_cancelable(),
+                })
+                .with_proxy(ProxySource::Async(raw));
+        }
+        composed
+            .register_async(Arc::new(tool))
+            .map_err(|error| error.to_string())?;
+    }
+    let count = composed.list().len();
+    cache_composed(entry.key, wanted, Arc::new(composed.clone()));
+    agent.set_registry(composed);
+    Ok(count)
+}
 /// The serialized length of the tool definitions an agent sends.
 ///
 /// `contextBreakdown`'s tools bucket follows the latest request header, so this
@@ -2307,7 +2650,10 @@ pub(crate) fn attach_subagent_tool(agent: &mut Agent, context: SubagentContext) 
             }
         },
     );
-    if let Err(error) = agent.try_add_async_tool(Arc::new(tool)) {
+    if let Err(error) = agent.try_add_async_tool(Arc::new(DeclaredAsyncTool::new(
+        Arc::new(tool),
+        declare("subagent"),
+    ))) {
         warn!("subagent tool was not registered: {error}");
         return;
     }
@@ -2421,7 +2767,10 @@ fn attach_subagent_result_tool(
             }
         },
     );
-    if let Err(error) = agent.try_add_async_tool(Arc::new(tool)) {
+    if let Err(error) = agent.try_add_async_tool(Arc::new(DeclaredAsyncTool::new(
+        Arc::new(tool),
+        declare("subagent_result"),
+    ))) {
         warn!("subagent_result tool was not registered: {error}");
     }
 }
@@ -5260,6 +5609,433 @@ mod tests {
         );
     }
 
+    /// Every built-in this host composes declares the metadata a capability
+    /// catalogue needs. A tool without a declaration is invisible to
+    /// composition, so the wiring is checked against a real build rather than
+    /// against the declaration table alone.
+    #[test]
+    fn the_builtin_tools_declare_their_capability_metadata() {
+        let settings = with_tools("workspace-write", None);
+        let built = build(&settings);
+        let registry = built.agent.registry().expect("a tool registry");
+
+        let declared = [
+            "bash",
+            "glob",
+            "grep",
+            "read_file",
+            "read_files",
+            "write_file",
+            "edit_file",
+            "apply_patch",
+            "list_dir",
+            "update_plan",
+            "web_search",
+            "subagent",
+            "subagent_result",
+        ];
+        let mut saw = 0;
+        for name in declared {
+            let Some(tool) = registry.get(name) else {
+                continue;
+            };
+            let metadata = tool
+                .metadata()
+                .unwrap_or_else(|| panic!("{name} declares capability metadata"));
+            assert_eq!(metadata.version.as_deref(), Some("1.0.0"), "{name}");
+            assert!(metadata.risk.is_some(), "{name} declares a risk class");
+            saw += 1;
+        }
+        assert!(
+            saw >= 8,
+            "the default build offers the file and shell tools, saw {saw}"
+        );
+    }
+
+    /// The turn's registry is exactly a resolved capability plan: the model can
+    /// name and govern every tool the build offers, with nothing left over on
+    /// either side.
+    #[test]
+    fn the_turns_tools_are_exactly_a_resolved_capability_plan() {
+        use crate::caps::plan_for_registry;
+        let settings = with_tools("workspace-write", None);
+        let built = build(&settings);
+        let registry = built.agent.registry().expect("a tool registry");
+        let plan = plan_for_registry(&built.agent).expect("the plan resolves");
+
+        assert!(
+            plan.is_local_only(),
+            "the turn composes only local bindings"
+        );
+        assert_eq!(
+            plan.capabilities.len(),
+            registry.list().len(),
+            "every registered tool is in the plan"
+        );
+        let planned: std::collections::BTreeSet<String> = plan
+            .capabilities
+            .iter()
+            .map(|capability| capability.descriptor.surface.to_string())
+            .collect();
+        let registered: std::collections::BTreeSet<String> = registry.list().into_iter().collect();
+        assert_eq!(
+            planned, registered,
+            "the plan and the registry name one set"
+        );
+    }
+
+    /// A real turn build records what it got: every capability, at its exact
+    /// version, with no secret material in the record.
+    #[test]
+    fn a_turn_build_snapshots_its_composition() {
+        let settings = with_tools("workspace-write", None);
+        let built = build(&settings);
+        let registry = built.agent.registry().expect("a tool registry");
+
+        let snapshot = built
+            .snapshot
+            .as_ref()
+            .expect("the build records its composition");
+
+        assert_eq!(snapshot.capabilities.len(), registry.list().len());
+        assert!(snapshot.is_local_only());
+        let json = serde_json::to_string(&snapshot).expect("the snapshot serializes");
+        assert!(!json.contains("secret"), "{json}");
+        assert!(!json.contains("api_key"), "{json}");
+    }
+
+    /// A real build writes exactly one record, and the record matches the
+    /// snapshot the build carries.
+    #[test]
+    fn a_turn_build_records_its_composition() {
+        let mut settings = with_tools("workspace-write", None);
+        let root = std::env::temp_dir().join(format!("bsh-composition-log-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        settings.save_root = Some(root.clone());
+
+        let built = build(&settings);
+
+        let snapshot = built.snapshot.as_ref().expect("the build records one");
+        let path = root.join("compositions.jsonl");
+        let records = crate::compositions::load(&path, 8);
+        assert_eq!(records.len(), 1, "one build writes one record");
+        assert_eq!(records[0], **snapshot);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A trusted peer's capability is offered to the model only when the build
+    /// asks for it, and the offered tool reaches the peer's runtime.
+    #[tokio::test]
+    async fn a_trusted_peer_capability_is_offered_as_a_tool() {
+        use crate::federation_node::{assemble, attach_remote_tools};
+        use agent::capability::composition::{Binding, ResolvedCapability, ResolvedComposition};
+        use agent::capability::{
+            CapabilityCall, CapabilityDescriptor, CapabilityKind, CapabilityOutput,
+            CapabilityProvider, Principal, ProviderHealth, ProviderId, ProviderKind, VersionSource,
+            Visibility, WorkspaceId, WorkspaceRuntime,
+        };
+        use async_trait::async_trait;
+        use federation::{FederationNode, InMemoryNetwork, NodeIdentity, PeerStore};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct Echo {
+            descriptor: CapabilityDescriptor,
+            calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl CapabilityProvider for Echo {
+            fn id(&self) -> &ProviderId {
+                static BUILTIN: std::sync::OnceLock<ProviderId> = std::sync::OnceLock::new();
+                BUILTIN.get_or_init(ProviderId::builtin)
+            }
+            fn kind(&self) -> ProviderKind {
+                ProviderKind::Builtin
+            }
+            async fn describe(
+                &self,
+            ) -> Result<Vec<CapabilityDescriptor>, agent::capability::CapabilityError> {
+                Ok(vec![self.descriptor.clone()])
+            }
+            async fn invoke(
+                &self,
+                call: CapabilityCall<'_>,
+            ) -> Result<CapabilityOutput, agent::capability::CapabilityError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(CapabilityOutput::json(
+                    serde_json::json!({ "remote": call.input }),
+                ))
+            }
+            async fn health(&self) -> ProviderHealth {
+                ProviderHealth::Available
+            }
+        }
+
+        let network = Arc::new(InMemoryNetwork::new());
+        let provider_identity = NodeIdentity::from_seed([31u8; 32]);
+        let provider_id = provider_identity.node_id();
+        let descriptor = CapabilityDescriptor::new(
+            "builtin/remote_echo".parse().expect("an id"),
+            CapabilityKind::Tool,
+            semver::Version::new(1, 0, 0),
+            VersionSource::Declared,
+        )
+        .with_visibility(Visibility::Public);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let echo: Arc<dyn CapabilityProvider> = Arc::new(Echo {
+            descriptor: descriptor.clone(),
+            calls: Arc::clone(&calls),
+        });
+        let peer_plan = ResolvedComposition {
+            id: "compose:peer".into(),
+            version: semver::Version::new(1, 0, 0),
+            workspace: WorkspaceId::new("ws:peer").expect("a workspace"),
+            capabilities: vec![ResolvedCapability {
+                descriptor: descriptor.clone(),
+                binding: Binding::Local {
+                    provider: ProviderId::builtin(),
+                },
+            }],
+            skipped: Vec::new(),
+        };
+        let peer_runtime =
+            Arc::new(WorkspaceRuntime::instantiate(peer_plan, &[echo]).expect("a peer runtime"));
+        let (peer_transport, peer_inbox) = network.join(provider_id.clone());
+        let peer_node = FederationNode::new(provider_identity, Arc::new(peer_transport))
+            .with_public_capabilities(vec![descriptor])
+            .with_runtime(peer_runtime);
+        let _peer_task = peer_node.start(peer_inbox);
+
+        let identity = NodeIdentity::from_seed([32u8; 32]);
+        let local_id = identity.node_id();
+        let (transport, inbox) = network.join(local_id.clone());
+        let federation = assemble(
+            identity,
+            PeerStore::new(),
+            Arc::new(transport),
+            inbox,
+            None,
+            None,
+        );
+        let now = agent::capability::unix_ms();
+        {
+            let peers = federation.node().peers();
+            let mut peers = peers.write().expect("peers");
+            peers.enroll(provider_id.clone(), now, None);
+            peers
+                .grant(
+                    &provider_id,
+                    "builtin/remote_echo".parse().expect("an id"),
+                    now,
+                    None,
+                )
+                .expect("granted");
+        }
+        {
+            let peers = peer_node.peers();
+            let mut peers = peers.write().expect("peers");
+            peers.enroll(local_id.clone(), now, None);
+            peers
+                .grant(
+                    &local_id,
+                    "builtin/remote_echo".parse().expect("an id"),
+                    now,
+                    None,
+                )
+                .expect("granted");
+        }
+        federation.refresh_peers().await;
+
+        let settings = with_tools("workspace-write", None);
+        let built = build(&settings);
+        assert!(
+            built
+                .agent
+                .live_tools()
+                .read()
+                .expect("live tools")
+                .get_async("remote_echo")
+                .is_none(),
+            "nothing remote is offered before the attach"
+        );
+
+        let added = attach_remote_tools(
+            &built.agent,
+            &federation,
+            WorkspaceId::new("ws:test").expect("a workspace"),
+            Principal::Local {
+                session: "session".to_string(),
+                preset: "preset".to_string(),
+            },
+        )
+        .expect("the capability attaches");
+        assert_eq!(added, 1);
+
+        let tool = built
+            .agent
+            .live_tools()
+            .read()
+            .expect("live tools")
+            .get_async("remote_echo")
+            .expect("the remote tool is registered");
+        let output = tool
+            .run(&serde_json::json!({ "v": 5 }))
+            .await
+            .expect("the peer runs it");
+        assert_eq!(output["remote"]["v"], 5);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // The peer leaves: the attached tool fails instead of falling back to
+        // anything local, and no local tool of that name exists to fall back to.
+        network.leave(&provider_id);
+        let error = tool
+            .run(&serde_json::json!({ "v": 6 }))
+            .await
+            .expect_err("the peer is gone");
+        assert!(
+            matches!(error, agent::tools::ToolError::Failed(_)),
+            "{error:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the failed call never reached the peer"
+        );
+        assert!(
+            built
+                .agent
+                .registry()
+                .expect("registry")
+                .get("remote_echo")
+                .is_none(),
+            "the remote tool has no local substitute"
+        );
+    }
+
+    /// The switch rebuilds the turn's registry through the capability model:
+    /// every tool becomes an async shim that dispatches through a provider,
+    /// and a shim still runs the real tool.
+    #[test]
+    fn the_capability_registry_switch_rebuilds_the_turn_registry() {
+        let plain = build(&with_tools("workspace-write", None));
+        let raw = plain.agent.registry().expect("a registry");
+        assert!(raw.get("update_plan").is_some(), "the raw tool is sync");
+        assert!(raw.get_async("update_plan").is_none());
+
+        let mut settings = with_tools("workspace-write", None);
+        settings.global.general.capability_registry = true;
+        let composed = build(&settings);
+        let registry = composed.agent.registry().expect("a registry");
+        assert!(
+            registry.get("update_plan").is_none(),
+            "the shim replaces the raw tool"
+        );
+        assert!(
+            registry.get_async("update_plan").is_some(),
+            "shims are async"
+        );
+
+        let result = registry
+            .execute("update_plan", &serde_json::json!({ "items": [] }))
+            .expect("the shim runs the real tool");
+        assert!(result.is_object(), "{result}");
+    }
+
+    /// The same call table through the raw registry and the capability
+    /// registry: success, schema rejection, body failure, and an unknown tool
+    /// land in the same class.
+    #[test]
+    fn the_two_registries_answer_the_same_call_table() {
+        use agent::ToolError;
+        let plain = build(&with_tools("workspace-write", None));
+        let mut settings = with_tools("workspace-write", None);
+        settings.global.general.capability_registry = true;
+        let composed = build(&settings);
+        let raw = plain.agent.registry().expect("the raw registry");
+        let shims = composed.agent.registry().expect("the composed registry");
+
+        // Success: an empty plan is valid and its projection is deterministic.
+        let call = serde_json::json!({ "items": [] });
+        assert_eq!(
+            raw.execute("update_plan", &call).expect("raw"),
+            shims.execute("update_plan", &call).expect("shim"),
+            "both paths return the same value"
+        );
+
+        // Schema rejection happens before the body on both paths.
+        let left = raw
+            .execute("update_plan", &serde_json::json!({}))
+            .unwrap_err();
+        let right = shims
+            .execute("update_plan", &serde_json::json!({}))
+            .unwrap_err();
+        assert!(matches!(left, ToolError::SchemaMismatch { .. }), "{left:?}");
+        assert!(
+            matches!(right, ToolError::SchemaMismatch { .. }),
+            "{right:?}"
+        );
+
+        // A body failure stays a tool failure on both paths. The message text
+        // differs (the shim reports the provider's classification), which is
+        // why the equivalence is a class.
+        if raw.get("read_file").is_some() {
+            let missing = serde_json::json!({ "path": "/definitely/not/here" });
+            let left = raw.execute("read_file", &missing).unwrap_err();
+            let right = shims.execute("read_file", &missing).unwrap_err();
+            assert!(matches!(left, ToolError::Failed(_)), "{left:?}");
+            assert!(matches!(right, ToolError::Failed(_)), "{right:?}");
+        }
+
+        // An unknown name never reaches either dispatcher.
+        let left = raw
+            .execute("no_such_tool", &serde_json::json!({}))
+            .unwrap_err();
+        let right = shims
+            .execute("no_such_tool", &serde_json::json!({}))
+            .unwrap_err();
+        assert!(matches!(left, ToolError::NotFound(_)), "{left:?}");
+        assert!(matches!(right, ToolError::NotFound(_)), "{right:?}");
+    }
+
+    /// An unchanged tool surface reuses the composition record: the cache is
+    /// keyed by names, schemas, and declarations, not by the clock.
+    #[test]
+    fn an_unchanged_build_reuses_the_composition() {
+        let settings = with_tools("workspace-write", None);
+        let first = build(&settings);
+        let second = build(&settings);
+
+        let left = first
+            .snapshot
+            .as_ref()
+            .expect("the first build records one");
+        let right = second.snapshot.as_ref().expect("the second does too");
+        assert!(
+            std::sync::Arc::ptr_eq(left, right),
+            "an unchanged surface reuses the cached composition"
+        );
+    }
+
+    /// A narrower surface is a different composition, not a cached one.
+    #[test]
+    fn a_changed_tool_surface_invalidates_the_composition() {
+        let wide = build(&with_tools("workspace-write", None));
+        let narrow = build(&with_tools("read-only", None));
+
+        let left = wide.snapshot.as_ref().expect("the wide build records one");
+        let right = narrow.snapshot.as_ref().expect("the narrow build does too");
+        assert!(
+            !std::sync::Arc::ptr_eq(left, right),
+            "a different tool surface is a new composition"
+        );
+        assert!(
+            right.capabilities.len() < left.capabilities.len(),
+            "the read-only surface is narrower: {} vs {}",
+            right.capabilities.len(),
+            left.capabilities.len()
+        );
+    }
     /// The intersection itself, as a truth table: the workspace switch is the
     /// master, an absent preset inherits it, and a declared `false` narrows
     /// only. Each arm is a state the two panes and the shipped presets put the

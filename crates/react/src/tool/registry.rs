@@ -1,5 +1,6 @@
 use super::descriptor::ToolDefinition;
 use super::error::ToolError;
+use super::metadata::ToolMetadata;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use serde_json::Value;
@@ -16,6 +17,10 @@ pub trait Tool: Send + Sync {
     }
     /// Run the tool with JSON input.
     fn run(&self, input: &Value) -> Result<Value, ToolError>;
+    /// Static capability metadata this tool declares, when it declares any.
+    fn metadata(&self) -> Option<&ToolMetadata> {
+        None
+    }
     /// JSON schema for the tool arguments.
     fn json_schema(&self) -> Value {
         serde_json::json!({})
@@ -68,6 +73,10 @@ pub trait AsyncTool: Send + Sync {
     }
     /// Run the tool with JSON input.
     async fn run(&self, input: &Value) -> Result<Value, ToolError>;
+    /// Static capability metadata this tool declares, when it declares any.
+    fn metadata(&self) -> Option<&ToolMetadata> {
+        None
+    }
     /// Run the tool with the engine's call id, so `cancel(call_id)` can target
     /// exactly this invocation. Tools that do not need it keep the default.
     async fn run_with_call_id(&self, input: &Value, _call_id: &str) -> Result<Value, ToolError> {

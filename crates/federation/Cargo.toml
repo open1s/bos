@@ -1,0 +1,25 @@
+[package]
+name = "federation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "BSH federation: node identity, signed JSON envelope, and the transport seam"
+repository = "https://github.com/open1s/bos"
+
+[dependencies]
+capability = { path = "../capability" }
+bus = { path = "../bus" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+ed25519-dalek = "3.0.0"
+rand.workspace = true
+base64 = "0.23.1"
+sha2 = "0.11.1"
+
+[dev-dependencies]
+semver.workspace = true

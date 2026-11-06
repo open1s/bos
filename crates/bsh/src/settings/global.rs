@@ -342,6 +342,9 @@ pub(crate) struct GlobalSettings {
     pub(crate) skill_sources: Vec<SkillSource>,
     /// MCP servers every workspace gets, merged with each workspace's own.
     pub(crate) mcp_servers: Vec<serde_json::Value>,
+    /// The federation node this app runs, when it runs one.
+    #[serde(default)]
+    pub(crate) federation: FederationSection,
     /// The provider tree, keyed by a concrete provider id.
     ///
     /// This is the reader's own document. A provider a plugin contributes does
@@ -436,11 +439,41 @@ impl Default for GlobalSettings {
             market_indexes: Vec::new(),
             workspaces: Vec::new(),
             web_search: WebSearchSection::default(),
+            federation: FederationSection::default(),
             default_preset: default_preset(),
         }
     }
 }
 
+/// The federation node's persisted settings.
+///
+/// Disabled by default: running a federation node opens a transport and
+/// answers peers, so it is an explicit choice. An empty path means the default
+/// under bsh's own directory, which is the one the `bsh federation` CLI writes.
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct FederationSection {
+    /// Whether this app runs a federation node.
+    #[serde(default)]
+    pub(crate) enabled: bool,
+    /// Offer trusted peers' capabilities to the model as tools.
+    #[serde(default)]
+    pub(crate) include_remote_tools: bool,
+    /// Identity seed file; empty uses the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) identity_path: Option<String>,
+    /// Peer and grant file; empty uses the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) peers_path: Option<String>,
+    /// Zenoh endpoints to connect to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) endpoints: Vec<String>,
+    /// Zenoh endpoints to listen on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) listen: Vec<String>,
+    /// Zenoh mode; empty means peer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) mode: Option<String>,
+}
 /// The preset a fresh install selects.
 fn default_preset() -> String {
     "standard".to_string()
@@ -553,6 +586,13 @@ pub(crate) struct General {
     pub(crate) performance_usage: String,
     /// Show the coding view: the trajectory tab and the Agent preset switch.
     pub(crate) developer_tools: bool,
+    /// Register the turn's tools through the capability model.
+    ///
+    /// Off by default: the composed registry validates, classifies, and
+    /// dispatches through a provider, which is one hop more than the raw tool
+    /// registry. The switch exists so a build can opt in without a fork.
+    #[serde(default)]
+    pub(crate) capability_registry: bool,
     /// Whether presets apply at all: the master switch over the whole system.
     ///
     /// ABSENT means enabled, so a file written before this field existed keeps
@@ -633,6 +673,7 @@ impl Default for General {
             composer_enter: "queue".to_string(),
             performance_usage: "detailed".to_string(),
             developer_tools: true,
+            capability_registry: false,
             // Absent is enabled: a fresh file and every file written before the
             // master switch existed apply their preset.
             presets_enabled: None,

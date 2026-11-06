@@ -3,6 +3,7 @@
 
 pub mod agent;
 pub mod bus;
+pub mod capabilities;
 pub mod error;
 pub mod extensions;
 pub mod goal;
@@ -21,6 +22,10 @@ pub mod skills;
 pub mod tools;
 
 pub use prelude::*;
+
+/// The capability domain the host composes with: identity, descriptors, and
+/// the two-level composition resolver.
+pub use capability;
 
 // The prompt corpus is public API: a host composes its persona into the same
 // identity and workflow framework the default prompt uses.

@@ -2,6 +2,8 @@
 members = [
     "crates/config",
     "crates/bus",
+    "crates/capability",
+    "crates/federation",
     "crates/agent",
     "crates/logging",
     "crates/react",

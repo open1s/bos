@@ -12,7 +12,7 @@
 //! round trip through the UI cannot drop a field a pane does not draw: what a
 //! pane writes is what the file holds.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -703,6 +703,30 @@ impl Settings {
             None if cfg!(test) => panic!("a test reached the real recycle bin"),
             None => crate::settings::dir().join("trash"),
         }
+    }
+
+    /// The composition log, beside the settings document.
+    ///
+    /// Derived from save_root for the same reason the vault is: a scratch
+    /// configuration gets a scratch log, and a test can never write the
+    /// reader's. A test build with no root records nothing rather than
+    /// panicking, because this log is diagnostic.
+    pub(crate) fn compositions_path(&self) -> Option<PathBuf> {
+        match &self.save_root {
+            Some(root) => Some(root.join("compositions.jsonl")),
+            None if cfg!(test) => None,
+            None => Some(crate::settings::dir().join("compositions.jsonl")),
+        }
+    }
+
+    /// The federation audit log the runtime writes.
+    pub(crate) fn federation_audit_path(&self) -> Option<PathBuf> {
+        let directory = match &self.global.federation.identity_path {
+            Some(path) => PathBuf::from(path).parent().map(Path::to_path_buf)?,
+            None if cfg!(test) => return None,
+            None => crate::settings::dir().join("federation"),
+        };
+        Some(directory.join("audit.jsonl"))
     }
 
     /// The admin-key vault's file.

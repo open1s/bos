@@ -1383,6 +1383,17 @@ impl Agent {
         Ok(())
     }
 
+    /// Replace the tool registry in one step.
+    ///
+    /// A host that composes its tools through the capability model builds the
+    /// registry itself; this swaps it in and drops the cached engine and
+    /// context snapshots, so the next turn sees exactly the composed set.
+    pub fn set_registry(&mut self, registry: ToolRegistry) {
+        self.registry = Some(Arc::new(registry));
+        self.engine_cache.lock().unwrap().take();
+        self.context_cache.lock().unwrap().take();
+    }
+
     /// Register an async tool and return explicit error on failure.
     pub fn try_add_async_tool(
         &mut self,

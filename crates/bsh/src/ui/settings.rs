@@ -2018,6 +2018,79 @@ impl Shell {
         .into_any_element()
     }
 
+    /// The text of the federation row, with or without a running node.
+    fn federation_text(
+        lang: crate::i18n::Lang,
+        status: Option<(&str, usize, usize, usize)>,
+        last: Option<(&str, &str)>,
+    ) -> String {
+        let value = match status {
+            Some((node, peers, remote, delegations)) => tr_args(
+                lang,
+                "settings.general.federationRunning",
+                &[
+                    ("node", node.to_string()),
+                    ("peers", peers.to_string()),
+                    ("remote", remote.to_string()),
+                    ("delegations", delegations.to_string()),
+                ],
+            ),
+            None => tr(lang, "settings.general.federationOff"),
+        };
+        let mut text = format!("{} · {}", tr(lang, "settings.general.federation"), value);
+        if let Some((operation, outcome)) = last {
+            // The newest decision, read once at launch: the pane never opens
+            // the log, and the row still says what this node did last.
+            text.push_str(" · ");
+            text.push_str(&tr_args(
+                lang,
+                "settings.general.federationRecent",
+                &[
+                    ("operation", operation.to_string()),
+                    ("outcome", outcome.to_string()),
+                ],
+            ));
+        }
+        text
+    }
+
+    /// A read-only line for the federation node, like the version row: it
+    /// reports what the process is, not a control the reader could flip here.
+    fn federation_row(&self) -> AnyElement {
+        let lang = self.state.lang;
+        let last = self
+            .state
+            .federation_recent
+            .last()
+            .map(|event| (event.operation.as_str(), event.outcome.as_str()));
+        let text = match crate::federation_node::running() {
+            Some(runtime) => {
+                let node = runtime.node_id().to_string();
+                let short: String = node.chars().take(8).collect();
+                Self::federation_text(
+                    lang,
+                    Some((
+                        &short,
+                        runtime.discovered_peers(),
+                        runtime.remote_capabilities(),
+                        runtime.active_delegations(),
+                    )),
+                    last,
+                )
+            }
+            None => Self::federation_text(lang, None, last),
+        };
+        hairline_bottom(
+            div()
+                .debug_selector(|| String::from("general-item-federation"))
+                .py(px(16.0))
+                .flex()
+                .items_center()
+                .border_color(rgb(theme::border_soft()))
+                .child(txt(text, 12.0, theme::faint())),
+        )
+        .into_any_element()
+    }
     /// The General permission row's value line and the selector naming the
     /// effective mode it reports.
     ///
@@ -2206,6 +2279,7 @@ impl Shell {
                 cx,
             ),
             self.current_version_row(),
+            self.federation_row(),
         ];
         if self.shortcuts_open {
             rows.push(self.shortcuts_disclosure(cx));
@@ -13429,5 +13503,27 @@ mod label_tests {
         let zh = vault_source_label(Lang::Zh, Some("keys/work"));
         assert!(zh.contains("keys/work"), "the id survives translation");
         assert_ne!(zh, "Choose from vault", "the value is translated");
+    }
+}
+
+#[cfg(test)]
+mod federation_tests {
+    use super::Shell;
+    use crate::i18n::Lang;
+
+    #[test]
+    fn the_federation_row_names_the_node_or_that_it_is_off() {
+        let off = Shell::federation_text(Lang::En, None, None);
+        assert!(off.contains("Federation"), "{off}");
+        assert!(off.contains("not running"), "{off}");
+
+        let on = Shell::federation_text(Lang::En, Some(("abc12345", 2, 7, 1)), None);
+        assert!(on.contains("abc12345"), "{on}");
+        assert!(on.contains('2') && on.contains('7'), "{on}");
+        assert!(on.contains('1'), "the active delegation count: {on}");
+
+        let last = Shell::federation_text(Lang::En, None, Some(("resource", "quota_exceeded")));
+        assert!(last.contains("last:"), "{last}");
+        assert!(last.contains("quota_exceeded"), "{last}");
     }
 }

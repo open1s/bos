@@ -2,6 +2,8 @@
 
 /// Shell command execution tool.
 pub mod bash;
+/// Capability metadata declared over an existing tool.
+pub mod declared;
 /// Adapters that turn plain functions into tools.
 pub mod function;
 /// The `get_goal` / `update_goal` tools and their shared goal store.
@@ -18,6 +20,7 @@ pub mod translator;
 pub mod validator;
 
 pub use bash::BashTool;
+pub use declared::{DeclaredAsyncTool, DeclaredTool};
 pub use function::{AsyncFunctionTool, FunctionTool};
 pub use goal::{GetGoalTool, GoalSettle, GoalStore, UpdateGoalTool};
 pub use jobs::JobTool;
@@ -29,3 +32,4 @@ pub use validator::validate_args;
 pub use react::tool::registry::AsyncTool;
 pub use react::tool::Tool;
 pub use react::tool::ToolError;
+pub use react::tool::ToolMetadata;

@@ -319,13 +319,32 @@ impl Shell {
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
         let target = cx.prompt_for_new_path(&dir, Some("audit.md"));
         let lang = self.state.lang;
+        // The composition log is diagnostic state beside the settings file; an
+        // export carries its most recent records so a turn can be explained
+        // without the machine it ran on.
+        let compositions = self
+            .state
+            .settings
+            .compositions_path()
+            .map(|path| crate::compositions::load(&path, 50))
+            .unwrap_or_default();
+        // The federation records are the same kind of diagnostic: the last 50
+        // decisions, so an export explains a cross-node call without the peer.
+        let federation = self
+            .state
+            .settings
+            .federation_audit_path()
+            .map(|path| crate::federation_audit::load(&path, 50))
+            .unwrap_or_default();
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(path))) = target.await else {
                 return;
             };
             let result = cx
                 .background_executor()
-                .spawn(async move { crate::export::write_audit(&view, lang, &path) })
+                .spawn(async move {
+                    crate::export::write_audit(&view, lang, &path, &compositions, &federation)
+                })
                 .await;
             let _ = this.update_in(cx, |this, _window, cx| {
                 let text = match result {

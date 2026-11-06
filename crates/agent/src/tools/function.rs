@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use react::tool::registry::AsyncTool;
-use react::tool::{Tool, ToolError};
+use react::tool::{Tool, ToolError, ToolMetadata};
 
 /// Boxed future returned by an [`AsyncFunctionTool`] closure.
 type BoxedToolFuture<'a> =
@@ -22,6 +22,7 @@ pub struct FunctionTool {
     skill: bool,
     category: String,
     deferred: bool,
+    metadata: Option<ToolMetadata>,
 }
 
 impl FunctionTool {
@@ -42,6 +43,7 @@ impl FunctionTool {
             skill: false,
             category: "general".to_string(),
             deferred: false,
+            metadata: None,
         }
     }
 
@@ -58,6 +60,7 @@ impl FunctionTool {
             skill: true,
             category: "skill".to_string(),
             deferred: false,
+            metadata: None,
         }
     }
 
@@ -73,6 +76,12 @@ impl FunctionTool {
     /// `call_tool`. See [`Tool::deferred`].
     pub fn with_deferred(mut self, deferred: bool) -> Self {
         self.deferred = deferred;
+        self
+    }
+
+    /// Declare the static capability metadata this tool carries.
+    pub fn with_metadata(mut self, metadata: ToolMetadata) -> Self {
+        self.metadata = Some(metadata);
         self
     }
 
@@ -115,6 +124,10 @@ impl Tool for FunctionTool {
 
     fn description(&self) -> String {
         self.description.clone()
+    }
+
+    fn metadata(&self) -> Option<&ToolMetadata> {
+        self.metadata.as_ref()
     }
 
     fn json_schema(&self) -> serde_json::Value {
@@ -171,6 +184,7 @@ pub struct AsyncFunctionTool {
     skill: bool,
     category: String,
     deferred: bool,
+    metadata: Option<ToolMetadata>,
 }
 
 impl AsyncFunctionTool {
@@ -187,6 +201,7 @@ impl AsyncFunctionTool {
             skill: false,
             category: "general".to_string(),
             deferred: false,
+            metadata: None,
         }
     }
 
@@ -242,6 +257,7 @@ impl AsyncFunctionTool {
             skill: true,
             category: "skill".to_string(),
             deferred: false,
+            metadata: None,
         }
     }
 
@@ -260,6 +276,12 @@ impl AsyncFunctionTool {
         self
     }
 
+    /// Declare the static capability metadata this tool carries.
+    pub fn with_metadata(mut self, metadata: ToolMetadata) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+
     /// Run the tool with JSON input.
     pub async fn run(&self, input: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
         (self.func)(input).await
@@ -274,6 +296,10 @@ impl AsyncTool for AsyncFunctionTool {
 
     fn description(&self) -> String {
         self.description.clone()
+    }
+
+    fn metadata(&self) -> Option<&ToolMetadata> {
+        self.metadata.as_ref()
     }
 
     fn json_schema(&self) -> serde_json::Value {

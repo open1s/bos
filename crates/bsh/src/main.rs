@@ -61,10 +61,19 @@ fn main() {
     if args.first().is_some_and(|arg| arg == "ext") {
         std::process::exit(bsh::extension_cli(&args[1..]));
     }
+    // Federation management is headless too: a node's identity and peer grants
+    // are files, and managing them must not require a window.
+    if args
+        .first()
+        .is_some_and(|arg| arg == "federation" || arg == "fed")
+    {
+        std::process::exit(bsh::federation_cli(&args[1..]));
+    }
     // --help is answered here so it works without opening a window.
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!(
-            "bsh - BOS Harness\n\nUSAGE: bsh [--settings[=SECTION]] [--browser=URL]\n       bsh ext <command> [options]\n\n  --settings  open the settings dialog on launch\n  SECTION     a rail cell - account | vault | general | models | web-search |\n              extensions | agent-presets - or a hosted view: tools |\n              plugin-inventory | shell | agent-loop | mcp | archived-sessions |\n              workspaces | context | plugins | automation | policy | extensions\n              (default: account)\n  --browser   open the Browser pane on URL (http or https)\n  ext         run the extension developer CLI; bsh ext help for the commands"
+            "bsh - BOS Harness\n\nUSAGE: bsh [--settings[=SECTION]] [--browser=URL]\n       bsh ext <command> [options]\n       bsh federation <command> [options]\n\n  --settings  open the settings dialog on launch\n  SECTION     a rail cell - account | vault | general | models | web-search |\n              extensions | agent-presets - or a hosted view: tools |\n              plugin-inventory | shell | agent-loop | mcp | archived-sessions |\n              workspaces | context | plugins | automation | policy | extensions\n              (default: account)\n  --browser   open the Browser pane on URL (http or https)\n  ext         run the extension developer CLI; bsh ext help for the commands
+  federation  manage this node's identity and peer grants; bsh federation help"
         );
         return;
     }

@@ -41,7 +41,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent::policy::{EgressGate, PolicySet, SystemResolver};
-use agent::tools::AsyncFunctionTool;
+use agent::tools::{AsyncFunctionTool, DeclaredAsyncTool};
 use agent::{Agent, ToolError};
 use serde_json::{json, Map, Value};
 
@@ -303,7 +303,10 @@ pub(crate) fn attach(agent: &mut Agent, tools: Tools) {
             },
         )
     };
-    if let Err(error) = agent.try_add_async_tool(Arc::new(search)) {
+    if let Err(error) = agent.try_add_async_tool(Arc::new(DeclaredAsyncTool::new(
+        Arc::new(search),
+        crate::tool_metadata::declared("web_search"),
+    ))) {
         log::warn!("web search tool was not registered: {error}");
     }
 }

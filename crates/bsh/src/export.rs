@@ -151,6 +151,8 @@ pub(crate) fn write_audit(
     view: &crate::audit::AuditView,
     lang: crate::i18n::Lang,
     out: &Path,
+    compositions: &[agent::capability::CompositionSnapshot],
+    federation: &[federation::FederationEvent],
 ) -> io::Result<(PathBuf, PathBuf)> {
     let chose_json = out.extension().and_then(|ext| ext.to_str()) == Some("json");
     let (markdown_path, json_path) = if chose_json {
@@ -159,7 +161,18 @@ pub(crate) fn write_audit(
         (out.to_path_buf(), out.with_extension("json"))
     };
     write_atomic(&markdown_path, view.to_markdown(lang).as_bytes())?;
-    write_atomic(&json_path, view.to_json().as_bytes())?;
+    // The view's own JSON keeps its shape; the composition log is added beside
+    // it, so a reader that already parses the audit is unaffected.
+    let mut document: serde_json::Value =
+        serde_json::from_str(&view.to_json()).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(object) = document.as_object_mut() {
+        let entries = serde_json::to_value(compositions).unwrap_or_else(|_| serde_json::json!([]));
+        object.insert("compositions".to_string(), entries);
+        let entries = serde_json::to_value(federation).unwrap_or_else(|_| serde_json::json!([]));
+        object.insert("federation".to_string(), entries);
+    }
+    let json = serde_json::to_string_pretty(&document).map_err(io::Error::other)?;
+    write_atomic(&json_path, json.as_bytes())?;
     Ok((markdown_path, json_path))
 }
 
@@ -295,9 +308,38 @@ mod tests {
                 }],
             }],
         };
+        let compositions = vec![agent::capability::CompositionSnapshot {
+            composition: "compose:test".to_string(),
+            version: "1.0.0".to_string(),
+            workspace: "ws:test".to_string(),
+            created_at_ms: 7,
+            capabilities: vec![agent::capability::CapabilitySnapshot {
+                id: "builtin/read_file".to_string(),
+                version: "1.2.0".to_string(),
+                provider: "builtin".to_string(),
+                origin: agent::capability::SnapshotOrigin::Local {
+                    provider: "builtin".to_string(),
+                },
+            }],
+            policy: Some("policy:turn".to_string()),
+        }];
+        let federation = vec![federation::FederationEvent::new(
+            federation::Direction::Inbound,
+            "peer-a",
+            "invoke",
+            Some("builtin/read_file"),
+            "denied",
+        )
+        .with_reason("capability not granted")];
         let chosen = root.join("audit.md");
-        let (markdown_path, json_path) =
-            write_audit(&view, crate::i18n::Lang::En, &chosen).expect("the audit export");
+        let (markdown_path, json_path) = write_audit(
+            &view,
+            crate::i18n::Lang::En,
+            &chosen,
+            &compositions,
+            &federation,
+        )
+        .expect("the audit export");
         assert_eq!(markdown_path, chosen);
         assert_eq!(json_path, root.join("audit.json"));
         let markdown = std::fs::read_to_string(&markdown_path).expect("the Markdown");
@@ -330,12 +372,30 @@ mod tests {
         let shell = &json["turns"][0]["calls"][1];
         assert_eq!(shell["sandbox"], serde_json::json!("heel"));
         assert_eq!(shell["network"], serde_json::json!("deny-all"));
+        // The composition log travels beside the view, with the exact versions
+        // and the origin of every capability the turn composed.
+        assert_eq!(json["compositions"][0]["composition"], "compose:test");
+        assert_eq!(
+            json["compositions"][0]["capabilities"][0]["version"],
+            "1.2.0"
+        );
+        assert_eq!(
+            json["compositions"][0]["capabilities"][0]["origin"]["kind"],
+            "local"
+        );
+        // The federation records travel too: a refusal names the peer, the
+        // capability, and the reason, and carries no argument.
+        assert_eq!(json["federation"][0]["direction"], "inbound");
+        assert_eq!(json["federation"][0]["outcome"], "denied");
+        assert_eq!(json["federation"][0]["capability"], "builtin/read_file");
+        assert_eq!(json["federation"][0]["reason"], "capability not granted");
         let read = &json["turns"][0]["calls"][0];
         assert!(read["sandbox"].is_null(), "a file read has no sandbox tier");
         assert!(read["network"].is_null());
         // Choosing a .json path flips the pair rather than overwriting it.
         let chosen_json = root.join("second.json");
-        let (md, json) = write_audit(&view, crate::i18n::Lang::En, &chosen_json).expect("the pair");
+        let (md, json) =
+            write_audit(&view, crate::i18n::Lang::En, &chosen_json, &[], &[]).expect("the pair");
         assert_eq!(md, root.join("second.md"));
         assert_eq!(json, chosen_json);
         let _ = std::fs::remove_dir_all(&root);
