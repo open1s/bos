@@ -104,6 +104,30 @@ Federation 不是把多个节点合并成一个超级进程。协调器可以辅
 
 > **实现状态说明：** BOS 已具备 Rust Runtime、Agent/Tool 执行、消息通信基础、BSH 桌面宿主、Ferris 扩展框架和 MCP 集成。完整的 BSH Composition 与 Federation 模型是平台的目标架构，将分阶段实现。上面列出的目标 Federation 能力不代表所有功能已经正式可用。
 
+## BSH 可以组合出什么？
+
+BSH 面向的是**按任务装配的工作空间**，而不是一个默认拥有全部工具权限的万能 Agent。下面三个场景展示同一套 BOS 基础如何组合成不同用途的工作环境。它们是组合蓝图示例，不代表这些预置方案已经开箱交付。
+
+### Research Workspace · 研究工作空间
+
+<p align="center"><img src="docs/assets/diagrams/scenario-research-workspace.svg" alt="研究工作空间蓝图：组合研究 Agent、项目资料、文档工具、分析能力和证据驱动的输出。" width="100%"></p>
+
+将研究目标、项目文档和选定的信息源集成，与研究 Agent 及分析工具组合起来。Workspace 可以围绕证据收集、信息提取、结果比较和结构化报告进行配置。信息源检索和专业分析能力由该 Workspace 配置的工具与扩展提供。
+
+### Software Engineering Workspace · 软件工程工作空间
+
+<p align="center"><img src="docs/assets/diagrams/scenario-software-engineering-workspace.svg" alt="软件工程工作空间蓝图：组合代码仓库上下文、工程 Agent、文件工具、终端、浏览器和扩展。" width="100%"></p>
+
+为 Coding Agent 提供代码仓库上下文和聚焦的工具集合：文件发现与批量读取、结构化编辑、终端操作、浏览器访问以及相关扩展。BSH 桌面端已经提供编辑器、Diff、终端和浏览器等操作界面；专用工具和执行策略则约束 Agent 的实际操作。开发者仍需审查代码变更和测试结果。
+
+### Distributed Multi-Agent Workspace · 分布式多 Agent 工作空间
+
+<p align="center"><img src="docs/assets/diagrams/scenario-distributed-multi-agent.svg" alt="分布式多 Agent 目标场景：请求节点向自治的研究和工程 Provider 节点委派有边界的任务。" width="100%"></p>
+
+协调 Workspace 可以将有明确边界的研究或工程任务委派给其他 BSH 节点上的专业 Agent，再汇总结果。每个节点保留自己的 Runtime、Secrets、Policy 和 Audit；远程任务必须经过调用方和提供方的双端授权。
+
+> **路线图状态：** 分布式场景展示的是 BSH Federation 的目标架构。节点注册、发现、远程 Capability 调用和跨节点任务委派将分阶段实现；这不代表完整工作流当前已经可用。
+
 ## 总体架构
 
 BOS 将共享执行基础、本地组合和跨节点协作分离。
