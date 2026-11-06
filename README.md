@@ -18,6 +18,10 @@
 </p>
 
 <p align="center">
+  <img src="docs/assets/diagrams/bsh-product-hero.svg" alt="Conceptual BSH product visual: a task-specific workspace composes scoped capabilities and collaborates with independently governed remote nodes. Not an application screenshot." width="100%">
+</p>
+
+<p align="center">
   <a href="https://pypi.org/project/nbos"><img src="https://img.shields.io/pypi/v/nbos?label=Python%20SDK&logo=pypi&color=3776AB" alt="Python SDK"></a>
   <a href="https://www.npmjs.com/package/@open1s/jsbos"><img src="https://img.shields.io/npm/v/@open1s/jsbos?label=JavaScript%20SDK&logo=npm&color=CB3837" alt="JavaScript SDK"></a>
   <a href="https://github.com/open1s/bos/actions/workflows/rust.yml"><img src="https://github.com/open1s/bos/actions/workflows/rust.yml/badge.svg" alt="Rust CI"></a>
