@@ -1399,7 +1399,7 @@ test pins it. Gaps are named rather than implied.
 
 | ADR | Decision | Implementation | Tests | Remaining gap |
 | --- | --- | --- | --- | --- |
-| 001 | Capability model: provider-qualified ids, descriptors, versions | crates/capability (id, descriptor, provider, error, context) | crates/capability/tests | none known |
+| 001 | Composition strategy: hybrid static boundary + dynamic selection | CompositionSpec, proposal gate, resolver | capability composition/proposal tests | Persisted composition manifest, lockfile, registry revision and full AI Assembly pipeline remain outstanding; see GAP-COMP-001/006 |
 | 002 | Composition Engine ownership: independent of Agent/ReAct | crates/capability + Agent provider adapters | capability and agent tests | Domain ownership is independent; complete host-neutral orchestration/activation boundary remains to be completed |
 | 003 | Execution: hybrid provider implementations behind one contract | capability::provider, WorkspaceRuntime, NativeToolProvider | capability/tests/workspace, agent native_provider | WorkspaceRuntime is currently a dispatch container; lifecycle, budget enforcement and context ownership remain outstanding; see GAP-COMP-002/003/004 |
 | 004 | Topology: autonomous Nodes, independent kernels | federation::service, PeerStore per Node, no shared workspace | federation/tests/service, trust | none known |
