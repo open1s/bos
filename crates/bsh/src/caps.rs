@@ -1762,13 +1762,13 @@ pub(crate) fn plan_for_registry(
     agent: &Agent,
 ) -> Result<agent::capability::composition::ResolvedComposition, String> {
     use agent::capability::composition::{
-        resolve, CapabilityRequirement, CompositionSpec, LocalScope,
+        resolve_host, CapabilityRequirement, CompositionSpec, LocalScope,
     };
     use agent::capability::id::WorkspaceId;
     use semver::{Version, VersionReq};
 
-    let registry = agent.registry().ok_or("the agent has no tool registry")?;
-    let catalogue = agent::capabilities::catalogue_from_registry(registry)
+    let registry = merged_registry(agent).ok_or("the agent has no tool registry")?;
+    let catalogue = agent::capabilities::catalogue_from_registry(&registry)
         .map_err(|error| error.to_string())?;
     let workspace = WorkspaceId::new("ws:turn").map_err(|error| error.to_string())?;
     let mut scope = LocalScope::new(workspace);
@@ -1781,7 +1781,7 @@ pub(crate) fn plan_for_registry(
         scope.admit(id.clone());
         spec = spec.with_requirement(CapabilityRequirement::new(id.clone(), VersionReq::STAR));
     }
-    resolve(&spec, &catalogue, &[], &scope).map_err(|error| error.to_string())
+    resolve_host(&spec, &catalogue, &[], &scope).map_err(|error| error.to_string())
 }
 
 /// One cached composition, keyed by the tool surface it was built from.
@@ -1867,10 +1867,30 @@ fn principal_salt(session: &str, preset: &str) -> u64 {
     hasher.finish()
 }
 
+/// The turn's whole tool surface: the base registry plus the live overlay.
+///
+/// Extension packages register their tools live, so a plan built from the base
+/// registry alone would omit exactly the capabilities a package contributes.
+/// The base registry wins a name collision; live tools are additive.
+fn merged_registry(agent: &Agent) -> Option<ToolRegistry> {
+    let mut merged = (**agent.registry()?).clone();
+    let live = agent.live_tools().read().ok()?;
+    for name in live.list() {
+        if merged.get(&name).is_some() || merged.get_async(&name).is_some() {
+            continue;
+        }
+        if let Some(tool) = live.get(&name) {
+            let _ = merged.register(tool);
+        } else if let Some(tool) = live.get_async(&name) {
+            let _ = merged.register_async(tool);
+        }
+    }
+    Some(merged)
+}
 /// The composition for this tool surface, and whether it was just built.
 fn composition_for(agent: &Agent) -> Option<(Arc<CachedComposition>, bool)> {
-    let registry = agent.registry()?;
-    let key = registry_fingerprint(registry);
+    let registry = merged_registry(agent)?;
+    let key = registry_fingerprint(&registry);
     let cached = COMPOSITION_CACHE.with(|cache| {
         cache
             .borrow()
@@ -1905,10 +1925,12 @@ fn composition_for(agent: &Agent) -> Option<(Arc<CachedComposition>, bool)> {
 /// one shim per capability, so every call is validated against the descriptor
 /// and dispatched through the same path a remote capability would take.
 fn compose_registry(agent: &mut Agent, session: &str, preset: &str) -> Result<usize, String> {
-    let registry = agent
-        .registry()
-        .ok_or("the agent has no tool registry")?
-        .clone();
+    let registry = merged_registry(agent).ok_or("the agent has no tool registry")?;
+    let live_names: HashSet<String> = agent
+        .live_tools()
+        .read()
+        .map(|live| live.list().into_iter().collect())
+        .unwrap_or_default();
     let entry = composition_for(agent)
         .ok_or("the composition could not be resolved")?
         .0;
@@ -1924,7 +1946,7 @@ fn compose_registry(agent: &mut Agent, session: &str, preset: &str) -> Result<us
     }
     let plan = (*entry.plan).clone();
     let provider: Arc<dyn CapabilityProvider> =
-        Arc::new(NativeToolProvider::new(Arc::clone(&registry)));
+        Arc::new(NativeToolProvider::new(Arc::new(registry.clone())));
     let runtime = Arc::new(
         WorkspaceRuntime::instantiate(plan, &[provider]).map_err(|error| error.to_string())?,
     );
@@ -1936,6 +1958,11 @@ fn compose_registry(agent: &mut Agent, session: &str, preset: &str) -> Result<us
     for descriptor in runtime.describe() {
         let id = descriptor.id.clone();
         let name = descriptor.surface.to_string();
+        // A live tool keeps its own advertisement and cancellation path; the
+        // shim registry covers the base tools only.
+        if live_names.contains(&name) {
+            continue;
+        }
         let Some(mut tool) = CapabilityTool::new(Arc::clone(&runtime), &id, principal.clone())
         else {
             continue;
@@ -5667,17 +5694,22 @@ mod tests {
             plan.is_local_only(),
             "the turn composes only local bindings"
         );
+        // The turn's surface is the base registry plus the live overlay:
+        // extension packages register their tools live, and the plan must
+        // account for exactly that union.
+        let mut surface: std::collections::BTreeSet<String> = registry.list().into_iter().collect();
+        surface.extend(built.agent.live_tools().read().expect("live tools").list());
         assert_eq!(
             plan.capabilities.len(),
-            registry.list().len(),
-            "every registered tool is in the plan"
+            surface.len(),
+            "every tool on the turn's surface is in the plan"
         );
         let planned: std::collections::BTreeSet<String> = plan
             .capabilities
             .iter()
             .map(|capability| capability.descriptor.surface.to_string())
             .collect();
-        let registered: std::collections::BTreeSet<String> = registry.list().into_iter().collect();
+        let registered: std::collections::BTreeSet<String> = surface;
         assert_eq!(
             planned, registered,
             "the plan and the registry name one set"
@@ -5697,7 +5729,9 @@ mod tests {
             .as_ref()
             .expect("the build records its composition");
 
-        assert_eq!(snapshot.capabilities.len(), registry.list().len());
+        let mut surface = registry.list();
+        surface.extend(built.agent.live_tools().read().expect("live tools").list());
+        assert_eq!(snapshot.capabilities.len(), surface.len());
         assert!(snapshot.is_local_only());
         let json = serde_json::to_string(&snapshot).expect("the snapshot serializes");
         assert!(!json.contains("secret"), "{json}");
@@ -6036,6 +6070,41 @@ mod tests {
             left.capabilities.len()
         );
     }
+
+    /// Extension packages register their tools live; the composition must see
+    /// them, or the one surface a package contributes is missing from the
+    /// snapshot and the plan.
+    #[test]
+    fn a_live_tool_reaches_the_composition() {
+        use agent::tools::AsyncFunctionTool;
+        use std::sync::Arc;
+
+        let built = build(&with_tools("workspace-write", None));
+        let live = AsyncFunctionTool::new(
+            "live_probe",
+            "A live tool",
+            serde_json::json!({ "type": "object" }),
+            |_args| Box::pin(async { Ok(serde_json::json!({ "ok": true })) }),
+        );
+        built
+            .agent
+            .add_live_async_tool(Arc::new(live))
+            .expect("a live tool");
+
+        let plan = crate::caps::plan_for_registry(&built.agent).expect("the plan");
+
+        assert!(
+            plan.capabilities
+                .iter()
+                .any(|capability| capability.descriptor.surface.as_str() == "live_probe"),
+            "the live overlay is part of the composition: {:?}",
+            plan.capabilities
+                .iter()
+                .map(|capability| capability.descriptor.surface.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// The intersection itself, as a truth table: the workspace switch is the
     /// master, an absent preset inherits it, and a declared `false` narrows
     /// only. Each arm is a state the two panes and the shipped presets put the

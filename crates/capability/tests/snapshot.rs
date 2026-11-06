@@ -3,7 +3,7 @@
 use capability::composition::{CapabilityRequirement, CompositionSpec, LocalScope};
 use capability::descriptor::{CapabilityDescriptor, OutputContract};
 use capability::id::{CapabilityId, CapabilityKind, NodeId, VersionSource, WorkspaceId};
-use capability::{resolve, Catalogue, CompositionSnapshot, SnapshotOrigin};
+use capability::{resolve_host, Catalogue, CompositionSnapshot, SnapshotOrigin};
 use semver::{Version, VersionReq};
 
 fn descriptor(id: &str, version: &str) -> CapabilityDescriptor {
@@ -39,7 +39,7 @@ fn a_local_plan_snapshots_versions_and_providers() {
             "builtin/grep".parse().unwrap(),
             VersionReq::STAR,
         ));
-    let resolved = resolve(&spec, &catalogue, &[], &scope).expect("resolved");
+    let resolved = resolve_host(&spec, &catalogue, &[], &scope).expect("resolved");
 
     let snapshot = CompositionSnapshot::from_resolved(&resolved, Some("policy:turn".into()), 42);
 
@@ -84,7 +84,7 @@ fn a_remote_plan_records_the_peer_and_the_grant() {
             CapabilityRequirement::new("builtin/build".parse().unwrap(), VersionReq::STAR)
                 .with_remote(capability::RemotePolicy::Allowed),
         );
-    let resolved = resolve(&spec, &local, &[peer], &scope).expect("resolved");
+    let resolved = resolve_host(&spec, &local, &[peer], &scope).expect("resolved");
 
     let snapshot = CompositionSnapshot::from_resolved(&resolved, None, 7);
 
@@ -110,7 +110,7 @@ fn a_snapshot_serializes_without_secret_material() {
         CompositionSpec::new("compose:test", Version::new(1, 0, 0), "snapshot").with_requirement(
             CapabilityRequirement::new("builtin/read_file".parse().unwrap(), VersionReq::STAR),
         );
-    let resolved = resolve(&spec, &catalogue, &[], &scope).expect("resolved");
+    let resolved = resolve_host(&spec, &catalogue, &[], &scope).expect("resolved");
     let snapshot = CompositionSnapshot::from_resolved(&resolved, None, 1);
 
     let json = serde_json::to_string(&snapshot).expect("serializes");

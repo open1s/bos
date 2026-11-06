@@ -400,7 +400,13 @@ pub enum CompositionError {
 
 /// Resolve a composition against a local catalogue and, when the spec allows
 /// it, the catalogues of the peers it names.
-pub fn resolve(
+///
+/// # Host-authored specs only
+///
+/// A specification that came from a model must pass
+/// `proposal::approve`/`proposal::resolve_approved` instead: the token makes
+/// the approval impossible to skip by accident.
+pub fn resolve_host(
     spec: &CompositionSpec,
     local: &Catalogue,
     peers: &[PeerCatalogue],

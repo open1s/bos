@@ -24,6 +24,7 @@ pub mod context;
 pub mod descriptor;
 pub mod error;
 pub mod id;
+pub mod proposal;
 pub mod provider;
 pub mod snapshot;
 pub mod transport;
@@ -31,7 +32,7 @@ pub mod workspace;
 
 pub use catalogue::Catalogue;
 pub use composition::{
-    resolve, Binding, CapabilityRequirement, CompositionError, CompositionId, CompositionSpec,
+    resolve_host, Binding, CapabilityRequirement, CompositionError, CompositionId, CompositionSpec,
     GrantRef, LocalScope, PeerCatalogue, PeerRef, RemotePolicy, ResolvedCapability,
     ResolvedComposition,
 };

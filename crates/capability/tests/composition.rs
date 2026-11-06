@@ -5,7 +5,7 @@
 
 use capability::catalogue::Catalogue;
 use capability::composition::{
-    resolve, Binding, CapabilityRequirement, CompositionError, CompositionSpec, GrantRef,
+    resolve_host, Binding, CapabilityRequirement, CompositionError, CompositionSpec, GrantRef,
     LocalScope, PeerCatalogue, PeerRef, RemotePolicy,
 };
 use capability::descriptor::{CapabilityDescriptor, OutputContract};
@@ -76,7 +76,7 @@ fn a_local_spec_resolves_entirely_inside_one_workspace() {
         .with_requirement(requirement("builtin/read_file", "^1"))
         .with_requirement(requirement("builtin/grep", "^1"));
 
-    let resolved = resolve(&spec, &local, &[], &scope).expect("a resolvable composition");
+    let resolved = resolve_host(&spec, &local, &[], &scope).expect("a resolvable composition");
 
     assert_eq!(resolved.capabilities.len(), 2);
     assert!(resolved.is_local_only());
@@ -96,7 +96,7 @@ fn an_optional_capability_that_is_absent_is_skipped() {
         .with_requirement(requirement("builtin/read_file", "^1"))
         .with_requirement(requirement("builtin/github_issues", "^1").with_required(false));
 
-    let resolved = resolve(&spec, &local, &[], &scope).expect("a resolvable composition");
+    let resolved = resolve_host(&spec, &local, &[], &scope).expect("a resolvable composition");
 
     assert_eq!(resolved.capabilities.len(), 1);
     assert_eq!(resolved.skipped, vec![cap("builtin/github_issues")]);
@@ -108,7 +108,7 @@ fn a_missing_required_capability_fails_without_activation() {
     let scope = LocalScope::admitting(workspace(), &local);
     let spec = spec().with_requirement(requirement("builtin/read_file", "^1"));
 
-    let error = resolve(&spec, &local, &[], &scope).expect_err("the spec cannot be satisfied");
+    let error = resolve_host(&spec, &local, &[], &scope).expect_err("the spec cannot be satisfied");
 
     assert!(matches!(
         error,
@@ -122,7 +122,8 @@ fn a_version_outside_the_accepted_range_fails() {
     let scope = LocalScope::admitting(workspace(), &local);
     let spec = spec().with_requirement(requirement("builtin/read_file", "^2"));
 
-    let error = resolve(&spec, &local, &[], &scope).expect_err("the range excludes the candidate");
+    let error =
+        resolve_host(&spec, &local, &[], &scope).expect_err("the range excludes the candidate");
 
     assert!(matches!(
         error,
@@ -136,7 +137,7 @@ fn the_workspace_view_refuses_a_capability_it_does_not_admit() {
     let scope = LocalScope::new(workspace());
     let spec = spec().with_requirement(requirement("builtin/read_file", "^1"));
 
-    let error = resolve(&spec, &local, &[], &scope).expect_err("nothing is admitted");
+    let error = resolve_host(&spec, &local, &[], &scope).expect_err("nothing is admitted");
 
     assert!(matches!(
         error,
@@ -153,7 +154,7 @@ fn a_refused_local_capability_is_never_rerouted_to_a_peer() {
         requirement("builtin/read_file", "^1").with_remote(RemotePolicy::Allowed),
     );
 
-    let error = resolve(&spec, &local, &[peer], &scope)
+    let error = resolve_host(&spec, &local, &[peer], &scope)
         .expect_err("the view refusal must not be bypassed by a peer");
 
     assert!(matches!(
@@ -171,7 +172,7 @@ fn an_allowed_remote_capability_binds_to_the_first_granted_peer() {
         .with_peer(granted("node-b"))
         .with_requirement(requirement("builtin/build", "^1").with_remote(RemotePolicy::Allowed));
 
-    let resolved = resolve(&spec, &local, &[peer], &scope).expect("the peer satisfies it");
+    let resolved = resolve_host(&spec, &local, &[peer], &scope).expect("the peer satisfies it");
 
     assert!(!resolved.is_local_only());
     assert_eq!(resolved.workspace, workspace());
@@ -194,7 +195,7 @@ fn a_forbidden_remote_capability_never_reaches_a_peer() {
         .with_peer(granted("node-b"))
         .with_requirement(requirement("builtin/build", "^1"));
 
-    let error = resolve(&spec, &local, &[peer], &scope).expect_err("remote is forbidden");
+    let error = resolve_host(&spec, &local, &[peer], &scope).expect_err("remote is forbidden");
 
     assert!(matches!(
         error,
@@ -211,7 +212,7 @@ fn a_required_peer_does_not_fall_back_to_a_local_implementation() {
         requirement("builtin/build", "^1").with_remote(RemotePolicy::Required(node("node-b"))),
     );
 
-    let error = resolve(&spec, &local, &[peer], &scope)
+    let error = resolve_host(&spec, &local, &[peer], &scope)
         .expect_err("a local implementation is not a substitute for the named peer");
 
     assert!(matches!(
@@ -228,7 +229,7 @@ fn a_required_peer_must_be_allowlisted() {
         requirement("builtin/build", "^1").with_remote(RemotePolicy::Required(node("node-c"))),
     );
 
-    let error = resolve(&spec, &local, &[], &scope).expect_err("node-c is not allowed");
+    let error = resolve_host(&spec, &local, &[], &scope).expect_err("node-c is not allowed");
 
     assert!(matches!(
         error,
@@ -245,7 +246,7 @@ fn a_remote_binding_requires_a_grant() {
         .with_peer(PeerRef::new(node("node-b")))
         .with_requirement(requirement("builtin/build", "^1").with_remote(RemotePolicy::Allowed));
 
-    let error = resolve(&spec, &local, &[peer], &scope).expect_err("no grant, no binding");
+    let error = resolve_host(&spec, &local, &[peer], &scope).expect_err("no grant, no binding");
 
     assert!(matches!(
         error,
@@ -267,7 +268,7 @@ fn the_first_allowed_peer_wins_and_the_order_is_the_spec_order() {
         .with_peer(granted("node-b"))
         .with_peer(granted("node-c"))
         .with_requirement(requirement_.clone());
-    let resolved = resolve(&forwards, &local, &peers, &scope).expect("node-b answers first");
+    let resolved = resolve_host(&forwards, &local, &peers, &scope).expect("node-b answers first");
     assert_eq!(
         resolved.capabilities[0].binding,
         Binding::Remote {
@@ -280,7 +281,7 @@ fn the_first_allowed_peer_wins_and_the_order_is_the_spec_order() {
         .with_peer(granted("node-c"))
         .with_peer(granted("node-b"))
         .with_requirement(requirement_);
-    let resolved = resolve(&backwards, &local, &peers, &scope).expect("node-c answers first");
+    let resolved = resolve_host(&backwards, &local, &peers, &scope).expect("node-c answers first");
     assert_eq!(
         resolved.capabilities[0].binding,
         Binding::Remote {
@@ -298,7 +299,7 @@ fn duplicate_requirements_are_refused() {
         .with_requirement(requirement("builtin/read_file", "^1"))
         .with_requirement(requirement("builtin/read_file", "^1"));
 
-    let error = resolve(&spec, &local, &[], &scope).expect_err("the spec is ambiguous");
+    let error = resolve_host(&spec, &local, &[], &scope).expect_err("the spec is ambiguous");
 
     assert!(matches!(error, CompositionError::Invalid { .. }));
 }
@@ -310,12 +311,12 @@ fn one_spec_resolves_locally_or_remotely_and_only_the_binding_changes() {
         .with_requirement(requirement("builtin/build", "^1").with_remote(RemotePolicy::Allowed));
     let local_plan = catalogue(&[("builtin/build", "1.0.0")]);
     let local_scope = LocalScope::admitting(workspace(), &local_plan);
-    let here = resolve(&spec, &local_plan, &[], &local_scope).expect("resolved locally");
+    let here = resolve_host(&spec, &local_plan, &[], &local_scope).expect("resolved locally");
     assert!(here.is_local_only());
 
     let empty = catalogue(&[]);
     let remote_scope = LocalScope::admitting(workspace(), &empty);
-    let there = resolve(
+    let there = resolve_host(
         &spec,
         &empty,
         &[PeerCatalogue::new(

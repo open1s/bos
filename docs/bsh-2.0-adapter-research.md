@@ -726,8 +726,10 @@ registry (`crates/bsh/src/caps.rs`, `the_builtin_tools_declare_their_capability_
 The web-search and subagent tools declare theirs too (network, spend, and a run read), and MCP tools
 now declare network egress, medium risk, and `net.egress` — with **no version**, because MCP carries
 none, so the catalogue records `VersionSource::Unknown` instead of inventing one. The MCP gateway
-declares the same. Not done yet: the switch that builds the turn's registry from a resolved
-workspace view (the capability registry stays opt-in).
+declares the same. Extension (Ferris-runtime) tools declare medium risk, an `extension` side
+effect, `extension.call`, and Unknown version; because packages register them LIVE, the plan and
+snapshot read a merged registry (base + live overlay), and a test pins that a live tool reaches the
+composition. The capability registry itself stays opt-in. Model-authored compositions go through `capability::proposal`: approved ids only, a risk ceiling, no remote binding or peer when the host forbids it, and no unseen capability; `resolve_proposal` refuses a spec the host resolver would accept. The gate returns an `ApprovedComposition` token that `resolve_approved` requires; the only constructor is `approve`, pinned by a compile_fail doctest. The public host entry point is named `resolve_host`, so no neutral `resolve` remains for a model path to call by accident.
 
 ### Slice 1 — Native provider behind a shim
 

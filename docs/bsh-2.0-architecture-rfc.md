@@ -1415,9 +1415,9 @@ test pins it. Gaps are named rather than implied.
 | --- | --- | --- |
 | Declare, validate, resolve, instantiate | implemented | capability/tests/composition.rs, workspace.rs |
 | Workspace exposes only its authorized set | implemented | LocalScope + resolver tests |
-| Built-in, Ferris, and MCP capabilities in one model | partial | built-in tools declare metadata; MCP tools declare network/medium/Unknown version; **Ferris has no capability provider** |
+| Built-in, Ferris, and MCP capabilities in one model | implemented | built-in tools declare metadata; MCP tools declare network/medium/Unknown; extension (Ferris-runtime) tools declare medium/extension/Unknown and now enter the composition through the live overlay, which `merged_registry` folds into the plan and snapshot |
 | Snapshots capture versions and policy refs | implemented | capability/tests/snapshot.rs, bsh compositions.rs |
-| AI proposals cannot bypass validation | not implemented | no proposal pipeline exists; the switch that composes a registry is opt-in (general.capability_registry) |
+| AI proposals cannot bypass validation | implemented as a gate | capability::proposal checks the host's approved ids, a risk ceiling, and remote policy, then returns an ApprovedComposition token that resolve_approved requires; the public resolver is named resolve_host, so no neutral resolve remains to call by accident (a compile_fail doctest pins that the token has no other constructor); tests pin that it refuses a spec the plain resolver would accept. No model-driven composer ships yet, so the gate is invoked by the host rather than by a pipeline |
 
 ### 30.3 Federation (section 28)
 
@@ -1468,4 +1468,26 @@ test pins it. Gaps are named rather than implied.
 - Item 8 (artifact retention): leases bound bytes, but no retention or deletion policy.
 - Item 10 (crate ownership): settled by the source-level analysis in
   bsh-2.0-adapter-research.md.
+
+
+### 30.7 Verification run (2026-11-06)
+
+| Suite | Result |
+| --- | --- |
+| capability (unit tests + doctests) | 31 passed |
+| federation | 76 passed |
+| agent | 436 passed, 6 failed |
+| bsh caps::tests | 139 passed, 7 failed, 1 ignored |
+| bsh federation_node / federation_audit / compositions / export / settings / extension metadata | all passed |
+| clippy (capability, federation, agent, bsh; all targets, -D warnings) | clean |
+| rustdoc (same four crates, -D warnings) | clean |
+| cargo fmt --check (same four crates) | clean |
+
+The thirteen failures are one environmental class: this host's outer sandbox
+denies the nested sandbox-exec the heel tests require (sandbox_apply:
+Operation not permitted). They live in agent::tools::bash and the caps
+heel/network cases, none in a path this work changed. The two composition
+tests that the live-overlay change did regress - the plan and the snapshot
+counted only the base registry - were found by this run and fixed: the turn's
+surface is the base registry plus the live overlay.
 

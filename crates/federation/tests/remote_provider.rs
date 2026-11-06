@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use capability::composition::{
-    resolve, Binding, CapabilityRequirement, CompositionSpec, GrantRef, LocalScope, PeerCatalogue,
-    PeerRef, RemotePolicy,
+    resolve_host, Binding, CapabilityRequirement, CompositionSpec, GrantRef, LocalScope,
+    PeerCatalogue, PeerRef, RemotePolicy,
 };
 use capability::{
     remote_provider_id, CapabilityCall, CapabilityDescriptor, CapabilityError, CapabilityId,
@@ -188,7 +188,7 @@ async fn a_remote_binding_executes_through_the_peer_provider() {
         catalogue.insert(descriptor("echo")).expect("unique");
         catalogue
     });
-    let plan = resolve(&remote_spec(&pair.provider_node), &local, &[peer], &scope)
+    let plan = resolve_host(&remote_spec(&pair.provider_node), &local, &[peer], &scope)
         .expect("resolved remotely");
     assert!(matches!(
         plan.capabilities[0].binding,
@@ -241,7 +241,8 @@ async fn an_unreachable_peer_fails_without_a_local_fallback() {
         catalogue.insert(descriptor("echo")).expect("unique");
         catalogue
     });
-    let plan = resolve(&remote_spec(&ghost), &local, &[peer], &scope).expect("resolved remotely");
+    let plan =
+        resolve_host(&remote_spec(&ghost), &local, &[peer], &scope).expect("resolved remotely");
 
     let provider: Arc<dyn CapabilityProvider> = Arc::new(RemoteCapabilityProvider::new(
         ghost.clone(),

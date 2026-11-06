@@ -236,6 +236,20 @@ pub(crate) struct ExtensionTool {
     qualified: String,
     calls: Arc<CallTracker>,
     active: Arc<AtomicBool>,
+    metadata: agent::tools::ToolMetadata,
+}
+
+/// What an extension tool declares about itself.
+///
+/// A package runs code this host did not read at build time: medium risk and a
+/// dedicated permission scope say so. The tool carries no version of its own
+/// (a package versions as a whole), so the catalogue records Unknown rather
+/// than inventing one.
+pub(crate) fn extension_tool_metadata() -> agent::tools::ToolMetadata {
+    agent::tools::ToolMetadata::new()
+        .with_risk("medium")
+        .with_side_effects(["extension"])
+        .with_permissions(["extension.call"])
 }
 
 /// The in-flight calls of one installed extension tool, keyed by call id.
@@ -555,6 +569,7 @@ impl ExtensionTool {
             qualified,
             calls,
             active,
+            metadata: extension_tool_metadata(),
         }
     }
 
@@ -585,6 +600,10 @@ impl react::tool::registry::AsyncTool for ExtensionTool {
 
     fn json_schema(&self) -> Value {
         self.descriptor.input_schema.clone()
+    }
+
+    fn metadata(&self) -> Option<&agent::tools::ToolMetadata> {
+        Some(&self.metadata)
     }
 
     fn supports_streaming(&self) -> bool {
@@ -1856,5 +1875,26 @@ mod tests {
             "a single progress chunk exceeded the cap"
         );
         assert_eq!(items.last().map(String::as_str), Some("done"));
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::extension_tool_metadata;
+
+    #[test]
+    fn an_extension_tool_declares_medium_risk_and_no_version() {
+        let metadata = extension_tool_metadata();
+
+        assert!(metadata.version.is_none(), "a package versions as a whole");
+        assert_eq!(metadata.risk.as_deref(), Some("medium"));
+        assert!(metadata
+            .side_effects
+            .iter()
+            .any(|effect| effect == "extension"));
+        assert!(metadata
+            .permissions
+            .iter()
+            .any(|scope| scope == "extension.call"));
     }
 }

@@ -8,7 +8,7 @@ use agent::capabilities::{
 };
 use agent::tools::{AsyncTool, FunctionTool, Tool, ToolError, ToolRegistry};
 use capability::composition::{
-    resolve, CapabilityRequirement, CompositionSpec, LocalScope, RemotePolicy,
+    resolve_host, CapabilityRequirement, CompositionSpec, LocalScope, RemotePolicy,
 };
 use capability::id::WorkspaceId;
 use capability::{CapabilityId, InvocationContext, InvocationId, Principal, WorkspaceRuntime};
@@ -92,7 +92,7 @@ fn runtime() -> Arc<WorkspaceRuntime> {
             )
             .with_remote(RemotePolicy::Forbidden),
         );
-    let plan = resolve(&spec, &catalogue, &[], &scope).expect("a plan");
+    let plan = resolve_host(&spec, &catalogue, &[], &scope).expect("a plan");
     let provider: Arc<dyn capability::CapabilityProvider> =
         Arc::new(NativeToolProvider::from_registry(&registry));
     Arc::new(WorkspaceRuntime::instantiate(plan, &[provider]).expect("a runtime"))
@@ -165,7 +165,7 @@ fn runtime_over(registry: &ToolRegistry) -> Arc<WorkspaceRuntime> {
         scope.admit(id.clone());
         spec = spec.with_requirement(CapabilityRequirement::new(id.clone(), VersionReq::STAR));
     }
-    let plan = resolve(&spec, &catalogue, &[], &scope).expect("a plan");
+    let plan = resolve_host(&spec, &catalogue, &[], &scope).expect("a plan");
     let provider: Arc<dyn capability::CapabilityProvider> =
         Arc::new(NativeToolProvider::from_registry(registry));
     Arc::new(WorkspaceRuntime::instantiate(plan, &[provider]).expect("a runtime"))

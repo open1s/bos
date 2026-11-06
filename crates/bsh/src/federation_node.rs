@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use agent::capabilities::{catalogue_from_registry, NativeToolProvider};
 use agent::capability::composition::{
-    resolve, CapabilityRequirement, CompositionSpec, GrantRef, LocalScope, PeerCatalogue, PeerRef,
-    RemotePolicy,
+    resolve_host, CapabilityRequirement, CompositionSpec, GrantRef, LocalScope, PeerCatalogue,
+    PeerRef, RemotePolicy,
 };
 use agent::capability::transport::FederationTransport;
 use agent::capability::{
@@ -175,7 +175,7 @@ pub(crate) fn compose(
     }
 
     let resolved =
-        resolve(&spec, &local_catalogue, &peers, &scope).map_err(|error| error.to_string())?;
+        resolve_host(&spec, &local_catalogue, &peers, &scope).map_err(|error| error.to_string())?;
     let mut providers: Vec<Arc<dyn CapabilityProvider>> =
         vec![Arc::new(NativeToolProvider::from_registry(local))];
     for peer in &peers {

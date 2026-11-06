@@ -42,6 +42,8 @@ pub enum SideEffect {
     Spend,
     /// Acts as a principal.
     Auth,
+    /// Runs third-party code contributed by an extension package.
+    Extension,
 }
 
 impl SideEffect {
@@ -54,6 +56,7 @@ impl SideEffect {
             Self::Process => "process",
             Self::Spend => "spend",
             Self::Auth => "auth",
+            Self::Extension => "extension",
         }
     }
 }
@@ -81,6 +84,7 @@ impl SideEffect {
             "process" => Some(Self::Process),
             "spend" => Some(Self::Spend),
             "auth" => Some(Self::Auth),
+            "extension" => Some(Self::Extension),
             _ => None,
         }
     }

@@ -88,7 +88,7 @@ mod tests {
     use agent::capability::composition::{CapabilityRequirement, CompositionSpec, LocalScope};
     use agent::capability::descriptor::CapabilityDescriptor;
     use agent::capability::id::{CapabilityKind, VersionSource, WorkspaceId};
-    use agent::capability::{resolve, Catalogue};
+    use agent::capability::{resolve_host, Catalogue};
     use semver::{Version, VersionReq};
 
     fn snapshot(index: usize) -> CompositionSnapshot {
@@ -108,7 +108,7 @@ mod tests {
                 id.parse().expect("a valid id"),
                 VersionReq::STAR,
             ));
-        let resolved = resolve(&spec, &catalogue, &[], &scope).expect("resolved");
+        let resolved = resolve_host(&spec, &catalogue, &[], &scope).expect("resolved");
         CompositionSnapshot::from_resolved(&resolved, None, index as u64)
     }
 
@@ -204,7 +204,7 @@ mod tests {
                 )
                 .with_remote(agent::capability::RemotePolicy::Allowed),
             );
-        let resolved = resolve(&spec, &local, &[peer], &scope).expect("resolved");
+        let resolved = resolve_host(&spec, &local, &[peer], &scope).expect("resolved");
         let snapshot = CompositionSnapshot::from_resolved(&resolved, None, 9);
 
         record_bounded(&path, &snapshot, MAX_BYTES, KEEP_LINES).expect("record");
