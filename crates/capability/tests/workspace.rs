@@ -1,5 +1,6 @@
 //! A workspace dispatches local and remote bindings through one path.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -22,6 +23,7 @@ struct Fake {
     provider: ProviderId,
     kind: ProviderKind,
     label: &'static str,
+    calls: Arc<AtomicUsize>,
 }
 
 #[async_trait]
@@ -39,6 +41,7 @@ impl CapabilityProvider for Fake {
     }
 
     async fn invoke(&self, _call: CapabilityCall<'_>) -> Result<CapabilityOutput, CapabilityError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(CapabilityOutput::text(self.label))
     }
 
@@ -92,6 +95,7 @@ async fn a_local_binding_dispatches_to_its_provider() {
         provider: ProviderId::builtin(),
         kind: ProviderKind::Builtin,
         label: "local",
+        calls: Arc::new(AtomicUsize::new(0)),
     });
     let plan = plan(
         Binding::Local {
@@ -119,6 +123,7 @@ async fn a_remote_binding_dispatches_to_the_peer_provider() {
         provider: capability::workspace::remote_provider_id(&node),
         kind: ProviderKind::Remote { node: node.clone() },
         label: "remote",
+        calls: Arc::new(AtomicUsize::new(0)),
     });
     let plan = plan(
         Binding::Remote {
@@ -157,12 +162,59 @@ async fn a_missing_provider_fails_at_instantiation_not_on_the_first_call() {
     assert!(matches!(error, WorkspaceError::MissingProvider { .. }));
 }
 
+
+#[tokio::test]
+async fn a_context_from_another_workspace_is_denied_before_provider_dispatch() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider: Arc<dyn CapabilityProvider> = Arc::new(Fake {
+        provider: ProviderId::builtin(),
+        kind: ProviderKind::Builtin,
+        label: "must not run",
+        calls: Arc::clone(&calls),
+    });
+    let runtime = WorkspaceRuntime::instantiate(
+        plan(
+            Binding::Local {
+                provider: ProviderId::builtin(),
+            },
+            "builtin/read_file",
+        ),
+        &[provider],
+    )
+    .expect("a runtime");
+    let foreign_context = InvocationContext::local(
+        InvocationId::new("inv:foreign"),
+        Principal::Local {
+            session: "other-session".to_string(),
+            preset: "other-preset".to_string(),
+        },
+        WorkspaceId::new("ws:other").expect("another workspace"),
+    );
+    let id = "builtin/read_file".parse().expect("a valid id");
+
+    let error = runtime
+        .invoke(&id, json!({}), &foreign_context)
+        .await
+        .expect_err("a foreign workspace context must not use this runtime");
+
+    assert!(
+        matches!(error, CapabilityError::Denied { .. }),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the provider must not observe a cross-workspace invocation"
+    );
+}
+
 #[tokio::test]
 async fn a_capability_outside_the_workspace_is_not_found() {
     let provider: Arc<dyn CapabilityProvider> = Arc::new(Fake {
         provider: ProviderId::builtin(),
         kind: ProviderKind::Builtin,
         label: "local",
+        calls: Arc::new(AtomicUsize::new(0)),
     });
     let runtime = WorkspaceRuntime::instantiate(
         plan(
