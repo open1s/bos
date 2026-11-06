@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1040" viewBox="0 0 1600 1040" role="img" aria-labelledby="title desc">
+<title id="title">BSH Distributed Composable Agent and Capability Platform</title>
+<desc id="desc">A platform overview showing multiple autonomous BSH nodes, each containing composable workspaces and local capabilities, connected through a federation layer while preserving independent trust boundaries. BOS Runtime and developer SDKs form the shared foundation.</desc>
+<defs>
+ <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#F8FBFF"/><stop offset="1" stop-color="#EEF4FC"/></linearGradient>
+ <linearGradient id="navy" x2="0" y2="1"><stop stop-color="#17345F"/><stop offset="1" stop-color="#102747"/></linearGradient>
+ <linearGradient id="blue" x2="0" y2="1"><stop stop-color="#EAF3FF"/><stop offset="1" stop-color="#DCEBFF"/></linearGradient>
+ <linearGradient id="teal" x2="0" y2="1"><stop stop-color="#E5FAF5"/><stop offset="1" stop-color="#D5F2E9"/></linearGradient>
+ <linearGradient id="violet" x2="0" y2="1"><stop stop-color="#F2EEFF"/><stop offset="1" stop-color="#E7E0FF"/></linearGradient>
+ <filter id="shadow" x="-15%" y="-15%" width="130%" height="140%"><feDropShadow dx="0" dy="7" stdDeviation="10" flood-color="#17345F" flood-opacity=".10"/></filter>
+ <style>
+ .title{font:700 42px Inter,Arial,sans-serif;fill:#142B4D}.subtitle{font:18px Inter,Arial,sans-serif;fill:#63758E}.eyebrow{font:700 14px Inter,Arial,sans-serif;letter-spacing:2px;fill:#54708F}.nodeTitle{font:700 23px Inter,Arial,sans-serif;fill:#17345F}.cardTitle{font:700 17px Inter,Arial,sans-serif;fill:#183456}.body{font:15px Inter,Arial,sans-serif;fill:#5E718A}.small{font:13px Inter,Arial,sans-serif;fill:#6D7F96}.white{fill:#FFF}.whiteSub{font:14px Inter,Arial,sans-serif;fill:#D2E1F4}.pill{font:700 13px Inter,Arial,sans-serif;fill:#28547D}
+ </style>
+</defs>
+<rect width="1600" height="1040" fill="url(#bg)"/>
+<text x="72" y="72" class="eyebrow">BOS / BSH PLATFORM</text>
+<text x="72" y="126" class="title">Distributed Composable Agent &amp; Capability Platform</text>
+<text x="74" y="160" class="subtitle">Compose locally. Collaborate globally. Keep every node autonomous and every boundary explicit.</text>
+
+<!-- node A -->
+<g filter="url(#shadow)">
+ <rect x="65" y="218" width="440" height="500" rx="26" fill="#FFFFFF" stroke="#C9D9ED" stroke-width="2"/>
+ <rect x="65" y="218" width="440" height="76" rx="26" fill="url(#navy)"/>
+ <rect x="65" y="268" width="440" height="26" fill="url(#navy)"/>
+</g>
+<text x="98" y="264" class="white" font-size="23" font-weight="700">BSH NODE A</text><text x="468" y="262" text-anchor="end" class="whiteSub">Autonomous</text>
+<rect x="91" y="318" width="388" height="104" rx="16" fill="url(#blue)" stroke="#C8DDF8"/>
+<text x="115" y="350" class="cardTitle">Workspace Alpha</text><text x="115" y="376" class="body">Research Agent · Tools · Project Context</text>
+<rect x="91" y="436" width="388" height="104" rx="16" fill="url(#blue)" stroke="#C8DDF8"/>
+<text x="115" y="468" class="cardTitle">Workspace Beta</text><text x="115" y="494" class="body">Build Agent · Code Tools · Local Services</text>
+<rect x="91" y="554" width="388" height="72" rx="14" fill="#F7F9FC" stroke="#DCE5EF"/>
+<text x="112" y="584" class="cardTitle">Local Capability Pool</text><text x="112" y="608" class="small">Ferris Extensions · Built-ins · MCP · Resources</text>
+<rect x="91" y="642" width="388" height="48" rx="12" fill="#EAF0F8"/>
+<text x="285" y="672" text-anchor="middle" class="pill">Independent Runtime · Policy · Secrets · Audit</text>
+
+<!-- node B -->
+<g filter="url(#shadow)">
+ <rect x="1095" y="218" width="440" height="500" rx="26" fill="#FFFFFF" stroke="#C9D9ED" stroke-width="2"/>
+ <rect x="1095" y="218" width="440" height="76" rx="26" fill="url(#navy)"/>
+ <rect x="1095" y="268" width="440" height="26" fill="url(#navy)"/>
+</g>
+<text x="1128" y="264" class="white" font-size="23" font-weight="700">BSH NODE B</text><text x="1498" y="262" text-anchor="end" class="whiteSub">Autonomous</text>
+<rect x="1121" y="318" width="388" height="104" rx="16" fill="url(#teal)" stroke="#BDE8D8"/>
+<text x="1145" y="350" class="cardTitle">Workspace Gamma</text><text x="1145" y="376" class="body">Data Agent · Domain Tools · Private Data</text>
+<rect x="1121" y="436" width="388" height="104" rx="16" fill="url(#teal)" stroke="#BDE8D8"/>
+<text x="1145" y="468" class="cardTitle">Workspace Delta</text><text x="1145" y="494" class="body">Operations Agent · Services · Runtime Tasks</text>
+<rect x="1121" y="554" width="388" height="72" rx="14" fill="#F7F9FC" stroke="#DCE5EF"/>
+<text x="1142" y="584" class="cardTitle">Local Capability Pool</text><text x="1142" y="608" class="small">Ferris Extensions · Built-ins · MCP · Resources</text>
+<rect x="1121" y="642" width="388" height="48" rx="12" fill="#EAF0F8"/>
+<text x="1315" y="672" text-anchor="middle" class="pill">Independent Runtime · Policy · Secrets · Audit</text>
+
+<!-- federation -->
+<g filter="url(#shadow)">
+ <rect x="570" y="250" width="460" height="420" rx="26" fill="#FFFFFF" stroke="#BFCFE5" stroke-width="2"/>
+</g>
+<rect x="570" y="250" width="460" height="86" rx="26" fill="url(#violet)"/>
+<rect x="570" y="310" width="460" height="26" fill="url(#violet)"/>
+<text x="800" y="291" text-anchor="middle" class="nodeTitle">BSH FEDERATION</text>
+<text x="800" y="316" text-anchor="middle" class="small">Peer-to-peer · Optional coordination</text>
+<rect x="608" y="366" width="384" height="62" rx="13" fill="#F8F6FF" stroke="#DED6FA"/>
+<text x="800" y="392" text-anchor="middle" class="cardTitle">Identity &amp; Trust</text><text x="800" y="414" text-anchor="middle" class="small">Enrollment · Authentication · Revocation</text>
+<rect x="608" y="442" width="384" height="62" rx="13" fill="#F8F6FF" stroke="#DED6FA"/>
+<text x="800" y="468" text-anchor="middle" class="cardTitle">Discovery &amp; Capability Catalog</text><text x="800" y="490" text-anchor="middle" class="small">Peer presence · Advertisements · Metadata</text>
+<rect x="608" y="518" width="384" height="62" rx="13" fill="#F8F6FF" stroke="#DED6FA"/>
+<text x="800" y="544" text-anchor="middle" class="cardTitle">Delegation &amp; Collaboration</text><text x="800" y="566" text-anchor="middle" class="small">Remote calls · Agent tasks · Leases</text>
+<rect x="608" y="594" width="384" height="48" rx="12" fill="#EDE8FF"/>
+<text x="800" y="624" text-anchor="middle" class="pill">Coordinator assists — peers retain authority</text>
+
+<!-- connectors -->
+<g fill="none" stroke="#6F8DB5" stroke-width="4" stroke-linecap="round">
+ <path d="M505 450 H570"/><path d="M1030 450 H1095"/>
+</g>
+<g fill="#6F8DB5"><path d="M558 441 L570 450 L558 459Z"/><path d="M1083 441 L1095 450 L1083 459Z"/></g>
+<text x="538" y="430" text-anchor="middle" class="small">secure link</text><text x="1062" y="430" text-anchor="middle" class="small">secure link</text>
+<g fill="none" stroke="#8C79C9" stroke-width="2.5" stroke-dasharray="7 7"><path d="M505 610 C535 700 1065 700 1095 610"/></g>
+<text x="800" y="704" text-anchor="middle" class="small">Remote capability remains hosted and governed by its provider node</text>
+
+<!-- foundation -->
+<rect x="65" y="770" width="1470" height="112" rx="22" fill="url(#navy)"/>
+<text x="105" y="813" class="white" font-size="21" font-weight="700">BOS SHARED FOUNDATION</text>
+<text x="105" y="844" class="whiteSub">Rust Runtime · Agent Engine · Tool Dispatch · Bus · Model Adapters · Resilience · Observability</text>
+<g>
+ <rect x="1000" y="793" width="150" height="60" rx="13" fill="#294A76"/><text x="1075" y="829" text-anchor="middle" class="white" font-size="15" font-weight="700">Rust API</text>
+ <rect x="1165" y="793" width="150" height="60" rx="13" fill="#294A76"/><text x="1240" y="829" text-anchor="middle" class="white" font-size="15" font-weight="700">NBOS</text>
+ <rect x="1330" y="793" width="165" height="60" rx="13" fill="#294A76"/><text x="1412" y="829" text-anchor="middle" class="white" font-size="15" font-weight="700">JSBOS</text>
+</g>
+<text x="800" y="945" text-anchor="middle" class="subtitle">AI proposes compositions. Runtime validates and enforces. Each node decides what it shares and what it executes.</text>
+</svg>
