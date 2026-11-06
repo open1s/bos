@@ -3,18 +3,18 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/bos-logo.png" alt="BOS — Rust-Native AI Agent Platform" width="400">
+  <img src="docs/assets/bos-logo.png" alt="BOS — Rust-Native Agent Runtime and Distributed Platform" width="400">
 </p>
 
-<h1 align="center">BOS — The Rust-Native AI Agent Platform</h1>
+<h1 align="center">BOS — Brain Operating System</h1>
 
 <p align="center">
-  <strong>One Runtime. Multiple Interfaces. One Extensible Agent Workspace.</strong>
+  <strong>Distributed Composable Agent &amp; Capability Platform</strong>
 </p>
 
 <p align="center">
-  Build with Rust, Python, and JavaScript. Develop and operate agents in BSH,
-  the native desktop workspace built on BOS Runtime.
+  Compose agents, tools, runtimes and resources into purpose-built workspaces.<br>
+  Connect independent BSH nodes to collaborate across machines and trust boundaries.
 </p>
 
 <p align="center">
@@ -26,10 +26,10 @@
 </p>
 
 <p align="center">
-  <a href="#quick-start">Quick start</a> ·
+  <a href="#what-is-bos">What is BOS?</a> ·
+  <a href="#bsh-platform">BSH platform</a> ·
   <a href="#architecture">Architecture</a> ·
-  <a href="#bsh-agent-workspace">BSH workspace</a> ·
-  <a href="#extension-platform">Extensions</a> ·
+  <a href="#quick-start">Quick start</a> ·
   <a href="#documentation">Documentation</a>
 </p>
 
@@ -37,59 +37,114 @@
 
 ## What is BOS?
 
-**BOS is a Rust-native AI Agent Platform built around one shared execution core.**
-Use the runtime directly from Rust, access it through the NBOS Python and JSBOS
-JavaScript interfaces, or work with agents in BSH—the native GPUI desktop workspace.
+**BOS is a Rust-native foundation for building, composing and operating AI agents as a distributed system.**
 
-| Part | Role | When to use it |
-|---|---|---|
-| **BOS Runtime** | Shared Rust agent execution core | Embed agent capabilities in applications and services |
-| **Rust** | Native interface to the runtime | Build Rust applications and infrastructure |
-| **NBOS** | Python interface to the same runtime | Python applications, automation and prototyping |
-| **JSBOS** | JavaScript / Node.js interface to the same runtime | Node.js services and JavaScript tooling |
-| **BSH** | Native GPUI agent workspace | Develop, use and operate agents in an integrated desktop environment |
-| **Extension Platform** | Extensibility layer within BSH | Adapt the workspace with tools, commands, panels and other contributions |
+At its center is **BSH**: not merely a desktop agent workspace, but a **Distributed Composable Agent & Capability Platform**. A BSH node is a capability container: it assembles agents, tools, extensions, models, context and resources into purpose-built workspaces. Multiple independent BSH nodes can then be connected as a federation, allowing agents and capabilities to be discovered, delegated to and composed across machines—without collapsing their runtime or security boundaries.
+
+BOS provides the shared execution foundation and developer interfaces. BSH turns that foundation into an environment for composing and operating local and distributed agent systems.
+
+| Layer | Responsibility |
+|---|---|
+| **BOS Runtime** | Rust-native agent execution, tool dispatch, model integration, messaging and runtime controls |
+| **BSH Node** | A composable capability container that hosts workspaces, agents, extensions and local resources |
+| **Composition Engine** | Selects and assembles capability sets for a task or workspace, independently of the agent reasoning loop |
+| **Ferris Extension Framework** | Packages, loads and governs extensions across supported execution providers |
+| **Federation** | Connects independent BSH nodes and exposes explicitly authorized remote capabilities and agent services |
+| **Rust / NBOS / JSBOS** | Native, Python and JavaScript interfaces to the shared BOS implementation |
+
+### The platform in one sentence
+
+**One Runtime. Composable Workspaces. Collaborative Agents. Federated Capabilities. Independent Trust Boundaries.**
+
+## BSH platform
+
+BSH has two complementary roles.
+
+### 1. A composable capability container
+
+A BSH node assembles only the capabilities needed for a particular purpose. A workspace can receive a tailored capability view instead of exposing every installed tool to every agent.
+
+A composition may include:
+
+- **Agents** — task-focused agents, specialist roles and delegated workers.
+- **Tools and skills** — built-in tools, user-defined tools, skills and MCP integrations.
+- **Extensions** — host contributions and isolated extension packages managed through Ferris.
+- **Models and policies** — model providers, routing choices, permissions and execution constraints.
+- **Context and resources** — project files, memory, services and other explicitly granted resources.
+- **Workflows** — reusable task compositions and coordinated agent activities.
+
+Composition is a first-class platform concern, not a side effect of agent prompting. The Composition Engine is designed to remain independent of the ReAct/agent reasoning engine. AI can propose a composition; the runtime validates compatibility, dependencies, permissions and resource limits before activation.
+
+### 2. A distributed agent and capability platform
+
+A BSH installation is an autonomous node. Multiple nodes can form a federation and collaborate while retaining their own identity, runtime, policies, secrets, files and audit records.
+
+The intended federation model supports:
+
+- **Node and capability discovery** — discover peers and the capabilities they advertise.
+- **Remote capability invocation** — use a remote capability through a local, policy-aware interface.
+- **Agent delegation** — assign a bounded task to an agent on another node and receive its result.
+- **Multi-agent collaboration** — coordinate specialists across nodes when a task benefits from distributed expertise or resources.
+- **Resource-aware collaboration** — request access to selected services or resources without copying an entire node's environment.
+- **Independent governance** — authorize at both the requesting node and the provider node; either side can deny or revoke access.
+
+Federation is not a shared super-process. A coordinator may help with rendezvous, discovery or scheduling, but it does not become the execution authority for peer nodes. Remote capabilities remain remote, and discovery never implies trust.
+
+> **Implementation status:** BOS already provides the Rust runtime, agent/tool execution, messaging foundations, BSH desktop host, Ferris extension framework and MCP integration. The full BSH composition and federation model is the platform's architectural direction and is being developed in stages. Do not interpret the target federation capabilities above as a claim that every feature is already generally available.
 
 ## Architecture
 
-BOS separates the shared execution core from its developer interfaces and desktop workspace. Rust applications, NBOS and JSBOS use the same native runtime; BSH is a native GPUI application built directly on BOS crates. The Extension Platform extends BSH—it is not a second agent runtime.
+BOS separates the shared execution foundation, local composition and cross-node collaboration.
 
 <p align="center">
-  <img src="docs/assets/diagrams/bos-platform-architecture.svg" alt="BOS architecture: Rust, Python and JavaScript interfaces plus BSH share the BOS Runtime; the BSH Extension Platform extends the desktop workspace." width="100%">
+  <img src="docs/assets/diagrams/bos-platform-architecture.svg" alt="BOS runtime and developer interfaces: Rust, Python and JavaScript share the native runtime, with BSH as the host for composable agent workspaces." width="100%">
 </p>
 
-The runtime brings together agent orchestration, tool and skill dispatch, messaging, model adapters and resilience. Configuration, telemetry, memory, capability controls and external integrations provide the supporting foundation. The diagram below presents the platform as a set of collaborating subsystems and integration boundaries—not as a sequential execution pipeline.
+### Local node architecture
+
+Within one BSH node, the platform is organized around distinct responsibilities:
+
+| Subsystem | Responsibility |
+|---|---|
+| **Agent Runtime** | Runs agents and reasoning loops, manages sessions and coordinates tool calls |
+| **Capability System** | Describes available operations and mediates access to providers |
+| **Composition Engine** | Resolves a task-specific composition and produces a workspace capability view |
+| **Workspace Runtime** | Activates and isolates a composition with its context, resources and lifecycle |
+| **Ferris** | Manages extension packages, providers, lifecycle and execution boundaries |
+| **Policy and Audit** | Enforces authorization, limits and traceable execution decisions |
+| **Bus and Adapters** | Provides messaging and integration seams for local and external systems |
+
+### Federation architecture
+
+Federation connects nodes; it does not merge them.
+
+| Plane | Responsibility |
+|---|---|
+| **Identity and Trust** | Node identity, enrollment, trust establishment, revocation and peer authentication |
+| **Discovery and Control** | Peer discovery, capability advertisements, policy metadata and coordination |
+| **Delegation and Collaboration** | Bounded task delegation, remote agent interaction, leases and task state |
+| **Data and Execution** | Authorized remote invocation and minimal exchange of task inputs and results |
+
+The federation protocol is transport-agnostic. Transports such as Zenoh may be used as implementation substrates, but transport connectivity alone does not establish identity, authorization or trust.
 
 ### BSH extension and agent model
-
-The companion view shows the BSH extension boundary and the agent runtime environment. The extension framework is a host-integrated subsystem; the agent model is a set of cooperating capabilities governed by shared safety and runtime controls.
 
 <p align="center">
   <img src="docs/assets/diagrams/bsh-extension-agent-model.svg" alt="BSH extension framework and agent execution model, showing host services, extension runtimes, agent engine, context, tools, runtime environment and governance." width="100%">
 </p>
 
-### Agent execution
-
-The ReAct execution loop combines model reasoning with policy-aware tool execution. Tool results are fed back into the session context until the agent returns a final response or reaches its configured execution boundary.
+The extension framework is a host-integrated subsystem. It supplies capabilities to BSH through explicit contracts; it is not a second agent runtime. MCP is an integration protocol and adapter, not the canonical capability model of the platform.
 
 ## Why BOS?
 
-- **One execution model.** Rust, Python and JavaScript interfaces share the
-  same Rust implementation rather than maintaining independent agent engines.
-- **Agent orchestration.** ReAct execution coordinates model responses, tool
-  calls, observations and lifecycle hooks.
-- **Model interoperability.** Provider adapters support OpenAI-compatible
-  endpoints, Anthropic, NVIDIA NIM, Google AI and OpenRouter.
-- **MCP integration.** Connect to MCP servers over stdio or HTTP and work with
-  their tools, resources and prompts.
-- **Multi-agent communication.** A message bus provides publish/subscribe,
-  query/response and RPC patterns.
-- **Reusable context.** Load directory-based `SKILL.md` skills and use
-  in-memory or file-backed memory.
-- **Operational controls.** Configure retries, rate limiting, circuit
-  breaking, execution deadlines, metrics and capability authorization.
-- **An extensible workspace.** Extend BSH with declarative, process,
-  WASM Component, Extism, MCP and built-in packages.
+- **Rust-native execution.** A shared implementation underpins native applications and language bindings.
+- **Composable by design.** Assemble task-specific workspaces from agents, tools, extensions, models, context and resources.
+- **Agent-oriented runtime.** ReAct execution coordinates model responses, tool calls, observations and lifecycle hooks.
+- **LLM-aware tools.** Tool contracts, schemas and bounded outputs help models select and use capabilities effectively.
+- **Extensible execution.** Ferris supports multiple extension providers, including declarative, process, WebAssembly Component, Extism, MCP and built-in integrations.
+- **Distributed communication foundation.** The bus provides publish/subscribe, query/response and RPC patterns for system components.
+- **Policy at execution boundaries.** Capability authorization, sandboxing, limits and audit controls are treated as runtime responsibilities.
+- **Language interoperability.** Rust, Python and JavaScript interfaces use the same underlying implementation.
 
 ## Quick start
 
@@ -180,29 +235,25 @@ On macOS, a development app can also be packaged with
 ### Install BSH
 
 Prebuilt installers are published on the
-[releases page](https://github.com/open1s/bos/releases): a dmg for macOS
-(Apple silicon and Intel), `.deb`, `.rpm` and portable tarballs for Linux
-x86_64 (arm64 when the runner completes), and a per-user MSI and portable zip
-for Windows x64. Each release carries `SHA256SUMS`.
+[releases page](https://github.com/open1s/bos/releases). Available formats and
+platform coverage are listed with each release. Each release carries
+`SHA256SUMS`.
 
 The tag-driven build, signing and notarization setup is documented in
 [docs/bsh-release.md](docs/bsh-release.md).
 
-## BSH agent workspace
+## BSH desktop environment
 
-**BSH brings agent execution and everyday development tools into one native
-desktop workspace.** It is built with GPUI and the BOS Runtime.
+BSH provides a native GPUI environment for developing, using and operating agents. It is also the operator interface for local and, as federation capabilities mature, distributed workspaces.
 
-- **Workspaces and sessions** — organise projects and persistent conversations.
-- **Agent-first interaction** — streaming responses, task plans, queued
-  messages and visible subagent activity.
+- **Workspaces and sessions** — organize projects and persistent conversations.
+- **Agent-first interaction** — streaming responses, task plans, queued messages and visible subagent activity.
 - **Integrated terminal** — Ghostty terminal surface with command-policy checks.
 - **Browser pane** — embedded WebView for browsing alongside an agent.
 - **Code editor** — file tree, tabs, diffs and tree-sitter language grammars.
 - **Settings and credentials** — provider configuration and an encrypted vault.
 - **Bilingual interface** — English and Chinese.
-- **Extensions** — add tools, commands, panels, prompts, contexts, skills,
-  themes, language services, agent roles, workflows, storage and hooks.
+- **Extensions** — add tools, commands, panels, prompts, contexts, skills, themes, language services, agent roles, workflows, storage and hooks.
 
 ### BSH interface preview
 
@@ -218,21 +269,18 @@ desktop workspace.** It is built with GPUI and the BOS Runtime.
 
 Replacement instructions: [BSH screenshot guide](docs/assets/bsh-showcase/README.md).
 
-## Extension Platform
+## Ferris Extension Framework
 
-The Extension Platform is BSH's workspace extensibility layer. Packages are
-described by `extension.toml`; BSH validates package contents, resolves
-dependencies, manages lifecycle and evaluates capability permissions when an
-extension requests host functionality.
+[Ferris](crates/ferris-core/) is the extension framework used by BSH. It separates extension package and lifecycle management from the host's agent reasoning engine. BSH adapts extension-provided functionality into host capabilities through explicit contracts and permission checks.
 
-| Runtime | Intended use |
+| Provider | Intended use |
 |---|---|
 | **Declarative** | JSON-defined tools, panels, prompts and themes |
 | **Process** | Existing programs and services communicating through JSON-RPC |
 | **WASM Component** | Portable components using the WebAssembly Component Model and WIT |
 | **Extism** | Existing Extism plugins |
-| **MCP** | Reuse an MCP server |
-| **Built-in** | First-party Rust functionality linked into BSH |
+| **MCP** | Reuse an MCP server through an adapter |
+| **Built-in** | First-party Rust functionality linked into the host |
 
 Create and validate a package:
 
@@ -250,14 +298,7 @@ Start here:
 - [WIT interface](crates/bsh/wit/extension.wit)
 - [Extension examples](examples/extensions/)
 
-**Security note:** extension capability authorization and operating-system
-isolation are separate controls. Enforcement differs by operating system and
-runtime. Consult the [BSH extension platform](docs/bsh-extension.md) and
-[security policy](SECURITY.md) for the current contract and limitations.
-
-### Extension package lifecycle
-
-See [lifecycle and activation](docs/bsh-extension.md#4-lifecycle-and-activation) for the package path from manifest validation through dependency resolution, immutable installation and runtime activation.
+**Security note:** extension capability authorization and operating-system isolation are separate controls. Enforcement differs by operating system and runtime. Consult the [BSH extension platform](docs/bsh-extension.md) and [security policy](SECURITY.md) for the current contract and limitations.
 
 ## Model configuration
 
@@ -284,16 +325,16 @@ sensitive credentials in its encrypted vault.
 
 | Resource | Description |
 |---|---|
-| [BOS / BSH textbook](docs/BOS-BSH-Textbook.md) | In-depth guide to the runtime, desktop workspace and extensions |
-| [Architecture](ARCHITECTURE.md) | Component responsibilities and architecture |
+| [BOS / BSH textbook](docs/BOS-BSH-Textbook.md) | In-depth guide to the runtime, desktop host and extension framework |
+| [Architecture](ARCHITECTURE.md) | Current component responsibilities and architecture |
 | [Rust user guide](docs/rust-user-guide.md) | Embed and use BOS from Rust |
 | [Python user guide](docs/python-user-guide.md) | Use BOS from Python |
 | [JavaScript user guide](docs/javascript-user-guide.md) | Use BOS from Node.js and JavaScript |
-| [BSH extension platform](docs/bsh-extension.md) | Manifest, runtimes, capabilities, CLI, security and authoring |
+| [BSH extension platform](docs/bsh-extension.md) | Manifest, providers, lifecycle, capabilities, CLI and security |
 | [BSH Built-in Tools 2.0](docs/bsh-built-in-tools-2.0.md) | LLM-oriented tool contracts, batch file operations, output budgets and benchmark plan |
 | [Contributor onboarding](ONBOARDING.md) | Set up a development environment |
 | [Settings](docs/bsh-settings-spec.md) · [Terminal policy](docs/bsh-terminal-policy.md) · [Hooks](docs/bsh-hook-system.md) | Subsystem specifications |
-| [BSH release pipeline](docs/bsh-release.md) | Installer artifacts, signing and the tag-driven release workflow |
+| [BSH release pipeline](docs/bsh-release.md) | Installer artifacts, signing and release workflow |
 | [REX guide](docs/rex-user-guide.md) · [Diagnostics](docs/diagnostics.md) | Resource tooling and troubleshooting |
 | [Wiki](https://github.com/open1s/bos/wiki) · [Changelog](CHANGELOG.md) | Guides and release history |
 
@@ -320,9 +361,8 @@ cd crates/jsbos && npm install && npx ava
 - [Good first issues](https://github.com/open1s/bos/labels/good%20first%20issue)
 
 If BOS is useful to you, consider starring the repository and sharing what you
-build with it. Feedback and real-world examples help others discover BOS and
-help guide its development.
+build with it. Feedback and real-world examples help guide the platform.
 
 ## License
 
-MIT OR Apache-2.0 · Version 4.0.1 · [Releases](https://github.com/open1s/bos/releases)
+MIT OR Apache-2.0 · [Releases](https://github.com/open1s/bos/releases)
