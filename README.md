@@ -373,6 +373,7 @@ sensitive credentials in its encrypted vault.
 |---|---|
 | [BOS / BSH textbook](docs/BOS-BSH-Textbook.md) | In-depth guide to the runtime, desktop host and extension framework |
 | [Architecture](ARCHITECTURE.md) | Current component responsibilities and architecture |
+| [BSH 2.0 workspace acceptance](docs/bsh-2.0-e2e-acceptance.md) | Code-backed implementation gap, golden-path demo and end-to-end security acceptance |
 | [Rust user guide](docs/rust-user-guide.md) | Embed and use BOS from Rust |
 | [Python user guide](docs/python-user-guide.md) | Use BOS from Python |
 | [JavaScript user guide](docs/javascript-user-guide.md) | Use BOS from Node.js and JavaScript |
