@@ -60,6 +60,10 @@ BOS provides the shared execution foundation and developer interfaces. BSH turns
 
 BSH has two complementary roles.
 
+<p align="center"><img src="docs/assets/diagrams/bsh-platform-value.svg" alt="BOS and BSH value proposition: Rust-native foundation, composable workspaces and federated autonomous nodes." width="100%"></p>
+
+BSH turns the BOS foundation into a practical operating environment: compose capabilities for a task, run them in a governed workspace, extend the platform, and connect independent nodes when collaboration requires it.
+
 ### 1. A composable capability container
 
 A BSH node assembles only the capabilities needed for a particular purpose. A workspace can receive a tailored capability view instead of exposing every installed tool to every agent.
@@ -74,6 +78,8 @@ A composition may include:
 - **Workflows** — reusable task compositions and coordinated agent activities.
 
 Composition is a first-class platform concern, not a side effect of agent prompting. The Composition Engine is designed to remain independent of the ReAct/agent reasoning engine. AI can propose a composition; the runtime validates compatibility, dependencies, permissions and resource limits before activation.
+
+<p align="center"><img src="docs/assets/diagrams/bsh-composable-workspace-visual.svg" alt="How BSH composes agents, models, tools, extensions, context and resources into a validated task-specific workspace." width="100%"></p>
 
 ### 2. A distributed agent and capability platform
 
@@ -90,6 +96,8 @@ The intended federation model supports:
 
 Federation is not a shared super-process. A coordinator may help with rendezvous, discovery or scheduling, but it does not become the execution authority for peer nodes. Remote capabilities remain remote, and discovery never implies trust.
 
+<p align="center"><img src="docs/assets/diagrams/bsh-federation-value.svg" alt="Federation connects autonomous BSH nodes through bounded requests and independent authorization at both ends." width="100%"></p>
+
 > **Implementation status:** BOS already provides the Rust runtime, agent/tool execution, messaging foundations, BSH desktop host, Ferris extension framework and MCP integration. The full BSH composition and federation model is the platform's architectural direction and is being developed in stages. Do not interpret the target federation capabilities above as a claim that every feature is already generally available.
 
 ## Architecture
@@ -97,12 +105,14 @@ Federation is not a shared super-process. A coordinator may help with rendezvous
 BOS separates the shared execution foundation, local composition and cross-node collaboration.
 
 <p align="center">
-  <img src="docs/assets/diagrams/bos-platform-architecture.svg" alt="BOS runtime and developer interfaces: Rust, Python and JavaScript share the native runtime, with BSH as the host for composable agent workspaces." width="100%">
+  <img src="docs/assets/diagrams/bsh-distributed-platform.svg" alt="BSH distributed platform: autonomous nodes contain composable workspaces and collaborate through federation while retaining independent trust boundaries." width="100%">
 </p>
 
 ### Local node architecture
 
 Within one BSH node, the platform is organized around distinct responsibilities:
+
+<p align="center"><img src="docs/assets/diagrams/bsh-composable-node.svg" alt="Internal architecture of one composable BSH node, from composition and workspace runtime to scoped capabilities and providers." width="100%"></p>
 
 | Subsystem | Responsibility |
 |---|---|
@@ -145,6 +155,12 @@ The extension framework is a host-integrated subsystem. It supplies capabilities
 - **Distributed communication foundation.** The bus provides publish/subscribe, query/response and RPC patterns for system components.
 - **Policy at execution boundaries.** Capability authorization, sandboxing, limits and audit controls are treated as runtime responsibilities.
 - **Language interoperability.** Rust, Python and JavaScript interfaces use the same underlying implementation.
+
+## BOS developer foundation
+
+BOS keeps the core implementation in Rust and exposes it through native Rust, Python and JavaScript interfaces. BSH is the operator workspace built on the same foundation.
+
+<p align="center"><img src="docs/assets/diagrams/bos-developer-foundation.svg" alt="BOS shared Rust-native foundation powering Rust, Python and JavaScript integrations and the BSH application." width="100%"></p>
 
 ## Quick start
 
