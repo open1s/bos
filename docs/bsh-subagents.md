@@ -33,6 +33,22 @@ answer with the `subagent_result` tool: pass the id (and optionally
 result is bounded to 16,000 characters; the full result and the child
 transcript stay in the run registry and the subagent menu.
 
+A child is not a dead end once it starts: `send_message` continues it. On a
+running child the message takes the same path as a prompt the reader queues in
+the composer - it waits behind the current turn and starts the next one when
+that settles - and on a settled child it reopens the run and runs on the live
+agent that answered the last turn, so the conversation carries over. A run
+restored after a restart has no live process to continue, and the tool refuses
+it with that reason rather than starting a stranger; delegate again with the
+context the new child needs.
+
+`interrupt_agent` is the stop control from the model side. It aborts the
+child's detached turn, releases its slot immediately, drops any prompts queued
+behind the turn, and marks the run failed with `interrupted by the parent
+turn` so the menu and the audit agree about what happened. A run that already
+settled is reported unchanged, and a run restored after a restart has no task
+to abort, so the tool says that instead of pretending to have stopped it.
+
 The child's tools still carry the parent session and policy principal, so the
 same workspace policy, permission ceiling, path scopes and builtin Rego modules
 apply to a child.

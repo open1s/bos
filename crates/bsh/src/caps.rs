@@ -1016,8 +1016,7 @@ fn build_agent_for_session_inner(
         if gates.list && !off_tool("job_list") {
             shell_tools.push(Arc::new(DeclaredTool::new(
                 Arc::new(
-                    agent::tools::JobTool::lister("job_list")
-                        .with_jobs(jobs.clone(), session),
+                    agent::tools::JobTool::lister("job_list").with_jobs(jobs.clone(), session),
                 ),
                 declare("job_list"),
             )));
@@ -1462,7 +1461,10 @@ fn build_agent_for_session_inner(
                     .map(|path| path.to_string_lossy().to_string())
                     .unwrap_or_default(),
                 crate::context::RuntimeFacts::from_effective(&eff),
-                !off_tool("send_message"),
+                SubagentTools {
+                    message: !off_tool("send_message"),
+                    interrupt: !off_tool("interrupt_agent"),
+                },
             );
             attach_subagent_tool(&mut agent, context);
         }
@@ -2330,12 +2332,21 @@ pub(crate) struct SubagentContext {
     /// which a delegated prompt may name. Carrying the parsed content means a
     /// child costs pushes, not a second walk of the sources.
     skills: Vec<agent::skills::SkillContent>,
-    /// Whether the turn carries `send_message`.
+    /// The delegation companions this turn carries besides the spawn tool.
     ///
-    /// The reader's own per-tool switch decides this once for the turn; a
-    /// nested child inherits the answer rather than re-deciding it, so a
+    /// The reader's own per-tool switches decide them once for the turn; a
+    /// nested child inherits the answers rather than re-deciding them, so a
     /// switched-off tool does not reappear one level down.
-    message: bool,
+    tools: SubagentTools,
+}
+
+/// Which delegation companions a turn carries beside `subagent`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SubagentTools {
+    /// Whether `send_message` may continue a child's conversation.
+    pub(crate) message: bool,
+    /// Whether `interrupt_agent` may stop a running child.
+    pub(crate) interrupt: bool,
 }
 
 impl SubagentContext {
@@ -2351,7 +2362,7 @@ impl SubagentContext {
         preset: impl Into<String>,
         root: impl Into<String>,
         runtime: crate::context::RuntimeFacts,
-        message: bool,
+        tools: SubagentTools,
     ) -> Self {
         let (sync_tools, async_tools) = match agent.registry() {
             Some(registry) => {
@@ -2382,7 +2393,7 @@ impl SubagentContext {
             // The model-facing set, not the pre-extension set: a child must
             // inherit the package skills the parent turn actually carries.
             skills: agent.all_skills(),
-            message,
+            tools,
         }
     }
 
@@ -2462,7 +2473,7 @@ impl SubagentContext {
                 self.preset.clone(),
                 self.root.clone(),
                 self.runtime.clone(),
-                self.message,
+                self.tools,
             );
             attach_subagent_tool(&mut child, nested);
             crate::prompts::append_subagent_guidance(&mut child);
@@ -2525,12 +2536,21 @@ pub(crate) fn rebuild_child_agent(
         root,
         crate::context::RuntimeFacts::from_effective(&built.effective),
         // A rebuilt child answers the same reader switches as the turn that
-        // spawned it: the switch was stored in the settings, not in the run.
-        !built
-            .effective
-            .disabled_tools
-            .iter()
-            .any(|tool| tool == "send_message"),
+        // spawned it: the switches were stored in the settings, not in the run.
+        {
+            let eff = &built.effective;
+            let carries = |name: &str| {
+                !eff.disabled_tools.iter().any(|tool| tool == name)
+                    && eff
+                        .preset_tools
+                        .as_ref()
+                        .is_none_or(|tools| tools.iter().any(|tool| tool == name))
+            };
+            SubagentTools {
+                message: carries("send_message"),
+                interrupt: carries("interrupt_agent"),
+            }
+        },
     );
     Ok(context.child_with_delegation(child_id, gates.subagent))
 }
@@ -2710,7 +2730,9 @@ pub(crate) fn attach_subagent_tool(agent: &mut Agent, context: SubagentContext) 
                 // to await the whole child turn, which serialized the parent
                 // behind work it had just delegated. The registry is the live
                 // handle the header and subagent_result read.
-                tokio::spawn(async move {
+                let registry_for_handle = registry.clone();
+                let handle_id = task_id.clone();
+                let handle = tokio::spawn(async move {
                     log::info!("subagent {task_id} started: {task_title}");
                     let result =
                         stream_child(&child, prompt, registry.clone(), &task_id, &turn_context)
@@ -2729,6 +2751,10 @@ pub(crate) fn attach_subagent_tool(agent: &mut Agent, context: SubagentContext) 
                         }
                     }
                 });
+                // Detached means interruptible: the handle is what
+                // interrupt_agent aborts. A turn that settles first drops it in
+                // finish/fail.
+                registry_for_handle.set_handle(&handle_id, handle.abort_handle());
                 Ok(serde_json::json!({
                     "subagent_id": id,
                     "status": "running",
@@ -2746,8 +2772,12 @@ pub(crate) fn attach_subagent_tool(agent: &mut Agent, context: SubagentContext) 
         return;
     }
     attach_subagent_result_tool(agent, result_registry, result_session);
-    if message_context.message {
-        attach_subagent_message_tool(agent, message_context);
+    let tools = message_context.tools;
+    if tools.message {
+        attach_subagent_message_tool(agent, Arc::clone(&message_context));
+    }
+    if tools.interrupt {
+        attach_subagent_interrupt_tool(agent, message_context);
     }
 }
 
@@ -2961,7 +2991,13 @@ fn attach_subagent_message_tool(agent: &mut Agent, context: Arc<SubagentContext>
                         "subagent run '{id}' is already running a turn and refused the queue; read it with subagent_result"
                     )));
                 }
-                tokio::spawn(continue_child(context.clone(), id.clone(), child, message));
+                let handle = tokio::spawn(continue_child(
+                    context.clone(),
+                    id.clone(),
+                    child,
+                    message,
+                ));
+                context.registry.set_handle(&id, handle.abort_handle());
                 Ok(serde_json::json!({
                     "subagent_id": id,
                     "status": "started",
@@ -3000,6 +3036,91 @@ async fn continue_child(
     match result {
         Ok((text, usage)) => registry.finish(&id, text, usage, transcript),
         Err(message) => registry.fail(&id, message, Some(usage), transcript),
+    }
+}
+
+/// Install the tool that stops a running child.
+///
+/// The reader's subagent menu can stop a run; this is the same registry call
+/// from the model side. A settled run is not an error - it reports the state it
+/// already has - and a run with no live task (restored after a restart) says so
+/// instead of pretending to have stopped it.
+fn attach_subagent_interrupt_tool(agent: &mut Agent, context: Arc<SubagentContext>) {
+    let tool = agent::tools::AsyncFunctionTool::from_fn(
+        "interrupt_agent",
+        "Stop a running subagent. The child's turn is aborted and its slot is released; the run is marked failed with 'interrupted by the parent turn', and any prompts queued behind it are dropped. A run that already settled is reported unchanged, not stopped. Use it when a child is clearly going the wrong way, then delegate again with a corrected prompt.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "subagent_id": { "type": "string", "description": "The id the subagent tool returned; list the runs with subagent_result and no id." }
+            },
+            "required": ["subagent_id"]
+        }),
+        move |args| {
+            let context = context.clone();
+            async move {
+                let id = args
+                    .get("subagent_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if id.is_empty() {
+                    return Err(ToolError::InvalidInput(
+                        "subagent_id is required; list the runs with subagent_result and no id"
+                            .to_string(),
+                    ));
+                }
+                let Some(run) = context.registry.run(&id) else {
+                    return Err(ToolError::InvalidInput(format!(
+                        "no subagent run '{id}'; list them with subagent_result and no id"
+                    )));
+                };
+                if run.session != context.session {
+                    return Err(ToolError::InvalidInput(format!(
+                        "no subagent run '{id}'; list them with subagent_result and no id"
+                    )));
+                }
+                if !run.status.is_running() {
+                    return Ok(serde_json::json!({
+                        "subagent_id": id,
+                        "interrupted": false,
+                        "status": run.status.as_str(),
+                        "note": "The run already settled; read it with subagent_result."
+                    }));
+                }
+                if !context.registry.interrupt(&id) {
+                    // It may have settled between the status check and the
+                    // abort: report the state it reached rather than claiming a
+                    // failure to stop something that already finished.
+                    if let Some(now) = context.registry.run(&id) {
+                        if !now.status.is_running() {
+                            return Ok(serde_json::json!({
+                                "subagent_id": id,
+                                "interrupted": false,
+                                "status": now.status.as_str(),
+                                "note": "The run settled before it could be stopped; read it with subagent_result."
+                            }));
+                        }
+                    }
+                    return Err(ToolError::Failed(format!(
+                        "subagent run '{id}' has no live process to stop (it was restored after a restart); its status is unchanged. Start a new subagent instead."
+                    )));
+                }
+                Ok(serde_json::json!({
+                    "subagent_id": id,
+                    "interrupted": true,
+                    "status": "failed",
+                    "note": "The child's turn was stopped and its slot released. Start a new subagent if the work still matters."
+                }))
+            }
+        },
+    );
+    if let Err(error) = agent.try_add_async_tool(Arc::new(DeclaredAsyncTool::new(
+        Arc::new(tool),
+        declare("interrupt_agent"),
+    ))) {
+        warn!("interrupt_agent tool was not registered: {error}");
     }
 }
 
@@ -7805,11 +7926,7 @@ mod tests {
                 Some(&["subagent"]),
                 (false, false, false, false, false, false),
             ),
-            (
-                WORKSPACE_WRITE,
-                None,
-                (true, true, true, true, true, true),
-            ),
+            (WORKSPACE_WRITE, None, (true, true, true, true, true, true)),
             (
                 WORKSPACE_WRITE,
                 Some(&["bash", "job_output", "job_kill"]),
@@ -7820,11 +7937,7 @@ mod tests {
                 Some(&["subagent"]),
                 (false, false, false, false, false, true),
             ),
-            (
-                FULL_ACCESS,
-                None,
-                (true, true, true, true, true, true),
-            ),
+            (FULL_ACCESS, None, (true, true, true, true, true, true)),
         ];
         for (permission, tools, expected) in table {
             let settings = with_tools(permission, *tools);
@@ -7962,6 +8075,7 @@ mod tests {
                     gates.bash,
                     gates.background_spawn,
                     gates.output,
+                    gates.list,
                     gates.kill,
                     gates.subagent,
                 ),
@@ -8002,10 +8116,11 @@ verdict := {{"allow": false, "rule": "{rule}", "reason": "refused by the workspa
             &deny_rule("no-job-output", "capability", "job_output"),
         );
         let settings = rooted(&root);
-        let (bash, background, output, kill, subagent) = gated_tools(&settings);
+        let (bash, background, output, list, kill, subagent) = gated_tools(&settings);
         assert!(bash, "bash is not part of the job_output decision");
         assert!(background, "the background flag is not job_output either");
         assert!(!output, "the denied capability removed job_output");
+        assert!(list, "the roster is not part of the job_output decision");
         assert!(kill, "an unrelated tool stayed");
         assert!(subagent, "an unrelated tool stayed");
     }
@@ -8027,6 +8142,10 @@ verdict := {{"allow": false, "rule": "{rule}", "reason": "refused by the workspa
             "",
             root.to_string_lossy().to_string(),
             crate::context::RuntimeFacts::from_effective(&built.effective),
+            crate::caps::SubagentTools {
+                message: true,
+                interrupt: true,
+            },
         );
         let child = context.child("child-1");
         assert_eq!(
@@ -8059,6 +8178,10 @@ verdict := {{"allow": false, "rule": "{rule}", "reason": "refused by the workspa
             "",
             root.to_string_lossy().to_string(),
             crate::context::RuntimeFacts::from_effective(&built.effective),
+            crate::caps::SubagentTools {
+                message: true,
+                interrupt: true,
+            },
         );
         let child = context.child("child-1");
         let skill = child
@@ -8082,7 +8205,7 @@ verdict := {{"allow": false, "rule": "{rule}", "reason": "refused by the workspa
             &deny_rule("no-background", "capability", "run_in_background"),
         );
         let settings = rooted(&root);
-        let (bash, background, output, kill, _subagent) = gated_tools(&settings);
+        let (bash, background, output, _list, kill, _subagent) = gated_tools(&settings);
         assert!(bash, "the shell itself stayed");
         assert!(!background, "the denied capability withdrew the flag");
         assert!(output && kill, "the job tools are independent");
@@ -10733,11 +10856,95 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
                 .run(&serde_json::json!({ "subagent_id": id, "message": "again" }))
                 .await
             {
-                Err(ToolError::Failed(message)) => {
+                Err(agent::ToolError::Failed(message)) => {
                     assert!(message.contains("no live process"), "{message}")
                 }
                 other => panic!("expected the stale-run refusal, got {other:?}"),
             }
+        });
+    }
+
+    /// `interrupt_agent` aborts the child's task, releases its slot and marks
+    /// the run failed with the reason; a run that already settled reports
+    /// itself instead of being rewritten.
+    #[test]
+    fn interrupt_agent_stops_a_running_child() {
+        use std::sync::Arc;
+        let registry = Arc::new(crate::subagent::SubagentRegistry::default());
+        let built = crate::caps::build_agent_for_session_with_subagents(
+            &bare(),
+            &Vault::disabled(),
+            &SessionChoice::default(),
+            &crate::mcp::McpPool::default(),
+            "session",
+            "session",
+            registry.clone(),
+        );
+        let tool = built
+            .agent
+            .registry()
+            .expect("registry")
+            .get_async("interrupt_agent")
+            .expect("interrupt_agent is attached to a writable turn");
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let id = registry
+                .try_begin(
+                    "session",
+                    "session",
+                    1,
+                    0,
+                    "Slow",
+                    "wait",
+                    crate::subagent::SUBAGENT_SLOTS,
+                )
+                .expect("a free slot");
+            let task = tokio::spawn(async {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            });
+            registry.set_handle(&id, task.abort_handle());
+
+            let stopped = tool
+                .run(&serde_json::json!({ "subagent_id": id }))
+                .await
+                .expect("a running child is interruptible");
+            assert_eq!(stopped["interrupted"], true);
+            assert_eq!(stopped["status"], "failed");
+            let run = registry.run(&id).expect("run");
+            assert_eq!(run.status.as_str(), "failed");
+            assert!(
+                run.error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("interrupted")),
+                "{:?}",
+                run.error
+            );
+            assert_eq!(registry.running_count(), 0, "the slot was released");
+            assert!(task.await.is_err(), "the child task was aborted");
+
+            // A settled run keeps its own answer: interrupt changes nothing.
+            let settled = registry
+                .try_begin(
+                    "session",
+                    "session",
+                    1,
+                    0,
+                    "Done",
+                    "finish",
+                    crate::subagent::SUBAGENT_SLOTS,
+                )
+                .expect("a free slot");
+            registry.finish(&settled, "the answer".to_string(), (1, 1), Vec::new());
+            let out = tool
+                .run(&serde_json::json!({ "subagent_id": settled }))
+                .await
+                .expect("a settled run reports itself");
+            assert_eq!(out["interrupted"], false);
+            assert_eq!(out["status"], "done");
+            assert_eq!(
+                registry.run(&settled).expect("run").result.as_deref(),
+                Some("the answer")
+            );
         });
     }
 

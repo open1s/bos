@@ -265,7 +265,7 @@ Injection order for one turn:
 | list_dir | `crates/bsh/src/prompts.rs:59` | system, when registered | `Use list_dir to see what a directory holds before reading or creating files; it reports names and kinds, not contents.` |
 | web_search | `crates/bsh/src/prompts.rs:66` | system, when registered | DSH's no-fetch branch, verbatim |
 | mcp gateway | `crates/bsh/src/prompts.rs` | system, when the lazy `mcp` tool is registered | discover with `action=list`, then `action=call` with server/tool/arguments; do not guess a tool name |
-| subagent rule | `crates/bsh/src/prompts.rs:65` | system, when `subagent` registered | `## Delegating with subagents` + DSH's delegation sentence + BSH's background start, wave limit, `subagent_result` collection and child-prompt pattern |
+| subagent rule | `crates/bsh/src/prompts.rs:65` | system, when `subagent` registered | `## Delegating with subagents` + DSH's delegation sentence + BSH's background start, wave limit, `subagent_result` collection, `send_message` continuation, `interrupt_agent` stop and child-prompt pattern |
 | shipped `ptc` persona | `crates/bsh/src/prompts.rs:149` | persona slot | `You execute work in batched steps: …` |
 | shipped `creator` persona | `crates/bsh/src/prompts.rs:152` | persona slot | `You extend this harness through conversation: …` |
 | shipped `read-only` persona | `crates/bsh/src/prompts.rs:155` | persona slot | `You are a read-only analyst: …` |

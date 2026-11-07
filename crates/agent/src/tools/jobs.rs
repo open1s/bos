@@ -504,8 +504,11 @@ verdict := {"allow": false, "rule": "no-job-output", "reason": "job output is no
         let older = registry.begin("session-a", "bash", "sleep 5");
         let newer = registry.begin("session-a", "bash", "sleep 6");
         let foreign = registry.begin("session-b", "bash", "echo not-yours");
-        registry.append_output(&newer, b"partial
-");
+        registry.append_output(
+            &newer,
+            b"partial
+",
+        );
 
         let tool = JobTool::lister("job_list").with_jobs(registry, "session-a");
         let listed = tool.run(&serde_json::json!({})).expect("the roster");
@@ -514,7 +517,9 @@ verdict := {"allow": false, "rule": "no-job-output", "reason": "job output is no
         let jobs = listed["jobs"].as_array().expect("jobs");
         assert_eq!(jobs[0]["id"], serde_json::json!(newer), "newest first");
         assert_eq!(jobs[1]["id"], serde_json::json!(older));
-        assert!(jobs.iter().all(|job| job["id"] != serde_json::json!(foreign)));
+        assert!(jobs
+            .iter()
+            .all(|job| job["id"] != serde_json::json!(foreign)));
         assert_eq!(jobs[0]["status"], serde_json::json!("running"));
         assert_eq!(jobs[0]["running"], serde_json::json!(true));
         assert!(

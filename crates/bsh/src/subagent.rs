@@ -225,6 +225,12 @@ pub(crate) struct SubagentRegistry {
     /// The live child agent behind each settled run, so the reader can send a
     /// follow-up into the same conversation.
     agents: Mutex<HashMap<String, Arc<tokio::sync::Mutex<agent::Agent>>>>,
+    /// The abort handle of each running turn, so it can be stopped.
+    ///
+    /// A detached child is a Tokio task; without its handle the only way to
+    /// stop one is to stop the whole runner. The handle is registered when the
+    /// turn is spawned and dropped when it settles or is interrupted.
+    handles: Mutex<HashMap<String, tokio::task::AbortHandle>>,
     next: AtomicU64,
 }
 
@@ -345,6 +351,7 @@ impl SubagentRegistry {
         usage: (u64, u64),
         transcript: Vec<SubagentMessage>,
     ) {
+        self.forget_handle(id);
         if let Ok(mut runs) = self.runs.lock() {
             if let Some(run) = runs.iter_mut().find(|run| run.id == id) {
                 run.status = SubagentStatus::Done;
@@ -366,6 +373,7 @@ impl SubagentRegistry {
         usage: Option<(u64, u64)>,
         transcript: Vec<SubagentMessage>,
     ) {
+        self.forget_handle(id);
         if let Ok(mut runs) = self.runs.lock() {
             if let Some(run) = runs.iter_mut().find(|run| run.id == id) {
                 run.status = SubagentStatus::Failed;
@@ -379,6 +387,51 @@ impl SubagentRegistry {
                 run.transcript = transcript;
             }
         }
+    }
+
+    /// Drop a run's abort handle once its task has settled.
+    fn forget_handle(&self, id: &str) {
+        if let Ok(mut handles) = self.handles.lock() {
+            handles.remove(id);
+        }
+    }
+
+    /// Remember the task running one child turn so it can be stopped.
+    pub(crate) fn set_handle(&self, id: &str, handle: tokio::task::AbortHandle) {
+        if let Ok(mut handles) = self.handles.lock() {
+            handles.insert(id.to_string(), handle);
+        }
+    }
+
+    /// Stop one running child turn.
+    ///
+    /// The run is marked failed with the reason rather than left running: the
+    /// abort drops the turn's future, so nothing else will ever settle it, and
+    /// a run that still reads "running" would hold its slot forever. Prompts
+    /// queued behind the turn are dropped for the same reason.
+    ///
+    /// False when no task is registered: a run restored after a restart has a
+    /// status but no process, and a settled run has nothing to stop.
+    pub(crate) fn interrupt(&self, id: &str) -> bool {
+        let handle = self
+            .handles
+            .lock()
+            .ok()
+            .and_then(|mut handles| handles.remove(id));
+        let Some(handle) = handle else {
+            return false;
+        };
+        handle.abort();
+        if let Ok(mut runs) = self.runs.lock() {
+            if let Some(run) = runs.iter_mut().find(|run| run.id == id) {
+                run.status = SubagentStatus::Failed;
+                run.finished_at = Some(now_ms());
+                run.error = Some("interrupted by the parent turn".to_string());
+                run.pending.clear();
+                run.revision += 1;
+            }
+        }
+        true
     }
 
     /// Keep the live child agent behind a run for follow-up input.

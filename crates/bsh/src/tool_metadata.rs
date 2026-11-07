@@ -56,6 +56,13 @@ pub(crate) fn builtin_metadata(name: &str) -> Option<ToolMetadata> {
             .with_risk("high")
             .with_side_effects(["spend"])
             .with_permissions(["agent.spawn"]),
+        // Stopping a child signals a task this session owns: no spend, but a
+        // process-level effect the audit must record.
+        "interrupt_agent" => ToolMetadata::new()
+            .with_version("1.0.0")
+            .with_risk("low")
+            .with_side_effects(["process"])
+            .with_permissions(["agent.write:runs"]),
         "job_list" | "job_output" => ToolMetadata::new()
             .with_version("1.0.0")
             .with_risk("low")
@@ -125,6 +132,7 @@ mod tests {
             "job_kill",
             "job_list",
             "send_message",
+            "interrupt_agent",
         ] {
             let metadata = builtin_metadata(name).unwrap_or_else(|| panic!("{name} is declared"));
             assert_eq!(metadata.version.as_deref(), Some("1.0.0"), "{name}");

@@ -366,7 +366,13 @@ fn capability_follows_the_effective_permission_in_data() {
             PolicyData::new(dir.path()).with_permission(permission.to_string()),
         )
     };
-    let gated = ["run_in_background", "job_output", "job_kill", "subagent"];
+    let gated = [
+        "run_in_background",
+        "job_output",
+        "job_list",
+        "job_kill",
+        "subagent",
+    ];
 
     let writable = tool_set("workspace-write");
     for tool in gated {

@@ -80,9 +80,12 @@ the workspace root; the answer decides whether the tool is offered at all.
      "action": "capability", "target": {"kind": "path", "path": "/workspace"}}
 
 The gated names are `run_in_background` (the shell's detached-run flag),
-`job_output`, `job_kill` and `subagent`. `bash` itself is governed by the
-permission matrix and the preset's `tools` allowlist as well as by its spawn
-check at call time.
+`job_output`, `job_list`, `job_kill` and `subagent`. `bash` itself is
+governed by the permission matrix and the preset's `tools` allowlist as well
+as by its spawn check at call time. `send_message` and `interrupt_agent` are
+not separate capabilities: continuing or stopping a child is delegation again,
+so `send_message` asks the `subagent` spawn question at call time, and both
+ride the `subagent` gate at build time.
 
 ## The data
 
@@ -104,8 +107,8 @@ The host installs one data document:
 `permission` is the **effective** permission: the session's mode capped by the
 preset's ceiling (`read-only` | `workspace-write` | `danger-full-access`).
 The baseline's capability rule reads it, so a read-only turn refuses
-`run_in_background`, `job_output`, `job_kill` and `subagent` in Rego as well
-as in the host's registration matrix. `preset_permission` remains the preset's
+`run_in_background`, `job_output`, `job_list`, `job_kill` and `subagent` in
+Rego as well as in the host's registration matrix. `preset_permission` remains the preset's
 own ceiling, which is what the generated read-only module reads.
 
 Two keys describe the shell's confinement, and they answer different questions:
@@ -315,8 +318,8 @@ explicit empty list mounts nothing:
   means none. MCP entries are server namespaces (the name the settings entry
   or extension server registers under).
 - The tool vocabulary is `bash`, `glob`, `grep`, `read_file`, `write_file`,
-  `edit_file`, `list_dir`, `update_plan`, `job_output`, `job_kill` and
-  `subagent`.
+  `edit_file`, `list_dir`, `update_plan`, `job_output`, `job_list`,
+  `job_kill`, `subagent`, `send_message` and `interrupt_agent`.
   `run_in_background` is the shell's own flag, so the `bash` entry gates it;
   it is also its own capability name for a Rego policy. A preset cannot use
   `tools` to widen the permission matrix: the allowlist is intersected with
@@ -543,7 +546,7 @@ In plain English:
   `subagent` (delegating to a child agent). A workspace policy may narrow
   those; running any other tool as a process is refused.
 - **Capability** questions allow `run_in_background`, `job_output`,
-  `job_kill` and `subagent` only while `data.permission` is not
+  `job_list`, `job_kill` and `subagent` only while `data.permission` is not
   `read-only`.
 - Anything else falls to a default refusal.
 

@@ -94,7 +94,7 @@ Pattern:
 
 Do not finish a turn that started subagents before collecting them: a finished child's result lives in the registry, not in your context. `subagent_result` with no id lists the session's runs.
 
-A child is not a dead end once it starts: `send_message` queues a correction behind a running child's current turn, and starts a new turn on a finished one. Prefer that over spawning a second child with the same brief.
+A child is not a dead end once it starts: `send_message` queues a correction behind a running child's current turn, and starts a new turn on a finished one. Prefer that over spawning a second child with the same brief. When a child is clearly going the wrong way, `interrupt_agent` stops it and frees its slot; the run is marked failed with the reason, so delegate again with what you learned.
 
 A child has its own context and the same tools; it does not see this conversation unless the prompt contains the needed context.";
 
@@ -132,6 +132,7 @@ pub(crate) const KNOWN_TOOLS: &[&str] = &[
     "read_file",
     "read_files",
     "send_message",
+    "interrupt_agent",
     "subagent",
     "subagent_result",
     "update_plan",

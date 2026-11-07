@@ -35,10 +35,11 @@
 //!   `job_kill` (stopping a job this session owns) and `subagent` (delegating
 //!   to a child agent) are also spawns the baseline permits; the workspace
 //!   policy narrows them. Any other process start is refused.
-//! - **Capability** is the registration-time question. The four gated tools -
-//!   `run_in_background`, `job_output`, `job_kill` and `subagent` - are
-//!   offered only while `data.permission` grants side effects; a read-only
-//!   turn refuses them in Rego as well as in the Rust matrix.
+//! - **Capability** is the registration-time question. The five gated tools -
+//!   `run_in_background`, `job_output`, `job_list`, `job_kill` and
+//!   `subagent` - are offered only while `data.permission` grants side
+//!   effects; a read-only turn refuses them in Rego as well as in the Rust
+//!   matrix.
 //! - Anything else falls to a default refusal.
 //!
 //! Containment is one `startswith` against `data.workspace_prefix` (the root
@@ -149,7 +150,7 @@ verdict := {"allow": true, "rule": "capability-granted"} if {
 # string is data, not a Rego constant, so a preset ceiling and the session mode
 # are already folded into data.permission by the host.
 gated_capability(tool) if {
-    some gated in ["run_in_background", "job_output", "job_kill", "subagent"]
+    some gated in ["run_in_background", "job_output", "job_list", "job_kill", "subagent"]
     tool == gated
 }
 
