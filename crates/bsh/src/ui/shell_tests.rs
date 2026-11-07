@@ -4210,6 +4210,346 @@ fn the_default_model_picker_filters_and_picks(cx: &mut TestAppContext) {
     assert_eq!(cleared, None, "No default clears it");
 }
 
+/// The shell installs a host.runs service at assembly, and a run whose session
+/// is gone is refused visibly instead of staying queued forever.
+#[gpui::test]
+fn the_shell_serves_host_runs(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("task-runs", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    use crate::extension::runs::RunsService as _;
+    let service = cx
+        .update(|_, cx| shell.read(cx).task_runs.clone())
+        .expect("the shell installed a runs service at assembly");
+
+    let spec = crate::extension::runs::RunSpec {
+        session: "no-such-session".to_string(),
+        objective: "review the working copy".to_string(),
+        tier: crate::extension::runs::RunTier::Turn,
+        limits: crate::extension::runs::Limits::default(),
+        target: None,
+        capability: None,
+        trace: "task-1".to_string(),
+    };
+    let handle = crate::extension::runs::Runs::with(service.clone())
+        .start(spec)
+        .expect("the service accepts the run");
+    cx.run_until_parked();
+    let snapshot = service.observe(&handle.id).expect("the snapshot");
+    assert_eq!(
+        snapshot.state,
+        crate::extension::runs::RunState::Failed,
+        "a run for a missing session fails instead of staying queued"
+    );
+    assert_eq!(snapshot.error.as_deref(), Some("the session is gone"));
+}
+
+/// The Tasks tab reads the workspace's records and draws a row; an empty
+/// workspace says so.
+#[gpui::test]
+fn the_tasks_tab_shows_the_workspace_board(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let dir = std::env::temp_dir().join(format!("bsh-tasks-pane-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch workspace");
+
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("tasks-pane", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.state
+                .settings
+                .global
+                .workspaces
+                .push(crate::settings::global::WorkspaceRef {
+                    id: "ws-tasks".to_string(),
+                    name: "Tasks".to_string(),
+                    root: dir.to_string_lossy().to_string(),
+                    created_at: 0,
+                    updated_at: 0,
+                });
+            this.state.settings.global.general.active_workspace = "ws-tasks".to_string();
+        });
+    });
+
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(crate::ui::right_panel::RightTab::Tasks, window, cx);
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("tasks-empty").is_some(),
+        "an empty workspace says there are no tasks"
+    );
+
+    let task = crate::extension::tasks::Task::open(
+        "task-1",
+        "Review the diff",
+        "Review the working copy",
+        crate::extension::tasks::Origin {
+            session: "ses-1".to_string(),
+            turn: 1,
+        },
+        crate::extension::tasks::Trigger::Now,
+        crate::extension::tasks::Tier::Subagent,
+        1_000,
+    )
+    .expect("a task");
+    {
+        use crate::extension::tasks::TasksStore as _;
+        crate::extension::tasks::FileTasksStore
+            .save(&dir, &task)
+            .expect("save");
+    }
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(crate::ui::right_panel::RightTab::Tasks, window, cx);
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("task-row-task-1").is_some(),
+        "the saved task is a board row"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A due every-task fires from the tick: the record turns Running with a run
+/// id, and the run reaches the service (which refuses here because the scratch
+/// session has no model, which is the correct refusal to observe).
+#[gpui::test]
+fn a_due_task_fires_from_the_tick(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let dir = std::env::temp_dir().join(format!("bsh-task-tick-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch workspace");
+
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("task-tick", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let session = cx.update(|_, cx| shell.read(cx).state.active_id.clone().expect("session"));
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.state
+                .settings
+                .global
+                .workspaces
+                .push(crate::settings::global::WorkspaceRef {
+                    id: "ws-tick".to_string(),
+                    name: "Tick".to_string(),
+                    root: dir.to_string_lossy().to_string(),
+                    created_at: 0,
+                    updated_at: 0,
+                });
+            this.state.settings.global.general.active_workspace = "ws-tick".to_string();
+        });
+    });
+
+    let task = crate::extension::tasks::Task::open(
+        "task-1",
+        "Hourly review",
+        "Review the working copy",
+        crate::extension::tasks::Origin { session, turn: 0 },
+        crate::extension::tasks::Trigger::Every {
+            every_seconds: 60,
+            last_run_ms: 0,
+        },
+        crate::extension::tasks::Tier::Turn,
+        1_000,
+    )
+    .expect("a task");
+    {
+        use crate::extension::tasks::TasksStore as _;
+        crate::extension::tasks::FileTasksStore
+            .save(&dir, &task)
+            .expect("save");
+    }
+
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| this.check_task_schedules(cx));
+    });
+    use crate::extension::tasks::TasksStore as _;
+    let stored = crate::extension::tasks::FileTasksStore
+        .load(&dir, "task-1")
+        .expect("load")
+        .expect("record");
+    assert_eq!(
+        stored.status,
+        crate::extension::tasks::TaskStatus::Running,
+        "a due task is running"
+    );
+    let attempt = stored.attempts.last().expect("an attempt");
+    assert_eq!(
+        attempt.status,
+        crate::extension::tasks::AttemptStatus::Running
+    );
+    let run = attempt.run.clone().expect("a run id");
+    match &stored.trigger {
+        crate::extension::tasks::Trigger::Every { last_run_ms, .. } => {
+            assert!(*last_run_ms > 0, "the trigger remembers when it fired");
+        }
+        other => panic!("unexpected trigger {other:?}"),
+    }
+
+    // The pump receives the command and the service refuses the turn because
+    // the scratch session chose no model.
+    cx.run_until_parked();
+    let service = cx
+        .update(|_, cx| shell.read(cx).task_runs.clone())
+        .expect("the runs service");
+    use crate::extension::runs::RunsService as _;
+    let snapshot = service.observe(&run).expect("the run");
+    assert_eq!(snapshot.state, crate::extension::runs::RunState::Failed);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An armed task whose run settled is dropped when no model can open the
+/// resume turn: the arming clears once, nothing is retried forever, and the
+/// session gains no half-opened prompt.
+#[gpui::test]
+fn an_armed_task_clears_without_a_model(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let dir = std::env::temp_dir().join(format!("bsh-task-resume-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch workspace");
+
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("task-resume", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let session = cx.update(|_, cx| shell.read(cx).state.active_id.clone().expect("session"));
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.state
+                .settings
+                .global
+                .workspaces
+                .push(crate::settings::global::WorkspaceRef {
+                    id: "ws-resume".to_string(),
+                    name: "Resume".to_string(),
+                    root: dir.to_string_lossy().to_string(),
+                    created_at: 0,
+                    updated_at: 0,
+                });
+            this.state.settings.global.general.active_workspace = "ws-resume".to_string();
+        });
+    });
+
+    // A service whose single run is already settled, installed on the shell so
+    // the tick observes it without any real turn.
+    use crate::extension::runs::RunsService as _;
+    let (service, _requests) = crate::ui::task_runs::TaskRuns::new();
+    let spec = crate::extension::runs::RunSpec {
+        session: session.clone(),
+        objective: "Review the working copy".to_string(),
+        tier: crate::extension::runs::RunTier::Turn,
+        limits: crate::extension::runs::Limits::default(),
+        target: None,
+        capability: None,
+        trace: "task-1".to_string(),
+    };
+    let handle = service.start(spec).expect("queued");
+    service.record(
+        &handle.id,
+        crate::extension::runs::RunState::Succeeded,
+        Some("done".to_string()),
+        3,
+        1,
+        None,
+    );
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.task_runs = Some(service.clone());
+        });
+    });
+
+    let mut task = crate::extension::tasks::Task::open(
+        "task-1",
+        "Slow review",
+        "Review the working copy",
+        crate::extension::tasks::Origin {
+            session: session.clone(),
+            turn: 0,
+        },
+        crate::extension::tasks::Trigger::Now,
+        crate::extension::tasks::Tier::Turn,
+        1_000,
+    )
+    .expect("a task");
+    task.status = crate::extension::tasks::TaskStatus::Running;
+    task.resume_armed_ms = Some(1_000);
+    let mut attempt =
+        crate::extension::tasks::Attempt::queued("task-1-1", crate::extension::tasks::Tier::Turn);
+    attempt.run = Some(handle.id.clone());
+    attempt.status = crate::extension::tasks::AttemptStatus::Running;
+    task.attempts.push(attempt);
+    {
+        use crate::extension::tasks::TasksStore as _;
+        crate::extension::tasks::FileTasksStore
+            .save(&dir, &task)
+            .expect("save");
+    }
+
+    let before = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .store
+            .session(&session)
+            .expect("session")
+            .messages
+            .len()
+    });
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| this.check_task_resumes(cx));
+    });
+    use crate::extension::tasks::TasksStore as _;
+    let stored = crate::extension::tasks::FileTasksStore
+        .load(&dir, "task-1")
+        .expect("load")
+        .expect("record");
+    assert!(stored.resume_armed_ms.is_none(), "the arming is cleared");
+    let after = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .store
+            .session(&session)
+            .expect("session")
+            .messages
+            .len()
+    });
+    assert_eq!(before, after, "no turn was opened without a model");
+
+    // A second tick has nothing left to deliver.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| this.check_task_resumes(cx));
+    });
+    let stored = crate::extension::tasks::FileTasksStore
+        .load(&dir, "task-1")
+        .expect("load")
+        .expect("record");
+    assert!(stored.resume_armed_ms.is_none());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The model chip opens its own menu in place, the way the reference's trigger
 /// does - and the list that menu offers is the pane's own: the active provider's
 /// catalog, with the reference's fallback for an unresolved model.

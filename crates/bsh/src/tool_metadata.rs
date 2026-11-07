@@ -34,6 +34,17 @@ pub(crate) fn builtin_metadata(name: &str) -> Option<ToolMetadata> {
             .with_risk("medium")
             .with_side_effects(["write"])
             .with_permissions(["schedule.write"]),
+        "task_create" => ToolMetadata::new()
+            .with_version("1.0.0")
+            .with_risk("medium")
+            .with_side_effects(["write", "spend"])
+            .with_permissions(["task.write", "agent.spawn"]),
+        "task_join" => read_only("task.read"),
+        "task_cancel" => ToolMetadata::new()
+            .with_version("1.0.0")
+            .with_risk("medium")
+            .with_side_effects(["write"])
+            .with_permissions(["task.write"]),
         "get_goal" => local("goal.read", "low"),
         "update_goal" => local("goal.write", "medium"),
         "web_search" => ToolMetadata::new()

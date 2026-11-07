@@ -278,6 +278,12 @@ pub(crate) struct Shell {
     /// wake after the test scheduler has finished panics inside the waker; see
     /// [Shell::keep_task]. Keeping the handles makes the waker this shell's.
     foreground_tasks: Vec<ForegroundTask>,
+    /// The host.runs service this shell installed, if any.
+    pub(crate) task_runs: Option<Arc<crate::ui::task_runs::TaskRuns>>,
+    /// Sessions with an extension-started run in flight, by run id.
+    task_run_sessions: std::collections::BTreeMap<String, String>,
+    /// Peer tasks this shell is running, by session.
+    peer_task_runs: std::collections::BTreeMap<String, String>,
     /// The composer's text engine.
     pub(crate) composer: Entity<TextareaState>,
     /// The placeholder key the composer currently carries, so the refresh only
@@ -1841,9 +1847,13 @@ impl Shell {
                 cx.stop_propagation();
             }
         }));
+        let (task_runs, task_requests) = crate::ui::task_runs::TaskRuns::new();
         let mut shell = Self {
             state,
             foreground_tasks: Vec::new(),
+            task_runs: None,
+            task_run_sessions: std::collections::BTreeMap::new(),
+            peer_task_runs: std::collections::BTreeMap::new(),
             composer,
             placeholder_key,
             placeholder_fit: None,
@@ -2089,6 +2099,51 @@ impl Shell {
             models_selected: std::collections::BTreeSet::new(),
             _subs: subs,
         };
+        // The host.runs seam: extensions start runs through this service, and
+        // this shell's pump turns each command into a real turn. Installed
+        // once per shell; dropping the shell withdraws this exact service.
+        crate::extension::runs::install_runs_service(task_runs.clone());
+        shell.task_runs = Some(task_runs.clone());
+        let pump = cx.spawn(async move |this, cx| {
+            while let Ok(command) = task_requests.recv().await {
+                match command {
+                    crate::ui::task_runs::RunCommand::Start { id, spec } => {
+                        let outcome =
+                            this.update(cx, |shell, cx| shell.start_task_run(&id, &spec, cx));
+                        match outcome {
+                            Ok(Ok(())) => task_runs.record(
+                                &id,
+                                crate::extension::runs::RunState::Running,
+                                None,
+                                0,
+                                0,
+                                None,
+                            ),
+                            Ok(Err(why)) => task_runs.record(
+                                &id,
+                                crate::extension::runs::RunState::Failed,
+                                None,
+                                0,
+                                0,
+                                Some(why),
+                            ),
+                            Err(_) => task_runs.record(
+                                &id,
+                                crate::extension::runs::RunState::Failed,
+                                None,
+                                0,
+                                0,
+                                Some("the shell is gone".to_string()),
+                            ),
+                        }
+                    }
+                    crate::ui::task_runs::RunCommand::Cancel { id } => {
+                        let _ = this.update(cx, |shell, cx| shell.cancel_task_run(&id, cx));
+                    }
+                }
+            }
+        });
+        shell.keep_task(pump);
         crate::theme::apply(&shell.state.settings.global.general.theme_mode, window, cx);
         // Follow a live host appearance switch, which is what makes the System
         // option mean anything: the copied palette tokens would otherwise go
@@ -2256,6 +2311,9 @@ impl Shell {
                 .update(cx, |this, cx| {
                     if !this.state.settings.global.schedules.is_empty() {
                         this.check_schedules(cx);
+                        this.check_task_schedules(cx);
+                        this.check_task_resumes(cx);
+                        this.check_peer_tasks(cx);
                     }
                 })
                 .is_err()
@@ -4026,6 +4084,302 @@ impl Shell {
         cx.notify();
     }
 
+    /// Fire the due task records of the active workspace.
+    ///
+    /// Only the turn executor exists on this host, so a due subagent, job or
+    /// delegation task waits rather than inventing a run. A due turn task is
+    /// handed to the runs service (the same seam extensions use), its record
+    /// is marked Running with the run id, and a watcher settles it.
+    pub(crate) fn check_task_schedules(&mut self, cx: &mut Context<Self>) {
+        use crate::extension::tasks::{
+            Attempt, AttemptStatus, FileTasksStore, Host, TaskStatus, TasksStore, Tier, Trigger,
+        };
+        let root = self.state.settings.active_workspace_root();
+        if root.is_empty() {
+            return;
+        }
+        let root = std::path::PathBuf::from(root);
+        let Some(service) = self.task_runs.clone() else {
+            return;
+        };
+        let now_ms = crate::settings::unix_now().saturating_mul(1_000);
+        let Ok(tasks) = FileTasksStore.list(&root) else {
+            return;
+        };
+        for task in tasks {
+            if task.status != TaskStatus::Scheduled
+                || task.host != Host::Local
+                || task.tier != Tier::Turn
+            {
+                continue;
+            }
+            let due = match task.trigger {
+                Trigger::At { at_ms } => at_ms <= now_ms,
+                Trigger::Every {
+                    every_seconds,
+                    last_run_ms,
+                } => last_run_ms.saturating_add(every_seconds.saturating_mul(1_000)) <= now_ms,
+                Trigger::Now => false,
+            };
+            if !due {
+                continue;
+            }
+            if self.state.streams.contains_key(&task.origin.session) {
+                continue;
+            }
+            let spec = crate::extension::runs::RunSpec {
+                session: task.origin.session.clone(),
+                objective: task.intent.clone(),
+                tier: crate::extension::runs::RunTier::Turn,
+                limits: crate::extension::runs::Limits {
+                    steps: task.budget.max_steps,
+                    tokens: task.budget.max_tokens,
+                    deadline_ms: task.budget.deadline_ms,
+                },
+                target: None,
+                capability: None,
+                trace: task.id.clone(),
+            };
+            let Ok(handle) = crate::extension::runs::Runs::with(service.clone()).start(spec) else {
+                continue;
+            };
+            let mut record = task;
+            record.status = TaskStatus::Running;
+            let mut attempt = Attempt::queued(
+                format!("{}-{}", record.id, record.attempts.len() + 1),
+                Tier::Turn,
+            );
+            attempt.run = Some(handle.id.clone());
+            attempt.status = AttemptStatus::Running;
+            attempt.started_ms = Some(now_ms);
+            record.attempts.push(attempt);
+            if let Trigger::Every { last_run_ms, .. } = &mut record.trigger {
+                *last_run_ms = now_ms;
+            }
+            record.updated_ms = now_ms;
+            let _ = FileTasksStore.save(&root, &record);
+            self.watch_task_run(
+                service.clone(),
+                root.clone(),
+                record.id.clone(),
+                handle.id.clone(),
+                cx,
+            );
+        }
+    }
+
+    /// Poll a scheduled run until it settles, then settle its record.
+    ///
+    /// The wait is bounded: ten minutes is the largest deadline a task budget
+    /// can carry, so a watcher cannot outlive the run it watches by much.
+    fn watch_task_run(
+        &mut self,
+        service: Arc<crate::ui::task_runs::TaskRuns>,
+        root: std::path::PathBuf,
+        task: String,
+        run: String,
+        cx: &mut Context<Self>,
+    ) {
+        let watcher = cx.spawn(async move |_this, cx| {
+            for _ in 0..1_200 {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(500))
+                    .await;
+                let runs = crate::extension::runs::Runs::with(service.clone());
+                let Some(snapshot) = runs.observe(&run) else {
+                    return;
+                };
+                if snapshot.state.is_settled() {
+                    settle_scheduled_record(&root, &task, &run, &snapshot);
+                    return;
+                }
+            }
+        });
+        self.keep_task(watcher);
+    }
+
+    /// Claim the peer tasks due on this node and run each as a background turn.
+    ///
+    /// The node records tasks other peers asked this one to own; this shell is
+    /// what actually runs them. Each task gets its own background session, so
+    /// remote work never lands in the reader's open chat.
+    pub(crate) fn check_peer_tasks(&mut self, cx: &mut Context<Self>) {
+        let Some(runtime) = crate::federation_node::running() else {
+            return;
+        };
+        let now_ms = crate::settings::unix_now().saturating_mul(1_000);
+        for task in runtime.node().claim_due_tasks(now_ms) {
+            let title = format!("Federation work: {}", task.origin);
+            let Some(session) = self.background_session(&title) else {
+                let _ = runtime.node().settle_task(
+                    &task.id,
+                    false,
+                    None,
+                    Some("a session could not be created".to_string()),
+                );
+                continue;
+            };
+            let choice = self.state.session_choice(&session);
+            if let Some(key) = self.state.settings.refusal_for(&choice) {
+                let _ = runtime.node().settle_task(
+                    &task.id,
+                    false,
+                    None,
+                    Some(crate::i18n::tr(self.state.lang, key)),
+                );
+                continue;
+            }
+            let Some((transcript, budget)) = self.state.begin_turn_in(&session, &task.objective)
+            else {
+                let _ = runtime.node().settle_task(
+                    &task.id,
+                    false,
+                    None,
+                    Some("the session could not open a turn".to_string()),
+                );
+                continue;
+            };
+            let plan = self.state.plan_mode(&session);
+            let request = crate::state::turn_text(&task.objective, plan);
+            let input = crate::state::turn_input(&request, &[]);
+            self.spawn_turn(session.clone(), input, transcript, budget, cx);
+            self.peer_task_runs.insert(session, task.id.clone());
+        }
+    }
+
+    /// Create a session without making it the reader's active chat.
+    fn background_session(&mut self, title: &str) -> Option<String> {
+        let workspace = self
+            .state
+            .settings
+            .active_workspace()
+            .map(|record| record.id.clone())
+            .unwrap_or_default();
+        let session = crate::model::Session::new(&workspace, title);
+        let id = session.id.clone();
+        if self.state.store.save(&session).is_err() {
+            return None;
+        }
+        self.state.store.insert(session);
+        crate::extension::publish(
+            crate::extension::topics::SESSION_CREATED,
+            serde_json::json!({ "session": id, "workspace": workspace }),
+        );
+        Some(id)
+    }
+
+    /// Settle the peer task a session was running, from the turn's result.
+    pub(crate) fn settle_peer_task(&mut self, session: &str, failed: bool) {
+        let Some(task_id) = self.peer_task_runs.remove(session) else {
+            return;
+        };
+        let Some(runtime) = crate::federation_node::running() else {
+            return;
+        };
+        let result = self
+            .state
+            .store
+            .session(session)
+            .and_then(|session| session.messages.last())
+            .map(|message| message.text.clone());
+        let error = failed.then(|| "the turn failed".to_string());
+        let _ = runtime.node().settle_task(&task_id, !failed, result, error);
+    }
+
+    /// Deliver the settled results of armed tasks, one trigger turn per
+    /// session per tick.
+    ///
+    /// Arming happens when a join returns with work still running. Delivery
+    /// clears the arming in the same write, so a result ships at most once
+    /// even across restarts. A session that cannot open a turn (no model, or
+    /// gone) drops the arming rather than retrying forever; the board still
+    /// shows the result.
+    pub(crate) fn check_task_resumes(&mut self, cx: &mut Context<Self>) {
+        use crate::extension::runs::RunsService as _;
+        use crate::extension::tasks::{FileTasksStore, TasksStore};
+        let root = self.state.settings.active_workspace_root();
+        if root.is_empty() {
+            return;
+        }
+        let root = std::path::PathBuf::from(root);
+        let Some(service) = self.task_runs.clone() else {
+            return;
+        };
+        let Ok(tasks) = FileTasksStore.list(&root) else {
+            return;
+        };
+        let mut groups: std::collections::BTreeMap<String, Vec<crate::extension::tasks::Task>> =
+            std::collections::BTreeMap::new();
+        for task in tasks
+            .into_iter()
+            .filter(|task| task.resume_armed_ms.is_some())
+        {
+            groups
+                .entry(task.origin.session.clone())
+                .or_default()
+                .push(task);
+        }
+        let now_ms = crate::settings::unix_now().saturating_mul(1_000);
+        for (session, group) in groups {
+            if self.state.streams.contains_key(&session) {
+                continue;
+            }
+            let mut settled: Vec<(
+                crate::extension::tasks::Task,
+                crate::extension::runs::RunSnapshot,
+            )> = Vec::new();
+            for task in &group {
+                let Some(run) = task.attempts.last().and_then(|attempt| attempt.run.clone()) else {
+                    continue;
+                };
+                let snapshot = service
+                    .observe(&run)
+                    .or_else(|| self.state.subagents.run(&run).map(|run| run.snapshot()))
+                    .or_else(|| crate::federation_tools::delegation_snapshot(&run));
+                if let Some(snapshot) = snapshot {
+                    if snapshot.state.is_settled() {
+                        settled.push((task.clone(), snapshot));
+                    }
+                }
+            }
+            if settled.is_empty() {
+                continue;
+            }
+            let choice = self.state.session_choice(&session);
+            let undeliverable = self.state.settings.refusal_for(&choice).is_some()
+                || self.state.store.session(&session).is_none();
+            if undeliverable {
+                for (mut task, _) in settled {
+                    task.resume_armed_ms = None;
+                    task.updated_ms = now_ms;
+                    let _ = FileTasksStore.save(&root, &task);
+                }
+                continue;
+            }
+            let text = crate::task_tools::resume_prompt(&settled);
+            let Some((transcript, budget)) = self.state.begin_turn_in(&session, &text) else {
+                for (mut task, _) in settled {
+                    task.resume_armed_ms = None;
+                    task.updated_ms = now_ms;
+                    let _ = FileTasksStore.save(&root, &task);
+                }
+                continue;
+            };
+            let plan = self.state.plan_mode(&session);
+            let request = crate::state::turn_text(&text, plan);
+            let input = crate::state::turn_input(&request, &[]);
+            self.spawn_turn(session.clone(), input, transcript, budget, cx);
+            for (mut task, _) in settled {
+                task.resume_armed_ms = None;
+                task.updated_ms = now_ms;
+                if let Some(attempt) = task.attempts.last_mut() {
+                    attempt.delivered_ms = Some(now_ms);
+                }
+                let _ = FileTasksStore.save(&root, &task);
+            }
+        }
+    }
+
     /// Own a foreground task so THIS shell's drop cancels it.
     ///
     /// A detached task outlives the entity: its waker survives the window, so a
@@ -4265,6 +4619,8 @@ impl Shell {
                             }),
                         );
                         shell.state.finish_plan(&session_id);
+                        shell.settle_task_run(&session_id, failed);
+                        shell.settle_peer_task(&session_id, failed);
                         // A goal the model settled during the turn takes
                         // effect BEFORE the loop decides to continue: a
                         // completed or blocked goal must not start round n+1.
@@ -5065,6 +5421,105 @@ impl Shell {
         }
     }
 
+    /// Start an extension-requested run. Only the turn tier is wired on this
+    /// host so far; the seam refuses anything else rather than pretending.
+    pub(crate) fn start_task_run(
+        &mut self,
+        run: &str,
+        spec: &crate::extension::runs::RunSpec,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if !matches!(spec.tier, crate::extension::runs::RunTier::Turn) {
+            return Err("only the turn tier is wired on this host".to_string());
+        }
+        if self.state.streams.contains_key(&spec.session) {
+            return Err("the session is busy".to_string());
+        }
+        if self.state.store.session(&spec.session).is_none() {
+            return Err("the session is gone".to_string());
+        }
+        let choice = self.state.session_choice(&spec.session);
+        if let Some(key) = self.state.settings.refusal_for(&choice) {
+            return Err(crate::i18n::tr(self.state.lang, key));
+        }
+        let Some((transcript, budget)) = self.state.begin_turn_in(&spec.session, &spec.objective)
+        else {
+            return Err("the session is gone".to_string());
+        };
+        let plan = self.state.plan_mode(&spec.session);
+        let request = crate::state::turn_text(&spec.objective, plan);
+        let input = crate::state::turn_input(&request, &[]);
+        self.spawn_turn(spec.session.clone(), input, transcript, budget, cx);
+        self.task_run_sessions
+            .insert(spec.session.clone(), run.to_string());
+        Ok(())
+    }
+
+    /// Settle the run this shell started for a session, after its turn ended.
+    pub(crate) fn settle_task_run(&mut self, session: &str, failed: bool) {
+        let Some(run) = self.task_run_sessions.remove(session) else {
+            return;
+        };
+        let Some(service) = self.task_runs.clone() else {
+            return;
+        };
+        // The result is the last assistant row; its meta carries the usage the
+        // turn reported, so the board shows what the run actually cost.
+        let (result, tokens) = self
+            .state
+            .store
+            .session(session)
+            .and_then(|session| session.messages.last())
+            .map(|message| {
+                let tokens = message
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.usage.as_ref())
+                    .map(|usage| usage.prompt_tokens + usage.completion_tokens)
+                    .unwrap_or(0);
+                (Some(message.text.clone()), tokens)
+            })
+            .unwrap_or((None, 0));
+        let state = if failed {
+            crate::extension::runs::RunState::Failed
+        } else {
+            crate::extension::runs::RunState::Succeeded
+        };
+        service.record(
+            &run,
+            state,
+            result,
+            tokens,
+            0,
+            failed.then(|| "the turn failed".to_string()),
+        );
+    }
+
+    /// Stop an extension-started run of this shell.
+    pub(crate) fn cancel_task_run(&mut self, run: &str, cx: &mut Context<Self>) {
+        let Some(session) = self
+            .task_run_sessions
+            .iter()
+            .find(|(_, id)| id.as_str() == run)
+            .map(|(session, _)| session.clone())
+        else {
+            return;
+        };
+        self.task_run_sessions.remove(&session);
+        if let Some(service) = self.task_runs.clone() {
+            service.record(
+                run,
+                crate::extension::runs::RunState::Cancelled,
+                None,
+                0,
+                0,
+                None,
+            );
+        }
+        self.state.stop(&session);
+        cx.notify();
+    }
+
     /// Put a session's title into the rename field, in place on its row.
     ///
     /// The reference renames inline, so the row the reader pointed at is where
@@ -5538,6 +5993,10 @@ impl Shell {
 
 impl Drop for Shell {
     fn drop(&mut self) {
+        if let Some(service) = &self.task_runs {
+            let service: Arc<dyn crate::extension::runs::RunsService> = service.clone();
+            crate::extension::runs::clear_runs_service_if(&service);
+        }
         // Close the channels FIRST, then cancel the tasks. Closing is
         // synchronous and wakes the awaiting task on this thread (allowed by
         // gpui-pre's scheduler), clearing the listener the Tokio senders would
@@ -6083,6 +6542,64 @@ impl Render for Shell {
                 ))
             })
     }
+}
+
+/// Settle a scheduled task's record from its finished run.
+fn settle_scheduled_record(
+    root: &std::path::Path,
+    task_id: &str,
+    run_id: &str,
+    snapshot: &crate::extension::runs::RunSnapshot,
+) {
+    use crate::extension::runs::RunState;
+    use crate::extension::tasks::{
+        AttemptStatus, FileTasksStore, TaskStatus, TasksStore, Trigger, Usage,
+    };
+    let Ok(Some(mut record)) = FileTasksStore.load(root, task_id) else {
+        return;
+    };
+    let status = match snapshot.state {
+        RunState::Succeeded => TaskStatus::Succeeded,
+        RunState::Failed => TaskStatus::Failed,
+        RunState::Cancelled => TaskStatus::Cancelled,
+        RunState::Unknown => TaskStatus::Unknown,
+        RunState::Queued | RunState::Running => return,
+    };
+    let now_ms = crate::settings::unix_now().saturating_mul(1_000);
+    if let Some(attempt) = record
+        .attempts
+        .iter_mut()
+        .find(|attempt| attempt.run.as_deref() == Some(run_id))
+    {
+        attempt.status = match status {
+            TaskStatus::Succeeded => AttemptStatus::Succeeded,
+            TaskStatus::Failed => AttemptStatus::Failed,
+            TaskStatus::Cancelled => AttemptStatus::Cancelled,
+            TaskStatus::Unknown => AttemptStatus::Unknown,
+            _ => attempt.status,
+        };
+        attempt.ended_ms = Some(now_ms);
+        if snapshot.result.is_some() {
+            attempt.result = snapshot.result.clone();
+        }
+        if snapshot.error.is_some() {
+            attempt.error = snapshot.error.clone();
+        }
+        if snapshot.tokens != 0 || snapshot.steps != 0 {
+            attempt.usage = Some(Usage {
+                tokens: snapshot.tokens,
+                steps: snapshot.steps,
+                wall_ms: 0,
+            });
+        }
+    }
+    record.status = if matches!(record.trigger, Trigger::Every { .. }) {
+        TaskStatus::Scheduled
+    } else {
+        status
+    };
+    record.updated_ms = now_ms;
+    let _ = FileTasksStore.save(root, &record);
 }
 
 #[cfg(test)]

@@ -1476,13 +1476,14 @@ fn build_agent_for_session_inner(
         }
     }
 
+    let mut task_subagents: Option<Arc<SubagentContext>> = None;
     if let Some((parent, registry)) = subagents {
         // Delegation is a capability, not a free attachment: the same single
         // predicate that gates the shell family decides whether the tool and
         // its standing guidance exist at all, and the reader's own switch for
         // `subagent` closes it like every other tool's.
         if gates.subagent && !off_tool("subagent") {
-            let context = SubagentContext::new(
+            let context = Arc::new(SubagentContext::new(
                 &agent,
                 parent,
                 parent,
@@ -1498,8 +1499,40 @@ fn build_agent_for_session_inner(
                     message: !off_tool("send_message"),
                     interrupt: !off_tool("interrupt_agent"),
                 },
-            );
+            ));
+            task_subagents = Some(context.clone());
             attach_subagent_tool(&mut agent, context);
+        }
+    }
+
+    // Durable tasks: create a record and run it as a turn, then join it.
+    // The store lives beside the workspace's sessions, so a turn's task is
+    // scoped to the workspace that turn actually runs in.
+    let task_root = choice
+        .workspace
+        .as_ref()
+        .and_then(|id| {
+            settings
+                .global
+                .workspaces
+                .iter()
+                .find(|workspace| &workspace.id == id)
+        })
+        .map(|workspace| std::path::PathBuf::from(&workspace.root))
+        .or_else(|| {
+            let root = settings.active_workspace_root();
+            (!root.is_empty()).then(|| std::path::PathBuf::from(root))
+        });
+    if let Some(workspace) = task_root {
+        if !off_tool("task_create") {
+            crate::task_tools::attach(
+                &mut agent,
+                crate::task_tools::TaskToolsContext {
+                    session: session.to_string(),
+                    workspace,
+                    subagents: task_subagents,
+                },
+            );
         }
     }
 
@@ -2447,6 +2480,98 @@ impl SubagentContext {
         }
     }
 
+    /// Start one detached child and return its run id and the title it was
+    /// given. Policy is asked before the child exists, so a denial creates no
+    /// run row and no child session; the slot is reserved atomically.
+    pub(crate) fn spawn_child(
+        &self,
+        title: &str,
+        prompt: &str,
+    ) -> Result<(String, String), ToolError> {
+        let prompt = prompt.trim().to_string();
+        if prompt.is_empty() {
+            return Err(ToolError::InvalidInput(
+                "prompt is required and must not be empty".to_string(),
+            ));
+        }
+        self.authorize_spawn()?;
+        let title = if title.trim().is_empty() {
+            prompt
+                .lines()
+                .next()
+                .unwrap_or("Subagent")
+                .chars()
+                .take(60)
+                .collect::<String>()
+        } else {
+            title.trim().to_string()
+        };
+        // A live estimate for the header before the child reports usage:
+        // prompt bytes plus a small allowance for tools/config.
+        let estimated_tokens = (prompt.chars().count() / 4) as u64 + 2_000;
+        let Some(id) = self.registry.try_begin(
+            &self.session,
+            &self.parent,
+            self.depth + 1,
+            estimated_tokens,
+            &title,
+            &prompt,
+            crate::subagent::SUBAGENT_SLOTS,
+        ) else {
+            return Err(ToolError::Failed(
+                "all subagent slots are running; wait for one to finish".to_string(),
+            ));
+        };
+        let child = self.child(&id);
+        let turn_context = crate::context::TurnContext::from_facts(&self.runtime, true);
+        let registry = self.registry.clone();
+        let task_id = id.clone();
+        let task_title = title.clone();
+        // The child is detached on the runner's runtime: the parent continues
+        // with work it delegated. The registry is the live handle the header,
+        // subagent_result and the task join read.
+        let registry_for_handle = registry.clone();
+        let handle_id = task_id.clone();
+        let handle = tokio::spawn(async move {
+            log::info!("subagent {task_id} started: {task_title}");
+            let result = stream_child(
+                &child,
+                prompt.to_string(),
+                registry.clone(),
+                &task_id,
+                &turn_context,
+            )
+            .await;
+            let usage = child.last_token_usage().unwrap_or((0, 0));
+            let transcript = child_transcript(&child);
+            registry.set_agent(&task_id, Arc::new(tokio::sync::Mutex::new(child)));
+            match result {
+                Ok((text, usage)) => {
+                    registry.finish(&task_id, text, usage, transcript);
+                    log::info!("subagent {task_id} done");
+                }
+                Err(message) => {
+                    log::warn!("subagent {task_id} failed: {message}");
+                    registry.fail(&task_id, message, Some(usage), transcript);
+                }
+            }
+        });
+        // Detached means interruptible: the handle is what interrupt_agent
+        // aborts. A turn that settles first drops it in finish/fail.
+        registry_for_handle.set_handle(&handle_id, handle.abort_handle());
+        Ok((id, title))
+    }
+
+    /// The run's observed snapshot for the task seam, when it exists.
+    pub(crate) fn snapshot(&self, id: &str) -> Option<crate::extension::runs::RunSnapshot> {
+        self.registry.run(id).map(|run| run.snapshot())
+    }
+
+    /// Stop one child run. Returns whether the registry knew the id.
+    pub(crate) fn interrupt_run(&self, id: &str) -> bool {
+        self.registry.interrupt(id)
+    }
+
     /// Build a child and, below the depth cap, give it the subagent tool too.
     fn child(&self, child_id: &str) -> Agent {
         self.child_with_delegation(child_id, true)
@@ -2508,7 +2633,7 @@ impl SubagentContext {
                 self.runtime.clone(),
                 self.tools,
             );
-            attach_subagent_tool(&mut child, nested);
+            attach_subagent_tool(&mut child, Arc::new(nested));
             crate::prompts::append_subagent_guidance(&mut child);
         }
         child
@@ -2685,8 +2810,7 @@ pub(crate) async fn stream_child(
 }
 
 /// Install the subagent tool on a parent turn.
-pub(crate) fn attach_subagent_tool(agent: &mut Agent, context: SubagentContext) {
-    let context = Arc::new(context);
+pub(crate) fn attach_subagent_tool(agent: &mut Agent, context: Arc<SubagentContext>) {
     // The collector needs the same registry and session the starter uses. Take
     // them before the starter closure moves the Arc, and keep one handle for the
     // follow-up tool the same build may also install.
@@ -2711,83 +2835,13 @@ pub(crate) fn attach_subagent_tool(agent: &mut Agent, context: SubagentContext) 
                     .get("description")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("")
-                    .trim()
                     .to_string();
                 let prompt = args
                     .get("prompt")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("")
-                    .trim()
                     .to_string();
-                if prompt.is_empty() {
-                    return Err(ToolError::InvalidInput(
-                        "prompt is required and must not be empty".to_string(),
-                    ));
-                }
-                // Policy before the child exists: a denied spawn creates no run
-                // row and no child session.
-                context.authorize_spawn()?;
-                let title = if title.is_empty() {
-                    prompt
-                        .lines()
-                        .next()
-                        .unwrap_or("Subagent")
-                        .chars()
-                        .take(60)
-                        .collect()
-                } else {
-                    title
-                };
-                // A live estimate for the header before the child reports
-                // usage: prompt bytes plus a small allowance for tools/config.
-                let estimated_tokens = (prompt.chars().count() / 4) as u64 + 2_000;
-                let Some(id) = context.registry.try_begin(
-                    &context.session,
-                    &context.parent,
-                    context.depth + 1,
-                    estimated_tokens,
-                    &title,
-                    &prompt,
-                    crate::subagent::SUBAGENT_SLOTS,
-                ) else {
-                    return Err(ToolError::Failed(
-                        "all subagent slots are running; wait for one to finish".to_string(),
-                    ));
-                };
-                let child = context.child(&id);
-                let turn_context = crate::context::TurnContext::from_facts(&context.runtime, true);
-                let registry = context.registry.clone();
-                let task_id = id.clone();
-                let task_title = title.clone();
-                // The child is detached on the runner's runtime: the tool used
-                // to await the whole child turn, which serialized the parent
-                // behind work it had just delegated. The registry is the live
-                // handle the header and subagent_result read.
-                let registry_for_handle = registry.clone();
-                let handle_id = task_id.clone();
-                let handle = tokio::spawn(async move {
-                    log::info!("subagent {task_id} started: {task_title}");
-                    let result =
-                        stream_child(&child, prompt, registry.clone(), &task_id, &turn_context)
-                            .await;
-                    let usage = child.last_token_usage().unwrap_or((0, 0));
-                    let transcript = child_transcript(&child);
-                    registry.set_agent(&task_id, Arc::new(tokio::sync::Mutex::new(child)));
-                    match result {
-                        Ok((text, usage)) => {
-                            registry.finish(&task_id, text, usage, transcript);
-                            log::info!("subagent {task_id} done");
-                        }
-                        Err(message) => {
-                            log::warn!("subagent {task_id} failed: {message}");
-                            registry.fail(&task_id, message, Some(usage), transcript);
-                        }
-                    }
-                });
-                // Detached means interruptible: the handle is what
-                // interrupt_agent aborts. A turn that settles first drops it in
-                // finish/fail.
-                registry_for_handle.set_handle(&handle_id, handle.abort_handle());
+                let (id, title) = context.spawn_child(&title, &prompt)?;
                 Ok(serde_json::json!({
                     "subagent_id": id,
                     "status": "running",

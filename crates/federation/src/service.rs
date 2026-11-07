@@ -44,6 +44,7 @@ use crate::membership::FederationId;
 use crate::peers::PeerStore;
 use crate::resource::{LeaseId, LeaseStore, ResourceStreamMessage};
 use crate::rotation::RotationRecord;
+use crate::task::{FederatedTask, TaskCreateRequest, TaskIdRequest, TaskQueue};
 
 /// How long a caller waits for a result when the context has no deadline.
 pub const DEFAULT_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -465,6 +466,10 @@ pub struct FederationNode {
     replay_path: Option<PathBuf>,
     /// Where delegation records are persisted, when they are.
     delegation_path: Option<PathBuf>,
+    /// Peer-owned tasks this node records for other nodes.
+    tasks: Arc<RwLock<TaskQueue>>,
+    /// Where the task queue persists, when persistence was requested.
+    task_path: Option<PathBuf>,
     /// The revision last written, so a quiet loop writes nothing.
     delegation_revision: Arc<AtomicU64>,
     /// Serializes delegation-file writes from concurrent handler tasks.
@@ -507,6 +512,8 @@ impl FederationNode {
             replay: ReplayCache::new(),
             replay_path: None,
             delegation_path: None,
+            tasks: Arc::new(RwLock::new(TaskQueue::new())),
+            task_path: None,
             delegation_revision: Arc::new(AtomicU64::new(0)),
             delegation_write: Arc::new(Mutex::new(())),
         }
@@ -551,6 +558,27 @@ impl FederationNode {
             ),
         }
         self.delegation_path = Some(path);
+        self
+    }
+
+    /// Load and persist the peer task queue at `path`.
+    ///
+    /// A malformed file is reported and the node starts with an empty queue
+    /// rather than refusing to run; the file is left untouched for inspection.
+    pub fn with_task_persistence(mut self, path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        match TaskQueue::load(&path) {
+            Ok(queue) => {
+                if let Ok(mut slot) = self.tasks.write() {
+                    *slot = queue;
+                }
+            }
+            Err(error) => tracing::warn!(
+                "federation: task queue {} was not loaded: {error}",
+                path.display()
+            ),
+        }
+        self.task_path = Some(path);
         self
     }
 
@@ -710,6 +738,50 @@ impl FederationNode {
         Arc::clone(&self.delegations)
     }
 
+    /// The peer-owned task queue this node records for other nodes.
+    pub fn tasks(&self) -> Arc<RwLock<TaskQueue>> {
+        Arc::clone(&self.tasks)
+    }
+
+    /// Claim the peer tasks due now, persisting the Running marks.
+    pub fn claim_due_tasks(&self, now_ms: u64) -> Vec<FederatedTask> {
+        let mut queue = self
+            .tasks
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let due = queue.claim_due(now_ms);
+        if !due.is_empty() {
+            if let Some(path) = &self.task_path {
+                if let Err(error) = queue.save(path) {
+                    tracing::warn!("federation: task queue was not written: {error}");
+                }
+            }
+        }
+        due
+    }
+
+    /// Settle one claimed peer task and persist the queue.
+    pub fn settle_task(
+        &self,
+        id: &str,
+        ok: bool,
+        result: Option<String>,
+        error: Option<String>,
+    ) -> Result<(), crate::task::TaskQueueError> {
+        let now = unix_ms();
+        let mut queue = self
+            .tasks
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        queue.settle(id, ok, result, error, now)?;
+        if let Some(path) = &self.task_path {
+            if let Err(error) = queue.save(path) {
+                tracing::warn!("federation: task queue was not written: {error}");
+            }
+        }
+        Ok(())
+    }
+
     /// Start routing frames from this Node's inbox.
     ///
     /// The task owns the inbox; dropping it closes the inbox and stops routing.
@@ -745,6 +817,8 @@ impl FederationNode {
         let delegation_path = self.delegation_path.clone();
         let delegation_revision = Arc::clone(&self.delegation_revision);
         let delegation_write = Arc::clone(&self.delegation_write);
+        let tasks = Arc::clone(&self.tasks);
+        let task_path = self.task_path.clone();
         tokio::spawn(async move {
             while let Some(frame) = inbox.recv().await {
                 let Ok(envelope) = Envelope::decode(&frame) else {
@@ -800,6 +874,9 @@ impl FederationNode {
                                 | "delegation_cancel"
                                 | "discover"
                                 | "invoke_cancel"
+                                | "task_create"
+                                | "task_status"
+                                | "task_cancel"
                         ) {
                             let reply = seal_reply(
                                 &identity,
@@ -825,6 +902,9 @@ impl FederationNode {
                             | "invoke_cancel"
                             | "knowledge_query"
                             | "knowledge_publication"
+                            | "task_create"
+                            | "task_status"
+                            | "task_cancel"
                     ) {
                         if let Some(path) = &replay_path {
                             if let Err(error) = replay.save(path) {
@@ -848,6 +928,9 @@ impl FederationNode {
                         | "knowledge_publication"
                         | "artifact_cleanup"
                         | "rotation"
+                        | "task_create"
+                        | "task_status"
+                        | "task_cancel"
                 );
                 let permit = if handled {
                     admission.try_admit(&envelope.sender, &envelope.kind)
@@ -970,6 +1053,37 @@ impl FederationNode {
                             };
                             let _ = transport.send(&envelope.sender, reply).await;
                             journal.persist(&delegations);
+                        });
+                    }
+                    "task_create" | "task_status" | "task_cancel" => {
+                        let identity = identity.clone();
+                        let transport = Arc::clone(&transport);
+                        let peers = Arc::clone(&peers);
+                        let tasks = Arc::clone(&tasks);
+                        let task_path = task_path.clone();
+                        let audit = audit.clone();
+                        let kind = envelope.kind.clone();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            let reply = match kind.as_str() {
+                                "task_create" => {
+                                    serve_task_create(
+                                        &identity, &peers, &tasks, &task_path, &audit, &envelope,
+                                    )
+                                    .await
+                                }
+                                "task_status" => {
+                                    serve_task_status(&identity, &peers, &tasks, &audit, &envelope)
+                                        .await
+                                }
+                                _ => {
+                                    serve_task_cancel(
+                                        &identity, &peers, &tasks, &task_path, &audit, &envelope,
+                                    )
+                                    .await
+                                }
+                            };
+                            let _ = transport.send(&envelope.sender, reply).await;
                         });
                     }
                     "discover" => {
@@ -1381,6 +1495,95 @@ impl FederationNode {
             )
             .await?;
         decode_delegation(&reply)
+    }
+
+    /// Ask a peer to own a task. The peer records it; its shell runs it.
+    pub async fn create_task(
+        &self,
+        peer: &NodeId,
+        request: TaskCreateRequest,
+        context: &InvocationContext,
+    ) -> Result<FederatedTask, CapabilityError> {
+        let started = Instant::now();
+        let subject = request.id.clone();
+        let result = self.create_task_inner(peer, request, context).await;
+        self.record_outcome("task_create", peer, Some(subject), started, &result);
+        result
+    }
+
+    async fn create_task_inner(
+        &self,
+        peer: &NodeId,
+        request: TaskCreateRequest,
+        context: &InvocationContext,
+    ) -> Result<FederatedTask, CapabilityError> {
+        self.require_trusted(peer)?;
+        let payload = self
+            .round_trip(
+                peer,
+                "task_create",
+                json!({ "request": request }),
+                context.deadline,
+            )
+            .await?;
+        decode_task(&payload)
+    }
+
+    /// Read a peer-owned task.
+    pub async fn task_status(
+        &self,
+        peer: &NodeId,
+        id: &str,
+        context: &InvocationContext,
+    ) -> Result<FederatedTask, CapabilityError> {
+        let request = TaskIdRequest { id: id.to_string() };
+        self.require_trusted(peer)?;
+        let payload = self
+            .round_trip(
+                peer,
+                "task_status",
+                json!({ "request": request }),
+                context.deadline,
+            )
+            .await?;
+        decode_task(&payload)
+    }
+
+    /// Cancel a peer-owned task.
+    pub async fn cancel_task(
+        &self,
+        peer: &NodeId,
+        id: &str,
+        context: &InvocationContext,
+    ) -> Result<FederatedTask, CapabilityError> {
+        let request = TaskIdRequest { id: id.to_string() };
+        self.require_trusted(peer)?;
+        let payload = self
+            .round_trip(
+                peer,
+                "task_cancel",
+                json!({ "request": request }),
+                context.deadline,
+            )
+            .await?;
+        decode_task(&payload)
+    }
+
+    /// Refuse a peer this node does not trust.
+    fn require_trusted(&self, peer: &NodeId) -> Result<(), CapabilityError> {
+        let now = unix_ms();
+        let peers = self
+            .peers
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if peers.is_trusted(peer, now) {
+            Ok(())
+        } else {
+            Err(CapabilityError::Denied {
+                reason: format!("peer {peer} is not enrolled"),
+                policy: None,
+            })
+        }
     }
 
     /// Read the authoritative state of one delegation from its owner.
@@ -2014,6 +2217,16 @@ fn decode_delegation(payload: &Value) -> Result<DelegationRecord, CapabilityErro
     Err(wire_error(payload, None))
 }
 
+fn decode_task(payload: &Value) -> Result<FederatedTask, CapabilityError> {
+    if payload.get("ok").and_then(Value::as_bool) == Some(true) {
+        return serde_json::from_value(payload.get("task").cloned().unwrap_or(Value::Null))
+            .map_err(|error| CapabilityError::Invalid {
+                message: format!("the peer returned an unreadable task: {error}"),
+            });
+    }
+    Err(wire_error(payload, None))
+}
+
 fn wire_error(payload: &Value, capability: Option<&CapabilityId>) -> CapabilityError {
     let error = payload.get("error");
     let kind = error
@@ -2517,6 +2730,238 @@ async fn serve_knowledge_publication(
             json!({ "ok": true, "accepted": accepted }),
         ),
         Err(error) => seal_reply(identity, envelope, error_payload(error.into())),
+    }
+}
+
+/// The JSON reply for a task.
+fn ok_task(task: &FederatedTask) -> Value {
+    json!({ "ok": true, "task": task })
+}
+
+/// A task-create request: validate the sender, record the task, answer with it.
+async fn serve_task_create(
+    identity: &NodeIdentity,
+    peers: &Arc<RwLock<PeerStore>>,
+    tasks: &Arc<RwLock<TaskQueue>>,
+    task_path: &Option<PathBuf>,
+    audit: &Option<Arc<dyn FederationAudit>>,
+    envelope: &Envelope,
+) -> Vec<u8> {
+    let started = Instant::now();
+    let reply = serve_task_create_inner(identity, peers, tasks, task_path, envelope).await;
+    record_reply(audit, envelope, "task_create", started, &reply);
+    reply
+}
+
+async fn serve_task_create_inner(
+    identity: &NodeIdentity,
+    peers: &Arc<RwLock<PeerStore>>,
+    tasks: &Arc<RwLock<TaskQueue>>,
+    task_path: &Option<PathBuf>,
+    envelope: &Envelope,
+) -> Vec<u8> {
+    let Some(request) = envelope
+        .payload
+        .get("request")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<TaskCreateRequest>(value).ok())
+    else {
+        return seal_reply(
+            identity,
+            envelope,
+            error_payload(CapabilityError::Invalid {
+                message: "the request does not carry a task".to_string(),
+            }),
+        );
+    };
+    if let Err(error) = authorize_sender(peers, &envelope.sender, &[]) {
+        return seal_reply(identity, envelope, error_payload(error));
+    }
+    let now = unix_ms();
+    let mut queue = tasks
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let outcome = queue.create(
+        request.id,
+        envelope.sender.as_str().to_string(),
+        request.objective,
+        request.schedule,
+        request.budget_steps,
+        request.budget_tokens,
+        request.deadline_ms,
+        now,
+    );
+    match outcome {
+        Ok(task) => {
+            if let Some(path) = task_path {
+                if let Err(error) = queue.save(path) {
+                    tracing::warn!("federation: task queue was not written: {error}");
+                }
+            }
+            seal_reply(identity, envelope, ok_task(&task))
+        }
+        Err(error) => seal_reply(
+            identity,
+            envelope,
+            error_payload(CapabilityError::Invalid {
+                message: error.to_string(),
+            }),
+        ),
+    }
+}
+
+/// Read one task; only its origin may see it.
+async fn serve_task_status(
+    identity: &NodeIdentity,
+    peers: &Arc<RwLock<PeerStore>>,
+    tasks: &Arc<RwLock<TaskQueue>>,
+    audit: &Option<Arc<dyn FederationAudit>>,
+    envelope: &Envelope,
+) -> Vec<u8> {
+    let started = Instant::now();
+    let reply = serve_task_status_inner(identity, peers, tasks, envelope).await;
+    record_reply(audit, envelope, "task_status", started, &reply);
+    reply
+}
+
+async fn serve_task_status_inner(
+    identity: &NodeIdentity,
+    peers: &Arc<RwLock<PeerStore>>,
+    tasks: &Arc<RwLock<TaskQueue>>,
+    envelope: &Envelope,
+) -> Vec<u8> {
+    let Some(request) = envelope
+        .payload
+        .get("request")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<TaskIdRequest>(value).ok())
+    else {
+        return seal_reply(
+            identity,
+            envelope,
+            error_payload(CapabilityError::Invalid {
+                message: "the request does not carry a task id".to_string(),
+            }),
+        );
+    };
+    if let Err(error) = authorize_sender(peers, &envelope.sender, &[]) {
+        return seal_reply(identity, envelope, error_payload(error));
+    }
+    let queue = tasks
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match queue.get(&request.id) {
+        Some(task) if task.origin == envelope.sender.as_str() => {
+            seal_reply(identity, envelope, ok_task(task))
+        }
+        Some(_) => seal_reply(
+            identity,
+            envelope,
+            error_payload(CapabilityError::Denied {
+                reason: "the task belongs to another node".to_string(),
+                policy: None,
+            }),
+        ),
+        None => seal_reply(
+            identity,
+            envelope,
+            error_payload(CapabilityError::Invalid {
+                message: format!("task {} is unknown", request.id),
+            }),
+        ),
+    }
+}
+
+/// Cancel one task; only its origin may cancel it.
+async fn serve_task_cancel(
+    identity: &NodeIdentity,
+    peers: &Arc<RwLock<PeerStore>>,
+    tasks: &Arc<RwLock<TaskQueue>>,
+    task_path: &Option<PathBuf>,
+    audit: &Option<Arc<dyn FederationAudit>>,
+    envelope: &Envelope,
+) -> Vec<u8> {
+    let started = Instant::now();
+    let reply = serve_task_cancel_inner(identity, peers, tasks, task_path, envelope).await;
+    record_reply(audit, envelope, "task_cancel", started, &reply);
+    reply
+}
+
+async fn serve_task_cancel_inner(
+    identity: &NodeIdentity,
+    peers: &Arc<RwLock<PeerStore>>,
+    tasks: &Arc<RwLock<TaskQueue>>,
+    task_path: &Option<PathBuf>,
+    envelope: &Envelope,
+) -> Vec<u8> {
+    let Some(request) = envelope
+        .payload
+        .get("request")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<TaskIdRequest>(value).ok())
+    else {
+        return seal_reply(
+            identity,
+            envelope,
+            error_payload(CapabilityError::Invalid {
+                message: "the request does not carry a task id".to_string(),
+            }),
+        );
+    };
+    if let Err(error) = authorize_sender(peers, &envelope.sender, &[]) {
+        return seal_reply(identity, envelope, error_payload(error));
+    }
+    let now = unix_ms();
+    let mut queue = tasks
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match queue.get(&request.id) {
+        Some(task) if task.origin == envelope.sender.as_str() => {}
+        Some(_) => {
+            return seal_reply(
+                identity,
+                envelope,
+                error_payload(CapabilityError::Denied {
+                    reason: "the task belongs to another node".to_string(),
+                    policy: None,
+                }),
+            );
+        }
+        None => {
+            return seal_reply(
+                identity,
+                envelope,
+                error_payload(CapabilityError::Invalid {
+                    message: format!("task {} is unknown", request.id),
+                }),
+            );
+        }
+    }
+    match queue.cancel(&request.id, now) {
+        Ok(()) => {
+            if let Some(path) = task_path {
+                if let Err(error) = queue.save(path) {
+                    tracing::warn!("federation: task queue was not written: {error}");
+                }
+            }
+            match queue.get(&request.id) {
+                Some(task) => seal_reply(identity, envelope, ok_task(task)),
+                None => seal_reply(
+                    identity,
+                    envelope,
+                    error_payload(CapabilityError::Invalid {
+                        message: format!("task {} is unknown", request.id),
+                    }),
+                ),
+            }
+        }
+        Err(error) => seal_reply(
+            identity,
+            envelope,
+            error_payload(CapabilityError::Invalid {
+                message: error.to_string(),
+            }),
+        ),
     }
 }
 

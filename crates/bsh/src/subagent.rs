@@ -104,6 +104,24 @@ impl SubagentStatus {
 }
 
 impl SubagentRun {
+    /// The run as the task seam observes it.
+    pub(crate) fn snapshot(&self) -> crate::extension::runs::RunSnapshot {
+        use crate::extension::runs::{RunSnapshot, RunState};
+        let state = match self.status {
+            SubagentStatus::Running => RunState::Running,
+            SubagentStatus::Done => RunState::Succeeded,
+            SubagentStatus::Failed => RunState::Failed,
+        };
+        RunSnapshot {
+            id: self.id.clone(),
+            state,
+            result: self.result.clone(),
+            tokens: self.prompt_tokens + self.completion_tokens,
+            steps: 0,
+            error: self.error.clone(),
+        }
+    }
+
     /// The child transcript as the main chat rows expect it.
     ///
     /// Tool calls become ToolEvent entries on the preceding assistant row and a

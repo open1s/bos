@@ -30,6 +30,7 @@ pub(crate) mod shell;
 mod shell_tests;
 pub(crate) mod sidebar;
 pub(crate) mod statusbar;
+pub(crate) mod task_runs;
 pub(crate) mod terminal_view;
 pub(crate) mod todo_panel;
 pub(crate) mod trajectory;

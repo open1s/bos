@@ -1156,6 +1156,7 @@ pub(crate) fn assemble_with_federation(
     if let Some(path) = delegations {
         node = node.with_lease_persistence(path.with_file_name("leases.json"));
         node = node.with_replay_persistence(path.with_file_name("replay.json"));
+        node = node.with_task_persistence(path.with_file_name("tasks.json"));
         node = node.with_delegation_persistence(path);
     }
     if let Some(path) = audit {

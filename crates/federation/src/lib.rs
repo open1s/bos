@@ -29,6 +29,7 @@ pub mod provider;
 pub mod resource;
 pub mod rotation;
 pub mod service;
+pub mod task;
 pub mod zenoh;
 
 pub use artifacts::{
@@ -69,5 +70,9 @@ pub use service::{
     AdmissionLimits, FederationNode, RemoteStream, ResourceSource, MAX_CONCURRENT_STREAMS,
     MAX_IN_FLIGHT_CONTROL, MAX_IN_FLIGHT_CONTROL_PER_PEER, MAX_IN_FLIGHT_HANDLERS,
     MAX_IN_FLIGHT_PER_PEER, MAX_RESOURCE_STREAMS, MAX_STREAM_DURATION, STREAM_CHUNK,
+};
+pub use task::{
+    FederatedTask, FederatedTaskState, TaskCreateRequest, TaskIdRequest, TaskQueue, TaskQueueError,
+    TaskSchedule,
 };
 pub use zenoh::{inbox_key, node_key, Inbox, ZenohTransport};

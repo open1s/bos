@@ -47,6 +47,7 @@ pub(crate) mod skill_invocation;
 pub(crate) mod state;
 pub(crate) mod store;
 pub(crate) mod subagent;
+pub(crate) mod task_tools;
 pub(crate) mod terminal;
 pub(crate) mod theme;
 pub(crate) mod tool_metadata;

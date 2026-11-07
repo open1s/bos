@@ -339,6 +339,8 @@ pub(crate) enum RightTab {
     Extensions,
     /// The federation node's peers and grants.
     Federation,
+    /// Durable tasks: running, queued, scheduled and settled.
+    Tasks,
 }
 
 impl RightTab {
@@ -351,6 +353,7 @@ impl RightTab {
             RightTab::Browser => "right.tab.browser",
             RightTab::Extensions => "right.tab.extensions",
             RightTab::Federation => "right.tab.federation",
+            RightTab::Tasks => "right.tab.tasks",
         }
     }
 
@@ -363,6 +366,7 @@ impl RightTab {
             RightTab::Browser => IconName::Globe,
             RightTab::Extensions => IconName::Puzzle,
             RightTab::Federation => IconName::GitBranch,
+            RightTab::Tasks => IconName::ClipboardList,
         }
     }
 
@@ -377,17 +381,19 @@ impl RightTab {
             RightTab::Browser => "browser",
             RightTab::Extensions => "extensions",
             RightTab::Federation => "federation",
+            RightTab::Tasks => "tasks",
         }
     }
 
     /// Every pane the Start screen offers, in the order it lists them.
-    const ALL: [RightTab; 6] = [
+    const ALL: [RightTab; 7] = [
         RightTab::Files,
         RightTab::Diff,
         RightTab::Terminal,
         RightTab::Browser,
         RightTab::Extensions,
         RightTab::Federation,
+        RightTab::Tasks,
     ];
 }
 
@@ -418,6 +424,9 @@ pub(crate) struct RightPanel {
     pub(crate) diff: super::diff_pane::DiffView,
     /// The federation pane's peers and drafts.
     pub(crate) federation: FederationPane,
+    /// The Tasks board's records, read once per open so a frame never touches
+    /// the store.
+    pub(crate) tasks: std::cell::RefCell<Option<Vec<crate::extension::tasks::Task>>>,
 }
 
 /// One enrolled peer as the federation pane lists it.
@@ -1158,6 +1167,7 @@ impl Shell {
             Some(RightTab::Diff) => body.child(self.diff_pane(cx)),
             Some(RightTab::Browser) => body.child(self.browser_pane(cx)),
             Some(RightTab::Federation) => body.child(self.federation_pane(cx)),
+            Some(RightTab::Tasks) => body.child(self.tasks_pane(cx)),
             Some(RightTab::Extensions) => body.child(match &self.right_extension_panels {
                 Some(view) => view.clone().into_any_element(),
                 None => div()
@@ -1178,6 +1188,154 @@ impl Shell {
     /// actions that change them (enroll a peer, grant a capability). Revoking
     /// is per row. A running node is edited live; otherwise the peer store file
     /// is edited and the change applies at the next launch.
+    /// The Tasks board: durable work grouped by state.
+    fn tasks_pane(&self, _cx: &mut Context<Self>) -> AnyElement {
+        use crate::extension::tasks::{FileTasksStore, TasksStore as _};
+        let lang = self.state.lang;
+        let root = self.state.settings.active_workspace_root();
+        let tasks = {
+            let mut cache = self.right.tasks.borrow_mut();
+            if cache.is_none() {
+                *cache = Some(FileTasksStore.list(Path::new(&root)).unwrap_or_default());
+            }
+            cache.clone().unwrap_or_default()
+        };
+        let board = crate::extension::tasks::board(&tasks);
+        let mut list = div()
+            .id("tasks-scroll")
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_y_scroll()
+            .px(px(12.0))
+            .py(px(12.0));
+        let mut any = false;
+        for section in &board.sections {
+            if section.rows.is_empty() {
+                continue;
+            }
+            any = true;
+            list = list.child(
+                txt(
+                    lang.tr(Self::task_section_key(section.kind)),
+                    11.0,
+                    theme::faint(),
+                )
+                .px(px(8.0))
+                .pt(px(10.0))
+                .pb(px(4.0)),
+            );
+            for row in &section.rows {
+                list = list.child(self.task_row(row, lang));
+            }
+        }
+        if !any {
+            return div()
+                .debug_selector(|| "tasks-empty".to_string())
+                .flex()
+                .flex_col()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .gap(px(6.0))
+                .child(txt(
+                    lang.tr("right.tasks.empty"),
+                    theme::SIDEBAR_SIZE,
+                    theme::text(),
+                ))
+                .child(txt(
+                    lang.tr("right.tasks.emptyHint"),
+                    theme::RIGHT_HINT_SIZE,
+                    theme::faint(),
+                ))
+                .into_any_element();
+        }
+        div()
+            .flex()
+            .flex_col()
+            .h_full()
+            .child(list)
+            .into_any_element()
+    }
+
+    /// One board row: a status dot, the title, and the tier and host it runs
+    /// on. The row is the unit the pane exists for, so it carries its id for
+    /// the click tests.
+    fn task_row(
+        &self,
+        row: &crate::extension::tasks::BoardRow,
+        lang: crate::i18n::Lang,
+    ) -> AnyElement {
+        use crate::extension::tasks::{Host, Tier};
+        let tier = match row.tier {
+            Tier::Turn => "right.tasks.tierTurn",
+            Tier::Subagent => "right.tasks.tierSubagent",
+            Tier::Job => "right.tasks.tierJob",
+            Tier::Delegation => "right.tasks.tierDelegation",
+            Tier::PeerTask => "right.tasks.tierPeerTask",
+        };
+        let host = match &row.host {
+            Host::Local => lang.tr("right.tasks.local").to_string(),
+            Host::Peer { node } => format!("{}: {node}", lang.tr("right.tasks.peer")),
+        };
+        let meta = format!("{} · {}", lang.tr(tier), host);
+        let id = format!("task-row-{}", row.id);
+        div()
+            .debug_selector(move || id.clone())
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .min_h(px(40.0))
+            .px(px(8.0))
+            .rounded(px(8.0))
+            .child(
+                div()
+                    .w(px(6.0))
+                    .h(px(6.0))
+                    .flex_none()
+                    .rounded_full()
+                    .bg(rgb(Self::task_status_color(row.status))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .min_w_0()
+                    .flex_1()
+                    .gap(px(2.0))
+                    .child(txt(row.title.clone(), 13.0, theme::text()).truncate())
+                    .child(txt(meta, 11.0, theme::faint()).truncate()),
+            )
+            .into_any_element()
+    }
+
+    /// The section's label key.
+    fn task_section_key(kind: crate::extension::tasks::BoardSectionKind) -> &'static str {
+        use crate::extension::tasks::BoardSectionKind;
+        match kind {
+            BoardSectionKind::Running => "right.tasks.running",
+            BoardSectionKind::Queued => "right.tasks.queued",
+            BoardSectionKind::Scheduled => "right.tasks.scheduled",
+            BoardSectionKind::History => "right.tasks.history",
+        }
+    }
+
+    /// The status dot's colour.
+    fn task_status_color(status: crate::extension::tasks::TaskStatus) -> u32 {
+        use crate::extension::tasks::TaskStatus;
+        match status {
+            TaskStatus::Running => theme::accent(),
+            TaskStatus::Blocked | TaskStatus::Unknown => theme::warn(),
+            TaskStatus::Failed => theme::error(),
+            TaskStatus::Succeeded => theme::success(),
+            TaskStatus::Scheduled | TaskStatus::Queued | TaskStatus::Waiting => theme::faint(),
+            TaskStatus::Cancelled | TaskStatus::Interrupted => theme::muted(),
+        }
+    }
+
     fn federation_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let lang = self.state.lang;
         let peers = self.right.federation.peers.clone();
@@ -3777,6 +3935,7 @@ impl Shell {
             RightTab::Browser => Some("\u{2318}T"),
             RightTab::Extensions => None,
             RightTab::Federation => None,
+            RightTab::Tasks => None,
         };
         div()
             .id(SharedString::from(format!("right-card-{}", tab.key())))
@@ -3829,6 +3988,7 @@ impl Shell {
                                 RightTab::Browser => "right.browser.hint",
                                 RightTab::Extensions => "right.extensions.hint",
                                 RightTab::Federation => "right.federation.hint",
+                                RightTab::Tasks => "right.tasks.hint",
                             }),
                             theme::RIGHT_HINT_SIZE,
                             theme::faint(),
@@ -5492,6 +5652,10 @@ impl Shell {
     ) {
         self.right.open = true;
         self.right.tab = Some(tab);
+        if tab == RightTab::Tasks {
+            // One store read per open, never per frame.
+            *self.right.tasks.borrow_mut() = None;
+        }
         if tab == RightTab::Federation {
             self.reload_federation();
         }

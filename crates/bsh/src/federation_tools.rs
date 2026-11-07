@@ -59,6 +59,128 @@ fn context() -> InvocationContext {
     context
 }
 
+/// Send a delegation and return its record.
+///
+/// The model-facing tool and the task executor share this, so the request and
+/// its contract shape cannot drift between the two callers.
+pub(crate) async fn delegate_record(
+    target: &str,
+    objective: &str,
+    capability: Option<&str>,
+    input: Value,
+) -> Result<federation::DelegationRecord, ToolError> {
+    let runtime = runtime()?;
+    let node = runtime.node();
+    let target = NodeId::new(target).map_err(|error| ToolError::InvalidInput(error.to_string()))?;
+    let capability = capability
+        .map(str::parse::<CapabilityId>)
+        .transpose()
+        .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
+    let contract = capability.as_ref().map(|capability| {
+        json!({
+            "capability": capability.to_string(),
+            "input": input,
+        })
+        .to_string()
+    });
+    let request = DelegationRequest {
+        id: DelegationId::new(format!("agent-{}", unix_ms())),
+        parent: None,
+        target: target.clone(),
+        objective: objective.to_string(),
+        capabilities: capability.into_iter().collect(),
+        deadline_ms: Some(unix_ms() + 30_000),
+        allow_sub_delegation: false,
+        result_contract: contract,
+    };
+    node.delegate(&target, request, &context())
+        .await
+        .map_err(|error| ToolError::Failed(error.to_string()))
+}
+
+/// Ask a peer to own a task.
+pub(crate) async fn create_peer_task(
+    target: &str,
+    request: federation::TaskCreateRequest,
+) -> Result<federation::FederatedTask, ToolError> {
+    let runtime = runtime()?;
+    let node = runtime.node();
+    let target = NodeId::new(target).map_err(|error| ToolError::InvalidInput(error.to_string()))?;
+    node.create_task(&target, request, &context())
+        .await
+        .map_err(|error| ToolError::Failed(error.to_string()))
+}
+
+/// Read a peer-owned task.
+pub(crate) async fn peer_task_status(
+    target: &str,
+    id: &str,
+) -> Result<federation::FederatedTask, ToolError> {
+    let runtime = runtime()?;
+    let node = runtime.node();
+    let target = NodeId::new(target).map_err(|error| ToolError::InvalidInput(error.to_string()))?;
+    node.task_status(&target, id, &context())
+        .await
+        .map_err(|error| ToolError::Failed(error.to_string()))
+}
+
+/// Cancel a peer-owned task.
+pub(crate) async fn cancel_peer_task(
+    target: &str,
+    id: &str,
+) -> Result<federation::FederatedTask, ToolError> {
+    let runtime = runtime()?;
+    let node = runtime.node();
+    let target = NodeId::new(target).map_err(|error| ToolError::InvalidInput(error.to_string()))?;
+    node.cancel_task(&target, id, &context())
+        .await
+        .map_err(|error| ToolError::Failed(error.to_string()))
+}
+
+/// Cancel a delegation on its peer. The task executor uses this; the tool has
+/// its own arm because it returns the record.
+pub(crate) async fn cancel_delegation(target: &str, id: &str) -> Result<(), ToolError> {
+    let runtime = runtime()?;
+    let node = runtime.node();
+    let target = NodeId::new(target).map_err(|error| ToolError::InvalidInput(error.to_string()))?;
+    let delegation = DelegationId::new(id.to_string());
+    node.cancel_delegation(&target, &delegation, &context())
+        .await
+        .map_err(|error| ToolError::Failed(error.to_string()))?;
+    Ok(())
+}
+
+/// The delegation's snapshot for the task seam, when this node knows it.
+pub(crate) fn delegation_snapshot(id: &str) -> Option<crate::extension::runs::RunSnapshot> {
+    use crate::extension::runs::{RunSnapshot, RunState};
+    use federation::DelegationState;
+    let runtime = crate::federation_node::running()?;
+    let node = runtime.node();
+    let delegations = node.delegations();
+    let store = delegations.read().ok()?;
+    let record = store.record(&DelegationId::new(id.to_string()))?;
+    let state = match record.state {
+        DelegationState::Created | DelegationState::Accepted | DelegationState::Running => {
+            RunState::Running
+        }
+        DelegationState::Succeeded => RunState::Succeeded,
+        DelegationState::Failed | DelegationState::Rejected => RunState::Failed,
+        DelegationState::Cancelled => RunState::Cancelled,
+    };
+    let result = record.result.as_ref().map(|value| match value.as_str() {
+        Some(text) => text.to_string(),
+        None => value.to_string(),
+    });
+    Some(RunSnapshot {
+        id: id.to_string(),
+        state,
+        result,
+        tokens: 0,
+        steps: 0,
+        error: record.error.clone(),
+    })
+}
+
 fn target(input: &Value) -> Result<NodeId, ToolError> {
     let raw = input
         .get("target")
@@ -199,35 +321,11 @@ impl FederationTool {
                 Ok(json!({ "peers": peers }))
             }
             "federation_delegate" => {
-                let target = target(input)?;
+                let target = string(input, "target")?;
                 let objective = string(input, "objective")?;
-                let capability = input
-                    .get("capability")
-                    .and_then(Value::as_str)
-                    .map(str::parse::<CapabilityId>)
-                    .transpose()
-                    .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
-                let contract = capability.as_ref().map(|capability| {
-                    json!({
-                        "capability": capability.to_string(),
-                        "input": input.get("input").cloned().unwrap_or(Value::Null),
-                    })
-                    .to_string()
-                });
-                let request = DelegationRequest {
-                    id: DelegationId::new(format!("agent-{}", unix_ms())),
-                    parent: None,
-                    target: target.clone(),
-                    objective,
-                    capabilities: capability.into_iter().collect(),
-                    deadline_ms: Some(unix_ms() + 30_000),
-                    allow_sub_delegation: false,
-                    result_contract: contract,
-                };
-                let record = node
-                    .delegate(&target, request, &context())
-                    .await
-                    .map_err(|error| ToolError::Failed(error.to_string()))?;
+                let capability = input.get("capability").and_then(Value::as_str);
+                let payload = input.get("input").cloned().unwrap_or(Value::Null);
+                let record = delegate_record(&target, &objective, capability, payload).await?;
                 serde_json::to_value(record).map_err(|error| ToolError::Failed(error.to_string()))
             }
             "federation_cancel" => {
