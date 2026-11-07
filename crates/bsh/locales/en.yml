@@ -1483,6 +1483,7 @@
 "right.tasks.next": "Next"
 "right.tasks.attempts": "Attempts"
 "right.tasks.stop": "Stop"
+"right.tasks.retry": "Retry"
 "right.tasks.clearCompleted": "Clear completed"
 "right.tasks.summaryRunning": "running"
 "right.tasks.local": "Local"

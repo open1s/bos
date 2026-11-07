@@ -998,7 +998,13 @@ fn build_agent_for_session_inner(
             if let Some(reason) = crate::settings::resolve::sandbox_off_reason(&eff.sandbox) {
                 bash = bash.with_sandbox_reason(reason);
             }
-            shell_tools.push(Arc::new(DeclaredTool::new(Arc::new(bash), declare("bash"))));
+            // Publish the SAME tool to the scheduled-job seam: a job fired from
+            // the task store must run under this session's policy and sandbox,
+            // and rebuilding it elsewhere would duplicate (and drift from) the
+            // permission decision made here.
+            let bash: Arc<dyn agent::tools::Tool> = Arc::new(bash);
+            crate::extension::commands::install_command_tool(session, Arc::clone(&bash));
+            shell_tools.push(Arc::new(DeclaredTool::new(bash, declare("bash"))));
         }
         // The job tools share the shell bundle but each has its own gate: a
         // preset that names only `job_output` gets exactly that tool, and a

@@ -644,6 +644,84 @@ pub(crate) struct FederationSection {
     /// The directory the exposed file tools are confined to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) expose_root: Option<String>,
+    /// Accept remote work: peer-owned tasks and objective delegations.
+    #[serde(default = "default_true")]
+    pub(crate) remote_work: bool,
+    /// The most steps one remote run may use.
+    #[serde(default = "default_remote_steps")]
+    pub(crate) max_task_steps: u32,
+    /// The most tokens one remote run may use.
+    #[serde(default = "default_remote_tokens")]
+    pub(crate) max_task_tokens: u64,
+    /// The longest wall clock one remote run may claim.
+    #[serde(default = "default_remote_deadline_ms")]
+    pub(crate) max_task_deadline_ms: u64,
+}
+
+/// The shipped remote-work step cap.
+fn default_remote_steps() -> u32 {
+    20
+}
+
+/// The shipped remote-work token cap.
+fn default_remote_tokens() -> u64 {
+    200_000
+}
+
+/// The shipped remote-work deadline cap, in milliseconds.
+fn default_remote_deadline_ms() -> u64 {
+    600_000
+}
+
+impl FederationSection {
+    /// Whether this node accepts remote work at all.
+    pub(crate) fn remote_work_enabled(&self) -> bool {
+        self.enabled && self.remote_work
+    }
+
+    /// Refuse a peer task that asks for more than this node's policy permits.
+    pub(crate) fn admits_task(
+        &self,
+        steps: u32,
+        tokens: u64,
+        deadline_ms: u64,
+    ) -> Result<(), &'static str> {
+        if !self.remote_work_enabled() {
+            return Err("remote work is disabled on this node");
+        }
+        if steps > self.max_task_steps
+            || tokens > self.max_task_tokens
+            || deadline_ms > self.max_task_deadline_ms
+        {
+            return Err("the request asks for more than this node's remote-work budget");
+        }
+        Ok(())
+    }
+
+    /// Refuse a delegation when remote work is off.
+    ///
+    /// A delegation's deadline is absolute, not a duration, so it is not compared
+    /// to the wall-clock cap; the owner enforces its own deadline.
+    pub(crate) fn admits_delegation(&self) -> Result<(), &'static str> {
+        if !self.remote_work_enabled() {
+            return Err("remote work is disabled on this node");
+        }
+        Ok(())
+    }
+
+    /// The budget a peer request may actually use: its ask, capped.
+    pub(crate) fn clamp_task_budget(
+        &self,
+        steps: u32,
+        tokens: u64,
+        deadline_ms: u64,
+    ) -> (u32, u64, u64) {
+        (
+            steps.min(self.max_task_steps),
+            tokens.min(self.max_task_tokens),
+            deadline_ms.min(self.max_task_deadline_ms),
+        )
+    }
 }
 
 impl Default for FederationSection {
@@ -667,6 +745,10 @@ impl Default for FederationSection {
             node_name: None,
             expose: Vec::new(),
             expose_root: None,
+            remote_work: true,
+            max_task_steps: default_remote_steps(),
+            max_task_tokens: default_remote_tokens(),
+            max_task_deadline_ms: default_remote_deadline_ms(),
         }
     }
 }
@@ -2337,6 +2419,28 @@ impl GlobalSettings {
 
 #[cfg(test)]
 mod tests {
+
+    /// The remote-work policy refuses an over-budget ask and clamps to its cap.
+    #[test]
+    fn remote_work_policy_caps_a_peer_request() {
+        use super::FederationSection;
+        let federation = FederationSection::default();
+        assert!(federation.admits_task(20, 200_000, 600_000).is_ok());
+        assert!(federation.admits_task(21, 200_000, 600_000).is_err());
+        assert!(federation.admits_task(20, 200_001, 600_000).is_err());
+        assert!(federation.admits_task(20, 200_000, 600_001).is_err());
+        assert!(federation.admits_delegation().is_ok());
+
+        let off = FederationSection {
+            remote_work: false,
+            ..FederationSection::default()
+        };
+        assert!(off.admits_task(1, 1, 1).is_err(), "remote work is off");
+        assert!(off.admits_delegation().is_err());
+
+        let clamped = federation.clamp_task_budget(99, 999_999, 9_999_999);
+        assert_eq!(clamped, (20, 200_000, 600_000));
+    }
 
     #[test]
     fn the_federation_node_is_on_by_default() {

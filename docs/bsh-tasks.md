@@ -1,27 +1,43 @@
 # Tasks: durable, tier-bound work the reader and the model share
 
-Status: design approved (grilling session, 2026-11-07). Implemented so far:
-the record plus store, the typed host.runs seam and its shell service, task_create
-and task_join, the Tasks tab, the turn-tier scheduler, the subagent executor, and
-the delegation executor (a delegated task carries a capability contract, which
-is what a peer executes on this build), and resume triggers (a timed-out join
-arms the task, the tick delivers one harness-generated turn with the settled
-results, and the arming clears in the same write), and task_cancel (turn,
-subagent and delegation runs are stopped, scheduled tasks are disabled). The
-job executor, the peer-side agent turn for objective-only delegations and
-peer-owned tasks are still open; the peer-side task queue (record, claim,
-settle, cancel, dead-claim recovery) and its wire operations (task_create,
-task_status, task_cancel, origin-scoped) and the peer shell drain (the peer
-claims due tasks, runs each as a background turn in its own session, and settles
-the queue with the result), and the local mirror with the peer-task tier (the
-origin stores a Host::Peer record, forwards create/cancel, and refreshes status
-and result from the owner on join). The job tier runs a command through the
-turn's own shell tool, joins through the job roster and cancels through the
-roster's kill. An objective-only delegation is claimed by the peer's shell,
-run as an agent turn in a background session, and settled with its text, so a
-delegated task may name a capability or just an objective. The
-extension-packaging gate and a live two-node end-to-end test remain; the phase
-table below is the plan of record.
+Status: design approved (grilling session, 2026-11-07). Implemented: the
+record plus store, the typed host.runs seam and its shell service, the five
+tools (task_create, task_join, task_cancel, task_status, task_list, task_retry),
+the Tasks tab (a fit-to-pane graph with staggered rows and routed connectors,
+plus the board list), the turn-tier scheduler with dependencies and a deadline
+sweep, the subagent executor, the job executor (a command through the turn's own
+shell tool; the tick settles the record and keeps the job's captured tail as the
+attempt result), the delegation executor (a capability contract or just an
+objective, run by the peer's shell as an agent turn), the peer-side task queue
+(record, claim, settle, cancel, dead-claim recovery, persistence) with its wire
+operations and peer shell drain, the local mirror with the peer-task tier, resume
+triggers (arm on a timed-out join, deliver one harness turn per tick, coalesced,
+deliver-once across restarts), and restart reconciliation (attempts that died
+with the process become interrupted).
+
+Lifecycle settlement does not depend on a join: the turn pump settles the record
+when the run ends, and the tick closes subagent and job records from the
+registries. A real-transport end-to-end test
+(crates/federation/tests/task_tcp_e2e.rs) drives two Zenoh sessions over
+loopback: create, single claim, settle, status back to the origin, cancel, and
+an objective delegation claimed and settled. Scheduled delegation firing is
+wired: the scheduler marks the attempt and hands the peer RPC to the runner's
+runtime (never the UI thread), and the tick settles the record from the
+delegation store. The scheduler, the deadline sweep and the resume
+delivery all walk every registered workspace, so a task in a non-active
+workspace still fires, expires and delivers. A peer delegation whose record the owner
+cancels is stopped on the peer's next tick. A failed turn task retries itself
+when its policy is Auto, and the board carries Stop and Retry. Scheduled job
+firing uses the shell tool the session's agent build publishes (policy, sandbox
+and preset included), so a job never runs unconfined; a session that has not
+built one refuses with a reason. Remote work is consented and bounded: the
+federation settings carry remote_work (off refuses peer tasks and objective
+delegations with a reason) and step/token/wall-clock caps (an over-budget request
+is refused, a request within budget is clamped, and the clamped deadline stops
+the peer's turn on the tick). The tick also refreshes non-terminal peer mirrors
+from their owner at most once per 15 seconds (the answer lands in the store, and
+a failed pull marks the mirror Unknown). Still open: the extension-packaging gate
+(tools register in core). The phase table below is the plan of record.
 
 A task is a durable unit of user intent. It has a lifecycle, a trigger, and at
 most one active attempt. Attempts are runs bound to one of the existing execution

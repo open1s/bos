@@ -27,6 +27,7 @@ mod agent;
 use std::sync::Arc;
 
 mod cli;
+pub(crate) mod commands;
 #[cfg(test)]
 mod e2e;
 mod errors;

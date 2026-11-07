@@ -4435,6 +4435,682 @@ fn the_tick_settles_a_finished_subagent_task(cx: &mut TestAppContext) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A settled turn task can be retried from the board, and an Auto policy
+/// retries it without a click.
+#[gpui::test]
+fn the_board_retries_a_failed_turn_task(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let dir = std::env::temp_dir().join(format!("bsh-task-retry-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch workspace");
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("task-retry", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let session = cx.update(|_, cx| shell.read(cx).state.active_id.clone().expect("session"));
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.state
+                .settings
+                .global
+                .workspaces
+                .push(crate::settings::global::WorkspaceRef {
+                    id: "ws-retry".to_string(),
+                    name: "Retry".to_string(),
+                    root: dir.to_string_lossy().to_string(),
+                    created_at: 0,
+                    updated_at: 0,
+                });
+            this.state.settings.global.general.active_workspace = "ws-retry".to_string();
+            if let Some(session) = this.state.store.session_mut(&session) {
+                session.workspace = "ws-retry".to_string();
+            }
+        });
+    });
+    let mut task = crate::extension::tasks::Task::open(
+        "task-retry",
+        "Retry me",
+        "intent",
+        crate::extension::tasks::Origin {
+            session: session.clone(),
+            turn: 0,
+        },
+        crate::extension::tasks::Trigger::Now,
+        crate::extension::tasks::Tier::Turn,
+        1,
+    )
+    .expect("task");
+    task.status = crate::extension::tasks::TaskStatus::Failed;
+    task.retry = crate::extension::tasks::Retry {
+        mode: crate::extension::tasks::RetryMode::Auto,
+        max_attempts: 3,
+    };
+    let mut attempt = crate::extension::tasks::Attempt::queued(
+        "task-retry-1",
+        crate::extension::tasks::Tier::Turn,
+    );
+    attempt.run = Some("run-old".to_string());
+    attempt.status = crate::extension::tasks::AttemptStatus::Failed;
+    task.attempts.push(attempt);
+    {
+        use crate::extension::tasks::TasksStore as _;
+        crate::extension::tasks::FileTasksStore
+            .save(&dir, &task)
+            .expect("save");
+    }
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(crate::ui::right_panel::RightTab::Tasks, window, cx);
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let mode = cx
+        .debug_bounds("task-graph-mode")
+        .expect("the Tree/List control");
+    cx.simulate_click(mode.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let history = cx
+        .debug_bounds("tasks-history-header")
+        .expect("the History header");
+    cx.simulate_click(history.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let row = cx
+        .debug_bounds("task-row-task-retry")
+        .expect("the failed task row");
+    cx.simulate_click(row.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let retry = cx
+        .debug_bounds("task-retry-task-retry")
+        .expect("the retry control");
+    cx.simulate_click(retry.center(), Modifiers::default());
+    use crate::extension::tasks::TasksStore as _;
+    let stored = crate::extension::tasks::FileTasksStore
+        .load(&dir, "task-retry")
+        .expect("load")
+        .expect("record");
+    assert_eq!(
+        stored.status,
+        crate::extension::tasks::TaskStatus::Running,
+        "the retry starts a new attempt"
+    );
+    assert_eq!(stored.attempts.len(), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An Auto policy retries a failed turn task without a click.
+#[gpui::test]
+fn an_auto_policy_retries_a_failed_turn_task(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let dir = std::env::temp_dir().join(format!("bsh-task-auto-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch workspace");
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("task-auto", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let session = cx.update(|_, cx| shell.read(cx).state.active_id.clone().expect("session"));
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.state
+                .settings
+                .global
+                .workspaces
+                .push(crate::settings::global::WorkspaceRef {
+                    id: "ws-auto".to_string(),
+                    name: "Auto".to_string(),
+                    root: dir.to_string_lossy().to_string(),
+                    created_at: 0,
+                    updated_at: 0,
+                });
+            this.state.settings.global.general.active_workspace = "ws-auto".to_string();
+            if let Some(session) = this.state.store.session_mut(&session) {
+                session.workspace = "ws-auto".to_string();
+            }
+        });
+    });
+    let mut task = crate::extension::tasks::Task::open(
+        "task-auto",
+        "Auto",
+        "intent",
+        crate::extension::tasks::Origin {
+            session: session.clone(),
+            turn: 0,
+        },
+        crate::extension::tasks::Trigger::Now,
+        crate::extension::tasks::Tier::Turn,
+        1,
+    )
+    .expect("task");
+    task.status = crate::extension::tasks::TaskStatus::Failed;
+    task.retry = crate::extension::tasks::Retry {
+        mode: crate::extension::tasks::RetryMode::Auto,
+        max_attempts: 3,
+    };
+    {
+        use crate::extension::tasks::TasksStore as _;
+        crate::extension::tasks::FileTasksStore
+            .save(&dir, &task)
+            .expect("save");
+    }
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| this.auto_retry_failed_turns());
+    });
+    use crate::extension::tasks::TasksStore as _;
+    let stored = crate::extension::tasks::FileTasksStore
+        .load(&dir, "task-auto")
+        .expect("load")
+        .expect("record");
+    assert_eq!(
+        stored.status,
+        crate::extension::tasks::TaskStatus::Running,
+        "the policy starts the next attempt"
+    );
+    assert_eq!(stored.attempts.len(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A due delegation task with no federation node records the refusal instead
+/// of staying Running.
+#[gpui::test]
+fn a_scheduled_delegation_without_a_node_fails(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let dir = std::env::temp_dir().join(format!("bsh-task-sched-del-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch workspace");
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("task-sched-del", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let session = cx.update(|_, cx| shell.read(cx).state.active_id.clone().expect("session"));
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.state
+                .settings
+                .global
+                .workspaces
+                .push(crate::settings::global::WorkspaceRef {
+                    id: "ws-sched-del".to_string(),
+                    name: "Scheduled".to_string(),
+                    root: dir.to_string_lossy().to_string(),
+                    created_at: 0,
+                    updated_at: 0,
+                });
+            this.state.settings.global.general.active_workspace = "ws-sched-del".to_string();
+            if let Some(session) = this.state.store.session_mut(&session) {
+                session.workspace = "ws-sched-del".to_string();
+            }
+        });
+    });
+    let task = {
+        let mut task = crate::extension::tasks::Task::open(
+            "task-sched-del",
+            "Delegate",
+            "intent",
+            crate::extension::tasks::Origin {
+                session: session.clone(),
+                turn: 0,
+            },
+            crate::extension::tasks::Trigger::Every {
+                every_seconds: 60,
+                last_run_ms: 0,
+            },
+            crate::extension::tasks::Tier::Delegation,
+            1,
+        )
+        .expect("task");
+        task.target = Some("node-b".to_string());
+        task
+    };
+    {
+        use crate::extension::tasks::TasksStore as _;
+        crate::extension::tasks::FileTasksStore
+            .save(&dir, &task)
+            .expect("save");
+    }
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| this.check_task_schedules(cx));
+    });
+    use crate::extension::tasks::TasksStore as _;
+    let stored = crate::extension::tasks::FileTasksStore
+        .load(&dir, "task-sched-del")
+        .expect("load")
+        .expect("record");
+    assert_eq!(stored.status, crate::extension::tasks::TaskStatus::Failed);
+    assert!(
+        stored
+            .attempts
+            .last()
+            .and_then(|attempt| attempt.error.as_deref())
+            .unwrap_or_default()
+            .contains("federation node is not running"),
+        "the refusal is recorded"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A task stored in another registered workspace fires on its own clock, not
+/// only while that workspace is active.
+#[gpui::test]
+fn the_scheduler_fires_tasks_in_other_workspaces(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let dir_a = std::env::temp_dir().join(format!("bsh-task-ws-a-{}", std::process::id()));
+    let dir_b = std::env::temp_dir().join(format!("bsh-task-ws-b-{}", std::process::id()));
+    for dir in [&dir_a, &dir_b] {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).expect("scratch workspace");
+    }
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("task-ws", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let session = cx.update(|_, cx| shell.read(cx).state.active_id.clone().expect("session"));
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            for (id, dir) in [("ws-a", &dir_a), ("ws-b", &dir_b)] {
+                this.state
+                    .settings
+                    .global
+                    .workspaces
+                    .push(crate::settings::global::WorkspaceRef {
+                        id: id.to_string(),
+                        name: id.to_string(),
+                        root: dir.to_string_lossy().to_string(),
+                        created_at: 0,
+                        updated_at: 0,
+                    });
+            }
+            this.state.settings.global.general.active_workspace = "ws-a".to_string();
+            if let Some(session) = this.state.store.session_mut(&session) {
+                session.workspace = "ws-a".to_string();
+            }
+        });
+    });
+    let task = crate::extension::tasks::Task::open(
+        "task-b",
+        "B",
+        "intent",
+        crate::extension::tasks::Origin {
+            session: session.clone(),
+            turn: 0,
+        },
+        crate::extension::tasks::Trigger::Every {
+            every_seconds: 60,
+            last_run_ms: 0,
+        },
+        crate::extension::tasks::Tier::Turn,
+        1,
+    )
+    .expect("task");
+    {
+        use crate::extension::tasks::TasksStore as _;
+        crate::extension::tasks::FileTasksStore
+            .save(&dir_b, &task)
+            .expect("save");
+    }
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| this.check_task_schedules(cx));
+    });
+    use crate::extension::tasks::TasksStore as _;
+    let stored = crate::extension::tasks::FileTasksStore
+        .load(&dir_b, "task-b")
+        .expect("load")
+        .expect("record");
+    assert!(
+        !stored.attempts.is_empty(),
+        "the task in the inactive workspace fired"
+    );
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+/// A scheduled job task runs through the session's own shell tool and settles
+/// from the roster.
+#[gpui::test]
+fn a_scheduled_job_runs_through_the_sessions_tool(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let dir = std::env::temp_dir().join(format!("bsh-task-sched-job-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch workspace");
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("task-sched-job", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let session = cx.update(|_, cx| shell.read(cx).state.active_id.clone().expect("session"));
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.state
+                .settings
+                .global
+                .workspaces
+                .push(crate::settings::global::WorkspaceRef {
+                    id: "ws-sched-job".to_string(),
+                    name: "Scheduled".to_string(),
+                    root: dir.to_string_lossy().to_string(),
+                    created_at: 0,
+                    updated_at: 0,
+                });
+            this.state.settings.global.general.active_workspace = "ws-sched-job".to_string();
+            if let Some(session) = this.state.store.session_mut(&session) {
+                session.workspace = "ws-sched-job".to_string();
+            }
+            let tool = agent::tools::BashTool::new("bash")
+                .with_jobs(this.state.jobs.clone(), session.clone());
+            crate::extension::commands::install_command_tool(&session, std::sync::Arc::new(tool));
+        });
+    });
+    let mut task = crate::extension::tasks::Task::open(
+        "task-sched-job",
+        "Job",
+        "intent",
+        crate::extension::tasks::Origin {
+            session: session.clone(),
+            turn: 0,
+        },
+        crate::extension::tasks::Trigger::Every {
+            every_seconds: 60,
+            last_run_ms: 0,
+        },
+        crate::extension::tasks::Tier::Job,
+        1,
+    )
+    .expect("task");
+    task.command = Some("echo hi".to_string());
+    {
+        use crate::extension::tasks::TasksStore as _;
+        crate::extension::tasks::FileTasksStore
+            .save(&dir, &task)
+            .expect("save");
+    }
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| this.check_task_schedules(cx));
+    });
+    use crate::extension::tasks::TasksStore as _;
+    let fired = crate::extension::tasks::FileTasksStore
+        .load(&dir, "task-sched-job")
+        .expect("load")
+        .expect("record");
+    assert_eq!(fired.status, crate::extension::tasks::TaskStatus::Running);
+    let run = fired
+        .attempts
+        .last()
+        .and_then(|attempt| attempt.run.clone())
+        .expect("a job id");
+    for _ in 0..100 {
+        let settled = cx.update(|_, cx| {
+            shell
+                .read(cx)
+                .state
+                .jobs
+                .job(&run)
+                .map(|job| job.status.is_settled())
+                .unwrap_or(false)
+        });
+        if settled {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| this.settle_observed_tasks());
+    });
+    let stored = crate::extension::tasks::FileTasksStore
+        .load(&dir, "task-sched-job")
+        .expect("load")
+        .expect("record");
+    assert_eq!(
+        stored.status,
+        crate::extension::tasks::TaskStatus::Scheduled,
+        "a cadence task returns to its schedule after firing"
+    );
+    let attempt = stored.attempts.last().expect("attempt");
+    assert_eq!(
+        attempt.status,
+        crate::extension::tasks::AttemptStatus::Succeeded,
+        "the attempt settles"
+    );
+    assert!(
+        attempt.result.as_deref().unwrap_or_default().contains("hi"),
+        "the output is the result"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Deadlines and resume delivery cover every registered workspace, not only
+/// the active one.
+#[gpui::test]
+fn the_sweeps_reach_other_workspaces(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let dir_a = std::env::temp_dir().join(format!("bsh-sweep-a-{}", std::process::id()));
+    let dir_b = std::env::temp_dir().join(format!("bsh-sweep-b-{}", std::process::id()));
+    for dir in [&dir_a, &dir_b] {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).expect("scratch workspace");
+    }
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("sweeps", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let session = cx.update(|_, cx| shell.read(cx).state.active_id.clone().expect("session"));
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            for (id, dir) in [("ws-a", &dir_a), ("ws-b", &dir_b)] {
+                this.state
+                    .settings
+                    .global
+                    .workspaces
+                    .push(crate::settings::global::WorkspaceRef {
+                        id: id.to_string(),
+                        name: id.to_string(),
+                        root: dir.to_string_lossy().to_string(),
+                        created_at: 0,
+                        updated_at: 0,
+                    });
+            }
+            this.state.settings.global.general.active_workspace = "ws-a".to_string();
+            if let Some(session) = this.state.store.session_mut(&session) {
+                session.workspace = "ws-a".to_string();
+            }
+        });
+    });
+
+    // An overdue running task in the inactive workspace.
+    let mut late = crate::extension::tasks::Task::open(
+        "late-b",
+        "Late",
+        "intent",
+        crate::extension::tasks::Origin {
+            session: session.clone(),
+            turn: 0,
+        },
+        crate::extension::tasks::Trigger::Now,
+        crate::extension::tasks::Tier::Turn,
+        1,
+    )
+    .expect("task");
+    late.status = crate::extension::tasks::TaskStatus::Running;
+    let mut late_attempt =
+        crate::extension::tasks::Attempt::queued("late-b-1", crate::extension::tasks::Tier::Turn);
+    late_attempt.run = Some("run-late-b".to_string());
+    late_attempt.status = crate::extension::tasks::AttemptStatus::Running;
+    late_attempt.started_ms = Some(1);
+    late.attempts.push(late_attempt);
+    // An armed task whose child run has settled.
+    let run = cx
+        .update(|_, cx| {
+            shell.update(cx, |this, _| {
+                this.state
+                    .subagents
+                    .try_begin(&session, &session, 1, 1_000, "child", "look", 3)
+            })
+        })
+        .expect("child run");
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.state
+                .subagents
+                .finish(&run, "done".to_string(), (0, 0), Vec::new());
+        });
+    });
+    let mut armed = crate::extension::tasks::Task::open(
+        "armed-b",
+        "Armed",
+        "intent",
+        crate::extension::tasks::Origin {
+            session: session.clone(),
+            turn: 0,
+        },
+        crate::extension::tasks::Trigger::Now,
+        crate::extension::tasks::Tier::Subagent,
+        1,
+    )
+    .expect("task");
+    armed.status = crate::extension::tasks::TaskStatus::Succeeded;
+    armed.resume_armed_ms = Some(5);
+    let mut armed_attempt = crate::extension::tasks::Attempt::queued(
+        "armed-b-1",
+        crate::extension::tasks::Tier::Subagent,
+    );
+    armed_attempt.run = Some(run);
+    armed_attempt.status = crate::extension::tasks::AttemptStatus::Succeeded;
+    armed.attempts.push(armed_attempt);
+    {
+        use crate::extension::tasks::TasksStore as _;
+        crate::extension::tasks::FileTasksStore
+            .save(&dir_b, &late)
+            .expect("save late");
+        crate::extension::tasks::FileTasksStore
+            .save(&dir_b, &armed)
+            .expect("save armed");
+    }
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.expire_task_deadlines(cx);
+            this.check_task_resumes(cx);
+        });
+    });
+    use crate::extension::tasks::TasksStore as _;
+    let late = crate::extension::tasks::FileTasksStore
+        .load(&dir_b, "late-b")
+        .expect("load")
+        .expect("record");
+    assert_eq!(
+        late.status,
+        crate::extension::tasks::TaskStatus::Failed,
+        "the deadline sweep reaches the inactive workspace"
+    );
+    let armed = crate::extension::tasks::FileTasksStore
+        .load(&dir_b, "armed-b")
+        .expect("load")
+        .expect("record");
+    assert!(
+        armed.resume_armed_ms.is_none(),
+        "the resume sweep reaches the inactive workspace too"
+    );
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+/// The tick pulls a peer mirror at most once per interval, and never touches a
+/// terminal one.
+#[gpui::test]
+fn the_tick_refreshes_a_peer_mirror_once_per_interval(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let dir = std::env::temp_dir().join(format!("bsh-task-mirror-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch workspace");
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("task-mirror", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let session = cx.update(|_, cx| shell.read(cx).state.active_id.clone().expect("session"));
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.state
+                .settings
+                .global
+                .workspaces
+                .push(crate::settings::global::WorkspaceRef {
+                    id: "ws-mirror".to_string(),
+                    name: "Mirror".to_string(),
+                    root: dir.to_string_lossy().to_string(),
+                    created_at: 0,
+                    updated_at: 0,
+                });
+            this.state.settings.global.general.active_workspace = "ws-mirror".to_string();
+            if let Some(session) = this.state.store.session_mut(&session) {
+                session.workspace = "ws-mirror".to_string();
+            }
+        });
+    });
+    let mut mirror = crate::extension::tasks::Task::open(
+        "task-mirror",
+        "Remote",
+        "intent",
+        crate::extension::tasks::Origin {
+            session: session.clone(),
+            turn: 0,
+        },
+        crate::extension::tasks::Trigger::Every {
+            every_seconds: 60,
+            last_run_ms: 0,
+        },
+        crate::extension::tasks::Tier::PeerTask,
+        1,
+    )
+    .expect("task");
+    mirror.host = crate::extension::tasks::Host::Peer {
+        node: "node-b".to_string(),
+    };
+    mirror.status = crate::extension::tasks::TaskStatus::Running;
+    let mut attempt = crate::extension::tasks::Attempt::queued(
+        "task-mirror-1",
+        crate::extension::tasks::Tier::PeerTask,
+    );
+    attempt.run = Some("remote-1".to_string());
+    attempt.status = crate::extension::tasks::AttemptStatus::Running;
+    mirror.attempts.push(attempt);
+    {
+        use crate::extension::tasks::TasksStore as _;
+        crate::extension::tasks::FileTasksStore
+            .save(&dir, &mirror)
+            .expect("save");
+    }
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| this.refresh_peer_mirrors());
+    });
+    use crate::extension::tasks::TasksStore as _;
+    let checked = crate::extension::tasks::FileTasksStore
+        .load(&dir, "task-mirror")
+        .expect("load")
+        .expect("record")
+        .mirror_checked_ms;
+    assert!(checked > 0, "the tick records when it asked");
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| this.refresh_peer_mirrors());
+    });
+    let again = crate::extension::tasks::FileTasksStore
+        .load(&dir, "task-mirror")
+        .expect("load")
+        .expect("record")
+        .mirror_checked_ms;
+    assert_eq!(again, checked, "a second tick inside the window is a no-op");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The board's Stop action marks a local running task cancelled.
 #[gpui::test]
 fn the_board_stop_marks_a_running_task(cx: &mut TestAppContext) {

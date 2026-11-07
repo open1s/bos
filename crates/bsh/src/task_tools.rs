@@ -866,7 +866,7 @@ pub(crate) async fn create_with(
             "next_fire_ms": remote.next_run_ms,
         }));
     }
-    if tier == Tier::Job {
+    if tier == Tier::Job && !trigger.is_scheduled() {
         let Some(command) = args
             .get("command")
             .and_then(Value::as_str)
@@ -914,6 +914,47 @@ pub(crate) async fn create_with(
         task.status = TaskStatus::Waiting;
     }
     if !matches!(trigger, Trigger::Now) {
+        // A scheduled job or delegation stores what it will need when its
+        // clock fires; the dispatcher starts it later.
+        if tier == Tier::Job {
+            task.command = args
+                .get("command")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if task
+                .command
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+            {
+                return Err(ToolError::InvalidInput(
+                    "a job task needs a command".to_string(),
+                ));
+            }
+        }
+        if tier == Tier::Delegation {
+            task.target = args
+                .get("target")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            task.capability = args
+                .get("capability")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            task.input = args.get("input").cloned();
+            if task
+                .target
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+            {
+                return Err(ToolError::InvalidInput(
+                    "a delegation task needs a target peer".to_string(),
+                ));
+            }
+        }
         FileTasksStore
             .save(&context.workspace, &task)
             .map_err(|error| ToolError::Failed(format!("the task could not be saved: {error}")))?;
@@ -947,7 +988,7 @@ pub(crate) async fn create_with(
             "state": "running",
         }));
     }
-    if tier == Tier::Delegation {
+    if tier == Tier::Delegation && !trigger.is_scheduled() {
         let Some(target) = args
             .get("target")
             .and_then(Value::as_str)
@@ -1193,13 +1234,24 @@ fn job_snapshot(
 }
 
 /// The local mirror status for a peer task state.
-fn mirror_status(state: federation::FederatedTaskState) -> TaskStatus {
+pub(crate) fn mirror_status(state: federation::FederatedTaskState) -> TaskStatus {
     match state {
         federation::FederatedTaskState::Queued => TaskStatus::Scheduled,
         federation::FederatedTaskState::Running => TaskStatus::Running,
         federation::FederatedTaskState::Succeeded => TaskStatus::Succeeded,
         federation::FederatedTaskState::Failed => TaskStatus::Failed,
         federation::FederatedTaskState::Cancelled => TaskStatus::Cancelled,
+    }
+}
+
+/// The attempt state for a peer task state.
+pub(crate) fn mirror_attempt_status(state: federation::FederatedTaskState) -> AttemptStatus {
+    match state {
+        federation::FederatedTaskState::Queued => AttemptStatus::Queued,
+        federation::FederatedTaskState::Running => AttemptStatus::Running,
+        federation::FederatedTaskState::Succeeded => AttemptStatus::Succeeded,
+        federation::FederatedTaskState::Failed => AttemptStatus::Failed,
+        federation::FederatedTaskState::Cancelled => AttemptStatus::Cancelled,
     }
 }
 
@@ -1850,18 +1902,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&context.workspace);
     }
 
-    /// A job task cannot bind a clock: the scheduler fires turns only.
+    /// A scheduled job task is saved for the scheduler instead of starting now.
     #[tokio::test]
-    async fn create_refuses_a_scheduled_job_task() {
+    async fn create_saves_a_scheduled_job_task() {
         let context = context("job-scheduled");
-        let error = create_with(
+        let value = create_with(
             &Runs::empty(),
             &context,
             &json!({"intent": "x", "tier": "job", "command": "echo hi", "trigger": {"every_seconds": 3600}}),
         )
         .await
-        .expect_err("scheduled job");
-        assert!(format!("{error:?}").contains("starts now"));
+        .expect("scheduled job");
+        let id = value["task"].as_str().expect("id");
+        let stored = FileTasksStore
+            .load(&context.workspace, id)
+            .expect("load")
+            .expect("record");
+        assert_eq!(stored.status, TaskStatus::Scheduled);
+        assert_eq!(stored.command.as_deref(), Some("echo hi"));
+        assert!(stored.attempts.is_empty(), "nothing started yet");
         let _ = std::fs::remove_dir_all(&context.workspace);
     }
 

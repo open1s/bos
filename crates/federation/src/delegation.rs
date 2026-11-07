@@ -163,6 +163,9 @@ pub enum DelegationError {
     /// A child's deadline outlives the parent's.
     #[error("delegation deadline exceeds the parent's")]
     DeadlineExceedsParent,
+    /// The request's deadline has already passed.
+    #[error("delegation deadline has already expired")]
+    DeadlineExpired,
 }
 
 /// The authoritative delegation records.
@@ -206,6 +209,13 @@ impl DelegationStore {
             return Err(DelegationError::Invalid {
                 message: format!("delegation {} already exists", request.id),
             });
+        }
+        // An expired bound is not a bound: refuse it at acceptance rather than
+        // letting the execution path treat it as "no deadline".
+        if let Some(deadline) = request.deadline_ms {
+            if deadline <= now_ms {
+                return Err(DelegationError::DeadlineExpired);
+            }
         }
         let id = request.id.clone();
         self.records.insert(
@@ -269,11 +279,16 @@ impl DelegationStore {
                 });
             }
         }
-        if let (Some(child), Some(parent_deadline)) =
-            (request.deadline_ms, parent_record.request.deadline_ms)
-        {
-            if child > parent_deadline {
-                return Err(DelegationError::DeadlineExceedsParent);
+        // A child may not widen the parent's temporal bound: a later deadline
+        // is refused, and so is omitting the deadline entirely when the parent
+        // has one. Only a parent without a deadline leaves the child free.
+        if let Some(parent_deadline) = parent_record.request.deadline_ms {
+            match request.deadline_ms {
+                Some(child) if child > parent_deadline => {
+                    return Err(DelegationError::DeadlineExceedsParent);
+                }
+                None => return Err(DelegationError::DeadlineExceedsParent),
+                Some(_) => {}
             }
         }
         let mut request = request;

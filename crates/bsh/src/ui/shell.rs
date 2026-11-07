@@ -292,6 +292,8 @@ pub(crate) struct Shell {
     task_run_sessions: std::collections::BTreeMap<String, String>,
     /// Peer tasks this shell is running, by session.
     peer_task_runs: std::collections::BTreeMap<String, String>,
+    /// The clamped deadline (unix ms) of each running peer task, by session.
+    peer_task_deadlines: std::collections::BTreeMap<String, u64>,
     /// Objective delegations this shell is running, by session.
     peer_delegation_runs: std::collections::BTreeMap<String, String>,
     /// The composer's text engine.
@@ -1868,6 +1870,7 @@ impl Shell {
             graph_pan_drag: None,
             task_run_sessions: std::collections::BTreeMap::new(),
             peer_task_runs: std::collections::BTreeMap::new(),
+            peer_task_deadlines: std::collections::BTreeMap::new(),
             peer_delegation_runs: std::collections::BTreeMap::new(),
             composer,
             placeholder_key,
@@ -2356,9 +2359,12 @@ impl Shell {
                         this.check_task_schedules(cx);
                         this.expire_task_deadlines(cx);
                         this.settle_observed_tasks();
+                        this.check_peer_delegation_cancels();
                         this.check_task_resumes(cx);
                         this.check_peer_tasks(cx);
                         this.check_peer_delegations(cx);
+                        this.check_peer_task_deadlines();
+                        this.refresh_peer_mirrors();
                     }
                 })
                 .is_err()
@@ -4136,18 +4142,28 @@ impl Shell {
     /// handed to the runs service (the same seam extensions use), its record
     /// is marked Running with the run id, and a watcher settles it.
     pub(crate) fn check_task_schedules(&mut self, cx: &mut Context<Self>) {
-        use crate::extension::tasks::{
-            Attempt, AttemptStatus, FileTasksStore, Host, TaskStatus, TasksStore, Tier, Trigger,
-        };
-        let root = self.state.settings.active_workspace_root();
-        if root.is_empty() {
-            return;
-        }
-        let root = std::path::PathBuf::from(root);
         let Some(service) = self.task_runs.clone() else {
             return;
         };
         let now_ms = crate::settings::unix_now().saturating_mul(1_000);
+        // Every registered workspace, not only the active one: a task stored in
+        // another workspace must still fire on its own clock.
+        for root in self.task_roots() {
+            self.schedule_tasks_at(root, service.clone(), now_ms, cx);
+        }
+    }
+
+    /// Schedule the due tasks in one workspace's store.
+    fn schedule_tasks_at(
+        &mut self,
+        root: std::path::PathBuf,
+        service: Arc<crate::ui::task_runs::TaskRuns>,
+        now_ms: u64,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::extension::tasks::{
+            Attempt, AttemptStatus, FileTasksStore, Host, TaskStatus, TasksStore, Tier, Trigger,
+        };
         let Ok(tasks) = FileTasksStore.list(&root) else {
             return;
         };
@@ -4158,7 +4174,7 @@ impl Shell {
         for task in tasks {
             if !matches!(task.status, TaskStatus::Scheduled | TaskStatus::Waiting)
                 || task.host != Host::Local
-                || task.tier != Tier::Turn
+                || !matches!(task.tier, Tier::Turn | Tier::Delegation | Tier::Job)
             {
                 continue;
             }
@@ -4189,6 +4205,14 @@ impl Shell {
                     }
                     continue;
                 }
+            }
+            if task.tier == Tier::Delegation {
+                self.fire_scheduled_delegation(root.clone(), task, now_ms);
+                continue;
+            }
+            if task.tier == Tier::Job {
+                self.fire_scheduled_job(root.clone(), task, now_ms);
+                continue;
             }
             if self.state.streams.contains_key(&task.origin.session) {
                 continue;
@@ -4274,6 +4298,13 @@ impl Shell {
         let now_ms = crate::settings::unix_now().saturating_mul(1_000);
         for record in runtime.node().claim_objective_delegations(now_ms) {
             let id = record.request.id.to_string();
+            if let Err(reason) = self.state.settings.global.federation.admits_delegation() {
+                let _ =
+                    runtime
+                        .node()
+                        .settle_objective_delegation(&id, None, Some(reason.to_string()));
+                continue;
+            }
             let origin = record
                 .origin
                 .as_ref()
@@ -4345,23 +4376,240 @@ impl Shell {
         }
     }
 
+    /// Start a due job task through the session's own shell tool.
+    fn fire_scheduled_job(
+        &mut self,
+        root: std::path::PathBuf,
+        task: crate::extension::tasks::Task,
+        now_ms: u64,
+    ) {
+        use crate::extension::tasks::{
+            Attempt, AttemptStatus, FileTasksStore, TaskStatus, TasksStore, Tier, Trigger,
+        };
+        let mut record = task;
+        let attempt_id = format!("{}-{}", record.id, record.attempts.len() + 1);
+        let mut attempt = Attempt::queued(attempt_id.clone(), Tier::Job);
+        attempt.status = AttemptStatus::Running;
+        attempt.started_ms = Some(now_ms);
+        record.attempts.push(attempt);
+        record.status = TaskStatus::Running;
+        if let Trigger::Every { last_run_ms, .. } = &mut record.trigger {
+            *last_run_ms = now_ms;
+        }
+        record.updated_ms = now_ms;
+        let _ = FileTasksStore.save(&root, &record);
+
+        let Some(command) = record.command.clone() else {
+            fail_task_attempt(
+                &root,
+                &record.id,
+                &attempt_id,
+                "the task has no command".to_string(),
+                now_ms,
+            );
+            return;
+        };
+        let Some(tool) = crate::extension::commands::command_tool(&record.origin.session) else {
+            fail_task_attempt(
+                &root,
+                &record.id,
+                &attempt_id,
+                "the session has not built its shell tool yet; open a turn there first".to_string(),
+                now_ms,
+            );
+            return;
+        };
+        match tool.run(&serde_json::json!({
+            "command": command,
+            "run_in_background": true,
+        })) {
+            Ok(response) => {
+                let Some(job) = response.get("job_id").and_then(serde_json::Value::as_str) else {
+                    fail_task_attempt(
+                        &root,
+                        &record.id,
+                        &attempt_id,
+                        "the shell did not report a job id".to_string(),
+                        now_ms,
+                    );
+                    return;
+                };
+                if let Ok(Some(mut stored)) = FileTasksStore.load(&root, &record.id) {
+                    if let Some(attempt) = stored
+                        .attempts
+                        .iter_mut()
+                        .find(|attempt| attempt.id == attempt_id)
+                    {
+                        attempt.run = Some(job.to_string());
+                    }
+                    stored.updated_ms = now_ms;
+                    let _ = FileTasksStore.save(&root, &stored);
+                }
+            }
+            Err(error) => {
+                fail_task_attempt(
+                    &root,
+                    &record.id,
+                    &attempt_id,
+                    format!("the command could not start: {error:?}"),
+                    now_ms,
+                );
+            }
+        }
+    }
+
+    /// Fire a due delegation task: mark the attempt, then hand the RPC to the
+    /// runner's runtime so the UI thread never waits on the wire.
+    fn fire_scheduled_delegation(
+        &mut self,
+        root: std::path::PathBuf,
+        task: crate::extension::tasks::Task,
+        now_ms: u64,
+    ) {
+        use crate::extension::tasks::{
+            Attempt, AttemptStatus, FileTasksStore, TaskStatus, TasksStore, Tier, Trigger,
+        };
+        let Some(target) = task.target.clone() else {
+            return;
+        };
+        let mut record = task;
+        let attempt_id = format!("{}-{}", record.id, record.attempts.len() + 1);
+        let mut attempt = Attempt::queued(attempt_id.clone(), Tier::Delegation);
+        attempt.status = AttemptStatus::Running;
+        attempt.started_ms = Some(now_ms);
+        record.attempts.push(attempt);
+        record.status = TaskStatus::Running;
+        if let Trigger::Every { last_run_ms, .. } = &mut record.trigger {
+            *last_run_ms = now_ms;
+        }
+        record.updated_ms = now_ms;
+        let _ = FileTasksStore.save(&root, &record);
+
+        if crate::federation_node::running().is_none() {
+            // Report the refusal on the record instead of leaving it Running.
+            if let Ok(Some(mut stored)) = FileTasksStore.load(&root, &record.id) {
+                stored.status = TaskStatus::Failed;
+                stored.updated_ms = now_ms;
+                if let Some(attempt) = stored
+                    .attempts
+                    .iter_mut()
+                    .find(|attempt| attempt.id == attempt_id)
+                {
+                    attempt.status = AttemptStatus::Failed;
+                    attempt.ended_ms = Some(now_ms);
+                    attempt.error = Some("the federation node is not running".to_string());
+                }
+                let _ = FileTasksStore.save(&root, &stored);
+            }
+            return;
+        }
+
+        let objective = record.intent.clone();
+        let capability = record.capability.clone();
+        let input = record.input.clone().unwrap_or(serde_json::Value::Null);
+        let task_id = record.id.clone();
+        self.state.runner.rt().spawn(async move {
+            let outcome = crate::federation_tools::delegate_record(
+                &target,
+                &objective,
+                capability.as_deref(),
+                input,
+            )
+            .await;
+            let Ok(Some(mut record)) = FileTasksStore.load(&root, &task_id) else {
+                return;
+            };
+            let now = crate::settings::unix_now().saturating_mul(1_000);
+            match outcome {
+                Ok(remote) => {
+                    if let Some(attempt) = record
+                        .attempts
+                        .iter_mut()
+                        .find(|attempt| attempt.id == attempt_id)
+                    {
+                        attempt.run = Some(remote.request.id.to_string());
+                    }
+                    record.updated_ms = now;
+                    let _ = FileTasksStore.save(&root, &record);
+                }
+                Err(error) => {
+                    record.status = TaskStatus::Failed;
+                    record.updated_ms = now;
+                    if let Some(attempt) = record
+                        .attempts
+                        .iter_mut()
+                        .find(|attempt| attempt.id == attempt_id)
+                    {
+                        attempt.status = AttemptStatus::Failed;
+                        attempt.ended_ms = Some(now);
+                        attempt.error = Some(format!("the delegation could not start: {error:?}"));
+                    }
+                    let _ = FileTasksStore.save(&root, &record);
+                }
+            }
+        });
+    }
+
+    /// Map a delegation's state to a task outcome.
+    fn delegation_outcome(
+        state: federation::DelegationState,
+        result: Option<serde_json::Value>,
+        error: Option<String>,
+    ) -> Option<(
+        crate::extension::runs::RunState,
+        Option<String>,
+        Option<String>,
+    )> {
+        use federation::DelegationState;
+        let text = result
+            .as_ref()
+            .and_then(|value| {
+                value
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .or_else(|| result.map(|value| value.to_string()));
+        match state {
+            DelegationState::Succeeded => {
+                Some((crate::extension::runs::RunState::Succeeded, text, None))
+            }
+            DelegationState::Failed | DelegationState::Rejected => Some((
+                crate::extension::runs::RunState::Failed,
+                text,
+                error.or_else(|| Some(format!("the delegation ended {state:?}"))),
+            )),
+            DelegationState::Cancelled => {
+                Some((crate::extension::runs::RunState::Cancelled, text, error))
+            }
+            DelegationState::Created | DelegationState::Accepted | DelegationState::Running => None,
+        }
+    }
+
     /// Fail local runs past their deadline, and stop them where a stopper
     /// exists. The sweep runs on the same tick as the scheduler.
     pub(crate) fn expire_task_deadlines(&mut self, _cx: &mut Context<Self>) {
+        let now_ms = crate::settings::unix_now().saturating_mul(1_000);
+        let service = self.task_runs.clone();
+        for root in self.task_roots() {
+            self.expire_deadlines_in(root, now_ms, service.clone());
+        }
+    }
+
+    /// Fail the local runs past their deadline in one workspace.
+    fn expire_deadlines_in(
+        &mut self,
+        root: std::path::PathBuf,
+        now_ms: u64,
+        service: Option<Arc<crate::ui::task_runs::TaskRuns>>,
+    ) {
         use crate::extension::runs::RunsService as _;
         use crate::extension::tasks::{
             AttemptStatus, FileTasksStore, Host, TaskStatus, TasksStore, Tier,
         };
-        let root = self.state.settings.active_workspace_root();
-        if root.is_empty() {
-            return;
-        }
-        let root = std::path::PathBuf::from(root);
         let Ok(tasks) = FileTasksStore.list(&root) else {
             return;
         };
-        let now_ms = crate::settings::unix_now().saturating_mul(1_000);
-        let service = self.task_runs.clone();
         for mut task in tasks {
             if task.host != Host::Local || task.status != TaskStatus::Running {
                 continue;
@@ -4400,6 +4648,39 @@ impl Shell {
         }
     }
 
+    /// Stop a peer delegation's turn when the owner cancels the record.
+    ///
+    /// The peer keeps the session-to-delegation map; a cancelled record means
+    /// the origin no longer wants the work, so the turn is stopped. The
+    /// terminal event's settlement is a no-op on an already-cancelled record.
+    pub(crate) fn check_peer_delegation_cancels(&mut self) {
+        let Some(runtime) = crate::federation_node::running() else {
+            return;
+        };
+        let cancelled: Vec<String> = {
+            let store = runtime.node().delegations();
+            let Ok(store) = store.read() else {
+                return;
+            };
+            self.peer_delegation_runs
+                .iter()
+                .filter(|(_, id)| {
+                    store
+                        .record(&federation::DelegationId::new((*id).clone()))
+                        .map(|record| {
+                            matches!(record.state, federation::DelegationState::Cancelled)
+                        })
+                        .unwrap_or(false)
+                })
+                .map(|(session, _)| session.clone())
+                .collect()
+        };
+        for session in cancelled {
+            self.peer_delegation_runs.remove(&session);
+            self.state.stop(&session);
+        }
+    }
+
     /// Claim the peer tasks due on this node and run each as a background turn.
     ///
     /// The node records tasks other peers asked this one to own; this shell is
@@ -4411,6 +4692,17 @@ impl Shell {
         };
         let now_ms = crate::settings::unix_now().saturating_mul(1_000);
         for task in runtime.node().claim_due_tasks(now_ms) {
+            let policy = self.state.settings.global.federation.clone();
+            if let Err(reason) =
+                policy.admits_task(task.budget_steps, task.budget_tokens, task.deadline_ms)
+            {
+                let _ = runtime
+                    .node()
+                    .settle_task(&task.id, false, None, Some(reason.to_string()));
+                continue;
+            }
+            let (_, _, deadline_ms) =
+                policy.clamp_task_budget(task.budget_steps, task.budget_tokens, task.deadline_ms);
             let title = format!("Federation work: {}", task.origin);
             let Some(session) = self.background_session(&title) else {
                 let _ = runtime.node().settle_task(
@@ -4445,7 +4737,108 @@ impl Shell {
             let request = crate::state::turn_text(&task.objective, plan);
             let input = crate::state::turn_input(&request, &[]);
             self.spawn_turn(session.clone(), input, transcript, budget, cx);
+            self.peer_task_deadlines
+                .insert(session.clone(), now_ms.saturating_add(deadline_ms));
             self.peer_task_runs.insert(session, task.id.clone());
+        }
+    }
+
+    /// Pull the owner's state for non-terminal peer mirrors.
+    ///
+    /// The tick marks the check time and hands the RPC to the runner's runtime;
+    /// the answer lands in the store, and the board reads it on its next open.
+    /// A failed pull marks the mirror Unknown, so the board says so.
+    pub(crate) fn refresh_peer_mirrors(&mut self) {
+        use crate::extension::tasks::{FileTasksStore, Host, TaskStatus, TasksStore};
+        let now_ms = crate::settings::unix_now().saturating_mul(1_000);
+        let mut due = Vec::new();
+        for root in self.task_roots() {
+            let Ok(tasks) = FileTasksStore.list(&root) else {
+                continue;
+            };
+            for mut task in tasks {
+                let Host::Peer { node } = task.host.clone() else {
+                    continue;
+                };
+                if matches!(
+                    task.status,
+                    TaskStatus::Succeeded | TaskStatus::Failed | TaskStatus::Cancelled
+                ) {
+                    continue;
+                }
+                if now_ms.saturating_sub(task.mirror_checked_ms) < 15_000 {
+                    continue;
+                }
+                task.mirror_checked_ms = now_ms;
+                task.updated_ms = now_ms;
+                let _ = FileTasksStore.save(&root, &task);
+                due.push((root.clone(), task.id.clone(), node));
+            }
+        }
+        if due.is_empty() {
+            return;
+        }
+        self.right.tasks.borrow_mut().take();
+        let runtime = self.state.runner.rt();
+        for (root, id, node) in due {
+            runtime.spawn(async move {
+                let outcome = crate::federation_tools::peer_task_status(&node, &id).await;
+                let now = crate::settings::unix_now().saturating_mul(1_000);
+                let Ok(Some(mut record)) = FileTasksStore.load(&root, &id) else {
+                    return;
+                };
+                match outcome {
+                    Ok(remote) => {
+                        record.status = crate::task_tools::mirror_status(remote.state);
+                        record.updated_ms = now;
+                        if let Some(attempt) = record.attempts.last_mut() {
+                            attempt.status = crate::task_tools::mirror_attempt_status(remote.state);
+                            if remote.result.is_some() {
+                                attempt.result = remote.result;
+                            }
+                            if matches!(
+                                remote.state,
+                                federation::FederatedTaskState::Succeeded
+                                    | federation::FederatedTaskState::Failed
+                                    | federation::FederatedTaskState::Cancelled
+                            ) {
+                                attempt.ended_ms = Some(now);
+                            }
+                        }
+                        let _ = FileTasksStore.save(&root, &record);
+                    }
+                    Err(_) => {
+                        record.status = TaskStatus::Unknown;
+                        record.updated_ms = now;
+                        let _ = FileTasksStore.save(&root, &record);
+                    }
+                }
+            });
+        }
+    }
+
+    /// Stop a peer task whose clamped deadline has passed.
+    pub(crate) fn check_peer_task_deadlines(&mut self) {
+        let now_ms = crate::settings::unix_now().saturating_mul(1_000);
+        let expired: Vec<String> = self
+            .peer_task_deadlines
+            .iter()
+            .filter(|(_, deadline)| **deadline <= now_ms)
+            .map(|(session, _)| session.clone())
+            .collect();
+        for session in expired {
+            self.peer_task_deadlines.remove(&session);
+            if let Some(task) = self.peer_task_runs.remove(&session) {
+                if let Some(runtime) = crate::federation_node::running() {
+                    let _ = runtime.node().settle_task(
+                        &task,
+                        false,
+                        None,
+                        Some("the remote-work deadline was exceeded".to_string()),
+                    );
+                }
+            }
+            self.state.stop(&session);
         }
     }
 
@@ -4472,6 +4865,7 @@ impl Shell {
 
     /// Settle the peer task a session was running, from the turn's result.
     pub(crate) fn settle_peer_task(&mut self, session: &str, failed: bool) {
+        self.peer_task_deadlines.remove(session);
         let Some(task_id) = self.peer_task_runs.remove(session) else {
             return;
         };
@@ -4499,27 +4893,27 @@ impl Shell {
     pub(crate) fn check_task_resumes(&mut self, cx: &mut Context<Self>) {
         use crate::extension::runs::RunsService as _;
         use crate::extension::tasks::{FileTasksStore, TasksStore};
-        let root = self.state.settings.active_workspace_root();
-        if root.is_empty() {
-            return;
-        }
-        let root = std::path::PathBuf::from(root);
         let Some(service) = self.task_runs.clone() else {
             return;
         };
-        let Ok(tasks) = FileTasksStore.list(&root) else {
-            return;
-        };
-        let mut groups: std::collections::BTreeMap<String, Vec<crate::extension::tasks::Task>> =
-            std::collections::BTreeMap::new();
-        for task in tasks
-            .into_iter()
-            .filter(|task| task.resume_armed_ms.is_some())
-        {
-            groups
-                .entry(task.origin.session.clone())
-                .or_default()
-                .push(task);
+        // Every workspace: a task in another one must still deliver its result.
+        let mut groups: std::collections::BTreeMap<
+            String,
+            Vec<(std::path::PathBuf, crate::extension::tasks::Task)>,
+        > = std::collections::BTreeMap::new();
+        for root in self.task_roots() {
+            let Ok(tasks) = FileTasksStore.list(&root) else {
+                continue;
+            };
+            for task in tasks
+                .into_iter()
+                .filter(|task| task.resume_armed_ms.is_some())
+            {
+                groups
+                    .entry(task.origin.session.clone())
+                    .or_default()
+                    .push((root.clone(), task));
+            }
         }
         let now_ms = crate::settings::unix_now().saturating_mul(1_000);
         for (session, group) in groups {
@@ -4527,10 +4921,11 @@ impl Shell {
                 continue;
             }
             let mut settled: Vec<(
+                std::path::PathBuf,
                 crate::extension::tasks::Task,
                 crate::extension::runs::RunSnapshot,
             )> = Vec::new();
-            for task in &group {
+            for (root, task) in &group {
                 let Some(run) = task.attempts.last().and_then(|attempt| attempt.run.clone()) else {
                     continue;
                 };
@@ -4540,7 +4935,7 @@ impl Shell {
                     .or_else(|| crate::federation_tools::delegation_snapshot(&run));
                 if let Some(snapshot) = snapshot {
                     if snapshot.state.is_settled() {
-                        settled.push((task.clone(), snapshot));
+                        settled.push((root.clone(), task.clone(), snapshot));
                     }
                 }
             }
@@ -4551,16 +4946,23 @@ impl Shell {
             let undeliverable = self.state.settings.refusal_for(&choice).is_some()
                 || self.state.store.session(&session).is_none();
             if undeliverable {
-                for (mut task, _) in settled {
+                for (root, mut task, _) in settled {
                     task.resume_armed_ms = None;
                     task.updated_ms = now_ms;
                     let _ = FileTasksStore.save(&root, &task);
                 }
                 continue;
             }
-            let text = crate::task_tools::resume_prompt(&settled);
+            let rows: Vec<(
+                crate::extension::tasks::Task,
+                crate::extension::runs::RunSnapshot,
+            )> = settled
+                .iter()
+                .map(|(_, task, snapshot)| (task.clone(), snapshot.clone()))
+                .collect();
+            let text = crate::task_tools::resume_prompt(&rows);
             let Some((transcript, budget)) = self.state.begin_turn_in(&session, &text) else {
-                for (mut task, _) in settled {
+                for (root, mut task, _) in settled {
                     task.resume_armed_ms = None;
                     task.updated_ms = now_ms;
                     let _ = FileTasksStore.save(&root, &task);
@@ -4571,7 +4973,7 @@ impl Shell {
             let request = crate::state::turn_text(&text, plan);
             let input = crate::state::turn_input(&request, &[]);
             self.spawn_turn(session.clone(), input, transcript, budget, cx);
-            for (mut task, _) in settled {
+            for (root, mut task, _) in settled {
                 task.resume_armed_ms = None;
                 task.updated_ms = now_ms;
                 if let Some(attempt) = task.attempts.last_mut() {
@@ -5753,6 +6155,24 @@ impl Shell {
                             }
                         }
                     }
+                    Tier::Delegation => {
+                        if let Some(runtime) = crate::federation_node::running() {
+                            let id = federation::DelegationId::new(run.clone());
+                            let store = runtime.node().delegations();
+                            let found = store.read().ok().and_then(|store| {
+                                store.record(&id).map(|record| {
+                                    (record.state, record.result.clone(), record.error.clone())
+                                })
+                            });
+                            if let Some((state, result, error)) = found {
+                                if let Some((run_state, result, error)) =
+                                    Self::delegation_outcome(state, result, error)
+                                {
+                                    finished.push((run, run_state, result, error));
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -5798,6 +6218,9 @@ impl Shell {
         let roots = self.task_roots();
         if crate::task_tools::settle_by_run(&roots, &run, state, result, error, tokens) {
             self.right.tasks.borrow_mut().take();
+            if failed {
+                self.auto_retry_failed_turns();
+            }
         }
     }
 
@@ -6851,6 +7274,32 @@ impl Render for Shell {
 }
 
 /// Settle a scheduled task's record from its finished run.
+/// Mark a task attempt failed with a reason, keeping the record truthful.
+fn fail_task_attempt(
+    root: &std::path::Path,
+    task: &str,
+    attempt: &str,
+    reason: String,
+    now_ms: u64,
+) {
+    use crate::extension::tasks::{AttemptStatus, FileTasksStore, TaskStatus, TasksStore};
+    let Ok(Some(mut record)) = FileTasksStore.load(root, task) else {
+        return;
+    };
+    record.status = TaskStatus::Failed;
+    record.updated_ms = now_ms;
+    if let Some(attempt) = record
+        .attempts
+        .iter_mut()
+        .find(|candidate| candidate.id == attempt)
+    {
+        attempt.status = AttemptStatus::Failed;
+        attempt.ended_ms = Some(now_ms);
+        attempt.error = Some(reason);
+    }
+    let _ = FileTasksStore.save(root, &record);
+}
+
 fn settle_scheduled_record(
     root: &std::path::Path,
     task_id: &str,
@@ -6914,6 +7363,34 @@ mod tests {
     // macro, which shadows the builtin one its own expansion emits.
     use super::selection_drag;
     use super::{compact_error_text, compact_failure_text};
+
+    /// A delegation's terminal state maps to a task outcome; a live one maps
+    /// to nothing so the record stays Running.
+    #[test]
+    fn a_delegation_outcome_maps_to_a_task_state() {
+        use super::Shell;
+        use crate::extension::runs::RunState;
+        use federation::DelegationState;
+
+        let (state, text, error) = Shell::delegation_outcome(
+            DelegationState::Succeeded,
+            Some(serde_json::json!({ "text": "answer" })),
+            None,
+        )
+        .expect("a terminal outcome");
+        assert!(matches!(state, RunState::Succeeded));
+        assert_eq!(text.as_deref(), Some("answer"));
+        assert!(error.is_none());
+
+        let (state, _text, error) =
+            Shell::delegation_outcome(DelegationState::Rejected, None, Some("no".to_string()))
+                .expect("a terminal outcome");
+        assert!(matches!(state, RunState::Failed));
+        assert_eq!(error.as_deref(), Some("no"));
+
+        assert!(Shell::delegation_outcome(DelegationState::Running, None, None).is_none());
+    }
+
     use crate::i18n::Lang;
     use agent::agent::context::CompactionFailure;
 

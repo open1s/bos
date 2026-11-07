@@ -93,8 +93,6 @@ pub(crate) enum Refusal {
     SubagentNeedsATurn,
     /// A peer task is owned by the peer's clock, so it needs a schedule.
     PeerTaskNeedsASchedule,
-    /// The scheduler starts turns only; a job task has no clock dispatcher yet.
-    JobNeedsToStartNow,
 }
 
 impl Refusal {
@@ -107,7 +105,6 @@ impl Refusal {
             Self::PeerTaskNeedsASchedule => {
                 "a peer task is owned by the peer's clock, so it needs a schedule"
             }
-            Self::JobNeedsToStartNow => "a job task starts now; the scheduler fires turns only",
         }
     }
 }
@@ -120,9 +117,6 @@ impl Tier {
         }
         if matches!(self, Self::PeerTask) && !trigger.is_scheduled() {
             return Err(Refusal::PeerTaskNeedsASchedule);
-        }
-        if matches!(self, Self::Job) && trigger.is_scheduled() {
-            return Err(Refusal::JobNeedsToStartNow);
         }
         Ok(())
     }
@@ -388,6 +382,9 @@ pub(crate) struct Task {
     /// write, which is the delivery-once guarantee.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) resume_armed_ms: Option<u64>,
+    /// When a peer mirror's owner was last asked, in unix milliseconds.
+    #[serde(default)]
+    pub(crate) mirror_checked_ms: u64,
     /// When it was created, in unix milliseconds.
     pub(crate) created_ms: u64,
     /// When it last changed, in unix milliseconds.
@@ -448,6 +445,7 @@ impl Task {
             },
             attempts: Vec::new(),
             resume_armed_ms: None,
+            mirror_checked_ms: 0,
             created_ms: now_ms,
             updated_ms: now_ms,
         })
@@ -772,6 +770,7 @@ mod tests {
             status: TaskStatus::Queued,
             attempts: vec![Attempt::queued("att-1", Tier::Subagent)],
             resume_armed_ms: None,
+            mirror_checked_ms: 0,
             created_ms: 1_000,
             updated_ms: 1_000,
         }
@@ -913,12 +912,9 @@ mod tests {
             },
             Tier::Job,
             10,
-        );
-        assert_eq!(
-            scheduled_job.unwrap_err(),
-            Refusal::JobNeedsToStartNow,
-            "the scheduler fires turns only"
-        );
+        )
+        .expect("a scheduled job is legal");
+        assert_eq!(scheduled_job.status, TaskStatus::Scheduled);
         let cadence = Task::open(
             "task-every",
             "title",

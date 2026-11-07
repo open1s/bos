@@ -1468,6 +1468,7 @@
 "right.tasks.next": "下次"
 "right.tasks.attempts": "尝试"
 "right.tasks.stop": "停止"
+"right.tasks.retry": "重试"
 "right.tasks.clearCompleted": "清除已完成"
 "right.tasks.summaryRunning": "运行中"
 "right.tasks.local": "本机"

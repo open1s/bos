@@ -1229,6 +1229,21 @@ impl Shell {
             })
     }
 
+    /// Every workspace root a task record may live in.
+    fn task_roots_for_pane(&self) -> Vec<std::path::PathBuf> {
+        let mut roots = std::collections::BTreeSet::new();
+        let active = self.state.settings.active_workspace_root();
+        if !active.is_empty() {
+            roots.insert(std::path::PathBuf::from(active));
+        }
+        for workspace in &self.state.settings.global.workspaces {
+            if !workspace.root.is_empty() {
+                roots.insert(std::path::PathBuf::from(&workspace.root));
+            }
+        }
+        roots.into_iter().collect()
+    }
+
     /// The Tasks tab: the run graph by default, the store list on request.
     fn tasks_pane(&self, cx: &mut Context<Self>) -> AnyElement {
         if self.graph_tree {
@@ -1841,7 +1856,7 @@ impl Shell {
         lang: crate::i18n::Lang,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        use crate::extension::tasks::{FileTasksStore, Host, TaskStatus, TasksStore};
+        use crate::extension::tasks::{FileTasksStore, Host, TaskStatus, TasksStore, Tier};
         let root = self.task_workspace_root();
         let record = FileTasksStore.load(&root, &row.id).ok().flatten();
         let mut detail = div()
@@ -1889,7 +1904,37 @@ impl Shell {
         }
         let id = row.id.clone();
         let can_stop = matches!(row.status, TaskStatus::Running) && matches!(row.host, Host::Local);
+        let can_retry = matches!(row.tier, Tier::Turn)
+            && matches!(row.host, Host::Local)
+            && !matches!(
+                row.status,
+                TaskStatus::Running
+                    | TaskStatus::Queued
+                    | TaskStatus::Scheduled
+                    | TaskStatus::Waiting
+            );
         let mut actions = div().flex().items_center().gap(px(6.0)).pt(px(4.0));
+        if can_retry {
+            let retry_id = format!("task-retry-{}", row.id);
+            let retry_task = row.id.clone();
+            actions = actions.child(
+                div()
+                    .id(SharedString::from(retry_id.clone()))
+                    .debug_selector(move || retry_id.clone())
+                    .px(px(8.0))
+                    .py(px(3.0))
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(rgb(theme::border_soft()))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(theme::hover())))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.retry_task_turn(&retry_task);
+                        cx.notify();
+                    }))
+                    .child(txt(lang.tr("right.tasks.retry"), 11.0, theme::text())),
+            );
+        }
         if can_stop {
             let stop_id = format!("task-stop-{}", row.id);
             actions = actions.child(
@@ -1911,6 +1956,84 @@ impl Shell {
             );
         }
         detail.child(actions).into_any_element()
+    }
+
+    /// Start a new attempt for a settled turn task in one workspace.
+    fn retry_turn_in(&mut self, root: &std::path::Path, id: &str) {
+        use crate::extension::runs::{Limits, RunSpec, RunTier, Runs};
+        use crate::extension::tasks::{
+            Attempt, AttemptStatus, FileTasksStore, Host, TaskStatus, TasksStore, Tier,
+        };
+        let Ok(Some(mut record)) = FileTasksStore.load(root, id) else {
+            return;
+        };
+        if !matches!(record.host, Host::Local) || record.tier != Tier::Turn {
+            return;
+        }
+        if record.active_attempt().is_some() || !record.may_retry() {
+            return;
+        }
+        let Some(service) = self.task_runs.clone() else {
+            return;
+        };
+        let spec = RunSpec {
+            session: record.origin.session.clone(),
+            objective: record.intent.clone(),
+            tier: RunTier::Turn,
+            limits: Limits {
+                steps: record.budget.max_steps,
+                tokens: record.budget.max_tokens,
+                deadline_ms: record.budget.deadline_ms,
+            },
+            target: None,
+            capability: None,
+            trace: record.id.clone(),
+        };
+        let Ok(handle) = Runs::with(service).start(spec) else {
+            return;
+        };
+        let now = crate::settings::unix_now().saturating_mul(1_000);
+        let attempt_id = format!("{}-{}", record.id, record.attempts.len() + 1);
+        let mut attempt = Attempt::queued(attempt_id, Tier::Turn);
+        attempt.run = Some(handle.id.clone());
+        attempt.status = AttemptStatus::Running;
+        attempt.started_ms = Some(now);
+        record.attempts.push(attempt);
+        record.status = TaskStatus::Running;
+        record.updated_ms = now;
+        let _ = FileTasksStore.save(root, &record);
+        self.right.tasks.borrow_mut().take();
+    }
+
+    /// Retry a settled local turn task from the pane.
+    pub(crate) fn retry_task_turn(&mut self, id: &str) {
+        let root = self.task_workspace_root();
+        self.retry_turn_in(&root, id);
+    }
+
+    /// Start a new attempt for failed turn tasks whose policy is automatic.
+    pub(crate) fn auto_retry_failed_turns(&mut self) {
+        use crate::extension::tasks::{
+            FileTasksStore, Host, RetryMode, TaskStatus, TasksStore, Tier,
+        };
+        let roots = self.task_roots_for_pane();
+        for root in roots {
+            let Ok(tasks) = FileTasksStore.list(&root) else {
+                continue;
+            };
+            for record in tasks {
+                if !matches!(record.host, Host::Local) || record.tier != Tier::Turn {
+                    continue;
+                }
+                if record.status != TaskStatus::Failed {
+                    continue;
+                }
+                if record.retry.mode != RetryMode::Auto || !record.may_retry() {
+                    continue;
+                }
+                self.retry_turn_in(&root, &record.id);
+            }
+        }
     }
 
     /// Delete the settled records of the active session's workspace.
