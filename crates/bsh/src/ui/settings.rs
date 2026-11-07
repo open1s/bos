@@ -323,6 +323,43 @@ struct DefaultModelGroup {
     rows: Vec<(String, crate::settings::global::ModelRef, bool)>,
 }
 
+/// The provider groups one query leaves, labels already resolved.
+///
+/// Empty groups are dropped, so a heading never heads nothing. The filter is a
+/// case-insensitive substring over the visible label - provider and model name
+/// together - because that is what the reader sees and types.
+fn default_model_matches(
+    settings: &crate::settings::Settings,
+    query: &str,
+    active: &str,
+) -> Vec<DefaultModelGroup> {
+    let needle = query.trim().to_lowercase();
+    settings
+        .catalogs_by_provider(active)
+        .into_iter()
+        .filter_map(|(provider, models)| {
+            let heading = provider_display(settings, &provider);
+            let rows: Vec<(String, crate::settings::global::ModelRef, bool)> = models
+                .into_iter()
+                .filter_map(|nickname| {
+                    let reference = crate::settings::global::ModelRef {
+                        provider: provider.clone(),
+                        model: nickname,
+                    };
+                    let label =
+                        format!("{} · {}", heading, settings.model_display_name(&reference));
+                    if !needle.is_empty() && !label.to_lowercase().contains(&needle) {
+                        return None;
+                    }
+                    let checked = settings.global.default_model.as_ref() == Some(&reference);
+                    Some((label, reference, checked))
+                })
+                .collect();
+            (!rows.is_empty()).then_some(DefaultModelGroup { heading, rows })
+        })
+        .collect()
+}
+
 /// The provider's display name as the models UI shows it: the reader's name
 /// for it, else the shipped label, else the id.
 fn provider_display(settings: &crate::settings::Settings, id: &str) -> String {
@@ -4464,45 +4501,21 @@ impl Shell {
 
     /// The machine-wide default model: what a session uses until it picks one.
     ///
-    /// One settings row, not a list. The reference's own row language (title,
-    /// hint, a 36px control on the right) with the catalogue behind the
-    /// control's menu: an always-expanded list turns one preference into a
-    /// second copy of the provider cards below it.
+    /// One settings row (title, hint, a 36px select on the right). The list is
+    /// drawn only while the picker is open and is FILTERED by what the reader
+    /// types: a machine with several providers has dozens of models, so finding
+    /// one is typing a fragment rather than scanning a list.
     fn default_model_row(&self, cx: &mut Context<Self>) -> AnyElement {
         let lang = self.state.lang;
         let draft = self.state.draft();
         let current = draft.global.default_model.clone();
+        let open = self.default_model_open;
+        let query = self.default_model_query.read(cx).value().to_string();
         let active = current
             .as_ref()
             .map(|reference| reference.provider.as_str())
             .unwrap_or_default();
-        // Labels are computed once, outside the menu builder: the builder is
-        // `Fn`, and a second resolution per open would read the whole tree
-        // again for facts this row already holds.
-        let groups: Vec<DefaultModelGroup> = draft
-            .catalogs_by_provider(active)
-            .into_iter()
-            .map(|(provider, models)| {
-                let heading = provider_display(draft, &provider);
-                let rows = models
-                    .into_iter()
-                    .map(|nickname| {
-                        let reference = crate::settings::global::ModelRef {
-                            provider: provider.clone(),
-                            model: nickname,
-                        };
-                        let label =
-                            format!("{} · {}", heading, draft.model_display_name(&reference));
-                        let checked = current.as_ref() == Some(&reference);
-                        (label, reference, checked)
-                    })
-                    .collect();
-                DefaultModelGroup { heading, rows }
-            })
-            .collect();
         let value = default_model_label(draft, lang);
-        let none_label = lang.tr("settings.defaultModelNone").to_string();
-        let shell = cx.entity().clone();
         let control = Button::new(SharedString::from("default-model-control"))
             .ghost()
             .h(px(36.0))
@@ -4530,54 +4543,188 @@ impl Shell {
                         },
                     )),
             )
-            .child(icon(IconName::ChevronDown, 12.0, theme::caption()))
-            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
-                let mut menu = menu.min_w(px(280.0)).max_w(px(420.0));
-                let clear = shell.clone();
-                menu = menu.item(
-                    PopupMenuItem::new(none_label.clone())
-                        .checked(current.is_none())
-                        .on_click(move |_, _, cx| {
-                            clear.update(cx, |this, cx| {
-                                this.state.set_default_model(None);
-                                cx.notify();
-                            });
-                        }),
-                );
-                for group in groups.iter() {
-                    let heading = group.heading.clone();
-                    menu = menu.item(PopupMenuItem::element(move |_, _| {
-                        txt(heading.clone(), 11.0, theme::faint())
-                            .px(px(8.0))
-                            .py(px(6.0))
-                            .into_any_element()
-                    }));
-                    for (label, reference, checked) in &group.rows {
-                        let pick = shell.clone();
-                        let picked = reference.clone();
-                        menu = menu.item(
-                            PopupMenuItem::new(label.clone())
-                                .checked(*checked)
-                                .on_click(move |_, _, cx| {
-                                    let picked = picked.clone();
-                                    pick.update(cx, |this, cx| {
-                                        this.state.set_default_model(Some(picked.clone()));
-                                        cx.notify();
-                                    });
-                                }),
-                        );
-                    }
+            .child(icon(
+                if open {
+                    IconName::ChevronUp
+                } else {
+                    IconName::ChevronDown
+                },
+                12.0,
+                theme::caption(),
+            ))
+            .on_click(cx.listener(|this, _event, window, cx| {
+                this.default_model_open = !this.default_model_open;
+                if !this.default_model_open {
+                    this.default_model_query
+                        .update(cx, |input, cx| input.set_value("", window, cx));
                 }
-                menu
-            });
-        self.preference_row(
-            "settings.defaultModel",
-            Some("settings.defaultModelHint"),
+                cx.notify();
+            }));
+
+        let mut row = div().py(px(16.0)).flex().flex_col().gap(px(10.0)).child(
             div()
-                .debug_selector(|| "default-model-control".to_string())
-                .child(control)
-                .into_any_element(),
-        )
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .gap(px(4.0))
+                        .min_w_0()
+                        .pr(px(48.0))
+                        .child(txt(lang.tr("settings.defaultModel"), 14.0, theme::text()))
+                        .child(txt(
+                            lang.tr("settings.defaultModelHint"),
+                            12.0,
+                            theme::faint(),
+                        )),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "default-model-control".to_string())
+                        .child(control),
+                ),
+        );
+
+        if open {
+            let groups = default_model_matches(draft, &query, active);
+            let mut options = div()
+                .id("default-model-options")
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .max_h(px(280.0))
+                .overflow_y_scroll();
+            // The escape hatch stays first and is never filtered: clearing a
+            // default is not a search result.
+            let none_label = lang.tr("settings.defaultModelNone").to_string();
+            let none_checked = current.is_none();
+            let mut none_row = div()
+                .id("default-model-none")
+                .debug_selector(|| "default-model-none".to_string())
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .min_h(px(30.0))
+                .px(px(8.0))
+                .rounded(px(8.0))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(theme::hover())))
+                .child(txt(
+                    none_label,
+                    12.0,
+                    if none_checked {
+                        theme::text()
+                    } else {
+                        theme::muted()
+                    },
+                ));
+            if none_checked {
+                none_row = none_row.child(txt("✓", 12.0, theme::accent()));
+            }
+            options = options.child(none_row.on_click(cx.listener(|this, _, window, cx| {
+                this.state.set_default_model(None);
+                this.default_model_open = false;
+                this.default_model_query
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                cx.notify();
+            })));
+            let mut index = 0usize;
+            for group in &groups {
+                options = options.child(
+                    txt(group.heading.clone(), 11.0, theme::faint())
+                        .px(px(8.0))
+                        .py(px(4.0)),
+                );
+                for (label, reference, checked) in &group.rows {
+                    let picked = reference.clone();
+                    let selector = format!("default-model-option-{index}");
+                    let mut option = div()
+                        .id(SharedString::from(selector.clone()))
+                        .debug_selector(move || selector.clone())
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .min_h(px(30.0))
+                        .px(px(8.0))
+                        .rounded(px(8.0))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(theme::hover())))
+                        .child(txt(
+                            label.clone(),
+                            12.0,
+                            if *checked {
+                                theme::text()
+                            } else {
+                                theme::muted()
+                            },
+                        ));
+                    if *checked {
+                        option = option.child(txt("✓", 12.0, theme::accent()));
+                    }
+                    options =
+                        options.child(option.on_click(cx.listener(move |this, _, window, cx| {
+                            this.state.set_default_model(Some(picked.clone()));
+                            this.default_model_open = false;
+                            this.default_model_query
+                                .update(cx, |input, cx| input.set_value("", window, cx));
+                            cx.notify();
+                        })));
+                    index += 1;
+                }
+            }
+            if groups.is_empty() {
+                options = options.child(
+                    txt(
+                        lang.tr("settings.defaultModelNoMatch"),
+                        12.0,
+                        theme::faint(),
+                    )
+                    .px(px(8.0))
+                    .py(px(8.0)),
+                );
+            }
+            let search = div()
+                .debug_selector(|| "default-model-search".to_string())
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .h(px(34.0))
+                .px(px(10.0))
+                .rounded(px(8.0))
+                .bg(rgb(theme::page()))
+                .border_1()
+                .border_color(rgb(theme::border()))
+                .child(icon(IconName::Search, 12.0, theme::faint()))
+                .child(
+                    Input::new(&self.default_model_query)
+                        .appearance(false)
+                        .w_full()
+                        .h(px(32.0)),
+                );
+            row = row.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .p(px(8.0))
+                    .rounded(px(12.0))
+                    .border_1()
+                    .border_color(rgb(theme::border_soft()))
+                    .bg(rgb(theme::page()))
+                    .child(search)
+                    .child(options),
+            );
+        }
+
+        hairline_bottom(row)
+            .border_color(rgb(theme::border_soft()))
+            .into_any_element()
     }
 
     /// One provider card: the reference's row head, modernised to the pane's
@@ -13831,7 +13978,7 @@ mod default_model_tests {
     // NO glob import: this file imports gpui, which re-exports a "test"
     // attribute macro. A glob here would shadow the builtin #[test] and the
     // expansion would recurse until the parser dies.
-    use super::default_model_label;
+    use super::{default_model_label, default_model_matches};
     use crate::i18n::Lang;
 
     /// The closed control names the default, or says there is none; the provider
@@ -13849,5 +13996,36 @@ mod default_model_tests {
             model: "m".to_string(),
         });
         assert_eq!(default_model_label(&settings, Lang::En), "p · M");
+    }
+
+    /// The filter keeps only rows whose visible label contains the query, and
+    /// drops a provider group that has nothing left.
+    #[test]
+    fn the_filter_keeps_only_matching_rows() {
+        let mut settings = crate::settings::Settings::default();
+        settings
+            .global
+            .add_provider("p", "", "https://p.example/v1", &[]);
+        let _ = settings.global.add_model("p", "glm", "GLM", "p/glm", "");
+        let _ = settings.global.add_model("p", "kimi", "Kimi", "p/kimi", "");
+
+        let all = default_model_matches(&settings, "", "");
+        assert_eq!(all.len(), 1, "one provider group");
+        assert_eq!(all[0].rows.len(), 2, "both models");
+
+        let filtered = default_model_matches(&settings, "kimi", "");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].rows.len(), 1);
+        assert_eq!(filtered[0].rows[0].1.model, "kimi");
+
+        assert!(
+            default_model_matches(&settings, "nothing", "").is_empty(),
+            "a provider with no matching model is dropped"
+        );
+        assert_eq!(
+            default_model_matches(&settings, "KIMI", "").len(),
+            1,
+            "the filter is case-insensitive"
+        );
     }
 }

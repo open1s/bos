@@ -1779,6 +1779,21 @@ impl Shell {
                 }
             },
         ));
+        // Typing in the default-model picker filters its list, and the Shell
+        // draws that list: the field's change must ask for a frame.
+        subs.push(cx.subscribe_in(
+            &default_model_query,
+            window,
+            |_this: &mut Shell,
+             _state: &Entity<InputState>,
+             event: &InputEvent,
+             _window: &mut Window,
+             cx: &mut Context<Shell>| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            },
+        ));
         // The palette's keys are intercepted ABOVE the kit's input: the input
         // binds up, down, tab and escape in its own key context, so a raw key
         // listener on an ancestor never sees them. An interceptor runs before

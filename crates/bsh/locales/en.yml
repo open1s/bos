@@ -411,6 +411,8 @@
 "settings.defaultModel": "Default model"
 "settings.defaultModelNone": "No default"
 "settings.defaultModelHint": "Sessions that pick no model of their own use this one."
+"settings.defaultModelSearch": "Search models"
+"settings.defaultModelNoMatch": "No models match"
 "settings.modelId": "Model ID"
 "settings.shellHint": "Cap how long a command runs and how much it may return."
 "settings.shellTimeout": "Command timeout (seconds)"

@@ -4122,10 +4122,10 @@ fn seed_provider(global: &mut crate::settings::global::GlobalSettings, id: &str,
     );
 }
 
-/// The Models pane draws the default-model control, and the draft edit the
-/// control performs is what the pane saves.
+/// The picker opens in place, filters as the reader types, and picking a row
+/// writes the draft the pane saves.
 #[gpui::test]
-fn the_default_model_row_renders_its_control(cx: &mut TestAppContext) {
+fn the_default_model_picker_filters_and_picks(cx: &mut TestAppContext) {
     cx.update(gpui_kit::component::init);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_turns("default-model", 1);
@@ -4135,33 +4135,79 @@ fn the_default_model_row_renders_its_control(cx: &mut TestAppContext) {
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
     cx.update(|_, cx| {
         shell.update(cx, |this, _| {
-            seed_provider(
-                &mut this.state.draft_mut().global,
+            this.state.draft_mut().global.add_provider(
                 "alpha",
+                "",
                 "https://alpha.example",
+                &[
+                    crate::settings::global::ModelEntry::named("glm"),
+                    crate::settings::global::ModelEntry::named("kimi"),
+                ],
             );
         })
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let control = cx
+        .debug_bounds("default-model-control")
+        .expect("the default-model control");
+    cx.simulate_click(control.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(
-        cx.debug_bounds("default-model-control").is_some(),
-        "the default-model control is on the pane"
+        cx.debug_bounds("default-model-search").is_some(),
+        "the picker opens with a search field"
+    );
+    assert!(
+        cx.debug_bounds("default-model-option-1").is_some(),
+        "both models are offered before a query"
     );
 
-    // The control's handler edits the DRAFT; Save is what persists it.
-    let chosen = crate::settings::global::ModelRef {
-        provider: "alpha".to_string(),
-        model: "alpha-model".to_string(),
-    };
-    cx.update(|_, cx| {
-        shell.update(cx, |this, _| {
-            this.state.set_default_model(Some(chosen.clone()));
+    // Type a fragment: only the matching model remains.
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.default_model_query.update(cx, |input, cx| {
+                input.set_value("kimi", window, cx);
+            });
         })
     });
-    let drafted = cx.update(|_, cx| shell.read(cx).state.draft().global.default_model.clone());
-    assert_eq!(drafted, Some(chosen));
-    let saved = cx.update(|_, cx| shell.read(cx).state.settings.global.default_model.clone());
-    assert_eq!(saved, None, "the saved document waits for Save");
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("default-model-option-1").is_none(),
+        "the filter drops the non-matching model"
+    );
+    let option = cx
+        .debug_bounds("default-model-option-0")
+        .expect("the matching model row");
+    cx.simulate_click(option.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let chosen = cx.update(|_, cx| shell.read(cx).state.draft().global.default_model.clone());
+    assert_eq!(
+        chosen,
+        Some(crate::settings::global::ModelRef {
+            provider: "alpha".to_string(),
+            model: "kimi".to_string(),
+        }),
+        "the row writes the draft the pane saves"
+    );
+    assert!(
+        cx.debug_bounds("default-model-search").is_none(),
+        "picking closes the picker"
+    );
+
+    // Reopen and clear: the escape hatch is always offered.
+    let control = cx
+        .debug_bounds("default-model-control")
+        .expect("the default-model control");
+    cx.simulate_click(control.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let clear = cx
+        .debug_bounds("default-model-none")
+        .expect("the no-default row");
+    cx.simulate_click(clear.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let cleared = cx.update(|_, cx| shell.read(cx).state.draft().global.default_model.clone());
+    assert_eq!(cleared, None, "No default clears it");
 }
 
 /// The model chip opens its own menu in place, the way the reference's trigger
