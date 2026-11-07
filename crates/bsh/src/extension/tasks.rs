@@ -364,6 +364,9 @@ pub(crate) struct Task {
     /// For a job: the command line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) command: Option<String>,
+    /// For a delegation: the capability input, so a retry can repeat it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) input: Option<serde_json::Value>,
     /// Tasks that must succeed first.
     #[serde(default)]
     pub(crate) deps: Vec<String>,
@@ -430,6 +433,7 @@ impl Task {
             target: None,
             capability: None,
             command: None,
+            input: None,
             deps: Vec::new(),
             budget: if scheduled {
                 Budget::cadence()
@@ -761,6 +765,7 @@ mod tests {
             target: None,
             capability: None,
             command: None,
+            input: None,
             deps: Vec::new(),
             budget: Budget::default(),
             retry: Retry::default(),

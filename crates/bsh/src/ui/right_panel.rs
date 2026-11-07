@@ -3,7 +3,7 @@
 //!
 //! The panel is the reference's own right column: a tab strip that carries one
 //! chip per open pane, a header of controls on its right edge, and either the
-//! Start screen's three cards or the body of the pane the reader chose. Only
+//! Start screen's cards or the body of the pane the reader chose. Only
 //! Workspace Files is built here so far; the terminal and the browser take the
 //! same tab, so what they need is a tab chip and a body, not a second frame.
 //!
@@ -385,7 +385,8 @@ impl RightTab {
         }
     }
 
-    /// Every pane the Start screen offers, in the order it lists them.
+    /// Every pane the panel can show, in the order the Start screen lists the
+    /// ones it offers.
     const ALL: [RightTab; 7] = [
         RightTab::Files,
         RightTab::Diff,
@@ -395,6 +396,18 @@ impl RightTab {
         RightTab::Federation,
         RightTab::Tasks,
     ];
+
+    /// Whether the Start screen offers this pane as a card.
+    ///
+    /// Diff is the one pane it does not: a comparison needs a file, and the
+    /// surface has no picker of its own, so a card could only open it empty.
+    /// The pane is reached where its material is - a file row's Diff control,
+    /// a step's View diff - and from the strip, which still offers every pane
+    /// because the panel can show them all. Keeping Diff in [`Self::ALL`] is
+    /// what lets both facts share one ordered list.
+    pub(crate) fn on_start_screen(self) -> bool {
+        !matches!(self, RightTab::Diff)
+    }
 }
 
 /// The right panel's own state: whether it is open, which pane is up, and the
@@ -427,6 +440,10 @@ pub(crate) struct RightPanel {
     /// The Tasks board's records, read once per open so a frame never touches
     /// the store.
     pub(crate) tasks: std::cell::RefCell<Option<Vec<crate::extension::tasks::Task>>>,
+    /// Task rows whose detail is expanded.
+    pub(crate) expanded: std::collections::BTreeSet<String>,
+    /// Whether the History section shows its rows.
+    pub(crate) history_open: bool,
 }
 
 /// One enrolled peer as the federation pane lists it.
@@ -1555,7 +1572,7 @@ impl Shell {
             .into_any_element()
     }
 
-    fn tasks_list(&self, _cx: &mut Context<Self>) -> AnyElement {
+    fn tasks_list(&self, cx: &mut Context<Self>) -> AnyElement {
         use crate::extension::tasks::{FileTasksStore, TasksStore as _};
         let lang = self.state.lang;
         let root = self.task_workspace_root();
@@ -1583,6 +1600,66 @@ impl Shell {
                 continue;
             }
             any = true;
+            if section.kind == crate::extension::tasks::BoardSectionKind::History {
+                let open = self.right.history_open;
+                let label = format!(
+                    "{} ({})",
+                    lang.tr(Self::task_section_key(section.kind)),
+                    section.rows.len()
+                );
+                let header = div()
+                    .id("tasks-history-header")
+                    .debug_selector(|| "tasks-history-header".to_string())
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .px(px(8.0))
+                    .pt(px(10.0))
+                    .pb(px(4.0))
+                    .cursor_pointer()
+                    .hover(|style| style.opacity(0.8))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.right.history_open = !this.right.history_open;
+                        cx.notify();
+                    }))
+                    .child(txt(label, 11.0, theme::faint()))
+                    .child(txt(
+                        if open { "\u{25BE}" } else { "\u{25B8}" },
+                        11.0,
+                        theme::faint(),
+                    ));
+                let clear = div()
+                    .id("tasks-clear-completed")
+                    .debug_selector(|| "tasks-clear-completed".to_string())
+                    .px(px(8.0))
+                    .pt(px(10.0))
+                    .pb(px(4.0))
+                    .cursor_pointer()
+                    .hover(|style| style.opacity(0.8))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.clear_completed_tasks();
+                        cx.notify();
+                    }))
+                    .child(txt(
+                        lang.tr("right.tasks.clearCompleted"),
+                        11.0,
+                        theme::faint(),
+                    ));
+                list = list.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(header)
+                        .child(clear),
+                );
+                if open {
+                    for row in &section.rows {
+                        list = list.child(self.task_row(row, lang, cx));
+                    }
+                }
+                continue;
+            }
             list = list.child(
                 txt(
                     lang.tr(Self::task_section_key(section.kind)),
@@ -1594,7 +1671,7 @@ impl Shell {
                 .pb(px(4.0)),
             );
             for row in &section.rows {
-                list = list.child(self.task_row(row, lang));
+                list = list.child(self.task_row(row, lang, cx));
             }
         }
         if !any {
@@ -1629,10 +1706,12 @@ impl Shell {
     /// One board row: a status dot, the title, and the tier and host it runs
     /// on. The row is the unit the pane exists for, so it carries its id for
     /// the click tests.
+    /// One board row: the summary, plus the detail and actions when expanded.
     fn task_row(
         &self,
         row: &crate::extension::tasks::BoardRow,
         lang: crate::i18n::Lang,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
         use crate::extension::tasks::{Host, Tier};
         let tier = match row.tier {
@@ -1646,9 +1725,12 @@ impl Shell {
             Host::Local => lang.tr("right.tasks.local").to_string(),
             Host::Peer { node } => format!("{}: {node}", lang.tr("right.tasks.peer")),
         };
-        let meta = format!("{} · {}", lang.tr(tier), host);
+        let meta = format!("{} \u{00B7} {}", lang.tr(tier), host);
         let id = format!("task-row-{}", row.id);
-        div()
+        let expanded = self.right.expanded.contains(&row.id);
+        let toggle = row.id.clone();
+        let summary = div()
+            .id(SharedString::from(id.clone()))
             .debug_selector(move || id.clone())
             .flex()
             .flex_row()
@@ -1657,6 +1739,14 @@ impl Shell {
             .min_h(px(40.0))
             .px(px(8.0))
             .rounded(px(8.0))
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(theme::hover())))
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                if !this.right.expanded.insert(toggle.clone()) {
+                    this.right.expanded.remove(&toggle);
+                }
+                cx.notify();
+            }))
             .child(
                 div()
                     .w(px(6.0))
@@ -1674,11 +1764,159 @@ impl Shell {
                     .gap(px(2.0))
                     .child(txt(row.title.clone(), 13.0, theme::text()).truncate())
                     .child(txt(meta, 11.0, theme::faint()).truncate()),
-            )
-            .into_any_element()
+            );
+        let mut column = div().flex().flex_col();
+        column = column.child(summary);
+        if expanded {
+            column = column.child(self.task_detail(row, lang, cx));
+        }
+        column.into_any_element()
     }
 
-    /// The section's label key.
+    /// The expanded detail: intent, trigger, budget, attempts and actions.
+    fn task_detail(
+        &self,
+        row: &crate::extension::tasks::BoardRow,
+        lang: crate::i18n::Lang,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use crate::extension::tasks::{FileTasksStore, Host, TaskStatus, TasksStore};
+        let root = self.task_workspace_root();
+        let record = FileTasksStore.load(&root, &row.id).ok().flatten();
+        let mut detail = div()
+            .debug_selector({
+                let id = format!("task-detail-{}", row.id);
+                move || id.clone()
+            })
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .px(px(14.0))
+            .pb(px(8.0));
+        if let Some(record) = &record {
+            detail = detail
+                .child(txt(lang.tr("right.tasks.intent"), 11.0, theme::faint()).pt(px(4.0)))
+                .child(txt(record.intent.clone(), 12.0, theme::muted()));
+            if let Some(next) = record.trigger.next_fire_ms() {
+                detail = detail.child(txt(
+                    format!("{}: {}", lang.tr("right.tasks.next"), next),
+                    11.0,
+                    theme::faint(),
+                ));
+            }
+            if !record.attempts.is_empty() {
+                detail = detail
+                    .child(txt(lang.tr("right.tasks.attempts"), 11.0, theme::faint()).pt(px(4.0)));
+                for attempt in &record.attempts {
+                    let result = attempt
+                        .result
+                        .as_deref()
+                        .map(|text| text.chars().take(160).collect::<String>())
+                        .unwrap_or_default();
+                    detail = detail.child(txt(
+                        format!(
+                            "{} \u{00B7} {} {}",
+                            attempt.id,
+                            format!("{:?}", attempt.status).to_lowercase(),
+                            result
+                        ),
+                        11.0,
+                        theme::muted(),
+                    ));
+                }
+            }
+        }
+        let id = row.id.clone();
+        let can_stop = matches!(row.status, TaskStatus::Running) && matches!(row.host, Host::Local);
+        let mut actions = div().flex().items_center().gap(px(6.0)).pt(px(4.0));
+        if can_stop {
+            let stop_id = format!("task-stop-{}", row.id);
+            actions = actions.child(
+                div()
+                    .id(SharedString::from(stop_id.clone()))
+                    .debug_selector(move || stop_id.clone())
+                    .px(px(8.0))
+                    .py(px(3.0))
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(rgb(theme::border_soft()))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(theme::hover())))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.stop_task_local(&id);
+                        cx.notify();
+                    }))
+                    .child(txt(lang.tr("right.tasks.stop"), 11.0, theme::text())),
+            );
+        }
+        detail.child(actions).into_any_element()
+    }
+
+    /// Delete the settled records of the active session's workspace.
+    pub(crate) fn clear_completed_tasks(&mut self) {
+        use crate::extension::tasks::{FileTasksStore, TaskStatus, TasksStore};
+        let root = self.task_workspace_root();
+        let Ok(tasks) = FileTasksStore.list(&root) else {
+            return;
+        };
+        for task in tasks {
+            let settled = matches!(
+                task.status,
+                TaskStatus::Succeeded
+                    | TaskStatus::Failed
+                    | TaskStatus::Cancelled
+                    | TaskStatus::Interrupted
+            );
+            if settled {
+                let _ = FileTasksStore.delete(&root, &task.id);
+            }
+        }
+        self.right.tasks.borrow_mut().take();
+        self.right.expanded.clear();
+    }
+
+    /// Stop a local task from the pane. Peer work is stopped from the tool,
+    /// whose async seam can reach the peer.
+    pub(crate) fn stop_task_local(&mut self, id: &str) {
+        use crate::extension::runs::RunsService as _;
+        use crate::extension::tasks::{
+            AttemptStatus, FileTasksStore, Host, TaskStatus, TasksStore, Tier,
+        };
+        let root = self.task_workspace_root();
+        let Ok(Some(mut task)) = FileTasksStore.load(&root, id) else {
+            return;
+        };
+        if !matches!(task.host, Host::Local) {
+            return;
+        }
+        let run = task.attempts.last().and_then(|attempt| attempt.run.clone());
+        if let Some(run) = &run {
+            match task.tier {
+                Tier::Turn => {
+                    if let Some(service) = &self.task_runs {
+                        let _ = service.cancel(run);
+                    }
+                }
+                Tier::Subagent => {
+                    let _ = self.state.subagents.interrupt(run);
+                }
+                Tier::Job => {
+                    self.state.jobs.kill(run);
+                }
+                Tier::Delegation | Tier::PeerTask => return,
+            }
+        }
+        let now = crate::settings::unix_now().saturating_mul(1_000);
+        task.status = TaskStatus::Cancelled;
+        task.updated_ms = now;
+        if let Some(attempt) = task.attempts.last_mut() {
+            attempt.status = AttemptStatus::Cancelled;
+            attempt.ended_ms = Some(now);
+        }
+        let _ = FileTasksStore.save(&root, &task);
+        self.right.tasks.borrow_mut().take();
+    }
+
     fn task_section_key(kind: crate::extension::tasks::BoardSectionKind) -> &'static str {
         use crate::extension::tasks::BoardSectionKind;
         match kind {
@@ -4249,7 +4487,8 @@ impl Shell {
         Some((parts.join(" \u{b7} "), true))
     }
 
-    /// The Start screen: the panel's headline over its three cards.
+    /// The Start screen: the panel's headline over the panes it offers as
+    /// cards.
     ///
     /// Measured from the reference's own guide: a centred column with a 14px
     /// gap and 24px side padding, and an invisible 10% spacer after the last
@@ -4275,7 +4514,10 @@ impl Shell {
             )
             .mb(px(16.0)),
         );
-        for tab in RightTab::ALL {
+        for tab in RightTab::ALL
+            .into_iter()
+            .filter(|tab| tab.on_start_screen())
+        {
             stack = stack.child(self.right_start_card(tab, cx));
         }
         // The reference's `::after { flex: 0 10% }`: a spacer that takes no

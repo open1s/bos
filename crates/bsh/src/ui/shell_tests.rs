@@ -4248,6 +4248,194 @@ fn the_shell_serves_host_runs(cx: &mut TestAppContext) {
     assert_eq!(snapshot.error.as_deref(), Some("the session is gone"));
 }
 
+/// The History section starts collapsed, opens on its header, and Clear
+/// removes the settled records.
+#[gpui::test]
+fn the_history_section_collapses_and_clears(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let dir = std::env::temp_dir().join(format!("bsh-task-history-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch workspace");
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("task-history", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let session = cx.update(|_, cx| shell.read(cx).state.active_id.clone().expect("session"));
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.state
+                .settings
+                .global
+                .workspaces
+                .push(crate::settings::global::WorkspaceRef {
+                    id: "ws-history".to_string(),
+                    name: "History".to_string(),
+                    root: dir.to_string_lossy().to_string(),
+                    created_at: 0,
+                    updated_at: 0,
+                });
+            this.state.settings.global.general.active_workspace = "ws-history".to_string();
+            if let Some(session) = this.state.store.session_mut(&session) {
+                session.workspace = "ws-history".to_string();
+            }
+        });
+    });
+    let mut done = crate::extension::tasks::Task::open(
+        "task-done",
+        "Done",
+        "intent",
+        crate::extension::tasks::Origin {
+            session: session.clone(),
+            turn: 0,
+        },
+        crate::extension::tasks::Trigger::Now,
+        crate::extension::tasks::Tier::Turn,
+        1,
+    )
+    .expect("task");
+    done.status = crate::extension::tasks::TaskStatus::Succeeded;
+    {
+        use crate::extension::tasks::TasksStore as _;
+        crate::extension::tasks::FileTasksStore
+            .save(&dir, &done)
+            .expect("save");
+    }
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(crate::ui::right_panel::RightTab::Tasks, window, cx);
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let mode = cx
+        .debug_bounds("task-graph-mode")
+        .expect("the Tree/List control");
+    cx.simulate_click(mode.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("task-row-task-done").is_none(),
+        "History starts collapsed"
+    );
+    let header = cx
+        .debug_bounds("tasks-history-header")
+        .expect("the History header");
+    cx.simulate_click(header.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("task-row-task-done").is_some(),
+        "the header opens the section"
+    );
+    let clear = cx
+        .debug_bounds("tasks-clear-completed")
+        .expect("the clear control");
+    cx.simulate_click(clear.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    use crate::extension::tasks::TasksStore as _;
+    assert!(
+        crate::extension::tasks::FileTasksStore
+            .load(&dir, "task-done")
+            .expect("load")
+            .is_none(),
+        "clear removes the settled record"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The board's Stop action marks a local running task cancelled.
+#[gpui::test]
+fn the_board_stop_marks_a_running_task(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let dir = std::env::temp_dir().join(format!("bsh-task-stop-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch workspace");
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("task-stop", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let session = cx.update(|_, cx| shell.read(cx).state.active_id.clone().expect("session"));
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.state
+                .settings
+                .global
+                .workspaces
+                .push(crate::settings::global::WorkspaceRef {
+                    id: "ws-stop".to_string(),
+                    name: "Stop".to_string(),
+                    root: dir.to_string_lossy().to_string(),
+                    created_at: 0,
+                    updated_at: 0,
+                });
+            this.state.settings.global.general.active_workspace = "ws-stop".to_string();
+            if let Some(session) = this.state.store.session_mut(&session) {
+                session.workspace = "ws-stop".to_string();
+            }
+        });
+    });
+    let mut task = crate::extension::tasks::Task::open(
+        "task-stop",
+        "Stop me",
+        "intent",
+        crate::extension::tasks::Origin {
+            session: session.clone(),
+            turn: 0,
+        },
+        crate::extension::tasks::Trigger::Now,
+        crate::extension::tasks::Tier::Turn,
+        1_000,
+    )
+    .expect("task");
+    task.status = crate::extension::tasks::TaskStatus::Running;
+    let mut attempt = crate::extension::tasks::Attempt::queued(
+        "task-stop-1",
+        crate::extension::tasks::Tier::Turn,
+    );
+    attempt.run = Some("run-x".to_string());
+    attempt.status = crate::extension::tasks::AttemptStatus::Running;
+    task.attempts.push(attempt);
+    {
+        use crate::extension::tasks::TasksStore as _;
+        crate::extension::tasks::FileTasksStore
+            .save(&dir, &task)
+            .expect("save");
+    }
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(crate::ui::right_panel::RightTab::Tasks, window, cx);
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let mode = cx
+        .debug_bounds("task-graph-mode")
+        .expect("the Tree/List control");
+    cx.simulate_click(mode.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let row = cx
+        .debug_bounds("task-row-task-stop")
+        .expect("the running task row");
+    cx.simulate_click(row.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let stop = cx
+        .debug_bounds("task-stop-task-stop")
+        .expect("the stop control");
+    cx.simulate_click(stop.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    use crate::extension::tasks::TasksStore as _;
+    let stored = crate::extension::tasks::FileTasksStore
+        .load(&dir, "task-stop")
+        .expect("load")
+        .expect("record");
+    assert_eq!(
+        stored.status,
+        crate::extension::tasks::TaskStatus::Cancelled,
+        "the stop control marks the record"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The Tasks tab opens on the run graph: the main-agent node over its
 /// subagent children, and the zoom control scales it.
 #[gpui::test]
@@ -4425,9 +4613,14 @@ fn the_tasks_tab_shows_the_workspace_board(cx: &mut TestAppContext) {
         })
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
+    let row = cx
+        .debug_bounds("task-row-task-1")
+        .expect("the saved task is a board row");
+    cx.simulate_click(row.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(
-        cx.debug_bounds("task-row-task-1").is_some(),
-        "the saved task is a board row"
+        cx.debug_bounds("task-detail-task-1").is_some(),
+        "clicking a row expands its detail"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -17915,9 +18108,10 @@ fn a_patch_file_opens_as_a_comparison(cx: &mut TestAppContext) {
 }
 
 /// The strip is a real tab list, not a badge for the pane already open: every
-/// pane the Start screen offers is one press away, Diff included. This is the
-/// entry point the pane never had - its body needs no file picker, so the only
-/// door was the Start screen.
+/// pane the panel can show is one press away, Diff included even though the
+/// Start screen no longer offers it as a card. A comparison needs a file, so a
+/// file row and a step's View diff remain its material doors; the strip opens
+/// the pane itself.
 #[gpui::test]
 fn the_right_strip_offers_the_diff_pane(cx: &mut TestAppContext) {
     init_test_app(cx);
@@ -20602,7 +20796,7 @@ fn notes_follow_a_rename_and_go_with_a_delete() {
 }
 
 /// The header's right control opens the panel, and the panel starts on the
-/// reference's own three Start cards.
+/// reference's own Start cards.
 #[gpui::test]
 fn the_header_opens_the_right_panel_on_its_start_screen(cx: &mut TestAppContext) {
     init_test_app(cx);
@@ -20643,6 +20837,11 @@ fn the_header_opens_the_right_panel_on_its_start_screen(cx: &mut TestAppContext)
             "the Start screen carries the {card} card"
         );
     }
+    assert!(
+        cx.debug_bounds("right-card-right.tab.diff").is_none(),
+        "Diff is not a Start card: a comparison needs a file, so the pane \
+         opens from a file row or a step, not from here"
+    );
 }
 
 #[gpui::test]

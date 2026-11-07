@@ -42,7 +42,8 @@ pub(crate) fn attach(agent: &mut Agent, context: TaskToolsContext) {
     attach_join(agent, context.clone());
     attach_cancel(agent, context.clone());
     attach_status(agent, context.clone());
-    attach_list(agent, context);
+    attach_list(agent, context.clone());
+    attach_retry(agent, context);
 }
 
 /// The create tool.
@@ -236,6 +237,38 @@ pub(crate) async fn cancel_with(
     Ok(json!({ "task": id, "state": "cancelled" }))
 }
 
+/// The retry tool.
+fn attach_retry(agent: &mut Agent, context: TaskToolsContext) {
+    let tool = AsyncFunctionTool::from_fn(
+        "task_retry",
+        "Run a task again as a new attempt, reusing its intent and tier. Refused while an attempt is live, once the task has used all its attempts, and for delegations (their input is not stored; create a new task instead).",
+        json!({
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "The task id returned by task_create."
+                }
+            },
+            "required": ["task"]
+        }),
+        move |args| {
+            let context = context.clone();
+            async move {
+                let runs = crate::extension::runs::runs();
+                retry_with(&runs, &context, &args).await
+            }
+        },
+    );
+    let metadata = crate::tool_metadata::builtin_metadata("task_retry")
+        .expect("task_retry metadata is declared");
+    if let Err(error) =
+        agent.try_add_async_tool(Arc::new(DeclaredAsyncTool::new(Arc::new(tool), metadata)))
+    {
+        log::warn!("task_retry tool was not registered: {error}");
+    }
+}
+
 /// The status tool.
 fn attach_status(agent: &mut Agent, context: TaskToolsContext) {
     let tool = AsyncFunctionTool::from_fn(
@@ -368,6 +401,123 @@ pub(crate) fn reconcile(
     changed
 }
 
+/// Start a new attempt for a settled task.
+pub(crate) async fn retry_with(
+    runs: &Runs,
+    context: &TaskToolsContext,
+    args: &Value,
+) -> Result<Value, ToolError> {
+    let id = args
+        .get("task")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| ToolError::InvalidInput("task is required".to_string()))?;
+    let Some(mut record) = FileTasksStore
+        .load(&context.workspace, id)
+        .map_err(|error| ToolError::Failed(format!("the task could not be read: {error}")))?
+    else {
+        return Err(ToolError::Failed(format!("unknown task {id}")));
+    };
+    if record.active_attempt().is_some() {
+        return Err(ToolError::Failed(
+            "the task still has a live attempt; stop it before retrying".to_string(),
+        ));
+    }
+    if !record.may_retry() {
+        return Err(ToolError::Failed(
+            "the task has used all of its attempts".to_string(),
+        ));
+    }
+    let now = crate::settings::unix_now().saturating_mul(1_000);
+    let run = match record.tier {
+        Tier::Turn => {
+            let spec = RunSpec {
+                session: record.origin.session.clone(),
+                objective: record.intent.clone(),
+                tier: RunTier::Turn,
+                limits: Limits {
+                    steps: record.budget.max_steps,
+                    tokens: record.budget.max_tokens,
+                    deadline_ms: record.budget.deadline_ms,
+                },
+                target: None,
+                capability: None,
+                trace: record.id.clone(),
+            };
+            runs.start(spec).map_err(ToolError::Failed)?.id
+        }
+        Tier::Subagent => {
+            let Some(subagents) = context.subagents.as_ref() else {
+                return Err(ToolError::Failed(
+                    "subagents are not available in this turn".to_string(),
+                ));
+            };
+            let (run, _) = subagents.spawn_child(&record.title, &record.intent)?;
+            run
+        }
+        Tier::Job => {
+            let Some(command) = record.command.clone() else {
+                return Err(ToolError::Failed(
+                    "the task has no command to run".to_string(),
+                ));
+            };
+            let Some(bash) = context.bash.clone() else {
+                return Err(ToolError::Failed(
+                    "the shell tool is not available in this turn".to_string(),
+                ));
+            };
+            let response = bash
+                .run(&json!({ "command": command, "run_in_background": true }))
+                .map_err(|error| {
+                    ToolError::Failed(format!("the command could not start: {error:?}"))
+                })?;
+            response
+                .get("job_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ToolError::Failed("the shell did not report a job id".to_string()))?
+                .to_string()
+        }
+        Tier::Delegation => {
+            let Some(target) = record.target.clone() else {
+                return Err(ToolError::Failed(
+                    "the task names no peer to retry on".to_string(),
+                ));
+            };
+            let Some(input) = record.input.clone() else {
+                return Err(ToolError::Failed(
+                    "the delegation input was not stored".to_string(),
+                ));
+            };
+            let remote = crate::federation_tools::delegate_record(
+                &target,
+                &record.intent,
+                record.capability.as_deref(),
+                input,
+            )
+            .await?;
+            remote.request.id.to_string()
+        }
+        Tier::PeerTask => {
+            return Err(ToolError::Failed(
+                "a peer task retry needs a new id on the peer; create a new task".to_string(),
+            ));
+        }
+    };
+    let attempt_id = format!("{}-{}", record.id, record.attempts.len() + 1);
+    let mut attempt = Attempt::queued(attempt_id, record.tier);
+    attempt.run = Some(run.clone());
+    attempt.status = AttemptStatus::Running;
+    attempt.started_ms = Some(now);
+    record.attempts.push(attempt);
+    record.status = TaskStatus::Running;
+    record.updated_ms = now;
+    FileTasksStore
+        .save(&context.workspace, &record)
+        .map_err(|error| ToolError::Failed(format!("the task could not be saved: {error}")))?;
+    Ok(json!({ "task": id, "run": run, "state": "running" }))
+}
+
 /// One task as the tools report it, with long results clipped.
 fn task_json(task: &Task) -> Value {
     json!({
@@ -380,6 +530,7 @@ fn task_json(task: &Task) -> Value {
         "trigger": task.trigger,
         "target": task.target,
         "command": task.command,
+        "input": task.input,
         "budget": task.budget,
         "retry": task.retry,
         "next_fire_ms": task.trigger.next_fire_ms(),
@@ -754,6 +905,7 @@ pub(crate) async fn create_with(
             .map(str::trim)
             .filter(|capability| !capability.is_empty());
         let payload = args.get("input").cloned().unwrap_or(Value::Null);
+        task.input = Some(payload.clone());
         let record =
             crate::federation_tools::delegate_record(target, intent, capability, payload).await?;
         let run = record.request.id.to_string();
@@ -1810,6 +1962,123 @@ mod tests {
             .await
             .is_err(),
             "a now task cannot wait on another"
+        );
+        let _ = std::fs::remove_dir_all(&context.workspace);
+    }
+
+    /// Retry starts a fresh attempt on a settled task.
+    #[tokio::test]
+    async fn retry_starts_a_new_attempt() {
+        let context = context("retry");
+        let fake = Fake::new();
+        let runs = Runs::with(fake);
+        let value = create_with(&runs, &context, &json!({"intent": "Review"}))
+            .await
+            .expect("created");
+        let id = value["task"].as_str().expect("id").to_string();
+        let mut record = FileTasksStore
+            .load(&context.workspace, &id)
+            .expect("load")
+            .expect("record");
+        record.status = TaskStatus::Failed;
+        record.attempts.last_mut().expect("attempt").status = AttemptStatus::Failed;
+        FileTasksStore
+            .save(&context.workspace, &record)
+            .expect("save");
+
+        let report = retry_with(&runs, &context, &json!({"task": id.clone()}))
+            .await
+            .expect("retry");
+        assert_eq!(report["state"], "running");
+        let stored = FileTasksStore
+            .load(&context.workspace, &id)
+            .expect("load")
+            .expect("record");
+        assert_eq!(stored.status, TaskStatus::Running);
+        assert_eq!(stored.attempts.len(), 2);
+        assert_eq!(
+            stored.attempts.last().expect("attempt").run.as_deref(),
+            Some("run-2")
+        );
+        let _ = std::fs::remove_dir_all(&context.workspace);
+    }
+
+    /// A live attempt and an exhausted retry budget both refuse.
+    #[tokio::test]
+    async fn retry_refuses_while_live_or_exhausted() {
+        let context = context("retry-refused");
+        let runs = Runs::with(Fake::new());
+        let value = create_with(&runs, &context, &json!({"intent": "Review"}))
+            .await
+            .expect("created");
+        let id = value["task"].as_str().expect("id").to_string();
+        assert!(
+            retry_with(&runs, &context, &json!({"task": id.clone()}))
+                .await
+                .is_err(),
+            "a live attempt cannot be retried"
+        );
+
+        let mut record = FileTasksStore
+            .load(&context.workspace, &id)
+            .expect("load")
+            .expect("record");
+        record.attempts.iter_mut().for_each(|attempt| {
+            attempt.status = AttemptStatus::Failed;
+        });
+        record.attempts.push(Attempt::queued("a2", Tier::Turn));
+        record.attempts.push(Attempt::queued("a3", Tier::Turn));
+        record.attempts.iter_mut().for_each(|attempt| {
+            attempt.status = AttemptStatus::Failed;
+        });
+        record.status = TaskStatus::Failed;
+        FileTasksStore
+            .save(&context.workspace, &record)
+            .expect("save");
+        let error = retry_with(&runs, &context, &json!({"task": id.clone()}))
+            .await
+            .expect_err("exhausted");
+        assert!(format!("{error:?}").contains("all of its attempts"));
+        let _ = std::fs::remove_dir_all(&context.workspace);
+    }
+
+    /// A delegation records its input, and a retry re-delegates with it rather
+    /// than refusing for want of the input.
+    #[tokio::test]
+    async fn delegation_input_is_recorded_and_retried() {
+        let context = context("delegation-input");
+        let mut task = Task::open(
+            "task-d",
+            "t",
+            "i",
+            Origin {
+                session: "ses-1".to_string(),
+                turn: 0,
+            },
+            Trigger::Now,
+            Tier::Delegation,
+            1,
+        )
+        .expect("task");
+        task.target = Some("node-b".to_string());
+        task.capability = Some("review".to_string());
+        task.input = Some(json!({"path": "src"}));
+        task.status = TaskStatus::Failed;
+        let mut attempt = Attempt::queued("a1", Tier::Delegation);
+        attempt.status = AttemptStatus::Failed;
+        task.attempts.push(attempt);
+        FileTasksStore
+            .save(&context.workspace, &task)
+            .expect("save");
+
+        let status = status_with(&context, &json!({"task": "task-d"})).expect("status");
+        assert_eq!(status["input"]["path"], "src");
+        let error = retry_with(&Runs::empty(), &context, &json!({"task": "task-d"}))
+            .await
+            .expect_err("no node");
+        assert!(
+            format!("{error:?}").to_lowercase().contains("federation"),
+            "the retry reaches the delegation instead of refusing for want of the input"
         );
         let _ = std::fs::remove_dir_all(&context.workspace);
     }
