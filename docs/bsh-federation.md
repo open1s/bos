@@ -476,7 +476,9 @@ restart as Failed with an indeterminate reason, then cancels its pending
 dependents. Tasks carry an attempt ceiling, an acceptance criterion, and artifact
 references; a retryable failure returns the task to Pending until the ceiling,
 a successful outcome records its artifacts, and a final failure calls the
-executor's compensation hook (recorded on the task). The graph is a library API: the
+executor's compensation hook (recorded on the task). A failed remote
+compensation is queued durably so `DelegationExecutor::reconcile_compensations`
+can retry it; a receipt is stored on the task after success. The graph is a library API: the
 right panel lists delegations but does not draw the graph, and a host supplies
 the `TaskExecutor`; `DelegationExecutor` is the delegation-backed one.
 
@@ -521,17 +523,25 @@ let progress = runner.run(executor, 4).await?;
   never revived. A lease whose stream ended still requires the peer to re-open.
 - The Federation pane lists the newest delegations (with Cancel), the granted
   resource leases, and knowledge query/publication forms for the selected peer.
-  A lease can be opened by id + URI and its first chunks are shown read-only;
-  richer artifact inspection remains a library surface.
+  A lease can be opened by id + URI and its first chunks are shown read-only.
+  The local artifact store is listed with size and a Remove action; an executor
+  that supports cleanup deletes expired bytes at the end of a task run.
 - TLS deployments disable Zenoh scouting so a scouted plaintext link cannot
-  bypass the configured TLS endpoints.
+  bypass the configured TLS endpoints. Certificate files are read when the
+  listener starts, so the Federation pane's Reload TLS action stops the node and
+  starts it again from the current settings; established sessions reconnect.
 - Knowledge federation is opt-in: a host must install a `KnowledgeService` and a
-  `KnowledgeAuthorizer`. The default is deny, and a node without both refuses
-  explicitly.
+  `KnowledgeAuthorizer`. BSH installs both when
+  `[federation] knowledge_enabled = true`; a peer still needs a
+  `builtin/knowledge_query` or `builtin/knowledge_publish` grant. The default is
+  deny, and a node without both refuses explicitly. BSH persists the store to
+  `knowledge.json` after a publication or revocation, and the pane lists local
+  items with a Revoke action.
 - Federation membership is advertised (signed `federation` and `policy_revision`
   on discovery records) and recorded on a peer at enrollment, but it grants
   nothing by itself: trust and grants stay per peer. There is no shared membership
-  authority, and key rotation still requires re-enrollment.
+  authority; a signed rotation record moves grants from the old key to its
+  successor and revokes the old identity.
 
 ## Acceptance scenario
 

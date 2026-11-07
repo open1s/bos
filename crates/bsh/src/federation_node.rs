@@ -30,6 +30,47 @@ use semver::{Version, VersionReq};
 /// How often a node re-announces presence and public descriptors.
 const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(10);
 
+/// The TLS endpoint peers connect to while Zenoh listens on loopback.
+static TLS_TERMINATOR: OnceLock<std::sync::Mutex<Option<bus::tls_terminator::TlsTerminator>>> =
+    OnceLock::new();
+
+fn terminator_slot() -> &'static std::sync::Mutex<Option<bus::tls_terminator::TlsTerminator>> {
+    TLS_TERMINATOR.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Start the public TLS terminator and move Zenoh's listener to loopback.
+async fn start_tls_terminator(
+    config: &mut BusConfig,
+    settings: &crate::settings::Settings,
+) -> Option<bus::tls_terminator::TlsTerminator> {
+    let tls = config.tls.as_ref()?;
+    let listen = config.listen.as_ref()?.first()?.strip_prefix("tls/")?;
+    let public = listen.parse::<std::net::SocketAddr>().ok()?;
+    let certificate = tls.certificate.as_ref().map(PathBuf::from)?;
+    let private_key = tls.private_key.as_ref().map(PathBuf::from)?;
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+    let backend_port = probe.local_addr().ok()?.port();
+    drop(probe);
+    let backend = format!("127.0.0.1:{backend_port}")
+        .parse()
+        .expect("a loopback address");
+    let terminator =
+        bus::tls_terminator::TlsTerminator::start(bus::tls_terminator::TerminatorConfig {
+            listen: public,
+            backend,
+            certificate,
+            private_key,
+            client_ca: tls.root_ca_certificate.as_ref().map(PathBuf::from),
+            require_client_certificate: tls.enable_mtls.unwrap_or(false),
+        })
+        .await
+        .map_err(|error| log::warn!("federation: TLS terminator did not start: {error}"))
+        .ok()?;
+    config.listen = Some(vec![format!("tcp/127.0.0.1:{backend_port}")]);
+    let _ = settings;
+    Some(terminator)
+}
+
 /// How long a discovered record stays listed without a fresh announcement.
 const DISCOVERY_STALE_MS: u64 = 30_000;
 
@@ -51,6 +92,9 @@ pub(crate) struct FederationRuntime {
     /// The announcement task: presence plus public descriptors, every interval.
     #[allow(dead_code)]
     announce_task: tokio::task::JoinHandle<()>,
+    /// Retries failed remote compensations from compensation.json.
+    #[allow(dead_code)]
+    reconciler: Option<tokio::task::JoinHandle<()>>,
     /// Nodes seen on the announce key, excluding this one.
     discovered: Arc<RwLock<BTreeMap<NodeId, DiscoveryRecord>>>,
     /// This node's signing identity, kept for an on-demand announcement.
@@ -308,6 +352,37 @@ pub(crate) fn running() -> Option<Arc<FederationRuntime>> {
         .and_then(|slot| slot.as_ref().map(Arc::clone))
 }
 
+/// Replace the running listener so it rereads the configured TLS material.
+///
+/// Zenoh builds its TLS `ServerConfig` when a listener starts, so replacing
+/// certificate files cannot affect a live listener. This stops the node and
+/// starts it again from the current settings; established sessions reconnect,
+/// which is a supervised restart rather than a zero-interruption handoff.
+/// Returns whether a node is running afterwards.
+pub(crate) fn reload_tls(settings: &crate::settings::Settings) -> bool {
+    if let Ok(slot) = terminator_slot().lock() {
+        if let Some(terminator) = slot.as_ref() {
+            match terminator.reload() {
+                Ok(()) => {
+                    log::info!("federation: TLS certificate reloaded without dropping sessions");
+                    return running().is_some();
+                }
+                Err(error) => {
+                    log::warn!("federation: TLS reload failed, restarting listener: {error}");
+                }
+            }
+        }
+    }
+    let was_running = running().is_some();
+    if was_running {
+        stop();
+    }
+    if !settings.global.federation.enabled {
+        return false;
+    }
+    start_from_settings(settings)
+}
+
 /// Stop the node and release its data directory lock.
 ///
 /// The peer store is on disk, so a stop loses no state; the next start (or the
@@ -319,6 +394,14 @@ pub(crate) fn stop() -> bool {
             runtime.task.abort();
             runtime.refresher.abort();
             runtime.announce_task.abort();
+            if let Some(reconciler) = runtime.reconciler.as_ref() {
+                reconciler.abort();
+            }
+            if let Ok(mut slot) = terminator_slot().lock() {
+                if let Some(terminator) = slot.take() {
+                    terminator.abort();
+                }
+            }
             log::info!("federation node stopped");
             true
         }
@@ -654,6 +737,15 @@ async fn build(
     let identity =
         NodeIdentity::load_or_create(&identity_path).map_err(|error| error.to_string())?;
     let peers = PeerStore::load(&peers_path).map_err(|error| error.to_string())?;
+    let mut config = config;
+    if let Some(terminator) = start_tls_terminator(&mut config, &settings).await {
+        if let Ok(mut slot) = terminator_slot().lock() {
+            if let Some(old) = slot.take() {
+                old.abort();
+            }
+            *slot = Some(terminator);
+        }
+    }
     let bus = Bus::try_from(config)
         .await
         .map_err(|error| format!("the federation transport did not open: {error}"))?;
@@ -695,6 +787,7 @@ async fn build(
             settings.global.federation.node_name.as_deref(),
         )),
         settings.global.federation.federation_id.clone(),
+        settings.global.federation.knowledge_enabled,
     ))
 }
 
@@ -726,6 +819,7 @@ pub(crate) fn assemble(
         advertise,
         node_name,
         None,
+        false,
     )
 }
 
@@ -743,6 +837,7 @@ pub(crate) fn assemble_with_federation(
     advertise: Vec<agent::capability::CapabilityDescriptor>,
     node_name: Option<String>,
     federation_id: Option<String>,
+    knowledge_enabled: bool,
 ) -> FederationRuntime {
     let announce_transport = Arc::clone(&transport);
     let peer_file = delegations
@@ -751,6 +846,43 @@ pub(crate) fn assemble_with_federation(
         .map(|directory| directory.join("peers.json"));
     let mut node = FederationNode::new(identity.clone(), transport)
         .with_peer_store(Arc::new(RwLock::new(peers)));
+    if let Some(peer_file) = &peer_file {
+        let root = peer_file
+            .parent()
+            .map(|directory| directory.join("artifacts"));
+        if let Some(root) = root {
+            let _ = std::fs::create_dir_all(&root);
+            node = node.with_artifact_store(Arc::new(federation::FileArtifactStore::new(root)));
+        }
+    }
+    if knowledge_enabled {
+        let knowledge_peers = node.peers();
+        let knowledge_path = peer_file
+            .as_ref()
+            .map(|path| path.with_file_name("knowledge.json"));
+        let service = knowledge_path
+            .as_ref()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(
+                |text| match federation::KnowledgeService::from_json(&text) {
+                    Ok(service) => Some(service),
+                    Err(error) => {
+                        log::warn!("federation: knowledge store was not loaded: {error}");
+                        None
+                    }
+                },
+            )
+            .unwrap_or_default();
+        node = node.with_knowledge(
+            Arc::new(RwLock::new(service)),
+            Arc::new(crate::federation_knowledge::GrantKnowledgeAuthorizer::new(
+                knowledge_peers,
+            )),
+        );
+        if let Some(path) = knowledge_path {
+            node = node.with_knowledge_persistence(path);
+        }
+    }
     let federation = federation_id
         .as_deref()
         .map(str::trim)
@@ -773,6 +905,43 @@ pub(crate) fn assemble_with_federation(
     let node = Arc::new(node);
     let node_id = node.node();
     let task = node.start(inbox);
+    let reconciler = peer_file.as_ref().map(|peers_path| {
+        let node = Arc::clone(&node);
+        let queue_path = peers_path.with_file_name("compensation.json");
+        tokio::spawn(async move {
+            loop {
+                let mut queue = federation::CompensationQueue::load(&queue_path);
+                let now = unix_ms();
+                for entry in queue.due_entries(now) {
+                    let Ok(target) = NodeId::new(entry.target.clone()) else {
+                        queue.remove(&entry.delegation_id);
+                        continue;
+                    };
+                    let id = federation::DelegationId::new(entry.delegation_id.clone());
+                    let context = agent::capability::InvocationContext::local(
+                        agent::capability::InvocationId::new(format!("comp-{}", entry.task_id)),
+                        agent::capability::Principal::Local {
+                            session: "federation-reconciler".to_string(),
+                            preset: String::new(),
+                        },
+                        WorkspaceId::new("ws:federation").expect("a workspace"),
+                    );
+                    match node.cancel_delegation(&target, &id, &context).await {
+                        Ok(_) => {
+                            queue.remove(&entry.delegation_id);
+                        }
+                        Err(error) => {
+                            queue.record_failure(&entry.delegation_id, error.to_string(), unix_ms())
+                        }
+                    }
+                }
+                if let Err(error) = queue.save() {
+                    log::debug!("federation: compensation queue was not saved: {error}");
+                }
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        })
+    });
     if let Some(peer_file) = peer_file {
         notify_rotation(&node, &peer_file);
     }
@@ -850,6 +1019,7 @@ pub(crate) fn assemble_with_federation(
         task,
         refresher,
         announce_task,
+        reconciler,
         discovered,
         identity,
         announce_transport,

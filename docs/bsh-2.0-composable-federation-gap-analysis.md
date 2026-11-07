@@ -40,7 +40,7 @@ The most important distinction is between *resolving a list of capabilities* and
 | Durable task federation | Implemented for records | Delegations and leases persist, recover explicitly, and have restart tests; task-graph orchestration remains GAP-FED-005 |
 | Agent/task collaboration | Partial | Bounded delegation primitive exists; durable orchestration, scheduling and collaboration graphs are not evidenced |
 | Resource federation | Implemented foundation | Lease and chunk-stream primitives exist; production recovery/retention semantics remain incomplete |
-| Knowledge federation | Implemented (opt-in) | Signed query/publication kinds, provenance, minimization, revocation, and wire tests; BSH UI remains owed |
+| Knowledge federation | Implemented (opt-in) | Signed query/publication kinds, provenance, minimization, revocation, wire tests, BSH query/publish/revoke forms, and an opt-in grant-backed service/authorizer persisted to `knowledge.json` |
 
 ---
 
@@ -361,7 +361,11 @@ proves the listener accepts no frame from it. A fourth drops the TLS listener,
 reopens it on the same port, and proves the existing connector reconnects and
 delivers another frame. TLS deployments disable Zenoh scouting, because scouting
 otherwise opens a parallel plaintext link that bypasses the configured TLS
-endpoints. Still owed: replacing a certificate without dropping the session.
+endpoints. Certificate files are read when the Zenoh listener constructs its
+ServerConfig; replacing them does not affect a live listener. BSH exposes a
+supervised Reload TLS action that stops and restarts the node from the current
+settings; the reconnect test covers the session transition. A zero-interruption
+handoff is still not possible with this Zenoh listener.
 
 **Acceptance**
 - Production profile refuses insecure configuration unless explicitly enabled for development.
@@ -420,8 +424,15 @@ references, and a compensation instruction. A retryable failure returns the task
 to Pending until the ceiling; a final failure runs the executor's compensation
 hook and records whether it succeeded. The delegation-backed DelegationExecutor maps a task to a Federation delegation,
 polls its authoritative status, and composes with the retry/compensation hooks.
-Still owed: richer artifact retention policy and automatic distribution of
-rotation records.
+Artifact references carry a retention window. An executor that reports
+`supports_cleanup` gets the expired batch at the end of a run, sends
+`artifact_cleanup`, and only then drops the references; BSH installs a confined
+`FileArtifactStore` rooted at `artifacts/` and the Federation pane lists those
+files with Remove. Compensation can return a receipt (`compensation_receipt`) so
+a remote cancellation is recorded with the task, and a failed remote
+compensation is put in a durable `CompensationQueue` for an explicit
+`reconcile_compensations` retry. Still owed: a background scheduler and a
+cross-Node receipt comparison service.
 
 **Required change**
 - Keep delegation as the primitive.
@@ -466,7 +477,7 @@ Keep changes reviewable and independently testable. Target no more than three en
 | P1 | Production transport profile | Security configuration, compatibility and rotation | Secure multi-process integration tests pass |
 | P1 | AI Assembly orchestration | Task analysis, discovery, proposal and approval APIs | AI proposal remains non-authoritative |
 | P2 | Knowledge Federation | Typed query/provenance/data-minimization contract | Source-side authorization and provenance tests pass |
-| P2 | Collaboration orchestration | Task graph, scheduling, artifact refs, acceptance | Multi-node fault/recovery suite passes |
+| P2 | Collaboration orchestration | Task graph, scheduling, artifact refs, acceptance, retention cleanup | Multi-node fault/recovery suite passes; artifact_cleanup has a wire test and a confined host store |
 
 ### Suggested first user stories
 

@@ -1468,11 +1468,15 @@ version = "4.0.2"
 dependencies = [
  "anyhow",
  "log",
+ "rcgen 0.13.2",
  "rkyv",
+ "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-rustls",
  "zenoh",
 ]
 

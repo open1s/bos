@@ -26,6 +26,9 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
+use crate::artifacts::{
+    ArtifactCleanupRequest, ArtifactCleanupResponse, ArtifactFailure, ArtifactStore,
+};
 use crate::audit::{Direction, FederationAudit, FederationEvent};
 use crate::delegation::{
     DelegationId, DelegationRecord, DelegationRequest, DelegationState, DelegationStore,
@@ -34,7 +37,8 @@ use crate::discovery::DiscoveryRecord;
 use crate::envelope::Envelope;
 use crate::identity::NodeIdentity;
 use crate::knowledge::{
-    KnowledgeAuthorizer, KnowledgePublication, KnowledgeQuery, KnowledgeResponse, KnowledgeService,
+    KnowledgeAuthorizer, KnowledgeItem, KnowledgePublication, KnowledgeQuery, KnowledgeResponse,
+    KnowledgeService,
 };
 use crate::membership::FederationId;
 use crate::peers::PeerStore;
@@ -437,6 +441,10 @@ pub struct FederationNode {
     federation: Option<FederationId>,
     /// Where peer state is written after a rotation, when configured.
     peer_path: Option<PathBuf>,
+    /// Where the local knowledge store is written after a mutation.
+    knowledge_path: Option<PathBuf>,
+    /// The host store that makes artifact deletion real.
+    artifact_store: Option<Arc<dyn ArtifactStore>>,
     /// The policy revision attached to discovery publications.
     policy_revision: u64,
     /// Independent admission budgets for handler classes and streams.
@@ -489,6 +497,8 @@ impl FederationNode {
             audit: None,
             federation: None,
             peer_path: None,
+            knowledge_path: None,
+            artifact_store: None,
             policy_revision: 0,
             admission_limits: AdmissionLimits::default(),
             next_correlation: AtomicU64::new(0),
@@ -640,6 +650,18 @@ impl FederationNode {
         self
     }
 
+    /// Install the host store used by artifact_cleanup.
+    pub fn with_artifact_store(mut self, store: Arc<dyn ArtifactStore>) -> Self {
+        self.artifact_store = Some(store);
+        self
+    }
+
+    /// Persist the local knowledge store after each publication or revocation.
+    pub fn with_knowledge_persistence(mut self, path: impl Into<PathBuf>) -> Self {
+        self.knowledge_path = Some(path.into());
+        self
+    }
+
     /// Enable the knowledge protocol with a host-governed store and policy.
     pub fn with_knowledge(
         mut self,
@@ -704,6 +726,8 @@ impl FederationNode {
         let leases = Arc::clone(&self.leases);
         let knowledge = self.knowledge.clone();
         let knowledge_authorizer = self.knowledge_authorizer.clone();
+        let knowledge_path = self.knowledge_path.clone();
+        let artifact_store = self.artifact_store.clone();
         let streams = Arc::clone(&self.streams);
         let sessions = Arc::clone(&self.sessions);
         let source = self.source.clone();
@@ -822,6 +846,7 @@ impl FederationNode {
                         | "discover"
                         | "knowledge_query"
                         | "knowledge_publication"
+                        | "artifact_cleanup"
                         | "rotation"
                 );
                 let permit = if handled {
@@ -969,6 +994,21 @@ impl FederationNode {
                             let _ = transport.send(&envelope.sender, reply).await;
                         });
                     }
+                    "artifact_cleanup" => {
+                        let identity = identity.clone();
+                        let transport = Arc::clone(&transport);
+                        let peers = Arc::clone(&peers);
+                        let store = artifact_store.clone();
+                        let audit = audit.clone();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            let reply = serve_artifact_cleanup(
+                                &identity, &peers, &store, &audit, &envelope,
+                            )
+                            .await;
+                            let _ = transport.send(&envelope.sender, reply).await;
+                        });
+                    }
                     "rotation" => {
                         let identity = identity.clone();
                         let transport = Arc::clone(&transport);
@@ -1010,6 +1050,7 @@ impl FederationNode {
                         let peers = Arc::clone(&peers);
                         let knowledge = knowledge.clone();
                         let authorizer = knowledge_authorizer.clone();
+                        let knowledge_path = knowledge_path.clone();
                         let audit = audit.clone();
                         tokio::spawn(async move {
                             let _permit = permit;
@@ -1018,6 +1059,7 @@ impl FederationNode {
                                 &peers,
                                 &knowledge,
                                 &authorizer,
+                                &knowledge_path,
                                 &audit,
                                 &envelope,
                             )
@@ -1202,6 +1244,34 @@ impl FederationNode {
         decode_knowledge_accepted(&reply)
     }
 
+    /// Ask a peer to remove the bytes behind artifact references.
+    pub async fn cleanup_artifacts(
+        &self,
+        peer: &NodeId,
+        request: &ArtifactCleanupRequest,
+        context: &InvocationContext,
+    ) -> Result<ArtifactCleanupResponse, CapabilityError> {
+        request.validate()?;
+        let payload = serde_json::to_value(request).map_err(|error| CapabilityError::Invalid {
+            message: error.to_string(),
+        })?;
+        let reply = self
+            .round_trip(peer, "artifact_cleanup", payload, context.deadline)
+            .await?;
+        if reply.get("ok").and_then(Value::as_bool) != Some(true) {
+            return Err(wire_error(&reply, None));
+        }
+        let response = reply
+            .get("response")
+            .cloned()
+            .ok_or_else(|| CapabilityError::Invalid {
+                message: "artifact cleanup reply carries no response".to_string(),
+            })?;
+        serde_json::from_value(response).map_err(|error| CapabilityError::Invalid {
+            message: error.to_string(),
+        })
+    }
+
     /// Send a signed key-rotation record to a peer.
     ///
     /// The envelope is signed by the successor key; the record itself is signed
@@ -1223,6 +1293,36 @@ impl FederationNode {
         } else {
             Err(wire_error(&reply, None))
         }
+    }
+
+    /// The live knowledge items this Node serves, for a local management view.
+    pub fn knowledge_items(&self) -> Vec<KnowledgeItem> {
+        let Some(service) = &self.knowledge else {
+            return Vec::new();
+        };
+        service
+            .read()
+            .map(|service| service.items().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Revoke one item this Node published, and persist the result.
+    pub fn revoke_knowledge(&self, id: &str) -> Result<bool, CapabilityError> {
+        let Some(service) = &self.knowledge else {
+            return Err(CapabilityError::Unavailable {
+                reason: "this Node serves no knowledge".to_string(),
+            });
+        };
+        let mut guard = service
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let revoked = guard.revoke(&self.node(), id)?;
+        if revoked {
+            if let Some(path) = &self.knowledge_path {
+                persist_knowledge(&guard, path);
+            }
+        }
+        Ok(revoked)
     }
 
     /// Submit a delegation to a peer and return the record it created.
@@ -1860,6 +1960,31 @@ fn error_reason(error: &CapabilityError) -> Option<String> {
     }
 }
 
+fn persist_knowledge(service: &KnowledgeService, path: &std::path::Path) {
+    let Ok(text) = service.to_json() else {
+        tracing::warn!("federation: knowledge store did not serialize");
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let temporary = path.with_extension("json.tmp");
+    let written = std::fs::write(&temporary, text).and_then(|()| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600));
+        }
+        std::fs::rename(&temporary, path)
+    });
+    if let Err(error) = written {
+        tracing::warn!(
+            "federation: knowledge store {} was not written: {error}",
+            path.display()
+        );
+    }
+}
+
 fn record(audit: &Option<Arc<dyn FederationAudit>>, event: FederationEvent) {
     if let Some(audit) = audit {
         audit.record(event);
@@ -2207,11 +2332,95 @@ async fn serve_knowledge_query(
     }
 }
 
+async fn serve_artifact_cleanup(
+    identity: &NodeIdentity,
+    peers: &Arc<RwLock<PeerStore>>,
+    store: &Option<Arc<dyn ArtifactStore>>,
+    audit: &Option<Arc<dyn FederationAudit>>,
+    envelope: &Envelope,
+) -> Vec<u8> {
+    let started = Instant::now();
+    if let Err(error) = authorize_sender(peers, &envelope.sender, &[]) {
+        record(
+            audit,
+            FederationEvent::new(
+                Direction::Inbound,
+                envelope.sender.as_str(),
+                "artifact_cleanup",
+                None,
+                error_kind(&error),
+            )
+            .with_reason(error.to_string()),
+        );
+        return seal_reply(identity, envelope, error_payload(error));
+    }
+    let request: ArtifactCleanupRequest = match serde_json::from_value(envelope.payload.clone()) {
+        Ok(request) => request,
+        Err(error) => {
+            let error = CapabilityError::Invalid {
+                message: format!("unreadable artifact cleanup request: {error}"),
+            };
+            return seal_reply(identity, envelope, error_payload(error));
+        }
+    };
+    if let Err(error) = request.validate() {
+        return seal_reply(identity, envelope, error_payload(error));
+    }
+    let Some(store) = store else {
+        let error = CapabilityError::Unavailable {
+            reason: "this Node has no artifact store".to_string(),
+        };
+        return seal_reply(identity, envelope, error_payload(error));
+    };
+    let mut removed = Vec::new();
+    let mut failed = Vec::new();
+    for artifact in &request.artifacts {
+        match store.remove(&envelope.sender, artifact).await {
+            Ok(true) => removed.push(artifact.uri.clone()),
+            Ok(false) => failed.push(ArtifactFailure {
+                uri: artifact.uri.clone(),
+                error: "the store declined to remove it".to_string(),
+            }),
+            Err(error) => failed.push(ArtifactFailure {
+                uri: artifact.uri.clone(),
+                error,
+            }),
+        }
+    }
+    let response = ArtifactCleanupResponse {
+        schema: crate::artifacts::ARTIFACT_CLEANUP_SCHEMA,
+        request_id: request.request_id,
+        removed,
+        failed,
+    };
+    record(
+        audit,
+        FederationEvent::new(
+            Direction::Inbound,
+            envelope.sender.as_str(),
+            "artifact_cleanup",
+            None,
+            if response.failed.is_empty() {
+                "ok"
+            } else {
+                "partial"
+            },
+        )
+        .with_elapsed_ms(started.elapsed().as_millis() as u64),
+    );
+    seal_reply(
+        identity,
+        envelope,
+        json!({ "ok": true, "response": response }),
+    )
+}
+
 async fn serve_knowledge_publication(
     identity: &NodeIdentity,
     peers: &Arc<RwLock<PeerStore>>,
     knowledge: &Option<Arc<RwLock<KnowledgeService>>>,
     authorizer: &Option<Arc<dyn KnowledgeAuthorizer>>,
+    knowledge_path: &Option<PathBuf>,
     audit: &Option<Arc<dyn FederationAudit>>,
     envelope: &Envelope,
 ) -> Vec<u8> {
@@ -2266,10 +2475,18 @@ async fn serve_knowledge_publication(
             return seal_reply(identity, envelope, error_payload(error));
         }
     };
-    let result = service
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .publish(&envelope.sender, &publication, unix_ms());
+    let result = {
+        let mut guard = service
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let outcome = guard.publish(&envelope.sender, &publication, unix_ms());
+        if outcome.is_ok() {
+            if let Some(path) = knowledge_path {
+                persist_knowledge(&guard, path);
+            }
+        }
+        outcome
+    };
     let event = match &result {
         Ok(count) => FederationEvent::new(
             Direction::Inbound,

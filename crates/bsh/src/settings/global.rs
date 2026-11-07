@@ -496,6 +496,9 @@ pub(crate) struct FederationSection {
     /// grants. Empty means no federation is advertised.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) federation_id: Option<String>,
+    /// Install a local knowledge service for peers with a knowledge grant.
+    #[serde(default)]
+    pub(crate) knowledge_enabled: bool,
     /// The name this node shows to peers; empty uses the machine's host name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) node_name: Option<String>,
@@ -527,6 +530,7 @@ impl Default for FederationSection {
             tls_mtls: false,
             tls_verify_name: None,
             federation_id: None,
+            knowledge_enabled: false,
             node_name: None,
             expose: Vec::new(),
             expose_root: None,

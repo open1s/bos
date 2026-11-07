@@ -494,6 +494,48 @@ impl KnowledgeService {
         Self::default()
     }
 
+    /// Serialize the live store for a durable host cache.
+    pub fn to_json(&self) -> Result<String, KnowledgeError> {
+        #[derive(Serialize)]
+        struct Snapshot<'a> {
+            items: &'a BTreeMap<String, KnowledgeItem>,
+            publisher: &'a BTreeMap<String, NodeId>,
+            revoked: &'a BTreeSet<String>,
+        }
+        serde_json::to_string(&Snapshot {
+            items: &self.items,
+            publisher: &self.publisher,
+            revoked: &self.revoked,
+        })
+        .map_err(|error| KnowledgeError::Invalid {
+            message: error.to_string(),
+        })
+    }
+
+    /// Load a snapshot written by to_json.
+    pub fn from_json(text: &str) -> Result<Self, KnowledgeError> {
+        #[derive(Deserialize)]
+        struct Snapshot {
+            items: BTreeMap<String, KnowledgeItem>,
+            publisher: BTreeMap<String, NodeId>,
+            revoked: BTreeSet<String>,
+        }
+        let snapshot: Snapshot =
+            serde_json::from_str(text).map_err(|error| KnowledgeError::Invalid {
+                message: error.to_string(),
+            })?;
+        Ok(Self {
+            items: snapshot.items,
+            publisher: snapshot.publisher,
+            revoked: snapshot.revoked,
+        })
+    }
+
+    /// Every live item, for a local management surface.
+    pub fn items(&self) -> impl Iterator<Item = &KnowledgeItem> {
+        self.items.values()
+    }
+
     /// Publish items after verifying provenance, freshness, and size.
     pub fn publish(
         &mut self,
@@ -502,6 +544,7 @@ impl KnowledgeService {
         now_ms: u64,
     ) -> Result<usize, KnowledgeError> {
         publication.validate()?;
+        let mut seen = BTreeSet::new();
         for item in &publication.items {
             if item.id.trim().is_empty() {
                 return Err(KnowledgeError::Invalid {
@@ -525,7 +568,7 @@ impl KnowledgeService {
                     id: item.id.clone(),
                 });
             }
-            if self.publisher.contains_key(&item.id) {
+            if !seen.insert(item.id.clone()) || self.publisher.contains_key(&item.id) {
                 return Err(KnowledgeError::Duplicate {
                     id: item.id.clone(),
                 });
@@ -656,4 +699,43 @@ pub fn knowledge_hash(payload: &Value) -> String {
         let _ = write!(hex, "{byte:02x}");
     }
     hex
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::NodeIdentity;
+
+    fn item(node: &NodeId) -> KnowledgeItem {
+        let payload = serde_json::json!({ "fact": "sky is blue" });
+        KnowledgeItem {
+            id: "k-1".to_string(),
+            class: KnowledgeClass::Public,
+            payload: payload.clone(),
+            provenance: Provenance {
+                origin: node.clone(),
+                source: "test".to_string(),
+                issued_at_ms: 1,
+                expires_at_ms: None,
+                content_hash: knowledge_hash(&payload),
+            },
+            retention_ms: None,
+        }
+    }
+
+    #[test]
+    fn a_store_survives_a_json_round_trip_and_keeps_revocations() {
+        let node = NodeIdentity::from_seed([9u8; 32]).node_id();
+        let mut service = KnowledgeService::new();
+        let duplicate = KnowledgePublication::new(vec![item(&node), item(&node)]);
+        assert!(service.publish(&node, &duplicate, 2).is_err());
+        let single = KnowledgePublication::new(vec![item(&node)]);
+        assert_eq!(service.publish(&node, &single, 2).expect("published"), 1);
+        assert!(service.revoke(&node, "k-1").expect("revoked"));
+
+        let json = service.to_json().expect("serialized");
+        let restored = KnowledgeService::from_json(&json).expect("restored");
+        assert!(restored.is_revoked("k-1"));
+        assert!(restored.get("k-1").is_none());
+    }
 }

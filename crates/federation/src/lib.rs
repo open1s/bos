@@ -13,8 +13,10 @@
 //! Nothing here decides authorization. A valid signature proves who sent a
 //! message; it never proves that the sender may invoke what it asks for.
 
+pub mod artifacts;
 pub mod audit;
 pub mod collaboration;
+pub mod compensation;
 pub mod delegation;
 pub mod discovery;
 pub mod envelope;
@@ -29,12 +31,18 @@ pub mod rotation;
 pub mod service;
 pub mod zenoh;
 
+pub use artifacts::{
+    ArtifactCleanupRequest, ArtifactCleanupResponse, ArtifactFailure, ArtifactStore,
+    FileArtifactStore, ARTIFACT_CLEANUP_KIND, ARTIFACT_CLEANUP_SCHEMA, MAX_CLEANUP_ARTIFACTS,
+};
 pub use audit::{Direction, FederationAudit, FederationEvent, MemoryAudit};
 pub use capability::{FederationMessage, FederationTransport, MessageId, PeerSession};
 pub use collaboration::{
-    ArtifactRef, CollaborationError, DelegationExecutor, Orchestrator, TaskExecutor, TaskGraph,
-    TaskNode, TaskNodeId, TaskOutcome, TaskProgress, TaskState, COLLABORATION_SCHEMA,
+    ArtifactRef, CollaborationError, DelegationExecutor, Orchestrator, ReceiptMismatch,
+    TaskExecutor, TaskGraph, TaskNode, TaskNodeId, TaskOutcome, TaskProgress, TaskState,
+    COLLABORATION_SCHEMA,
 };
+pub use compensation::{CompensationQueue, PendingCompensation};
 pub use delegation::{
     DelegationError, DelegationId, DelegationRecord, DelegationRequest, DelegationState,
     DelegationStore,

@@ -18,9 +18,13 @@ serde_json = "1.0"
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 rkyv = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2.2"
+tokio-rustls = "0.26"
 
 [dev-dependencies]
 log = "0.4.29"
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
 
 [lib]

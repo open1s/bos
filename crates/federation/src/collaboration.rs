@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::compensation::{CompensationQueue, PendingCompensation};
 use crate::delegation::DelegationId;
 
 use async_trait::async_trait;
@@ -95,6 +96,15 @@ pub struct TaskNode {
     /// Why compensation failed, when it did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compensation_error: Option<String>,
+    /// When the task reached a terminal state, in Unix milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at_ms: Option<u64>,
+    /// Default artifact retention for this task, in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_retention_ms: Option<u64>,
+    /// The remote acknowledgement of compensation, when one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compensation_receipt: Option<Value>,
 }
 
 fn one_attempt() -> u32 {
@@ -114,6 +124,9 @@ pub struct ArtifactRef {
     /// Size in bytes, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes: Option<u64>,
+    /// Retain this artifact for this many milliseconds after the task finishes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_ms: Option<u64>,
 }
 
 impl ArtifactRef {
@@ -124,7 +137,14 @@ impl ArtifactRef {
             uri: uri.into(),
             sha256: None,
             bytes: None,
+            retention_ms: None,
         }
+    }
+
+    /// Set this artifact's retention window.
+    pub fn with_retention(mut self, retention_ms: u64) -> Self {
+        self.retention_ms = Some(retention_ms);
+        self
     }
 }
 
@@ -219,6 +239,9 @@ impl TaskGraph {
                 compensation: None,
                 compensated: false,
                 compensation_error: None,
+                finished_at_ms: None,
+                artifact_retention_ms: None,
+                compensation_receipt: None,
             },
         );
         self.revision += 1;
@@ -260,6 +283,7 @@ impl TaskGraph {
         &mut self,
         id: &TaskNodeId,
         error: Option<String>,
+        receipt: Option<Value>,
     ) -> Result<(), CollaborationError> {
         let task = self
             .tasks
@@ -267,6 +291,7 @@ impl TaskGraph {
             .ok_or_else(|| CollaborationError::UnknownTask { id: id.clone() })?;
         task.compensated = true;
         task.compensation_error = error;
+        task.compensation_receipt = receipt;
         self.revision += 1;
         Ok(())
     }
@@ -398,6 +423,7 @@ impl TaskGraph {
         task.result = Some(outcome.result);
         task.artifacts = outcome.artifacts;
         task.error = None;
+        task.finished_at_ms = Some(capability::unix_ms());
         self.revision += 1;
         Ok(())
     }
@@ -427,6 +453,7 @@ impl TaskGraph {
         }
         task.state = TaskState::Failed;
         task.error = Some(reason);
+        task.finished_at_ms = Some(capability::unix_ms());
         self.revision += 1;
         self.cancel_dependents(id);
         Ok(true)
@@ -486,11 +513,80 @@ impl TaskGraph {
                 task.state = TaskState::Failed;
                 task.error =
                     Some("interrupted by a Node restart; the outcome is indeterminate".to_string());
+                task.finished_at_ms = Some(capability::unix_ms());
                 self.revision += 1;
             }
             self.cancel_dependents(id);
         }
         running.len()
+    }
+
+    /// Set the default artifact retention window for one task.
+    pub fn set_artifact_retention(
+        &mut self,
+        id: &TaskNodeId,
+        retention_ms: u64,
+    ) -> Result<(), CollaborationError> {
+        let task = self
+            .tasks
+            .get_mut(id)
+            .ok_or_else(|| CollaborationError::UnknownTask { id: id.clone() })?;
+        task.artifact_retention_ms = Some(retention_ms);
+        self.revision += 1;
+        Ok(())
+    }
+
+    /// Drop artifact references whose retention window has elapsed.
+    ///
+    /// Results are kept; only the reference (not the host's stored bytes) is
+    /// removed. An artifact with no retention and no task default is kept.
+    pub fn prune_artifacts(&mut self, now_ms: u64) -> usize {
+        self.take_expired_artifacts(now_ms).len()
+    }
+
+    /// The artifact references whose retention elapsed, without removing them.
+    pub fn expired_artifacts(&self, now_ms: u64) -> Vec<ArtifactRef> {
+        let mut expired = Vec::new();
+        for task in self.tasks.values() {
+            let Some(finished) = task.finished_at_ms else {
+                continue;
+            };
+            let default = task.artifact_retention_ms;
+            for artifact in &task.artifacts {
+                let retention = artifact.retention_ms.or(default);
+                if retention.is_some_and(|retention| finished.saturating_add(retention) <= now_ms) {
+                    expired.push(artifact.clone());
+                }
+            }
+        }
+        expired
+    }
+
+    /// Remove and return the artifact references whose retention elapsed.
+    ///
+    /// A caller that has a peer artifact store can send these to
+    /// `FederationNode::cleanup_artifacts` instead of dropping them silently.
+    pub fn take_expired_artifacts(&mut self, now_ms: u64) -> Vec<ArtifactRef> {
+        let mut removed = Vec::new();
+        for task in self.tasks.values_mut() {
+            let Some(finished) = task.finished_at_ms else {
+                continue;
+            };
+            let default = task.artifact_retention_ms;
+            task.artifacts.retain(|artifact| {
+                let retention = artifact.retention_ms.or(default);
+                let keep =
+                    retention.is_none_or(|retention| finished.saturating_add(retention) > now_ms);
+                if !keep {
+                    removed.push(artifact.clone());
+                }
+                keep
+            });
+        }
+        if !removed.is_empty() {
+            self.revision += 1;
+        }
+        removed
     }
 
     /// Whether every task is terminal.
@@ -580,6 +676,21 @@ pub trait TaskExecutor: Send + Sync {
     async fn compensate(&self, _task: &TaskNode) -> Result<(), String> {
         Ok(())
     }
+
+    /// Evidence that compensation happened, stored for reconciliation.
+    fn compensation_evidence(&self, _task: &TaskNode) -> Option<Value> {
+        None
+    }
+
+    /// Whether this executor can delete artifact bytes, not just references.
+    fn supports_cleanup(&self) -> bool {
+        false
+    }
+
+    /// Remove the bytes behind expired references. Only called when supported.
+    async fn cleanup_artifacts(&self, _artifacts: &[ArtifactRef]) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Why a graph operation was refused.
@@ -633,6 +744,19 @@ pub enum CollaborationError {
     Storage(String),
 }
 
+/// One task whose stored compensation receipt disagrees with the target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReceiptMismatch {
+    /// The task whose receipt was checked.
+    pub task_id: String,
+    /// The state the receipt recorded.
+    pub expected: String,
+    /// The state the target reports now, when it answered.
+    pub actual: Option<String>,
+    /// A transport or missing-receipt error.
+    pub error: Option<String>,
+}
+
 /// A task executor that delegates each task through a FederationNode.
 ///
 /// The executor submits the task as a delegation, polls its authoritative
@@ -646,6 +770,8 @@ pub struct DelegationExecutor {
     contract: Option<String>,
     context: capability::InvocationContext,
     poll: Duration,
+    receipt: std::sync::Mutex<Option<Value>>,
+    compensation_queue: Option<std::path::PathBuf>,
 }
 
 impl DelegationExecutor {
@@ -663,6 +789,8 @@ impl DelegationExecutor {
             contract: None,
             context,
             poll: Duration::from_millis(25),
+            receipt: std::sync::Mutex::new(None),
+            compensation_queue: None,
         }
     }
 
@@ -670,6 +798,129 @@ impl DelegationExecutor {
     pub fn with_contract(mut self, contract: impl Into<String>) -> Self {
         self.contract = Some(contract.into());
         self
+    }
+
+    /// Persist failed compensations here and retry them later.
+    pub fn with_compensation_queue(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.compensation_queue = Some(path.into());
+        self
+    }
+
+    /// Compare a stored compensation receipt with the target's live record.
+    pub async fn receipt_matches_remote(&self, task: &TaskNode) -> Result<bool, String> {
+        let receipt = task
+            .compensation_receipt
+            .as_ref()
+            .ok_or_else(|| "the task has no compensation receipt".to_string())?;
+        let delegation = receipt
+            .get("delegation")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "the receipt names no delegation".to_string())?;
+        let expected = receipt
+            .get("state")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "the receipt has no state".to_string())?;
+        let record = self
+            .node
+            .delegation_status(&self.target, &DelegationId::new(delegation), &self.context)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(format!("{:?}", record.state) == expected)
+    }
+
+    /// Check every task receipt against its target in one pass.
+    pub async fn audit_receipts(&self, tasks: &[TaskNode]) -> Vec<ReceiptMismatch> {
+        let mut mismatches = Vec::new();
+        for task in tasks {
+            let Some(receipt) = &task.compensation_receipt else {
+                continue;
+            };
+            let expected = receipt
+                .get("state")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            let Some(delegation) = receipt.get("delegation").and_then(Value::as_str) else {
+                mismatches.push(ReceiptMismatch {
+                    task_id: task.id.to_string(),
+                    expected,
+                    actual: None,
+                    error: Some("the receipt names no delegation".to_string()),
+                });
+                continue;
+            };
+            match self
+                .node
+                .delegation_status(&self.target, &DelegationId::new(delegation), &self.context)
+                .await
+            {
+                Ok(record) => {
+                    let actual = format!("{:?}", record.state);
+                    if actual != expected {
+                        mismatches.push(ReceiptMismatch {
+                            task_id: task.id.to_string(),
+                            expected,
+                            actual: Some(actual),
+                            error: None,
+                        });
+                    }
+                }
+                Err(error) => mismatches.push(ReceiptMismatch {
+                    task_id: task.id.to_string(),
+                    expected,
+                    actual: None,
+                    error: Some(error.to_string()),
+                }),
+            }
+        }
+        mismatches
+    }
+
+    /// Retry every queued compensation addressed to this executor's target.
+    pub async fn reconcile_compensations(&self) -> Result<usize, String> {
+        let Some(path) = &self.compensation_queue else {
+            return Ok(0);
+        };
+        let mut queue = CompensationQueue::load(path);
+        let now = capability::unix_ms();
+        let pending: Vec<(String, String)> = queue
+            .due_entries(now)
+            .into_iter()
+            .filter(|entry| entry.target == self.target.to_string())
+            .map(|entry| (entry.delegation_id, entry.task_id))
+            .collect();
+        let mut settled = 0;
+        for (delegation, task_id) in pending {
+            let id = DelegationId::new(delegation.clone());
+            match self
+                .node
+                .cancel_delegation(&self.target, &id, &self.context)
+                .await
+            {
+                Ok(_) => {
+                    queue.remove(&delegation);
+                    settled += 1;
+                }
+                Err(error) => {
+                    queue.record_failure(&delegation, error.to_string(), capability::unix_ms())
+                }
+            }
+            let _ = task_id;
+        }
+        queue.save()?;
+        Ok(settled)
+    }
+
+    /// Retry due compensations on a background interval.
+    pub fn spawn_reconciler(self: Arc<Self>, every: Duration) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                if let Err(error) = self.reconcile_compensations().await {
+                    tracing::warn!("collaboration: compensation reconciliation failed: {error}");
+                }
+                tokio::time::sleep(every).await;
+            }
+        })
     }
 
     /// Change the status poll interval.
@@ -750,11 +1001,69 @@ impl TaskExecutor for DelegationExecutor {
 
     async fn compensate(&self, task: &TaskNode) -> Result<(), String> {
         let id = Self::request_id(task);
-        self.node
+        let result = self
+            .node
             .cancel_delegation(&self.target, &id, &self.context)
-            .await
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+            .await;
+        if let Some(path) = &self.compensation_queue {
+            let mut queue = CompensationQueue::load(path);
+            match &result {
+                Ok(_) => {
+                    queue.remove(&id.to_string());
+                }
+                Err(error) => queue.enqueue(PendingCompensation {
+                    task_id: task.id.to_string(),
+                    delegation_id: id.to_string(),
+                    target: self.target.to_string(),
+                    attempts: 0,
+                    last_error: Some(error.to_string()),
+                    updated_at_ms: capability::unix_ms(),
+                    next_attempt_ms: capability::unix_ms(),
+                }),
+            }
+            if let Err(error) = queue.save() {
+                tracing::warn!("collaboration: compensation queue was not saved: {error}");
+            }
+        }
+        let record = result.map_err(|error| error.to_string())?;
+        let receipt = serde_json::json!({
+            "kind": "delegation_cancel",
+            "delegation": record.request.id.to_string(),
+            "state": format!("{:?}", record.state),
+        });
+        if let Ok(mut slot) = self.receipt.lock() {
+            *slot = Some(receipt);
+        }
+        Ok(())
+    }
+
+    fn compensation_evidence(&self, _task: &TaskNode) -> Option<Value> {
+        self.receipt.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    fn supports_cleanup(&self) -> bool {
+        true
+    }
+
+    async fn cleanup_artifacts(&self, artifacts: &[ArtifactRef]) -> Result<(), String> {
+        for chunk in artifacts.chunks(crate::artifacts::MAX_CLEANUP_ARTIFACTS) {
+            let request = crate::artifacts::ArtifactCleanupRequest::new(
+                format!("task-cleanup-{}", capability::unix_ms()),
+                chunk.to_vec(),
+            );
+            let response = self
+                .node
+                .cleanup_artifacts(&self.target, &request, &self.context)
+                .await
+                .map_err(|error| error.to_string())?;
+            if !response.failed.is_empty() {
+                return Err(format!(
+                    "{} artifact(s) were not removed",
+                    response.failed.len()
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -836,7 +1145,13 @@ impl Orchestrator {
                         if let Some(task) = task {
                             if task.compensation.is_some() {
                                 let compensation = executor.compensate(&task).await;
-                                self.graph.set_compensated(&id, compensation.err())?;
+                                let receipt = if compensation.is_ok() {
+                                    executor.compensation_evidence(&task)
+                                } else {
+                                    None
+                                };
+                                self.graph
+                                    .set_compensated(&id, compensation.err(), receipt)?;
                             }
                         }
                     }
@@ -858,6 +1173,21 @@ impl Orchestrator {
                 }
             }
             self.persist()?;
+        }
+        if executor.supports_cleanup() {
+            let now = capability::unix_ms();
+            let expired = self.graph.expired_artifacts(now);
+            if !expired.is_empty() {
+                match executor.cleanup_artifacts(&expired).await {
+                    Ok(()) => {
+                        self.graph.prune_artifacts(now);
+                        self.persist()?;
+                    }
+                    Err(error) => {
+                        tracing::warn!("collaboration: artifact cleanup failed: {error}");
+                    }
+                }
+            }
         }
         Ok(self.graph.progress())
     }

@@ -467,6 +467,28 @@ pub(crate) struct FederationLeaseRow {
     pub(crate) expires_at_ms: Option<u64>,
 }
 
+/// One artifact file in the local federation store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FederationArtifactRow {
+    /// Display name.
+    pub(crate) name: String,
+    /// Size in bytes.
+    pub(crate) bytes: u64,
+    /// Absolute path, for removal.
+    pub(crate) path: std::path::PathBuf,
+}
+
+/// One locally served knowledge item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FederationKnowledgeRow {
+    /// The item id.
+    pub(crate) id: String,
+    /// Its class label.
+    pub(crate) class: String,
+    /// The provenance source.
+    pub(crate) source: String,
+}
+
 /// One peer seen on the announce key, with the capabilities it advertises.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DiscoveredPeerRow {
@@ -508,6 +530,10 @@ pub(crate) struct FederationPane {
     pub(crate) lease_output: Option<String>,
     /// The last resource-stream failure.
     pub(crate) lease_error: Option<String>,
+    /// Knowledge items this Node currently serves.
+    pub(crate) knowledge_items: Vec<FederationKnowledgeRow>,
+    /// Files in the local artifact store.
+    pub(crate) artifacts: Vec<FederationArtifactRow>,
     /// Capabilities selected for a discovered peer, by node id.
     pub(crate) pending: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
     /// The capability chosen from the selected peer's menu.
@@ -1263,6 +1289,25 @@ impl Shell {
                                 cx.notify();
                             },
                         )
+                    })
+                    .child(if runtime.is_some() {
+                        self.federation_small_button(
+                            "federation-tls-reload",
+                            lang.tr("right.federation.reloadTls"),
+                            cx,
+                            |this, cx| {
+                                let settings = this.state.settings.clone();
+                                std::thread::spawn(move || {
+                                    crate::federation_node::reload_tls(&settings);
+                                });
+                                this.right.federation.notice =
+                                    Some(this.state.lang.tr("right.federation.reloadingTls"));
+                                this.right.federation.error = None;
+                                cx.notify();
+                            },
+                        )
+                    } else {
+                        div().into_any_element()
                     }),
             );
 
@@ -1294,6 +1339,14 @@ impl Shell {
                     self.state.settings.global.federation.include_remote_tools,
                     cx,
                     |settings, on| settings.global.federation.include_remote_tools = on,
+                ))
+                .child(self.federation_switch_row(
+                    "federation-knowledge-service",
+                    lang.tr("right.federation.knowledgeService"),
+                    lang.tr("right.federation.knowledgeServiceHint"),
+                    self.state.settings.global.federation.knowledge_enabled,
+                    cx,
+                    |settings, on| settings.global.federation.knowledge_enabled = on,
                 )),
         );
 
@@ -1906,6 +1959,50 @@ impl Shell {
             }
         }
 
+        // Artifacts are references until the host stores bytes; this lists the
+        // BSH store and lets the reader remove one directly.
+        let artifacts = self.right.federation.artifacts.clone();
+        if !artifacts.is_empty() {
+            pane = pane.child(self.federation_section_title(crate::i18n::tr_args(
+                lang,
+                "right.federation.artifacts",
+                &[("count", artifacts.len().to_string())],
+            )));
+            for (index, artifact) in artifacts.iter().take(8).enumerate() {
+                pane = pane.child(
+                    div()
+                        .id(SharedString::from(format!("federation-artifact-{index}")))
+                        .debug_selector(move || format!("federation-artifact-{index}"))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .py(px(4.0))
+                        .child(txt(artifact.name.clone(), 11.0, theme::text()))
+                        .child(txt(format!("{} B", artifact.bytes), 11.0, theme::faint()))
+                        .child(self.federation_small_button(
+                            "federation-artifact-remove",
+                            lang.tr("right.federation.remove"),
+                            cx,
+                            {
+                                let path = artifact.path.clone();
+                                move |this, cx| {
+                                    if let Err(error) = std::fs::remove_file(&path) {
+                                        this.right.federation.notice =
+                                            Some(format!("{}: {error}", path.display()));
+                                    } else {
+                                        this.right.federation.notice = Some(
+                                            this.state.lang.tr("right.federation.artifactRemoved"),
+                                        );
+                                    }
+                                    this.reload_federation_quiet();
+                                    cx.notify();
+                                }
+                            },
+                        )),
+                );
+            }
+        }
+
         // A resource stream is opened by its holder against a lease the peer
         // already granted. This is a bounded read: four chunks or a close.
         pane =
@@ -2238,6 +2335,73 @@ impl Shell {
         );
         if let Some(notice) = &self.right.federation.knowledge_notice {
             pane = pane.child(self.federation_banner(notice.clone(), true));
+        }
+
+        // Local items are what this Node actually answers with; revoking here
+        // removes them from subsequent queries and rewrites the store.
+        let knowledge_items = self.right.federation.knowledge_items.clone();
+        if !knowledge_items.is_empty() {
+            pane = pane.child(self.federation_section_title(crate::i18n::tr_args(
+                lang,
+                "right.federation.servedKnowledge",
+                &[("count", knowledge_items.len().to_string())],
+            )));
+            for (index, item) in knowledge_items.iter().take(8).enumerate() {
+                pane = pane.child(
+                    div()
+                        .id(SharedString::from(format!("federation-knowledge-{index}")))
+                        .debug_selector(move || format!("federation-knowledge-{index}"))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .py(px(4.0))
+                        .child(txt(short_node(&item.id), 11.0, theme::muted()))
+                        .child(Self::federation_badge(item.class.clone(), true))
+                        .child(txt(short_node(&item.source), 11.0, theme::faint()))
+                        .when(crate::federation_node::running().is_some(), |row| {
+                            row.child(self.federation_small_button(
+                                "federation-knowledge-revoke",
+                                lang.tr("right.federation.revoke"),
+                                cx,
+                                {
+                                    let id = item.id.clone();
+                                    move |this, cx| {
+                                        let Some(runtime) = crate::federation_node::running()
+                                        else {
+                                            this.right.federation.knowledge_error = Some(
+                                                this.state.lang.tr("right.federation.notRunning"),
+                                            );
+                                            cx.notify();
+                                            return;
+                                        };
+                                        match runtime.node().revoke_knowledge(&id) {
+                                            Ok(true) => {
+                                                this.right.federation.knowledge_notice = Some(
+                                                    this.state
+                                                        .lang
+                                                        .tr("right.federation.knowledgeRevoked"),
+                                                );
+                                                this.right.federation.knowledge_error = None;
+                                            }
+                                            Ok(false) => {
+                                                this.right.federation.knowledge_error =
+                                                    Some(this.state.lang.tr(
+                                                        "right.federation.knowledgeRevokeMissing",
+                                                    ));
+                                            }
+                                            Err(error) => {
+                                                this.right.federation.knowledge_error =
+                                                    Some(error.to_string());
+                                            }
+                                        }
+                                        this.reload_federation_quiet();
+                                        cx.notify();
+                                    }
+                                },
+                            ))
+                        }),
+                );
+            }
         }
 
         // Grant to the selected peer: the capability menu lists what that peer
@@ -2817,6 +2981,23 @@ impl Shell {
                     .read()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 federation_delegation_rows(&store)
+            })
+            .unwrap_or_default();
+        self.right.federation.artifacts =
+            federation_artifact_rows(&crate::federation::dir().join("artifacts"));
+        self.right.federation.knowledge_items = runtime
+            .as_ref()
+            .map(|runtime| {
+                runtime
+                    .node()
+                    .knowledge_items()
+                    .into_iter()
+                    .map(|item| FederationKnowledgeRow {
+                        id: item.id,
+                        class: format!("{:?}", item.class).to_lowercase(),
+                        source: item.provenance.source,
+                    })
+                    .collect()
             })
             .unwrap_or_default();
         self.right.federation.leases = runtime
@@ -8296,6 +8477,27 @@ pub(crate) fn federation_delegation_rows(
         .collect()
 }
 
+/// Files in the local artifact store, sorted by name.
+pub(crate) fn federation_artifact_rows(root: &Path) -> Vec<FederationArtifactRow> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut rows: Vec<FederationArtifactRow> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let metadata = entry.metadata().ok()?;
+            metadata.is_file().then(|| FederationArtifactRow {
+                name: entry.file_name().to_string_lossy().into_owned(),
+                bytes: metadata.len(),
+                path,
+            })
+        })
+        .collect();
+    rows.sort_by(|left, right| left.name.cmp(&right.name));
+    rows
+}
+
 /// Resource leases this Node granted, sorted by id.
 pub(crate) fn federation_lease_rows(store: &federation::LeaseStore) -> Vec<FederationLeaseRow> {
     store
@@ -8827,6 +9029,22 @@ mod federation_pane_tests {
         assert_eq!(rows[0].objective, "newer");
         assert_eq!(rows[0].state, "right.federation.stateCreated");
         assert_eq!(rows[0].target, target.to_string());
+    }
+
+    #[test]
+    fn artifact_rows_list_files_sorted_by_name() {
+        let root = std::env::temp_dir().join(format!("bsh-artifacts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::write(root.join("b.bin"), b"12").expect("b");
+        std::fs::write(root.join("a.bin"), b"1").expect("a");
+
+        let rows = super::federation_artifact_rows(&root);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "a.bin");
+        assert_eq!(rows[1].bytes, 2);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
