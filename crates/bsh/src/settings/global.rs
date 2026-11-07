@@ -52,6 +52,10 @@ pub(crate) enum ScheduleRefusal {
     Name,
     /// The instruction is empty.
     Prompt,
+    /// The id is empty, or a task already carries it.
+    Id,
+    /// No task carries the id.
+    Unknown,
 }
 
 impl GlobalSettings {
@@ -66,17 +70,47 @@ impl GlobalSettings {
         session_id: &str,
         every_seconds: u64,
     ) -> Result<String, ScheduleRefusal> {
+        let now = unix_now();
+        let mut id = format!("task-{now}");
+        // Two tasks created in the same second must not share an id: one would
+        // shadow the other in every lookup the pane and the clock do.
+        let mut suffix = 1;
+        while self.schedules.iter().any(|entry| entry.id == id) {
+            id = format!("task-{now}-{suffix}");
+            suffix += 1;
+        }
+        self.add_schedule_with_id(&id, name, prompt, session_id, every_seconds)?;
+        Ok(id)
+    }
+
+    /// Append a task under an id the caller minted.
+    ///
+    /// The model's tools mint the id so the tool result can name the task it
+    /// created; the UI leaves it to [`Self::add_schedule`]. Both paths validate
+    /// and store through this one function, so the two editors cannot disagree
+    /// about what a valid task is.
+    pub(crate) fn add_schedule_with_id(
+        &mut self,
+        id: &str,
+        name: &str,
+        prompt: &str,
+        session_id: &str,
+        every_seconds: u64,
+    ) -> Result<(), ScheduleRefusal> {
+        let id = id.trim();
         let name = name.trim();
         let prompt = prompt.trim();
+        if id.is_empty() || self.schedules.iter().any(|entry| entry.id == id) {
+            return Err(ScheduleRefusal::Id);
+        }
         if name.is_empty() || name.chars().count() > Self::NAME_LIMIT {
             return Err(ScheduleRefusal::Name);
         }
         if prompt.is_empty() {
             return Err(ScheduleRefusal::Prompt);
         }
-        let id = format!("task-{}", unix_now());
         self.schedules.push(Schedule {
-            id: id.clone(),
+            id: id.to_string(),
             name: name.to_string(),
             prompt: prompt.to_string(),
             session_id: session_id.to_string(),
@@ -84,7 +118,85 @@ impl GlobalSettings {
             enabled: true,
             last_run: 0,
         });
-        Ok(id)
+        Ok(())
+    }
+
+    /// Change fields on one task; `None` leaves that field alone.
+    ///
+    /// Every provided field is validated before the task is touched, so a
+    /// refused edit changes nothing.
+    pub(crate) fn edit_schedule(
+        &mut self,
+        id: &str,
+        name: Option<&str>,
+        prompt: Option<&str>,
+        every_seconds: Option<u64>,
+        enabled: Option<bool>,
+    ) -> Result<(), ScheduleRefusal> {
+        if let Some(name) = name {
+            let name = name.trim();
+            if name.is_empty() || name.chars().count() > Self::NAME_LIMIT {
+                return Err(ScheduleRefusal::Name);
+            }
+        }
+        if let Some(prompt) = prompt {
+            if prompt.trim().is_empty() {
+                return Err(ScheduleRefusal::Prompt);
+            }
+        }
+        let Some(entry) = self.schedules.iter_mut().find(|entry| entry.id == id) else {
+            return Err(ScheduleRefusal::Unknown);
+        };
+        if let Some(name) = name {
+            entry.name = name.trim().to_string();
+        }
+        if let Some(prompt) = prompt {
+            entry.prompt = prompt.trim().to_string();
+        }
+        if let Some(every_seconds) = every_seconds {
+            entry.every_seconds = every_seconds;
+        }
+        if let Some(enabled) = enabled {
+            entry.enabled = enabled;
+        }
+        Ok(())
+    }
+
+    /// Apply one queued request from the model's schedule tools.
+    pub(crate) fn apply_schedule_request(
+        &mut self,
+        request: &crate::schedule::ScheduleRequest,
+    ) -> Result<(), ScheduleRefusal> {
+        use crate::schedule::ScheduleRequest;
+        match request {
+            ScheduleRequest::Create {
+                id,
+                name,
+                prompt,
+                session_id,
+                every_seconds,
+            } => self.add_schedule_with_id(id, name, prompt, session_id, *every_seconds),
+            ScheduleRequest::Edit {
+                id,
+                name,
+                prompt,
+                every_seconds,
+                enabled,
+            } => self.edit_schedule(
+                id,
+                name.as_deref(),
+                prompt.as_deref(),
+                *every_seconds,
+                *enabled,
+            ),
+            ScheduleRequest::Remove { id } => {
+                if self.remove_schedule(id) {
+                    Ok(())
+                } else {
+                    Err(ScheduleRefusal::Unknown)
+                }
+            }
+        }
     }
 
     /// Drop a task; false when no task carries the id.
@@ -457,6 +569,17 @@ pub(crate) struct FederationSection {
     /// Whether this app runs a federation node.
     #[serde(default = "default_true")]
     pub(crate) enabled: bool,
+    /// The node profile this machine runs by default.
+    ///
+    /// One profile is one node: its own key, peer store, delegations and audit
+    /// log under `federation/<profile>/`. The empty/default profile keeps the
+    /// old layout (the files directly under `federation/`), so a node created
+    /// before profiles existed keeps its identity. A launch flag or the
+    /// `BSH_FEDERATION_PROFILE` environment variable overrides this for one
+    /// instance - which is what two app windows on one machine use, since they
+    /// share this file.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) profile: String,
     /// Offer trusted peers' capabilities to the model as tools.
     #[serde(default)]
     pub(crate) include_remote_tools: bool,
@@ -518,6 +641,7 @@ impl Default for FederationSection {
     fn default() -> Self {
         Self {
             enabled: true,
+            profile: String::new(),
             include_remote_tools: false,
             identity_path: None,
             peers_path: None,
@@ -1543,8 +1667,8 @@ fn preset_deny_paths() -> Vec<String> {
 
 /// The shipped declaration for an id, or none.
 ///
-/// Standard mounts the three core bundles and inherits every tool, skill, MCP
-/// server, extension and the workspace prompt.
+/// Standard mounts the three core bundles plus federation, and inherits every
+/// tool, skill, MCP server, extension and the workspace prompt.
 ///
 /// # The network policy of a shipped preset
 ///
@@ -1577,7 +1701,18 @@ fn preset_deny_paths() -> Vec<String> {
 /// intersected with the workspace allowlist, never unioned with it, so a preset
 /// can narrow the workspace's reach and never widen it.
 pub(crate) fn built_in_preset(id: &str) -> Option<Preset> {
-    let standard_bundles = vec!["shell".to_string(), "files".to_string(), "plan".to_string()];
+    // Federation rides the everyday presets: its node is on by default (it
+    // only answers enrolled peers), and a model that cannot see the delegation
+    // tools cannot use the feature at all. A preset that wants a turn with no
+    // federation drops the bundle from its own plugin list, and the reader can
+    // switch the extension off in Settings > Extensions.
+    let standard_bundles = vec![
+        "shell".to_string(),
+        "files".to_string(),
+        "plan".to_string(),
+        "schedule".to_string(),
+        "federation".to_string(),
+    ];
     let standard_guard = || {
         (
             preset_deny_paths(),

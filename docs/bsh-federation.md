@@ -55,6 +55,81 @@ BSH launch reads `rotation.json` and delivers it to every enrolled peer; the
 same record can be applied by hand with `accept-rotation`, and delivery is
 idempotent for a peer that was offline.
 
+## Several nodes on one machine
+
+One BSH process runs one federation node. A **profile** is that node's name on
+this machine: its own key, peer store, delegations, artifacts and audit log.
+The default profile keeps today's layout (files directly under
+`~/.bos/bsh/federation/`); any other profile lives in
+`~/.bos/bsh/federation/<profile>/`.
+
+Run a second node by giving the second instance a profile:
+
+```sh
+BSH_FEDERATION_PROFILE=work bsh
+bsh --federation-profile=work        # the same thing as a launch flag
+```
+
+Both instances read one `settings.toml`, so the launch flag (or the
+environment) is what makes the second one a different node;
+`[federation] profile = "work"` is only the persistent default for a machine
+that always runs that profile.
+
+See what is running:
+
+```sh
+$ bsh federation profiles
+PROFILE  STATE    PEERS  NODE                                  NAME
+default  running  0      1UIH2hlJd9z0atv+wrwudbUtWopCGE/t/cAAJPDj6No=  studio
+work     idle     0      kQ3...                                 studio (work)
+profiles 2
+```
+
+`STATE` is the directory lock: `running` means a process owns that profile's
+files right now, which is what makes the column live rather than stored. The
+node name carries the profile, so peers can tell two nodes on one machine
+apart.
+
+Manage one profile's files while its app is closed:
+
+```sh
+bsh federation --profile work status
+bsh federation --profile work enroll <node-id>
+bsh federation --profile work grant <node-id> builtin/read_file
+```
+
+The first node on the machine listens on `tcp/[::]:7447`; when that port is
+already taken, the next one binds a loopback ephemeral port and links to
+`tcp/127.0.0.1:7447` itself, so local nodes connect with no endpoint
+configuration at all. (Zenoh scouting runs on top of that but is not relied on
+for the local case.) A node with its own `listen` keeps it and is never
+silently moved.
+
+Each profile's files are locked while its node runs: a second process on the
+same profile is refused with the directory named, and `profiles` reports that
+profile as `running`.
+
+Run nodes without a window - as many as the machine needs:
+
+```sh
+bsh federation serve                     # the default profile, foreground
+bsh federation serve --profile work      # a second node, same machine
+bsh federation serve --profile a --profile b   # several nodes, ONE process
+```
+
+Each node prints its id, identity path and status, and a status line whenever
+its peer picture changes; Ctrl-C stops them all and releases every lock. A
+single process may host as many profiles as named - each keeps its own
+identity, peer store, directory lock and transport session. The exception is
+TLS: its terminator is process-wide and every profile shares the settings that
+carry the certificates, so a second TLS node is refused instead of silently
+replacing the first one's listener. In that line
+`peers` is presence - nodes whose announcement is live - while `catalogues`
+counts how many of them published capabilities, so a linked pair with nothing
+exposed reads `peers=1 catalogues=0`, not zero peers. The Federation row in
+Settings > General uses the same presence count and names a non-default
+profile, so two windows on one machine are tellable apart without a terminal.
+
 ## Managing peers
 
 Management is headless, so it works before any window exists and on a machine
@@ -72,6 +147,23 @@ bsh federation accept-rotation <record.json>
 `enroll` trusts the identity; it grants nothing. `grant` names one capability.
 `revoke` drops the peer and every grant it held. Enrollments and grants are
 persisted in `peers.json` beside the identity with an atomic write.
+
+### Pairing two local profiles
+
+Linking is automatic; trusting is one command. `pair` enrolls both profiles
+with each other and takes both directory locks while it writes:
+
+```sh
+bsh federation pair work --grant builtin/read_file
+# paired <id> (default) <-> <id> (work)
+#   grant: work may invoke builtin/read_file on default
+```
+
+Grants are directional: `--grant` means "the OTHER profile may invoke this
+capability here", so run it once per direction. Both nodes must be stopped
+(the locks are held for a running node's lifetime), a refused pair leaves both
+stores untouched, and the capability must also be listed in this node's
+`[federation] expose` for the node to serve it.
 
 A peer id is the value the other node prints as `node ...` in its own
 `bsh federation status`.

@@ -41,6 +41,7 @@ pub(crate) mod preset_catalogue;
 pub(crate) mod prompts;
 pub(crate) mod reference;
 pub(crate) mod runner;
+pub(crate) mod schedule;
 pub(crate) mod settings;
 pub(crate) mod skill_invocation;
 pub(crate) mod state;
@@ -69,11 +70,108 @@ pub fn extension_cli(args: &[String]) -> i32 {
 ///
 /// This is the headless surface for a node's identity and peer grants: it works
 /// before any window exists, and it is the same state a running node loads.
+/// Select the federation node profile this process runs.
+///
+/// The launch flag (`--federation-profile=work`) calls this before the window
+/// exists; two app instances on one machine share `settings.toml`, so a
+/// per-process switch is what lets the second one run a node of its own.
+/// Returns false for a name that cannot be a directory, so the caller can
+/// refuse the launch instead of silently falling back to the default node.
+pub fn set_federation_profile(name: &str) -> bool {
+    if federation::valid_profile(name) {
+        federation::set_profile(name);
+        true
+    } else {
+        false
+    }
+}
+
+/// Run one `bsh federation` command, profile-aware.
+///
+/// `--profile NAME` (or `-p`) selects which node's files the command reads or
+/// writes; without it the saved profile, then `default`. `profiles` lists every
+/// node on the machine instead of acting on one.
 pub fn federation_cli(args: &[String]) -> i32 {
     let mut out = std::io::stdout();
+    // `--profile` (or `-p`) may lead the command, so it is taken out before the
+    // command dispatch and every subcommand below is profile-scoped.
+    let mut rest: Vec<String> = Vec::with_capacity(args.len());
+    let mut requested: Vec<String> = Vec::new();
+    let mut grants: Vec<String> = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--profile" || arg == "-p" {
+            match iter.next() {
+                Some(name) => requested.push(name.clone()),
+                None => {
+                    eprintln!("--profile needs a name");
+                    return 2;
+                }
+            }
+        } else if let Some(name) = arg.strip_prefix("--profile=") {
+            requested.push(name.to_string());
+        } else if arg == "--grant" {
+            match iter.next() {
+                Some(name) => grants.push(name.clone()),
+                None => {
+                    eprintln!("--grant needs a capability id");
+                    return 2;
+                }
+            }
+        } else if let Some(name) = arg.strip_prefix("--grant=") {
+            grants.push(name.to_string());
+        } else {
+            rest.push(arg.clone());
+        }
+    }
+    for name in &requested {
+        if !federation::valid_profile(name) {
+            eprintln!(
+                "'{name}' is not a valid federation profile name (letters, digits, '-', '_', '.')"
+            );
+            return 2;
+        }
+    }
+    if let Some(name) = requested.first() {
+        federation::set_profile(name);
+    }
     let settings = settings::Settings::load();
-    let name = federation::resolve_node_name(settings.global.federation.node_name.as_deref());
-    federation::command(args, &federation::dir(), Some(&name), &mut out)
+    let profile = federation::resolve_profile(Some(&settings.global.federation.profile));
+    let name = federation::display_name(settings.global.federation.node_name.as_deref(), &profile);
+    let command = rest.first().map(String::as_str);
+    if command == Some("serve") {
+        // One process, one node per profile: repeating --profile runs several.
+        let profiles = if requested.is_empty() {
+            vec![profile.clone()]
+        } else {
+            requested.clone()
+        };
+        return federation::serve(&settings, &profiles);
+    }
+    if command == Some("pair") {
+        let Some(other) = rest.get(1) else {
+            eprintln!("pair needs the other profile's name: bsh federation pair <profile>");
+            return 2;
+        };
+        return federation::pair(&federation::dir(), &profile, other, &grants, &mut out);
+    }
+    if !grants.is_empty() {
+        eprintln!("--grant is only meaningful for the pair command");
+        return 2;
+    }
+    if command == Some("profiles") {
+        return federation::profiles(
+            &federation::dir(),
+            settings.global.federation.node_name.as_deref(),
+            &mut out,
+        );
+    }
+    federation::command(
+        &rest,
+        &federation::node_dir_for(&profile),
+        Some(&name),
+        &mut out,
+    )
 }
 
 /// Launch the BOS Harness desktop window. Blocks until the window closes.

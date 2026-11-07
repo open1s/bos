@@ -2732,7 +2732,7 @@ impl Shell {
             })
             .unwrap_or_default();
         self.right.federation.artifacts =
-            federation_artifact_rows(&crate::federation::dir().join("artifacts"));
+            federation_artifact_rows(&self.state.settings.federation_dir().join("artifacts"));
         self.right.federation.knowledge_items = runtime
             .as_ref()
             .map(|runtime| {

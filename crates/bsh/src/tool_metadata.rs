@@ -28,6 +28,12 @@ pub(crate) fn builtin_metadata(name: &str) -> Option<ToolMetadata> {
             .with_side_effects(["write"])
             .with_permissions(["fs.write:workspace"]),
         "update_plan" => local("plan.write", "low"),
+        "schedule_list" => read_only("schedule.read"),
+        "schedule_create" | "schedule_edit" | "schedule_delete" => ToolMetadata::new()
+            .with_version("1.0.0")
+            .with_risk("medium")
+            .with_side_effects(["write"])
+            .with_permissions(["schedule.write"]),
         "get_goal" => local("goal.read", "low"),
         "update_goal" => local("goal.write", "medium"),
         "web_search" => ToolMetadata::new()
@@ -133,6 +139,8 @@ mod tests {
             "job_list",
             "send_message",
             "interrupt_agent",
+            "schedule_create",
+            "schedule_list",
         ] {
             let metadata = builtin_metadata(name).unwrap_or_else(|| panic!("{name} is declared"));
             assert_eq!(metadata.version.as_deref(), Some("1.0.0"), "{name}");

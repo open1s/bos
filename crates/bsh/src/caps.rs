@@ -1190,14 +1190,47 @@ fn build_agent_for_session_inner(
         }
     }
 
+    // The model's own automation tasks, mounted by the `schedule` bundle the
+    // shipped presets list. Read Only never reaches here at all because it
+    // grants no writes, the reader's per-tool switches close one tool at a
+    // time, and the Extensions list closes the bundle.
+    //
+    // The tools never touch settings: a turn is built from a snapshot, so they
+    // queue a request and the shell applies it (see crate::schedule).
+    if writes && !off_bundle("schedule") {
+        let mut tools: Vec<Arc<dyn agent::tools::Tool>> = Vec::new();
+        for tool in schedule_tools(settings.global.schedules.clone(), session) {
+            if off_tool(tool.name()) {
+                continue;
+            }
+            let metadata = declare(tool.name());
+            tools.push(Arc::new(DeclaredTool::new(tool, metadata)));
+        }
+        if !tools.is_empty() {
+            bundles.push(plugins::Bundle::new("schedule", tools));
+        }
+    }
+
     // Federation is a first-class tool family, not a hidden pane action: the
     // model lists peers and delegates through the same signed node the UI uses.
     if (crate::federation_node::running().is_some() || settings.global.federation.enabled)
         && !off_bundle("federation")
     {
         let mut tools: Vec<Arc<dyn agent::tools::Tool>> = Vec::new();
+        // Read Only keeps the QUERIES (status, peers, knowledge) and loses the
+        // actions: delegating work to a peer and deleting a peer's artifacts
+        // are writes this turn may not perform.
+        let writes = allows_writes(&permission);
         for tool in crate::federation_tools::FederationTool::bundle() {
             let name = tool.name().to_string();
+            if !writes
+                && matches!(
+                    name.as_str(),
+                    "federation_delegate" | "federation_cancel" | "federation_cleanup"
+                )
+            {
+                continue;
+            }
             if off_tool(&name) {
                 continue;
             }
@@ -5043,6 +5076,300 @@ fn list_dir_tool(
     )
 }
 
+/// The model's automation-task tools.
+///
+/// Each tool validates its own fields and queues a [crate::schedule::ScheduleRequest];
+/// the shell applies the batch at the turn's end and saves once. The list tool
+/// shows the saved tasks plus what is still pending, so a create and a list in
+/// the same turn do not contradict each other.
+///
+/// Scheduling is capped by the same name and prompt rules the pane enforces,
+/// and a task is always owned by the session that created it: a model cannot
+/// park work in a conversation the reader is not looking at.
+fn schedule_tools(
+    saved: Vec<crate::settings::global::Schedule>,
+    session: &str,
+) -> Vec<Arc<dyn agent::tools::Tool>> {
+    use crate::schedule::{ScheduleQueue, ScheduleRequest};
+    use crate::settings::global::GlobalSettings;
+
+    let queue = Arc::clone(ScheduleQueue::global());
+    let session = session.to_string();
+    let mut tools: Vec<Arc<dyn agent::tools::Tool>> = Vec::new();
+
+    let create_queue = queue.clone();
+    let create_session = session.clone();
+    tools.push(Arc::new(FunctionTool::new(
+        "schedule_create",
+        "Create a scheduled task: a prompt the scheduler sends to this session. every_seconds = 0 runs it once; N repeats every N seconds while the app is open.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "prompt": { "type": "string", "description": "The instruction sent when the task fires; write it as a complete request." },
+                "name": { "type": "string", "description": "Short title; defaults to the prompt's first line." },
+                "every_seconds": { "type": "integer", "minimum": 0, "description": "Seconds between runs; 0 (default) runs once." },
+                "session_id": { "type": "string", "description": "Session to run in; omit for this one." }
+            },
+            "required": ["prompt"],
+            "additionalProperties": false
+        }),
+        move |args| {
+            let prompt = args
+                .get("prompt")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if prompt.is_empty() {
+                return Err(ToolError::InvalidInput(
+                    "prompt is required and must not be empty".to_string(),
+                ));
+            }
+            let name = match args.get("name").and_then(serde_json::Value::as_str) {
+                Some(name) if !name.trim().is_empty() => name.trim().to_string(),
+                Some(_) => {
+                    return Err(ToolError::InvalidInput(
+                        "name must not be empty when it is given".to_string(),
+                    ))
+                }
+                None => default_task_name(prompt),
+            };
+            if name.chars().count() > GlobalSettings::NAME_LIMIT {
+                return Err(ToolError::InvalidInput(format!(
+                    "name is longer than {} characters",
+                    GlobalSettings::NAME_LIMIT
+                )));
+            }
+            if let Some(wanted) = args.get("session_id").and_then(serde_json::Value::as_str) {
+                if !wanted.trim().is_empty() && wanted.trim() != create_session {
+                    return Err(ToolError::InvalidInput(
+                        "a task runs in the session that created it; omit session_id to use this one"
+                            .to_string(),
+                    ));
+                }
+            }
+            let every_seconds = args
+                .get("every_seconds")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let id = create_queue.next_id();
+            create_queue.push(ScheduleRequest::Create {
+                id: id.clone(),
+                name: name.clone(),
+                prompt: prompt.to_string(),
+                session_id: create_session.clone(),
+                every_seconds,
+            });
+            Ok(serde_json::json!({
+                "id": id,
+                "name": name,
+                "session_id": create_session,
+                "every_seconds": every_seconds,
+                "status": "pending",
+                "applies": "when this turn ends; call schedule_list to confirm"
+            }))
+        },
+    )));
+
+    let list_saved = saved.clone();
+    let list_queue = queue.clone();
+    tools.push(Arc::new(FunctionTool::new(
+        "schedule_list",
+        "List automation tasks with cadence, enabled state, last run and next run, plus changes still pending from this turn.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }),
+        move |_args| {
+            let now = crate::settings::global::unix_now();
+            let schedules: Vec<serde_json::Value> = list_saved
+                .iter()
+                .map(|task| {
+                    let next = if !task.enabled {
+                        serde_json::Value::Null
+                    } else if task.last_run == 0 {
+                        serde_json::json!(now)
+                    } else if task.every_seconds == 0 {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::json!(task.last_run.saturating_add(task.every_seconds))
+                    };
+                    serde_json::json!({
+                        "id": task.id,
+                        "name": task.name,
+                        "prompt": task.prompt,
+                        "session_id": task.session_id,
+                        "every_seconds": task.every_seconds,
+                        "enabled": task.enabled,
+                        "last_run": task.last_run,
+                        "next_run": next,
+                    })
+                })
+                .collect();
+            let pending: Vec<serde_json::Value> = list_queue
+                .snapshot()
+                .iter()
+                .map(describe_schedule_request)
+                .collect();
+            Ok(serde_json::json!({
+                "schedules": schedules,
+                "pending": pending,
+            }))
+        },
+    )));
+
+    let edit_saved = saved.clone();
+    let edit_queue = queue.clone();
+    tools.push(Arc::new(FunctionTool::new(
+        "schedule_edit",
+        "Change a task's name, prompt, cadence or enabled state (false pauses, true resumes, including a one-shot task that already ran).",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "Task id from schedule_list." },
+                "name": { "type": "string", "description": "New title." },
+                "prompt": { "type": "string", "description": "New instruction." },
+                "every_seconds": { "type": "integer", "minimum": 0, "description": "New cadence; 0 means one shot." },
+                "enabled": { "type": "boolean", "description": "false pauses, true resumes." }
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        }),
+        move |args| {
+            let id = required_id(args)?;
+            if !edit_saved.iter().any(|task| task.id == id) {
+                return Err(ToolError::InvalidInput(format!(
+                    "no automation task '{id}'; call schedule_list"
+                )));
+            }
+            let name = optional_text(args, "name")?;
+            if let Some(name) = &name {
+                if name.chars().count() > GlobalSettings::NAME_LIMIT {
+                    return Err(ToolError::InvalidInput(format!(
+                        "name is longer than {} characters",
+                        GlobalSettings::NAME_LIMIT
+                    )));
+                }
+            }
+            let prompt = optional_text(args, "prompt")?;
+            let every_seconds = args
+                .get("every_seconds")
+                .and_then(serde_json::Value::as_u64);
+            let enabled = args.get("enabled").and_then(serde_json::Value::as_bool);
+            if name.is_none() && prompt.is_none() && every_seconds.is_none() && enabled.is_none() {
+                return Err(ToolError::InvalidInput(
+                    "nothing to change; pass name, prompt, every_seconds or enabled".to_string(),
+                ));
+            }
+            edit_queue.push(ScheduleRequest::Edit {
+                id: id.clone(),
+                name,
+                prompt,
+                every_seconds,
+                enabled,
+            });
+            Ok(serde_json::json!({
+                "id": id,
+                "status": "pending",
+                "applies": "when this turn ends; call schedule_list to confirm"
+            }))
+        },
+    )));
+
+    let delete_saved = saved;
+    let delete_queue = queue;
+    tools.push(Arc::new(FunctionTool::new(
+        "schedule_delete",
+        "Delete an automation task. Deleting stops the next firing, not a turn it already started.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "Task id from schedule_list." }
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        }),
+        move |args| {
+            let id = required_id(args)?;
+            if !delete_saved.iter().any(|task| task.id == id) {
+                return Err(ToolError::InvalidInput(format!(
+                    "no automation task '{id}'; call schedule_list"
+                )));
+            }
+            delete_queue.push(ScheduleRequest::Remove { id: id.clone() });
+            Ok(serde_json::json!({
+                "id": id,
+                "status": "pending",
+                "applies": "when this turn ends; call schedule_list to confirm"
+            }))
+        },
+    )));
+
+    tools
+}
+
+/// The task id every edit/delete call must carry.
+fn required_id(args: &serde_json::Value) -> Result<String, ToolError> {
+    match args.get("id").and_then(serde_json::Value::as_str) {
+        Some(id) if !id.trim().is_empty() => Ok(id.trim().to_string()),
+        _ => Err(ToolError::InvalidInput(
+            "id is required; call schedule_list for the ids".to_string(),
+        )),
+    }
+}
+
+/// An optional non-empty text field, refusing an explicit empty string.
+fn optional_text(args: &serde_json::Value, key: &str) -> Result<Option<String>, ToolError> {
+    match args.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(text)) if !text.trim().is_empty() => {
+            Ok(Some(text.trim().to_string()))
+        }
+        Some(_) => Err(ToolError::InvalidInput(format!(
+            "{key} must be a non-empty string when it is given"
+        ))),
+    }
+}
+
+/// The default task title: the prompt's first line, bounded.
+fn default_task_name(prompt: &str) -> String {
+    let line = prompt.lines().next().unwrap_or("").trim();
+    let name: String = line.chars().take(60).collect();
+    if name.is_empty() {
+        "Scheduled task".to_string()
+    } else {
+        name
+    }
+}
+
+/// One pending request as the list tool reports it.
+fn describe_schedule_request(request: &crate::schedule::ScheduleRequest) -> serde_json::Value {
+    use crate::schedule::ScheduleRequest;
+    match request {
+        ScheduleRequest::Create {
+            id,
+            name,
+            prompt,
+            session_id,
+            every_seconds,
+        } => serde_json::json!({
+            "action": "create", "id": id, "name": name, "prompt": prompt,
+            "session_id": session_id, "every_seconds": every_seconds,
+        }),
+        ScheduleRequest::Edit {
+            id,
+            name,
+            prompt,
+            every_seconds,
+            enabled,
+        } => serde_json::json!({
+            "action": "edit", "id": id, "name": name, "prompt": prompt,
+            "every_seconds": every_seconds, "enabled": enabled,
+        }),
+        ScheduleRequest::Remove { id } => serde_json::json!({ "action": "delete", "id": id }),
+    }
+}
+
 /// Open the file-backed memory store on a short-lived runtime.
 ///
 /// FileMemory::open is async while the build is sync and may run inside an
@@ -5085,6 +5412,9 @@ mod tests {
     use crate::settings::Settings;
     use crate::vault::Vault;
     use agent::policy::{Action, EgressRuleSet, PolicyInput, Target};
+
+    /// Serialises the tests that share the process-wide schedule queue.
+    static SCHEDULE_QUEUE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// The browser's tools are reachable without being advertised. A pane the
     /// model cannot drive is a picture, so the nine names must be on the agent
@@ -7621,6 +7951,12 @@ mod tests {
                 "diagnostics__why".to_string(),
                 "edit_file".to_string(),
                 "extensions__list".to_string(),
+                "federation_cancel".to_string(),
+                "federation_cleanup".to_string(),
+                "federation_delegate".to_string(),
+                "federation_peers".to_string(),
+                "federation_query".to_string(),
+                "federation_status".to_string(),
                 "glob".to_string(),
                 "grep".to_string(),
                 "job_kill".to_string(),
@@ -7629,11 +7965,16 @@ mod tests {
                 "list_dir".to_string(),
                 "read_file".to_string(),
                 "read_files".to_string(),
+                "schedule_create".to_string(),
+                "schedule_delete".to_string(),
+                "schedule_edit".to_string(),
+                "schedule_list".to_string(),
                 "update_plan".to_string(),
                 "write_file".to_string(),
             ],
             "Workspace Write carries the whole shell family, including the \
-             job tools its own read-write turn may start"
+             job tools its own read-write turn may start, the federation \
+             family and the automation-task tools"
         );
         assert_eq!(
             names(&read_only),
@@ -7641,6 +7982,9 @@ mod tests {
                 "diagnostics__graph".to_string(),
                 "diagnostics__why".to_string(),
                 "extensions__list".to_string(),
+                "federation_peers".to_string(),
+                "federation_query".to_string(),
+                "federation_status".to_string(),
                 "glob".to_string(),
                 "grep".to_string(),
                 "list_dir".to_string(),
@@ -7648,7 +7992,8 @@ mod tests {
                 "read_files".to_string(),
                 "update_plan".to_string(),
             ],
-            "Read Only must drop the shell and the writer, and keep the readers"
+            "Read Only must drop the shell, the writer and the peer ACTIONS, \
+             and keep the readers - including the federation queries"
         );
     }
 
@@ -8351,15 +8696,22 @@ verdict := {{"allow": false, "rule": "{rule}", "reason": "refused by the workspa
         assert_eq!(build(&settings).agent.config().max_steps, 0);
     }
 
-    /// The tool array's wire size stays inside a budget.
+    /// The ADVERTISED tool array's wire size stays inside a budget.
     ///
-    /// The schemas ride EVERY request as part of the provider's cached prompt
+    /// These schemas ride EVERY request as part of the provider's cached prompt
     /// prefix, so each essay-length description is re-prefilled on every cache
     /// miss and burns window the conversation needs. Built-in Tools 2.0 added
     /// `read_files` and `apply_patch` and the measured set is 17,191 chars
     /// across 22 tools, so the ceiling sits just above it: a new essay-length
     /// description trips the test, while the shipped surface fits. Raising this
     /// number again is the wrong fix - trim the copy instead.
+    ///
+    /// A DEFERRED tool is not in the array: the browser family and the
+    /// federation family are registered and callable through `find_tool` /
+    /// `call_tool`, which is how a rare family stays off every request. The
+    /// measure is therefore the advertised set, not the registry - counting a
+    /// schema that is never sent would charge the budget for a tool the model
+    /// cannot see until it asks.
     #[test]
     fn the_tool_array_stays_inside_its_wire_budget() {
         const WIRE_BUDGET_CHARS: usize = 18_000;
@@ -8370,6 +8722,9 @@ verdict := {{"allow": false, "rule": "{rule}", "reason": "refused by the workspa
             .expect("the default build registers tools");
         let mut schemas: Vec<String> = Vec::new();
         for (name, tool) in registry.iter() {
+            if tool.deferred() {
+                continue;
+            }
             schemas.push(
                 serde_json::json!({
                     "type": "function",
@@ -8384,6 +8739,9 @@ verdict := {{"allow": false, "rule": "{rule}", "reason": "refused by the workspa
         }
         for name in registry.async_tool_names() {
             if let Some(tool) = registry.get_async(&name) {
+                if tool.deferred() {
+                    continue;
+                }
                 schemas.push(
                     serde_json::json!({
                         "type": "function",
@@ -10862,6 +11220,158 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
                 other => panic!("expected the stale-run refusal, got {other:?}"),
             }
         });
+    }
+
+    /// The model's automation-task tools ride a writable turn and are absent
+    /// from a read-only one: scheduling spends future turns, so Read Only must
+    /// not reach it.
+    #[test]
+    fn the_build_carries_the_schedule_tools() {
+        let names = tool_names(&build(&bare()));
+        for name in [
+            "schedule_create",
+            "schedule_edit",
+            "schedule_list",
+            "schedule_delete",
+        ] {
+            assert!(names.iter().any(|tool| tool == name), "{name}: {names:?}");
+        }
+
+        let read_only = build(&with_tools(READ_ONLY, None));
+        let names = tool_names(&read_only);
+        assert!(
+            !names.iter().any(|tool| tool.starts_with("schedule_")),
+            "a read-only turn schedules nothing: {names:?}"
+        );
+    }
+
+    /// A create call queues a request the host applies to the real settings
+    /// document; the tool itself never writes it.
+    #[test]
+    fn a_schedule_tool_queues_a_task_the_host_applies() {
+        use crate::schedule::ScheduleQueue;
+        // This test owns the queue for its duration; the sibling queue test
+        // takes the same lock.
+        let _queue = SCHEDULE_QUEUE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = ScheduleQueue::global().drain();
+        let built = build(&bare());
+        let created = built
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "schedule_create",
+                &serde_json::json!({
+                    "prompt": "Check the federation peers and report any that are down.",
+                    "every_seconds": 3600
+                }),
+            )
+            .expect("the task is accepted");
+        let id = created["id"].as_str().expect("an id").to_string();
+        assert_eq!(created["status"], "pending");
+
+        let requests = ScheduleQueue::global().drain();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        let crate::schedule::ScheduleRequest::Create {
+            id: queued_id,
+            name,
+            every_seconds,
+            ..
+        } = &requests[0]
+        else {
+            panic!("expected a create request, got {:?}", requests[0]);
+        };
+        assert_eq!(queued_id, &id);
+        assert_eq!(*every_seconds, 3600);
+        assert!(name.starts_with("Check the federation peers"), "{name}");
+
+        let mut global = crate::settings::Settings::default().global;
+        global
+            .apply_schedule_request(&requests[0])
+            .expect("the host applies it");
+        assert_eq!(global.schedules.len(), 1);
+        assert_eq!(global.schedules[0].id, id);
+    }
+
+    /// The list tool reports the saved tasks and any request still waiting for
+    /// the shell, so a create and a list in one turn do not disagree.
+    #[test]
+    fn schedule_list_reports_saved_and_pending_tasks() {
+        use crate::schedule::{ScheduleQueue, ScheduleRequest};
+        let _queue = SCHEDULE_QUEUE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = ScheduleQueue::global().drain();
+        let mut settings = bare();
+        settings
+            .global
+            .add_schedule("Nightly", "summarize the day", "session", 86_400)
+            .expect("a saved task");
+        let built = build(&settings);
+        let listed = built
+            .agent
+            .registry()
+            .expect("registry")
+            .execute("schedule_list", &serde_json::json!({}))
+            .expect("the list");
+        assert_eq!(listed["schedules"][0]["name"], "Nightly");
+        assert_eq!(listed["schedules"][0]["every_seconds"], 86_400);
+
+        ScheduleQueue::global().push(ScheduleRequest::Remove {
+            id: "task-pending".to_string(),
+        });
+        let listed = built
+            .agent
+            .registry()
+            .expect("registry")
+            .execute("schedule_list", &serde_json::json!({}))
+            .expect("the list");
+        assert_eq!(listed["pending"][0]["action"], "delete");
+        let _ = ScheduleQueue::global().drain();
+    }
+
+    /// The shipped everyday presets carry the federation family. It is
+    /// CALLABLE through `find_tool`/`call_tool` without riding every request,
+    /// and the Extensions switch still closes it.
+    #[test]
+    fn the_standard_preset_offers_the_federation_tools() {
+        let built = build(&bare());
+        let names = tool_names(&built);
+        for name in [
+            "federation_status",
+            "federation_peers",
+            "federation_delegate",
+        ] {
+            assert!(names.iter().any(|tool| tool == name), "{name}: {names:?}");
+        }
+        let advertised: Vec<String> = built
+            .agent
+            .model_tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert!(
+            advertised.iter().any(|tool| tool == "federation_status"),
+            "the status probe is the signpost in the array: {advertised:?}"
+        );
+        assert!(
+            !advertised.iter().any(|tool| tool == "federation_delegate"),
+            "the rest of the family is withheld: {advertised:?}"
+        );
+        assert!(
+            advertised.iter().any(|tool| tool == "find_tool"),
+            "and the discovery pair is what reaches it: {advertised:?}"
+        );
+
+        let mut off = bare();
+        off.workspace.disabled.extensions = vec!["federation".to_string()];
+        let names = tool_names(&build(&off));
+        assert!(
+            !names.iter().any(|tool| tool.starts_with("federation_")),
+            "the Extensions switch closes the family: {names:?}"
+        );
     }
 
     /// `interrupt_agent` aborts the child's task, releases its slot and marks

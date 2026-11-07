@@ -1314,8 +1314,11 @@ impl Shell {
             InputState::new(window, cx)
                 .placeholder(crate::i18n::tr(lang, "right.browser.urlPlaceholder"))
         });
-        let machine_name = crate::federation::resolve_node_name(
+        let federation_profile =
+            crate::federation::resolve_profile(Some(&state.settings.global.federation.profile));
+        let machine_name = crate::federation::display_name(
             state.settings.global.federation.node_name.as_deref(),
+            &federation_profile,
         );
         let federation_name =
             cx.new(|cx| InputState::new(window, cx).placeholder(machine_name.clone()));
@@ -3920,6 +3923,39 @@ impl Shell {
         self.spawn_turn(id.to_string(), input, transcript, budget, cx);
     }
 
+    /// Apply the automation-task changes the model's tools queued.
+    ///
+    /// The tools cannot write settings themselves - a turn is built from a
+    /// snapshot - so they queue a request and the shell owns the write. One
+    /// save covers the batch, and the pane, the clock and the model's next
+    /// `schedule_list` then read the same list.
+    pub(crate) fn apply_schedule_requests(&mut self, cx: &mut Context<Self>) {
+        let requests = crate::schedule::ScheduleQueue::global().drain();
+        if requests.is_empty() {
+            return;
+        }
+        let mut changed = false;
+        for request in requests {
+            match self.state.settings.global.apply_schedule_request(&request) {
+                Ok(()) => changed = true,
+                // The tool validated the same fields, so a refusal here is a
+                // race with another writer, not a user error: log it and move on.
+                Err(refusal) => {
+                    log::warn!(
+                        "automation task request refused ({}): {refusal:?}",
+                        request.describe()
+                    );
+                }
+            }
+        }
+        if changed {
+            if let Err(error) = self.state.settings.save_global() {
+                log::warn!("automation task changes could not be saved: {error}");
+            }
+        }
+        cx.notify();
+    }
+
     /// Start every automation task that has come due.
     ///
     /// The reference runs a task in the session it was created in, so its events
@@ -3929,6 +3965,10 @@ impl Shell {
     /// into nothing, and a task whose session is already streaming is skipped for
     /// this tick.
     pub(crate) fn check_schedules(&mut self, cx: &mut Context<Self>) {
+        // A turn may have queued task changes through the model's tools; they
+        // land before this tick decides what is due, so a task created in the
+        // turn that just ended can fire on the same tick.
+        self.apply_schedule_requests(cx);
         let now = crate::settings::unix_now();
         let due = self.state.settings.global.due_schedules(now);
         for id in due {
@@ -4204,6 +4244,9 @@ impl Shell {
                         // effect BEFORE the loop decides to continue: a
                         // completed or blocked goal must not start round n+1.
                         shell.state.settle_goal(&session_id);
+                        // A task the model created during this turn lands now,
+                        // before the composer returns to the reader.
+                        shell.apply_schedule_requests(cx);
                         shell.state.persist_subagents();
                         // A finished turn can append trajectory rows, so a page
                         // the trace had exhausted is worth asking for again.
@@ -4246,6 +4289,7 @@ impl Shell {
                 // completion committed before the reader stopped the round is
                 // not thrown away.
                 shell.state.settle_goal(&id);
+                shell.apply_schedule_requests(cx);
                 shell.state.persist_subagents();
                 shell.trace_done = false;
                 shell.drain_inbox(&id, cx);

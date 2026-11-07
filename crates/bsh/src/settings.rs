@@ -737,12 +737,26 @@ impl Settings {
         }
     }
 
+    /// The node profile this process runs.
+    ///
+    /// The launch flag, the environment, then `[federation] profile`, then
+    /// `default`. The pane, the audit reader and the runtime resolve through
+    /// this one function, so they cannot disagree about which node is on.
+    pub(crate) fn federation_profile(&self) -> String {
+        crate::federation::resolve_profile(Some(&self.global.federation.profile))
+    }
+
+    /// The directory this process's federation node keeps its files in.
+    pub(crate) fn federation_dir(&self) -> PathBuf {
+        crate::federation::node_dir_for(&self.federation_profile())
+    }
+
     /// The federation audit log the runtime writes.
     pub(crate) fn federation_audit_path(&self) -> Option<PathBuf> {
         let directory = match &self.global.federation.identity_path {
             Some(path) => PathBuf::from(path).parent().map(Path::to_path_buf)?,
             None if cfg!(test) => return None,
-            None => crate::settings::dir().join("federation"),
+            None => self.federation_dir(),
         };
         Some(directory.join("audit.jsonl"))
     }
@@ -758,7 +772,7 @@ impl Settings {
         {
             Some(path) => Some(path),
             None if cfg!(test) => None,
-            None => Some(crate::federation::dir().join("peers.json")),
+            None => Some(self.federation_dir().join("peers.json")),
         }
     }
 
@@ -1726,15 +1740,18 @@ mod tests {
         assert!(settings.is_due(&settings.schedules[0], 61));
         assert_eq!(settings.next_run(&settings.schedules[0], 30), Some(61));
 
-        // A repeated name on another session is a second task, not a clash.
-        assert!(settings
+        // A repeated name on another session is a second task, not a clash -
+        // and two tasks created in one second still get distinct ids.
+        let other = settings
             .add_schedule("Nightly digest", "x", "s-2", 1)
-            .is_ok());
+            .expect("a second task");
+        assert_ne!(other, id, "the ids are distinct");
         assert_eq!(settings.schedules.len(), 2);
         assert!(settings.toggle_schedule(&id));
         assert!(!settings.is_due(&settings.schedules[0], 10_000));
         assert!(settings.remove_schedule(&id));
         assert!(!settings.remove_schedule(&id));
+        assert!(settings.remove_schedule(&other));
         assert!(settings.schedules.is_empty());
     }
 
@@ -1745,6 +1762,88 @@ mod tests {
         let mut settings = GlobalSettings::default();
         assert!(settings.add_schedule("", "prompt", "s", 60).is_err());
         assert!(settings.add_schedule("name", "   ", "s", 60).is_err());
+    }
+
+    /// The model's tools mint the id and change tasks through the same
+    /// validated path the pane uses, so the two editors cannot disagree about
+    /// what a task is.
+    #[test]
+    fn a_minted_task_id_is_unique_and_editable() {
+        let mut settings = GlobalSettings::default();
+        settings
+            .add_schedule_with_id("task-1", "First", "one", "s", 60)
+            .expect("the first task");
+        assert_eq!(
+            settings.add_schedule_with_id("task-1", "Again", "two", "s", 60),
+            Err(super::ScheduleRefusal::Id),
+            "an id is never reused"
+        );
+        settings
+            .add_schedule_with_id("task-2", "Second", "two", "s", 0)
+            .expect("a second task");
+
+        settings
+            .edit_schedule("task-1", Some("Renamed"), None, Some(0), Some(false))
+            .expect("edited");
+        let task = settings
+            .schedules
+            .iter()
+            .find(|task| task.id == "task-1")
+            .expect("the task");
+        assert_eq!(task.name, "Renamed");
+        assert_eq!(task.every_seconds, 0);
+        assert!(!task.enabled);
+
+        // A refused edit changes nothing.
+        assert_eq!(
+            settings.edit_schedule("task-1", Some(""), None, None, None),
+            Err(super::ScheduleRefusal::Name)
+        );
+        assert_eq!(
+            settings
+                .schedules
+                .iter()
+                .find(|task| task.id == "task-1")
+                .expect("the task")
+                .name,
+            "Renamed"
+        );
+        assert_eq!(
+            settings.edit_schedule("missing", None, Some("x"), None, None),
+            Err(super::ScheduleRefusal::Unknown)
+        );
+    }
+
+    /// A queued request applies through the same API the pane uses.
+    #[test]
+    fn a_queued_request_applies_to_the_task_list() {
+        let mut settings = GlobalSettings::default();
+        let create = crate::schedule::ScheduleRequest::Create {
+            id: "task-9".to_string(),
+            name: "Nightly".to_string(),
+            prompt: "check peers".to_string(),
+            session_id: "s".to_string(),
+            every_seconds: 30,
+        };
+        settings.apply_schedule_request(&create).expect("created");
+        assert_eq!(settings.schedules.len(), 1);
+
+        let edit = crate::schedule::ScheduleRequest::Edit {
+            id: "task-9".to_string(),
+            name: None,
+            prompt: Some("check peers twice".to_string()),
+            every_seconds: None,
+            enabled: Some(false),
+        };
+        settings.apply_schedule_request(&edit).expect("edited");
+        assert_eq!(settings.schedules[0].prompt, "check peers twice");
+        assert!(!settings.schedules[0].enabled);
+
+        let remove = crate::schedule::ScheduleRequest::Remove {
+            id: "task-9".to_string(),
+        };
+        settings.apply_schedule_request(&remove).expect("removed");
+        assert!(settings.schedules.is_empty());
     }
 
     /// Presets are declared in the file, so the retired preset directory has

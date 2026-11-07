@@ -7,6 +7,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use agent::capability::{unix_ms, CapabilityId, NodeId};
 use federation::identity::is_valid_node_id;
@@ -17,6 +18,217 @@ use federation::{
 /// The directory a federation node keeps its files in.
 pub(crate) fn dir() -> PathBuf {
     crate::settings::dir().join("federation")
+}
+
+/// The profile name used when nothing names one.
+pub(crate) const DEFAULT_PROFILE: &str = "default";
+
+/// The launch-time profile override (`--federation-profile`).
+///
+/// A process-global because a launch has one node: the flag is read before the
+/// window exists and the node's files are resolved from it later, on the
+/// federation thread.
+static PROFILE: OnceLock<String> = OnceLock::new();
+
+/// Set the profile this process runs; later calls are ignored.
+pub(crate) fn set_profile(name: &str) {
+    let _ = PROFILE.set(name.trim().to_string());
+}
+
+/// Whether a name can be a profile.
+///
+/// A profile becomes a directory under bsh's federation directory, so the rule
+/// is a directory-name rule: no separators, no `.`/`..`, no hidden leading
+/// dot, and a bounded length. Everything else is refused where the reader can
+/// see it instead of being silently rewritten.
+pub(crate) fn valid_profile(name: &str) -> bool {
+    let name = name.trim();
+    !name.is_empty()
+        && name.len() <= 64
+        && name != "."
+        && name != ".."
+        && !name.starts_with('.')
+        && name.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+}
+
+/// The profile this process runs: the launch flag, then the environment, then
+/// the saved setting, then `default`.
+///
+/// Two app instances on one machine share `settings.toml`, so the flag and the
+/// environment are what let the second instance run its own node without
+/// editing the document the first one also reads.
+pub(crate) fn resolve_profile(configured: Option<&str>) -> String {
+    if let Some(name) = PROFILE.get() {
+        return name.clone();
+    }
+    if let Ok(name) = std::env::var("BSH_FEDERATION_PROFILE") {
+        if valid_profile(&name) {
+            return name.trim().to_string();
+        }
+    }
+    configured
+        .filter(|name| valid_profile(name))
+        .map(|name| name.trim().to_string())
+        .unwrap_or_else(|| DEFAULT_PROFILE.to_string())
+}
+
+/// The directory one profile's files live in.
+///
+/// The default profile keeps today's paths, so an existing node is not moved by
+/// this feature; every other profile is a subdirectory of the same root and
+/// therefore a node of its own - its own key, peer store, delegations and audit
+/// log.
+pub(crate) fn node_dir_for(profile: &str) -> PathBuf {
+    node_dir_in(&dir(), profile)
+}
+
+/// The directory one profile's files live in under an explicit root.
+///
+/// The tests and the pairing command need the same layout without touching the
+/// process's real data directory.
+pub(crate) fn node_dir_in(root: &Path, profile: &str) -> PathBuf {
+    if profile == DEFAULT_PROFILE {
+        root.to_path_buf()
+    } else {
+        root.join(profile)
+    }
+}
+
+/// The name a node shows to peers, tagged with its profile when it is not the
+/// default: two nodes on one machine must be distinguishable in a peer list.
+pub(crate) fn display_name(configured: Option<&str>, profile: &str) -> String {
+    let base = resolve_node_name(configured);
+    if profile == DEFAULT_PROFILE {
+        base
+    } else {
+        format!("{base} ({profile})")
+    }
+}
+
+/// Run this profile's node headlessly until the process is interrupted.
+///
+/// This is what makes several nodes on one machine a one-liner: no window per
+/// node, no second settings file, and each node holds its own profile's locks.
+/// The node's tasks live on the shared runtime, so this thread only has to keep
+/// the process alive.
+pub(crate) fn serve(settings: &crate::settings::Settings, profiles: &[String]) -> i32 {
+    // A headless node must be diagnosable: the transport's own reasons (a taken
+    // port, a refused endpoint) are written to the log, and without this they
+    // go nowhere.
+    let log_dir = crate::settings::dir().join("log");
+    std::fs::create_dir_all(&log_dir).ok();
+    logging::auto_init_tracing_in(log_dir, "bsh");
+    if !settings.global.federation.enabled {
+        eprintln!("federation is disabled: set [federation] enabled = true in settings.toml");
+        return 1;
+    }
+    if profiles.is_empty() {
+        eprintln!("serve needs at least one profile");
+        return 2;
+    }
+    // One process, one node per profile: several heads, one supervisor.
+    for (index, profile) in profiles.iter().enumerate() {
+        if !crate::federation_node::start_profile(settings, profile, index == 0) {
+            eprintln!(
+                "the federation node did not start (profile {profile}); another process may already own profile {profile}'s files, or a TLS node is already running in this one"
+            );
+            return 1;
+        }
+    }
+    let mut last: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for (profile, runtime) in crate::federation_node::running_profiles() {
+        println!(
+            "[{profile}] {} identity {}",
+            runtime.status(),
+            node_dir_for(&profile).join("node.key").display()
+        );
+        last.insert(profile, runtime.status());
+    }
+    println!("stop with Ctrl-C");
+    // Watch every node rather than simply sleeping: a peer that appears is the
+    // one fact the reader came for, and it is otherwise invisible without a
+    // window.
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        let running = crate::federation_node::running_profiles();
+        if running.is_empty() {
+            eprintln!("all federation nodes stopped");
+            return 2;
+        }
+        for (profile, runtime) in running {
+            let status = runtime.status();
+            if last.get(&profile) != Some(&status) {
+                println!("[{profile}] {status}");
+                last.insert(profile, status);
+            }
+        }
+    }
+}
+
+/// List the node profiles on this machine: one row per profile that has a key.
+///
+/// This is the "what is running here" answer for a host that runs several
+/// nodes: the state column is the directory lock (running when another process
+/// owns it), so the list is live rather than a stored flag.
+pub(crate) fn profiles(root: &Path, name: Option<&str>, out: &mut dyn Write) -> i32 {
+    let mut rows: Vec<(String, PathBuf)> = vec![(DEFAULT_PROFILE.to_string(), root.to_path_buf())];
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(profile) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if valid_profile(&profile) {
+                rows.push((profile, path));
+            }
+        }
+    }
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let _ = writeln!(out, "PROFILE\tSTATE\tPEERS\tNODE\tNAME");
+    let mut shown = 0;
+    for (profile, directory) in rows {
+        let identity_path = directory.join("node.key");
+        if !identity_path.is_file() {
+            continue;
+        }
+        let Ok(identity) = NodeIdentity::load_or_create(&identity_path) else {
+            continue;
+        };
+        let peers = PeerStore::load(&directory.join("peers.json"))
+            .map(|store| store.iter().count())
+            .unwrap_or(0);
+        // The lock IS the liveness probe: a node holds it for its lifetime, so a
+        // profile we can lock is not running anywhere.
+        let state = match crate::federation_lock::DataDirLock::acquire(&directory) {
+            Ok(lock) => {
+                drop(lock);
+                "idle"
+            }
+            Err(_) => "running",
+        };
+        let _ = writeln!(
+            out,
+            "{profile}\t{state}\t{peers}\t{}\t{}",
+            identity.node_id(),
+            display_name(name, &profile)
+        );
+        shown += 1;
+    }
+    if shown == 0 {
+        let _ = writeln!(
+            out,
+            "no federation profiles under {} (the app creates one on first launch)",
+            root.display()
+        );
+    }
+    let _ = writeln!(out, "profiles {shown}");
+    0
 }
 
 /// The name a node shows to peers: the configured one, or the machine's name.
@@ -39,9 +251,113 @@ pub(crate) fn resolve_node_name(configured: Option<&str>) -> String {
     }
 }
 
-const USAGE: &str = "\
-bsh federation <command>
+/// Enroll two local profiles with each other.
+///
+/// Linking is automatic (the transport finds the first node's port), but trust
+/// is explicit by design: this is the one command that writes both peer
+/// stores. `--grant CAP` records that the OTHER profile may invoke CAP on
+/// THIS one; repeat it for several capabilities. The reverse direction is a
+/// second run with the profiles swapped, because a grant is always something
+/// one side gives, never something both sides obtain at once.
+pub(crate) fn pair(
+    root: &Path,
+    profile: &str,
+    other: &str,
+    grants: &[String],
+    out: &mut dyn Write,
+) -> i32 {
+    if !valid_profile(other) {
+        return fail(out, &format!("'{other}' is not a valid profile name"));
+    }
+    if other == profile {
+        return fail(out, "a profile cannot pair with itself");
+    }
+    let this_dir = node_dir_in(root, profile);
+    let other_dir = node_dir_in(root, other);
+    if !other_dir.join("node.key").is_file() {
+        return fail(
+            out,
+            &format!(
+                "profile '{other}' has no node yet; run 'bsh federation --profile {other} status' once"
+            ),
+        );
+    }
+    // Both peer stores are read-modify-write files, so take both directory
+    // locks - in sorted order, so a refused pair can never deadlock.
+    let mut dirs = vec![this_dir.clone(), other_dir.clone()];
+    dirs.sort();
+    let mut locks = Vec::new();
+    for dir in &dirs {
+        match crate::federation_lock::DataDirLock::acquire(dir) {
+            Ok(lock) => locks.push(lock),
+            Err(message) => return fail(out, &message),
+        }
+    }
+    let this = match NodeIdentity::load_or_create(&this_dir.join("node.key")) {
+        Ok(identity) => identity,
+        Err(error) => return fail(out, &error.to_string()),
+    };
+    let peer = match NodeIdentity::load_or_create(&other_dir.join("node.key")) {
+        Ok(identity) => identity,
+        Err(error) => return fail(out, &error.to_string()),
+    };
+    let now = unix_ms();
+    let mut this_store = PeerStore::load(&this_dir.join("peers.json")).unwrap_or_default();
+    let mut other_store = PeerStore::load(&other_dir.join("peers.json")).unwrap_or_default();
+    this_store.enroll(peer.node_id(), now, Some(format!("profile {other}")));
+    other_store.enroll(this.node_id(), now, Some(format!("profile {profile}")));
 
+    let mut granted = Vec::new();
+    for name in grants {
+        let capability: CapabilityId = match name.parse() {
+            Ok(capability) => capability,
+            Err(error) => return fail(out, &format!("invalid capability id '{name}': {error}")),
+        };
+        if let Err(error) = this_store.grant(&peer.node_id(), capability.clone(), now, None) {
+            return fail(out, &error.to_string());
+        }
+        granted.push(capability.to_string());
+    }
+    if let Err(error) = this_store.save(&this_dir.join("peers.json")) {
+        return fail(
+            out,
+            &format!("the {profile} peer store could not be written: {error}"),
+        );
+    }
+    if let Err(error) = other_store.save(&other_dir.join("peers.json")) {
+        return fail(
+            out,
+            &format!("the {other} peer store could not be written: {error}"),
+        );
+    }
+    let _ = writeln!(
+        out,
+        "paired {} ({profile}) <-> {} ({other})",
+        this.node_id(),
+        peer.node_id()
+    );
+    for capability in granted {
+        let _ = writeln!(out, "  grant: {other} may invoke {capability} on {profile}");
+    }
+    let _ = writeln!(out, "both directions enrolled; start both nodes to use it");
+    0
+}
+
+const USAGE: &str = "\
+bsh federation [--profile NAME] <command>
+
+  (no command) / help                     this text
+  serve                                   run this profile's node in the
+                                          foreground, without a window; repeat
+                                          --profile to run several nodes in
+                                          this one process (Ctrl-C stops all)
+  pair <profile> [--grant <capability>]...
+                                          enroll this profile and another local
+                                          profile with each other; --grant lets
+                                          the OTHER profile invoke the
+                                          capability on THIS one
+  profiles                                every node profile on this machine:
+                                          state, peers, node id and name
   status                                  show this node's id, its peers, and
                                           the last decisions
   enroll <node-id>                        trust a peer
@@ -52,8 +368,17 @@ bsh federation <command>
                                           signed rotation record for peers
   accept-rotation <record.json>           apply a peer's signed key rotation
 
-Identity and peers live in bsh's own directory; a peer id is a base64 Ed25519
-public key, which is what a peer prints as its node id.";
+  --profile NAME                          act on that profile's node instead of
+                                          the default one (repeatable for serve)
+
+Identity and peers live in bsh's own directory, one subdirectory per profile;
+a peer id is a base64 Ed25519 public key, which is what a peer prints as its
+node id.
+
+Several nodes on one machine: give each one its own profile. The app runs the
+default profile unless launched with --federation-profile=NAME or
+BSH_FEDERATION_PROFILE=NAME; bsh federation --profile NAME ... manages that
+node's files while the app is closed.";
 
 /// Run one federation command against the files under `root`.
 pub(crate) fn command(
@@ -410,6 +735,115 @@ mod tests {
 
     fn peer() -> String {
         NodeIdentity::from_seed([7u8; 32]).node_id().to_string()
+    }
+
+    /// A profile becomes a directory, so the rule is a directory-name rule.
+    #[test]
+    fn a_profile_is_a_directory_name() {
+        for good in ["default", "work", "second-2", "a.b_c"] {
+            assert!(valid_profile(good), "{good}");
+        }
+        for bad in ["", " ", ".", "..", ".hidden", "a/b", "a\\b"] {
+            assert!(!valid_profile(bad), "{bad:?}");
+        }
+        assert!(!valid_profile(&"x".repeat(65)), "bounded");
+    }
+
+    /// The default profile keeps today's paths; a named one is its own node.
+    #[test]
+    fn the_default_profile_keeps_the_legacy_layout() {
+        assert_eq!(node_dir_for(DEFAULT_PROFILE), dir());
+        assert_eq!(node_dir_for("work"), dir().join("work"));
+        assert_ne!(node_dir_for("one"), node_dir_for("two"));
+    }
+
+    /// Two nodes on one machine must be distinguishable in a peer list.
+    #[test]
+    fn a_named_profile_is_visible_in_the_node_name() {
+        assert_eq!(display_name(Some("Mac"), DEFAULT_PROFILE), "Mac");
+        assert_eq!(display_name(Some("Mac"), "work"), "Mac (work)");
+    }
+
+    /// The roster lists every node on the machine with its live state.
+    #[test]
+    fn profiles_lists_each_nodes_state_and_id() {
+        let root = scratch("profiles");
+        let first = NodeIdentity::load_or_create(&root.join("node.key")).expect("default node");
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).expect("profile dir");
+        let second = NodeIdentity::load_or_create(&work.join("node.key")).expect("work node");
+        assert_ne!(
+            first.node_id(),
+            second.node_id(),
+            "each profile is a node of its own"
+        );
+
+        let mut out = Vec::new();
+        assert_eq!(profiles(&root, Some("Mac"), &mut out), 0);
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("default	"), "{text}");
+        assert!(text.contains("work	"), "{text}");
+        assert!(text.contains("profiles 2"), "{text}");
+        assert!(text.contains("Mac (work)"), "{text}");
+    }
+
+    /// Pairing writes both peer stores: each side trusts the other, and a grant
+    /// is recorded on the side that GIVES it.
+    #[test]
+    fn pair_enrolls_both_profiles_and_grants_one_direction() {
+        let root = scratch("pair");
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).expect("profile dir");
+        let this = NodeIdentity::load_or_create(&root.join("node.key")).expect("this node");
+        let peer = NodeIdentity::load_or_create(&work.join("node.key")).expect("peer node");
+
+        let mut out = Vec::new();
+        let code = pair(
+            &root,
+            DEFAULT_PROFILE,
+            "work",
+            &["builtin/read_file".to_string()],
+            &mut out,
+        );
+        let text = String::from_utf8(out).expect("utf8");
+        assert_eq!(code, 0, "{text}");
+        assert!(text.contains("paired"), "{text}");
+
+        let mine = PeerStore::load(&root.join("peers.json")).expect("my store");
+        let record = mine
+            .iter()
+            .find(|record| record.node == peer.node_id())
+            .expect("the peer is enrolled here");
+        assert_eq!(record.state, TrustState::Trusted);
+        assert!(
+            record
+                .grants
+                .iter()
+                .any(|grant| grant.capability.to_string() == "builtin/read_file"),
+            "the grant is recorded on the giving side"
+        );
+
+        let theirs = PeerStore::load(&work.join("peers.json")).expect("their store");
+        let back = theirs
+            .iter()
+            .find(|record| record.node == this.node_id())
+            .expect("this node is enrolled there");
+        assert_eq!(back.state, TrustState::Trusted);
+        assert!(
+            back.grants.is_empty(),
+            "the other side obtained no grant out of it"
+        );
+    }
+
+    /// Pairing a profile that does not exist says where to create it.
+    #[test]
+    fn pair_refuses_a_profile_without_a_node() {
+        let root = scratch("pair-missing");
+        let mut out = Vec::new();
+        let code = pair(&root, DEFAULT_PROFILE, "work", &[], &mut out);
+        assert_eq!(code, 1);
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("no node yet"), "{text}");
     }
 
     #[test]

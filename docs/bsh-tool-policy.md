@@ -82,7 +82,9 @@ the workspace root; the answer decides whether the tool is offered at all.
 The gated names are `run_in_background` (the shell's detached-run flag),
 `job_output`, `job_list`, `job_kill` and `subagent`. `bash` itself is
 governed by the permission matrix and the preset's `tools` allowlist as well
-as by its spawn check at call time. `send_message` and `interrupt_agent` are
+as by its spawn check at call time. The automation-task tools are gated by the
+permission matrix alone - a writable turn schedules, Read Only does not - and
+each of them still answers to its own per-tool switch. `send_message` and `interrupt_agent` are
 not separate capabilities: continuing or stopping a child is delegation again,
 so `send_message` asks the `subagent` spawn question at call time, and both
 ride the `subagent` gate at build time.
@@ -317,9 +319,13 @@ explicit empty list mounts nothing:
   every tool/skill/server/tool/extension the build would otherwise carry; []
   means none. MCP entries are server namespaces (the name the settings entry
   or extension server registers under).
-- The tool vocabulary is `bash`, `glob`, `grep`, `read_file`, `write_file`,
-  `edit_file`, `list_dir`, `update_plan`, `job_output`, `job_list`,
-  `job_kill`, `subagent`, `send_message` and `interrupt_agent`.
+- The tool vocabulary is `bash`, `glob`, `grep`, `read_file`, `read_files`,
+  `write_file`, `edit_file`, `apply_patch`, `list_dir`, `update_plan`,
+  `job_output`, `job_list`, `job_kill`, `subagent`, `send_message`,
+  `interrupt_agent`, the four `schedule_*` tools and the `federation_*`
+  family. `schedule_*` answers to the permission matrix (Read Only schedules
+  nothing) rather than to a Rego capability, and `federation_*` answers to the
+  federation enable switch and the Extensions list.
   `run_in_background` is the shell's own flag, so the `bash` entry gates it;
   it is also its own capability name for a Rego policy. A preset cannot use
   `tools` to widen the permission matrix: the allowlist is intersected with

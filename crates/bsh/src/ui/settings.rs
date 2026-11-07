@@ -2023,6 +2023,15 @@ impl Shell {
         .into_any_element()
     }
 
+    /// The profile segment of the federation row, for a non-default node.
+    fn federation_profile_suffix(lang: crate::i18n::Lang, profile: &str) -> String {
+        tr_args(
+            lang,
+            "settings.general.federationProfile",
+            &[("profile", profile.to_string())],
+        )
+    }
+
     /// The text of the federation row, with or without a running node.
     fn federation_text(
         lang: crate::i18n::Lang,
@@ -2119,7 +2128,7 @@ impl Shell {
             .federation_recent
             .last()
             .map(|event| (event.operation.as_str(), event.outcome.as_str()));
-        let text = match crate::federation_node::running() {
+        let mut text = match crate::federation_node::running() {
             Some(runtime) => {
                 let node = runtime.node_id().to_string();
                 let short: String = node.chars().take(8).collect();
@@ -2127,7 +2136,9 @@ impl Shell {
                     lang,
                     Some((
                         &short,
-                        runtime.discovered_peers(),
+                        // Presence, not catalogues: a linked peer that exposes
+                        // no capability is still a peer.
+                        runtime.announced_peers().len(),
                         runtime.remote_capabilities(),
                         runtime.active_delegations(),
                     )),
@@ -2142,6 +2153,14 @@ impl Shell {
                 last,
             ),
         };
+        // Which node this window runs. Not a control: two instances share
+        // settings.toml, so the profile is chosen at launch, and a field here
+        // would only change the machine default the second window also reads.
+        let profile = self.state.settings.federation_profile();
+        if profile != crate::federation::DEFAULT_PROFILE {
+            text.push_str(" · ");
+            text.push_str(&Self::federation_profile_suffix(lang, &profile));
+        }
         hairline_bottom(
             div()
                 .debug_selector(|| String::from("general-item-federation"))
@@ -8159,6 +8178,8 @@ impl Shell {
             let key = match refusal {
                 crate::settings::ScheduleRefusal::Name => "task.invalidTitle",
                 crate::settings::ScheduleRefusal::Prompt => "task.invalidPrompt",
+                crate::settings::ScheduleRefusal::Id => "task.invalidId",
+                crate::settings::ScheduleRefusal::Unknown => "task.unknown",
             };
             let text = tr(lang, key).to_string();
             self.state.notice(text);
@@ -13627,5 +13648,16 @@ mod federation_tests {
         assert!(enabled.contains("Enabled"), "{enabled}");
         assert!(last.contains("last:"), "{last}");
         assert!(last.contains("quota_exceeded"), "{last}");
+    }
+
+    /// A node on a non-default profile says so in the same row: two instances
+    /// on one machine must be tellable apart without a terminal.
+    #[test]
+    fn the_federation_row_names_a_non_default_profile() {
+        let en = Shell::federation_profile_suffix(Lang::En, "work");
+        assert_eq!(en, "profile work");
+        let zh = Shell::federation_profile_suffix(Lang::Zh, "work");
+        assert!(zh.contains("work"), "{zh}");
+        assert!(zh.contains("节点配置"), "{zh}");
     }
 }

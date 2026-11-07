@@ -82,7 +82,7 @@ impl Tool for FederationTool {
 
     fn description(&self) -> String {
         match self.name {
-            "federation_status" => "Federation status.".to_string(),
+            "federation_status" => "Federation status: node identity, enrolled peers and outstanding delegations. The rest of the family (peers, delegate, query, cancel, cleanup) is reachable through find_tool.".to_string(),
             "federation_peers" => "List enrolled and discovered peers.".to_string(),
             "federation_delegate" => "Delegate a task to a peer.".to_string(),
             "federation_cancel" => "Cancel a delegation.".to_string(),
@@ -94,6 +94,22 @@ impl Tool for FederationTool {
 
     fn category(&self) -> String {
         "federation".to_string()
+    }
+
+    /// The family is callable without being advertised, except its signpost.
+    ///
+    /// Six schemas ride every request for a surface most turns never touch, and
+    /// the tool array has a wire budget (see the budget test in `caps`). The
+    /// browser made the same call: `find_tool` names the withheld tools and
+    /// `call_tool` runs one, so a turn that needs a peer pays for the discovery
+    /// step and every other turn pays nothing.
+    ///
+    /// `federation_status` stays in the array on purpose: it is the one cheap
+    /// schema that tells the model the family EXISTS, so a prompt about peers
+    /// leads to `find_tool` instead of a claim that no such capability is
+    /// installed.
+    fn deferred(&self) -> bool {
+        self.name != "federation_status"
     }
 
     fn json_schema(&self) -> Value {

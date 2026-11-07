@@ -182,7 +182,7 @@ pub(crate) struct FederationRuntime {
     policy_revision: u64,
     /// The data directory's writer lock, held for the process's lifetime.
     #[allow(dead_code)]
-    lock: Option<crate::federation_lock::DataDirLock>,
+    lock: Option<crate::federation_lock::NodeLocks>,
 }
 
 impl FederationRuntime {
@@ -308,15 +308,22 @@ impl FederationRuntime {
             .unwrap_or(0)
     }
 
-    /// One line for the startup log.
+    /// One line for the startup log and the headless node.
     ///
     /// Read-only and cheap: it reports the node id and what discovery has
     /// cached, and never composes a workspace, because this is called while a
     /// pane renders.
+    ///
+    /// `peers` is PRESENCE: nodes whose announcement has been seen and has not
+    /// expired. `catalogues` is how many of those published capabilities this
+    /// node has fetched - a linked pair of default nodes has one peer and no
+    /// catalogues, and reporting only the catalogue count made a healthy link
+    /// read as "0 peers".
     pub(crate) fn status(&self) -> String {
         format!(
-            "node {} discovered_peers={} remote_capabilities={}",
+            "node {} peers={} catalogues={} remote_capabilities={}",
             self.node_id,
+            self.announced_peers().len(),
             self.discovered_peers(),
             self.remote_capabilities()
         )
@@ -414,18 +421,60 @@ pub(crate) fn compose(
         remote,
     })
 }
-static RUNTIME: OnceLock<std::sync::RwLock<Option<Arc<FederationRuntime>>>> = OnceLock::new();
+/// Every node this process runs, by profile.
+///
+/// One process may host several nodes (profiles) at once: each has its own
+/// identity, peer store, locks and transport session. The app starts the
+/// profile it launched with; `bsh federation serve --profile a --profile b`
+/// starts several headless nodes in one process.
+static RUNTIMES: OnceLock<std::sync::RwLock<BTreeMap<String, Arc<FederationRuntime>>>> =
+    OnceLock::new();
 
-fn slot() -> &'static std::sync::RwLock<Option<Arc<FederationRuntime>>> {
-    RUNTIME.get_or_init(|| std::sync::RwLock::new(None))
+/// The profile the app presents. A headless process may have none, in which
+/// case its single node is the answer.
+static PRIMARY: OnceLock<String> = OnceLock::new();
+
+fn nodes() -> &'static std::sync::RwLock<BTreeMap<String, Arc<FederationRuntime>>> {
+    RUNTIMES.get_or_init(|| std::sync::RwLock::new(BTreeMap::new()))
 }
 
-/// The node this process runs, when settings enabled one.
+/// The node this process presents: the profile it launched with, or the only
+/// node it runs.
 pub(crate) fn running() -> Option<Arc<FederationRuntime>> {
-    slot()
+    let nodes = nodes().read().ok()?;
+    if let Some(profile) = PRIMARY.get() {
+        return nodes.get(profile).cloned();
+    }
+    if nodes.len() == 1 {
+        return nodes.values().next().cloned();
+    }
+    None
+}
+
+/// One profile's node, when this process runs it.
+pub(crate) fn running_profile(profile: &str) -> Option<Arc<FederationRuntime>> {
+    nodes().read().ok()?.get(profile).cloned()
+}
+
+/// Every node this process runs, by profile.
+pub(crate) fn running_profiles() -> Vec<(String, Arc<FederationRuntime>)> {
+    nodes()
         .read()
-        .ok()
-        .and_then(|slot| slot.as_ref().map(Arc::clone))
+        .map(|nodes| {
+            nodes
+                .iter()
+                .map(|(profile, runtime)| (profile.clone(), Arc::clone(runtime)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether the settings ask for a TLS transport.
+fn has_tls(config: &crate::settings::global::FederationSection) -> bool {
+    config.tls_ca.is_some()
+        || config.tls_cert.is_some()
+        || config.tls_key.is_some()
+        || config.tls_mtls
 }
 
 /// Replace the running listener so it rereads the configured TLS material.
@@ -471,30 +520,51 @@ pub(crate) fn reload_tls(settings: &crate::settings::Settings) -> bool {
 /// The peer store is on disk, so a stop loses no state; the next start (or the
 /// next launch) loads it again. Returns whether a node was running.
 pub(crate) fn stop() -> bool {
-    let taken = slot().write().ok().and_then(|mut slot| slot.take());
-    match taken {
-        Some(runtime) => {
-            runtime.task.abort();
-            runtime.refresher.abort();
-            runtime.announce_task.abort();
-            if let Some(reconciler) = runtime.reconciler.as_ref() {
-                reconciler.abort();
-            }
-            if let Ok(mut slot) = terminator_slot().lock() {
-                if let Some(terminator) = slot.take() {
-                    terminator.abort();
-                }
-            }
-            if let Ok(mut clients) = client_slot().lock() {
-                for client in clients.drain(..) {
-                    client.abort();
-                }
-            }
-            log::info!("federation node stopped");
-            true
-        }
+    let profile = PRIMARY.get().cloned().or_else(|| {
+        nodes()
+            .read()
+            .ok()
+            .and_then(|nodes| nodes.keys().next().cloned())
+    });
+    match profile {
+        Some(profile) => stop_profile(&profile),
         None => false,
     }
+}
+
+/// Stop one profile's node and release its directory locks.
+pub(crate) fn stop_profile(profile: &str) -> bool {
+    let taken = nodes()
+        .write()
+        .ok()
+        .and_then(|mut nodes| nodes.remove(profile));
+    let Some(runtime) = taken else {
+        return false;
+    };
+    runtime.task.abort();
+    runtime.refresher.abort();
+    runtime.announce_task.abort();
+    if let Some(reconciler) = runtime.reconciler.as_ref() {
+        reconciler.abort();
+    }
+    // The TLS terminators are process-wide, so they are stopped only when no
+    // node is left: a plaintext profile may still be serving beside the one
+    // that owned them.
+    let empty = nodes().read().map(|nodes| nodes.is_empty()).unwrap_or(true);
+    if empty {
+        if let Ok(mut slot) = terminator_slot().lock() {
+            if let Some(terminator) = slot.take() {
+                terminator.abort();
+            }
+        }
+        if let Ok(mut clients) = client_slot().lock() {
+            for client in clients.drain(..) {
+                client.abort();
+            }
+        }
+    }
+    log::info!("federation node stopped (profile {profile})");
+    true
 }
 
 /// Publish one signed announcement over `transport`.
@@ -566,14 +636,41 @@ pub(crate) fn apply_announce(
 /// working without federation: a node that cannot start must not stop the
 /// window from opening.
 pub(crate) fn start_from_settings(settings: &crate::settings::Settings) -> bool {
+    let profile = crate::federation::resolve_profile(Some(&settings.global.federation.profile));
+    start_profile(settings, &profile, true)
+}
+
+/// Start one profile's node; `primary` names the one the window presents.
+pub(crate) fn start_profile(
+    settings: &crate::settings::Settings,
+    profile: &str,
+    primary: bool,
+) -> bool {
     let config = &settings.global.federation;
     if !config.enabled {
         return false;
     }
-    if running().is_some() {
+    if running_profile(profile).is_some() {
         return true;
     }
-    let dir = crate::federation::dir();
+    // One TLS terminator exists per process, and every profile shares this
+    // settings document, so a second node while TLS is on would replace the
+    // first one's listener. One TLS node per process is the honest limit.
+    if has_tls(config)
+        && nodes()
+            .read()
+            .map(|nodes| !nodes.is_empty())
+            .unwrap_or(false)
+    {
+        log::warn!(
+            "federation: profile {profile} asks for TLS, but the TLS transport is process-wide; run one TLS node per process"
+        );
+        return false;
+    }
+    // One profile is one node. The default profile keeps the old layout, so an
+    // existing node is not moved; every other profile is its own directory and
+    // therefore its own key, peer store, delegations and audit log.
+    let dir = crate::federation::node_dir_for(profile);
     let identity_path = config
         .identity_path
         .as_ref()
@@ -584,17 +681,13 @@ pub(crate) fn start_from_settings(settings: &crate::settings::Settings) -> bool 
         .as_ref()
         .map(PathBuf::from)
         .unwrap_or_else(|| dir.join("peers.json"));
-    let tls = (config.tls_ca.is_some()
-        || config.tls_cert.is_some()
-        || config.tls_key.is_some()
-        || config.tls_mtls)
-        .then(|| bus::TlsConfig {
-            root_ca_certificate: config.tls_ca.clone(),
-            certificate: config.tls_cert.clone(),
-            private_key: config.tls_key.clone(),
-            enable_mtls: Some(config.tls_mtls),
-            verify_name_on_connect: Some(config.tls_verify_name.unwrap_or(true)),
-        });
+    let tls = has_tls(config).then(|| bus::TlsConfig {
+        root_ca_certificate: config.tls_ca.clone(),
+        certificate: config.tls_cert.clone(),
+        private_key: config.tls_key.clone(),
+        enable_mtls: Some(config.tls_mtls),
+        verify_name_on_connect: Some(config.tls_verify_name.unwrap_or(true)),
+    });
     let scouting = tls.is_none();
     let bus_config = BusConfig {
         mode: config.mode.clone().unwrap_or_else(|| "peer".to_string()),
@@ -616,9 +709,15 @@ pub(crate) fn start_from_settings(settings: &crate::settings::Settings) -> bool 
                 .read()
                 .map(|store| store.iter().count())
                 .unwrap_or(0);
-            log::info!("federation {} peers={peers}", runtime.status());
-            if let Ok(mut slot) = slot().write() {
-                *slot = Some(Arc::new(runtime));
+            log::info!(
+                "federation {} profile={profile} peers={peers}",
+                runtime.status()
+            );
+            if let Ok(mut nodes) = nodes().write() {
+                nodes.insert(profile.to_string(), Arc::new(runtime));
+            }
+            if primary {
+                let _ = PRIMARY.set(profile.to_string());
             }
             true
         }
@@ -809,6 +908,78 @@ fn delegation_store_path(peers_path: &std::path::Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("delegations.json"))
 }
 
+/// The endpoint a node listens on when the settings name none.
+///
+/// A fixed local port is what makes a second node on the same machine
+/// connectable without configuration: the first node owns it and the second
+/// links to it. LAN peers still reach the first node through scouting; a
+/// deployment that needs another address sets `listen`.
+const DEFAULT_FEDERATION_ENDPOINT: &str = "tcp/[::]:7447";
+
+/// Where the second node on this machine links to the first.
+const LOCAL_FEDERATION_ENDPOINT: &str = "tcp/127.0.0.1:7447";
+
+/// Open the federation transport, falling back to a loopback ephemeral port
+/// when the default listen endpoint is taken.
+///
+/// Two nodes on one machine cannot share one fixed listen port. The second node
+/// taking a loopback port keeps local scouting working - the port it actually
+/// bound is what scouting advertises - so a pair of local nodes find each other
+/// with no configuration.
+async fn open_bus(mut config: BusConfig, explicit_listen: bool) -> Result<Bus, String> {
+    if config.listen.is_none() {
+        config.listen = Some(vec![DEFAULT_FEDERATION_ENDPOINT.to_string()]);
+    }
+    match Bus::try_from(config.clone()).await {
+        Ok(bus) => Ok(bus),
+        Err(first) => {
+            // The reader named the endpoint, so a refused bind is their fact
+            // to see: do not silently listen somewhere else.
+            if explicit_listen {
+                return Err(format!("the federation transport did not open: {first}"));
+            }
+            let port = free_loopback_port().map_err(|error| {
+                format!("the federation transport did not open: {first}; no fallback port: {error}")
+            })?;
+            let mut fallback = config;
+            fallback.listen = Some(vec![format!("tcp/127.0.0.1:{port}")]);
+            // The node that owns the default port is a local peer, so link to
+            // it directly instead of waiting for scouting to find an ephemeral
+            // port. One link is enough: peers exchange their other locators.
+            let mut connect = fallback.connect.take().unwrap_or_default();
+            if !connect
+                .iter()
+                .any(|endpoint| endpoint == LOCAL_FEDERATION_ENDPOINT)
+            {
+                connect.push(LOCAL_FEDERATION_ENDPOINT.to_string());
+            }
+            fallback.connect = Some(connect);
+            log::info!(
+                "federation: the default listen endpoint is unavailable ({first}); listening on 127.0.0.1:{port} and linking to the local node"
+            );
+            Bus::try_from(fallback).await.map_err(|error| {
+                format!(
+                    "the federation transport did not open: {first}; the loopback fallback also failed: {error}"
+                )
+            })
+        }
+    }
+}
+
+/// A currently free loopback port.
+///
+/// The probe is released before Zenoh binds it, so this is a best-effort
+/// choice: a collision between the two is a bind failure the caller reports,
+/// not a silent fallback to a shared port.
+fn free_loopback_port() -> Result<u16, String> {
+    let listener =
+        std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(|error| error.to_string())?;
+    listener
+        .local_addr()
+        .map(|address| address.port())
+        .map_err(|error| error.to_string())
+}
+
 async fn build(
     settings: crate::settings::Settings,
     identity_path: PathBuf,
@@ -816,12 +987,11 @@ async fn build(
     config: BusConfig,
 ) -> Result<FederationRuntime, String> {
     // One writer per directory: a second instance must not start a node whose
-    // in-memory peer store would diverge from this one's.
-    let directory = identity_path
-        .parent()
-        .map(|directory| directory.to_path_buf())
-        .unwrap_or_else(crate::federation::dir);
-    let lock = crate::federation_lock::DataDirLock::acquire(&directory)?;
+    // in-memory peer store would diverge from this one's. The identity and the
+    // peer store may live in different directories, so both are locked in one
+    // sorted pass - a shared peer store with two keys is the shape that would
+    // otherwise corrupt it.
+    let lock = crate::federation_lock::NodeLocks::acquire(&identity_path, &peers_path)?;
     let identity =
         NodeIdentity::load_or_create(&identity_path).map_err(|error| error.to_string())?;
     let peers = PeerStore::load(&peers_path).map_err(|error| error.to_string())?;
@@ -834,9 +1004,8 @@ async fn build(
             *slot = Some(terminator);
         }
     }
-    let bus = Bus::try_from(config)
-        .await
-        .map_err(|error| format!("the federation transport did not open: {error}"))?;
+    let explicit_listen = !settings.global.federation.listen.is_empty();
+    let bus = open_bus(config, explicit_listen).await?;
     let transport = ZenohTransport::new(bus.session(), identity.node_id());
     let inbox = transport
         .subscribe()
@@ -860,6 +1029,7 @@ async fn build(
         }
         Err(_) => (None, Vec::new()),
     };
+    let profile = crate::federation::resolve_profile(Some(&settings.global.federation.profile));
     Ok(assemble_with_federation(
         identity,
         peers,
@@ -871,8 +1041,9 @@ async fn build(
         runtime,
         Some(delegation_store_path(&peers_path)),
         advertise,
-        Some(crate::federation::resolve_node_name(
+        Some(crate::federation::display_name(
             settings.global.federation.node_name.as_deref(),
+            &profile,
         )),
         settings.global.federation.federation_id.clone(),
         settings.global.federation.knowledge_enabled,
@@ -888,7 +1059,7 @@ pub(crate) fn assemble(
     inbox: tokio::sync::mpsc::Receiver<Vec<u8>>,
     bus: Option<Bus>,
     audit: Option<PathBuf>,
-    lock: Option<crate::federation_lock::DataDirLock>,
+    lock: Option<crate::federation_lock::NodeLocks>,
     runtime: Option<Arc<WorkspaceRuntime>>,
     delegations: Option<PathBuf>,
     advertise: Vec<agent::capability::CapabilityDescriptor>,
@@ -919,7 +1090,7 @@ pub(crate) fn assemble_with_federation(
     inbox: tokio::sync::mpsc::Receiver<Vec<u8>>,
     bus: Option<Bus>,
     audit: Option<PathBuf>,
-    lock: Option<crate::federation_lock::DataDirLock>,
+    lock: Option<crate::federation_lock::NodeLocks>,
     runtime: Option<Arc<WorkspaceRuntime>>,
     delegations: Option<PathBuf>,
     advertise: Vec<agent::capability::CapabilityDescriptor>,
@@ -1520,6 +1691,27 @@ mod tests {
         assert!(!start_from_settings(&settings));
     }
 
+    /// A TLS node is one per process: the terminator is a singleton, and every
+    /// profile shares the settings that carry the certificates.
+    #[test]
+    fn a_tls_node_is_recognised_from_the_settings() {
+        let mut config = crate::settings::global::FederationSection::default();
+        assert!(!has_tls(&config));
+        config.tls_mtls = true;
+        assert!(has_tls(&config));
+        config.tls_mtls = false;
+        config.tls_cert = Some("cert.pem".to_string());
+        assert!(has_tls(&config));
+    }
+
+    /// A process with no node reports no profiles, and asking for a profile
+    /// that was never started is a miss rather than a creation.
+    #[test]
+    fn a_process_with_no_node_reports_no_profiles() {
+        assert!(crate::federation_node::running_profiles().is_empty());
+        assert!(crate::federation_node::running_profile("work").is_none());
+    }
+
     /// The whole federation path over two in-process nodes: discovery,
     /// composition, a remote call, a delegation, a bounded resource stream,
     /// and revocation cutting every plane at once.
@@ -1962,7 +2154,7 @@ mod tests {
             .get(&"builtin/read_file".parse().expect("an id"))
             .is_some());
         assert!(
-            runtime.status().contains("discovered_peers=1"),
+            runtime.status().contains("catalogues=1"),
             "{}",
             runtime.status()
         );
