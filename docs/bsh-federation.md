@@ -130,6 +130,22 @@ exposed reads `peers=1 catalogues=0`, not zero peers. The Federation row in
 Settings > General uses the same presence count and names a non-default
 profile, so two windows on one machine are tellable apart without a terminal.
 
+## Verifying a host
+
+`scripts/verify-federation-local.sh` runs the whole local story against a
+scratch `BSH_HOME`: profile creation, pairing, the live roster, two processes
+finding each other over TCP, the same profile refused twice, and several nodes
+in one process. It prints `PASS`/`FAIL` per check and exits non-zero on a
+failure, so it can gate a release.
+
+The protocol itself is covered by `cargo test -p federation` (identity,
+envelope, discovery, peers/grants, delegation, resources, knowledge, rotation,
+audit), and the host path by the `federation` tests in `bsh` - including
+`two_local_profiles_federate_over_the_real_transport`, which runs two profiles
+over a real Zenoh TCP link and exercises presence, the granted catalogue, a
+remote read, delegation accept/status/cancel, the audit log, revocation on both
+planes, and lock release.
+
 ## Managing peers
 
 Management is headless, so it works before any window exists and on a machine

@@ -304,8 +304,23 @@ pub(crate) fn pair(
     let now = unix_ms();
     let mut this_store = PeerStore::load(&this_dir.join("peers.json")).unwrap_or_default();
     let mut other_store = PeerStore::load(&other_dir.join("peers.json")).unwrap_or_default();
-    this_store.enroll(peer.node_id(), now, Some(format!("profile {other}")));
-    other_store.enroll(this.node_id(), now, Some(format!("profile {profile}")));
+    // Enrolling REPLACES a peer record, grants included, so an already-trusted
+    // peer is left alone: pairing twice (once per direction) must not wipe the
+    // grant the first call recorded.
+    let peer_id = peer.node_id();
+    if !this_store
+        .iter()
+        .any(|record| record.node == peer_id && record.state == TrustState::Trusted)
+    {
+        this_store.enroll(peer_id.clone(), now, Some(format!("profile {other}")));
+    }
+    let this_id = this.node_id();
+    if !other_store
+        .iter()
+        .any(|record| record.node == this_id && record.state == TrustState::Trusted)
+    {
+        other_store.enroll(this_id.clone(), now, Some(format!("profile {profile}")));
+    }
 
     let mut granted = Vec::new();
     for name in grants {
@@ -313,7 +328,7 @@ pub(crate) fn pair(
             Ok(capability) => capability,
             Err(error) => return fail(out, &format!("invalid capability id '{name}': {error}")),
         };
-        if let Err(error) = this_store.grant(&peer.node_id(), capability.clone(), now, None) {
+        if let Err(error) = this_store.grant(&peer_id, capability.clone(), now, None) {
             return fail(out, &error.to_string());
         }
         granted.push(capability.to_string());
@@ -821,6 +836,27 @@ mod tests {
                 .iter()
                 .any(|grant| grant.capability.to_string() == "builtin/read_file"),
             "the grant is recorded on the giving side"
+        );
+
+        // Pairing again, in the other direction, must not wipe the grant the
+        // first call recorded: enrolling a peer replaces its record.
+        let mut again = Vec::new();
+        assert_eq!(
+            pair(&root, "work", DEFAULT_PROFILE, &[], &mut again),
+            0,
+            "{}",
+            String::from_utf8_lossy(&again)
+        );
+        let mine_again = PeerStore::load(&root.join("peers.json")).expect("my store");
+        assert!(
+            mine_again
+                .iter()
+                .find(|record| record.node == peer.node_id())
+                .expect("the peer is still enrolled")
+                .grants
+                .iter()
+                .any(|grant| grant.capability.to_string() == "builtin/read_file"),
+            "the grant survives a second pair"
         );
 
         let theirs = PeerStore::load(&work.join("peers.json")).expect("their store");

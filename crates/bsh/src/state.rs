@@ -1002,9 +1002,9 @@ impl AppState {
     ///
     /// A session carries its own (provider, nickname) pair, so two chats in the
     /// same workspace can run on different models. The pair is a reference into
-    /// the global tree and never a copy of the endpoint. It is the ONLY model
-    /// selection: a session that names none has no model and is refused at send
-    /// rather than inheriting one from somewhere else.
+    /// the global tree and never a copy of the endpoint. A session that names
+    /// none follows the machine-wide default model; it is refused at send only
+    /// when neither names one.
     pub(crate) fn session_choice(&self, id: &str) -> crate::settings::resolve::SessionChoice {
         self.store
             .session(id)
@@ -4295,6 +4295,17 @@ impl AppState {
         self.save_session(&id);
     }
 
+    /// Choose the machine-wide default model, or clear it.
+    ///
+    /// The settings pane edits the DRAFT, like every other field there; Save
+    /// writes it to the document the resolver reads.
+    pub(crate) fn set_default_model(
+        &mut self,
+        reference: Option<crate::settings::global::ModelRef>,
+    ) {
+        self.draft_mut().global.default_model = reference;
+    }
+
     /// Choose the active session's model by nickname under the provider it
     /// already names, or the first provider that carries the nickname.
     ///
@@ -7431,6 +7442,47 @@ mod tests {
             crate::i18n::tr(zh, "row.newChat")
         );
         assert_eq!(crate::model::Session::title_from("hello", zh), "hello");
+    }
+
+    /// A chat that picked no model follows the machine default; one that picked
+    /// its own keeps it, and the others are unaffected.
+    #[test]
+    fn a_chat_without_a_model_follows_the_machine_default() {
+        let mut state = state_with_models("default-model");
+        let first = state.active_id.clone().expect("the first session");
+        let second = state.new_session().expect("the second session");
+        state.settings.global.default_model = Some(crate::settings::global::ModelRef {
+            provider: "p".to_string(),
+            model: "alpha".to_string(),
+        });
+        for id in [&first, &second] {
+            assert_eq!(
+                state
+                    .effective_in(id)
+                    .model_ref
+                    .map(|reference| reference.model),
+                Some("alpha".to_string()),
+                "the default fills a session that picked nothing"
+            );
+        }
+
+        // Picking one in a chat is the explicit choice; the other chat keeps
+        // following the default.
+        state.select_model_from("p", "beta");
+        assert_eq!(
+            state
+                .effective_in(&second)
+                .model_ref
+                .map(|reference| reference.model),
+            Some("beta".to_string())
+        );
+        assert_eq!(
+            state
+                .effective_in(&first)
+                .model_ref
+                .map(|reference| reference.model),
+            Some("alpha".to_string())
+        );
     }
 
     /// Register the provider the model tests choose from.

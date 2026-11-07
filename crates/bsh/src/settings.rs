@@ -1434,6 +1434,27 @@ mod tests {
         );
     }
 
+    /// The machine default model is part of the document: it survives a write
+    /// and a read, and a file written before the field existed parses without
+    /// one.
+    #[test]
+    fn the_default_model_survives_a_reload() {
+        let mut global = GlobalSettings::default();
+        global.add_provider("p", "", "https://p.example/v1", &[]);
+        let _ = global.add_model("p", "m", "", "m", "");
+        global.default_model = Some(super::global::ModelRef {
+            provider: "p".to_string(),
+            model: "m".to_string(),
+        });
+        let text = toml::to_string(&global).expect("serialize");
+        assert!(text.contains("default_model"), "{text}");
+        let back = GlobalSettings::from_toml(&text).expect("deserialize");
+        assert_eq!(back.default_model, global.default_model);
+
+        let old = GlobalSettings::from_toml("schema_version = 1\n").expect("an old file");
+        assert_eq!(old.default_model, None, "an absent field is no default");
+    }
+
     /// Dropping the model drops its declaration, so a re-added leaf starts
     /// permissive rather than inheriting a stale answer.
     #[test]

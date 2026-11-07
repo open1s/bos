@@ -314,10 +314,14 @@ shell ended up confined to a temporary directory a test had made.
 
 ## Resolution
 
-**Model:** `session.provider/model` → **refuse and say so**. There is no
-workspace and no global term: there is no default model. A legacy workspace pair
-is migrated onto the open session at launch, once, which is an upgrade step and
-not a resolution level.
+**Model:** `session.provider/model` → `default_model` → **refuse and say
+so**. The machine-wide default (Settings > Models > Default model) fills the gap
+for a session that picked none, so a fresh chat is sendable without choosing a
+model first; a session that picked one in the composer keeps it. With no default,
+the old behaviour holds and the send is refused. A legacy workspace pair is
+migrated onto the open session at launch, once, which is an upgrade step and not
+a resolution level, and deleting the provider or model a default names clears the
+default rather than leaving a turn that can only fail.
 
 **Preset:** `session.agent_preset` → `default_preset` → none. The preset is a
 **session** fact, not a workspace one, because it decides the tool schemas and

@@ -2389,4 +2389,238 @@ mod tests {
         assert_eq!(record.node, node_id);
         assert!(record.verify());
     }
+
+    /// END-TO-END over the REAL transport: two profiles on this host, each with
+    /// its own directory, key, peer store, lock and Zenoh session, linked by TCP
+    /// on loopback. This is the path the app runs, minus the window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_local_profiles_federate_over_the_real_transport() {
+        use agent::capability::{InvocationContext, InvocationId, Principal, WorkspaceId};
+        use federation::{DelegationId, DelegationRequest, DelegationState};
+        use serde_json::json;
+
+        let root =
+            std::env::temp_dir().join(format!("bsh-fed-e2e-{}-{}", std::process::id(), unix_ms()));
+        let docs = root.join("docs");
+        std::fs::create_dir_all(&docs).expect("the exposed root");
+        std::fs::write(docs.join("hello.txt"), "hello from node a").expect("the exposed file");
+
+        // Two profiles, one identity each, paired in both directions: each side
+        // trusts the other and the caller holds the provider's grant.
+        for profile in ["a", "b"] {
+            let dir = crate::federation::node_dir_in(&root, profile);
+            std::fs::create_dir_all(&dir).expect("a profile directory");
+            NodeIdentity::load_or_create(&dir.join("node.key")).expect("an identity");
+        }
+        let mut out = Vec::new();
+        for (this, other) in [("a", "b"), ("b", "a")] {
+            assert_eq!(
+                crate::federation::pair(
+                    &root,
+                    this,
+                    other,
+                    &["builtin/read_file".to_string()],
+                    &mut out
+                ),
+                0,
+                "{}",
+                String::from_utf8_lossy(&out)
+            );
+        }
+        let a_identity = NodeIdentity::load_or_create(
+            &crate::federation::node_dir_in(&root, "a").join("node.key"),
+        )
+        .expect("node a");
+        let b_identity = NodeIdentity::load_or_create(
+            &crate::federation::node_dir_in(&root, "b").join("node.key"),
+        )
+        .expect("node b");
+        let a_id = a_identity.node_id();
+        let b_id = b_identity.node_id();
+
+        let mut settings = crate::settings::Settings::default();
+        settings.global.federation.enabled = true;
+        settings.global.federation.expose = vec!["builtin/read_file".to_string()];
+        settings.global.federation.expose_root = Some(docs.to_string_lossy().to_string());
+        // The exposed tool's policy is the workspace policy, so the exposed root
+        // must ALSO be the active workspace; otherwise the read is refused by
+        // the baseline as "outside the workspace" before any peer is involved.
+        settings.global.workspaces = vec![crate::settings::global::WorkspaceRef {
+            id: "ws-e2e".to_string(),
+            name: "e2e".to_string(),
+            root: docs.to_string_lossy().to_string(),
+            created_at: 0,
+            updated_at: 0,
+        }];
+        settings.global.general.active_workspace = "ws-e2e".to_string();
+
+        let port_a = free_loopback_port().expect("a port for a");
+        let port_b = free_loopback_port().expect("a port for b");
+        let bus = |port: u16, connect: Option<u16>| BusConfig {
+            mode: "peer".to_string(),
+            connect: connect.map(|port| vec![format!("tcp/127.0.0.1:{port}")]),
+            listen: Some(vec![format!("tcp/127.0.0.1:{port}")]),
+            peer: None,
+            tls: None,
+            // The real host may run other BSH nodes; this pair must find each
+            // other through the endpoint it was given, not through scouting.
+            scouting: false,
+        };
+        let a = build(
+            settings.clone(),
+            root.join("a").join("node.key"),
+            root.join("a").join("peers.json"),
+            bus(port_a, None),
+        )
+        .await
+        .expect("node a starts over TCP");
+        let b = build(
+            settings.clone(),
+            root.join("b").join("node.key"),
+            root.join("b").join("peers.json"),
+            bus(port_b, Some(port_a)),
+        )
+        .await
+        .expect("node b starts over TCP");
+
+        // Both profile locks are held while the nodes run.
+        assert!(
+            crate::federation_lock::DataDirLock::acquire(&root.join("a")).is_err(),
+            "a running node owns its directory"
+        );
+
+        // Presence over the real link, then the catalogue behind the grant.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if !a.announced_peers().is_empty() && !b.announced_peers().is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no announcement over TCP: a={} b={}",
+                a.status(),
+                b.status()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            a.announced_peers().iter().any(|peer| peer.node == b_id),
+            "a sees b: {}",
+            a.status()
+        );
+        b.refresh_peers().await;
+        assert!(
+            b.discovered_peers() >= 1,
+            "the granted catalogue arrives: {}",
+            b.status()
+        );
+
+        let context = InvocationContext::local(
+            InvocationId::new("inv:e2e-host"),
+            Principal::Local {
+                session: "e2e".to_string(),
+                preset: "standard".to_string(),
+            },
+            WorkspaceId::new("ws:e2e-host").expect("a workspace"),
+        );
+
+        // A remote read over the real socket.
+        let output = b
+            .node()
+            .invoke(
+                &a_id,
+                &"builtin/read_file".parse().expect("a capability"),
+                json!({ "path": "hello.txt" }),
+                &context,
+            )
+            .await
+            .expect("the peer answers");
+        let text = serde_json::to_string(&output).expect("the output serializes");
+        assert!(text.contains("hello from node a"), "{text}");
+
+        // The coordination plane: accepted, readable, cancelled.
+        let request = DelegationRequest {
+            id: DelegationId::new("d-e2e-host"),
+            parent: None,
+            target: a_id.clone(),
+            objective: "read hello.txt".to_string(),
+            capabilities: vec!["builtin/read_file".parse().expect("a capability")],
+            deadline_ms: None,
+            allow_sub_delegation: false,
+            result_contract: None,
+        };
+        let accepted = b
+            .node()
+            .delegate(&a_id, request, &context)
+            .await
+            .expect("the peer accepts the task");
+        assert_eq!(accepted.state, DelegationState::Accepted);
+        let status = b
+            .node()
+            .delegation_status(&a_id, &DelegationId::new("d-e2e-host"), &context)
+            .await
+            .expect("the owner reports");
+        assert_eq!(status.state, DelegationState::Accepted);
+        let cancelled = b
+            .node()
+            .cancel_delegation(&a_id, &DelegationId::new("d-e2e-host"), &context)
+            .await
+            .expect("cancelled");
+        assert_eq!(cancelled.state, DelegationState::Cancelled);
+
+        // The provider's audit log names the work it did.
+        let audit = std::fs::read_dir(root.join("a"))
+            .expect("node a's directory")
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("audit") && name.ends_with(".jsonl"))
+            });
+        let log = audit
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .unwrap_or_default();
+        assert!(log.contains("builtin/read_file"), "audit: {log}");
+        assert!(log.contains("d-e2e-host"), "audit: {log}");
+
+        // Revocation cuts the plane: the same call is refused now.
+        a.node().peers().write().expect("peers").revoke(&b_id);
+        let refused = b
+            .node()
+            .invoke(
+                &a_id,
+                &"builtin/read_file".parse().expect("a capability"),
+                json!({ "path": "hello.txt" }),
+                &context,
+            )
+            .await;
+        assert!(refused.is_err(), "a revoked peer is refused");
+        // The coordination plane is cut by the same decision.
+        let revoked_task = DelegationRequest {
+            id: DelegationId::new("d-e2e-revoked"),
+            parent: None,
+            target: a_id.clone(),
+            objective: "should not run".to_string(),
+            capabilities: vec!["builtin/read_file".parse().expect("a capability")],
+            deadline_ms: None,
+            allow_sub_delegation: false,
+            result_contract: None,
+        };
+        assert!(
+            b.node()
+                .delegate(&a_id, revoked_task, &context)
+                .await
+                .is_err(),
+            "a revoked peer cannot delegate either"
+        );
+
+        // Dropping a node releases both of its directory locks.
+        drop(a);
+        drop(b);
+        assert!(crate::federation_lock::DataDirLock::acquire(&root.join("a")).is_ok());
+        assert!(crate::federation_lock::DataDirLock::acquire(&root.join("b")).is_ok());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

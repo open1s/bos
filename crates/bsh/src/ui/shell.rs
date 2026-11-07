@@ -306,6 +306,10 @@ pub(crate) struct Shell {
     pub(crate) plugin_search: Entity<InputState>,
     /// The egress allowlist entry field in the policy pane.
     pub(crate) policy_entry: Entity<InputState>,
+    /// The default-model picker's search field.
+    pub(crate) default_model_query: Entity<InputState>,
+    /// Whether the default-model picker's list is expanded.
+    pub(crate) default_model_open: bool,
     /// The browser pane's address bar.
     pub(crate) browser_url: Entity<InputState>,
     /// The federation pane's node-name field.
@@ -1308,6 +1312,10 @@ impl Shell {
         let policy_entry = cx.new(|cx| {
             InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "settings.policyAddHint"))
         });
+        let default_model_query = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(crate::i18n::tr(lang, "settings.defaultModelSearch"))
+        });
         // The browser's address bar. Its placeholder says what can be opened,
         // because an empty field would otherwise read as "anything goes".
         let browser_url = cx.new(|cx| {
@@ -1832,6 +1840,8 @@ impl Shell {
             plugin_search,
             policy_entry,
             browser_url,
+            default_model_query,
+            default_model_open: false,
             federation_name,
             federation_enroll,
             federation_grant,

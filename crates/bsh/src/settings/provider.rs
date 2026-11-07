@@ -432,7 +432,19 @@ impl GlobalSettings {
 
     /// Drop a provider and everything under it.
     pub(crate) fn remove_provider(&mut self, id: &str) -> bool {
-        self.providers.remove(id).is_some()
+        let removed = self.providers.remove(id).is_some();
+        // A default that names a removed provider would refuse every session
+        // that relies on it, so it is cleared with the provider. The pane then
+        // says "no default" instead of failing at send.
+        if removed
+            && self
+                .default_model
+                .as_ref()
+                .is_some_and(|reference| reference.provider == id)
+        {
+            self.default_model = None;
+        }
+        removed
     }
 
     /// Point a provider at another connection.
@@ -576,10 +588,19 @@ impl GlobalSettings {
 
     /// Drop one model.
     pub(crate) fn remove_model(&mut self, provider: &str, nickname: &str) -> bool {
-        self.providers
+        let removed = self
+            .providers
             .get_mut(provider)
             .map(|entry| entry.models.remove(nickname).is_some())
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if removed
+            && self.default_model.as_ref().is_some_and(|reference| {
+                reference.provider == provider && reference.model == nickname
+            })
+        {
+            self.default_model = None;
+        }
+        removed
     }
 
     /// Switch one input type on one model.
@@ -659,6 +680,31 @@ impl ModelEntry {
 mod tests {
     use super::global::Preset;
     use super::*;
+
+    /// Deleting the model a default names clears the default, so the next
+    /// fresh session is refused for "no model" rather than "unknown model".
+    #[test]
+    fn removing_the_default_model_clears_the_default() {
+        let mut global = with_model();
+        global.default_model = Some(global::ModelRef {
+            provider: "nvidia".to_string(),
+            model: "nvidia/moonshotai/kimi-k3".to_string(),
+        });
+        assert!(global.remove_model("nvidia", "nvidia/moonshotai/kimi-k3"));
+        assert_eq!(global.default_model, None, "the default is cleared");
+
+        // A different model's removal leaves it alone.
+        let mut global = with_model();
+        global.default_model = Some(global::ModelRef {
+            provider: "nvidia".to_string(),
+            model: "nvidia/moonshotai/kimi-k3".to_string(),
+        });
+        assert!(!global.remove_model("other", "nvidia/moonshotai/kimi-k3"));
+        assert!(
+            global.default_model.is_some(),
+            "another model's removal leaves the default alone"
+        );
+    }
 
     /// A tree with one shipped family whose model id is also its nickname.
     fn with_model() -> GlobalSettings {
@@ -973,7 +1019,13 @@ mod tests {
         assert!(global.preset_is_shipped("standard"));
         assert_eq!(
             global.preset("standard").expect("the preset").plugins,
-            vec!["shell".to_string(), "files".to_string(), "plan".to_string()]
+            vec![
+                "shell".to_string(),
+                "files".to_string(),
+                "plan".to_string(),
+                "schedule".to_string(),
+                "federation".to_string()
+            ]
         );
         assert!(global.preset("no-such-preset").is_none());
         global.presets.insert(

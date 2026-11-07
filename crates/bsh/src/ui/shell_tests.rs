@@ -4122,6 +4122,48 @@ fn seed_provider(global: &mut crate::settings::global::GlobalSettings, id: &str,
     );
 }
 
+/// The Models pane draws the default-model control, and the draft edit the
+/// control performs is what the pane saves.
+#[gpui::test]
+fn the_default_model_row_renders_its_control(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::component::init);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("default-model", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("models"), state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            seed_provider(
+                &mut this.state.draft_mut().global,
+                "alpha",
+                "https://alpha.example",
+            );
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("default-model-control").is_some(),
+        "the default-model control is on the pane"
+    );
+
+    // The control's handler edits the DRAFT; Save is what persists it.
+    let chosen = crate::settings::global::ModelRef {
+        provider: "alpha".to_string(),
+        model: "alpha-model".to_string(),
+    };
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.state.set_default_model(Some(chosen.clone()));
+        })
+    });
+    let drafted = cx.update(|_, cx| shell.read(cx).state.draft().global.default_model.clone());
+    assert_eq!(drafted, Some(chosen));
+    let saved = cx.update(|_, cx| shell.read(cx).state.settings.global.default_model.clone());
+    assert_eq!(saved, None, "the saved document waits for Save");
+}
+
 /// The model chip opens its own menu in place, the way the reference's trigger
 /// does - and the list that menu offers is the pane's own: the active provider's
 /// catalog, with the reference's fallback for an unresolved model.

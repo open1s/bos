@@ -593,10 +593,11 @@ pub(crate) struct Session {
     pub(crate) provider: Option<String>,
     /// The model nickname inside that provider.
     ///
-    /// The pair is the session's explicit choice and the ONLY model selection,
-    /// written only when the composer picks a model in THIS chat. It is
-    /// deliberately not copied into a new session: a fresh chat starts with no
-    /// model and asks for one instead of inheriting a neighbour's.
+    /// The pair is the session's explicit choice, written only when the
+    /// composer picks a model in THIS chat. It is deliberately not copied into
+    /// a new session: a fresh chat starts with no model and follows the
+    /// machine-wide default (Settings > Models > Default model) until the
+    /// reader picks one here.
     #[serde(default)]
     pub(crate) model: Option<String>,
     /// The preset this session runs, recorded when it is selected.

@@ -87,7 +87,7 @@ pub(crate) struct Connection {
 /// Why a turn cannot be sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Refusal {
-    /// No level names a model: a fresh install, or a workspace that never chose.
+    /// Neither the session nor the machine default names a model.
     NoModel,
     /// A name the provider tree no longer defines.
     UnknownModel(ModelRef),
@@ -109,6 +109,9 @@ pub(crate) enum Refusal {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct SessionChoice {
     /// The model the session recorded, if any.
+    ///
+    /// None means "follow the machine default": the resolution falls back to
+    /// `GlobalSettings::default_model` and only refuses when that is absent too.
     pub(crate) model: Option<ModelRef>,
     /// The preset id the session recorded, if any.
     pub(crate) preset: Option<String>,
@@ -576,7 +579,11 @@ pub(crate) fn resolve_with_catalogue(
     skill_sources: Vec<ResolvedSource>,
     skills: std::sync::Arc<Vec<DiscoveredSkill>>,
 ) -> Resolution {
-    let model = choose_model(global, session.model.as_ref());
+    // The session's own pick wins; a session that picked none takes the
+    // machine-wide default. Neither is a workspace fallback: the retired
+    // workspace pair stays retired (see the fixture test).
+    let chosen = session.model.as_ref().or(global.default_model.as_ref());
+    let model = choose_model(global, chosen);
 
     // The master switch is read ONCE, before the selection: with presets off
     // the selection is kept in the settings but contributes nothing, so the
@@ -1215,6 +1222,61 @@ mcp_servers = [
         );
     }
 
+    /// The machine default resolves a session that names none, and a session
+    /// that picked one keeps its own choice.
+    #[test]
+    fn the_global_default_fills_a_session_that_names_none() {
+        let mut g = global();
+        g.default_model = Some(ModelRef {
+            provider: "nvidia".to_string(),
+            model: "glm".to_string(),
+        });
+
+        let r = resolve(&g, &workspace(), Some(&entry()), &SessionChoice::default());
+        let ModelChoice::Found {
+            reference,
+            connection,
+        } = &r.model
+        else {
+            panic!("the default resolves: {:?}", r.model);
+        };
+        assert_eq!(reference.model, "glm");
+        assert_eq!(
+            connection.model, "nvidia/z-ai/glm-5.3-flash",
+            "the connection carries the default's API id"
+        );
+        assert!(r.model.refusal().is_none(), "the turn is sendable");
+
+        // A session that picked one is not overridden by the default.
+        let picked = resolve(&g, &workspace(), Some(&entry()), &choice("nvidia", "kimi"));
+        assert_eq!(
+            picked
+                .model
+                .reference()
+                .map(|reference| reference.model.as_str()),
+            Some("kimi")
+        );
+    }
+
+    /// A default that no longer resolves is reported, never silently replaced.
+    #[test]
+    fn a_stale_default_is_a_missing_model() {
+        let mut g = global();
+        let stale = ModelRef {
+            provider: "nvidia".to_string(),
+            model: "retired".to_string(),
+        };
+        g.default_model = Some(stale.clone());
+        let r = resolve(&g, &workspace(), Some(&entry()), &SessionChoice::default());
+        assert_eq!(
+            r.model,
+            ModelChoice::Missing {
+                reference: stale.clone()
+            }
+        );
+        assert_eq!(r.model.refusal(), Some(Refusal::UnknownModel(stale)));
+    }
+
     #[test]
     fn no_model_anywhere_is_unchosen_and_refuses() {
         let empty = WorkspaceSettings::from_toml("").expect("parses");
@@ -1548,8 +1610,8 @@ mcp_servers = [
         assert_eq!(r.preset_id.as_deref(), Some("standard"));
         assert_eq!(
             r.plugins,
-            vec!["shell", "files", "plan"],
-            "the shipped standard preset mounts the three bundles"
+            vec!["shell", "files", "plan", "schedule", "federation"],
+            "the shipped standard preset mounts the core bundles, scheduling and federation"
         );
         assert!(r.refusal().is_none());
     }
@@ -1658,7 +1720,13 @@ mcp_servers = [
         assert_eq!(default_back.preset_id.as_deref(), Some("standard"));
         assert_eq!(
             default_back.plugins,
-            vec!["shell".to_string(), "files".to_string(), "plan".to_string()],
+            vec![
+                "shell".to_string(),
+                "files".to_string(),
+                "plan".to_string(),
+                "schedule".to_string(),
+                "federation".to_string()
+            ],
             "the DEFAULT preset is restored as well, not silently cleared"
         );
     }

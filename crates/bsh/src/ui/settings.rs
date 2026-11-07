@@ -298,6 +298,49 @@ pub(crate) fn provider_label(id: &str, name: Option<&str>) -> String {
         .unwrap_or_else(|| id.to_string())
 }
 
+/// The default-model control's text: the chosen model, or the no-default word.
+///
+/// One function, so the closed control and any test describe the same fact; the
+/// provider is part of the label because two providers can carry a nickname
+/// that reads alike.
+fn default_model_label(settings: &crate::settings::Settings, lang: Lang) -> String {
+    match &settings.global.default_model {
+        Some(reference) => format!(
+            "{} · {}",
+            provider_display(settings, &reference.provider),
+            settings.model_display_name(reference)
+        ),
+        None => lang.tr("settings.defaultModelNone").to_string(),
+    }
+}
+
+/// One provider's group in the default-model menu.
+struct DefaultModelGroup {
+    /// The provider heading, already resolved to its display name.
+    heading: String,
+    /// One row per model: the label, the reference it selects, and whether it
+    /// is the default in force.
+    rows: Vec<(String, crate::settings::global::ModelRef, bool)>,
+}
+
+/// The provider's display name as the models UI shows it: the reader's name
+/// for it, else the shipped label, else the id.
+fn provider_display(settings: &crate::settings::Settings, id: &str) -> String {
+    let name = settings
+        .global
+        .providers
+        .get(id)
+        .and_then(|provider| provider.name.as_deref())
+        .or_else(|| {
+            settings
+                .global
+                .plugin_providers
+                .get(id)
+                .and_then(|provider| provider.name.as_deref())
+        });
+    provider_label(id, name)
+}
+
 /// The label of the provider's API-key source control.
 ///
 /// A chosen entry names itself, so the row states where the credential comes
@@ -4393,7 +4436,10 @@ impl Shell {
         } else {
             cards
         };
-        let mut rows: Vec<AnyElement> = Vec::with_capacity(listed.len() + 1);
+        let mut rows: Vec<AnyElement> = Vec::with_capacity(listed.len() + 2);
+        // The default first: it is the one choice that applies to every chat
+        // that has not picked a model of its own.
+        rows.push(self.default_model_row(cx));
         rows.extend(listed);
         rows.push(self.add_provider_block(cx));
         ("settings.models", "settings.modelsHint", rows)
@@ -4414,6 +4460,124 @@ impl Shell {
                 .child(txt(lang.tr("settings.modelsEmpty"), 12.0, theme::faint())),
         )
         .into_any_element()
+    }
+
+    /// The machine-wide default model: what a session uses until it picks one.
+    ///
+    /// One settings row, not a list. The reference's own row language (title,
+    /// hint, a 36px control on the right) with the catalogue behind the
+    /// control's menu: an always-expanded list turns one preference into a
+    /// second copy of the provider cards below it.
+    fn default_model_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let draft = self.state.draft();
+        let current = draft.global.default_model.clone();
+        let active = current
+            .as_ref()
+            .map(|reference| reference.provider.as_str())
+            .unwrap_or_default();
+        // Labels are computed once, outside the menu builder: the builder is
+        // `Fn`, and a second resolution per open would read the whole tree
+        // again for facts this row already holds.
+        let groups: Vec<DefaultModelGroup> = draft
+            .catalogs_by_provider(active)
+            .into_iter()
+            .map(|(provider, models)| {
+                let heading = provider_display(draft, &provider);
+                let rows = models
+                    .into_iter()
+                    .map(|nickname| {
+                        let reference = crate::settings::global::ModelRef {
+                            provider: provider.clone(),
+                            model: nickname,
+                        };
+                        let label =
+                            format!("{} · {}", heading, draft.model_display_name(&reference));
+                        let checked = current.as_ref() == Some(&reference);
+                        (label, reference, checked)
+                    })
+                    .collect();
+                DefaultModelGroup { heading, rows }
+            })
+            .collect();
+        let value = default_model_label(draft, lang);
+        let none_label = lang.tr("settings.defaultModelNone").to_string();
+        let shell = cx.entity().clone();
+        let control = Button::new(SharedString::from("default-model-control"))
+            .ghost()
+            .h(px(36.0))
+            .px(px(14.0))
+            .rounded(px(12.0))
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .bg(rgb(theme::selected_row()))
+            .cursor_pointer()
+            .child(
+                div()
+                    .max_w(px(300.0))
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .child(txt(
+                        value,
+                        14.0,
+                        if current.is_none() {
+                            theme::muted()
+                        } else {
+                            theme::text()
+                        },
+                    )),
+            )
+            .child(icon(IconName::ChevronDown, 12.0, theme::caption()))
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                let mut menu = menu.min_w(px(280.0)).max_w(px(420.0));
+                let clear = shell.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(none_label.clone())
+                        .checked(current.is_none())
+                        .on_click(move |_, _, cx| {
+                            clear.update(cx, |this, cx| {
+                                this.state.set_default_model(None);
+                                cx.notify();
+                            });
+                        }),
+                );
+                for group in groups.iter() {
+                    let heading = group.heading.clone();
+                    menu = menu.item(PopupMenuItem::element(move |_, _| {
+                        txt(heading.clone(), 11.0, theme::faint())
+                            .px(px(8.0))
+                            .py(px(6.0))
+                            .into_any_element()
+                    }));
+                    for (label, reference, checked) in &group.rows {
+                        let pick = shell.clone();
+                        let picked = reference.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(label.clone())
+                                .checked(*checked)
+                                .on_click(move |_, _, cx| {
+                                    let picked = picked.clone();
+                                    pick.update(cx, |this, cx| {
+                                        this.state.set_default_model(Some(picked.clone()));
+                                        cx.notify();
+                                    });
+                                }),
+                        );
+                    }
+                }
+                menu
+            });
+        self.preference_row(
+            "settings.defaultModel",
+            Some("settings.defaultModelHint"),
+            div()
+                .debug_selector(|| "default-model-control".to_string())
+                .child(control)
+                .into_any_element(),
+        )
     }
 
     /// One provider card: the reference's row head, modernised to the pane's
@@ -13659,5 +13823,31 @@ mod federation_tests {
         let zh = Shell::federation_profile_suffix(Lang::Zh, "work");
         assert!(zh.contains("work"), "{zh}");
         assert!(zh.contains("节点配置"), "{zh}");
+    }
+}
+
+#[cfg(test)]
+mod default_model_tests {
+    // NO glob import: this file imports gpui, which re-exports a "test"
+    // attribute macro. A glob here would shadow the builtin #[test] and the
+    // expansion would recurse until the parser dies.
+    use super::default_model_label;
+    use crate::i18n::Lang;
+
+    /// The closed control names the default, or says there is none; the provider
+    /// is part of the label because two providers can carry the same nickname.
+    #[test]
+    fn the_control_label_names_the_default_or_says_there_is_none() {
+        let mut settings = crate::settings::Settings::default();
+        assert_eq!(default_model_label(&settings, Lang::En), "No default");
+        settings
+            .global
+            .add_provider("p", "", "https://p.example/v1", &[]);
+        let _ = settings.global.add_model("p", "m", "M", "p/m", "");
+        settings.global.default_model = Some(crate::settings::global::ModelRef {
+            provider: "p".to_string(),
+            model: "m".to_string(),
+        });
+        assert_eq!(default_model_label(&settings, Lang::En), "p · M");
     }
 }

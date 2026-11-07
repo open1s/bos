@@ -525,6 +525,14 @@ pub(crate) struct GlobalSettings {
     /// The local web-search tool's endpoint and per-search budget.
     #[serde(default)]
     pub(crate) web_search: WebSearchSection,
+    /// The model a session uses when it names none of its own.
+    ///
+    /// One machine-wide fallback, so a fresh chat is sendable without picking a
+    /// model every time. A session that picked one in the composer keeps its own
+    /// choice; the default only fills the gap. Absent means the old behaviour:
+    /// a session with no model is refused at send.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) default_model: Option<ModelRef>,
     /// The preset a session takes when it names none. The reference keeps this
     /// as the registry's selectedDefault, resolved over the deployment default.
     #[serde(default = "default_preset")]
@@ -552,6 +560,7 @@ impl Default for GlobalSettings {
             workspaces: Vec::new(),
             web_search: WebSearchSection::default(),
             federation: FederationSection::default(),
+            default_model: None,
             default_preset: default_preset(),
         }
     }
