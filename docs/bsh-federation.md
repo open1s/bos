@@ -479,8 +479,9 @@ a successful outcome records its artifacts, and a final failure calls the
 executor's compensation hook (recorded on the task). A failed remote
 compensation is queued durably so `DelegationExecutor::reconcile_compensations`
 can retry it; BSH runs that queue every 30 seconds with exponential backoff.
-A receipt is stored on the task after success, and `audit_receipts` compares a
-batch of task receipts with the target's live records. The graph is a library API: the
+A receipt is stored on the task after success; the Work tab's Audit receipts
+action and the node's 30-second auditor compare a task-graph receipt batch with
+each target's live records. The graph is a library API: the
 right panel lists delegations but does not draw the graph, and a host supplies
 the `TaskExecutor`; `DelegationExecutor` is the delegation-backed one.
 
@@ -532,9 +533,10 @@ let progress = runner.run(executor, 4).await?;
 - TLS deployments disable Zenoh scouting so a scouted plaintext link cannot
   bypass the configured TLS endpoints. BSH terminates TLS itself with a
   reloadable rustls resolver and forwards plaintext only to a loopback Zenoh
-  listener, so Reload TLS swaps the certificate for new handshakes without
-  dropping established connections. Client certificates and the CA bundle are
-  still read when the terminator starts.
+  listener, so Reload TLS swaps the server certificate and the client CA for new
+  handshakes without dropping established connections. Outbound TLS is the same
+  shape: BSH keeps Zenoh on a loopback client proxy that owns the client
+  certificate, so Reload TLS also replaces the client cert and its CA.
 The model has the same surface as `federation_status`, `federation_peers`,
 `federation_delegate`, `federation_cancel`, `federation_query` and
 `federation_cleanup` tools; it reads peer ids from `federation_peers` instead of

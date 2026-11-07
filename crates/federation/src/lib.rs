@@ -38,9 +38,9 @@ pub use artifacts::{
 pub use audit::{Direction, FederationAudit, FederationEvent, MemoryAudit};
 pub use capability::{FederationMessage, FederationTransport, MessageId, PeerSession};
 pub use collaboration::{
-    ArtifactRef, CollaborationError, DelegationExecutor, Orchestrator, ReceiptMismatch,
-    TaskExecutor, TaskGraph, TaskNode, TaskNodeId, TaskOutcome, TaskProgress, TaskState,
-    COLLABORATION_SCHEMA,
+    ArtifactRef, CollaborationError, DelegationExecutor, Orchestrator, ReceiptAuditor,
+    ReceiptMismatch, TaskExecutor, TaskGraph, TaskNode, TaskNodeId, TaskOutcome, TaskProgress,
+    TaskState, COLLABORATION_SCHEMA,
 };
 pub use compensation::{CompensationQueue, PendingCompensation};
 pub use delegation::{

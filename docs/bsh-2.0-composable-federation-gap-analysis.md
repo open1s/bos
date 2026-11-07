@@ -366,7 +366,8 @@ ServerConfig, so BSH puts a rustls terminator in front of a loopback Zenoh
 listener. The terminator owns the public TLS port, reloads its certificate
 resolver on demand, and leaves established connections running; a bus test
 proves an old connection survives while a new handshake gets the replacement
-certificate. Client certificates and the CA bundle still load at start.
+certificate and client CA. A loopback client proxy does the same for outbound
+TLS, so the client certificate reloads without rebuilding the Zenoh session.
 
 **Acceptance**
 - Production profile refuses insecure configuration unless explicitly enabled for development.

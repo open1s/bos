@@ -20,10 +20,14 @@ use serde_json::Value;
 /// gets the partial output and a running status instead.
 pub const MAX_WAIT_MS: u64 = 30_000;
 
+/// Characters of one command line the roster keeps.
+const COMMAND_CAP: usize = 200;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Output,
     Kill,
+    List,
 }
 
 /// One of the two job tools, sharing the registry and principal of the shell.
@@ -44,6 +48,16 @@ impl JobTool {
     /// The stop control, which takes an id.
     pub fn stopper(name: &str) -> Self {
         Self::new(name, Kind::Kill)
+    }
+
+    /// The roster, which takes no arguments.
+    ///
+    /// A background job outlives the call that started it, and a turn may open
+    /// several; without a roster the only way back to one is the id in an
+    /// earlier tool result. The list is the session's own jobs, newest first,
+    /// with metadata rather than output - reading one stays `job_output`'s job.
+    pub fn lister(name: &str) -> Self {
+        Self::new(name, Kind::List)
     }
 
     fn new(name: &str, kind: Kind) -> Self {
@@ -158,6 +172,41 @@ impl JobTool {
             "status": status.as_str(),
         }))
     }
+
+    /// The session's own jobs, newest first, as metadata rather than output.
+    ///
+    /// No per-call policy check: a job is addressed by its id and the roster is
+    /// confined to the calling session, which is the boundary `owned` enforces
+    /// for the other two tools. The registration gate already asked the policy
+    /// whether `job_list` exists for this turn.
+    fn list(&self) -> Result<Value, ToolError> {
+        let registry = self.registry()?;
+        let jobs: Vec<Value> = registry
+            .list_for_session(&self.session)
+            .into_iter()
+            .map(|job| {
+                // The command is the model's own text; keep the roster bounded
+                // so a wide shell cannot flood the context through it.
+                let command: String = job.command.chars().take(COMMAND_CAP).collect();
+                serde_json::json!({
+                    "id": job.id,
+                    "tool": job.tool,
+                    "status": job.status.as_str(),
+                    "running": job.status.is_running(),
+                    "exit_code": job.status.exit_code(),
+                    "duration_ms": job.duration_ms,
+                    "command": command,
+                    "command_truncated": job.command.chars().count() > COMMAND_CAP,
+                    "output_bytes": job.output_len,
+                    "output_truncated": job.output_dropped > 0,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({
+            "count": jobs.len(),
+            "jobs": jobs,
+        }))
+    }
 }
 
 impl Tool for JobTool {
@@ -174,6 +223,10 @@ impl Tool for JobTool {
             Kind::Kill => "Stop a running background job. Pass the job id returned by bash with \
                  run_in_background. The whole process group is signalled; an already \
                  settled job reports killed: false."
+                .to_string(),
+            Kind::List => "List this session's background jobs, newest first: id, status, \
+                 duration, command and the size of the captured output. Use it when you \
+                 need a job id you no longer hold; read one with job_output."
                 .to_string(),
         }
     }
@@ -211,6 +264,11 @@ impl Tool for JobTool {
                 "required": ["id"],
                 "additionalProperties": false
             }),
+            Kind::List => serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
         }
     }
 
@@ -235,6 +293,16 @@ impl Tool for JobTool {
                 },
             );
         }
+        if self.kind == Kind::List {
+            // No argument, so the definition carries an empty object schema
+            // rather than an optional `id` the model could think it needs.
+            return react::tool::ToolDefinition::new(self.name(), self.description())
+                .with_parameters(react::tool::ToolParameters {
+                    param_type: "object".to_string(),
+                    properties: Some(std::collections::HashMap::new()),
+                    required: None,
+                });
+        }
         react::tool::ToolDefinition::new(self.name(), self.description()).with_parameters(
             react::tool::ToolParameters {
                 param_type: "object".to_string(),
@@ -248,6 +316,7 @@ impl Tool for JobTool {
         match self.kind {
             Kind::Output => self.read_output(input),
             Kind::Kill => self.stop(input),
+            Kind::List => self.list(),
         }
     }
 }
@@ -425,5 +494,62 @@ verdict := {"allow": false, "rule": "no-job-output", "reason": "job output is no
             }
             other => panic!("expected a read refusal, got {other:?}"),
         }
+    }
+
+    /// The roster is the calling session's own jobs, newest first, and it
+    /// carries metadata rather than the captured bytes.
+    #[test]
+    fn the_roster_lists_only_the_callers_session_newest_first() {
+        let registry = Arc::new(JobRegistry::new());
+        let older = registry.begin("session-a", "bash", "sleep 5");
+        let newer = registry.begin("session-a", "bash", "sleep 6");
+        let foreign = registry.begin("session-b", "bash", "echo not-yours");
+        registry.append_output(&newer, b"partial
+");
+
+        let tool = JobTool::lister("job_list").with_jobs(registry, "session-a");
+        let listed = tool.run(&serde_json::json!({})).expect("the roster");
+
+        assert_eq!(listed["count"], serde_json::json!(2), "{listed}");
+        let jobs = listed["jobs"].as_array().expect("jobs");
+        assert_eq!(jobs[0]["id"], serde_json::json!(newer), "newest first");
+        assert_eq!(jobs[1]["id"], serde_json::json!(older));
+        assert!(jobs.iter().all(|job| job["id"] != serde_json::json!(foreign)));
+        assert_eq!(jobs[0]["status"], serde_json::json!("running"));
+        assert_eq!(jobs[0]["running"], serde_json::json!(true));
+        assert!(
+            jobs[0].get("output").is_none(),
+            "the roster must not copy the captured output: {listed}"
+        );
+        assert_eq!(jobs[0]["output_bytes"], serde_json::json!(8));
+    }
+
+    /// An empty roster is an empty list, not an error: a turn that never
+    /// backgrounded anything should learn that in one call.
+    #[test]
+    fn an_empty_roster_is_an_empty_list() {
+        let registry = Arc::new(JobRegistry::new());
+        let tool = JobTool::lister("job_list").with_jobs(registry, "session-a");
+        let listed = tool.run(&serde_json::json!({})).expect("the roster");
+        assert_eq!(listed["count"], serde_json::json!(0));
+        assert_eq!(listed["jobs"], serde_json::json!([]));
+    }
+
+    /// The list schema takes no argument: an `id` the model invents is not
+    /// silently ignored, it simply does not exist.
+    #[test]
+    fn the_roster_schema_has_no_parameters() {
+        let tool = JobTool::lister("job_list");
+        let schema = tool.json_schema();
+        assert_eq!(schema["type"], serde_json::json!("object"));
+        assert_eq!(schema["properties"], serde_json::json!({}));
+        assert_eq!(schema["additionalProperties"], serde_json::json!(false));
+        let definition = tool.to_openai_definition();
+        assert!(definition
+            .function
+            .parameters
+            .as_ref()
+            .and_then(|parameters| parameters.required.as_ref())
+            .is_none_or(|required| required.is_empty()));
     }
 }

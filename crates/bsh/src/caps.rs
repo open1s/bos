@@ -314,6 +314,8 @@ pub(crate) struct ToolGates {
     pub(crate) background_spawn: bool,
     /// Whether `job_output` may read a job's captured output.
     pub(crate) output: bool,
+    /// Whether `job_list` may enumerate the session's jobs.
+    pub(crate) list: bool,
     /// Whether `job_kill` may terminate a job.
     pub(crate) kill: bool,
     /// Whether the `subagent` tool may be attached.
@@ -324,8 +326,8 @@ pub(crate) struct ToolGates {
 /// three gates allow it:
 ///
 /// 1. the permission matrix grants side effects (`read-only` grants none of
-///    `bash`, `run_in_background`, `job_output`, `job_kill` or
-///    `subagent`; the two writable modes grant all five);
+///    `bash`, `run_in_background`, `job_output`, `job_list`, `job_kill`
+///    or `subagent`; the two writable modes grant all six);
 /// 2. the preset's `tools` allowlist either is absent (inherit) or names the
 ///    tool - an absent list inherits, an explicit list intersects; and
 /// 3. the Rego policy answers the capability question for the tool name with
@@ -362,6 +364,7 @@ pub(crate) fn tool_gates_for(
         bash: allowed && bash,
         background_spawn: allowed && bash && capability("run_in_background"),
         output: allowed && in_preset("job_output") && capability("job_output"),
+        list: allowed && in_preset("job_list") && capability("job_list"),
         kill: allowed && in_preset("job_kill") && capability("job_kill"),
         subagent: allowed && in_preset("subagent") && capability("subagent"),
     }
@@ -1010,6 +1013,15 @@ fn build_agent_for_session_inner(
                 declare("job_output"),
             )));
         }
+        if gates.list && !off_tool("job_list") {
+            shell_tools.push(Arc::new(DeclaredTool::new(
+                Arc::new(
+                    agent::tools::JobTool::lister("job_list")
+                        .with_jobs(jobs.clone(), session),
+                ),
+                declare("job_list"),
+            )));
+        }
         if gates.kill && !off_tool("job_kill") {
             shell_tools.push(Arc::new(DeclaredTool::new(
                 Arc::new(
@@ -1435,8 +1447,9 @@ fn build_agent_for_session_inner(
     if let Some((parent, registry)) = subagents {
         // Delegation is a capability, not a free attachment: the same single
         // predicate that gates the shell family decides whether the tool and
-        // its standing guidance exist at all.
-        if gates.subagent {
+        // its standing guidance exist at all, and the reader's own switch for
+        // `subagent` closes it like every other tool's.
+        if gates.subagent && !off_tool("subagent") {
             let context = SubagentContext::new(
                 &agent,
                 parent,
@@ -1449,6 +1462,7 @@ fn build_agent_for_session_inner(
                     .map(|path| path.to_string_lossy().to_string())
                     .unwrap_or_default(),
                 crate::context::RuntimeFacts::from_effective(&eff),
+                !off_tool("send_message"),
             );
             attach_subagent_tool(&mut agent, context);
         }
@@ -2316,6 +2330,12 @@ pub(crate) struct SubagentContext {
     /// which a delegated prompt may name. Carrying the parsed content means a
     /// child costs pushes, not a second walk of the sources.
     skills: Vec<agent::skills::SkillContent>,
+    /// Whether the turn carries `send_message`.
+    ///
+    /// The reader's own per-tool switch decides this once for the turn; a
+    /// nested child inherits the answer rather than re-deciding it, so a
+    /// switched-off tool does not reappear one level down.
+    message: bool,
 }
 
 impl SubagentContext {
@@ -2331,6 +2351,7 @@ impl SubagentContext {
         preset: impl Into<String>,
         root: impl Into<String>,
         runtime: crate::context::RuntimeFacts,
+        message: bool,
     ) -> Self {
         let (sync_tools, async_tools) = match agent.registry() {
             Some(registry) => {
@@ -2361,6 +2382,7 @@ impl SubagentContext {
             // The model-facing set, not the pre-extension set: a child must
             // inherit the package skills the parent turn actually carries.
             skills: agent.all_skills(),
+            message,
         }
     }
 
@@ -2440,6 +2462,7 @@ impl SubagentContext {
                 self.preset.clone(),
                 self.root.clone(),
                 self.runtime.clone(),
+                self.message,
             );
             attach_subagent_tool(&mut child, nested);
             crate::prompts::append_subagent_guidance(&mut child);
@@ -2501,6 +2524,13 @@ pub(crate) fn rebuild_child_agent(
         built.effective.preset_id.clone(),
         root,
         crate::context::RuntimeFacts::from_effective(&built.effective),
+        // A rebuilt child answers the same reader switches as the turn that
+        // spawned it: the switch was stored in the settings, not in the run.
+        !built
+            .effective
+            .disabled_tools
+            .iter()
+            .any(|tool| tool == "send_message"),
     );
     Ok(context.child_with_delegation(child_id, gates.subagent))
 }
@@ -2605,9 +2635,11 @@ pub(crate) async fn stream_child(
 pub(crate) fn attach_subagent_tool(agent: &mut Agent, context: SubagentContext) {
     let context = Arc::new(context);
     // The collector needs the same registry and session the starter uses. Take
-    // them before the starter closure moves the Arc.
+    // them before the starter closure moves the Arc, and keep one handle for the
+    // follow-up tool the same build may also install.
     let result_registry = context.registry.clone();
     let result_session = context.session.clone();
+    let message_context = Arc::clone(&context);
     let tool = agent::tools::AsyncFunctionTool::from_fn(
         "subagent",
         "Delegate ONE self-contained part of a large job to a focused child agent with its own context; write a complete prompt and run up to three children at once. Returns immediately with a subagent_id; the child keeps running in the background and you collect it with subagent_result. Do not use it for a trivial single step or tightly coupled sequential work.",
@@ -2714,6 +2746,9 @@ pub(crate) fn attach_subagent_tool(agent: &mut Agent, context: SubagentContext) 
         return;
     }
     attach_subagent_result_tool(agent, result_registry, result_session);
+    if message_context.message {
+        attach_subagent_message_tool(agent, message_context);
+    }
 }
 
 /// Install the collector a background subagent returns through.
@@ -2828,6 +2863,143 @@ fn attach_subagent_result_tool(
         declare("subagent_result"),
     ))) {
         warn!("subagent_result tool was not registered: {error}");
+    }
+}
+
+/// Install the tool that answers a child's next turn from the model side.
+///
+/// The reader can already type into a child from its menu; this is the same
+/// path for the model, and it reuses the same registry calls rather than a
+/// second opinion about what "the child is busy" means:
+///
+/// - a RUNNING child queues the message behind its current turn, and the child
+///   clock starts it when that turn settles, exactly as a reader's queued
+///   prompt starts;
+/// - a SETTLED child reopens immediately and runs on the live agent that
+///   answered its last turn, so the follow-up keeps the conversation.
+///
+/// A run restored from disk has no live process on this side (the child agent
+/// is not persisted); that case is refused with the one action that works
+/// instead of silently starting a stranger.
+fn attach_subagent_message_tool(agent: &mut Agent, context: Arc<SubagentContext>) {
+    let tool = agent::tools::AsyncFunctionTool::from_fn(
+        "send_message",
+        "Send a message to a subagent run you started: a running child queues it behind its current turn, and a finished child starts a new turn with the message. Returns queued or started; read the answer with subagent_result. The child cannot see this conversation, so a follow-up must carry its own context. Start a new delegation instead when the run's process is gone (a restart).",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "subagent_id": { "type": "string", "description": "The id the subagent tool returned; list the runs with subagent_result and no id." },
+                "message": { "type": "string", "description": "The follow-up: what to do next, with the context the child needs. It is a user row in the child's own conversation." }
+            },
+            "required": ["subagent_id", "message"]
+        }),
+        move |args| {
+            let context = context.clone();
+            async move {
+                let id = args
+                    .get("subagent_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let message = args
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if id.is_empty() {
+                    return Err(ToolError::InvalidInput(
+                        "subagent_id is required; list the runs with subagent_result and no id"
+                            .to_string(),
+                    ));
+                }
+                if message.is_empty() {
+                    return Err(ToolError::InvalidInput(
+                        "message is required and must not be empty".to_string(),
+                    ));
+                }
+                // The same non-disclosure the collector keeps: a run from
+                // another conversation is indistinguishable from an unknown id.
+                let Some(run) = context.registry.run(&id) else {
+                    return Err(ToolError::InvalidInput(format!(
+                        "no subagent run '{id}'; list them with subagent_result and no id"
+                    )));
+                };
+                if run.session != context.session {
+                    return Err(ToolError::InvalidInput(format!(
+                        "no subagent run '{id}'; list them with subagent_result and no id"
+                    )));
+                }
+                // A follow-up is another child turn, so it asks the same spawn
+                // question the first delegation asked, before anything moves.
+                context.authorize_spawn()?;
+                if run.status.is_running() && context.registry.queue_followup(&id, &message) {
+                    return Ok(serde_json::json!({
+                        "subagent_id": id,
+                        "status": "queued",
+                        "note": "The child is mid-turn; the message starts the next child turn when this one settles. Collect it with subagent_result."
+                    }));
+                }
+                let Some(child) = context.registry.agent(&id) else {
+                    return Err(ToolError::Failed(format!(
+                        "subagent run '{id}' has no live process (it was restored after a restart), so a follow-up cannot continue it. Start a new subagent with the context it needs."
+                    )));
+                };
+                if !context.registry.begin_followup(&id, &message) {
+                    // It settled between the snapshot and the reopen: queue
+                    // behind the turn that just started rather than opening a
+                    // second stream over the same transcript.
+                    if context.registry.queue_followup(&id, &message) {
+                        return Ok(serde_json::json!({
+                            "subagent_id": id,
+                            "status": "queued",
+                            "note": "The child started a turn while this call was made; the message starts the next one. Collect it with subagent_result."
+                        }));
+                    }
+                    return Err(ToolError::Failed(format!(
+                        "subagent run '{id}' is already running a turn and refused the queue; read it with subagent_result"
+                    )));
+                }
+                tokio::spawn(continue_child(context.clone(), id.clone(), child, message));
+                Ok(serde_json::json!({
+                    "subagent_id": id,
+                    "status": "started",
+                    "note": "The child is answering in the background; collect it with subagent_result before you finish the turn."
+                }))
+            }
+        },
+    );
+    if let Err(error) = agent.try_add_async_tool(Arc::new(DeclaredAsyncTool::new(
+        Arc::new(tool),
+        declare("send_message"),
+    ))) {
+        warn!("send_message tool was not registered: {error}");
+    }
+}
+
+/// Run one more turn into a child that already lives in the registry.
+///
+/// The turn itself is [stream_child], the same call the first delegation makes,
+/// so a follow-up reports the same transcript, token usage and finish/fail
+/// transitions. The child is locked for the turn so two queued prompts cannot
+/// write over one transcript.
+async fn continue_child(
+    context: Arc<SubagentContext>,
+    id: String,
+    child: Arc<tokio::sync::Mutex<Agent>>,
+    prompt: String,
+) {
+    let turn_context = crate::context::TurnContext::from_facts(&context.runtime, true);
+    let registry = context.registry.clone();
+    let guard = child.lock().await;
+    let result = stream_child(&guard, prompt, registry.clone(), &id, &turn_context).await;
+    let usage = guard.last_token_usage().unwrap_or((0, 0));
+    let transcript = child_transcript(&guard);
+    drop(guard);
+    match result {
+        Ok((text, usage)) => registry.finish(&id, text, usage, transcript),
+        Err(message) => registry.fail(&id, message, Some(usage), transcript),
     }
 }
 
@@ -5687,6 +5859,7 @@ mod tests {
             "list_dir",
             "update_plan",
             "web_search",
+            "job_list",
             "subagent",
             "subagent_result",
         ];
@@ -7115,6 +7288,7 @@ mod tests {
             vec![
                 "bash".to_string(),
                 "job_kill".to_string(),
+                "job_list".to_string(),
                 "job_output".to_string(),
             ]
         );
@@ -7329,6 +7503,7 @@ mod tests {
                 "glob".to_string(),
                 "grep".to_string(),
                 "job_kill".to_string(),
+                "job_list".to_string(),
                 "job_output".to_string(),
                 "list_dir".to_string(),
                 "read_file".to_string(),
@@ -7545,14 +7720,14 @@ mod tests {
         assert!(!names.iter().any(|name| name == "update_goal"), "{names:?}");
     }
 
-    /// The five gated capabilities, in display order.
-    type Gates = (bool, bool, bool, bool, bool);
+    /// The six gated capabilities, in display order.
+    type Gates = (bool, bool, bool, bool, bool, bool);
     /// One row of the registration table.
     type GateRow<'a> = (&'a str, Option<&'a [&'a str]>, Gates);
 
     /// The gated tools a built parent turn actually carries.
     ///
-    /// The tuple is `(bash, run_in_background, job_output, job_kill,
+    /// The tuple is `(bash, run_in_background, job_output, job_list, job_kill,
     /// subagent)`. `run_in_background` is a shell capability rather than a
     /// tool, so it is read from the schema the agent advertises.
     fn gated_tools(settings: &Settings) -> Gates {
@@ -7577,6 +7752,7 @@ mod tests {
             bash.is_some(),
             background,
             registry.get("job_output").is_some(),
+            registry.get("job_list").is_some(),
             registry.get("job_kill").is_some(),
             registry.get_async("subagent").is_some(),
         )
@@ -7611,35 +7787,44 @@ mod tests {
     #[test]
     fn the_tool_gate_matrix_follows_permission_and_preset() {
         let table: &[GateRow] = &[
-            (READ_ONLY, None, (false, false, false, false, false)),
+            (READ_ONLY, None, (false, false, false, false, false, false)),
             (
                 READ_ONLY,
                 Some(&[
                     "bash",
                     "run_in_background",
                     "job_output",
+                    "job_list",
                     "job_kill",
                     "subagent",
                 ]),
-                (false, false, false, false, false),
+                (false, false, false, false, false, false),
             ),
             (
                 READ_ONLY,
                 Some(&["subagent"]),
-                (false, false, false, false, false),
+                (false, false, false, false, false, false),
             ),
-            (WORKSPACE_WRITE, None, (true, true, true, true, true)),
+            (
+                WORKSPACE_WRITE,
+                None,
+                (true, true, true, true, true, true),
+            ),
             (
                 WORKSPACE_WRITE,
                 Some(&["bash", "job_output", "job_kill"]),
-                (true, true, true, true, false),
+                (true, true, true, false, true, false),
             ),
             (
                 WORKSPACE_WRITE,
                 Some(&["subagent"]),
-                (false, false, false, false, true),
+                (false, false, false, false, false, true),
             ),
-            (FULL_ACCESS, None, (true, true, true, true, true)),
+            (
+                FULL_ACCESS,
+                None,
+                (true, true, true, true, true, true),
+            ),
         ];
         for (permission, tools, expected) in table {
             let settings = with_tools(permission, *tools);
@@ -10469,6 +10654,90 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             assert_eq!(out["prompt_tokens"], 3);
             let listed = tool.run(&serde_json::json!({})).await.expect("the list");
             assert_eq!(listed["runs"][0]["subagent_id"], id);
+        });
+    }
+
+    /// `send_message` queues behind a running child through the same registry
+    /// call the reader's own composer uses, refuses a run it does not own, and
+    /// refuses a settled run with no live process instead of rebuilding a
+    /// stranger from nothing.
+    #[test]
+    fn send_message_queues_behind_a_running_child_and_refuses_a_stale_run() {
+        use std::sync::Arc;
+        let registry = Arc::new(crate::subagent::SubagentRegistry::default());
+        let built = crate::caps::build_agent_for_session_with_subagents(
+            &bare(),
+            &Vault::disabled(),
+            &SessionChoice::default(),
+            &crate::mcp::McpPool::default(),
+            "session",
+            "session",
+            registry.clone(),
+        );
+        let tool = built
+            .agent
+            .registry()
+            .expect("registry")
+            .get_async("send_message")
+            .expect("send_message is attached to a writable turn");
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let id = registry
+                .try_begin(
+                    "session",
+                    "session",
+                    1,
+                    0,
+                    "Inspect",
+                    "look",
+                    crate::subagent::SUBAGENT_SLOTS,
+                )
+                .expect("a free slot");
+            let queued = tool
+                .run(&serde_json::json!({
+                    "subagent_id": id,
+                    "message": "also check the tests"
+                }))
+                .await
+                .expect("a running child queues");
+            assert_eq!(queued["status"], "queued");
+            assert_eq!(
+                registry.run(&id).expect("run").pending,
+                vec!["also check the tests".to_string()],
+                "the prompt waits behind the current child turn"
+            );
+
+            let unknown = tool
+                .run(&serde_json::json!({ "subagent_id": "nope", "message": "x" }))
+                .await;
+            assert!(unknown.is_err(), "an unknown run is refused");
+
+            let foreign = registry
+                .try_begin(
+                    "other",
+                    "other",
+                    1,
+                    0,
+                    "Elsewhere",
+                    "elsewhere",
+                    crate::subagent::SUBAGENT_SLOTS,
+                )
+                .expect("a free slot");
+            let refused = tool
+                .run(&serde_json::json!({ "subagent_id": foreign, "message": "x" }))
+                .await;
+            assert!(refused.is_err(), "another conversation's run is invisible");
+
+            registry.finish(&id, "done".to_string(), (1, 1), Vec::new());
+            match tool
+                .run(&serde_json::json!({ "subagent_id": id, "message": "again" }))
+                .await
+            {
+                Err(ToolError::Failed(message)) => {
+                    assert!(message.contains("no live process"), "{message}")
+                }
+                other => panic!("expected the stale-run refusal, got {other:?}"),
+            }
         });
     }
 

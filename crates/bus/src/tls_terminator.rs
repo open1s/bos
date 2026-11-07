@@ -62,9 +62,7 @@ impl TlsTerminator {
             current: Arc::clone(&current),
         });
         let server = build_server_config(&config, resolver)?;
-        let acceptor = Arc::new(RwLock::new(Arc::new(TlsAcceptor::from(Arc::new(
-            server,
-        )))));
+        let acceptor = Arc::new(RwLock::new(Arc::new(TlsAcceptor::from(Arc::new(server)))));
         let listener = TcpListener::bind(config.listen)
             .await
             .map_err(|error| error.to_string())?;
@@ -319,6 +317,128 @@ mod tests {
         // A new handshake uses the new certificate, so its client trusts CA2.
         std::fs::write(material.root.join("ca2.pem"), ca2).expect("ca2");
         let mut fresh = client(addr, &material.root.join("ca2.pem")).await;
+        round_trip(&mut fresh, b'c').await;
+
+        terminator.abort();
+        let _ = std::fs::remove_dir_all(material.root);
+    }
+
+    fn issue_with_client(name: &str) -> (String, String, String, String, String) {
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, format!("{name} ca"));
+        let ca_key = KeyPair::generate().expect("ca key");
+        let ca = ca_params.self_signed(&ca_key).expect("ca");
+        let mut server_params =
+            CertificateParams::new(vec!["localhost".to_string()]).expect("server params");
+        server_params
+            .distinguished_name
+            .push(DnType::CommonName, name);
+        let server_key = KeyPair::generate().expect("server key");
+        let server = server_params
+            .signed_by(&server_key, &ca, &ca_key)
+            .expect("server cert");
+        let mut client_params =
+            CertificateParams::new(Vec::<String>::new()).expect("client params");
+        client_params
+            .distinguished_name
+            .push(DnType::CommonName, format!("{name} client"));
+        let client_key = KeyPair::generate().expect("client key");
+        let client = client_params
+            .signed_by(&client_key, &ca, &ca_key)
+            .expect("client cert");
+        (
+            ca.pem(),
+            server.pem(),
+            server_key.serialize_pem(),
+            client.pem(),
+            client_key.serialize_pem(),
+        )
+    }
+
+    async fn client_with_cert(
+        addr: SocketAddr,
+        ca: &Path,
+        client_cert: &Path,
+        client_key: &Path,
+    ) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>, String> {
+        let mut roots = RootCertStore::empty();
+        for cert in load_certs(ca)? {
+            roots.add(cert).map_err(|error| error.to_string())?;
+        }
+        let certs = load_certs(client_cert)?;
+        let mut reader =
+            BufReader::new(std::fs::File::open(client_key).map_err(|error| error.to_string())?);
+        let key = rustls_pemfile::private_key(&mut reader)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "no client key".to_string())?;
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(certs, key)
+            .map_err(|error| error.to_string())?;
+        let connector = TlsConnector::from(Arc::new(config));
+        let tcp = tokio::net::TcpStream::connect(addr)
+            .await
+            .map_err(|error| error.to_string())?;
+        connector
+            .connect(ServerName::try_from("localhost").expect("name"), tcp)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ca_reload_admits_new_client_certificates_and_keeps_live_ones() {
+        let material = material("client-ca");
+        let (ca1, server1, server_key1, client1, client_key1) = issue_with_client("first");
+        std::fs::write(&material.ca, ca1).expect("ca1");
+        std::fs::write(&material.cert, server1).expect("server1");
+        std::fs::write(&material.key, server_key1).expect("server key1");
+        let client_cert1 = material.root.join("client1.pem");
+        let client_key1_path = material.root.join("client1.key");
+        std::fs::write(&client_cert1, client1).expect("client1");
+        std::fs::write(&client_key1_path, client_key1).expect("client key1");
+        let backend = echo_backend().await;
+        let client_ca = material.root.join("clients-ca.pem");
+        std::fs::copy(&material.ca, &client_ca).expect("client ca");
+        let terminator = TlsTerminator::start(TerminatorConfig {
+            listen: "127.0.0.1:0".parse().expect("listen"),
+            backend,
+            certificate: material.cert.clone(),
+            private_key: material.key.clone(),
+            client_ca: Some(client_ca.clone()),
+            require_client_certificate: true,
+        })
+        .await
+        .expect("terminator");
+        let addr = terminator.local_addr();
+        let mut old = client_with_cert(addr, &material.ca, &client_cert1, &client_key1_path)
+            .await
+            .expect("client1");
+        round_trip(&mut old, b'a').await;
+
+        let (ca2, server2, server_key2, client2, client_key2) = issue_with_client("second");
+        std::fs::write(&material.cert, server2).expect("server2");
+        std::fs::write(&material.key, server_key2).expect("server key2");
+        std::fs::write(&client_ca, ca2.clone()).expect("client ca2");
+        std::fs::write(material.root.join("ca2.pem"), ca2).expect("ca2");
+        terminator.reload().expect("reload");
+
+        // The live connection survives the CA change.
+        round_trip(&mut old, b'b').await;
+        let client_cert2 = material.root.join("client2.pem");
+        let client_key2_path = material.root.join("client2.key");
+        std::fs::write(&client_cert2, client2).expect("client2");
+        std::fs::write(&client_key2_path, client_key2).expect("client key2");
+        let mut fresh = client_with_cert(
+            addr,
+            &material.root.join("ca2.pem"),
+            &client_cert2,
+            &client_key2_path,
+        )
+        .await
+        .expect("client2");
         round_trip(&mut fresh, b'c').await;
 
         terminator.abort();

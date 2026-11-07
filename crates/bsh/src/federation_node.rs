@@ -5,6 +5,7 @@
 //! transport: identity file, persisted peers, router task.
 
 use std::collections::BTreeMap;
+use std::net::ToSocketAddrs as _;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
@@ -33,6 +34,13 @@ const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(10);
 /// The TLS endpoint peers connect to while Zenoh listens on loopback.
 static TLS_TERMINATOR: OnceLock<std::sync::Mutex<Option<bus::tls_terminator::TlsTerminator>>> =
     OnceLock::new();
+
+static TLS_CLIENTS: OnceLock<std::sync::Mutex<Vec<bus::tls_client::TlsClientTerminator>>> =
+    OnceLock::new();
+
+fn client_slot() -> &'static std::sync::Mutex<Vec<bus::tls_client::TlsClientTerminator>> {
+    TLS_CLIENTS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
 
 fn terminator_slot() -> &'static std::sync::Mutex<Option<bus::tls_terminator::TlsTerminator>> {
     TLS_TERMINATOR.get_or_init(|| std::sync::Mutex::new(None))
@@ -67,6 +75,69 @@ async fn start_tls_terminator(
         .map_err(|error| log::warn!("federation: TLS terminator did not start: {error}"))
         .ok()?;
     config.listen = Some(vec![format!("tcp/127.0.0.1:{backend_port}")]);
+
+    // Outbound TLS has the same lifecycle problem. Keep Zenoh on loopback and
+    // let a reloadable client proxy own the handshake and its client cert.
+    if let Some(connect) = config.connect.take() {
+        let mut endpoints = Vec::with_capacity(connect.len());
+        let mut clients = Vec::new();
+        for endpoint in connect {
+            let Some(remote) = endpoint.strip_prefix("tls/") else {
+                endpoints.push(endpoint);
+                continue;
+            };
+            let Some((host, port)) = remote.rsplit_once(':') else {
+                endpoints.push(endpoint.clone());
+                continue;
+            };
+            let Ok(port) = port.parse::<u16>() else {
+                endpoints.push(endpoint.clone());
+                continue;
+            };
+            let Ok(remote) = (host, port).to_socket_addrs().map(|mut addrs| {
+                addrs
+                    .next()
+                    .unwrap_or_else(|| std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+            }) else {
+                endpoints.push(endpoint.clone());
+                continue;
+            };
+            let Some(root_ca) = tls.root_ca_certificate.as_ref() else {
+                endpoints.push(endpoint.clone());
+                continue;
+            };
+            let proxy = bus::tls_client::TlsClientTerminator::start(
+                bus::tls_client::ClientTerminatorConfig {
+                    listen: "127.0.0.1:0".parse().expect("a loopback address"),
+                    remote,
+                    server_name: host.to_string(),
+                    root_ca: PathBuf::from(root_ca),
+                    certificate: tls.certificate.as_ref().map(PathBuf::from),
+                    private_key: tls.private_key.as_ref().map(PathBuf::from),
+                },
+            )
+            .await;
+            match proxy {
+                Ok(proxy) => {
+                    endpoints.push(format!("tcp/127.0.0.1:{}", proxy.local_addr().port()));
+                    clients.push(proxy);
+                }
+                Err(error) => {
+                    log::warn!(
+                        "federation: TLS client proxy for {endpoint} did not start: {error}"
+                    );
+                    endpoints.push(endpoint);
+                }
+            }
+        }
+        config.connect = Some(endpoints);
+        if let Ok(mut slot) = client_slot().lock() {
+            for proxy in slot.drain(..) {
+                proxy.abort();
+            }
+            *slot = clients;
+        }
+    }
     let _ = settings;
     Some(terminator)
 }
@@ -369,6 +440,13 @@ pub(crate) fn reload_tls(settings: &crate::settings::Settings) -> bool {
         if let Some(terminator) = slot.as_ref() {
             match terminator.reload() {
                 Ok(()) => {
+                    if let Ok(clients) = client_slot().lock() {
+                        for client in clients.iter() {
+                            if let Err(error) = client.reload() {
+                                log::warn!("federation: TLS client reload failed: {error}");
+                            }
+                        }
+                    }
                     log::info!("federation: TLS certificate reloaded without dropping sessions");
                     return running().is_some();
                 }
@@ -405,6 +483,11 @@ pub(crate) fn stop() -> bool {
             if let Ok(mut slot) = terminator_slot().lock() {
                 if let Some(terminator) = slot.take() {
                     terminator.abort();
+                }
+            }
+            if let Ok(mut clients) = client_slot().lock() {
+                for client in clients.drain(..) {
+                    client.abort();
                 }
             }
             log::info!("federation node stopped");
@@ -913,7 +996,19 @@ pub(crate) fn assemble_with_federation(
     let reconciler = peer_file.as_ref().map(|peers_path| {
         let node = Arc::clone(&node);
         let queue_path = peers_path.with_file_name("compensation.json");
+        let tasks_path = peers_path.with_file_name("tasks.json");
         tokio::spawn(async move {
+            let auditor = federation::ReceiptAuditor::new(
+                Arc::clone(&node),
+                agent::capability::InvocationContext::local(
+                    agent::capability::InvocationId::new("receipt-audit"),
+                    agent::capability::Principal::Local {
+                        session: "federation-auditor".to_string(),
+                        preset: String::new(),
+                    },
+                    WorkspaceId::new("ws:federation").expect("a workspace"),
+                ),
+            );
             loop {
                 let mut queue = federation::CompensationQueue::load(&queue_path);
                 let now = unix_ms();
@@ -942,6 +1037,19 @@ pub(crate) fn assemble_with_federation(
                 }
                 if let Err(error) = queue.save() {
                     log::debug!("federation: compensation queue was not saved: {error}");
+                }
+                if tasks_path.is_file() {
+                    if let Ok(graph) = federation::TaskGraph::load(&tasks_path) {
+                        let tasks: Vec<federation::TaskNode> =
+                            graph.tasks.values().cloned().collect();
+                        let mismatches = auditor.audit(&tasks).await;
+                        if !mismatches.is_empty() {
+                            log::warn!(
+                                "federation: {} compensation receipt(s) disagree with their target",
+                                mismatches.len()
+                            );
+                        }
+                    }
                 }
                 tokio::time::sleep(Duration::from_secs(30)).await;
             }

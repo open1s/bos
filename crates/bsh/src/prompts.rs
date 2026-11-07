@@ -94,6 +94,8 @@ Pattern:
 
 Do not finish a turn that started subagents before collecting them: a finished child's result lives in the registry, not in your context. `subagent_result` with no id lists the session's runs.
 
+A child is not a dead end once it starts: `send_message` queues a correction behind a running child's current turn, and starts a new turn on a finished one. Prefer that over spawning a second child with the same brief.
+
 A child has its own context and the same tools; it does not see this conversation unless the prompt contains the needed context.";
 
 /// The ordered per-tool guidance, ending with the subagent rule so a child
@@ -123,11 +125,13 @@ pub(crate) const KNOWN_TOOLS: &[&str] = &[
     "glob",
     "grep",
     "job_kill",
+    "job_list",
     "job_output",
     "list_dir",
     "mcp",
     "read_file",
     "read_files",
+    "send_message",
     "subagent",
     "subagent_result",
     "update_plan",

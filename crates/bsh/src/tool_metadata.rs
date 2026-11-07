@@ -49,7 +49,14 @@ pub(crate) fn builtin_metadata(name: &str) -> Option<ToolMetadata> {
             .with_risk("low")
             .with_side_effects(["read"])
             .with_permissions(["agent.read:runs"]),
-        "job_output" => ToolMetadata::new()
+        // A follow-up is another child turn, so it costs a model run: the same
+        // spend and the same spawn capability the first delegation declares.
+        "send_message" => ToolMetadata::new()
+            .with_version("1.0.0")
+            .with_risk("high")
+            .with_side_effects(["spend"])
+            .with_permissions(["agent.spawn"]),
+        "job_list" | "job_output" => ToolMetadata::new()
             .with_version("1.0.0")
             .with_risk("low")
             .with_side_effects(["read"])
@@ -116,6 +123,8 @@ mod tests {
             "update_goal",
             "job_output",
             "job_kill",
+            "job_list",
+            "send_message",
         ] {
             let metadata = builtin_metadata(name).unwrap_or_else(|| panic!("{name} is declared"));
             assert_eq!(metadata.version.as_deref(), Some("1.0.0"), "{name}");

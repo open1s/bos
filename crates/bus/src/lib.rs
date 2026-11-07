@@ -10,6 +10,7 @@ pub mod query;
 pub mod queryable;
 pub mod session;
 pub mod subscriber;
+pub mod tls_client;
 pub mod tls_terminator;
 
 pub use callable::Callable;

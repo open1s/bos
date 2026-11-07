@@ -1357,6 +1357,76 @@ impl Shell {
                 })),
         );
 
+        if tab == 1 {
+            pane = pane.child(self.federation_small_button(
+                "federation-audit-receipts",
+                lang.tr("right.federation.auditReceipts"),
+                cx,
+                |this, cx| {
+                    let Some(runtime) = crate::federation_node::running() else {
+                        this.right.federation.error =
+                            Some(this.state.lang.tr("right.federation.notRunning"));
+                        cx.notify();
+                        return;
+                    };
+                    let Some(peers_path) = this.state.settings.federation_peers_path() else {
+                        this.right.federation.error =
+                            Some(this.state.lang.tr("right.federation.noTasks"));
+                        cx.notify();
+                        return;
+                    };
+                    let tasks_path = peers_path.with_file_name("tasks.json");
+                    let Ok(graph) = federation::TaskGraph::load(&tasks_path) else {
+                        this.right.federation.error =
+                            Some(this.state.lang.tr("right.federation.noTasks"));
+                        cx.notify();
+                        return;
+                    };
+                    let tasks: Vec<federation::TaskNode> = graph.tasks.values().cloned().collect();
+                    let auditor = federation::ReceiptAuditor::new(
+                        std::sync::Arc::clone(runtime.node()),
+                        agent::capability::InvocationContext::local(
+                            agent::capability::InvocationId::new(format!(
+                                "audit-{}",
+                                agent::capability::unix_ms()
+                            )),
+                            agent::capability::Principal::Local {
+                                session: "federation-pane".to_string(),
+                                preset: String::new(),
+                            },
+                            agent::capability::WorkspaceId::new("ws:federation")
+                                .expect("a workspace"),
+                        ),
+                    );
+                    let handle =
+                        crate::extension::spawn_async(async move { auditor.audit(&tasks).await });
+                    cx.spawn(async move |this, cx| {
+                        let mismatches = handle.await;
+                        let _ = this.update(cx, |this, cx| {
+                            match mismatches {
+                                Ok(mismatches) if mismatches.is_empty() => {
+                                    this.right.federation.notice =
+                                        Some(this.state.lang.tr("right.federation.receiptsMatch"));
+                                }
+                                Ok(mismatches) => {
+                                    this.right.federation.error = Some(crate::i18n::tr_args(
+                                        this.state.lang,
+                                        "right.federation.receiptsMismatch",
+                                        &[("count", mismatches.len().to_string())],
+                                    ));
+                                }
+                                Err(error) => {
+                                    this.right.federation.error = Some(error.to_string());
+                                }
+                            }
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                },
+            ));
+        }
+
         pane = match tab {
             1 => {
                 // Work: one card per delegation, with the only useful action

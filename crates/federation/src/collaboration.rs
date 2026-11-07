@@ -757,6 +757,83 @@ pub struct ReceiptMismatch {
     pub error: Option<String>,
 }
 
+/// A node-level auditor that checks task receipts across targets.
+pub struct ReceiptAuditor {
+    node: Arc<crate::service::FederationNode>,
+    context: capability::InvocationContext,
+}
+
+impl ReceiptAuditor {
+    /// Build an auditor for one node and invocation context.
+    pub fn new(
+        node: Arc<crate::service::FederationNode>,
+        context: capability::InvocationContext,
+    ) -> Self {
+        Self { node, context }
+    }
+
+    /// Compare every task's stored receipt with its target's live record.
+    pub async fn audit(&self, tasks: &[TaskNode]) -> Vec<ReceiptMismatch> {
+        let mut mismatches = Vec::new();
+        for task in tasks {
+            let Some(receipt) = &task.compensation_receipt else {
+                continue;
+            };
+            let expected = receipt
+                .get("state")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            let Some(target) = receipt
+                .get("target")
+                .and_then(Value::as_str)
+                .and_then(|target| capability::NodeId::new(target).ok())
+            else {
+                mismatches.push(ReceiptMismatch {
+                    task_id: task.id.to_string(),
+                    expected,
+                    actual: None,
+                    error: Some("the receipt names no target".to_string()),
+                });
+                continue;
+            };
+            let Some(delegation) = receipt.get("delegation").and_then(Value::as_str) else {
+                mismatches.push(ReceiptMismatch {
+                    task_id: task.id.to_string(),
+                    expected,
+                    actual: None,
+                    error: Some("the receipt names no delegation".to_string()),
+                });
+                continue;
+            };
+            match self
+                .node
+                .delegation_status(&target, &DelegationId::new(delegation), &self.context)
+                .await
+            {
+                Ok(record) => {
+                    let actual = format!("{:?}", record.state);
+                    if actual != expected {
+                        mismatches.push(ReceiptMismatch {
+                            task_id: task.id.to_string(),
+                            expected,
+                            actual: Some(actual),
+                            error: None,
+                        });
+                    }
+                }
+                Err(error) => mismatches.push(ReceiptMismatch {
+                    task_id: task.id.to_string(),
+                    expected,
+                    actual: None,
+                    error: Some(error.to_string()),
+                }),
+            }
+        }
+        mismatches
+    }
+}
+
 /// A task executor that delegates each task through a FederationNode.
 ///
 /// The executor submits the task as a delegation, polls its authoritative
@@ -1028,6 +1105,7 @@ impl TaskExecutor for DelegationExecutor {
         let record = result.map_err(|error| error.to_string())?;
         let receipt = serde_json::json!({
             "kind": "delegation_cancel",
+            "target": self.target.to_string(),
             "delegation": record.request.id.to_string(),
             "state": format!("{:?}", record.state),
         });
