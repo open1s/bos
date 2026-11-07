@@ -19967,6 +19967,7 @@ fn the_right_panel_offers_a_federation_pane(cx: &mut TestAppContext) {
     shell.update(cx, |this, cx| {
         this.right.open = true;
         this.right.tab = Some(crate::ui::right_panel::RightTab::Federation);
+        this.right.federation.advanced = true;
         this.reload_federation();
         cx.notify();
     });
@@ -20087,6 +20088,7 @@ fn the_federation_switches_write_the_settings(cx: &mut TestAppContext) {
     shell.update(cx, |this, cx| {
         this.right.open = true;
         this.right.tab = Some(crate::ui::right_panel::RightTab::Federation);
+        this.right.federation.advanced = true;
         this.reload_federation();
         cx.notify();
     });
@@ -20187,6 +20189,7 @@ fn exposing_a_capability_writes_the_setting(cx: &mut TestAppContext) {
     shell.update(cx, |this, cx| {
         this.right.open = true;
         this.right.tab = Some(crate::ui::right_panel::RightTab::Federation);
+        this.right.federation.advanced = true;
         cx.notify();
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -20227,6 +20230,7 @@ fn saving_a_node_name_persists_it_and_reports_it(cx: &mut TestAppContext) {
     shell.update(cx, |this, cx| {
         this.right.open = true;
         this.right.tab = Some(crate::ui::right_panel::RightTab::Federation);
+        this.right.federation.advanced = true;
         cx.notify();
     });
     cx.update(|window, cx| {

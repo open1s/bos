@@ -120,6 +120,11 @@ impl FederationRuntime {
         &self.node
     }
 
+    /// The federation advertised by this runtime, when configured.
+    pub(crate) fn federation(&self) -> Option<&federation::FederationId> {
+        self.federation.as_ref()
+    }
+
     /// The discovered capability catalogue of every trusted peer.
     pub(crate) fn peer_capabilities(&self) -> Arc<RwLock<BTreeMap<NodeId, Catalogue>>> {
         Arc::clone(&self.peer_capabilities)

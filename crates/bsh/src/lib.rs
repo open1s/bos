@@ -24,6 +24,7 @@ pub(crate) mod federation_audit;
 mod federation_knowledge;
 mod federation_lock;
 mod federation_node;
+pub(crate) mod federation_tools;
 pub(crate) mod files;
 pub(crate) mod glob;
 pub(crate) mod grep;

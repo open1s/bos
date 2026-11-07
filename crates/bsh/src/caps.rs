@@ -27,7 +27,7 @@ use agent::policy::{
 };
 use agent::tools::{
     BashTool, DeclaredAsyncTool, DeclaredTool, FunctionTool, GetGoalTool, GoalStore, PlanTool,
-    ToolMetadata, ToolRegistry, UpdateGoalTool,
+    Tool as _, ToolMetadata, ToolRegistry, UpdateGoalTool,
 };
 use agent::{Agent, AgentConfig, ToolError};
 use futures::StreamExt;
@@ -1176,6 +1176,25 @@ fn build_agent_for_session_inner(
         if !tools.is_empty() {
             goal_store = Some(store);
             bundles.push(plugins::Bundle::new("goal", tools));
+        }
+    }
+
+    // Federation is a first-class tool family, not a hidden pane action: the
+    // model lists peers and delegates through the same signed node the UI uses.
+    if (crate::federation_node::running().is_some() || settings.global.federation.enabled)
+        && !off_bundle("federation")
+    {
+        let mut tools: Vec<Arc<dyn agent::tools::Tool>> = Vec::new();
+        for tool in crate::federation_tools::FederationTool::bundle() {
+            let name = tool.name().to_string();
+            if off_tool(&name) {
+                continue;
+            }
+            let metadata = declare(&name);
+            tools.push(Arc::new(DeclaredTool::new(Arc::new(tool), metadata)));
+        }
+        if !tools.is_empty() {
+            bundles.push(plugins::Bundle::new("federation", tools));
         }
     }
 

@@ -362,10 +362,11 @@ reopens it on the same port, and proves the existing connector reconnects and
 delivers another frame. TLS deployments disable Zenoh scouting, because scouting
 otherwise opens a parallel plaintext link that bypasses the configured TLS
 endpoints. Certificate files are read when the Zenoh listener constructs its
-ServerConfig; replacing them does not affect a live listener. BSH exposes a
-supervised Reload TLS action that stops and restarts the node from the current
-settings; the reconnect test covers the session transition. A zero-interruption
-handoff is still not possible with this Zenoh listener.
+ServerConfig, so BSH puts a rustls terminator in front of a loopback Zenoh
+listener. The terminator owns the public TLS port, reloads its certificate
+resolver on demand, and leaves established connections running; a bus test
+proves an old connection survives while a new handshake gets the replacement
+certificate. Client certificates and the CA bundle still load at start.
 
 **Acceptance**
 - Production profile refuses insecure configuration unless explicitly enabled for development.
@@ -430,9 +431,9 @@ Artifact references carry a retention window. An executor that reports
 `FileArtifactStore` rooted at `artifacts/` and the Federation pane lists those
 files with Remove. Compensation can return a receipt (`compensation_receipt`) so
 a remote cancellation is recorded with the task, and a failed remote
-compensation is put in a durable `CompensationQueue` for an explicit
-`reconcile_compensations` retry. Still owed: a background scheduler and a
-cross-Node receipt comparison service.
+compensation is put in a durable `CompensationQueue`; BSH runs it every 30
+seconds with exponential backoff, and `audit_receipts` checks a task batch
+against the target's live records.
 
 **Required change**
 - Keep delegation as the primitive.

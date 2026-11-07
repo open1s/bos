@@ -478,7 +478,9 @@ references; a retryable failure returns the task to Pending until the ceiling,
 a successful outcome records its artifacts, and a final failure calls the
 executor's compensation hook (recorded on the task). A failed remote
 compensation is queued durably so `DelegationExecutor::reconcile_compensations`
-can retry it; a receipt is stored on the task after success. The graph is a library API: the
+can retry it; BSH runs that queue every 30 seconds with exponential backoff.
+A receipt is stored on the task after success, and `audit_receipts` compares a
+batch of task receipts with the target's live records. The graph is a library API: the
 right panel lists delegations but does not draw the graph, and a host supplies
 the `TaskExecutor`; `DelegationExecutor` is the delegation-backed one.
 
@@ -521,15 +523,23 @@ let progress = runner.run(executor, 4).await?;
   `federation/leases.json` (atomic 0600 writes). An interrupted delegation is
   recovered as `Failed` with an indeterminate-outcome reason; an expired lease is
   never revived. A lease whose stream ended still requires the peer to re-open.
-- The Federation pane lists the newest delegations (with Cancel), the granted
-  resource leases, and knowledge query/publication forms for the selected peer.
-  A lease can be opened by id + URI and its first chunks are shown read-only.
-  The local artifact store is listed with size and a Remove action; an executor
-  that supports cleanup deletes expired bytes at the end of a task run.
+- The Federation pane is task-shaped: tabs for Peers, Work, Resources and
+  Knowledge, grant chips on a peer card, and one Ask field for knowledge. Raw
+  node ids, capability ids, lease ids, URIs and JSON payloads live under an
+  Advanced disclosure rather than in the primary path. The local artifact store
+  is listed with size and Remove; an executor that supports cleanup deletes
+  expired bytes at the end of a task run.
 - TLS deployments disable Zenoh scouting so a scouted plaintext link cannot
-  bypass the configured TLS endpoints. Certificate files are read when the
-  listener starts, so the Federation pane's Reload TLS action stops the node and
-  starts it again from the current settings; established sessions reconnect.
+  bypass the configured TLS endpoints. BSH terminates TLS itself with a
+  reloadable rustls resolver and forwards plaintext only to a loopback Zenoh
+  listener, so Reload TLS swaps the certificate for new handshakes without
+  dropping established connections. Client certificates and the CA bundle are
+  still read when the terminator starts.
+The model has the same surface as `federation_status`, `federation_peers`,
+`federation_delegate`, `federation_cancel`, `federation_query` and
+`federation_cleanup` tools; it reads peer ids from `federation_peers` instead of
+being asked to type them.
+
 - Knowledge federation is opt-in: a host must install a `KnowledgeService` and a
   `KnowledgeAuthorizer`. BSH installs both when
   `[federation] knowledge_enabled = true`; a peer still needs a

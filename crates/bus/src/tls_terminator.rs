@@ -41,8 +41,8 @@ pub struct TerminatorConfig {
 #[derive(Debug, Clone)]
 pub struct TlsTerminator {
     current: Arc<RwLock<Arc<CertifiedKey>>>,
-    certificate: PathBuf,
-    private_key: PathBuf,
+    acceptor: Arc<RwLock<Arc<TlsAcceptor>>>,
+    config: TerminatorConfig,
     local_addr: SocketAddr,
     task: tokio::task::AbortHandle,
 }
@@ -58,41 +58,25 @@ impl TlsTerminator {
         let resolver = Arc::new(ReloadingResolver {
             current: Arc::clone(&current),
         });
-        let verifier = if config.require_client_certificate {
-            let path = config
-                .client_ca
-                .as_ref()
-                .ok_or_else(|| "mTLS needs a client CA bundle".to_string())?;
-            let mut roots = RootCertStore::empty();
-            for cert in load_certs(path)? {
-                roots.add(cert).map_err(|error| error.to_string())?;
-            }
-            Some(
-                WebPkiClientVerifier::builder(Arc::new(roots))
-                    .build()
-                    .map_err(|error| error.to_string())?,
-            )
-        } else {
-            None
-        };
-        let builder = match verifier {
-            Some(verifier) => ServerConfig::builder().with_client_cert_verifier(verifier),
-            None => ServerConfig::builder().with_no_client_auth(),
-        };
-        let mut server = builder.with_cert_resolver(resolver);
-        server.alpn_protocols.clear();
-        let acceptor = TlsAcceptor::from(Arc::new(server));
+        let server = build_server_config(&config, resolver)?;
+        let acceptor = Arc::new(RwLock::new(Arc::new(TlsAcceptor::from(Arc::new(
+            server,
+        )))));
         let listener = TcpListener::bind(config.listen)
             .await
             .map_err(|error| error.to_string())?;
         let local_addr = listener.local_addr().map_err(|error| error.to_string())?;
         let backend = config.backend;
+        let accept_loop = Arc::clone(&acceptor);
         let task = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     continue;
                 };
-                let acceptor = acceptor.clone();
+                let acceptor = accept_loop
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
                 tokio::spawn(async move {
                     let Ok(mut tls) = acceptor.accept(stream).await else {
                         return;
@@ -107,8 +91,8 @@ impl TlsTerminator {
         .abort_handle();
         Ok(Self {
             current,
-            certificate: config.certificate,
-            private_key: config.private_key,
+            acceptor,
+            config,
             local_addr,
             task,
         })
@@ -121,11 +105,20 @@ impl TlsTerminator {
 
     /// Re-read the certificate and key; new handshakes use them immediately.
     pub fn reload(&self) -> Result<(), String> {
-        let key = load_key(&self.certificate, &self.private_key)?;
+        let key = load_key(&self.config.certificate, &self.config.private_key)?;
+        let resolver = Arc::new(ReloadingResolver {
+            current: Arc::new(RwLock::new(Arc::clone(&key))),
+        });
+        let server = build_server_config(&self.config, resolver)?;
         *self
             .current
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = key;
+        *self
+            .acceptor
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Arc::new(TlsAcceptor::from(Arc::new(server)));
         Ok(())
     }
 
@@ -149,6 +142,36 @@ impl ResolvesServerCert for ReloadingResolver {
                 .clone(),
         )
     }
+}
+
+fn build_server_config(
+    config: &TerminatorConfig,
+    resolver: Arc<ReloadingResolver>,
+) -> Result<ServerConfig, String> {
+    let verifier = if config.require_client_certificate {
+        let path = config
+            .client_ca
+            .as_ref()
+            .ok_or_else(|| "mTLS needs a client CA bundle".to_string())?;
+        let mut roots = RootCertStore::empty();
+        for cert in load_certs(path)? {
+            roots.add(cert).map_err(|error| error.to_string())?;
+        }
+        Some(
+            WebPkiClientVerifier::builder(Arc::new(roots))
+                .build()
+                .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
+    let builder = match verifier {
+        Some(verifier) => ServerConfig::builder().with_client_cert_verifier(verifier),
+        None => ServerConfig::builder().with_no_client_auth(),
+    };
+    let mut server = builder.with_cert_resolver(resolver);
+    server.alpn_protocols.clear();
+    Ok(server)
 }
 
 fn load_key(certificate: &Path, private_key: &Path) -> Result<Arc<CertifiedKey>, String> {

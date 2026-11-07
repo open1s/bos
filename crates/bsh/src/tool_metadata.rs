@@ -59,6 +59,15 @@ pub(crate) fn builtin_metadata(name: &str) -> Option<ToolMetadata> {
             .with_risk("medium")
             .with_side_effects(["process"])
             .with_permissions(["proc.signal:jobs"]),
+        "federation_status" | "federation_peers" => read_only("net.federation"),
+        "federation_delegate" | "federation_cancel" | "federation_query" | "federation_cleanup" => {
+            ToolMetadata::new()
+                .with_version("1.0.0")
+                .with_risk("medium")
+                .with_side_effects(["network", "write"])
+                .with_permissions(["net.federation"])
+                .with_timeout_ms(30_000)
+        }
         _ => return None,
     };
     Some(metadata)
