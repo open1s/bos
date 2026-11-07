@@ -1525,12 +1525,15 @@ fn build_agent_for_session_inner(
         });
     if let Some(workspace) = task_root {
         if !off_tool("task_create") {
+            let task_bash = agent.registry().and_then(|registry| registry.get("bash"));
             crate::task_tools::attach(
                 &mut agent,
                 crate::task_tools::TaskToolsContext {
                     session: session.to_string(),
                     workspace,
                     subagents: task_subagents,
+                    bash: task_bash,
+                    jobs: Some(jobs.clone()),
                 },
             );
         }

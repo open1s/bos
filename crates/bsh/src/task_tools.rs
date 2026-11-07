@@ -29,13 +29,20 @@ pub(crate) struct TaskToolsContext {
     /// subagent-tier task spawns through it, so the child gets the same
     /// policy, slots and runner as one started by the subagent tool.
     pub(crate) subagents: Option<Arc<crate::caps::SubagentContext>>,
+    /// The turn's shell tool, for a job-tier task's command. It carries the
+    /// sandbox and policy a plain shell call gets.
+    pub(crate) bash: Option<Arc<dyn agent::tools::Tool>>,
+    /// The turn's job roster, for observing and stopping a job-tier task.
+    pub(crate) jobs: Option<Arc<agent::jobs::JobRegistry>>,
 }
 
 /// Attach the tools to an agent.
 pub(crate) fn attach(agent: &mut Agent, context: TaskToolsContext) {
     attach_create(agent, context.clone());
     attach_join(agent, context.clone());
-    attach_cancel(agent, context);
+    attach_cancel(agent, context.clone());
+    attach_status(agent, context.clone());
+    attach_list(agent, context);
 }
 
 /// The create tool.
@@ -56,8 +63,8 @@ fn attach_create(agent: &mut Agent, context: TaskToolsContext) {
                 },
                 "tier": {
                     "type": "string",
-                    "enum": ["turn", "subagent", "delegation", "peer-task"],
-                    "description": "How the task runs. turn starts a turn in this session; subagent delegates to a child agent; delegation sends the objective to a peer node for one capability; peer-task asks a peer to own and schedule the task on its own clock."
+                    "enum": ["turn", "subagent", "job", "delegation", "peer-task"],
+                    "description": "How the task runs. turn starts a turn in this session; subagent delegates to a child agent; job runs a shell command in the background; delegation sends the objective (or one capability) to a peer node; peer-task asks a peer to own and schedule the task on its own clock."
                 },
                 "target": {
                     "type": "string",
@@ -65,11 +72,20 @@ fn attach_create(agent: &mut Agent, context: TaskToolsContext) {
                 },
                 "capability": {
                     "type": "string",
-                    "description": "For a delegation: the capability the peer runs, as its grants report it."
+                    "description": "For a delegation: optional. Without it the peer runs an agent turn on the objective; with it the peer invokes exactly that capability."
                 },
                 "input": {
                     "type": "object",
                     "description": "For a delegation: the capability's own input object."
+                },
+                "command": {
+                    "type": "string",
+                    "description": "For a job: the shell command to run in the background."
+                },
+                "deps": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Task ids that must succeed first. Only a scheduled turn task may wait; it sits in Waiting until they do."
                 },
                 "trigger": {
                     "type": "object",
@@ -188,9 +204,16 @@ pub(crate) async fn cancel_with(
                 crate::federation_tools::cancel_delegation(&target, run).await?;
             }
             Tier::Job => {
-                return Err(ToolError::Failed(
-                    "stopping a job task is not wired yet".to_string(),
-                ));
+                let Some(jobs) = context.jobs.as_ref() else {
+                    return Err(ToolError::Failed(
+                        "the job roster is not available in this turn".to_string(),
+                    ));
+                };
+                if !jobs.kill(run) {
+                    return Err(ToolError::Failed(
+                        "the job could not be stopped".to_string(),
+                    ));
+                }
             }
             Tier::PeerTask => {}
         }
@@ -211,6 +234,226 @@ pub(crate) async fn cancel_with(
         .save(&context.workspace, &record)
         .map_err(|error| ToolError::Failed(format!("the task could not be saved: {error}")))?;
     Ok(json!({ "task": id, "state": "cancelled" }))
+}
+
+/// The status tool.
+fn attach_status(agent: &mut Agent, context: TaskToolsContext) {
+    let tool = AsyncFunctionTool::from_fn(
+        "task_status",
+        "Read one task's record: its state, trigger, budget and every attempt's outcome. Use it to inspect a task created earlier without waiting on it.",
+        json!({
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "The task id returned by task_create."
+                }
+            },
+            "required": ["task"]
+        }),
+        move |args| {
+            let context = context.clone();
+            async move { status_with(&context, &args) }
+        },
+    );
+    let metadata = crate::tool_metadata::builtin_metadata("task_status")
+        .expect("task_status metadata is declared");
+    if let Err(error) =
+        agent.try_add_async_tool(Arc::new(DeclaredAsyncTool::new(Arc::new(tool), metadata)))
+    {
+        log::warn!("task_status tool was not registered: {error}");
+    }
+}
+
+/// The list tool.
+fn attach_list(agent: &mut Agent, context: TaskToolsContext) {
+    let tool = AsyncFunctionTool::from_fn(
+        "task_list",
+        "List the tasks recorded for this workspace, newest first. Filter by session, or cap the count. A row names the id task_status and task_cancel take.",
+        json!({
+            "type": "object",
+            "properties": {
+                "session": {
+                    "type": "string",
+                    "description": "Only tasks whose origin session is this id."
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 200,
+                    "description": "How many rows to return, newest first. Default 50."
+                }
+            }
+        }),
+        move |args| {
+            let context = context.clone();
+            async move { list_with(&context, &args) }
+        },
+    );
+    let metadata = crate::tool_metadata::builtin_metadata("task_list")
+        .expect("task_list metadata is declared");
+    if let Err(error) =
+        agent.try_add_async_tool(Arc::new(DeclaredAsyncTool::new(Arc::new(tool), metadata)))
+    {
+        log::warn!("task_list tool was not registered: {error}");
+    }
+}
+
+/// Mark local attempts that died with the previous process as interrupted.
+///
+/// Called once at shell assembly, before any turn opens: the runs service, the
+/// subagent registry and the job roster are process-local, so nothing they held
+/// survives, and a record still marked Running is lying.
+pub(crate) fn reconcile(
+    workspace: &std::path::Path,
+    subagents: &crate::subagent::SubagentRegistry,
+    jobs: &agent::jobs::JobRegistry,
+) -> usize {
+    let Ok(tasks) = FileTasksStore.list(workspace) else {
+        return 0;
+    };
+    let mut changed = 0usize;
+    let now = crate::settings::unix_now().saturating_mul(1_000);
+    for mut task in tasks {
+        if !matches!(task.host, Host::Local) {
+            continue;
+        }
+        let Some(attempt) = task.attempts.last() else {
+            // A now task that never started cannot start after a restart.
+            if task.status == TaskStatus::Queued && matches!(task.trigger, Trigger::Now) {
+                task.status = TaskStatus::Interrupted;
+                task.updated_ms = now;
+                let _ = FileTasksStore.save(workspace, &task);
+                changed += 1;
+            }
+            continue;
+        };
+        if !matches!(
+            attempt.status,
+            AttemptStatus::Running | AttemptStatus::Queued
+        ) {
+            continue;
+        }
+        let Some(run) = attempt.run.clone() else {
+            continue;
+        };
+        let live = match task.tier {
+            // Nothing in the runs service survives a restart.
+            Tier::Turn => false,
+            Tier::Subagent => subagents
+                .run(&run)
+                .map(|run| run.status.is_running())
+                .unwrap_or(false),
+            Tier::Job => jobs
+                .job(&run)
+                .map(|job| job.status.is_running())
+                .unwrap_or(false),
+            // The peer may still own it; the join reports Unknown when it cannot
+            // be reached, so reconciliation only flags the local tiers.
+            Tier::Delegation | Tier::PeerTask => true,
+        };
+        if live {
+            continue;
+        }
+        task.status = TaskStatus::Interrupted;
+        task.updated_ms = now;
+        if let Some(attempt) = task.attempts.last_mut() {
+            attempt.status = AttemptStatus::Interrupted;
+            attempt.ended_ms = Some(now);
+            attempt.error = Some("interrupted by a restart".to_string());
+        }
+        let _ = FileTasksStore.save(workspace, &task);
+        changed += 1;
+    }
+    changed
+}
+
+/// One task as the tools report it, with long results clipped.
+fn task_json(task: &Task) -> Value {
+    json!({
+        "id": task.id,
+        "title": task.title,
+        "intent": task.intent,
+        "host": task.host,
+        "tier": task.tier,
+        "status": task.status,
+        "trigger": task.trigger,
+        "target": task.target,
+        "command": task.command,
+        "budget": task.budget,
+        "retry": task.retry,
+        "next_fire_ms": task.trigger.next_fire_ms(),
+        "created_ms": task.created_ms,
+        "updated_ms": task.updated_ms,
+        "attempts": task
+            .attempts
+            .iter()
+            .map(|attempt| {
+                json!({
+                    "id": attempt.id,
+                    "tier": attempt.tier,
+                    "run": attempt.run,
+                    "status": attempt.status,
+                    "result": attempt
+                        .result
+                        .as_deref()
+                        .map(|text| text.chars().take(800).collect::<String>()),
+                    "error": attempt.error,
+                    "started_ms": attempt.started_ms,
+                    "ended_ms": attempt.ended_ms,
+                    "delivered_ms": attempt.delivered_ms,
+                })
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// Read one task record.
+pub(crate) fn status_with(context: &TaskToolsContext, args: &Value) -> Result<Value, ToolError> {
+    let id = args
+        .get("task")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| ToolError::InvalidInput("task is required".to_string()))?;
+    let record = FileTasksStore
+        .load(&context.workspace, id)
+        .map_err(|error| ToolError::Failed(format!("the task could not be read: {error}")))?
+        .ok_or_else(|| ToolError::Failed(format!("unknown task {id}")))?;
+    Ok(task_json(&record))
+}
+
+/// List this workspace's tasks, newest first.
+pub(crate) fn list_with(context: &TaskToolsContext, args: &Value) -> Result<Value, ToolError> {
+    let limit = args
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(50)
+        .clamp(1, 200) as usize;
+    let session = args.get("session").and_then(Value::as_str);
+    let mut tasks = FileTasksStore
+        .list(&context.workspace)
+        .map_err(|error| ToolError::Failed(format!("the tasks could not be read: {error}")))?;
+    if let Some(session) = session {
+        tasks.retain(|task| task.origin.session == session);
+    }
+    tasks.sort_by(|left, right| (right.created_ms, &right.id).cmp(&(left.created_ms, &left.id)));
+    let total = tasks.len();
+    let rows: Vec<Value> = tasks
+        .into_iter()
+        .take(limit)
+        .map(|task| {
+            json!({
+                "id": task.id,
+                "title": task.title,
+                "host": task.host,
+                "tier": task.tier,
+                "status": task.status,
+                "next_fire_ms": task.trigger.next_fire_ms(),
+            })
+        })
+        .collect();
+    Ok(json!({ "total": total, "tasks": rows }))
 }
 
 /// A short board label from the intent when the model names none.
@@ -312,9 +555,23 @@ pub(crate) async fn create_with(
         .filter(|title| !title.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| derived_title(intent));
+    let deps: Vec<String> = args
+        .get("deps")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|dep| !dep.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
     let tier = match args.get("tier").and_then(Value::as_str).unwrap_or("turn") {
         "turn" => Tier::Turn,
         "subagent" => Tier::Subagent,
+        "job" => Tier::Job,
         "delegation" => Tier::Delegation,
         "peer-task" => Tier::PeerTask,
         other => {
@@ -325,7 +582,17 @@ pub(crate) async fn create_with(
     };
     let now = crate::settings::unix_now().saturating_mul(1_000);
     let trigger = parse_trigger(args, now)?;
+    if !deps.is_empty() && (tier != Tier::Turn || matches!(trigger, Trigger::Now)) {
+        return Err(ToolError::InvalidInput(
+            "dependencies are supported on scheduled turn tasks".to_string(),
+        ));
+    }
     let id = tasks::new_id(now);
+    if deps.iter().any(|dep| dep == &id) {
+        return Err(ToolError::InvalidInput(
+            "a task cannot depend on itself".to_string(),
+        ));
+    }
     let mut task = Task::open(
         &id,
         title.clone(),
@@ -387,6 +654,53 @@ pub(crate) async fn create_with(
             "next_fire_ms": remote.next_run_ms,
         }));
     }
+    if tier == Tier::Job {
+        let Some(command) = args
+            .get("command")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+        else {
+            return Err(ToolError::InvalidInput(
+                "a job task needs a command".to_string(),
+            ));
+        };
+        let Some(bash) = context.bash.clone() else {
+            return Err(ToolError::Failed(
+                "the shell tool is not available in this turn".to_string(),
+            ));
+        };
+        let response = bash
+            .run(&json!({ "command": command, "run_in_background": true }))
+            .map_err(|error| {
+                ToolError::Failed(format!("the command could not start: {error:?}"))
+            })?;
+        let Some(job) = response.get("job_id").and_then(Value::as_str) else {
+            return Err(ToolError::Failed(
+                "the shell did not report a job id".to_string(),
+            ));
+        };
+        task.command = Some(command.to_string());
+        let mut attempt = Attempt::queued(format!("{id}-1"), Tier::Job);
+        attempt.run = Some(job.to_string());
+        attempt.status = AttemptStatus::Running;
+        attempt.started_ms = Some(now);
+        task.attempts.push(attempt);
+        task.status = TaskStatus::Running;
+        task.updated_ms = now;
+        FileTasksStore
+            .save(&context.workspace, &task)
+            .map_err(|error| ToolError::Failed(format!("the task could not be saved: {error}")))?;
+        return Ok(json!({
+            "task": id,
+            "run": job,
+            "state": "running",
+        }));
+    }
+    task.deps = deps.clone();
+    if !deps.is_empty() {
+        task.status = TaskStatus::Waiting;
+    }
     if !matches!(trigger, Trigger::Now) {
         FileTasksStore
             .save(&context.workspace, &task)
@@ -432,24 +746,19 @@ pub(crate) async fn create_with(
                 "a delegated task needs a target node".to_string(),
             ));
         };
-        let Some(capability) = args
+        // Without a capability the peer runs an agent turn on the objective;
+        // with one it invokes exactly that capability.
+        let capability = args
             .get("capability")
             .and_then(Value::as_str)
             .map(str::trim)
-            .filter(|capability| !capability.is_empty())
-        else {
-            return Err(ToolError::InvalidInput(
-                "a delegated task needs a capability; the peer executes one exposed capability"
-                    .to_string(),
-            ));
-        };
+            .filter(|capability| !capability.is_empty());
         let payload = args.get("input").cloned().unwrap_or(Value::Null);
         let record =
-            crate::federation_tools::delegate_record(target, intent, Some(capability), payload)
-                .await?;
+            crate::federation_tools::delegate_record(target, intent, capability, payload).await?;
         let run = record.request.id.to_string();
         task.target = Some(target.to_string());
-        task.capability = Some(capability.to_string());
+        task.capability = capability.map(str::to_string);
         let mut attempt = Attempt::queued(format!("{id}-1"), Tier::Delegation);
         attempt.run = Some(run.clone());
         attempt.status = AttemptStatus::Running;
@@ -586,6 +895,12 @@ pub(crate) async fn join_with(
                     .and_then(|subagents| subagents.snapshot(id))
             })
             .or_else(|| crate::federation_tools::delegation_snapshot(id))
+            .or_else(|| {
+                context
+                    .jobs
+                    .as_ref()
+                    .and_then(|jobs| job_snapshot(jobs, id))
+            })
     };
     let report = tasks::join(observe, &local, timeout).await;
     for row in &report.rows {
@@ -633,6 +948,35 @@ pub(crate) async fn join_with(
             }))
             .collect::<Vec<_>>(),
     }))
+}
+
+/// The run's snapshot from the job roster, when it exists.
+fn job_snapshot(
+    jobs: &agent::jobs::JobRegistry,
+    id: &str,
+) -> Option<crate::extension::runs::RunSnapshot> {
+    use crate::extension::runs::RunState;
+    let job = jobs.job(id)?;
+    let state = match job.status {
+        agent::jobs::JobStatus::Running => RunState::Running,
+        agent::jobs::JobStatus::Succeeded { .. } => RunState::Succeeded,
+        agent::jobs::JobStatus::Failed { .. } => RunState::Failed,
+        agent::jobs::JobStatus::Killed => RunState::Cancelled,
+    };
+    let error = matches!(job.status, agent::jobs::JobStatus::Failed { .. }).then(|| {
+        format!(
+            "the command exited with {}",
+            job.status.exit_code().unwrap_or(-1)
+        )
+    });
+    Some(crate::extension::runs::RunSnapshot {
+        id: id.to_string(),
+        state,
+        result: jobs.output_for(id).map(|output| output.text),
+        tokens: 0,
+        steps: 0,
+        error,
+    })
 }
 
 /// The local mirror status for a peer task state.
@@ -777,6 +1121,8 @@ mod tests {
             session: "ses-1".to_string(),
             workspace,
             subagents: None,
+            bash: None,
+            jobs: None,
         }
     }
 
@@ -954,7 +1300,7 @@ mod tests {
         let error = create_with(
             &Runs::empty(),
             &context,
-            &json!({"intent": "Review", "tier": "job"}),
+            &json!({"intent": "Review", "tier": "cron"}),
         )
         .await
         .expect_err("unknown tier");
@@ -976,14 +1322,16 @@ mod tests {
         .expect_err("no target");
         assert!(format!("{missing_target:?}").contains("target node"));
 
-        let missing_capability = create_with(
+        // No capability is legal once a target is named: the peer runs an
+        // agent turn. Without a node it still refuses at the federation seam.
+        let no_node = create_with(
             &Runs::empty(),
             &context,
             &json!({"intent": "Audit", "tier": "delegation", "target": "node-b"}),
         )
         .await
-        .expect_err("no capability");
-        assert!(format!("{missing_capability:?}").contains("capability"));
+        .expect_err("no node");
+        assert!(format!("{no_node:?}").contains("federation node is not running"));
 
         assert!(FileTasksStore
             .list(&context.workspace)
@@ -1258,6 +1606,211 @@ mod tests {
             .await
             .expect_err("no node");
         assert!(format!("{error:?}").contains("federation node is not running"));
+        let _ = std::fs::remove_dir_all(&context.workspace);
+    }
+
+    /// A job task needs a command, and the command needs the turn's shell tool.
+    #[tokio::test]
+    async fn create_refuses_an_incomplete_job_task() {
+        let context = context("job-refused");
+        let no_command = create_with(
+            &Runs::empty(),
+            &context,
+            &json!({"intent": "x", "tier": "job"}),
+        )
+        .await
+        .expect_err("no command");
+        assert!(format!("{no_command:?}").contains("needs a command"));
+
+        let no_shell = create_with(
+            &Runs::empty(),
+            &context,
+            &json!({"intent": "x", "tier": "job", "command": "echo hi"}),
+        )
+        .await
+        .expect_err("no shell tool");
+        assert!(format!("{no_shell:?}").contains("shell tool is not available"));
+        assert!(FileTasksStore
+            .list(&context.workspace)
+            .expect("list")
+            .is_empty());
+        let _ = std::fs::remove_dir_all(&context.workspace);
+    }
+
+    /// A job task cannot bind a clock: the scheduler fires turns only.
+    #[tokio::test]
+    async fn create_refuses_a_scheduled_job_task() {
+        let context = context("job-scheduled");
+        let error = create_with(
+            &Runs::empty(),
+            &context,
+            &json!({"intent": "x", "tier": "job", "command": "echo hi", "trigger": {"every_seconds": 3600}}),
+        )
+        .await
+        .expect_err("scheduled job");
+        assert!(format!("{error:?}").contains("starts now"));
+        let _ = std::fs::remove_dir_all(&context.workspace);
+    }
+
+    /// The job roster's snapshot maps each status.
+    #[test]
+    fn job_snapshots_map_the_roster() {
+        let jobs = agent::jobs::JobRegistry::new();
+        let id = jobs.begin("ses-1", "bash", "sleep 1");
+        let snapshot = job_snapshot(&jobs, &id).expect("a snapshot");
+        assert_eq!(snapshot.state, RunState::Running);
+        assert!(job_snapshot(&jobs, "missing").is_none());
+    }
+
+    /// status reads a saved record and refuses an unknown id.
+    #[tokio::test]
+    async fn status_reads_a_record() {
+        let context = context("status");
+        let runs = Runs::with(Fake::new());
+        let value = create_with(&runs, &context, &json!({"intent": "Review"}))
+            .await
+            .expect("created");
+        let id = value["task"].as_str().expect("id");
+        let record = status_with(&context, &json!({"task": id})).expect("status");
+        assert_eq!(record["id"], id);
+        assert_eq!(record["status"], "running");
+        assert_eq!(record["attempts"][0]["run"], "run-1");
+        assert!(status_with(&context, &json!({"task": "nope"})).is_err());
+        let _ = std::fs::remove_dir_all(&context.workspace);
+    }
+
+    /// list returns newest first and respects the limit.
+    #[tokio::test]
+    async fn list_returns_newest_first() {
+        let context = context("list");
+        for (index, title) in ["a", "b", "c"].iter().enumerate() {
+            let id = format!("task-{index}");
+            let task = Task::open(
+                &id,
+                *title,
+                "intent",
+                Origin {
+                    session: "ses-1".to_string(),
+                    turn: 0,
+                },
+                Trigger::Now,
+                Tier::Turn,
+                index as u64,
+            )
+            .expect("task");
+            FileTasksStore
+                .save(&context.workspace, &task)
+                .expect("save");
+        }
+        let list = list_with(&context, &json!({"limit": 2})).expect("list");
+        assert_eq!(list["total"], 3);
+        assert_eq!(list["tasks"].as_array().expect("rows").len(), 2);
+        assert_eq!(list["tasks"][0]["id"], "task-2");
+        let filtered = list_with(&context, &json!({"session": "other"})).expect("list");
+        assert_eq!(filtered["total"], 0);
+        let _ = std::fs::remove_dir_all(&context.workspace);
+    }
+
+    /// reconcile marks a local run that died with the process as interrupted,
+    /// and leaves a scheduled task alone.
+    #[test]
+    fn reconcile_marks_dead_local_runs() {
+        let context = context("reconcile");
+        let mut task = Task::open(
+            "task-1",
+            "t",
+            "i",
+            Origin {
+                session: "ses-1".to_string(),
+                turn: 0,
+            },
+            Trigger::Now,
+            Tier::Subagent,
+            1,
+        )
+        .expect("task");
+        task.status = TaskStatus::Running;
+        let mut attempt = Attempt::queued("a1", Tier::Subagent);
+        attempt.run = Some("sub-gone".to_string());
+        attempt.status = AttemptStatus::Running;
+        task.attempts.push(attempt);
+        FileTasksStore
+            .save(&context.workspace, &task)
+            .expect("save");
+
+        let scheduled = Task::open(
+            "task-2",
+            "s",
+            "i",
+            Origin {
+                session: "ses-1".to_string(),
+                turn: 0,
+            },
+            Trigger::Every {
+                every_seconds: 3_600,
+                last_run_ms: 0,
+            },
+            Tier::Turn,
+            1,
+        )
+        .expect("scheduled");
+        FileTasksStore
+            .save(&context.workspace, &scheduled)
+            .expect("save");
+
+        let subagents = crate::subagent::SubagentRegistry::default();
+        let jobs = agent::jobs::JobRegistry::new();
+        assert_eq!(reconcile(&context.workspace, &subagents, &jobs), 1);
+        let stored = FileTasksStore
+            .load(&context.workspace, "task-1")
+            .expect("load")
+            .expect("record");
+        assert_eq!(stored.status, TaskStatus::Interrupted);
+        assert_eq!(
+            stored.attempts.last().expect("attempt").status,
+            AttemptStatus::Interrupted
+        );
+        let untouched = FileTasksStore
+            .load(&context.workspace, "task-2")
+            .expect("load")
+            .expect("record");
+        assert_eq!(untouched.status, TaskStatus::Scheduled);
+        let _ = std::fs::remove_dir_all(&context.workspace);
+    }
+
+    /// Dependencies are recorded on a scheduled turn task and put it in
+    /// Waiting; a now task cannot wait on another.
+    #[tokio::test]
+    async fn create_records_dependencies_and_waits() {
+        let context = context("deps");
+        let value = create_with(
+            &Runs::empty(),
+            &context,
+            &json!({
+                "intent": "Check",
+                "trigger": {"every_seconds": 3600},
+                "deps": ["task-a"]
+            }),
+        )
+        .await
+        .expect("scheduled");
+        let id = value["task"].as_str().expect("id");
+        let stored = FileTasksStore
+            .load(&context.workspace, id)
+            .expect("load")
+            .expect("record");
+        assert_eq!(stored.status, TaskStatus::Waiting);
+        assert_eq!(stored.deps, vec!["task-a".to_string()]);
+        assert!(
+            create_with(
+                &Runs::empty(),
+                &context,
+                &json!({"intent": "x", "deps": ["a"]})
+            )
+            .await
+            .is_err(),
+            "a now task cannot wait on another"
+        );
         let _ = std::fs::remove_dir_all(&context.workspace);
     }
     /// An unknown id is a refusal, not an empty report.

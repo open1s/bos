@@ -24,8 +24,13 @@ pub trait BuiltinExtension: Send + Sync {
     /// manifest's contributes.tools.
     fn tools(&self) -> Vec<ToolDescriptor>;
 
-    /// Run one tool by contribution id.
-    fn call_tool(&self, name: &str, arguments: &Value) -> Result<Value, ExtensionError>;
+    /// Run one tool by contribution id, with the call's own context.
+    fn call_tool(
+        &self,
+        name: &str,
+        arguments: &Value,
+        context: &CallContext,
+    ) -> Result<Value, ExtensionError>;
 
     /// Prepare the extension.
     async fn activate(&self) -> Result<(), ExtensionError> {
@@ -149,14 +154,14 @@ impl Runtime for BuiltinRuntime {
         &self,
         name: &str,
         arguments: Value,
-        _context: &CallContext,
+        context: &CallContext,
     ) -> Result<Value, ExtensionError> {
         if !self.tools.iter().any(|tool| tool.id.as_str() == name) {
             return Err(ExtensionError::NotFound {
                 id: format!("{}::{name}", self.manifest.id()),
             });
         }
-        self.extension.call_tool(name, &arguments)
+        self.extension.call_tool(name, &arguments, context)
     }
 }
 
@@ -169,15 +174,32 @@ pub struct ClosureExtension {
     manifest_toml: &'static str,
     tools: Vec<ToolDescriptor>,
     #[allow(clippy::type_complexity)]
-    handler: Arc<dyn Fn(&str, &Value) -> Result<Value, ExtensionError> + Send + Sync>,
+    handler: Arc<dyn Fn(&str, &Value, &CallContext) -> Result<Value, ExtensionError> + Send + Sync>,
 }
 
 impl ClosureExtension {
-    /// Build a closure-backed extension.
+    /// Build a closure-backed extension that does not read the call context.
     pub fn new(
         manifest_toml: &'static str,
         tools: Vec<ToolDescriptor>,
         handler: impl Fn(&str, &Value) -> Result<Value, ExtensionError> + Send + Sync + 'static,
+    ) -> Self {
+        Self::new_with_context(manifest_toml, tools, move |name, arguments, _context| {
+            handler(name, arguments)
+        })
+    }
+
+    /// Build a closure-backed extension that reads the call context.
+    ///
+    /// The context carries the calling session and workspace, which is what a
+    /// tool acting on a turn needs; a two-argument handler cannot see either.
+    pub fn new_with_context(
+        manifest_toml: &'static str,
+        tools: Vec<ToolDescriptor>,
+        handler: impl Fn(&str, &Value, &CallContext) -> Result<Value, ExtensionError>
+            + Send
+            + Sync
+            + 'static,
     ) -> Self {
         Self {
             manifest_toml,
@@ -197,8 +219,13 @@ impl BuiltinExtension for ClosureExtension {
         self.tools.clone()
     }
 
-    fn call_tool(&self, name: &str, arguments: &Value) -> Result<Value, ExtensionError> {
-        (self.handler)(name, arguments)
+    fn call_tool(
+        &self,
+        name: &str,
+        arguments: &Value,
+        context: &CallContext,
+    ) -> Result<Value, ExtensionError> {
+        (self.handler)(name, arguments, context)
     }
 }
 
@@ -250,6 +277,44 @@ tools = ["echo"]
                 Ok(arguments.clone())
             },
         )
+    }
+
+    /// A context-aware closure sees the calling session and workspace, which a
+    /// two-argument handler cannot.
+    #[tokio::test]
+    async fn a_context_aware_closure_sees_the_session() {
+        let runtime = BuiltinRuntime::new(Arc::new(ClosureExtension::new_with_context(
+            MANIFEST,
+            vec![ToolDescriptor {
+                id: ContributionId::parse("echo").expect("id"),
+                description: "Echo the context".to_string(),
+                input_schema: empty_schema(),
+                capabilities: Vec::new(),
+            }],
+            |_name, _arguments, context| {
+                Ok(serde_json::json!({
+                    "session": context.session,
+                    "workspace": context
+                        .workspace
+                        .as_ref()
+                        .map(|path| path.display().to_string()),
+                }))
+            },
+        )))
+        .expect("runtime");
+        let context = CallContext::new(
+            runtime.id().clone(),
+            "correlation",
+            Some(std::path::PathBuf::from("/tmp/ws")),
+            1_000,
+        )
+        .with_session("ses-1");
+        let result = runtime
+            .call_tool("echo", serde_json::json!({}), &context)
+            .await
+            .expect("call");
+        assert_eq!(result["session"], "ses-1");
+        assert_eq!(result["workspace"], "/tmp/ws");
     }
 
     #[tokio::test]

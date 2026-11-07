@@ -351,6 +351,14 @@ impl SubagentRegistry {
             .map(|run| run.status)
     }
 
+    /// Every run, oldest first.
+    pub(crate) fn runs(&self) -> Vec<SubagentRun> {
+        self.runs
+            .lock()
+            .map(|runs| runs.clone())
+            .unwrap_or_default()
+    }
+
     /// One run's current snapshot, when it exists.
     pub(crate) fn run(&self, id: &str) -> Option<SubagentRun> {
         self.runs

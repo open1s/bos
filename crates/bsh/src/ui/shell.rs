@@ -280,10 +280,20 @@ pub(crate) struct Shell {
     foreground_tasks: Vec<ForegroundTask>,
     /// The host.runs service this shell installed, if any.
     pub(crate) task_runs: Option<Arc<crate::ui::task_runs::TaskRuns>>,
+    /// The Tasks graph's zoom, 0.5 to 2.0.
+    pub(crate) graph_zoom: f32,
+    /// Whether the Tasks tab shows the run graph (true) or the store list.
+    pub(crate) graph_tree: bool,
+    /// The Tasks graph's pan, in pixels.
+    pub(crate) graph_pan: (f32, f32),
+    /// A pan in flight: the pan and mouse position when the drag began.
+    pub(crate) graph_pan_drag: Option<((f32, f32), (f32, f32))>,
     /// Sessions with an extension-started run in flight, by run id.
     task_run_sessions: std::collections::BTreeMap<String, String>,
     /// Peer tasks this shell is running, by session.
     peer_task_runs: std::collections::BTreeMap<String, String>,
+    /// Objective delegations this shell is running, by session.
+    peer_delegation_runs: std::collections::BTreeMap<String, String>,
     /// The composer's text engine.
     pub(crate) composer: Entity<TextareaState>,
     /// The placeholder key the composer currently carries, so the refresh only
@@ -1852,8 +1862,13 @@ impl Shell {
             state,
             foreground_tasks: Vec::new(),
             task_runs: None,
+            graph_zoom: 1.0,
+            graph_tree: true,
+            graph_pan: (0.0, 0.0),
+            graph_pan_drag: None,
             task_run_sessions: std::collections::BTreeMap::new(),
             peer_task_runs: std::collections::BTreeMap::new(),
+            peer_delegation_runs: std::collections::BTreeMap::new(),
             composer,
             placeholder_key,
             placeholder_fit: None,
@@ -2144,6 +2159,30 @@ impl Shell {
             }
         });
         shell.keep_task(pump);
+        // A process that just started holds no runs: mark the local attempts
+        // that died with the previous one. This runs before any turn opens, so
+        // it can never mistake a live run for a dead one.
+        let mut roots: std::collections::BTreeSet<std::path::PathBuf> =
+            std::collections::BTreeSet::new();
+        let active = shell.state.settings.active_workspace_root();
+        if !active.is_empty() {
+            roots.insert(std::path::PathBuf::from(active));
+        }
+        for workspace in &shell.state.settings.global.workspaces {
+            if !workspace.root.is_empty() {
+                roots.insert(std::path::PathBuf::from(&workspace.root));
+            }
+        }
+        for root in roots {
+            let count =
+                crate::task_tools::reconcile(&root, &shell.state.subagents, &shell.state.jobs);
+            if count > 0 {
+                log::info!(
+                    "tasks: {count} interrupted attempt(s) marked at {}",
+                    root.display()
+                );
+            }
+        }
         crate::theme::apply(&shell.state.settings.global.general.theme_mode, window, cx);
         // Follow a live host appearance switch, which is what makes the System
         // option mean anything: the copied palette tokens would otherwise go
@@ -2312,8 +2351,10 @@ impl Shell {
                     if !this.state.settings.global.schedules.is_empty() {
                         this.check_schedules(cx);
                         this.check_task_schedules(cx);
+                        this.expire_task_deadlines(cx);
                         this.check_task_resumes(cx);
                         this.check_peer_tasks(cx);
+                        this.check_peer_delegations(cx);
                     }
                 })
                 .is_err()
@@ -4106,8 +4147,12 @@ impl Shell {
         let Ok(tasks) = FileTasksStore.list(&root) else {
             return;
         };
+        let statuses: std::collections::BTreeMap<String, TaskStatus> = tasks
+            .iter()
+            .map(|task| (task.id.clone(), task.status))
+            .collect();
         for task in tasks {
-            if task.status != TaskStatus::Scheduled
+            if !matches!(task.status, TaskStatus::Scheduled | TaskStatus::Waiting)
                 || task.host != Host::Local
                 || task.tier != Tier::Turn
             {
@@ -4123,6 +4168,23 @@ impl Shell {
             };
             if !due {
                 continue;
+            }
+            if !task.deps.is_empty() {
+                let met = task.deps.iter().all(|dep| {
+                    statuses
+                        .get(dep)
+                        .map(|status| *status == TaskStatus::Succeeded)
+                        .unwrap_or(false)
+                });
+                if !met {
+                    if task.status != TaskStatus::Waiting {
+                        let mut waiting = task.clone();
+                        waiting.status = TaskStatus::Waiting;
+                        waiting.updated_ms = now_ms;
+                        let _ = FileTasksStore.save(&root, &waiting);
+                    }
+                    continue;
+                }
             }
             if self.state.streams.contains_key(&task.origin.session) {
                 continue;
@@ -4196,6 +4258,142 @@ impl Shell {
             }
         });
         self.keep_task(watcher);
+    }
+
+    /// Claim the objective delegations this node accepted and run each as a
+    /// background turn. A delegation with a structured contract already
+    /// executes inside the node; only an objective needs a model.
+    pub(crate) fn check_peer_delegations(&mut self, cx: &mut Context<Self>) {
+        let Some(runtime) = crate::federation_node::running() else {
+            return;
+        };
+        let now_ms = crate::settings::unix_now().saturating_mul(1_000);
+        for record in runtime.node().claim_objective_delegations(now_ms) {
+            let id = record.request.id.to_string();
+            let origin = record
+                .origin
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            let Some(session) = self.background_session(&format!("Delegation: {origin}")) else {
+                let _ = runtime.node().settle_objective_delegation(
+                    &id,
+                    None,
+                    Some("a session could not be created".to_string()),
+                );
+                continue;
+            };
+            let choice = self.state.session_choice(&session);
+            if let Some(key) = self.state.settings.refusal_for(&choice) {
+                let _ = runtime.node().settle_objective_delegation(
+                    &id,
+                    None,
+                    Some(crate::i18n::tr(self.state.lang, key)),
+                );
+                continue;
+            }
+            let Some((transcript, budget)) = self
+                .state
+                .begin_turn_in(&session, &record.request.objective)
+            else {
+                let _ = runtime.node().settle_objective_delegation(
+                    &id,
+                    None,
+                    Some("the session could not open a turn".to_string()),
+                );
+                continue;
+            };
+            let plan = self.state.plan_mode(&session);
+            let request = crate::state::turn_text(&record.request.objective, plan);
+            let input = crate::state::turn_input(&request, &[]);
+            self.spawn_turn(session.clone(), input, transcript, budget, cx);
+            self.peer_delegation_runs.insert(session, id);
+        }
+    }
+
+    /// Settle the objective delegation a session was running.
+    pub(crate) fn settle_peer_delegation(&mut self, session: &str, failed: bool) {
+        let Some(id) = self.peer_delegation_runs.remove(session) else {
+            return;
+        };
+        let Some(runtime) = crate::federation_node::running() else {
+            return;
+        };
+        let text = self
+            .state
+            .store
+            .session(session)
+            .and_then(|session| session.messages.last())
+            .map(|message| message.text.clone())
+            .unwrap_or_default();
+        if failed {
+            let _ = runtime.node().settle_objective_delegation(
+                &id,
+                None,
+                Some("the turn failed".to_string()),
+            );
+        } else {
+            let _ = runtime.node().settle_objective_delegation(
+                &id,
+                Some(serde_json::json!({ "text": text })),
+                None,
+            );
+        }
+    }
+
+    /// Fail local runs past their deadline, and stop them where a stopper
+    /// exists. The sweep runs on the same tick as the scheduler.
+    pub(crate) fn expire_task_deadlines(&mut self, _cx: &mut Context<Self>) {
+        use crate::extension::runs::RunsService as _;
+        use crate::extension::tasks::{
+            AttemptStatus, FileTasksStore, Host, TaskStatus, TasksStore, Tier,
+        };
+        let root = self.state.settings.active_workspace_root();
+        if root.is_empty() {
+            return;
+        }
+        let root = std::path::PathBuf::from(root);
+        let Ok(tasks) = FileTasksStore.list(&root) else {
+            return;
+        };
+        let now_ms = crate::settings::unix_now().saturating_mul(1_000);
+        let service = self.task_runs.clone();
+        for mut task in tasks {
+            if task.host != Host::Local || task.status != TaskStatus::Running {
+                continue;
+            }
+            let Some(started) = task.attempts.last().and_then(|attempt| attempt.started_ms) else {
+                continue;
+            };
+            if now_ms < started.saturating_add(task.budget.deadline_ms) {
+                continue;
+            }
+            let run = task.attempts.last().and_then(|attempt| attempt.run.clone());
+            if let Some(run) = &run {
+                match task.tier {
+                    Tier::Turn => {
+                        if let Some(service) = &service {
+                            let _ = service.cancel(run);
+                        }
+                    }
+                    Tier::Subagent => {
+                        let _ = self.state.subagents.interrupt(run);
+                    }
+                    Tier::Job => {
+                        self.state.jobs.kill(run);
+                    }
+                    Tier::Delegation | Tier::PeerTask => {}
+                }
+            }
+            task.status = TaskStatus::Failed;
+            task.updated_ms = now_ms;
+            if let Some(attempt) = task.attempts.last_mut() {
+                attempt.status = AttemptStatus::Failed;
+                attempt.ended_ms = Some(now_ms);
+                attempt.error = Some("deadline exceeded".to_string());
+            }
+            let _ = FileTasksStore.save(&root, &task);
+        }
     }
 
     /// Claim the peer tasks due on this node and run each as a background turn.
@@ -4619,8 +4817,12 @@ impl Shell {
                             }),
                         );
                         shell.state.finish_plan(&session_id);
+                        // A turn can create tasks; the pane's cache is stale
+                        // until the next open, so refresh it with the turn.
+                        shell.right.tasks.borrow_mut().take();
                         shell.settle_task_run(&session_id, failed);
                         shell.settle_peer_task(&session_id, failed);
+                        shell.settle_peer_delegation(&session_id, failed);
                         // A goal the model settled during the turn takes
                         // effect BEFORE the loop decides to continue: a
                         // completed or blocked goal must not start round n+1.

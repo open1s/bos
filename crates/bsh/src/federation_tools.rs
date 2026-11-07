@@ -167,9 +167,13 @@ pub(crate) fn delegation_snapshot(id: &str) -> Option<crate::extension::runs::Ru
         DelegationState::Failed | DelegationState::Rejected => RunState::Failed,
         DelegationState::Cancelled => RunState::Cancelled,
     };
-    let result = record.result.as_ref().map(|value| match value.as_str() {
-        Some(text) => text.to_string(),
-        None => value.to_string(),
+    let result = record.result.as_ref().map(|value| match value {
+        Value::String(text) => text.clone(),
+        other => other
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| other.to_string()),
     });
     Some(RunSnapshot {
         id: id.to_string(),

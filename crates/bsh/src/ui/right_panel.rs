@@ -1189,14 +1189,380 @@ impl Shell {
     /// is per row. A running node is edited live; otherwise the peer store file
     /// is edited and the change applies at the next launch.
     /// The Tasks board: durable work grouped by state.
-    fn tasks_pane(&self, _cx: &mut Context<Self>) -> AnyElement {
+    /// The workspace root the active session's tasks live in.
+    fn task_workspace_root(&self) -> std::path::PathBuf {
+        let session = self.state.active_id.clone().unwrap_or_default();
+        self.state
+            .session_choice(&session)
+            .workspace
+            .clone()
+            .and_then(|id| {
+                self.state
+                    .settings
+                    .global
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.id == id)
+                    .map(|workspace| std::path::PathBuf::from(&workspace.root))
+            })
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(self.state.settings.active_workspace_root())
+            })
+    }
+
+    /// The Tasks tab: the run graph by default, the store list on request.
+    fn tasks_pane(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.graph_tree {
+            self.task_graph_pane(cx)
+        } else {
+            self.tasks_list(cx)
+        }
+    }
+
+    /// The DSH-style task graph: a main-agent card over its subagent children.
+    fn task_graph_pane(&self, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let session = self.state.active_id.clone().unwrap_or_default();
+        let title = self
+            .state
+            .store
+            .session(&session)
+            .and_then(|session| {
+                session
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == crate::model::Role::User)
+                    .map(|message| message.text.clone())
+            })
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or_else(|| {
+                self.state
+                    .store
+                    .session(&session)
+                    .map(|session| session.title.clone())
+                    .unwrap_or_default()
+            });
+        let title: String = title.chars().take(64).collect();
+        let status = if self.state.streams.contains_key(&session) {
+            crate::ui::task_graph::GraphStatus::Running
+        } else {
+            crate::ui::task_graph::GraphStatus::Done
+        };
+        let runs = self.state.subagents.runs();
+        // Tasks live beside the session's own workspace, the same root the
+        // task tools wrote them to. The cache is refreshed on tab open and at
+        // turn end, never per frame.
+        let workspace = self.task_workspace_root();
+        let tasks = {
+            use crate::extension::tasks::TasksStore as _;
+            let mut cache = self.right.tasks.borrow_mut();
+            if cache.is_none() {
+                *cache = Some(
+                    crate::extension::tasks::FileTasksStore
+                        .list(&workspace)
+                        .unwrap_or_default(),
+                );
+            }
+            cache.clone().unwrap_or_default()
+        };
+        let graph = crate::ui::task_graph::layout(&session, &title, status, &tasks, &runs);
+        let zoom = self.graph_zoom;
+        let pan = self.graph_pan;
+        let scale_x = |x: f32| crate::ui::task_graph::MARGIN + x * zoom + pan.0;
+        let scale_y = |y: f32| crate::ui::task_graph::MARGIN + y * zoom + pan.1;
+        let card_w = crate::ui::task_graph::CARD_W * zoom;
+        let card_h = crate::ui::task_graph::CARD_H * zoom;
+        let content_w =
+            (graph.width * zoom + crate::ui::task_graph::MARGIN * 2.0).max(card_w + 64.0);
+        let content_h =
+            (graph.height * zoom + crate::ui::task_graph::MARGIN * 2.0).max(card_h + 64.0);
+
+        let mut edges: Vec<(f32, f32, f32, f32)> = Vec::new();
+        for (parent, child) in &graph.edges {
+            let (Some(parent), Some(child)) = (graph.nodes.get(*parent), graph.nodes.get(*child))
+            else {
+                continue;
+            };
+            edges.push((
+                scale_x(parent.x) + card_w / 2.0,
+                scale_y(parent.y) + card_h,
+                scale_x(child.x) + card_w / 2.0,
+                scale_y(child.y),
+            ));
+        }
+        let canvas_edges = canvas(
+            move |bounds, _window, _cx| bounds,
+            move |state, _bounds, window, _cx| {
+                let base = state.origin;
+                for (sx, sy, ex, ey) in &edges {
+                    let start = (base.x + px(*sx), base.y + px(*sy));
+                    let end = (base.x + px(*ex), base.y + px(*ey));
+                    let control = ((start.0 + end.0) / 2.0, (start.1 + end.1) / 2.0);
+                    let mut path = PathBuilder::stroke(px(1.5));
+                    path.move_to(point(start.0, start.1));
+                    for step in 1..=16 {
+                        let t = step as f32 / 16.0;
+                        let inv = 1.0 - t;
+                        let x = inv * inv * start.0 + 2.0 * inv * t * control.0 + t * t * end.0;
+                        let y = inv * inv * start.1 + 2.0 * inv * t * control.1 + t * t * end.1;
+                        path.line_to(point(x, y));
+                    }
+                    if let Ok(path) = path.build() {
+                        window.paint_path(path, rgb(theme::border()));
+                    }
+                }
+            },
+        );
+
+        let task_count = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == crate::ui::task_graph::NodeKind::Task)
+            .count();
+        let subagent_count = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == crate::ui::task_graph::NodeKind::Subagent)
+            .count();
+        let running = graph
+            .nodes
+            .iter()
+            .filter(|node| node.status == crate::ui::task_graph::GraphStatus::Running)
+            .count();
+        let summary = txt(
+            format!(
+                "{} {} \u{00B7} {} {} \u{00B7} {} {}",
+                task_count,
+                lang.tr("right.tasks.tasks"),
+                subagent_count,
+                lang.tr("right.tasks.subagents"),
+                running,
+                lang.tr("right.tasks.summaryRunning")
+            ),
+            12.0,
+            theme::muted(),
+        )
+        .debug_selector(|| "task-graph-summary".to_string());
+        let mut cards: Vec<AnyElement> = Vec::with_capacity(graph.nodes.len());
+        for node in &graph.nodes {
+            cards.push(self.task_graph_node(node, zoom, pan, lang));
+        }
+        let tree_label = lang.tr(if self.graph_tree {
+            "right.tasks.tree"
+        } else {
+            "right.tasks.list"
+        });
+        let mode = div()
+            .id("task-graph-mode")
+            .debug_selector(|| "task-graph-mode".to_string())
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .h(px(28.0))
+            .px(px(10.0))
+            .rounded(px(8.0))
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(theme::hover())))
+            .child(icon(IconName::GitBranch, 13.0, theme::muted()))
+            .child(txt(tree_label, 12.0, theme::text()))
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.graph_tree = !this.graph_tree;
+                cx.notify();
+            }));
+        let zoom_out = zoom_button("task-graph-zoom-out", "\u{2212}", cx, |this| {
+            this.graph_zoom = (this.graph_zoom - 0.1).max(0.5);
+        });
+        let zoom_in = zoom_button("task-graph-zoom-in", "+", cx, |this| {
+            this.graph_zoom = (this.graph_zoom + 0.1).min(2.0);
+        });
+        let zoom_fit = zoom_button("task-graph-zoom-reset", "\u{27F2}", cx, |this| {
+            this.graph_zoom = 1.0;
+        });
+        let percent = txt(
+            format!("{}%", (zoom * 100.0).round() as u32),
+            12.0,
+            theme::muted(),
+        )
+        .w(px(44.0))
+        .text_align(gpui::TextAlign::Center);
+        let toolbar = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .px(px(12.0))
+            .py(px(8.0))
+            .border_b_1()
+            .border_color(rgb(theme::border_soft()))
+            .child(mode)
+            .child(summary)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(zoom_out)
+                    .child(percent)
+                    .child(zoom_in)
+                    .child(zoom_fit),
+            );
+        div()
+            .flex()
+            .flex_col()
+            .h_full()
+            .child(toolbar)
+            .child(
+                div()
+                    .id("task-graph-scroll")
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_scroll()
+                    .child(
+                        div()
+                            .id("task-graph-canvas")
+                            .debug_selector(|| "task-graph-canvas".to_string())
+                            .relative()
+                            .w(px(content_w))
+                            .h(px(content_h))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                                    this.graph_pan_drag = Some((
+                                        this.graph_pan,
+                                        (event.position.x.as_f32(), event.position.y.as_f32()),
+                                    ));
+                                    cx.notify();
+                                }),
+                            )
+                            .on_mouse_move(cx.listener(
+                                |this, event: &MouseMoveEvent, _window, cx| {
+                                    let Some((pan, start)) = this.graph_pan_drag else {
+                                        return;
+                                    };
+                                    this.graph_pan = (
+                                        pan.0 + event.position.x.as_f32() - start.0,
+                                        pan.1 + event.position.y.as_f32() - start.1,
+                                    );
+                                    cx.notify();
+                                },
+                            ))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
+                                    this.graph_pan_drag = None;
+                                    cx.notify();
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(px(0.0))
+                                    .top(px(0.0))
+                                    .right(px(0.0))
+                                    .bottom(px(0.0))
+                                    .child(canvas_edges),
+                            )
+                            .children(cards),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// One graph card: the kind chip, the title and the status row.
+    fn task_graph_node(
+        &self,
+        node: &crate::ui::task_graph::GraphNode,
+        zoom: f32,
+        pan: (f32, f32),
+        lang: crate::i18n::Lang,
+    ) -> AnyElement {
+        use crate::ui::task_graph::{GraphStatus, NodeKind, CARD_H, CARD_W, MARGIN};
+        let kind = match node.kind {
+            NodeKind::Main => ("right.tasks.mainAgent", theme::accent()),
+            NodeKind::Subagent => ("right.tasks.subagent", theme::muted()),
+            NodeKind::Task => ("right.tasks.task", theme::muted()),
+        };
+        let (status_label, status_color) = match node.status {
+            GraphStatus::Running => (lang.tr(node.status.key()), theme::accent()),
+            GraphStatus::Queued | GraphStatus::Scheduled => {
+                (lang.tr(node.status.key()), theme::muted())
+            }
+            GraphStatus::Blocked => (lang.tr(node.status.key()), theme::warn()),
+            GraphStatus::Done => (lang.tr(node.status.key()), theme::success()),
+            GraphStatus::Failed => (lang.tr(node.status.key()), theme::error()),
+            GraphStatus::Cancelled => (lang.tr(node.status.key()), theme::faint()),
+        };
+        let border = match node.kind {
+            NodeKind::Main => theme::accent(),
+            NodeKind::Subagent | NodeKind::Task => theme::border_soft(),
+        };
+        let x = MARGIN + node.x * zoom + pan.0;
+        let y = MARGIN + node.y * zoom + pan.1;
+        let id = format!("task-graph-node-{}", node.id);
+        let mut header = div().flex().items_center().gap(px(6.0)).child(
+            div()
+                .px(px(6.0))
+                .py(px(1.0))
+                .rounded(px(4.0))
+                .border_1()
+                .border_color(rgb(theme::border_soft()))
+                .child(txt(lang.tr(kind.0), 11.0, kind.1)),
+        );
+        if let Some(subtitle) = node.subtitle {
+            header = header.child(txt(lang.tr(subtitle), 11.0, theme::muted()));
+        }
+        div()
+            .absolute()
+            .left(px(x))
+            .top(px(y))
+            .w(px(CARD_W * zoom))
+            .h(px(CARD_H * zoom))
+            .debug_selector(move || id.clone())
+            .rounded(px(10.0))
+            .border_1()
+            .border_color(rgb(border))
+            .bg(rgb(theme::page()))
+            .flex()
+            .flex_col()
+            .justify_between()
+            .p(px(10.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .child(header)
+                    .child(txt(node.title.clone(), 14.0, theme::text()).truncate()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .border_t_1()
+                    .border_color(rgb(theme::border_soft()))
+                    .pt(px(6.0))
+                    .child(
+                        div()
+                            .w(px(6.0))
+                            .h(px(6.0))
+                            .flex_none()
+                            .rounded_full()
+                            .bg(rgb(status_color)),
+                    )
+                    .child(txt(status_label, 12.0, theme::muted())),
+            )
+            .into_any_element()
+    }
+
+    fn tasks_list(&self, _cx: &mut Context<Self>) -> AnyElement {
         use crate::extension::tasks::{FileTasksStore, TasksStore as _};
         let lang = self.state.lang;
-        let root = self.state.settings.active_workspace_root();
+        let root = self.task_workspace_root();
         let tasks = {
             let mut cache = self.right.tasks.borrow_mut();
             if cache.is_none() {
-                *cache = Some(FileTasksStore.list(Path::new(&root)).unwrap_or_default());
+                *cache = Some(FileTasksStore.list(&root).unwrap_or_default());
             }
             cache.clone().unwrap_or_default()
         };
@@ -5496,6 +5862,33 @@ fn typed_text(keystroke: &Keystroke) -> Option<&str> {
         return None;
     }
     Some(text)
+}
+
+/// A small zoom control: a 28px clickable cell with one glyph.
+fn zoom_button(
+    id: &'static str,
+    label: &'static str,
+    cx: &mut Context<Shell>,
+    action: impl Fn(&mut Shell) + 'static,
+) -> AnyElement {
+    let action = std::sync::Arc::new(action);
+    div()
+        .id(id)
+        .debug_selector(move || id.to_string())
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(28.0))
+        .h(px(28.0))
+        .rounded(px(8.0))
+        .cursor_pointer()
+        .hover(|style| style.bg(rgb(theme::hover())))
+        .child(txt(label, 14.0, theme::text()))
+        .on_click(cx.listener(move |this, _event, _window, cx| {
+            action(this);
+            cx.notify();
+        }))
+        .into_any_element()
 }
 
 /// Handle the editing chords the pane owns: Cmd/Ctrl+C, +V, +X, +A, +Z and

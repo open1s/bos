@@ -743,6 +743,84 @@ impl FederationNode {
         Arc::clone(&self.tasks)
     }
 
+    /// Claim accepted objective-only delegations for this node's shell to run.
+    ///
+    /// A delegation with a structured contract executes in the node itself; an
+    /// objective alone needs a model, so the peer's shell claims it here. The
+    /// claim moves the record to Running and persists it, so a crash after the
+    /// claim is visible rather than silently re-run.
+    pub fn claim_objective_delegations(&self, now_ms: u64) -> Vec<DelegationRecord> {
+        let mut store = self
+            .delegations
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let ids: Vec<DelegationId> = store
+            .iter()
+            .filter(|record| {
+                record.state == DelegationState::Accepted
+                    && record.request.result_contract.is_none()
+            })
+            .map(|record| record.request.id.clone())
+            .collect();
+        let mut claimed = Vec::new();
+        for id in ids {
+            if store
+                .transition(&id, DelegationState::Running, now_ms)
+                .is_ok()
+            {
+                if let Some(record) = store.record(&id) {
+                    claimed.push(record.clone());
+                }
+            }
+        }
+        if !claimed.is_empty() {
+            self.persist_delegations(&store);
+        }
+        claimed
+    }
+
+    /// Record an objective delegation's outcome and persist it.
+    pub fn settle_objective_delegation(
+        &self,
+        id: &str,
+        result: Option<Value>,
+        error: Option<String>,
+    ) -> bool {
+        let now = unix_ms();
+        let delegation = DelegationId::new(id.to_string());
+        let mut store = self
+            .delegations
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let done = match error {
+            Some(error) => store.fail(&delegation, error, now).is_ok(),
+            None => store
+                .succeed(&delegation, result.unwrap_or(Value::Null), now)
+                .is_ok(),
+        };
+        if done {
+            self.persist_delegations(&store);
+        }
+        done
+    }
+
+    /// Write the delegation store through the same gate the request handlers use.
+    fn persist_delegations(&self, store: &DelegationStore) {
+        let Some(path) = &self.delegation_path else {
+            return;
+        };
+        let _gate = self
+            .delegation_write
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match store.save(path) {
+            Ok(()) => {
+                self.delegation_revision
+                    .store(store.revision(), std::sync::atomic::Ordering::Relaxed);
+            }
+            Err(error) => tracing::warn!("federation: delegation store was not written: {error}"),
+        }
+    }
     /// Claim the peer tasks due now, persisting the Running marks.
     pub fn claim_due_tasks(&self, now_ms: u64) -> Vec<FederatedTask> {
         let mut queue = self

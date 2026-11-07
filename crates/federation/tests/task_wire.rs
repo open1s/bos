@@ -7,8 +7,8 @@ use capability::{
     CapabilityError, InvocationContext, InvocationId, NodeId, Principal, WorkspaceId,
 };
 use federation::{
-    FederatedTaskState, FederationNode, InMemoryNetwork, NodeIdentity, TaskCreateRequest,
-    TaskSchedule,
+    DelegationId, DelegationRequest, DelegationState, FederatedTaskState, FederationNode,
+    InMemoryNetwork, NodeIdentity, TaskCreateRequest, TaskSchedule,
 };
 
 fn identity(seed: u8) -> NodeIdentity {
@@ -133,6 +133,58 @@ async fn a_task_is_created_read_and_cancelled_across_the_wire() {
         .await
         .expect("cancel");
     assert_eq!(cancelled.state, FederatedTaskState::Cancelled);
+}
+
+/// An objective-only delegation is accepted, claimed by the peer, and settled
+/// with the result the peer's shell produced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_objective_delegation_is_claimed_and_settled() {
+    let pair = pair().await;
+    let record = pair
+        .caller
+        .delegate(
+            &pair.target_id,
+            DelegationRequest {
+                id: DelegationId::new("d-obj"),
+                parent: None,
+                target: pair.target_id.clone(),
+                objective: "Audit the working copy".to_string(),
+                capabilities: Vec::new(),
+                deadline_ms: None,
+                allow_sub_delegation: false,
+                result_contract: None,
+            },
+            &context(),
+        )
+        .await
+        .expect("accepted");
+    assert_eq!(record.state, DelegationState::Accepted);
+
+    let claimed = pair
+        .target
+        .claim_objective_delegations(capability::unix_ms());
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].state, DelegationState::Running);
+    assert!(pair
+        .target
+        .claim_objective_delegations(capability::unix_ms())
+        .is_empty());
+
+    assert!(pair.target.settle_objective_delegation(
+        "d-obj",
+        Some(serde_json::json!({ "text": "done" })),
+        None
+    ));
+    let stored = pair
+        .target
+        .delegations()
+        .read()
+        .expect("delegations")
+        .record(&DelegationId::new("d-obj"))
+        .cloned()
+        .expect("stored");
+    assert_eq!(stored.state, DelegationState::Succeeded);
+    assert_eq!(stored.result, Some(serde_json::json!({ "text": "done" })));
 }
 
 /// A claim marks the task and persists it; settle writes the result through

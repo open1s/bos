@@ -93,6 +93,8 @@ pub(crate) enum Refusal {
     SubagentNeedsATurn,
     /// A peer task is owned by the peer's clock, so it needs a schedule.
     PeerTaskNeedsASchedule,
+    /// The scheduler starts turns only; a job task has no clock dispatcher yet.
+    JobNeedsToStartNow,
 }
 
 impl Refusal {
@@ -105,6 +107,7 @@ impl Refusal {
             Self::PeerTaskNeedsASchedule => {
                 "a peer task is owned by the peer's clock, so it needs a schedule"
             }
+            Self::JobNeedsToStartNow => "a job task starts now; the scheduler fires turns only",
         }
     }
 }
@@ -117,6 +120,9 @@ impl Tier {
         }
         if matches!(self, Self::PeerTask) && !trigger.is_scheduled() {
             return Err(Refusal::PeerTaskNeedsASchedule);
+        }
+        if matches!(self, Self::Job) && trigger.is_scheduled() {
+            return Err(Refusal::JobNeedsToStartNow);
         }
         Ok(())
     }
@@ -891,6 +897,23 @@ mod tests {
         assert_eq!(immediate.status, TaskStatus::Queued);
         assert_eq!(immediate.budget, Budget::default());
 
+        let scheduled_job = Task::open(
+            "task-job",
+            "title",
+            "intent",
+            origin.clone(),
+            Trigger::Every {
+                every_seconds: 60,
+                last_run_ms: 5,
+            },
+            Tier::Job,
+            10,
+        );
+        assert_eq!(
+            scheduled_job.unwrap_err(),
+            Refusal::JobNeedsToStartNow,
+            "the scheduler fires turns only"
+        );
         let cadence = Task::open(
             "task-every",
             "title",
@@ -900,10 +923,10 @@ mod tests {
                 every_seconds: 60,
                 last_run_ms: 5,
             },
-            Tier::Job,
+            Tier::Turn,
             10,
         )
-        .expect("a scheduled job is legal");
+        .expect("a scheduled turn is legal");
         assert_eq!(cadence.status, TaskStatus::Scheduled);
         assert_eq!(cadence.budget, Budget::cadence());
         assert_eq!(
@@ -951,7 +974,7 @@ mod tests {
                 every_seconds: 60,
                 last_run_ms: 0,
             },
-            Tier::Job,
+            Tier::Turn,
             30,
         )
         .expect("c");

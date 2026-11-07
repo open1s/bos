@@ -15,9 +15,13 @@ task_status, task_cancel, origin-scoped) and the peer shell drain (the peer
 claims due tasks, runs each as a background turn in its own session, and settles
 the queue with the result), and the local mirror with the peer-task tier (the
 origin stores a Host::Peer record, forwards create/cancel, and refreshes status
-and result from the owner on join). The job executor, the peer-side agent turn
-for objective-only delegations and the extension-packaging gate remain; the
-phase table below is the plan of record.
+and result from the owner on join). The job tier runs a command through the
+turn's own shell tool, joins through the job roster and cancels through the
+roster's kill. An objective-only delegation is claimed by the peer's shell,
+run as an agent turn in a background session, and settled with its text, so a
+delegated task may name a capability or just an objective. The
+extension-packaging gate and a live two-node end-to-end test remain; the phase
+table below is the plan of record.
 
 A task is a durable unit of user intent. It has a lifecycle, a trigger, and at
 most one active attempt. Attempts are runs bound to one of the existing execution

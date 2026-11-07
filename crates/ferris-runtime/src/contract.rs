@@ -214,6 +214,11 @@ pub struct CallContext {
     pub correlation_id: String,
     /// The workspace open for this call, used for scoped authorization.
     pub workspace: Option<PathBuf>,
+    /// The session whose turn invoked the call, when one exists.
+    ///
+    /// A tool that acts on a turn (a task, a delegation) needs the session it
+    /// belongs to; a workspace alone cannot name it.
+    pub session: Option<String>,
     /// The call's wall-clock ceiling.
     pub timeout_ms: u64,
 }
@@ -230,8 +235,15 @@ impl CallContext {
             extension,
             correlation_id: correlation_id.into(),
             workspace,
+            session: None,
             timeout_ms,
         }
+    }
+
+    /// Name the session this call belongs to.
+    pub fn with_session(mut self, session: impl Into<String>) -> Self {
+        self.session = Some(session.into());
+        self
     }
 }
 

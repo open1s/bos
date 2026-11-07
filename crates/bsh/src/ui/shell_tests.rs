@@ -4248,6 +4248,105 @@ fn the_shell_serves_host_runs(cx: &mut TestAppContext) {
     assert_eq!(snapshot.error.as_deref(), Some("the session is gone"));
 }
 
+/// The Tasks tab opens on the run graph: the main-agent node over its
+/// subagent children, and the zoom control scales it.
+#[gpui::test]
+fn the_tasks_graph_draws_the_run_tree(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("task-graph", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let session = cx.update(|_, cx| shell.read(cx).state.active_id.clone().expect("session"));
+    let dir = std::env::temp_dir().join(format!("bsh-task-graph-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch workspace");
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.state
+                .settings
+                .global
+                .workspaces
+                .push(crate::settings::global::WorkspaceRef {
+                    id: "ws-graph".to_string(),
+                    name: "Graph".to_string(),
+                    root: dir.to_string_lossy().to_string(),
+                    created_at: 0,
+                    updated_at: 0,
+                });
+            this.state.settings.global.general.active_workspace = "ws-graph".to_string();
+            if let Some(session) = this.state.store.session_mut(&session) {
+                session.workspace = "ws-graph".to_string();
+            }
+        });
+    });
+    let task = crate::extension::tasks::Task::open(
+        "task-graph-1",
+        "Fix the failing tests",
+        "intent",
+        crate::extension::tasks::Origin {
+            session: session.clone(),
+            turn: 0,
+        },
+        crate::extension::tasks::Trigger::Now,
+        crate::extension::tasks::Tier::Job,
+        1_000,
+    )
+    .expect("a task");
+    {
+        use crate::extension::tasks::TasksStore as _;
+        crate::extension::tasks::FileTasksStore
+            .save(&dir, &task)
+            .expect("save");
+    }
+    let run = cx
+        .update(|_, cx| {
+            shell.update(cx, |this, _| {
+                this.state.subagents.try_begin(
+                    &session,
+                    &session,
+                    1,
+                    1_000,
+                    "Sleep 10s (A)",
+                    "sleep",
+                    3,
+                )
+            })
+        })
+        .expect("a child run");
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(crate::ui::right_panel::RightTab::Tasks, window, cx);
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let main_selector: &'static str =
+        Box::leak(format!("task-graph-node-{session}").into_boxed_str());
+    let child_selector: &'static str = Box::leak(format!("task-graph-node-{run}").into_boxed_str());
+    assert!(
+        cx.debug_bounds(main_selector).is_some(),
+        "the main agent node"
+    );
+    assert!(
+        cx.debug_bounds(child_selector).is_some(),
+        "the subagent node"
+    );
+    assert!(
+        cx.debug_bounds("task-graph-node-task-graph-1").is_some(),
+        "a task_create record is a graph node"
+    );
+
+    let before = cx.update(|_, cx| shell.read(cx).graph_zoom);
+    let plus = cx
+        .debug_bounds("task-graph-zoom-in")
+        .expect("the zoom in control");
+    cx.simulate_click(plus.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let after = cx.update(|_, cx| shell.read(cx).graph_zoom);
+    assert!(after > before, "the zoom control moves the scale");
+}
 /// The Tasks tab reads the workspace's records and draws a row; an empty
 /// workspace says so.
 #[gpui::test]
@@ -4277,6 +4376,10 @@ fn the_tasks_tab_shows_the_workspace_board(cx: &mut TestAppContext) {
                     updated_at: 0,
                 });
             this.state.settings.global.general.active_workspace = "ws-tasks".to_string();
+            let session = this.state.active_id.clone().unwrap_or_default();
+            if let Some(session) = this.state.store.session_mut(&session) {
+                session.workspace = "ws-tasks".to_string();
+            }
         });
     });
 
@@ -4285,6 +4388,12 @@ fn the_tasks_tab_shows_the_workspace_board(cx: &mut TestAppContext) {
             this.open_right_tab(crate::ui::right_panel::RightTab::Tasks, window, cx);
         })
     });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    // The tab opens on the run graph; the store board is the List view.
+    let mode = cx
+        .debug_bounds("task-graph-mode")
+        .expect("the Tree/List control");
+    cx.simulate_click(mode.center(), Modifiers::default());
     cx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(
         cx.debug_bounds("tasks-empty").is_some(),
@@ -4547,6 +4656,184 @@ fn an_armed_task_clears_without_a_model(cx: &mut TestAppContext) {
         .expect("record");
     assert!(stored.resume_armed_ms.is_none());
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A waiting task fires once its dependency succeeds; one whose dependency is
+/// missing stays waiting.
+#[gpui::test]
+fn a_waiting_task_fires_when_its_dependency_succeeds(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let dir = std::env::temp_dir().join(format!("bsh-task-deps-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch workspace");
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("task-deps", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let session = cx.update(|_, cx| shell.read(cx).state.active_id.clone().expect("session"));
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.state
+                .settings
+                .global
+                .workspaces
+                .push(crate::settings::global::WorkspaceRef {
+                    id: "ws-deps".to_string(),
+                    name: "Deps".to_string(),
+                    root: dir.to_string_lossy().to_string(),
+                    created_at: 0,
+                    updated_at: 0,
+                });
+            this.state.settings.global.general.active_workspace = "ws-deps".to_string();
+            if let Some(session) = this.state.store.session_mut(&session) {
+                session.workspace = "ws-deps".to_string();
+            }
+        });
+    });
+    use crate::extension::tasks::TasksStore as _;
+    let mut dep = crate::extension::tasks::Task::open(
+        "dep",
+        "Dep",
+        "intent",
+        crate::extension::tasks::Origin {
+            session: session.clone(),
+            turn: 0,
+        },
+        crate::extension::tasks::Trigger::Now,
+        crate::extension::tasks::Tier::Turn,
+        1,
+    )
+    .expect("dep");
+    dep.status = crate::extension::tasks::TaskStatus::Succeeded;
+    crate::extension::tasks::FileTasksStore
+        .save(&dir, &dep)
+        .expect("save dep");
+
+    let mut waiting = crate::extension::tasks::Task::open(
+        "waiting",
+        "Waiting",
+        "Review",
+        crate::extension::tasks::Origin {
+            session: session.clone(),
+            turn: 0,
+        },
+        crate::extension::tasks::Trigger::Every {
+            every_seconds: 60,
+            last_run_ms: 0,
+        },
+        crate::extension::tasks::Tier::Turn,
+        2,
+    )
+    .expect("waiting");
+    waiting.status = crate::extension::tasks::TaskStatus::Waiting;
+    waiting.deps = vec!["dep".to_string()];
+    crate::extension::tasks::FileTasksStore
+        .save(&dir, &waiting)
+        .expect("save waiting");
+
+    let mut orphan = waiting.clone();
+    orphan.id = "orphan".to_string();
+    orphan.deps = vec!["missing".to_string()];
+    crate::extension::tasks::FileTasksStore
+        .save(&dir, &orphan)
+        .expect("save orphan");
+
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| this.check_task_schedules(cx));
+    });
+    let fired = crate::extension::tasks::FileTasksStore
+        .load(&dir, "waiting")
+        .expect("load")
+        .expect("record");
+    assert!(
+        !fired.attempts.is_empty(),
+        "a met dependency lets the task fire"
+    );
+    let waiting_still = crate::extension::tasks::FileTasksStore
+        .load(&dir, "orphan")
+        .expect("load")
+        .expect("record");
+    assert_eq!(
+        waiting_still.status,
+        crate::extension::tasks::TaskStatus::Waiting,
+        "a missing dependency keeps the task waiting"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A run past its budget deadline is failed and stopped.
+#[gpui::test]
+fn a_run_past_its_deadline_is_failed(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let dir = std::env::temp_dir().join(format!("bsh-task-deadline-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch workspace");
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("task-deadline", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let session = cx.update(|_, cx| shell.read(cx).state.active_id.clone().expect("session"));
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.state
+                .settings
+                .global
+                .workspaces
+                .push(crate::settings::global::WorkspaceRef {
+                    id: "ws-deadline".to_string(),
+                    name: "Deadline".to_string(),
+                    root: dir.to_string_lossy().to_string(),
+                    created_at: 0,
+                    updated_at: 0,
+                });
+            this.state.settings.global.general.active_workspace = "ws-deadline".to_string();
+            if let Some(session) = this.state.store.session_mut(&session) {
+                session.workspace = "ws-deadline".to_string();
+            }
+        });
+    });
+    use crate::extension::tasks::TasksStore as _;
+    let mut task = crate::extension::tasks::Task::open(
+        "late",
+        "Late",
+        "intent",
+        crate::extension::tasks::Origin {
+            session: session.clone(),
+            turn: 0,
+        },
+        crate::extension::tasks::Trigger::Now,
+        crate::extension::tasks::Tier::Turn,
+        1,
+    )
+    .expect("task");
+    task.status = crate::extension::tasks::TaskStatus::Running;
+    let mut attempt =
+        crate::extension::tasks::Attempt::queued("late-1", crate::extension::tasks::Tier::Turn);
+    attempt.run = Some("run-late".to_string());
+    attempt.status = crate::extension::tasks::AttemptStatus::Running;
+    attempt.started_ms = Some(1);
+    task.attempts.push(attempt);
+    crate::extension::tasks::FileTasksStore
+        .save(&dir, &task)
+        .expect("save");
+
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| this.expire_task_deadlines(cx));
+    });
+    let stored = crate::extension::tasks::FileTasksStore
+        .load(&dir, "late")
+        .expect("load")
+        .expect("record");
+    assert_eq!(stored.status, crate::extension::tasks::TaskStatus::Failed);
+    assert_eq!(
+        stored.attempts.last().expect("attempt").error.as_deref(),
+        Some("deadline exceeded")
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
