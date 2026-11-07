@@ -100,6 +100,18 @@ pub(crate) const GAP_Y: f32 = 84.0;
 /// Margin around the content inside the canvas.
 pub(crate) const MARGIN: f32 = 32.0;
 
+/// The zoom that fits a graph into the pane, never magnifying it.
+///
+/// A graph smaller than the pane keeps 1.0 so the cards stay at their measured
+/// size; a wider one scales down, but never below the readable floor.
+pub(crate) fn fit_zoom(graph_w: f32, graph_h: f32, available_w: f32, available_h: f32) -> f32 {
+    if graph_w <= 0.0 || graph_h <= 0.0 || available_w <= 0.0 || available_h <= 0.0 {
+        return 1.0;
+    }
+    let scale = (available_w / graph_w).min(available_h / graph_h);
+    scale.clamp(0.4, 1.0)
+}
+
 /// Build the graph for one session.
 pub(crate) fn layout(
     session: &str,
@@ -107,6 +119,7 @@ pub(crate) fn layout(
     main_status: GraphStatus,
     tasks: &[Task],
     runs: &[SubagentRun],
+    max_width: Option<f32>,
 ) -> Graph {
     let mut graph = Graph::default();
     graph.nodes.push(GraphNode {
@@ -190,7 +203,60 @@ pub(crate) fn layout(
         graph.edges.push((parent, index));
     }
     place(&mut graph);
+    if let Some(max_width) = max_width {
+        wrap(&mut graph, (max_width - MARGIN * 2.0).max(CARD_W));
+    }
     graph
+}
+
+/// Reflow depth-one nodes into staggered rows when the tree is wider than the
+/// pane. Odd rows sit half a gap right and two-fifths of a card down, so the
+/// rows brick instead of colliding and the connectors keep room to curve.
+fn wrap(graph: &mut Graph, inner: f32) {
+    let per_row = (((inner + GAP_X) / (CARD_W + GAP_X)).floor() as usize).max(1);
+    let depth_one: Vec<usize> = graph
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| node.depth == 1)
+        .map(|(index, _)| index)
+        .collect();
+    if depth_one.len() <= per_row {
+        return;
+    }
+    let mut first_row_right = 0.0f32;
+    for (position, index) in depth_one.iter().enumerate() {
+        let row = position / per_row;
+        let column = position % per_row;
+        let odd = row % 2 == 1;
+        let x = column as f32 * (CARD_W + GAP_X) + if odd { GAP_X / 2.0 } else { 0.0 };
+        let y = (row + 1) as f32 * (CARD_H + GAP_Y) + if odd { CARD_H * 0.4 } else { 0.0 };
+        let node = &mut graph.nodes[*index];
+        node.x = x;
+        node.y = y;
+        if row == 0 {
+            first_row_right = first_row_right.max(x + CARD_W);
+        }
+    }
+    // A nested run hangs under the parent it was drawn with.
+    for (parent, child) in graph.edges.clone() {
+        if graph.nodes[child].depth > 1 {
+            let parent_x = graph.nodes[parent].x;
+            let parent_y = graph.nodes[parent].y;
+            graph.nodes[child].x = parent_x;
+            graph.nodes[child].y = parent_y + CARD_H + GAP_Y;
+        }
+    }
+    graph.nodes[0].x = ((first_row_right - CARD_W) / 2.0).max(0.0);
+    graph.nodes[0].y = 0.0;
+    let mut width = 0.0f32;
+    let mut height = 0.0f32;
+    for node in &graph.nodes {
+        width = width.max(node.x + CARD_W);
+        height = height.max(node.y + CARD_H);
+    }
+    graph.width = width;
+    graph.height = height;
 }
 
 /// The status for a task record.
@@ -330,6 +396,7 @@ mod tests {
                 run("sub-a", "ses-1", 1, "Sleep 10s (A)"),
                 run("sub-b", "ses-1", 1, "Sleep 10s (B)"),
             ],
+            None,
         );
         assert_eq!(graph.nodes.len(), 3);
         assert_eq!(graph.edges.len(), 2);
@@ -342,6 +409,44 @@ mod tests {
         assert!((graph.nodes[0].x - expected).abs() < 0.5);
     }
 
+    /// A wide graph scales down to the pane; a small one keeps its size.
+    #[test]
+    fn fit_zoom_never_magnifies_and_scales_down() {
+        assert_eq!(fit_zoom(0.0, 0.0, 500.0, 500.0), 1.0);
+        assert_eq!(fit_zoom(300.0, 200.0, 600.0, 600.0), 1.0);
+        let fitted = fit_zoom(1000.0, 300.0, 500.0, 600.0);
+        assert!((fitted - 0.5).abs() < 0.001, "the width constrains it");
+        let tall = fit_zoom(400.0, 800.0, 1000.0, 400.0);
+        assert!((tall - 0.5).abs() < 0.001, "the height constrains it");
+        assert_eq!(fit_zoom(10_000.0, 10_000.0, 100.0, 100.0), 0.4);
+    }
+
+    /// A tree wider than the pane wraps into staggered rows instead of
+    /// colliding: odd rows sit half a column right and lower.
+    #[test]
+    fn a_wide_tree_wraps_into_staggered_rows() {
+        let runs: Vec<SubagentRun> = (0..6)
+            .map(|index| run(&format!("sub-{index}"), "ses-1", 1, "child"))
+            .collect();
+        let graph = layout(
+            "ses-1",
+            "main",
+            GraphStatus::Running,
+            &[],
+            &runs,
+            Some(700.0),
+        );
+        assert_eq!(graph.nodes.len(), 7);
+        let row0: Vec<&GraphNode> = graph.nodes.iter().skip(1).take(2).collect();
+        let row1: Vec<&GraphNode> = graph.nodes.iter().skip(3).take(2).collect();
+        assert_eq!(row0[0].y, row0[1].y, "a row shares its baseline");
+        assert!(row1[0].y > row0[0].y, "the next row is lower");
+        assert!(
+            (row1[0].x - GAP_X / 2.0).abs() < 0.5,
+            "the odd row is offset right by half a gap"
+        );
+        assert!(graph.width <= 701.0, "the wrapped tree fits");
+    }
     /// A task record is a node of its own, with its tier as the subtitle.
     #[test]
     fn a_store_task_is_a_node() {
@@ -351,6 +456,7 @@ mod tests {
             GraphStatus::Running,
             &[task("task-1", "ses-1", Tier::Job, None)],
             &[],
+            None,
         );
         assert_eq!(graph.nodes.len(), 2);
         assert_eq!(graph.nodes[1].kind, NodeKind::Task);
@@ -368,6 +474,7 @@ mod tests {
             GraphStatus::Running,
             &[task("task-1", "ses-1", Tier::Subagent, Some("sub-a"))],
             &[run("sub-a", "ses-1", 1, "Sleep 10s (A)")],
+            None,
         );
         assert_eq!(graph.nodes.len(), 2);
         assert_eq!(graph.nodes[1].id, "sub-a");
@@ -386,6 +493,7 @@ mod tests {
                 run("sub-a", "ses-1", 1, "A"),
                 run("sub-a1", "ses-1", 2, "A.1"),
             ],
+            None,
         );
         assert_eq!(graph.nodes.len(), 3);
         assert_eq!(graph.edges, vec![(0, 1), (1, 2)]);
@@ -400,6 +508,7 @@ mod tests {
             GraphStatus::Running,
             &[task("task-x", "ses-2", Tier::Job, None)],
             &[run("sub-x", "ses-2", 1, "elsewhere")],
+            None,
         );
         assert_eq!(graph.nodes.len(), 1);
         assert!(graph.edges.is_empty());

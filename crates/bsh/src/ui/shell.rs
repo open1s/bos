@@ -2105,7 +2105,10 @@ impl Shell {
             terminal_running: false,
             browser_focus: cx.focus_handle(),
             right_hover: false,
-            right: super::right_panel::RightPanel::default(),
+            right: super::right_panel::RightPanel {
+                graph_fit: true,
+                ..super::right_panel::RightPanel::default()
+            },
             files: super::right_panel::FilesPane::new(files_new, files_rename, files_note),
             models_fetched: None,
             models_fetch_failed: false,
@@ -2352,6 +2355,7 @@ impl Shell {
                         this.check_schedules(cx);
                         this.check_task_schedules(cx);
                         this.expire_task_deadlines(cx);
+                        this.settle_observed_tasks();
                         this.check_task_resumes(cx);
                         this.check_peer_tasks(cx);
                         this.check_peer_delegations(cx);
@@ -5658,6 +5662,107 @@ impl Shell {
     }
 
     /// Settle the run this shell started for a session, after its turn ended.
+    /// Every workspace root a task record may live in.
+    fn task_roots(&self) -> Vec<std::path::PathBuf> {
+        let mut roots = std::collections::BTreeSet::new();
+        let active = self.state.settings.active_workspace_root();
+        if !active.is_empty() {
+            roots.insert(std::path::PathBuf::from(active));
+        }
+        for workspace in &self.state.settings.global.workspaces {
+            if !workspace.root.is_empty() {
+                roots.insert(std::path::PathBuf::from(&workspace.root));
+            }
+        }
+        roots.into_iter().collect()
+    }
+
+    /// Settle local records whose child run or job has finished.
+    ///
+    /// A join is the tool's way to wait, but the durable record must not depend
+    /// on one: the tick closes it from the registries the shell already holds.
+    pub(crate) fn settle_observed_tasks(&mut self) {
+        use crate::extension::runs::RunState;
+        use crate::extension::tasks::{FileTasksStore, Host, TaskStatus, TasksStore, Tier};
+        use crate::subagent::SubagentStatus;
+        let roots = self.task_roots();
+        let mut finished = Vec::new();
+        for root in &roots {
+            let Ok(tasks) = FileTasksStore.list(root) else {
+                continue;
+            };
+            for record in tasks {
+                if record.host != Host::Local || record.status != TaskStatus::Running {
+                    continue;
+                }
+                let Some(run) = record
+                    .attempts
+                    .last()
+                    .and_then(|attempt| attempt.run.clone())
+                else {
+                    continue;
+                };
+                match record.tier {
+                    Tier::Subagent => {
+                        if let Some(child) = self.state.subagents.run(&run) {
+                            match child.status {
+                                SubagentStatus::Done => finished.push((
+                                    run,
+                                    RunState::Succeeded,
+                                    child.result,
+                                    child.error,
+                                )),
+                                SubagentStatus::Failed => finished.push((
+                                    run,
+                                    RunState::Failed,
+                                    child.result,
+                                    child.error,
+                                )),
+                                SubagentStatus::Running => {}
+                            }
+                        }
+                    }
+                    Tier::Job => {
+                        if let Some(job) = self.state.jobs.job(&run) {
+                            // The job's captured tail is the attempt's result:
+                            // without it the record reports a state nobody can
+                            // read anything back from.
+                            let output = self
+                                .state
+                                .jobs
+                                .output_for(&run)
+                                .map(|output| output.text.chars().take(4_000).collect::<String>())
+                                .filter(|text| !text.trim().is_empty());
+                            match job.status {
+                                agent::jobs::JobStatus::Succeeded { .. } => {
+                                    finished.push((run, RunState::Succeeded, output, None))
+                                }
+                                agent::jobs::JobStatus::Failed { code } => finished.push((
+                                    run,
+                                    RunState::Failed,
+                                    output,
+                                    Some(format!("the job exited with {code}")),
+                                )),
+                                agent::jobs::JobStatus::Killed => finished.push((
+                                    run,
+                                    RunState::Cancelled,
+                                    output,
+                                    Some("the job was stopped".to_string()),
+                                )),
+                                agent::jobs::JobStatus::Running => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for (run, state, result, error) in finished {
+            crate::task_tools::settle_by_run(&roots, &run, state, result, error, 0);
+            self.right.tasks.borrow_mut().take();
+        }
+    }
+
     pub(crate) fn settle_task_run(&mut self, session: &str, failed: bool) {
         let Some(run) = self.task_run_sessions.remove(session) else {
             return;
@@ -5687,14 +5792,13 @@ impl Shell {
         } else {
             crate::extension::runs::RunState::Succeeded
         };
-        service.record(
-            &run,
-            state,
-            result,
-            tokens,
-            0,
-            failed.then(|| "the turn failed".to_string()),
-        );
+        let error = failed.then(|| "the turn failed".to_string());
+        service.record(&run, state, result.clone(), tokens, 0, error.clone());
+        // The durable record must not wait for a join to learn the outcome.
+        let roots = self.task_roots();
+        if crate::task_tools::settle_by_run(&roots, &run, state, result, error, tokens) {
+            self.right.tasks.borrow_mut().take();
+        }
     }
 
     /// Stop an extension-started run of this shell.

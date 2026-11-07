@@ -4342,6 +4342,99 @@ fn the_history_section_collapses_and_clears(cx: &mut TestAppContext) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A finished child run closes its task record on the tick, with no join.
+#[gpui::test]
+fn the_tick_settles_a_finished_subagent_task(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let dir = std::env::temp_dir().join(format!("bsh-task-settle-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch workspace");
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("task-settle", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let session = cx.update(|_, cx| shell.read(cx).state.active_id.clone().expect("session"));
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.state
+                .settings
+                .global
+                .workspaces
+                .push(crate::settings::global::WorkspaceRef {
+                    id: "ws-settle".to_string(),
+                    name: "Settle".to_string(),
+                    root: dir.to_string_lossy().to_string(),
+                    created_at: 0,
+                    updated_at: 0,
+                });
+            this.state.settings.global.general.active_workspace = "ws-settle".to_string();
+            if let Some(session) = this.state.store.session_mut(&session) {
+                session.workspace = "ws-settle".to_string();
+            }
+        });
+    });
+    let run = cx
+        .update(|_, cx| {
+            shell.update(cx, |this, _| {
+                this.state
+                    .subagents
+                    .try_begin(&session, &session, 1, 1_000, "Research", "look", 3)
+            })
+        })
+        .expect("child run");
+    let mut task = crate::extension::tasks::Task::open(
+        "task-sub",
+        "Research",
+        "look",
+        crate::extension::tasks::Origin {
+            session: session.clone(),
+            turn: 0,
+        },
+        crate::extension::tasks::Trigger::Now,
+        crate::extension::tasks::Tier::Subagent,
+        1,
+    )
+    .expect("task");
+    task.status = crate::extension::tasks::TaskStatus::Running;
+    let mut attempt = crate::extension::tasks::Attempt::queued(
+        "task-sub-1",
+        crate::extension::tasks::Tier::Subagent,
+    );
+    attempt.run = Some(run.clone());
+    attempt.status = crate::extension::tasks::AttemptStatus::Running;
+    task.attempts.push(attempt);
+    {
+        use crate::extension::tasks::TasksStore as _;
+        crate::extension::tasks::FileTasksStore
+            .save(&dir, &task)
+            .expect("save");
+    }
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.state
+                .subagents
+                .finish(&run, "the answer".to_string(), (0, 0), Vec::new());
+            this.settle_observed_tasks();
+        });
+    });
+    use crate::extension::tasks::TasksStore as _;
+    let stored = crate::extension::tasks::FileTasksStore
+        .load(&dir, "task-sub")
+        .expect("load")
+        .expect("record");
+    assert_eq!(
+        stored.status,
+        crate::extension::tasks::TaskStatus::Succeeded
+    );
+    assert_eq!(
+        stored.attempts.last().expect("attempt").result.as_deref(),
+        Some("the answer")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The board's Stop action marks a local running task cancelled.
 #[gpui::test]
 fn the_board_stop_marks_a_running_task(cx: &mut TestAppContext) {
@@ -4526,14 +4619,27 @@ fn the_tasks_graph_draws_the_run_tree(cx: &mut TestAppContext) {
         "a task_create record is a graph node"
     );
 
-    let before = cx.update(|_, cx| shell.read(cx).graph_zoom);
+    assert!(
+        cx.update(|_, cx| shell.read(cx).right.graph_fit),
+        "the graph fits the pane by default"
+    );
+    let plus = cx
+        .debug_bounds("task-graph-zoom-in")
+        .expect("the zoom in control");
+    cx.simulate_click(plus.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        !cx.update(|_, cx| shell.read(cx).right.graph_fit),
+        "a manual zoom overrides the fit"
+    );
+    let manual = cx.update(|_, cx| shell.read(cx).graph_zoom);
     let plus = cx
         .debug_bounds("task-graph-zoom-in")
         .expect("the zoom in control");
     cx.simulate_click(plus.center(), Modifiers::default());
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let after = cx.update(|_, cx| shell.read(cx).graph_zoom);
-    assert!(after > before, "the zoom control moves the scale");
+    assert!(after > manual, "the manual zoom control moves the scale");
 }
 /// The Tasks tab reads the workspace's records and draws a row; an empty
 /// workspace says so.

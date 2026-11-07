@@ -444,6 +444,8 @@ pub(crate) struct RightPanel {
     pub(crate) expanded: std::collections::BTreeSet<String>,
     /// Whether the History section shows its rows.
     pub(crate) history_open: bool,
+    /// Whether the graph fits itself to the pane (true) or keeps a manual zoom.
+    pub(crate) graph_fit: bool,
 }
 
 /// One enrolled peer as the federation pane lists it.
@@ -1283,17 +1285,40 @@ impl Shell {
             }
             cache.clone().unwrap_or_default()
         };
-        let graph = crate::ui::task_graph::layout(&session, &title, status, &tasks, &runs);
-        let zoom = self.graph_zoom;
+        // The graph fits the pane by default: a wide tree wraps into staggered
+        // rows first, then scales down only if the rows are still too wide.
+        let available_w = (self.right_panel_w() - 24.0).max(240.0);
+        let available_h = (self.viewport_h - 104.0).max(220.0);
+        let graph = crate::ui::task_graph::layout(
+            &session,
+            &title,
+            status,
+            &tasks,
+            &runs,
+            Some(available_w),
+        );
+        let fit = crate::ui::task_graph::fit_zoom(
+            graph.width + crate::ui::task_graph::MARGIN * 2.0,
+            graph.height + crate::ui::task_graph::MARGIN * 2.0,
+            available_w,
+            available_h,
+        );
+        let zoom = if self.right.graph_fit {
+            fit
+        } else {
+            self.graph_zoom
+        };
         let pan = self.graph_pan;
-        let scale_x = |x: f32| crate::ui::task_graph::MARGIN + x * zoom + pan.0;
-        let scale_y = |y: f32| crate::ui::task_graph::MARGIN + y * zoom + pan.1;
+        let offset_x = ((available_w - graph.width * zoom) / 2.0).max(0.0);
+        let offset_y = ((available_h - graph.height * zoom) / 2.0).max(0.0);
+        let scale_x = |x: f32| crate::ui::task_graph::MARGIN + x * zoom + pan.0 + offset_x;
+        let scale_y = |y: f32| crate::ui::task_graph::MARGIN + y * zoom + pan.1 + offset_y;
         let card_w = crate::ui::task_graph::CARD_W * zoom;
         let card_h = crate::ui::task_graph::CARD_H * zoom;
-        let content_w =
-            (graph.width * zoom + crate::ui::task_graph::MARGIN * 2.0).max(card_w + 64.0);
+        let content_w = available_w;
         let content_h =
-            (graph.height * zoom + crate::ui::task_graph::MARGIN * 2.0).max(card_h + 64.0);
+            (graph.height * zoom + crate::ui::task_graph::MARGIN * 2.0 + offset_y * 2.0)
+                .max(available_h);
 
         let mut edges: Vec<(f32, f32, f32, f32)> = Vec::new();
         for (parent, child) in &graph.edges {
@@ -1315,14 +1340,25 @@ impl Shell {
                 for (sx, sy, ex, ey) in &edges {
                     let start = (base.x + px(*sx), base.y + px(*sy));
                     let end = (base.x + px(*ex), base.y + px(*ey));
-                    let control = ((start.0 + end.0) / 2.0, (start.1 + end.1) / 2.0);
+                    // A smooth S: leave the parent straight down, travel
+                    // sideways only in the gap between levels, and enter the
+                    // child straight from above, so the line never crosses a card.
+                    let gap = (end.1 - start.1).max(px(16.0));
+                    let control_a = (start.0, start.1 + gap * 0.45);
+                    let control_b = (end.0, end.1 - gap * 0.45);
                     let mut path = PathBuilder::stroke(px(1.5));
                     path.move_to(point(start.0, start.1));
-                    for step in 1..=16 {
-                        let t = step as f32 / 16.0;
+                    for step in 1..=24 {
+                        let t = step as f32 / 24.0;
                         let inv = 1.0 - t;
-                        let x = inv * inv * start.0 + 2.0 * inv * t * control.0 + t * t * end.0;
-                        let y = inv * inv * start.1 + 2.0 * inv * t * control.1 + t * t * end.1;
+                        let x = inv * inv * inv * start.0
+                            + 3.0 * inv * inv * t * control_a.0
+                            + 3.0 * inv * t * t * control_b.0
+                            + t * t * t * end.0;
+                        let y = inv * inv * inv * start.1
+                            + 3.0 * inv * inv * t * control_a.1
+                            + 3.0 * inv * t * t * control_b.1
+                            + t * t * t * end.1;
                         path.line_to(point(x, y));
                     }
                     if let Ok(path) = path.build() {
@@ -1363,7 +1399,12 @@ impl Shell {
         .debug_selector(|| "task-graph-summary".to_string());
         let mut cards: Vec<AnyElement> = Vec::with_capacity(graph.nodes.len());
         for node in &graph.nodes {
-            cards.push(self.task_graph_node(node, zoom, pan, lang));
+            cards.push(self.task_graph_node(
+                node,
+                zoom,
+                (pan.0 + offset_x, pan.1 + offset_y),
+                lang,
+            ));
         }
         let tree_label = lang.tr(if self.graph_tree {
             "right.tasks.tree"
@@ -1387,13 +1428,26 @@ impl Shell {
                 this.graph_tree = !this.graph_tree;
                 cx.notify();
             }));
-        let zoom_out = zoom_button("task-graph-zoom-out", "\u{2212}", cx, |this| {
-            this.graph_zoom = (this.graph_zoom - 0.1).max(0.5);
+        let zoom_out = zoom_button("task-graph-zoom-out", "\u{2212}", cx, move |this| {
+            let base = if this.right.graph_fit {
+                fit
+            } else {
+                this.graph_zoom
+            };
+            this.right.graph_fit = false;
+            this.graph_zoom = (base - 0.1).max(0.4);
         });
-        let zoom_in = zoom_button("task-graph-zoom-in", "+", cx, |this| {
-            this.graph_zoom = (this.graph_zoom + 0.1).min(2.0);
+        let zoom_in = zoom_button("task-graph-zoom-in", "+", cx, move |this| {
+            let base = if this.right.graph_fit {
+                fit
+            } else {
+                this.graph_zoom
+            };
+            this.right.graph_fit = false;
+            this.graph_zoom = (base + 0.1).min(2.0);
         });
-        let zoom_fit = zoom_button("task-graph-zoom-reset", "\u{27F2}", cx, |this| {
+        let zoom_fit = zoom_button("task-graph-zoom-reset", "\u{2922}", cx, |this| {
+            this.right.graph_fit = true;
             this.graph_zoom = 1.0;
         });
         let percent = txt(
@@ -1403,6 +1457,12 @@ impl Shell {
         )
         .w(px(44.0))
         .text_align(gpui::TextAlign::Center);
+        // A narrow pane keeps only the controls it can show: the summary is
+        // the first thing to go.
+        let mut left = div().flex().items_center().gap(px(10.0)).child(mode);
+        if available_w > 560.0 {
+            left = left.child(summary);
+        }
         let toolbar = div()
             .flex()
             .items_center()
@@ -1411,8 +1471,7 @@ impl Shell {
             .py(px(8.0))
             .border_b_1()
             .border_color(rgb(theme::border_soft()))
-            .child(mode)
-            .child(summary)
+            .child(left)
             .child(
                 div()
                     .flex()
@@ -1547,6 +1606,8 @@ impl Shell {
                 div()
                     .flex()
                     .flex_col()
+                    .w_full()
+                    .min_w_0()
                     .gap(px(6.0))
                     .child(header)
                     .child(txt(node.title.clone(), 14.0, theme::text()).truncate()),

@@ -325,12 +325,20 @@ struct RegistryState {
 /// Methods lock one short critical section and never hold it across I/O: a
 /// process is signalled after the lock is released, so the reader threads that
 /// append output are never blocked behind a kill.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct JobRegistry {
     inner: Mutex<RegistryState>,
     settled: Condvar,
     job_cap: usize,
     output_cap: usize,
+}
+
+impl Default for JobRegistry {
+    /// The shipped bounds, NOT a derived zero: a zero cap would silently drop
+    /// every job the moment it was registered.
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl JobRegistry {

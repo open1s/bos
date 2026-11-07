@@ -332,6 +332,67 @@ fn attach_list(agent: &mut Agent, context: TaskToolsContext) {
     }
 }
 
+/// Settle the record whose attempt run id matches, across the given workspaces.
+///
+/// The turn pump and the tick know an outcome before any join does; without
+/// this the durable record would stay Running after its run ended.
+pub(crate) fn settle_by_run(
+    roots: &[std::path::PathBuf],
+    run: &str,
+    state: crate::extension::runs::RunState,
+    result: Option<String>,
+    error: Option<String>,
+    tokens: u64,
+) -> bool {
+    use crate::extension::runs::RunState;
+    let (task_status, attempt_status) = match state {
+        RunState::Succeeded => (TaskStatus::Succeeded, AttemptStatus::Succeeded),
+        RunState::Failed => (TaskStatus::Failed, AttemptStatus::Failed),
+        RunState::Cancelled => (TaskStatus::Cancelled, AttemptStatus::Cancelled),
+        RunState::Unknown => (TaskStatus::Unknown, AttemptStatus::Unknown),
+        RunState::Queued | RunState::Running => return false,
+    };
+    let now = crate::settings::unix_now().saturating_mul(1_000);
+    for root in roots {
+        let Ok(tasks) = FileTasksStore.list(root) else {
+            continue;
+        };
+        for mut record in tasks {
+            let Some(attempt) = record
+                .attempts
+                .iter_mut()
+                .find(|attempt| attempt.run.as_deref() == Some(run))
+            else {
+                continue;
+            };
+            attempt.status = attempt_status;
+            attempt.ended_ms = Some(now);
+            if result.is_some() {
+                attempt.result = result.clone();
+            }
+            if error.is_some() {
+                attempt.error = error.clone();
+            }
+            if tokens != 0 {
+                attempt.usage = Some(crate::extension::tasks::Usage {
+                    tokens,
+                    steps: 0,
+                    wall_ms: 0,
+                });
+            }
+            record.status = if matches!(record.trigger, Trigger::Every { .. }) {
+                TaskStatus::Scheduled
+            } else {
+                task_status
+            };
+            record.updated_ms = now;
+            let _ = FileTasksStore.save(root, &record);
+            return true;
+        }
+    }
+    false
+}
+
 /// Mark local attempts that died with the previous process as interrupted.
 ///
 /// Called once at shell assembly, before any turn opens: the runs service, the
@@ -2081,6 +2142,176 @@ mod tests {
             "the retry reaches the delegation instead of refusing for want of the input"
         );
         let _ = std::fs::remove_dir_all(&context.workspace);
+    }
+
+    /// The record whose run ended settles immediately, and an every-trigger
+    /// record returns to its schedule.
+    #[test]
+    fn settle_by_run_closes_the_record() {
+        let context = context("settle");
+        let task = Task::open(
+            "task-1",
+            "t",
+            "i",
+            Origin {
+                session: "ses-1".to_string(),
+                turn: 0,
+            },
+            Trigger::Now,
+            Tier::Turn,
+            1,
+        )
+        .expect("task");
+        let mut attempt = Attempt::queued("a1", Tier::Turn);
+        attempt.run = Some("run-1".to_string());
+        attempt.status = AttemptStatus::Running;
+        let mut task = task;
+        task.status = TaskStatus::Running;
+        task.attempts.push(attempt);
+        FileTasksStore
+            .save(&context.workspace, &task)
+            .expect("save");
+
+        assert!(crate::task_tools::settle_by_run(
+            std::slice::from_ref(&context.workspace),
+            "run-1",
+            crate::extension::runs::RunState::Succeeded,
+            Some("done".to_string()),
+            None,
+            7,
+        ));
+        let stored = FileTasksStore
+            .load(&context.workspace, "task-1")
+            .expect("load")
+            .expect("record");
+        assert_eq!(stored.status, TaskStatus::Succeeded);
+        let attempt = stored.attempts.last().expect("attempt");
+        assert_eq!(attempt.status, AttemptStatus::Succeeded);
+        assert_eq!(attempt.result.as_deref(), Some("done"));
+        assert_eq!(attempt.usage.as_ref().map(|usage| usage.tokens), Some(7));
+
+        let mut scheduled = Task::open(
+            "task-2",
+            "s",
+            "i",
+            Origin {
+                session: "ses-1".to_string(),
+                turn: 0,
+            },
+            Trigger::Every {
+                every_seconds: 60,
+                last_run_ms: 0,
+            },
+            Tier::Turn,
+            1,
+        )
+        .expect("scheduled");
+        let mut attempt = Attempt::queued("a2", Tier::Turn);
+        attempt.run = Some("run-2".to_string());
+        attempt.status = AttemptStatus::Running;
+        scheduled.status = TaskStatus::Running;
+        scheduled.attempts.push(attempt);
+        FileTasksStore
+            .save(&context.workspace, &scheduled)
+            .expect("save");
+        crate::task_tools::settle_by_run(
+            std::slice::from_ref(&context.workspace),
+            "run-2",
+            crate::extension::runs::RunState::Failed,
+            None,
+            Some("boom".to_string()),
+            0,
+        );
+        let stored = FileTasksStore
+            .load(&context.workspace, "task-2")
+            .expect("load")
+            .expect("record");
+        assert_eq!(stored.status, TaskStatus::Scheduled);
+        let _ = std::fs::remove_dir_all(&context.workspace);
+    }
+
+    /// A job task starts a real process and settles through the same helper the
+    /// tick uses.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_job_task_starts_and_settles() {
+        let mut context = context("job");
+        let jobs = std::sync::Arc::new(agent::jobs::JobRegistry::default());
+        let bash = std::sync::Arc::new(
+            agent::tools::BashTool::new("bash").with_jobs(jobs.clone(), "ses-1".to_string()),
+        );
+        context.bash = Some(bash as std::sync::Arc<dyn agent::tools::Tool>);
+        context.jobs = Some(jobs.clone());
+        let value = create_with(
+            &Runs::empty(),
+            &context,
+            &json!({"intent": "run", "tier": "job", "command": "echo hi"}),
+        )
+        .await
+        .expect("created");
+        let run = value["run"].as_str().expect("job id").to_string();
+        for _ in 0..100 {
+            if jobs
+                .job(&run)
+                .map(|job| job.status.is_settled())
+                .unwrap_or(false)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let job = jobs.job(&run).expect("the job exists");
+        assert!(
+            job.status.is_settled(),
+            "the process finished: {:?}",
+            job.status
+        );
+        let output = jobs
+            .output_for(&run)
+            .map(|output| output.text)
+            .unwrap_or_default();
+        assert!(
+            output.contains("hi"),
+            "the job captured its output: {output:?}"
+        );
+        let root = std::path::PathBuf::from(&context.workspace);
+        assert!(crate::task_tools::settle_by_run(
+            &[root],
+            &run,
+            crate::extension::runs::RunState::Succeeded,
+            Some(output),
+            None,
+            0,
+        ));
+        let task_id = value["task"].as_str().expect("task");
+        let stored = FileTasksStore
+            .load(&context.workspace, task_id)
+            .expect("load")
+            .expect("record");
+        assert!(
+            stored
+                .attempts
+                .last()
+                .and_then(|attempt| attempt.result.as_deref())
+                .unwrap_or_default()
+                .contains("hi"),
+            "the attempt reports what the job printed"
+        );
+        let _ = std::fs::remove_dir_all(&context.workspace);
+    }
+
+    /// The default registry keeps the shipped caps, not a derived zero: a
+    /// zero cap dropped every job the moment it was registered.
+    #[test]
+    fn a_default_registry_keeps_its_jobs() {
+        use agent::tools::Tool as _;
+        let jobs = std::sync::Arc::new(agent::jobs::JobRegistry::default());
+        let bash = agent::tools::BashTool::new("bash").with_jobs(jobs.clone(), "ses-1".to_string());
+        let response = bash
+            .run(&json!({"command": "sleep 2", "run_in_background": true}))
+            .expect("started");
+        let id = response["job_id"].as_str().expect("id").to_string();
+        assert!(jobs.job(&id).is_some(), "the registry holds it");
+        jobs.kill(&id);
     }
     /// An unknown id is a refusal, not an empty report.
     #[tokio::test]
