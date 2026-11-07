@@ -2106,21 +2106,31 @@ pub(crate) fn capabilities(agent: &Agent) -> Vec<CapInfo> {
 /// disabled extension still contributes nothing, and a preset still narrows the
 /// tools, because neither of those is a switch THIS pane owns. The meter and
 /// the plugin inventory are priced from the real build, not this preview.
+#[cfg(test)]
 pub(crate) fn preview_capabilities(
     settings: &Settings,
     vault: &Vault,
     mcp: &crate::mcp::McpPool,
 ) -> Vec<CapInfo> {
+    capabilities(&preview_build(settings, vault, mcp).agent)
+}
+
+/// Build the preview agent once when a pane needs both the full capability list
+/// and the tool-schema size, instead of building twice.
+pub(crate) fn preview_build(
+    settings: &Settings,
+    vault: &Vault,
+    mcp: &crate::mcp::McpPool,
+) -> BuiltAgent {
     let mut preview = settings.clone();
     preview.workspace.disabled.tools.clear();
     preview.workspace.disabled.skills.clear();
-    let built = build_agent(
+    build_agent(
         &preview,
         vault,
         &crate::settings::resolve::SessionChoice::default(),
         mcp,
-    );
-    capabilities(&built.agent)
+    )
 }
 
 /// The workspace root, expanded, when one is configured.

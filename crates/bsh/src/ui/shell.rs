@@ -887,7 +887,13 @@ pub(crate) struct Shell {
     /// or permission switch rebakes the policy, and the pane must rebuild its
     /// tool list instead of showing the previous build's capabilities.
     pub(crate) caps_generation: u64,
+    /// Whether the capability preview was built for the current generation.
+    pub(crate) caps_ready: bool,
     pub(crate) plugins: Vec<crate::plugins::PluginInfo>,
+    /// The policy generation the cached plugin list was built for.
+    pub(crate) plugins_generation: u64,
+    /// Whether the plugin preview was built for the current generation.
+    pub(crate) plugins_ready: bool,
     /// Extension commands the composer palette can insert.
     pub(crate) extension_commands: Vec<crate::extension::CommandSurface>,
     /// Panels declared for the left sidebar.
@@ -1892,7 +1898,10 @@ impl Shell {
             composer_value: String::new(),
             caps: Vec::new(),
             caps_generation: 0,
+            caps_ready: false,
             plugins: Vec::new(),
+            plugins_generation: 0,
+            plugins_ready: false,
             extension_commands: crate::extension::cached_commands(),
             center_extension_panels,
             left_extension_panels,
@@ -2193,6 +2202,17 @@ impl Shell {
             }
         })
         .detach();
+        // The launch build already produced the committed capability and
+        // plugin lists. Seed them so the first Tools or plugin visit does not
+        // pay for a second identical build; a draft that disables tools or
+        // skills needs the preview build and falls back to it.
+        shell.caps = crate::caps::capabilities(&built.agent);
+        shell.caps_generation = shell.state.policy_generation;
+        shell.caps_ready = shell.state.settings.workspace.disabled.tools.is_empty()
+            && shell.state.settings.workspace.disabled.skills.is_empty();
+        shell.plugins = built.plugins;
+        shell.plugins_generation = shell.state.policy_generation;
+        shell.plugins_ready = true;
         if let Some(section) = open_settings {
             shell.open_settings_at(section, window, cx);
         }
@@ -2600,6 +2620,12 @@ impl Shell {
             self.plugins_tab = 1;
             if let Some(plugins) = super::settings::section_index("plugins") {
                 section = plugins;
+            }
+        }
+        if Some(section) == super::settings::section_index("tools") {
+            self.extensions_tab = 5;
+            if let Some(extensions) = super::settings::section_index("extensions") {
+                section = extensions;
             }
         }
         self.state.settings_section = section;

@@ -7959,6 +7959,41 @@ fn the_builtin_plugins_pane_reads_the_draft(cx: &mut TestAppContext) {
     assert!(enabled(cx, "files"), "another plugin is unaffected");
 }
 
+/// Tools and skills is reached from the Extensions pane's tab strip, the same
+/// way MCP and Skills are, rather than as a rail cell of its own.
+#[gpui::test]
+fn the_tools_and_skills_tab_lives_in_extensions(cx: &mut TestAppContext) {
+    use super::settings::section_index;
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = AppState::with_store(scratch_store("plugins-tools-tab"));
+        let shell =
+            cx.new(|cx| Shell::build_for_test(window, section_index("extensions"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let tab = cx
+        .debug_bounds("extensions-tab-tools")
+        .expect("the Tools and skills tab draws");
+    cx.simulate_click(tab.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let (plugins_tab, section) = cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.read(cx);
+        (shell.extensions_tab, shell.state.settings_section)
+    });
+    assert_eq!(plugins_tab, 5, "the Tools and skills tab is selected");
+    assert_eq!(
+        section,
+        section_index("extensions").expect("the Extensions pane"),
+        "the tab stays inside Extensions"
+    );
+    assert!(
+        cx.debug_bounds("settings-web-tools").is_some(),
+        "the tool switch from the Tools pane is drawn in this tab"
+    );
+}
 /// The Extensions pane has the reference shape: a tab strip, the page
 /// header's Refresh/Add controls, a search field, and the three vertical
 /// sections (built-in settings, experimental, installed) drawn as rows.

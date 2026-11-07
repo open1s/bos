@@ -1040,10 +1040,27 @@ impl Shell {
         view_height: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        if self.caps.is_empty() || self.caps_generation != self.state.policy_generation {
-            // The dialog previews the WORKSPACE configuration it is editing, so
-            // it resolves without a session choice: the pane's job is to show
-            // what the draft would build for a session that inherits.
+        let lang = self.state.lang;
+        let section = self.state.settings_section;
+        let generation = self.state.policy_generation;
+        // Build only the cache the OPEN pane draws. The old code built the
+        // agent and then built it again for the preview before every pane, so
+        // the first visit to Account paid two full builds. The Tools pane now
+        // pays one preview build, the plugin inventory one normal build, and
+        // every other pane pays none.
+        let tools_tab = section == 4 || (section == 17 && self.extensions_tab == 5);
+        if tools_tab && (!self.caps_ready || self.caps_generation != generation) {
+            let built =
+                crate::caps::preview_build(self.state.draft(), &self.state.vault, &self.state.mcp);
+            // The pane's list is a PREVIEW that keeps a switched-off tool and
+            // skill on screen - its row is the only control that can switch it
+            // back on.
+            self.caps = crate::caps::capabilities(&built.agent);
+            self.state.set_tools_schema(built.tools_schema_chars);
+            self.caps_generation = generation;
+            self.caps_ready = true;
+        }
+        if section == 5 && (!self.plugins_ready || self.plugins_generation != generation) {
             let built = crate::caps::build_agent(
                 self.state.draft(),
                 &self.state.vault,
@@ -1051,22 +1068,10 @@ impl Shell {
                 &self.state.mcp,
             );
             self.plugins = built.plugins;
-            // The dialog's build already knows the tool array, so the meter's
-            // tools bucket follows the draft without a second build.
             self.state.set_tools_schema(built.tools_schema_chars);
-            self.caps_generation = self.state.policy_generation;
-            // The pane's list is a PREVIEW that keeps a switched-off tool and
-            // skill on screen - its row is the only control that can switch it
-            // back on. See preview_capabilities for why the whole build above
-            // cannot serve as the list.
-            self.caps = crate::caps::preview_capabilities(
-                self.state.draft(),
-                &self.state.vault,
-                &self.state.mcp,
-            );
+            self.plugins_generation = generation;
+            self.plugins_ready = true;
         }
-        let lang = self.state.lang;
-        let section = self.state.settings_section;
 
         // Measured (SettingsRoot.module.css): the rail is 188 wide over an 18px
         // gap with 22/12 padding, a 16px/500 title, then 4px-spaced 40px cells with
@@ -6715,7 +6720,8 @@ impl Shell {
     /// The host owns the tree; this pane owns only the selected revision and
     /// the loading/error state. Actions are routed back to the owning runtime
     /// with the revision they were rendered from.
-    /// The Extensions pane's sub-tabs: installed inventory, MCP and skills.
+    /// The Extensions pane's sub-tabs: installed inventory, MCP, skills, theme,
+    /// market, and the Tools and skills list.
     fn extensions_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
         let lang = self.state.lang;
         let mut strip = div()
@@ -6733,6 +6739,7 @@ impl Shell {
             (2, tr(lang, "settings.extensionsTabSkills")),
             (3, tr(lang, "settings.extensionsTabTheme")),
             (4, tr(lang, "settings.extensionsTabMarket")),
+            (5, tr(lang, "settings.extensionsTabTools")),
         ] {
             let selected = self.extensions_tab == index;
             let id = match index {
@@ -6740,6 +6747,7 @@ impl Shell {
                 2 => "skills",
                 3 => "theme",
                 4 => "market",
+                5 => "tools",
                 _ => "installed",
             };
             strip = strip.child(
@@ -7267,6 +7275,10 @@ impl Shell {
         &mut self,
         cx: &mut Context<Self>,
     ) -> (&'static str, &'static str, Vec<AnyElement>) {
+        if self.extensions_tab == 5 {
+            let (_, hint, rows) = self.section_tools(cx);
+            return ("settings.extensions", hint, rows);
+        }
         if self.extensions_tab == 1 {
             self.plugins_tab = 1;
             let (_, _, rows) = self.section_builtin_plugins(cx);
