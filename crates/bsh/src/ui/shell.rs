@@ -316,6 +316,14 @@ pub(crate) struct Shell {
     pub(crate) federation_grant: Entity<InputState>,
     /// The federation pane's expose-root field.
     pub(crate) federation_expose_root: Entity<InputState>,
+    /// The federation pane's knowledge query field.
+    pub(crate) federation_knowledge: Entity<InputState>,
+    /// The federation pane's knowledge publication payload.
+    pub(crate) federation_knowledge_payload: Entity<InputState>,
+    /// The federation pane's resource lease id field.
+    pub(crate) federation_lease_id: Entity<InputState>,
+    /// The federation pane's resource URI field.
+    pub(crate) federation_lease_uri: Entity<InputState>,
     /// The browser pane's view, rebuilt only when the browser changed.
     pub(crate) browser_pane: Option<crate::browser::PaneView>,
     /// The URL the address bar was last filled from, so a frame that did not
@@ -1337,6 +1345,28 @@ impl Shell {
                 input.set_value(expose_root_value.clone(), window, cx);
             });
         }
+        let federation_knowledge = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(crate::i18n::tr(
+                lang,
+                "right.federation.knowledgePlaceholder",
+            ))
+        });
+        let federation_knowledge_payload = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(crate::i18n::tr(
+                lang,
+                "right.federation.knowledgePayloadPlaceholder",
+            ))
+        });
+        let federation_lease_id = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(crate::i18n::tr(lang, "right.federation.leaseIdPlaceholder"))
+        });
+        let federation_lease_uri = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(crate::i18n::tr(
+                lang,
+                "right.federation.leaseUriPlaceholder",
+            ))
+        });
         let mcp_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "settings.mcpSearch"))
         });
@@ -1803,6 +1833,10 @@ impl Shell {
             federation_enroll,
             federation_grant,
             federation_expose_root,
+            federation_knowledge,
+            federation_knowledge_payload,
+            federation_lease_id,
+            federation_lease_uri,
             browser_pane: None,
             browser_shown_url: String::new(),
             browser_rev: 0,

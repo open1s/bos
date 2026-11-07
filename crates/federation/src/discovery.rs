@@ -10,6 +10,7 @@ use capability::{unix_ms, CapabilityDescriptor, CapabilityId, NodeId, Visibility
 use serde::{Deserialize, Serialize};
 
 use crate::identity::{self, NodeIdentity};
+use crate::membership::FederationId;
 
 /// How long a discovery record stays current after it is published.
 pub const DISCOVERY_TTL_MS: u64 = 300_000;
@@ -59,6 +60,15 @@ pub struct DiscoveryRecord {
     /// expiry existed decodes as 0 and is therefore already stale.
     #[serde(default)]
     pub expires_at_ms: u64,
+    /// The federation the publisher claims membership in, when configured.
+    ///
+    /// This is signed metadata, not an authorization: enrollment and grants
+    /// remain the per-peer decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub federation: Option<FederationId>,
+    /// The publisher's policy revision at publication time.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub policy_revision: u64,
     /// Public descriptors only.
     pub descriptors: Vec<CapabilityDescriptor>,
     /// Base64 Ed25519 signature over the canonical form.
@@ -80,6 +90,17 @@ impl DiscoveryRecord {
         name: Option<String>,
         descriptors: Vec<CapabilityDescriptor>,
     ) -> Self {
+        Self::publish_federated(identity, name, None, 0, descriptors)
+    }
+
+    /// Build and sign a record that names its federation and policy revision.
+    pub fn publish_federated(
+        identity: &NodeIdentity,
+        name: Option<String>,
+        federation: Option<FederationId>,
+        policy_revision: u64,
+        descriptors: Vec<CapabilityDescriptor>,
+    ) -> Self {
         let name = name
             .map(|name| name.trim().to_string())
             .filter(|name| !name.is_empty());
@@ -89,6 +110,8 @@ impl DiscoveryRecord {
             name,
             published_at_ms,
             expires_at_ms: published_at_ms.saturating_add(DISCOVERY_TTL_MS),
+            federation,
+            policy_revision,
             descriptors: descriptors
                 .into_iter()
                 .filter(|descriptor| descriptor.visibility == Visibility::Public)
@@ -157,6 +180,10 @@ impl DiscoveryRecord {
         unsigned.signature = String::new();
         serde_json::to_vec(&unsigned).expect("a discovery record serializes")
     }
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[cfg(test)]

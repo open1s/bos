@@ -19,7 +19,8 @@ use async_trait::async_trait;
 use capability::transport::{unix_ms, FederationMessage, FederationTransport};
 use capability::{
     CancelToken, CapabilityDescriptor, CapabilityError, CapabilityId, CapabilityOutput,
-    DeliveryState, InvocationContext, InvocationId, NodeId, Principal, WorkspaceRuntime,
+    DelegationHop, DeliveryState, InvocationContext, InvocationId, NodeId, Principal, TaskId,
+    TraceContext, WorkspaceRuntime,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -32,8 +33,13 @@ use crate::delegation::{
 use crate::discovery::DiscoveryRecord;
 use crate::envelope::Envelope;
 use crate::identity::NodeIdentity;
+use crate::knowledge::{
+    KnowledgeAuthorizer, KnowledgePublication, KnowledgeQuery, KnowledgeResponse, KnowledgeService,
+};
+use crate::membership::FederationId;
 use crate::peers::PeerStore;
 use crate::resource::{LeaseId, LeaseStore, ResourceStreamMessage};
+use crate::rotation::RotationRecord;
 
 /// How long a caller waits for a result when the context has no deadline.
 pub const DEFAULT_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -74,6 +80,11 @@ struct ReplayInner {
     order: std::collections::VecDeque<(NodeId, String)>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ReplayFile {
+    entries: Vec<(NodeId, String, u64)>,
+}
+
 impl ReplayCache {
     fn new() -> Self {
         Self {
@@ -82,6 +93,65 @@ impl ReplayCache {
                 order: std::collections::VecDeque::new(),
             })),
         }
+    }
+
+    fn load(path: &std::path::Path) -> std::io::Result<Self> {
+        let cache = Self::new();
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(cache),
+            Err(error) => return Err(error),
+        };
+        let file: ReplayFile = serde_json::from_str(&text)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let now = unix_ms();
+        let mut inner = cache
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (sender, id, expires_at_ms) in file.entries {
+            if expires_at_ms <= now {
+                continue;
+            }
+            inner
+                .seen
+                .insert((sender.clone(), id.clone()), expires_at_ms);
+            inner.order.push_back((sender, id));
+        }
+        while inner.seen.len() > REPLAY_CAPACITY {
+            if let Some(oldest) = inner.order.pop_front() {
+                inner.seen.remove(&oldest);
+            }
+        }
+        drop(inner);
+        Ok(cache)
+    }
+
+    fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let entries: Vec<(NodeId, String, u64)> = {
+            let inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            inner
+                .seen
+                .iter()
+                .map(|((sender, id), expiry)| (sender.clone(), id.clone(), *expiry))
+                .collect()
+        };
+        let text = serde_json::to_string_pretty(&ReplayFile { entries })
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let temp = path.with_extension("json.tmp");
+        std::fs::write(&temp, text)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600));
+        }
+        std::fs::rename(&temp, path)
     }
 
     /// Return true when no key was seen before, recording all of them.
@@ -354,11 +424,21 @@ pub struct FederationNode {
     pending: Arc<Mutex<HashMap<String, PendingReply>>>,
     delegations: Arc<RwLock<DelegationStore>>,
     leases: Arc<RwLock<LeaseStore>>,
+    /// Host-governed knowledge, when this Node offers the knowledge protocol.
+    knowledge: Option<Arc<RwLock<KnowledgeService>>>,
+    /// The host's authorization decision for knowledge queries and publications.
+    knowledge_authorizer: Option<Arc<dyn KnowledgeAuthorizer>>,
     streams: Arc<Mutex<HashMap<LeaseId, InboundStream>>>,
     sessions: Arc<Mutex<HashMap<LeaseId, Arc<ServerSession>>>>,
     source: Option<Arc<dyn ResourceSource>>,
     public_capabilities: Arc<Vec<CapabilityDescriptor>>,
     audit: Option<Arc<dyn FederationAudit>>,
+    /// The federation this Node advertises, when it has one.
+    federation: Option<FederationId>,
+    /// Where peer state is written after a rotation, when configured.
+    peer_path: Option<PathBuf>,
+    /// The policy revision attached to discovery publications.
+    policy_revision: u64,
     /// Independent admission budgets for handler classes and streams.
     admission_limits: AdmissionLimits,
     /// A per-process counter that makes every correlation unique even when two
@@ -373,6 +453,8 @@ pub struct FederationNode {
     /// Message ids and idempotency keys already accepted, with the expiry of
     /// the frame that carried them.
     replay: ReplayCache,
+    /// Where the replay cache is persisted, when it is.
+    replay_path: Option<PathBuf>,
     /// Where delegation records are persisted, when they are.
     delegation_path: Option<PathBuf>,
     /// The revision last written, so a quiet loop writes nothing.
@@ -398,16 +480,22 @@ impl FederationNode {
             pending: Arc::new(Mutex::new(HashMap::new())),
             delegations: Arc::new(RwLock::new(DelegationStore::new())),
             leases: Arc::new(RwLock::new(LeaseStore::new())),
+            knowledge: None,
+            knowledge_authorizer: None,
             streams: Arc::new(Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             source: None,
             public_capabilities: Arc::new(Vec::new()),
             audit: None,
+            federation: None,
+            peer_path: None,
+            policy_revision: 0,
             admission_limits: AdmissionLimits::default(),
             next_correlation: AtomicU64::new(0),
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             catalogue_seen: Arc::new(RwLock::new(HashMap::new())),
             replay: ReplayCache::new(),
+            replay_path: None,
             delegation_path: None,
             delegation_revision: Arc::new(AtomicU64::new(0)),
             delegation_write: Arc::new(Mutex::new(())),
@@ -515,6 +603,54 @@ impl FederationNode {
         self
     }
 
+    /// Load and persist the replay/idempotency cache across restarts.
+    ///
+    /// Expired entries are dropped at load. A write failure is logged and the
+    /// frame is still processed: replay protection weakens after a write error,
+    /// but an authenticated request is not silently dropped because the disk
+    /// failed. The file is written only for request kinds, after admission.
+    pub fn with_replay_persistence(mut self, path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        match ReplayCache::load(&path) {
+            Ok(cache) => self.replay = cache,
+            Err(error) => tracing::warn!(
+                "federation: replay store {} was not loaded: {error}",
+                path.display()
+            ),
+        }
+        self.replay_path = Some(path);
+        self
+    }
+
+    /// Advertise federation membership and the policy revision peers should see.
+    pub fn with_federation(mut self, federation: FederationId, policy_revision: u64) -> Self {
+        self.federation = Some(federation);
+        self.policy_revision = policy_revision;
+        self
+    }
+
+    /// The federation this Node advertises, if configured.
+    pub fn federation(&self) -> Option<&FederationId> {
+        self.federation.as_ref()
+    }
+
+    /// Persist a peer rotation back to the peer file.
+    pub fn with_peer_persistence(mut self, path: impl Into<PathBuf>) -> Self {
+        self.peer_path = Some(path.into());
+        self
+    }
+
+    /// Enable the knowledge protocol with a host-governed store and policy.
+    pub fn with_knowledge(
+        mut self,
+        knowledge: Arc<RwLock<KnowledgeService>>,
+        authorizer: Arc<dyn KnowledgeAuthorizer>,
+    ) -> Self {
+        self.knowledge = Some(knowledge);
+        self.knowledge_authorizer = Some(authorizer);
+        self
+    }
+
     /// Attach the byte source resource streams read from.
     pub fn with_resource_source(mut self, source: Arc<dyn ResourceSource>) -> Self {
         self.source = Some(source);
@@ -566,13 +702,19 @@ impl FederationNode {
         let pending = Arc::clone(&self.pending);
         let delegations = Arc::clone(&self.delegations);
         let leases = Arc::clone(&self.leases);
+        let knowledge = self.knowledge.clone();
+        let knowledge_authorizer = self.knowledge_authorizer.clone();
         let streams = Arc::clone(&self.streams);
         let sessions = Arc::clone(&self.sessions);
         let source = self.source.clone();
         let public_capabilities = Arc::clone(&self.public_capabilities);
+        let federation = self.federation.clone();
+        let peer_path = self.peer_path.clone();
+        let policy_revision = self.policy_revision;
         let audit = self.audit.clone();
         let in_flight = Arc::clone(&self.in_flight);
         let replay = self.replay.clone();
+        let replay_path = self.replay_path.clone();
         let admission_limits = self.admission_limits;
         let admission = Admission::new(admission_limits);
         let stream_limit = admission_limits.resource_streams.max(1);
@@ -649,6 +791,26 @@ impl FederationNode {
                         }
                         continue;
                     }
+                    if matches!(
+                        envelope.kind.as_str(),
+                        "invoke"
+                            | "delegate"
+                            | "delegation_status"
+                            | "delegation_cancel"
+                            | "discover"
+                            | "invoke_cancel"
+                            | "knowledge_query"
+                            | "knowledge_publication"
+                    ) {
+                        if let Some(path) = &replay_path {
+                            if let Err(error) = replay.save(path) {
+                                tracing::warn!(
+                                    "federation: replay cache {} was not written: {error}",
+                                    path.display()
+                                );
+                            }
+                        }
+                    }
                 }
                 let handled = matches!(
                     envelope.kind.as_str(),
@@ -658,6 +820,9 @@ impl FederationNode {
                         | "delegation_cancel"
                         | "invoke_cancel"
                         | "discover"
+                        | "knowledge_query"
+                        | "knowledge_publication"
+                        | "rotation"
                 );
                 let permit = if handled {
                     admission.try_admit(&envelope.sender, &envelope.kind)
@@ -787,6 +952,7 @@ impl FederationNode {
                         let transport = Arc::clone(&transport);
                         let peers = Arc::clone(&peers);
                         let public_capabilities = Arc::clone(&public_capabilities);
+                        let federation = federation.clone();
                         let audit = audit.clone();
                         tokio::spawn(async move {
                             let _permit = permit;
@@ -794,6 +960,64 @@ impl FederationNode {
                                 &identity,
                                 &peers,
                                 &public_capabilities,
+                                &federation,
+                                policy_revision,
+                                &audit,
+                                &envelope,
+                            )
+                            .await;
+                            let _ = transport.send(&envelope.sender, reply).await;
+                        });
+                    }
+                    "rotation" => {
+                        let identity = identity.clone();
+                        let transport = Arc::clone(&transport);
+                        let peers = Arc::clone(&peers);
+                        let peer_path = peer_path.clone();
+                        let audit = audit.clone();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            let reply =
+                                serve_rotation(&identity, &peers, &peer_path, &audit, &envelope)
+                                    .await;
+                            let _ = transport.send(&envelope.sender, reply).await;
+                        });
+                    }
+                    "knowledge_query" => {
+                        let identity = identity.clone();
+                        let transport = Arc::clone(&transport);
+                        let peers = Arc::clone(&peers);
+                        let knowledge = knowledge.clone();
+                        let authorizer = knowledge_authorizer.clone();
+                        let audit = audit.clone();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            let reply = serve_knowledge_query(
+                                &identity,
+                                &peers,
+                                &knowledge,
+                                &authorizer,
+                                &audit,
+                                &envelope,
+                            )
+                            .await;
+                            let _ = transport.send(&envelope.sender, reply).await;
+                        });
+                    }
+                    "knowledge_publication" => {
+                        let identity = identity.clone();
+                        let transport = Arc::clone(&transport);
+                        let peers = Arc::clone(&peers);
+                        let knowledge = knowledge.clone();
+                        let authorizer = knowledge_authorizer.clone();
+                        let audit = audit.clone();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            let reply = serve_knowledge_publication(
+                                &identity,
+                                &peers,
+                                &knowledge,
+                                &authorizer,
                                 &audit,
                                 &envelope,
                             )
@@ -887,6 +1111,16 @@ impl FederationNode {
             "capability": capability_text,
             "input": input,
             "deadline_ms": deadline_ms,
+            "task": context.task.as_ref().map(TaskId::as_str),
+            "trace": {
+                "trace_id": context.trace.trace_id,
+                "span_id": context.trace.span_id,
+            },
+            "delegation": context
+                .delegation
+                .iter()
+                .map(|hop| json!({ "node": hop.node, "delegation": hop.delegation }))
+                .collect::<Vec<_>>(),
         });
         let reply = match self
             .round_trip(peer, "invoke", payload, context.deadline)
@@ -928,6 +1162,67 @@ impl FederationNode {
         }
         self.audit(event);
         decoded
+    }
+
+    /// Query a peer's governed knowledge.
+    ///
+    /// The peer's authorizer decides; a refusal is a Denied, a stale query is a
+    /// Timeout, and the returned items keep their remote provenance.
+    pub async fn query_knowledge(
+        &self,
+        peer: &NodeId,
+        query: &KnowledgeQuery,
+        context: &InvocationContext,
+    ) -> Result<KnowledgeResponse, CapabilityError> {
+        query.validate().map_err(CapabilityError::from)?;
+        let payload = serde_json::to_value(query).map_err(|error| CapabilityError::Invalid {
+            message: error.to_string(),
+        })?;
+        let reply = self
+            .round_trip(peer, "knowledge_query", payload, context.deadline)
+            .await?;
+        decode_knowledge_response(&reply)
+    }
+
+    /// Publish knowledge to a peer that authorizes this publisher.
+    pub async fn publish_knowledge(
+        &self,
+        peer: &NodeId,
+        publication: &KnowledgePublication,
+        context: &InvocationContext,
+    ) -> Result<usize, CapabilityError> {
+        publication.validate().map_err(CapabilityError::from)?;
+        let payload =
+            serde_json::to_value(publication).map_err(|error| CapabilityError::Invalid {
+                message: error.to_string(),
+            })?;
+        let reply = self
+            .round_trip(peer, "knowledge_publication", payload, context.deadline)
+            .await?;
+        decode_knowledge_accepted(&reply)
+    }
+
+    /// Send a signed key-rotation record to a peer.
+    ///
+    /// The envelope is signed by the successor key; the record itself is signed
+    /// by the old key, which is what the peer verifies before moving grants.
+    pub async fn publish_rotation(
+        &self,
+        peer: &NodeId,
+        record: &RotationRecord,
+        context: &InvocationContext,
+    ) -> Result<(), CapabilityError> {
+        let payload = serde_json::to_value(record).map_err(|error| CapabilityError::Invalid {
+            message: error.to_string(),
+        })?;
+        let reply = self
+            .round_trip(peer, "rotation", payload, context.deadline)
+            .await?;
+        if reply.get("ok").and_then(Value::as_bool) == Some(true) {
+            Ok(())
+        } else {
+            Err(wire_error(&reply, None))
+        }
     }
 
     /// Submit a delegation to a peer and return the record it created.
@@ -1374,6 +1669,39 @@ async fn serve(
         },
         runtime.workspace().clone(),
     );
+    if let Some(task) = payload.get("task").and_then(Value::as_str) {
+        context.task = Some(TaskId::new(task));
+    }
+    if let Some(trace) = payload.get("trace") {
+        let trace_id = trace
+            .get("trace_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let span_id = trace
+            .get("span_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !trace_id.is_empty() || !span_id.is_empty() {
+            context.trace = TraceContext::new(trace_id, span_id);
+        }
+    }
+    if let Some(hops) = payload.get("delegation").and_then(Value::as_array) {
+        for hop in hops {
+            let Some(node) = hop
+                .get("node")
+                .and_then(Value::as_str)
+                .and_then(|value| NodeId::new(value).ok())
+            else {
+                continue;
+            };
+            let delegation = hop
+                .get("delegation")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            context.delegation.push(DelegationHop { node, delegation });
+        }
+    }
     if let Some(deadline) = payload.get("deadline_ms").and_then(Value::as_u64) {
         let now = unix_ms();
         if deadline <= now {
@@ -1655,6 +1983,323 @@ async fn serve_invoke_cancel_inner(
             envelope,
             json!({ "ok": true, "cancelled": false }),
         ),
+    }
+}
+
+fn decode_knowledge_response(payload: &Value) -> Result<KnowledgeResponse, CapabilityError> {
+    if payload.get("ok").and_then(Value::as_bool) == Some(true) {
+        let response = payload.get("response").cloned().unwrap_or(Value::Null);
+        return serde_json::from_value(response).map_err(|error| CapabilityError::Invalid {
+            message: format!("the peer returned an unreadable knowledge response: {error}"),
+        });
+    }
+    Err(wire_error(payload, None))
+}
+
+fn decode_knowledge_accepted(payload: &Value) -> Result<usize, CapabilityError> {
+    if payload.get("ok").and_then(Value::as_bool) == Some(true) {
+        return payload
+            .get("accepted")
+            .and_then(Value::as_u64)
+            .map(|count| count as usize)
+            .ok_or_else(|| CapabilityError::Invalid {
+                message: "the peer did not report an accepted count".to_string(),
+            });
+    }
+    Err(wire_error(payload, None))
+}
+
+async fn serve_rotation(
+    identity: &NodeIdentity,
+    peers: &Arc<RwLock<PeerStore>>,
+    peer_path: &Option<PathBuf>,
+    audit: &Option<Arc<dyn FederationAudit>>,
+    envelope: &Envelope,
+) -> Vec<u8> {
+    let started = Instant::now();
+    let record: RotationRecord = match serde_json::from_value(envelope.payload.clone()) {
+        Ok(record) => record,
+        Err(error) => {
+            let error = CapabilityError::Invalid {
+                message: format!("unreadable rotation record: {error}"),
+            };
+            return seal_reply(identity, envelope, error_payload(error));
+        }
+    };
+    if !record.verify() {
+        let error = CapabilityError::Denied {
+            reason: "the rotation record was not signed by the old key".to_string(),
+            policy: None,
+        };
+        record_federation_event(
+            audit,
+            envelope,
+            &record,
+            "denied",
+            Some(error.to_string()),
+            started,
+        );
+        return seal_reply(identity, envelope, error_payload(error));
+    }
+    let outcome = {
+        let mut store = peers
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        store.rotate(&record, unix_ms()).map(|()| {
+            if let Some(path) = peer_path {
+                if let Err(error) = store.save(path) {
+                    tracing::warn!(
+                        "federation: rotated peer store {} was not written: {error}",
+                        path.display()
+                    );
+                }
+            }
+        })
+    };
+    match outcome {
+        Ok(()) => {
+            record_federation_event(audit, envelope, &record, "ok", None, started);
+            seal_reply(identity, envelope, json!({ "ok": true }))
+        }
+        Err(error) => {
+            let reason = error.to_string();
+            record_federation_event(
+                audit,
+                envelope,
+                &record,
+                "denied",
+                Some(reason.clone()),
+                started,
+            );
+            seal_reply(
+                identity,
+                envelope,
+                error_payload(CapabilityError::Denied {
+                    reason,
+                    policy: None,
+                }),
+            )
+        }
+    }
+}
+
+fn record_federation_event(
+    audit: &Option<Arc<dyn FederationAudit>>,
+    envelope: &Envelope,
+    rotation: &RotationRecord,
+    outcome: &str,
+    reason: Option<String>,
+    started: Instant,
+) {
+    let mut event = FederationEvent::new(
+        Direction::Inbound,
+        envelope.sender.as_str(),
+        "rotation",
+        Some(&rotation.old.to_string()),
+        outcome,
+    )
+    .with_elapsed_ms(started.elapsed().as_millis() as u64);
+    if let Some(reason) = reason {
+        event = event.with_reason(reason);
+    }
+    record(audit, event);
+}
+
+async fn serve_knowledge_query(
+    identity: &NodeIdentity,
+    peers: &Arc<RwLock<PeerStore>>,
+    knowledge: &Option<Arc<RwLock<KnowledgeService>>>,
+    authorizer: &Option<Arc<dyn KnowledgeAuthorizer>>,
+    audit: &Option<Arc<dyn FederationAudit>>,
+    envelope: &Envelope,
+) -> Vec<u8> {
+    let started = Instant::now();
+    if let Err(error) = authorize_sender(peers, &envelope.sender, &[]) {
+        record(
+            audit,
+            FederationEvent::new(
+                Direction::Inbound,
+                envelope.sender.as_str(),
+                "knowledge_query",
+                None,
+                error_kind(&error),
+            )
+            .with_reason(error.to_string()),
+        );
+        return seal_reply(identity, envelope, error_payload(error));
+    }
+    let (Some(service), Some(policy)) = (knowledge, authorizer) else {
+        let error = CapabilityError::Unavailable {
+            reason: "this Node does not offer knowledge federation".to_string(),
+        };
+        record(
+            audit,
+            FederationEvent::new(
+                Direction::Inbound,
+                envelope.sender.as_str(),
+                "knowledge_query",
+                None,
+                error_kind(&error),
+            ),
+        );
+        return seal_reply(identity, envelope, error_payload(error));
+    };
+    let query: KnowledgeQuery = match serde_json::from_value(envelope.payload.clone()) {
+        Ok(query) => query,
+        Err(error) => {
+            let error = CapabilityError::Invalid {
+                message: format!("unreadable knowledge query: {error}"),
+            };
+            record(
+                audit,
+                FederationEvent::new(
+                    Direction::Inbound,
+                    envelope.sender.as_str(),
+                    "knowledge_query",
+                    None,
+                    error_kind(&error),
+                ),
+            );
+            return seal_reply(identity, envelope, error_payload(error));
+        }
+    };
+    let mut rows = Vec::new();
+    let result = service
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .query(
+            &identity.node_id(),
+            &envelope.sender,
+            &query,
+            unix_ms(),
+            |peer, class, purpose, scope| policy.may_query(peer, class, purpose, scope),
+            &mut rows,
+        );
+    let event = match &result {
+        Ok(_) => FederationEvent::new(
+            Direction::Inbound,
+            envelope.sender.as_str(),
+            "knowledge_query",
+            Some(&query.query_id),
+            "ok",
+        )
+        .with_elapsed_ms(started.elapsed().as_millis() as u64),
+        Err(error) => {
+            let wire = CapabilityError::from(error.clone());
+            FederationEvent::new(
+                Direction::Inbound,
+                envelope.sender.as_str(),
+                "knowledge_query",
+                Some(&query.query_id),
+                error_kind(&wire),
+            )
+            .with_reason(error.to_string())
+        }
+    };
+    record(audit, event);
+    match result {
+        Ok(response) => seal_reply(
+            identity,
+            envelope,
+            json!({ "ok": true, "response": response }),
+        ),
+        Err(error) => seal_reply(identity, envelope, error_payload(error.into())),
+    }
+}
+
+async fn serve_knowledge_publication(
+    identity: &NodeIdentity,
+    peers: &Arc<RwLock<PeerStore>>,
+    knowledge: &Option<Arc<RwLock<KnowledgeService>>>,
+    authorizer: &Option<Arc<dyn KnowledgeAuthorizer>>,
+    audit: &Option<Arc<dyn FederationAudit>>,
+    envelope: &Envelope,
+) -> Vec<u8> {
+    let started = Instant::now();
+    if let Err(error) = authorize_sender(peers, &envelope.sender, &[]) {
+        record(
+            audit,
+            FederationEvent::new(
+                Direction::Inbound,
+                envelope.sender.as_str(),
+                "knowledge_publication",
+                None,
+                error_kind(&error),
+            )
+            .with_reason(error.to_string()),
+        );
+        return seal_reply(identity, envelope, error_payload(error));
+    }
+    let (Some(service), Some(policy)) = (knowledge, authorizer) else {
+        let error = CapabilityError::Unavailable {
+            reason: "this Node does not accept knowledge publications".to_string(),
+        };
+        return seal_reply(identity, envelope, error_payload(error));
+    };
+    if !policy.may_publish(&envelope.sender) {
+        let error = CapabilityError::Denied {
+            reason: format!(
+                "peer {} may not publish knowledge to this Node",
+                envelope.sender
+            ),
+            policy: None,
+        };
+        record(
+            audit,
+            FederationEvent::new(
+                Direction::Inbound,
+                envelope.sender.as_str(),
+                "knowledge_publication",
+                None,
+                error_kind(&error),
+            )
+            .with_reason(error.to_string()),
+        );
+        return seal_reply(identity, envelope, error_payload(error));
+    }
+    let publication: KnowledgePublication = match serde_json::from_value(envelope.payload.clone()) {
+        Ok(publication) => publication,
+        Err(error) => {
+            let error = CapabilityError::Invalid {
+                message: format!("unreadable knowledge publication: {error}"),
+            };
+            return seal_reply(identity, envelope, error_payload(error));
+        }
+    };
+    let result = service
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .publish(&envelope.sender, &publication, unix_ms());
+    let event = match &result {
+        Ok(count) => FederationEvent::new(
+            Direction::Inbound,
+            envelope.sender.as_str(),
+            "knowledge_publication",
+            None,
+            "ok",
+        )
+        .with_elapsed_ms(started.elapsed().as_millis() as u64)
+        .with_bytes(*count as u64),
+        Err(error) => {
+            let wire = CapabilityError::from(error.clone());
+            FederationEvent::new(
+                Direction::Inbound,
+                envelope.sender.as_str(),
+                "knowledge_publication",
+                None,
+                error_kind(&wire),
+            )
+            .with_reason(error.to_string())
+        }
+    };
+    record(audit, event);
+    match result {
+        Ok(accepted) => seal_reply(
+            identity,
+            envelope,
+            json!({ "ok": true, "accepted": accepted }),
+        ),
+        Err(error) => seal_reply(identity, envelope, error_payload(error.into())),
     }
 }
 
@@ -2672,9 +3317,6 @@ async fn produce(
         let limit = remaining
             .map_or(credit, |remaining| remaining.min(credit))
             .min(STREAM_CHUNK as u64);
-        eprintln!(
-            "produce offset={offset} credit={credit} limit={limit} stream_chunk={STREAM_CHUNK}"
-        );
         match source.read(&uri, offset, limit as usize).await {
             Ok(Some(bytes)) if bytes.is_empty() => {
                 send_stream(
@@ -2797,11 +3439,21 @@ async fn serve_discover(
     identity: &NodeIdentity,
     peers: &Arc<RwLock<PeerStore>>,
     capabilities: &[CapabilityDescriptor],
+    federation: &Option<FederationId>,
+    policy_revision: u64,
     audit: &Option<Arc<dyn FederationAudit>>,
     envelope: &Envelope,
 ) -> Vec<u8> {
     let started = Instant::now();
-    let reply = serve_discover_inner(identity, peers, capabilities, envelope).await;
+    let reply = serve_discover_inner(
+        identity,
+        peers,
+        capabilities,
+        federation,
+        policy_revision,
+        envelope,
+    )
+    .await;
     record_reply(audit, envelope, "discover", started, &reply);
     reply
 }
@@ -2810,6 +3462,8 @@ async fn serve_discover_inner(
     identity: &NodeIdentity,
     peers: &Arc<RwLock<PeerStore>>,
     capabilities: &[CapabilityDescriptor],
+    federation: &Option<FederationId>,
+    policy_revision: u64,
     envelope: &Envelope,
 ) -> Vec<u8> {
     let trusted = peers
@@ -2826,7 +3480,13 @@ async fn serve_discover_inner(
             }),
         );
     }
-    let record = DiscoveryRecord::publish(identity, capabilities.to_vec());
+    let record = DiscoveryRecord::publish_federated(
+        identity,
+        None,
+        federation.clone(),
+        policy_revision,
+        capabilities.to_vec(),
+    );
     seal_reply(identity, envelope, json!({ "ok": true, "record": record }))
 }
 
@@ -2861,6 +3521,32 @@ mod admission_tests {
             ReplayCache::new().admit(&key, 10_000, 0),
             "the replay cache is in memory, so a restart forgets it"
         );
+    }
+
+    #[test]
+    fn replay_cache_survives_a_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "bos-replay-{}-{}.json",
+            std::process::id(),
+            capability::unix_ms()
+        ));
+        let cache = ReplayCache::new();
+        let sender = node(21);
+        let now = capability::unix_ms();
+        assert!(cache.admit(
+            &[(sender.clone(), "m-restart".to_string())],
+            now + 60_000,
+            now
+        ));
+        cache.save(&path).expect("saved");
+        drop(cache);
+
+        let loaded = ReplayCache::load(&path).expect("loaded");
+        assert!(
+            !loaded.admit(&[(sender, "m-restart".to_string())], now + 60_000, now),
+            "a duplicate is refused across a restart"
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

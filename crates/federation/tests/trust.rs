@@ -110,6 +110,7 @@ fn an_expired_enrollment_is_denied_even_with_a_grant() {
         grants: store.record(&peer).expect("a record").grants.clone(),
         enrolled_at_ms: now,
         expires_at_ms: Some(now + 1),
+        federation: None,
         note: None,
     });
 

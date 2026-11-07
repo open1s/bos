@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 
 use agent::capability::{unix_ms, CapabilityId, NodeId};
 use federation::identity::is_valid_node_id;
-use federation::{NodeIdentity, PeerStore, TrustState};
+use federation::{
+    DelegationState, DelegationStore, NodeIdentity, PeerStore, RotationRecord, TrustState,
+};
 
 /// The directory a federation node keeps its files in.
 pub(crate) fn dir() -> PathBuf {
@@ -46,6 +48,9 @@ bsh federation <command>
   revoke <node-id>                        revoke a peer and its grants
   grant <node-id> <capability-id>         let a peer invoke one capability
   revoke-grant <node-id> <capability-id>  withdraw one grant
+  rotate [reason]                         replace this node's key and write a
+                                          signed rotation record for peers
+  accept-rotation <record.json>           apply a peer's signed key rotation
 
 Identity and peers live in bsh's own directory; a peer id is a base64 Ed25519
 public key, which is what a peer prints as its node id.";
@@ -105,6 +110,38 @@ pub(crate) fn command(
                             &root.join("audit.jsonl"),
                             std::time::SystemTime::now(),
                         );
+                        let delegation_path = root.join("delegations.json");
+                        if let Ok(delegations) = DelegationStore::load(&delegation_path) {
+                            let mut records: Vec<_> = delegations.iter().collect();
+                            records.sort_by(|left, right| {
+                                right.updated_at_ms.cmp(&left.updated_at_ms)
+                            });
+                            let active = records
+                                .iter()
+                                .filter(|record| record.state.is_active())
+                                .count();
+                            let _ =
+                                writeln!(out, "delegations {} active {}", records.len(), active);
+                            for record in records.into_iter().take(5) {
+                                let state = match record.state {
+                                    DelegationState::Created => "created",
+                                    DelegationState::Accepted => "accepted",
+                                    DelegationState::Running => "running",
+                                    DelegationState::Succeeded => "succeeded",
+                                    DelegationState::Failed => "failed",
+                                    DelegationState::Cancelled => "cancelled",
+                                    DelegationState::Rejected => "rejected",
+                                };
+                                let _ = writeln!(
+                                    out,
+                                    "  {} {} {} {}",
+                                    record.request.id,
+                                    state,
+                                    record.request.target,
+                                    record.request.objective
+                                );
+                            }
+                        }
                         let recent = crate::federation_audit::load(&root.join("audit.jsonl"), 5);
                         if !recent.is_empty() {
                             let _ = writeln!(out, "recent {}", recent.len());
@@ -128,6 +165,80 @@ pub(crate) fn command(
             }
             Err(error) => fail(out, &error.to_string()),
         },
+        Some("rotate") => {
+            let _lock = match crate::federation_lock::DataDirLock::acquire(root) {
+                Ok(lock) => lock,
+                Err(error) => return fail(out, &error),
+            };
+            let old = match NodeIdentity::load_or_create(&identity_path) {
+                Ok(identity) => identity,
+                Err(error) => return fail(out, &error.to_string()),
+            };
+            let new = match NodeIdentity::generate() {
+                Ok(identity) => identity,
+                Err(error) => return fail(out, &error.to_string()),
+            };
+            let reason = args
+                .iter()
+                .skip(1)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .trim()
+                .to_string();
+            let record = RotationRecord::sign(
+                &old,
+                &new,
+                unix_ms(),
+                (!reason.is_empty()).then_some(reason),
+            );
+            let record_path = root.join("rotation.json");
+            if let Err(error) = std::fs::write(&record_path, record.to_json().unwrap_or_default()) {
+                return fail(out, &error.to_string());
+            }
+            if let Err(error) = new.save(&identity_path) {
+                return fail(out, &error.to_string());
+            }
+            let _ = writeln!(out, "old {}", old.node_id());
+            let _ = writeln!(out, "new {}", new.node_id());
+            let _ = writeln!(out, "rotation {}", record_path.display());
+            let _ = writeln!(
+                out,
+                "give the rotation record to every peer and run: bsh federation accept-rotation <file>"
+            );
+            0
+        }
+        Some("accept-rotation") => {
+            let _lock = match crate::federation_lock::DataDirLock::acquire(root) {
+                Ok(lock) => lock,
+                Err(error) => return fail(out, &error),
+            };
+            let Some(path) = args.get(1) else {
+                return fail(out, "accept-rotation needs a record file");
+            };
+            let text = match std::fs::read_to_string(path) {
+                Ok(text) => text,
+                Err(error) => return fail(out, &error.to_string()),
+            };
+            let record = match RotationRecord::from_json(&text) {
+                Ok(record) => record,
+                Err(error) => return fail(out, &error.to_string()),
+            };
+            let mut store = match PeerStore::load(&peers_path) {
+                Ok(store) => store,
+                Err(error) => return fail(out, &error.to_string()),
+            };
+            match store.rotate(&record, unix_ms()) {
+                Ok(()) => match store.save(&peers_path) {
+                    Ok(()) => {
+                        let _ = writeln!(out, "rotated {} -> {}", record.old, record.new);
+                        0
+                    }
+                    Err(error) => fail(out, &error.to_string()),
+                },
+                Err(error) => fail(out, &error.to_string()),
+            }
+        }
         Some("enroll") => {
             // Mutations take the data directory's writer lock: a running app
             // owns it, and a CLI write behind its back would be lost.
@@ -299,6 +410,48 @@ mod tests {
 
     fn peer() -> String {
         NodeIdentity::from_seed([7u8; 32]).node_id().to_string()
+    }
+
+    #[test]
+    fn rotate_replaces_the_key_and_a_peer_can_accept_the_record() {
+        let root = scratch("rotate");
+        let old = NodeIdentity::load_or_create(&root.join("node.key")).expect("old identity");
+        let old_id = old.node_id();
+        let (code, output) = run(&root, &["rotate", "disk"]);
+        assert_eq!(code, 0, "{output}");
+        let new = NodeIdentity::load_or_create(&root.join("node.key")).expect("new identity");
+        assert_ne!(new.node_id(), old_id);
+        let record_path = root.join("rotation.json");
+        let record = federation::RotationRecord::from_json(
+            &std::fs::read_to_string(&record_path).expect("record"),
+        )
+        .expect("parse");
+        assert_eq!(record.old, old_id);
+        assert_eq!(record.new, new.node_id());
+        assert!(record.verify());
+
+        let peer_root = scratch("rotate-peer");
+        let mut store = federation::PeerStore::new();
+        let capability: CapabilityId = "builtin/read_file".parse().expect("capability");
+        store.enroll(old_id.clone(), unix_ms(), None);
+        store
+            .grant(&old_id, capability.clone(), unix_ms(), None)
+            .expect("grant");
+        store.save(&peer_root.join("peers.json")).expect("peers");
+        let (code, output) = run(
+            &peer_root,
+            &["accept-rotation", record_path.to_str().expect("path")],
+        );
+        assert_eq!(code, 0, "{output}");
+        let store = federation::PeerStore::load(&peer_root.join("peers.json")).expect("load");
+        assert!(store.is_trusted(&new.node_id(), unix_ms()));
+        store
+            .authorize(&new.node_id(), &capability, unix_ms())
+            .expect("grant moved");
+        assert!(!store.is_trusted(&old_id, unix_ms()));
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&peer_root);
     }
 
     #[test]

@@ -47,6 +47,39 @@ pub struct NodeIdentity {
 }
 
 impl NodeIdentity {
+    /// Generate a fresh identity from the operating system's entropy.
+    pub fn generate() -> Result<Self, IdentityError> {
+        Ok(Self::from_seed(random_seed()?))
+    }
+
+    /// Write this identity's seed as base64, private to the account.
+    ///
+    /// The file is the identity; a later load_or_create reads exactly this.
+    pub fn save(&self, path: &std::path::Path) -> Result<(), IdentityError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| IdentityError::Io {
+                path: parent.display().to_string(),
+                source,
+            })?;
+        }
+        let temp = path.with_extension("key.tmp");
+        std::fs::write(&temp, STANDARD.encode(self.signing.to_bytes())).map_err(|source| {
+            IdentityError::Io {
+                path: temp.display().to_string(),
+                source,
+            }
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600));
+        }
+        std::fs::rename(&temp, path).map_err(|source| IdentityError::Io {
+            path: path.display().to_string(),
+            source,
+        })
+    }
+
     /// Build an identity from a 32-byte seed.
     pub fn from_seed(seed: [u8; 32]) -> Self {
         Self {

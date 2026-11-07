@@ -403,6 +403,12 @@ pub enum KnowledgeError {
         /// The item id.
         id: String,
     },
+    /// The item was revoked and cannot be republished.
+    #[error("knowledge {id} was revoked")]
+    Revoked {
+        /// The item id.
+        id: String,
+    },
     /// Only the publisher can revoke an item.
     #[error("peer {peer} cannot revoke knowledge {id}")]
     RevokeDenied {
@@ -417,6 +423,61 @@ pub enum KnowledgeError {
         /// The item.
         id: String,
     },
+}
+
+/// The host decision for one knowledge query or publication.
+///
+/// The default is deny: a Node without an authorizer does not answer or accept
+/// knowledge messages. The callback sees the authenticated peer, requested
+/// class, purpose, and scope, so a grant revocation takes effect on the next
+/// query.
+pub trait KnowledgeAuthorizer: Send + Sync {
+    /// Whether this peer may run this query.
+    fn may_query(
+        &self,
+        peer: &NodeId,
+        class: KnowledgeClass,
+        purpose: KnowledgePurpose,
+        scope: Option<&WorkspaceId>,
+    ) -> bool;
+
+    /// Whether this peer may publish knowledge here.
+    fn may_publish(&self, peer: &NodeId) -> bool;
+}
+
+/// Map a knowledge failure onto the wire capability taxonomy.
+impl From<KnowledgeError> for capability::CapabilityError {
+    fn from(error: KnowledgeError) -> Self {
+        use capability::CapabilityError;
+        match error {
+            KnowledgeError::Schema { .. } | KnowledgeError::Invalid { .. } => {
+                CapabilityError::Invalid {
+                    message: error.to_string(),
+                }
+            }
+            KnowledgeError::Unauthorized { .. } | KnowledgeError::RevokeDenied { .. } => {
+                CapabilityError::Denied {
+                    reason: error.to_string(),
+                    policy: None,
+                }
+            }
+            KnowledgeError::Stale => CapabilityError::Timeout {
+                elapsed_ms: 0,
+                partial: None,
+            },
+            KnowledgeError::BadProvenance { .. } => CapabilityError::Invalid {
+                message: error.to_string(),
+            },
+            KnowledgeError::Duplicate { .. } | KnowledgeError::Revoked { .. } => {
+                CapabilityError::Duplicate {
+                    message: error.to_string(),
+                }
+            }
+            KnowledgeError::TooLarge { .. } => CapabilityError::Invalid {
+                message: error.to_string(),
+            },
+        }
+    }
 }
 
 /// The local authoritative knowledge store.
@@ -459,6 +520,11 @@ impl KnowledgeService {
             if !item.fresh(now_ms) {
                 return Err(KnowledgeError::Stale);
             }
+            if self.revoked.contains(&item.id) {
+                return Err(KnowledgeError::Revoked {
+                    id: item.id.clone(),
+                });
+            }
             if self.publisher.contains_key(&item.id) {
                 return Err(KnowledgeError::Duplicate {
                     id: item.id.clone(),
@@ -487,6 +553,11 @@ impl KnowledgeService {
         self.publisher.remove(id);
         self.revoked.insert(id.to_string());
         Ok(true)
+    }
+
+    /// One stored item, when it is still live.
+    pub fn get(&self, id: &str) -> Option<&KnowledgeItem> {
+        self.items.get(id)
     }
 
     /// Whether an item id was revoked, so a replayed publication cannot revive it.

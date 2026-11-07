@@ -37,10 +37,10 @@ The most important distinction is between *resolving a list of capabilities* and
 | Full Workspace lifecycle and isolation | Gap | Current WorkspaceRuntime is a dispatch map, not a transactional lifecycle/resource/security manager |
 | Federation identity and trust | Implemented foundation | Node identity, explicit peer enrollment, grants and revocation exist |
 | Remote capability invocation | Implemented foundation | Signed transport messages, Remote provider and dual authorization exist |
-| Durable task federation | Gap | Delegation records are in-memory; restart recovery is not implemented |
+| Durable task federation | Implemented for records | Delegations and leases persist, recover explicitly, and have restart tests; task-graph orchestration remains GAP-FED-005 |
 | Agent/task collaboration | Partial | Bounded delegation primitive exists; durable orchestration, scheduling and collaboration graphs are not evidenced |
 | Resource federation | Implemented foundation | Lease and chunk-stream primitives exist; production recovery/retention semantics remain incomplete |
-| Knowledge federation | Not implemented as a first-class subsystem | No dedicated query/provenance/data-minimization contract is present in the audited federation module set |
+| Knowledge federation | Implemented (opt-in) | Signed query/publication kinds, provenance, minimization, revocation, and wire tests; BSH UI remains owed |
 
 ---
 
@@ -261,7 +261,7 @@ There is also a real loopback Zenoh transport test in `crates/federation/tests/z
 
 ## 4. P0/P1 — Federation gaps
 
-### GAP-FED-001 — Delegation and lease state are process-local
+### GAP-FED-001 — Durable delegation and lease state
 
 **Evidence**
 - `FederationNode` initializes `DelegationStore` and `LeaseStore` behind in-memory locks in `crates/federation/src/service.rs`.
@@ -281,15 +281,21 @@ There is also a real loopback Zenoh transport test in `crates/federation/tests/z
 4. On restart, recover active tasks as recoverable/unknown and reconcile with providers; do not blindly replay side effects.
 5. Persist lease expiry and ensure expired leases cannot resume.
 
-**Status: delegations persisted; leases deliberately not.** `DelegationStore` is
-now serializable and carries a revision; `FederationNode::with_delegation_persistence`
-loads `delegations.json` at start, and the handler task writes it atomically
-(0600, one writer) after each inbound change. A restart test proves an accepted
-delegation still answers status. Leases are live stream state: a restart ends the
-streams, so persisting a lease would name a stream that no longer exists; the
-guide says the peer re-opens instead. Still owed: a schema version, idempotency
-records, and an explicit recovery policy for a record left `running` at crash
-(unreachable today because the bsh node has no executor).
+**Status: implemented for records and leases, with explicit recovery.** `DelegationStore`
+and `LeaseStore` are serializable; `FederationNode::with_delegation_persistence` and
+`with_lease_persistence` load them at start, and mutations are written atomically
+(0600, one writer) before success is reported. Delegation recovery marks
+Created/Accepted/Running records as Failed with an indeterminate-outcome reason
+rather than resetting them; terminal records survive. Lease recovery drops expired
+records, revocation rewrites the file, and grant/revoke/charge fail closed on a
+write error. Restart, expiry, revocation and write-failure tests pin the behavior.
+The replay/idempotency cache is also persisted when a path is configured
+(`federation/replay.json`): unexpired entries load at startup and request
+admission writes the cache; a write failure is logged and the request is still
+processed, so replay protection degrades visibly instead of silently dropping
+authenticated work. Still owed: a schema version for the replay file and lease
+renewal, which the current stream model does not need because a restart ends its
+streams.
 
 **Acceptance**
 - Restart tests recover terminal state and classify interrupted in-flight work.
@@ -342,32 +348,53 @@ the receiver grants credit, and the producer sends within it.
 - Add protocol compatibility negotiation and endpoint rotation/revocation behavior.
 - Add deployment tests for authenticated peers, untrusted publishers, network partitions and reconnects.
 
+**Status: mTLS verified across processes.** Federation settings expose TLS
+CA/certificate/key, client certificate requirement, endpoint and listen
+configuration, and verify-name; the Zenoh adapter validates them and a TLS
+listener without usable material fails rather than opening plaintext.
+`tests/tls_transport.rs` generates a CA, server and client certificate, opens
+two real Zenoh sessions over mutual TLS with hostname verification, and sends a
+sealed frame. A second test spawns the test executable as a separate OS process,
+runs the TLS listener there, and proves the same frame crosses the process
+boundary. A third test presents a client certificate signed by another CA and
+proves the listener accepts no frame from it. A fourth drops the TLS listener,
+reopens it on the same port, and proves the existing connector reconnects and
+delivers another frame. TLS deployments disable Zenoh scouting, because scouting
+otherwise opens a parallel plaintext link that bypasses the configured TLS
+endpoints. Still owed: replacing a certificate without dropping the session.
+
 **Acceptance**
 - Production profile refuses insecure configuration unless explicitly enabled for development.
 - Key rotation and peer revocation take effect without relying on stale discovery.
 - CI or release evidence covers the supported OS/network matrix.
 
-### GAP-FED-004 — Knowledge Federation is a product goal without a first-class contract
+**Key rotation is now operational.** `federation::RotationRecord` is signed by
+the old Node key, names the successor, and is verified before `PeerStore::rotate`
+moves the old grants to the new identity and revokes the old one. `bsh federation
+rotate [reason]` generates the successor, writes `rotation.json`, and replaces the
+key under the data-directory lock; `bsh federation accept-rotation <file>` applies
+the signed record on a peer. Tests cover the library primitive, forged/unenrolled
+records, the two-root CLI flow, and a real wire delivery that applies the record
+on the peer. BSH also delivers `rotation.json` to every enrolled peer on the
+next launch, idempotently, so an offline peer catches up later.
 
-**Evidence**
-- The audited `crates/federation/src` module set covers audit, delegation, discovery, envelope, identity, memory transport, peers, provider, resource, service and Zenoh.
-- No dedicated knowledge-query protocol/provider, provenance contract, data-minimization policy or retention contract is present.
-- RFC status §30.1 explicitly marks knowledge federation as not implemented.
+### GAP-FED-004 — Knowledge Federation contract and provenance
 
-**Impact**
-- A remote capability can technically be used to implement a query, but that does not provide the semantics needed for governed knowledge access.
-- Search, retrieval, citation, source permissions and data egress controls would otherwise be improvised in individual providers.
+**Status: implemented as an opt-in protocol.** `federation::knowledge` defines
+versioned query/publication/response contracts, a hash-bearing provenance record,
+classification/purpose/scope authorization through a host `KnowledgeAuthorizer`,
+retention/expiry, publisher-scoped revocation, bounded results and audit records.
+The signed envelope kinds `knowledge_query` and `knowledge_publication` are routed
+by `FederationNode`; a node without a service and authorizer refuses explicitly,
+and a denied authorizer fails closed. The wire tests cover query, publication,
+revocation, authorization and stale-query refusal. Results are always marked
+`KnowledgeOrigin::Remote`; they are never merged into local memory.
 
-**Required change**
-- Define Knowledge Query as a typed capability contract, not an implicit generic tool.
-- Include query scope, source allowlist, principal, purpose, result limits, provenance/citations, freshness, redaction and retention metadata.
-- Enforce source-side authorization at the provider Node.
-- Return provenance references and bounded excerpts rather than bulk source replication by default.
-
-**Acceptance**
-- Tests prove source ACLs are enforced on the provider node.
-- Results retain source provenance and policy decisions.
-- Query results cannot be used as implicit permission to access or export source content.
+**Still owed**
+- A BSH UI/CLI surface for knowledge queries and publications.
+- A concrete per-source allowlist beyond the host authorization callback.
+- Bulk-source replication remains deliberately unsupported: queries return
+  bounded items, not a replicated index.
 
 ### GAP-FED-005 — Federation delegation is not yet a durable collaboration orchestrator
 
@@ -379,6 +406,22 @@ the receiver grants credit, and the producer sends within it.
 **Impact**
 - Current delegation is a useful primitive, but it is not yet a general multi-Agent collaboration runtime.
 - Parallel/sequential execution, independent verification and long-running recovery remain higher-level orchestration work.
+
+**Status: implemented foundation.** `federation::collaboration` adds a
+versioned, durable `TaskGraph` with explicit dependencies, cycle and unknown-edge
+validation, deterministic topological/ready order, bounded parallel execution
+through `TaskExecutor`, failure containment (only dependents are cancelled), and
+restart recovery that marks an interrupted Running task Failed with an
+indeterminate reason. The graph persists atomically (0600) and every runner
+transition is written. Tests cover dependency-first order, concurrency bounds,
+partial failure, persistence/recovery, cycles, and deterministic ready order.
+Tasks carry max attempts, attempts, an acceptance criterion, artifact
+references, and a compensation instruction. A retryable failure returns the task
+to Pending until the ceiling; a final failure runs the executor's compensation
+hook and records whether it succeeded. The delegation-backed DelegationExecutor maps a task to a Federation delegation,
+polls its authoritative status, and composes with the retry/compensation hooks.
+Still owed: richer artifact retention policy and automatic distribution of
+rotation records.
 
 **Required change**
 - Keep delegation as the primitive.

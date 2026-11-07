@@ -24,3 +24,4 @@ tracing.workspace = true
 
 [dev-dependencies]
 semver.workspace = true
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }

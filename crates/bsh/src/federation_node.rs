@@ -23,7 +23,7 @@ use agent::tools::ToolRegistry;
 use bus::{Bus, BusConfig};
 use federation::{
     DiscoveryRecord, Envelope, FederationMessage, FederationNode, NodeIdentity, PeerStore,
-    RemoteCapabilityProvider, ZenohTransport,
+    RemoteCapabilityProvider, RotationRecord, ZenohTransport,
 };
 use semver::{Version, VersionReq};
 
@@ -61,6 +61,10 @@ pub(crate) struct FederationRuntime {
     advertise: Vec<agent::capability::CapabilityDescriptor>,
     /// The name this node announces; an edit takes effect on the next frame.
     node_name: Arc<RwLock<Option<String>>>,
+    /// The federation this runtime advertises, when configured.
+    federation: Option<federation::FederationId>,
+    /// The policy revision announced with discovery records.
+    policy_revision: u64,
     /// The data directory's writer lock, held for the process's lifetime.
     #[allow(dead_code)]
     lock: Option<crate::federation_lock::DataDirLock>,
@@ -112,9 +116,20 @@ impl FederationRuntime {
         let own = self.node_id.clone();
         let advertise = self.advertise.clone();
         let name = self.node_name();
+        let federation = self.federation.clone();
+        let policy_revision = self.policy_revision;
         std::thread::spawn(move || {
             crate::extension::block_on_tokio(async move {
-                announce_once(&identity, &transport, &own, &advertise, name.as_deref()).await;
+                announce_once(
+                    &identity,
+                    &transport,
+                    &own,
+                    &advertise,
+                    name.as_deref(),
+                    federation.as_ref(),
+                    policy_revision,
+                )
+                .await;
             });
         });
     }
@@ -129,6 +144,8 @@ impl FederationRuntime {
             &self.node_id,
             &self.advertise,
             name.as_deref(),
+            self.federation.as_ref(),
+            self.policy_revision,
         )
         .await;
     }
@@ -316,9 +333,16 @@ async fn announce_once(
     own: &NodeId,
     advertise: &[agent::capability::CapabilityDescriptor],
     name: Option<&str>,
+    federation: Option<&federation::FederationId>,
+    policy_revision: u64,
 ) {
-    let record =
-        DiscoveryRecord::publish_named(identity, name.map(str::to_string), advertise.to_vec());
+    let record = DiscoveryRecord::publish_federated(
+        identity,
+        name.map(str::to_string),
+        federation.cloned(),
+        policy_revision,
+        advertise.to_vec(),
+    );
     let Ok(payload) = serde_json::to_vec(&record) else {
         return;
     };
@@ -400,12 +424,14 @@ pub(crate) fn start_from_settings(settings: &crate::settings::Settings) -> bool 
             enable_mtls: Some(config.tls_mtls),
             verify_name_on_connect: Some(config.tls_verify_name.unwrap_or(true)),
         });
+    let scouting = tls.is_none();
     let bus_config = BusConfig {
         mode: config.mode.clone().unwrap_or_else(|| "peer".to_string()),
         connect: (!config.endpoints.is_empty()).then(|| config.endpoints.clone()),
         listen: (!config.listen.is_empty()).then(|| config.listen.clone()),
         peer: None,
         tls,
+        scouting,
     };
     let settings_for_build = settings.clone();
     let started = crate::extension::block_on_tokio(async move {
@@ -654,7 +680,7 @@ async fn build(
         }
         Err(_) => (None, Vec::new()),
     };
-    Ok(assemble(
+    Ok(assemble_with_federation(
         identity,
         peers,
         Arc::new(transport),
@@ -668,9 +694,11 @@ async fn build(
         Some(crate::federation::resolve_node_name(
             settings.global.federation.node_name.as_deref(),
         )),
+        settings.global.federation.federation_id.clone(),
     ))
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn assemble(
     identity: NodeIdentity,
@@ -685,14 +713,58 @@ pub(crate) fn assemble(
     advertise: Vec<agent::capability::CapabilityDescriptor>,
     node_name: Option<String>,
 ) -> FederationRuntime {
+    assemble_with_federation(
+        identity,
+        peers,
+        transport,
+        inbox,
+        bus,
+        audit,
+        lock,
+        runtime,
+        delegations,
+        advertise,
+        node_name,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn assemble_with_federation(
+    identity: NodeIdentity,
+    peers: PeerStore,
+    transport: Arc<dyn FederationTransport>,
+    inbox: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    bus: Option<Bus>,
+    audit: Option<PathBuf>,
+    lock: Option<crate::federation_lock::DataDirLock>,
+    runtime: Option<Arc<WorkspaceRuntime>>,
+    delegations: Option<PathBuf>,
+    advertise: Vec<agent::capability::CapabilityDescriptor>,
+    node_name: Option<String>,
+    federation_id: Option<String>,
+) -> FederationRuntime {
     let announce_transport = Arc::clone(&transport);
+    let peer_file = delegations
+        .as_ref()
+        .and_then(|path| path.parent())
+        .map(|directory| directory.join("peers.json"));
     let mut node = FederationNode::new(identity.clone(), transport)
         .with_peer_store(Arc::new(RwLock::new(peers)));
+    let federation = federation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(federation::FederationId::new);
+    if let Some(id) = federation.clone() {
+        node = node.with_federation(id, 1);
+    }
     if let Some(runtime) = runtime {
         node = node.with_runtime(runtime);
     }
     if let Some(path) = delegations {
         node = node.with_lease_persistence(path.with_file_name("leases.json"));
+        node = node.with_replay_persistence(path.with_file_name("replay.json"));
         node = node.with_delegation_persistence(path);
     }
     if let Some(path) = audit {
@@ -701,6 +773,9 @@ pub(crate) fn assemble(
     let node = Arc::new(node);
     let node_id = node.node();
     let task = node.start(inbox);
+    if let Some(peer_file) = peer_file {
+        notify_rotation(&node, &peer_file);
+    }
     let peer_capabilities = Arc::new(RwLock::new(BTreeMap::new()));
     let refresher = {
         let node = Arc::clone(&node);
@@ -720,6 +795,7 @@ pub(crate) fn assemble(
         let discovered = Arc::clone(&discovered);
         let own = node_id.clone();
         let advertise = advertise.clone();
+        let federation = federation.clone();
         let name_slot = Arc::clone(&node_name);
         tokio::spawn(async move {
             let Some(mut frames) = (match transport.subscribe_announce().await {
@@ -745,6 +821,8 @@ pub(crate) fn assemble(
                             &own,
                             &advertise,
                             name.as_deref(),
+                            federation.as_ref(),
+                            1,
                         )
                         .await;
                         let now = unix_ms();
@@ -777,8 +855,62 @@ pub(crate) fn assemble(
         announce_transport,
         advertise,
         node_name,
+        federation,
+        policy_revision: 1,
         lock,
     }
+}
+
+/// Deliver a pending signed rotation record to every currently enrolled peer.
+///
+/// The file is produced by the federation rotate command; sending is idempotent,
+/// so a peer that was offline receives it on a later launch. Delivery failures
+/// are logged, never fatal to startup.
+fn notify_rotation(node: &Arc<FederationNode>, peers_path: &std::path::Path) {
+    let Some(directory) = peers_path.parent() else {
+        return;
+    };
+    let path = directory.join("rotation.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(record) = RotationRecord::from_json(&text) else {
+        log::warn!(
+            "federation: rotation record {} is unreadable",
+            path.display()
+        );
+        return;
+    };
+    let peers: Vec<NodeId> = node
+        .peers()
+        .read()
+        .map(|store| {
+            store
+                .iter()
+                .filter(|peer| peer.enrolled(unix_ms()))
+                .map(|peer| peer.node.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    if peers.is_empty() {
+        return;
+    }
+    let node = Arc::clone(node);
+    crate::extension::spawn_async(async move {
+        for peer in peers {
+            let context = agent::capability::InvocationContext::local(
+                agent::capability::InvocationId::new(format!("rotation-{peer}")),
+                agent::capability::Principal::Local {
+                    session: "federation-rotation".to_string(),
+                    preset: String::new(),
+                },
+                WorkspaceId::new("ws:federation").expect("a workspace"),
+            );
+            if let Err(error) = node.publish_rotation(&peer, &record, &context).await {
+                log::debug!("federation: rotation was not delivered to {peer}: {error}");
+            }
+        }
+    });
 }
 
 /// One discovery pass: ask every enrolled peer what it publishes.

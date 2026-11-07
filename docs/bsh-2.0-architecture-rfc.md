@@ -1399,15 +1399,15 @@ test pins it. Gaps are named rather than implied.
 
 | ADR | Decision | Implementation | Tests | Remaining gap |
 | --- | --- | --- | --- | --- |
-| 001 | Composition strategy: hybrid static boundary + dynamic selection | CompositionSpec, proposal gate, resolver | capability composition/proposal tests | Persisted composition manifest, lockfile, registry revision and full AI Assembly pipeline remain outstanding; see GAP-COMP-001/006 |
+| 001 | Composition strategy: hybrid static boundary + dynamic selection | CompositionSpec, proposal gate, resolver, CompositionManifest/lock, AssemblyEngine | capability composition/proposal/lock/assembly tests | The model call itself is host-owned; no automatic LLM invocation ships |
 | 002 | Composition Engine ownership: independent of Agent/ReAct | crates/capability + Agent provider adapters | capability and agent tests | Domain ownership is independent; complete host-neutral orchestration/activation boundary remains to be completed |
-| 003 | Execution: hybrid provider implementations behind one contract | capability::provider, WorkspaceRuntime, NativeToolProvider | capability/tests/workspace, agent native_provider | WorkspaceRuntime is currently a dispatch container; lifecycle, budget enforcement and context ownership remain outstanding; see GAP-COMP-002/003/004 |
+| 003 | Execution: hybrid provider implementations behind one contract | capability::provider, WorkspaceRuntime, WorkspaceLifecycle, NativeToolProvider | capability/tests/workspace, lifecycle; agent native_provider | Lifecycle, budget enforcement, workspace ownership and activation journal are implemented; provider-kind coverage remains adapter-specific |
 | 004 | Topology: autonomous Nodes, independent kernels | federation::service, PeerStore per Node, no shared workspace | federation/tests/service, trust | none known |
 | 005 | Protocol: signed JSON envelope, explicit protocol and schema | federation::envelope | federation/tests (envelope, service, signing_vectors) | canonical form now specified and pinned (docs/federation-signing.md); no second implementation yet |
 | 006 | Autonomy: dual authorization, denials name the side | service::invoke, serve; CapabilityError::Denied | service tests (caller/provider refusals) | none known |
 | 007 | Remote composition: remote is a binding, never a local provider | composition::Binding::Remote, RemoteCapabilityProvider, bsh attach_remote_tools | federation remote_provider, bsh caps attach test | no local fallback by construction |
-| 008 | Two layers, one Capability Model, separate authority | one CompositionSpec/resolve; SnapshotOrigin; workspace id per Node | capability composition, snapshot, bsh compose | Knowledge Federation is not implemented; delegation/lease state is process-local; see GAP-FED-001/004/005 |
-| 009 | Zenoh, JSON, one endpoint, resource streams on the protocol | federation::zenoh, service resource path; bus::TlsConfig for transport TLS | zenoh_transport, resource, resource_wire, bus TLS tests | TLS settings are exposed, rendered, and validated by Zenoh, and a TLS listener without usable material fails instead of opening plaintext; handshake unverified here. Production security profile still incomplete; see GAP-FED-003. The ingress queue is bounded (1024 frames, 256 announcements) with drop-and-log overflow, the peer store is written 0600, and accepted delegations persist to delegations.json across restarts; a structured result_contract executes on the target's runtime (scope-checked, cancel-aware) and settles the record, delegation status/cancel are owner-only, handler dispatch is admitted at 64 global / 8 per peer with a retryable refusal, invocations carry an absolute deadline plus a scoped, idempotent remote cancel, resource streams are peer-bound with ordered, bounded delivery, discovery records expire after five minutes with clock-skew and replay rejection, inbound frames are deduplicated by sender-scoped message/idempotency keys, envelopes are recipient- and result-peer-bound, and resource checksums are incremental |
+| 008 | Two layers, one Capability Model, separate authority | one CompositionSpec/resolve; SnapshotOrigin; workspace id per Node; knowledge contract; durable delegation/lease stores | capability composition, snapshot, bsh compose, knowledge and knowledge_wire | Knowledge is opt-in: a host must provide a KnowledgeService and authorizer; broader collaboration orchestration remains GAP-FED-005 |
+| 009 | Zenoh, JSON, one endpoint, resource streams on the protocol | federation::zenoh, service resource path; bus::TlsConfig for transport TLS | zenoh_transport, resource, resource_wire, bus TLS tests | TLS settings are exposed, rendered, and validated by Zenoh, and a TLS listener without usable material fails instead of opening plaintext; a mutual-TLS two-session test now performs a real handshake with CA-signed server and client certificates and sends a sealed frame. Production security profile still incomplete; see GAP-FED-003. The ingress queue is bounded (1024 frames, 256 announcements) with drop-and-log overflow, the peer store is written 0600, and accepted delegations persist to delegations.json across restarts; a structured result_contract executes on the target's runtime (scope-checked, cancel-aware) and settles the record, delegation status/cancel are owner-only, handler dispatch is admitted at 64 global / 8 per peer with a retryable refusal, invocations carry an absolute deadline plus a scoped, idempotent remote cancel, resource streams are peer-bound with ordered, bounded delivery, discovery records expire after five minutes with clock-skew and replay rejection, inbound frames are deduplicated by sender-scoped message/idempotency keys, envelopes are recipient- and result-peer-bound, and resource checksums are incremental |
 
 ### 30.2 Local composition (section 28)
 
@@ -1424,6 +1424,13 @@ test pins it. Gaps are named rather than implied.
 | Criterion | Status | Evidence or gap |
 | --- | --- | --- |
 | Authenticated, revocable identities | implemented | NodeIdentity, peers.json, CLI revoke |
+| Durable delegation and lease state | implemented | delegations.json and leases.json are atomic 0600, startup recovery marks interrupted delegations Failed and drops expired leases; restart tests |
+| Knowledge federation | implemented (opt-in) | knowledge contract/service, signed knowledge_query/publication kinds, provenance, class/purpose/scope authorization, retention/revocation, wire tests |
+| Invocation context propagation | implemented | task, trace and delegation hops cross the envelope; a probe provider test pins them |
+| Bounded handler admission | implemented | independent invocation/control/resource budgets with retryable refusals and saturation tests |
+| Signed key rotation | implemented | RotationRecord signed by the old key; PeerStore::rotate moves grants and revokes the old id; bsh federation rotate/accept-rotation; tests |
+| Mutual TLS transport | implemented (cross-process) | tests/tls_transport.rs opens two Zenoh sessions with CA-signed server/client certificates and hostname verification, then sends a sealed frame; a second test runs the listener in a separate OS process |
+| Durable collaboration graph | implemented foundation | versioned TaskGraph, deterministic ready order, bounded executor, persisted transitions, restart recovery, failure containment |
 | Explicit trust and grants | implemented | PeerStore, enrollment tests, CLI |
 | Remote distinct from local providers | implemented | RemoteCapabilityProvider; compose skips a remote id a local tool owns |
 | Authorization at both ends | implemented | service tests, bsh end-to-end test |
@@ -1463,8 +1470,8 @@ test pins it. Gaps are named rather than implied.
 - Item 4 (human approval): not decided; the capability registry switch is opt-in, and
   no approval policy is attached to remote invocation.
 - Item 5 (cross-platform isolation): unproven; all evidence is macOS.
-- Item 6 (long-running task persistence): delegations are in memory; a restart loses
-  them. The ledger is a next step.
+- Item 6 (long-running task persistence): delegation and lease stores persist and
+  recover explicitly; broader task-graph orchestration remains GAP-FED-005.
 - Item 8 (artifact retention): leases bound bytes, but no retention or deletion policy.
 - Item 10 (crate ownership): settled by the source-level analysis in
   bsh-2.0-adapter-research.md.

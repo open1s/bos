@@ -95,6 +95,15 @@ where
     })
 }
 
+/// Spawn a future on the shared extension Tokio runtime without blocking GPUI.
+pub(crate) fn spawn_async<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    extension_runtime().spawn(future)
+}
+
 pub(crate) fn block_on_tokio<F, T>(future: F) -> T
 where
     F: std::future::Future<Output = T> + Send + 'static,

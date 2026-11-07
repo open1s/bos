@@ -14,20 +14,27 @@
 //! message; it never proves that the sender may invoke what it asks for.
 
 pub mod audit;
+pub mod collaboration;
 pub mod delegation;
 pub mod discovery;
 pub mod envelope;
 pub mod identity;
 pub mod knowledge;
+pub mod membership;
 pub mod memory;
 pub mod peers;
 pub mod provider;
 pub mod resource;
+pub mod rotation;
 pub mod service;
 pub mod zenoh;
 
 pub use audit::{Direction, FederationAudit, FederationEvent, MemoryAudit};
 pub use capability::{FederationMessage, FederationTransport, MessageId, PeerSession};
+pub use collaboration::{
+    ArtifactRef, CollaborationError, DelegationExecutor, Orchestrator, TaskExecutor, TaskGraph,
+    TaskNode, TaskNodeId, TaskOutcome, TaskProgress, TaskState, COLLABORATION_SCHEMA,
+};
 pub use delegation::{
     DelegationError, DelegationId, DelegationRecord, DelegationRequest, DelegationState,
     DelegationStore,
@@ -36,10 +43,12 @@ pub use discovery::DiscoveryRecord;
 pub use envelope::{Envelope, EnvelopeError, PROTOCOL, SCHEMA_VERSION};
 pub use identity::{IdentityError, NodeIdentity};
 pub use knowledge::{
-    knowledge_hash, KnowledgeAudit, KnowledgeClass, KnowledgeError, KnowledgeItem, KnowledgeOrigin,
-    KnowledgePublication, KnowledgePurpose, KnowledgeQuery, KnowledgeResponse, KnowledgeService,
-    Provenance, KNOWLEDGE_PROTOCOL, KNOWLEDGE_SCHEMA, MAX_KNOWLEDGE_BYTES, MAX_KNOWLEDGE_ITEMS,
+    knowledge_hash, KnowledgeAudit, KnowledgeAuthorizer, KnowledgeClass, KnowledgeError,
+    KnowledgeItem, KnowledgeOrigin, KnowledgePublication, KnowledgePurpose, KnowledgeQuery,
+    KnowledgeResponse, KnowledgeService, Provenance, KNOWLEDGE_PROTOCOL, KNOWLEDGE_SCHEMA,
+    MAX_KNOWLEDGE_BYTES, MAX_KNOWLEDGE_ITEMS,
 };
+pub use membership::FederationId;
 pub use memory::{InMemoryNetwork, InMemoryTransport};
 pub use peers::{Grant, PeerError, PeerRecord, PeerStore, TrustState};
 pub use provider::RemoteCapabilityProvider;
@@ -47,6 +56,7 @@ pub use resource::{
     checksum, LeaseId, LeaseStore, ResourceError, ResourceLease, ResourceStreamMessage,
     StreamReceiver, StreamSender,
 };
+pub use rotation::RotationRecord;
 pub use service::{
     AdmissionLimits, FederationNode, RemoteStream, ResourceSource, MAX_CONCURRENT_STREAMS,
     MAX_IN_FLIGHT_CONTROL, MAX_IN_FLIGHT_CONTROL_PER_PEER, MAX_IN_FLIGHT_HANDLERS,

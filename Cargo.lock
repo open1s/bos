@@ -3468,6 +3468,7 @@ dependencies = [
  "capability",
  "ed25519-dalek",
  "rand 0.10.3",
+ "rcgen 0.13.2",
  "semver",
  "serde",
  "serde_json",

@@ -23,6 +23,7 @@ fn peer_config(listen: Option<u16>, connect: Option<u16>) -> BusConfig {
         listen: listen.map(|port| vec![format!("tcp/127.0.0.1:{port}")]),
         peer: None,
         tls: None,
+        scouting: true,
     }
 }
 

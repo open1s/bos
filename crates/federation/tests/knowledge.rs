@@ -346,3 +346,24 @@ fn knowledge_contracts_ride_the_authenticated_envelope() {
         publication
     );
 }
+
+#[test]
+fn a_revoked_id_cannot_be_republished() {
+    let mut service = KnowledgeService::new();
+    let publisher = node("node:source");
+    let publication = KnowledgePublication::new(vec![item(
+        "k-revoked",
+        KnowledgeClass::Public,
+        json!({ "fact": 1 }),
+    )]);
+    service
+        .publish(&publisher, &publication, 200)
+        .expect("published");
+    service.revoke(&publisher, "k-revoked").expect("revoked");
+
+    let error = service
+        .publish(&publisher, &publication, 200)
+        .expect_err("a revoked id is not revived");
+    assert!(matches!(error, KnowledgeError::Revoked { .. }), "{error:?}");
+    assert!(service.get("k-revoked").is_none());
+}

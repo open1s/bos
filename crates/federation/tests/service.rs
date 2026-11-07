@@ -1785,3 +1785,126 @@ async fn the_resource_stream_budget_is_separate_and_configurable() {
         other => panic!("unexpected resource response: {other:?}"),
     }
 }
+
+#[derive(Default)]
+struct SeenContext {
+    task: Option<String>,
+    trace: (String, String),
+    delegation: Vec<(String, String)>,
+    remote_principal: bool,
+}
+
+struct ContextProbe {
+    seen: Arc<std::sync::Mutex<SeenContext>>,
+}
+
+#[async_trait]
+impl CapabilityProvider for ContextProbe {
+    fn id(&self) -> &ProviderId {
+        static ID: std::sync::OnceLock<ProviderId> = std::sync::OnceLock::new();
+        ID.get_or_init(ProviderId::builtin)
+    }
+
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::Builtin
+    }
+
+    async fn describe(&self) -> Result<Vec<CapabilityDescriptor>, CapabilityError> {
+        Ok(Vec::new())
+    }
+
+    async fn invoke(&self, call: CapabilityCall<'_>) -> Result<CapabilityOutput, CapabilityError> {
+        let mut seen = self.seen.lock().expect("seen");
+        seen.task = call
+            .context
+            .task
+            .as_ref()
+            .map(|task| task.as_str().to_string());
+        seen.trace = (
+            call.context.trace.trace_id.clone(),
+            call.context.trace.span_id.clone(),
+        );
+        seen.delegation = call
+            .context
+            .delegation
+            .iter()
+            .map(|hop| (hop.node.to_string(), hop.delegation.clone()))
+            .collect();
+        seen.remote_principal = matches!(call.context.principal, Principal::Remote { .. });
+        Ok(CapabilityOutput::text("probed"))
+    }
+
+    async fn health(&self) -> ProviderHealth {
+        ProviderHealth::Available
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_trace_and_delegation_reach_the_remote_provider() {
+    let network = Arc::new(InMemoryNetwork::new());
+    let caller_identity = identity(160);
+    let provider_identity = identity(161);
+    let caller_id = caller_identity.node_id();
+    let provider_id = provider_identity.node_id();
+    let (caller_transport, caller_inbox) = network.join(caller_id.clone());
+    let (provider_transport, provider_inbox) = network.join(provider_id.clone());
+    let seen = Arc::new(std::sync::Mutex::new(SeenContext::default()));
+    let provider = Arc::new(
+        FederationNode::new(provider_identity, Arc::new(provider_transport)).with_runtime(
+            runtime_with(
+                descriptor("echo"),
+                Arc::new(ContextProbe {
+                    seen: Arc::clone(&seen),
+                }),
+            ),
+        ),
+    );
+    let caller = Arc::new(FederationNode::new(
+        caller_identity,
+        Arc::new(caller_transport),
+    ));
+    let caller_task = caller.start(caller_inbox);
+    let provider_task = provider.start(provider_inbox);
+    let now = capability::unix_ms();
+    {
+        let store = caller.peers();
+        let mut peers = store.write().expect("peers");
+        peers.enroll(provider_id.clone(), now, None);
+        peers
+            .grant(&provider_id, capability("echo"), now, None)
+            .expect("granted");
+    }
+    {
+        let store = provider.peers();
+        let mut peers = store.write().expect("peers");
+        peers.enroll(caller_id.clone(), now, None);
+        peers
+            .grant(&caller_id, capability("echo"), now, None)
+            .expect("granted");
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let mut context = context();
+    context.task = Some(capability::TaskId::new("task-1"));
+    context.trace = capability::TraceContext::new("trace-1", "span-1");
+    context.delegation = vec![capability::DelegationHop {
+        node: caller_id.clone(),
+        delegation: "delegation-1".to_string(),
+    }];
+    caller
+        .invoke(&provider_id, &capability("echo"), json!({}), &context)
+        .await
+        .expect("the provider answers");
+
+    let seen = seen.lock().expect("seen");
+    assert_eq!(seen.task.as_deref(), Some("task-1"));
+    assert_eq!(seen.trace, ("trace-1".to_string(), "span-1".to_string()));
+    assert_eq!(
+        seen.delegation,
+        vec![(caller_id.to_string(), "delegation-1".to_string())]
+    );
+    assert!(seen.remote_principal);
+
+    caller_task.abort();
+    provider_task.abort();
+}

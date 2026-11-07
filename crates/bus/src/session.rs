@@ -198,6 +198,10 @@ pub struct BusConfig {
     pub peer: Option<Option<String>>,
     /// Transport TLS settings, when the session must be encrypted.
     pub tls: Option<TlsConfig>,
+    /// Whether Zenoh scouting may discover sessions outside the configured
+    /// endpoints. TLS deployments set this false: scouting can otherwise open a
+    /// parallel plaintext link that bypasses the configured TLS endpoints.
+    pub scouting: bool,
 }
 
 impl BusConfig {
@@ -209,6 +213,7 @@ impl BusConfig {
             listen: None,
             peer: None,
             tls: None,
+            scouting: true,
         }
     }
 }
@@ -240,6 +245,12 @@ impl BusConfig {
                 r#", "connect": {{"endpoints": {}}}"#,
                 serde_json::to_string(connect).expect("a list of strings always serializes")
             ));
+        }
+
+        if !self.scouting {
+            json.push_str(
+                r#", "scouting": {"multicast": {"enabled": false}, "gossip": {"enabled": false}}"#,
+            );
         }
 
         if let Some(tls) = &self.tls {
@@ -312,6 +323,7 @@ impl Default for BusConfig {
             listen: None,
             peer: None,
             tls: None,
+            scouting: true,
         }
     }
 }

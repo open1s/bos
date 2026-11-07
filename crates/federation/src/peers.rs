@@ -9,6 +9,9 @@ use std::collections::BTreeMap;
 
 use capability::{CapabilityError, CapabilityId, NodeId};
 
+use crate::membership::FederationId;
+use crate::rotation::RotationRecord;
+
 /// Where a peer relationship stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TrustState {
@@ -51,6 +54,12 @@ pub struct PeerRecord {
     pub enrolled_at_ms: u64,
     /// When the enrollment itself stops being valid.
     pub expires_at_ms: Option<u64>,
+    /// The federation membership this peer was enrolled under, when known.
+    ///
+    /// Membership is metadata beside the per-peer trust decision; it never
+    /// grants a capability by itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub federation: Option<FederationId>,
     /// Why the relationship exists, for an auditor.
     pub note: Option<String>,
 }
@@ -86,6 +95,12 @@ pub enum PeerError {
         /// What the parser said.
         message: String,
     },
+    /// A rotation record was refused.
+    #[error("rotation refused: {message}")]
+    Rotation {
+        /// Why.
+        message: String,
+    },
 }
 
 /// The peers this Node knows and what each may do.
@@ -102,20 +117,97 @@ impl PeerStore {
 
     /// Enroll a peer as trusted, with no grants yet.
     pub fn enroll(&mut self, node: NodeId, now_ms: u64, note: Option<String>) {
+        self.enroll_in(node, None, now_ms, note);
+    }
+
+    /// Enroll a peer and record the federation it was enrolled under.
+    pub fn enroll_in(
+        &mut self,
+        node: NodeId,
+        federation: Option<FederationId>,
+        now_ms: u64,
+        note: Option<String>,
+    ) {
         let record = PeerRecord {
             node: node.clone(),
             state: TrustState::Trusted,
             grants: Vec::new(),
             enrolled_at_ms: now_ms,
             expires_at_ms: None,
+            federation,
             note,
         };
         self.peers.insert(node, record);
     }
 
+    /// The federation recorded for a peer, when it has one.
+    pub fn federation_of(&self, node: &NodeId) -> Option<&FederationId> {
+        self.peers.get(node)?.federation.as_ref()
+    }
+
+    /// Every trusted member of one federation, sorted by node id.
+    pub fn members_of(&self, federation: &FederationId) -> Vec<&PeerRecord> {
+        self.peers
+            .values()
+            .filter(|record| record.federation.as_ref() == Some(federation))
+            .collect()
+    }
+
     /// Insert or replace a peer record, for loading persisted state.
     pub fn upsert(&mut self, record: PeerRecord) {
         self.peers.insert(record.node.clone(), record);
+    }
+
+    /// Apply a signed key rotation, moving the old identity's grants to the new.
+    ///
+    /// The old key must have signed the successor statement and must still be a
+    /// trusted peer here. The old record becomes Revoked; an already-trusted new
+    /// identity is refused rather than silently merged.
+    pub fn rotate(&mut self, record: &RotationRecord, now_ms: u64) -> Result<(), PeerError> {
+        if !record.verify() {
+            return Err(PeerError::Rotation {
+                message: "the old key did not sign this successor".to_string(),
+            });
+        }
+        let Some(old) = self.peers.get(&record.old).cloned() else {
+            return Err(PeerError::Rotation {
+                message: format!("{} is not an enrolled peer", record.old),
+            });
+        };
+        if !old.enrolled(now_ms) {
+            return Err(PeerError::Rotation {
+                message: format!("{} is not currently trusted", record.old),
+            });
+        }
+        if self
+            .peers
+            .get(&record.new)
+            .is_some_and(|existing| existing.enrolled(now_ms))
+        {
+            return Err(PeerError::Rotation {
+                message: format!("{} is already a trusted peer", record.new),
+            });
+        }
+        let mut grants = old.grants.clone();
+        grants.retain(|grant| grant.is_valid(now_ms));
+        self.peers.insert(
+            record.new.clone(),
+            PeerRecord {
+                node: record.new.clone(),
+                state: TrustState::Trusted,
+                grants,
+                enrolled_at_ms: record.rotated_at_ms,
+                expires_at_ms: old.expires_at_ms,
+                federation: old.federation.clone(),
+                note: Some(format!("rotated from {}", record.old)),
+            },
+        );
+        if let Some(previous) = self.peers.get_mut(&record.old) {
+            previous.state = TrustState::Revoked;
+            previous.grants.clear();
+            previous.note = Some(format!("rotated to {}", record.new));
+        }
+        Ok(())
     }
 
     /// Revoke a peer. Its grants are dropped with it.

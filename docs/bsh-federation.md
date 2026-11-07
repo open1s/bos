@@ -39,6 +39,22 @@ bsh federation status
 The seed file is created on first use, readable by its owner only on Unix. It
 *is* the identity: losing it loses every grant the peers recorded for you.
 
+A node may advertise a federation membership in its settings:
+
+```toml
+[federation]
+federation_id = "team:research"
+```
+
+The id and a policy revision travel in the signed discovery record, and a peer
+record can carry the federation it was enrolled under. Membership is metadata,
+never authority: the peer still needs explicit enrollment and a grant, and a
+matching federation id does not widen one. A signed RotationRecord lets the old
+key authorize a successor and moves the peer's grants. After `rotate`, the next
+BSH launch reads `rotation.json` and delivers it to every enrolled peer; the
+same record can be applied by hand with `accept-rotation`, and delivery is
+idempotent for a peer that was offline.
+
 ## Managing peers
 
 Management is headless, so it works before any window exists and on a machine
@@ -49,6 +65,8 @@ bsh federation enroll <peer-node-id>
 bsh federation grant <peer-node-id> builtin/read_file
 bsh federation revoke-grant <peer-node-id> builtin/read_file
 bsh federation revoke <peer-node-id>
+bsh federation rotate [reason]
+bsh federation accept-rotation <record.json>
 ```
 
 `enroll` trusts the identity; it grants nothing. `grant` names one capability.
@@ -171,9 +189,12 @@ audited as `replay/duplicate`.
 
 An entry lives until the envelope that carried it expires, so the cache never
 forgets a frame while it is still replayable. Storage is bounded at 4096 entries
-with the oldest evicted. The cache is in memory: a restart forgets it, so the
-residual window is a restart inside the envelope's lifetime (60 seconds by
-default). That is the documented policy; envelopes are short-lived on purpose.
+with the oldest evicted. A node started with replay persistence (BSH uses
+`federation/replay.json`) loads the unexpired entries and writes the cache after
+each admitted request, so a restart does not reopen the duplicate window. A write
+failure is logged and the frame is still processed: replay protection degrades
+rather than an authenticated request being silently dropped, and the failure is
+visible in the log. Expired entries are pruned at load.
 
 ## Discovery freshness
 
@@ -412,6 +433,58 @@ app runs, a successful write also broadcasts the record in-process, and the
 shell drains that channel while rendering (a cheap receive, never a file read),
 so the settings row follows new decisions without a relaunch.
 
+## Knowledge federation
+
+Knowledge is a separate opt-in protocol over the same signed envelope. A node
+installs a `KnowledgeService` (the authoritative local store) and a
+`KnowledgeAuthorizer` (the host decision) with `FederationNode::with_knowledge`;
+without both, a `knowledge_query` or `knowledge_publication` is refused and
+never silently ignored.
+
+```rust
+let service = Arc::new(RwLock::new(KnowledgeService::new()));
+let node = FederationNode::new(identity, transport)
+    .with_knowledge(service, Arc::new(my_authorizer));
+```
+
+The contract is versioned:
+
+- A query names its purpose, classification ceiling, optional workspace scope,
+  terms, item budget, and absolute deadline.
+- A publication carries items with an origin, source reference, issue/expiry
+  time, hex SHA-256 of the canonical payload, classification, and optional
+  retention ceiling.
+- A response is always marked `KnowledgeOrigin::Remote`; it is never merged into
+  local memory. Expired, revoked, and over-class items are dropped; a denied
+  query is a typed `Denied`, and a query past its deadline is a `Timeout`.
+- Revocation is publisher-scoped and idempotent, and a revoked id cannot be
+  replayed into the store. The authorizer sees the authenticated peer, class,
+  purpose, and scope, so revoking a grant takes effect on the next query.
+
+The authorizer is the source of ACLs; the protocol deliberately does not embed a
+second permission language. Results are bounded excerpts, not a replicated index,
+and knowledge is returned as data that a consumer evaluates rather than as
+instructions.
+
+## Collaboration graphs
+
+Above delegation, `federation::collaboration` provides a durable task graph:
+tasks declare dependencies, the runner executes only ready tasks with bounded
+concurrency, a failure cancels only its dependents, and every transition is
+persisted atomically (0600). Loading a graph marks a task left Running by a
+restart as Failed with an indeterminate reason, then cancels its pending
+dependents. Tasks carry an attempt ceiling, an acceptance criterion, and artifact
+references; a retryable failure returns the task to Pending until the ceiling,
+a successful outcome records its artifacts, and a final failure calls the
+executor's compensation hook (recorded on the task). The graph is a library API: the
+right panel lists delegations but does not draw the graph, and a host supplies
+the `TaskExecutor`; `DelegationExecutor` is the delegation-backed one.
+
+```rust
+let mut runner = Orchestrator::new(graph).with_persistence(path);
+let progress = runner.run(executor, 4).await?;
+```
+
 ## Failure behaviour
 
 - **A frame that fails verification is dropped.** A mutated payload, an expired
@@ -442,8 +515,23 @@ so the settings row follows new decisions without a relaunch.
   once at launch. It does not offer controls:
   enrollment and grants stay the CLI and the settings file, because a switch in
   a pane would be a permission decision dressed as a preference.
-- Resource streams and delegations are implemented at the protocol layer; the
-  UI does not yet surface a delegation list or a resource browser.
+- Delegations and leases persist in `federation/delegations.json` and
+  `federation/leases.json` (atomic 0600 writes). An interrupted delegation is
+  recovered as `Failed` with an indeterminate-outcome reason; an expired lease is
+  never revived. A lease whose stream ended still requires the peer to re-open.
+- The Federation pane lists the newest delegations (with Cancel), the granted
+  resource leases, and knowledge query/publication forms for the selected peer.
+  A lease can be opened by id + URI and its first chunks are shown read-only;
+  richer artifact inspection remains a library surface.
+- TLS deployments disable Zenoh scouting so a scouted plaintext link cannot
+  bypass the configured TLS endpoints.
+- Knowledge federation is opt-in: a host must install a `KnowledgeService` and a
+  `KnowledgeAuthorizer`. The default is deny, and a node without both refuses
+  explicitly.
+- Federation membership is advertised (signed `federation` and `policy_revision`
+  on discovery records) and recorded on a peer at enrollment, but it grants
+  nothing by itself: trust and grants stay per peer. There is no shared membership
+  authority, and key rotation still requires re-enrollment.
 
 ## Acceptance scenario
 
