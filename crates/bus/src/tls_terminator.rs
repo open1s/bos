@@ -38,7 +38,10 @@ pub struct TerminatorConfig {
 }
 
 /// A running terminator whose certificate can be reloaded.
-#[derive(Debug, Clone)]
+///
+/// `Clone` shares the same public endpoint; `tokio_rustls::TlsAcceptor` carries
+/// no `Debug`, so this type does not derive it either.
+#[derive(Clone)]
 pub struct TlsTerminator {
     current: Arc<RwLock<Arc<CertifiedKey>>>,
     acceptor: Arc<RwLock<Arc<TlsAcceptor>>>,
