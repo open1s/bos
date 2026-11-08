@@ -791,7 +791,9 @@ pub(crate) fn pane_tab_w(label: &str) -> f32 {
 
 /// The width a document tab asks for: padding, glyph, gap, label, close.
 pub(crate) fn file_tab_w(label: &str) -> f32 {
-    (56.0 + chip_label_w(label)).clamp(STRIP_TAB_MIN_W, STRIP_TAB_MAX_W)
+    // 8px padding a side, an 18px type badge, two 6px gaps and a 17px close
+    // leave 63px before the label; the extra pixel keeps the estimate honest.
+    (64.0 + chip_label_w(label)).clamp(STRIP_TAB_MIN_W, STRIP_TAB_MAX_W)
 }
 
 /// The category filter in Finder's Show All Tabs catalogue.
@@ -834,6 +836,48 @@ impl CatalogFilter {
             CatalogFilter::Panes => !matches!(entry, CatalogEntry::File(_)),
         }
     }
+}
+
+/// Which right-pane items the top search box offers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum RightSearchScope {
+    /// Panes and documents.
+    #[default]
+    All,
+    /// The pane items: Files, Diff, Terminal, Browser, Extensions, Federation,
+    /// Tasks.
+    Panes,
+    /// The documents opened out of Files.
+    Documents,
+}
+
+impl RightSearchScope {
+    /// The scope's label key in the string table.
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            RightSearchScope::All => "right.tabs.all",
+            RightSearchScope::Panes => "right.tabs.panes",
+            RightSearchScope::Documents => "right.tabs.documents",
+        }
+    }
+
+    /// The scope's stable id stem, for its menu row and the tests.
+    pub(crate) fn slug(self) -> &'static str {
+        match self {
+            RightSearchScope::All => "all",
+            RightSearchScope::Panes => "panes",
+            RightSearchScope::Documents => "documents",
+        }
+    }
+}
+
+/// One right-pane item the top search box can offer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RightSearchEntry {
+    /// A pane, opened by choosing the result.
+    Pane(RightTab),
+    /// A document opened out of Files.
+    File(usize),
 }
 
 /// One entry the Show All Tabs catalogue can draw.
@@ -1203,11 +1247,8 @@ impl Shell {
                     .iter()
                     .map(|file| file_tab_w(&file.label()))
                     .collect();
-                // The catalogue control is drawn only when it has something to
-                // catalog, and the strip's budget follows it.
-                let controls = if self.files.tabs.is_empty() { 2 } else { 3 };
                 let plan = plan_tab_strip(
-                    self.strip_budget(band, controls),
+                    self.strip_budget(band, 2),
                     None,
                     start_w,
                     &file_widths,
@@ -1244,9 +1285,6 @@ impl Shell {
                     strip = strip.child(self.tab_catalog(cx));
                 }
                 row.child(strip)
-                    .when(!self.files.tabs.is_empty(), |row| {
-                        row.child(self.right_catalog_control(cx))
-                    })
                     .child(self.right_panel_control(
                         "right-maximize",
                         if self.right.maximized {
@@ -1269,10 +1307,10 @@ impl Shell {
                 // launcher chips, and whatever is left out becomes the catalog
                 // behind the ellipsis. That is Finder's own order - the open
                 // window's document tabs first, the rest in an overflow menu.
-                let inactive: Vec<RightTab> = RightTab::ALL
-                    .into_iter()
-                    .filter(|pane| *pane != tab)
-                    .collect();
+                // The strip carries only the tabs that are OPEN: the active
+                // pane and the documents. The other panes are the Start grid's
+                // job, so they no longer take a chip slot here and cannot push
+                // a file tab into the overflow.
                 let file_widths: Vec<f32> = self
                     .files
                     .tabs
@@ -1281,12 +1319,12 @@ impl Shell {
                     .collect();
                 let active_w = pane_tab_w(&self.state.lang.tr(tab.key()));
                 let plan = plan_tab_strip(
-                    self.strip_budget(band, 4),
+                    self.strip_budget(band, 3),
                     Some(tab),
                     active_w,
                     &file_widths,
                     self.files.active,
-                    &inactive,
+                    &[],
                 );
                 let mut strip = div()
                     .h(px(theme::RIGHT_TAB_H))
@@ -1324,7 +1362,6 @@ impl Shell {
                     strip = strip.child(self.tab_catalog(cx));
                 }
                 row.child(strip)
-                    .child(self.right_catalog_control(cx))
                     .child(self.right_new_tab(cx))
                     .child(self.right_panel_control(
                         "right-maximize",
@@ -1416,34 +1453,6 @@ impl Shell {
             })
     }
 
-    /// The header's Show All Tabs control.
-    ///
-    /// The command is also on every tab's context menu, where Finder puts it,
-    /// but a menu hidden behind a right-click is not a door: this control is the
-    /// visible way into the searchable catalogue. It is drawn whenever the
-    /// panel has at least one tab to catalog.
-    fn right_catalog_control(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let label = self.state.lang.tr("right.tabs.search");
-        div()
-            .id("right-catalog")
-            .debug_selector(|| String::from("right-catalog"))
-            .w(px(26.0))
-            .h(px(26.0))
-            .flex_none()
-            .rounded(px(theme::RADIUS_SM))
-            .flex()
-            .items_center()
-            .justify_center()
-            .cursor_pointer()
-            .hover(|s| s.bg(rgb(theme::hover())))
-            .tooltip_show_delay(std::time::Duration::from_millis(500))
-            .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
-            .child(icon(IconName::Search, 14.0, theme::muted()))
-            .on_click(cx.listener(|this, _event, window, cx| {
-                this.open_tab_catalog(window, cx);
-            }))
-    }
-
     /// The strip's new-tab control: a press lands on the Start screen, which is
     /// where a pane without a chip of its own is picked.
     fn right_new_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1516,24 +1525,7 @@ impl Shell {
             .child(icon(IconName::Ellipsis, 14.0, theme::faint()))
             .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
                 let mut menu = menu.scrollable(true).max_h(px(420.0));
-                // The overflow menu is the compact view of the catalogue; its
-                // first row is the door to the searchable one, so a reader who
-                // reaches for the ellipsis finds the search where they look.
-                let search = entity.clone();
-                menu = menu
-                    .item(
-                        catalog_row(
-                            String::from("tab-catalog-open"),
-                            IconName::Search,
-                            lang.tr("right.tabs.search"),
-                            false,
-                        )
-                        .on_click(move |_, window, cx| {
-                            search.update(cx, |this, cx| this.open_tab_catalog(window, cx));
-                        }),
-                    )
-                    .item(PopupMenuItem::separator())
-                    .item(PopupMenuItem::label(lang.tr("right.tabs")));
+                menu = menu.item(PopupMenuItem::label(lang.tr("right.tabs")));
                 if docs.is_empty() {
                     menu = menu.item(PopupMenuItem::label(lang.tr("right.tabs.none")));
                 }
@@ -1659,6 +1651,15 @@ impl Shell {
         let label = lang.tr(tab.key());
         let documents = self.files.tabs.len();
         let group = SharedString::from("right-tab-group");
+        let icon_color = if tab == RightTab::Files {
+            // The reference paints the Files tab's folder gold; it is the one
+            // pane glyph that is a file-manager icon rather than a tool mark.
+            theme::warn()
+        } else if selected {
+            theme::text()
+        } else {
+            theme::muted()
+        };
         let entity = cx.entity();
         div()
             .id("right-tab")
@@ -1678,18 +1679,7 @@ impl Shell {
             .items_center()
             .gap(px(6.0))
             .overflow_hidden()
-            .child(
-                icon(
-                    tab.glyph(),
-                    14.0,
-                    if selected {
-                        theme::text()
-                    } else {
-                        theme::muted()
-                    },
-                )
-                .flex_none(),
-            )
+            .child(icon(tab.glyph(), 14.0, icon_color).flex_none())
             .child(
                 txt(
                     label,
@@ -1821,6 +1811,52 @@ impl Shell {
                 this.hide_terminal_view(cx);
                 cx.notify();
             }))
+    }
+
+    /// The right pane's Finder-style search bar: a field and a scope control at
+    /// the top of the body, above whatever pane is showing.
+    ///
+    /// It sits in the body rather than the tab strip so the tab strip keeps its
+    /// width: a permanent field would shrink every tab and force the launcher
+    /// chips into the overflow on day one. The bar is always there, on Start as
+    /// well as on a pane, which is what makes searching for Browser, Extensions
+    /// or a document a one-step gesture.
+    fn right_search_bar(&self) -> impl IntoElement {
+        let field = div()
+            .id("right-search-field")
+            .debug_selector(|| String::from("right-search-field"))
+            .w_full()
+            .min_w_0()
+            .h(px(30.0))
+            .px(px(8.0))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(rgb(theme::border_soft()))
+            .bg(rgb(theme::page()))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .child(icon(IconName::Search, 13.0, theme::faint()).flex_none())
+            .child(
+                Input::new(&self.right_search)
+                    .appearance(false)
+                    .w_full()
+                    .h(px(28.0)),
+            );
+        hairline_bottom(
+            div()
+                .h(px(36.0))
+                .flex_none()
+                .px(px(12.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .bg(rgb(theme::sidebar_bg()))
+                .child(field),
+        )
+        .border_color(rgb(theme::border_soft()))
     }
 
     /// The panel body: the Start screen, or the chosen pane.
@@ -5737,55 +5773,178 @@ impl Shell {
         Some((parts.join(" \u{b7} "), true))
     }
 
-    /// The Start screen: the panel's headline over the panes it offers as
-    /// cards.
+    /// The Start screen as Finder's Applications page: the category tabs, then
+    /// a grid of item cards for the panes and the open documents.
     ///
-    /// Measured from the reference's own guide: a centred column with a 14px
-    /// gap and 24px side padding, and an invisible 10% spacer after the last
-    /// card that biases the whole stack upward instead of dead-centring it.
+    /// The grid is the point. The old Start screen was a centred column of
+    /// 380px cards, so at any useful panel height a handful of panes filled it
+    /// and the rest required scrolling; square cards give three or four columns
+    /// at the same width, and the category row plus the top search field narrow
+    /// the grid without leaving the page.
     fn right_start(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut stack = div()
+        let lang = self.state.lang;
+        let (card_w, gap) = self.start_card_size();
+        let query = self.right_search_text.trim().to_lowercase();
+        let scope = self.right_search_scope;
+        let mut page = div()
             .id("right-start")
             .debug_selector(|| String::from("right-start"))
             .flex_1()
-            .min_h(px(0.0))
-            .overflow_y_scroll()
+            .min_h_0()
+            .w_full()
             .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap(px(14.0))
-            .px(px(24.0));
-        stack = stack.child(
-            txt(
-                self.state.lang.tr("right.start"),
-                theme::SIDEBAR_SIZE,
-                theme::muted(),
-            )
-            .mb(px(16.0)),
-        );
-        for tab in RightTab::ALL
-            .into_iter()
-            .filter(|tab| tab.on_start_screen())
-        {
-            stack = stack.child(self.right_start_card(tab, cx));
+            .flex_col();
+        page = page.child(self.right_search_bar());
+        page = page.child(self.start_filter_row(cx));
+
+        let mut grid = div()
+            .id("right-start-grid")
+            .debug_selector(|| String::from("right-start-grid"))
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .p(px(16.0))
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .justify_start()
+            .content_start()
+            .gap(px(gap))
+            .overflow_y_scroll();
+        let mut shown = 0usize;
+        if scope != RightSearchScope::Documents {
+            for tab in RightTab::ALL
+                .into_iter()
+                .filter(|tab| tab.on_start_screen())
+            {
+                let label = lang.tr(tab.key());
+                if !query.is_empty() && !label.to_lowercase().contains(&query) {
+                    continue;
+                }
+                shown += 1;
+                grid = grid.child(self.right_start_card(tab, card_w, cx));
+            }
         }
-        // The reference's `::after { flex: 0 10% }`: a spacer that takes no
-        // content but takes space, so the visible stack sits above the optical
-        // centre of the panel rather than dead-centred in it.
-        stack.child(div().flex_none().h(relative(0.10)))
+        if scope != RightSearchScope::Panes {
+            for (index, tab) in self.files.tabs.iter().enumerate() {
+                let label = tab.label();
+                let rel = tab.rel.display().to_string();
+                if !query.is_empty()
+                    && !label.to_lowercase().contains(&query)
+                    && !rel.to_lowercase().contains(&query)
+                {
+                    continue;
+                }
+                shown += 1;
+                grid = grid.child(self.right_start_file_card(index, tab, card_w, cx));
+            }
+        }
+        if shown == 0 {
+            grid = grid.child(
+                div()
+                    .w_full()
+                    .py(px(40.0))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(icon(IconName::Search, 20.0, theme::faint()))
+                    .child(txt(lang.tr("right.search.noResults"), 13.0, theme::muted())),
+            );
+        }
+        page.child(grid)
     }
 
-    /// One Start card: glyph, title group, and the shortcut hint trailing.
-    ///
-    /// Measured: 380px wide (max-width 100%), min-height 56, 14px/20px
-    /// padding, a 14px gap, a `.5px` border at the panel's own radius, and a
-    /// 26px icon. The whole card is the target.
-    fn right_start_card(&self, tab: RightTab, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The category tabs above the Start grid. They set the same scope the
+    /// search field's filter control does, so the two never disagree.
+    fn start_filter_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let lang = self.state.lang;
+        let mut row = div()
+            .h(px(36.0))
+            .flex_none()
+            .px(px(16.0))
+            .flex()
+            .flex_row()
+            .items_center();
+        for choice in [
+            RightSearchScope::All,
+            RightSearchScope::Panes,
+            RightSearchScope::Documents,
+        ] {
+            let active = self.right_search_scope == choice;
+            let slug = choice.slug();
+            row = row.child(
+                div()
+                    .id(SharedString::from(format!("right-start-filter-{slug}")))
+                    .debug_selector(move || format!("right-start-filter-{slug}"))
+                    .relative()
+                    .flex_1()
+                    .h(px(36.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .child(
+                        txt(
+                            lang.tr(choice.key()),
+                            13.0,
+                            if active {
+                                theme::text()
+                            } else {
+                                theme::muted()
+                            },
+                        )
+                        .font_weight(FontWeight::MEDIUM),
+                    )
+                    .when(active, |tab| {
+                        tab.child(
+                            div()
+                                .absolute()
+                                .bottom(px(0.0))
+                                .left(px(0.0))
+                                .right(px(0.0))
+                                .h(px(2.0))
+                                .rounded(px(1.0))
+                                .bg(rgb(theme::accent())),
+                        )
+                    })
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.right_search_scope = choice;
+                        cx.notify();
+                    })),
+            );
+        }
+        hairline_bottom(row).border_color(rgb(theme::border_soft()))
+    }
+
+    /// The grid card size at this panel width. Three columns at the default
+    /// panel width, never wider than 200px.
+    fn start_card_size(&self) -> (f32, f32) {
+        let gap = 12.0;
+        let pad = 16.0;
+        let width = (self.right_panel_w() - 1.0).max(0.0);
+        let columns = (((width - pad * 2.0 + gap) / 88.0).floor() as usize).clamp(2, 8);
+        let card = ((width - pad * 2.0 - gap * (columns - 1) as f32) / columns as f32).min(128.0);
+        (card, gap)
+    }
+
+    /// One Start card, as an Applications-style icon tile.
+    ///
+    /// The tile is the whole target: a 26px glyph over the pane's name, with
+    /// the shortcut underneath when one is bound. That is what lets three
+    /// columns fit in the default panel where the old 380px rows fit one.
+    fn right_start_card(
+        &self,
+        tab: RightTab,
+        width: f32,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let lang = self.state.lang;
+        let label = lang.tr(tab.key());
         // A pane with no key binding draws no hint: the shortcut is a fact
         // about the shell, and printing one nothing dispatches would be the
-        // exact "control that only looks wired" this crate refuses.
+        // exact "control that only looks wired" this crate refuses. Finder's
+        // icon view puts such detail in the tooltip, not under every label.
         let hint = match tab {
             RightTab::Files => Some("\u{2318}P"),
             RightTab::Diff => None,
@@ -5795,82 +5954,98 @@ impl Shell {
             RightTab::Federation => None,
             RightTab::Tasks => None,
         };
+        let tip = match hint {
+            Some(hint) => format!("{label}  {hint}"),
+            None => label.clone(),
+        };
         div()
             .id(SharedString::from(format!("right-card-{}", tab.key())))
-            .debug_selector(|| format!("right-card-{}", tab.key()))
-            .w(px(theme::RIGHT_CARD_W))
-            .max_w(px(theme::RIGHT_CARD_W))
-            .min_h(px(theme::RIGHT_CARD_H))
-            .px(px(20.0))
-            .py(px(14.0))
-            .rounded(px(theme::RADIUS_LG))
-            .border_1()
-            .border_color(rgb(theme::border_soft()))
-            .bg(rgb(theme::new_session_fill()))
+            .debug_selector(move || format!("right-card-{}", tab.key()))
+            .w(px(width))
+            .h(px(92.0))
+            .flex_none()
+            .p(px(4.0))
+            .rounded(px(8.0))
             .cursor_pointer()
             .hover(|s| s.bg(rgb(theme::hover())))
             .flex()
-            .flex_row()
+            .flex_col()
             .items_center()
-            .gap(px(14.0))
+            .justify_center()
+            .gap(px(5.0))
+            .tooltip_show_delay(std::time::Duration::from_millis(500))
+            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
             .child(
                 div()
-                    .w(px(26.0))
-                    .h(px(26.0))
                     .flex_none()
+                    .w(px(56.0))
+                    .h(px(56.0))
+                    .rounded(px(12.0))
+                    .border_1()
+                    .border_color(rgb(theme::border_soft()))
+                    .bg(rgb(theme::new_session_fill()))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(icon(tab.glyph(), 20.0, theme::muted())),
+                    .child(icon(tab.glyph(), 28.0, theme::muted())),
             )
-            .child(
-                div()
-                    .min_w_0()
-                    .flex_1()
-                    .flex()
-                    .flex_col()
-                    .gap(px(3.0))
-                    .child(
-                        txt(lang.tr(tab.key()), theme::SIDEBAR_SIZE, theme::text())
-                            .line_height(px(20.0))
-                            .truncate()
-                            .flex_1()
-                            .min_w_0(),
-                    )
-                    .child(
-                        txt(
-                            lang.tr(match tab {
-                                RightTab::Files => "right.files.hint",
-                                RightTab::Diff => "right.diff.hint",
-                                RightTab::Terminal => "right.terminal.hint",
-                                RightTab::Browser => "right.browser.hint",
-                                RightTab::Extensions => "right.extensions.hint",
-                                RightTab::Federation => "right.federation.hint",
-                                RightTab::Tasks => "right.tasks.hint",
-                            }),
-                            theme::RIGHT_HINT_SIZE,
-                            theme::faint(),
-                        )
-                        .line_height(px(15.0))
-                        .truncate()
-                        .flex_1()
-                        .min_w_0(),
-                    ),
-            )
-            .when_some(hint, |card, hint| {
-                card.child(
-                    txt(hint, theme::RIGHT_HINT_SIZE, theme::faint())
-                        .font_family("monospace")
-                        .flex_none(),
-                )
-            })
+            .child(txt(label, 12.5, theme::text()).min_w_0().text_ellipsis())
             .on_click(cx.listener(move |this, _event, window, cx| {
+                this.clear_right_search(window, cx);
                 this.open_right_tab(tab, window, cx);
                 // A terminal is a text surface: opening it puts the cursor
                 // where the reader's next keystroke will land.
                 if tab == RightTab::Terminal {
                     window.focus(&this.terminal_focus, cx);
                 }
+            }))
+    }
+
+    /// One open document as a Start-grid tile.
+    fn right_start_file_card(
+        &self,
+        index: usize,
+        tab: &FileTab,
+        width: f32,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let label = tab.label();
+        let path = tab.rel.display().to_string();
+        div()
+            .id(SharedString::from(format!("right-start-file-{index}")))
+            .debug_selector(move || format!("right-start-file-{index}"))
+            .w(px(width))
+            .h(px(92.0))
+            .flex_none()
+            .p(px(4.0))
+            .rounded(px(8.0))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(theme::hover())))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(5.0))
+            .tooltip_show_delay(std::time::Duration::from_millis(500))
+            .tooltip(move |window, cx| Tooltip::new(path.clone()).build(window, cx))
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(56.0))
+                    .h(px(56.0))
+                    .rounded(px(12.0))
+                    .border_1()
+                    .border_color(rgb(theme::border_soft()))
+                    .bg(rgb(theme::new_session_fill()))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(icon(file_glyph_for_name(&label), 28.0, theme::muted())),
+            )
+            .child(txt(label, 12.5, theme::text()).min_w_0().text_ellipsis())
+            .on_click(cx.listener(move |this, _event, window, cx| {
+                this.clear_right_search(window, cx);
+                this.focus_tab(index, cx);
             }))
     }
 
@@ -6496,11 +6671,11 @@ impl Shell {
             .id(SharedString::from(format!("file-tab-{index}")))
             .group(group.clone())
             .w(px(width))
-            .h(px(26.0))
+            .h(px(28.0))
             .flex_none()
             .min_w_0()
             .px(px(8.0))
-            .rounded(px(6.0))
+            .rounded(px(theme::RADIUS_SM))
             .flex()
             .flex_row()
             .items_center()
@@ -6513,7 +6688,22 @@ impl Shell {
             // reading, which is what Finder's own tab tooltip shows.
             .tooltip_show_delay(std::time::Duration::from_millis(500))
             .tooltip(move |window, cx| Tooltip::new(full_path.clone()).build(window, cx))
-            .child(icon(file_glyph_for_name(&name), 12.0, theme::faint()).flex_none())
+            .child(match file_type_badge(&name) {
+                Some((badge, color)) => div()
+                    .w(px(18.0))
+                    .h(px(18.0))
+                    .flex_none()
+                    .rounded(px(4.0))
+                    .bg(rgb(color))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(txt(badge, 8.0, 0xFFFFFF).font_weight(FontWeight::BOLD))
+                    .into_any_element(),
+                None => icon(file_glyph_for_name(&name), 12.0, theme::faint())
+                    .flex_none()
+                    .into_any_element(),
+            })
             .child(
                 txt(name, theme::CHIP_SIZE, text_color)
                     .font_weight(weight)
@@ -6546,7 +6736,9 @@ impl Shell {
                     .flex_none()
                     .rounded(px(4.0))
                     .cursor_pointer()
-                    .opacity(0.0)
+                    // The tab on screen shows its close the way the reference
+                    // does; an inactive tab reveals it on hover.
+                    .opacity(if selected { 1.0 } else { 0.0 })
                     .group_hover(group.clone(), |s| s.opacity(1.0))
                     .hover(|s| s.bg(rgb(theme::hover())))
                     .child(icon(IconName::X, 11.0, theme::faint()))
@@ -8891,6 +9083,11 @@ impl Shell {
         cx.notify();
     }
     pub(crate) fn open_file(&mut self, rel: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        // A document's body only exists on the Files tab, so opening one from
+        // anywhere else (a chat reference, a search result, the Start grid) has
+        // to bring that tab up with it. This is the invariant the strip's file
+        // chips rely on: every open file is a tab you can see and return to.
+        self.show_right_tab(RightTab::Files, cx);
         if let Some(index) = self.files.tab_index(rel) {
             self.files.active = Some(index);
             // Reopening a tab shows its remarks if it has any; a file with
@@ -9129,6 +9326,78 @@ impl Shell {
             }
         }
         cx.notify();
+    }
+
+    /// The right-pane items the top search box matches.
+    ///
+    /// The search covers the same things the pane offers: its seven surfaces
+    /// (Files, Browser, Extensions and the rest) and every document opened out
+    /// of Files. A document matches on its name or its workspace-relative path,
+    /// so a search for a directory still finds the file inside it.
+    pub(crate) fn right_search_matches(&self) -> Vec<(RightSearchEntry, String)> {
+        let query = self.right_search_text.trim().to_lowercase();
+        let mut matches = Vec::new();
+        if self.right_search_scope != RightSearchScope::Documents {
+            for tab in RightTab::ALL {
+                let label = self.state.lang.tr(tab.key());
+                if query.is_empty() || label.to_lowercase().contains(&query) {
+                    matches.push((RightSearchEntry::Pane(tab), label));
+                }
+            }
+        }
+        if self.right_search_scope != RightSearchScope::Panes {
+            for (index, tab) in self.files.tabs.iter().enumerate() {
+                let label = tab.label();
+                let rel = tab.rel.display().to_string();
+                if query.is_empty()
+                    || label.to_lowercase().contains(&query)
+                    || rel.to_lowercase().contains(&query)
+                {
+                    matches.push((RightSearchEntry::File(index), label));
+                }
+            }
+        }
+        matches
+    }
+
+    /// Clear the top search field and close its results.
+    pub(crate) fn clear_right_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.right_search_text.clear();
+        self.right_search
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        cx.notify();
+    }
+
+    /// Open one search result: a pane, or the document a file row names.
+    pub(crate) fn open_right_search_result(
+        &mut self,
+        entry: RightSearchEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.clear_right_search(window, cx);
+        match entry {
+            RightSearchEntry::Pane(tab) => self.open_right_tab(tab, window, cx),
+            RightSearchEntry::File(index) => self.focus_tab(index, cx),
+        }
+    }
+
+    /// Enter in the search field opens the first match, the way Finder's own
+    /// search opens the selection when Return is pressed.
+    pub(crate) fn open_first_right_search_result(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // The field lives on the main right pane only; with a pane open there is
+        // no visible search to press Enter in.
+        if self.right.tab.is_some() || self.right_search_text.trim().is_empty() {
+            return;
+        }
+        let Some((entry, _)) = self.right_search_matches().into_iter().next() else {
+            return;
+        };
+        self.open_right_search_result(entry, window, cx);
     }
 
     /// Write the active tab's buffer back to the file it came from.
@@ -9387,6 +9656,32 @@ impl Shell {
 
 /// The glyph a file is drawn with from its name alone, which is what a tab
 /// chip needs: a tab carries a label, not a listing row.
+/// The two-letter badge a tab shows for a file type, and its colour.
+///
+/// The reference draws a coloured file-type square on each document tab (MD,
+/// RS, TS, ...). Naming the type in the tab is what makes a strip of similar
+/// names scannable; a file the languages do not name keeps the generic glyph.
+fn file_type_badge(name: &str) -> Option<(&'static str, u32)> {
+    let ext = name.rsplit_once('.')?.1.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "md" | "markdown" | "mdx" => ("MD", 0x4A90E2),
+        "rs" => ("RS", 0xC2410C),
+        "ts" | "tsx" => ("TS", 0x2563EB),
+        "js" | "jsx" | "mjs" | "cjs" => ("JS", 0xB7791F),
+        "json" | "jsonc" => ("{}", 0x15803D),
+        "toml" | "yaml" | "yml" | "ini" => ("CFG", 0x6B7280),
+        "html" | "htm" => ("<>", 0xEA580C),
+        "css" | "scss" | "less" => ("CSS", 0x0284C7),
+        "sh" | "bash" | "zsh" => ("SH", 0x4D7C0F),
+        "py" => ("PY", 0x2563EB),
+        "go" => ("GO", 0x0891B2),
+        "c" | "h" => ("C", 0x475569),
+        "cpp" | "cc" | "hpp" => ("C+", 0x475569),
+        "svg" | "png" | "jpg" | "jpeg" | "webp" | "gif" => ("IMG", 0x15803D),
+        _ => return None,
+    })
+}
+
 fn file_glyph_for_name(name: &str) -> IconName {
     if files::image_extension(name) {
         return IconName::Image;

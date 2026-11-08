@@ -527,6 +527,12 @@ pub(crate) struct Shell {
     pub(crate) catalog_query_text: String,
     /// The Show All Tabs category filter.
     pub(crate) catalog_filter: super::right_panel::CatalogFilter,
+    /// The right pane's Finder-style search field.
+    pub(crate) right_search: Entity<InputState>,
+    /// What the right-pane search field holds, mirrored for render.
+    pub(crate) right_search_text: String,
+    /// Which right-pane items that field searches.
+    pub(crate) right_search_scope: super::right_panel::RightSearchScope,
     /// The task-name filter on the Automation tasks pane.
     pub(crate) task_search: Entity<InputState>,
     /// The name/id filter on the Installed extensions pane.
@@ -1453,6 +1459,11 @@ impl Shell {
                 .placeholder(crate::i18n::tr(lang, "right.tabs.search"))
                 .clean_on_escape()
         });
+        let right_search = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(crate::i18n::tr(lang, "right.search.placeholder"))
+                .clean_on_escape()
+        });
         let task_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "task.searchPlaceholder"))
         });
@@ -1619,6 +1630,24 @@ impl Shell {
                         this.catalog_query_text = this.catalog_query.read(cx).value().to_string();
                         cx.notify();
                     }
+                },
+            ),
+            cx.subscribe_in(
+                &right_search,
+                window,
+                |this: &mut Shell,
+                 _state: &Entity<InputState>,
+                 event: &InputEvent,
+                 window: &mut Window,
+                 cx: &mut Context<Shell>| match event {
+                    InputEvent::Change => {
+                        this.right_search_text = this.right_search.read(cx).value().to_string();
+                        cx.notify();
+                    }
+                    InputEvent::PressEnter { .. } => {
+                        this.open_first_right_search_result(window, cx);
+                    }
+                    _ => {}
                 },
             ),
             cx.subscribe_in(
@@ -1987,6 +2016,9 @@ impl Shell {
             catalog_query,
             catalog_query_text: String::new(),
             catalog_filter: super::right_panel::CatalogFilter::All,
+            right_search,
+            right_search_text: String::new(),
+            right_search_scope: super::right_panel::RightSearchScope::All,
             task_search,
             extension_search,
             task_name,

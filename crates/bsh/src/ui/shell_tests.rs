@@ -18889,66 +18889,6 @@ fn a_patch_file_opens_as_a_comparison(cx: &mut TestAppContext) {
     );
 }
 
-/// The strip is a real tab list, not a badge for the pane already open: every
-/// pane the panel can show is one press away, Diff included even though the
-/// Start screen no longer offers it as a card. A comparison needs a file, so a
-/// file row and a step's View diff remain its material doors; the strip opens
-/// the pane itself.
-#[gpui::test]
-fn the_right_strip_offers_the_diff_pane(cx: &mut TestAppContext) {
-    init_test_app(cx);
-    let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let mut state = state_with_turns("strip-diff", 1);
-        tests_pin_reference_defaults(&mut state);
-        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
-        Harness { shell }
-    });
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    // The panel starts collapsed; open it and pick Files, so the strip is
-    // showing one pane and must offer the others.
-    let toggle = cx
-        .debug_bounds("hdr-show-right-panel")
-        .expect("the header carries the right panel's toggle");
-    cx.simulate_click(toggle.center(), Modifiers::default());
-    draw_until(cx, "the Start screen renders", DRAW_UNTIL_MAX, |cx| {
-        cx.debug_bounds("right-card-right.tab.files").is_some()
-    });
-    let card = cx
-        .debug_bounds("right-card-right.tab.files")
-        .expect("the Files card renders");
-    cx.simulate_click(card.center(), Modifiers::default());
-    draw_until(cx, "the Files pane opens", DRAW_UNTIL_MAX, |cx| {
-        cx.update(|_, cx| shell.read(cx).right.tab == Some(RightTab::Files))
-    });
-
-    // The strip offers Diff while Files holds the body.
-    draw_until(cx, "the strip offers Diff", DRAW_UNTIL_MAX, |cx| {
-        cx.debug_bounds("right-pane-diff").is_some()
-    });
-    let chip = cx
-        .debug_bounds("right-pane-diff")
-        .expect("the strip's Diff chip");
-    cx.simulate_click(chip.center(), Modifiers::default());
-    draw_until(cx, "the comparison pane opens", DRAW_UNTIL_MAX, |cx| {
-        cx.update(|_, cx| shell.read(cx).right.tab == Some(RightTab::Diff))
-    });
-    assert!(
-        cx.update(|_, cx| shell.read(cx).right.open),
-        "the panel stays open on the pane the strip chose"
-    );
-    // Nothing is open yet, and the empty state says how a comparison arrives
-    // rather than drawing a blank box.
-    assert!(
-        cx.debug_bounds("diff-pane").is_some(),
-        "the Diff pane's body renders"
-    );
-    assert!(
-        cx.debug_bounds("diff-empty-hint").is_some(),
-        "with the hint that names its entry points"
-    );
-}
-
 /// The turn-focused pane lists the files that turn wrote, expands a recorded
 /// edit to its unified rows, and says plainly when a write recorded no old
 /// text. The list comes from the tool requests, so no VCS and no invented
@@ -22394,84 +22334,6 @@ fn closing_other_and_all_tabs_act_on_the_documents(cx: &mut TestAppContext) {
     assert_eq!(tab, None, "and returns the panel to Start");
 }
 
-/// At the panel's default width two documents and every launcher chip cannot
-/// fit, so the strip keeps the documents and moves the chips into the catalog.
-#[gpui::test]
-fn a_crowded_strip_moves_the_extra_tabs_into_the_catalog(cx: &mut TestAppContext) {
-    init_test_app(cx);
-    let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let state = state_with_workspace_tree("right-tab-overflow");
-        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
-        Harness { shell }
-    });
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    cx.update(|window, cx| {
-        shell.update(cx, |this, cx| {
-            this.open_right_tab(crate::ui::right_panel::RightTab::Files, window, cx);
-        });
-    });
-    for name in ["README.md", "Cargo.toml"] {
-        cx.update(|window, cx| {
-            shell.update(cx, |this, cx| {
-                this.open_file(std::path::Path::new(name), window, cx);
-            });
-        });
-    }
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-
-    assert!(
-        cx.debug_bounds("right-tab-overflow").is_some(),
-        "the strip cannot fit the documents and every chip, so the catalog stands in"
-    );
-    assert!(
-        cx.debug_bounds("file-tab-README.md").is_some()
-            && cx.debug_bounds("file-tab-Cargo.toml").is_some(),
-        "the documents are the tabs that stay visible"
-    );
-    assert!(
-        cx.debug_bounds("right-pane-tasks").is_none(),
-        "a launcher chip with no room moves into the catalog instead of overflowing"
-    );
-    // The complaint this shape closes: nothing the strip draws may pass the
-    // panel's right edge, and the controls after it stay inside the header.
-    let panel = cx.debug_bounds("right-panel").expect("the panel renders");
-    let right_edge = f32::from(panel.origin.x) + f32::from(panel.size.width);
-    for id in [
-        "file-tab-README.md",
-        "file-tab-Cargo.toml",
-        "right-tab-overflow",
-        "right-new-tab",
-        "right-maximize",
-        "right-close",
-    ] {
-        let bounds = cx
-            .debug_bounds(id)
-            .unwrap_or_else(|| panic!("{id} renders in the strip"));
-        assert!(
-            f32::from(bounds.origin.x) + f32::from(bounds.size.width) <= right_edge + 0.5,
-            "{id} must stop at the panel's right edge: {bounds:?} vs {right_edge}"
-        );
-    }
-
-    // The trigger is a real control, and choosing a document from its catalog
-    // focuses that document.
-    let overflow = cx
-        .debug_bounds("right-tab-overflow")
-        .expect("the catalog trigger renders");
-    cx.simulate_click(overflow.center(), Modifiers::default());
-    draw_until(cx, "the catalog opens", DRAW_UNTIL_MAX, |cx| {
-        cx.debug_bounds("tab-catalog-file-0").is_some()
-    });
-    let readme = cx
-        .debug_bounds("tab-catalog-file-0")
-        .expect("the catalog lists the documents");
-    cx.simulate_click(readme.center(), Modifiers::default());
-    draw_until(cx, "the catalog's choice lands", DRAW_UNTIL_MAX, |cx| {
-        cx.update(|_, cx| shell.read(cx).files.active == Some(0))
-    });
-}
-
 /// Finder's Show All Tabs puts every open tab in one overview, and choosing a
 /// card takes the body there with one press.
 #[gpui::test]
@@ -22672,14 +22534,13 @@ fn a_catalog_search_filters_the_tabs_by_name(cx: &mut TestAppContext) {
     });
 }
 
-/// The header's catalogue control is the visible door to the searchable
-/// overview, so the search box and category filters are not hidden behind a
-/// right-click.
+/// A document tile on Start opens the file as a tab, exactly like pressing its
+/// chip in the strip.
 #[gpui::test]
-fn the_header_catalog_control_opens_the_searchable_overview(cx: &mut TestAppContext) {
+fn a_start_document_tile_opens_the_file_as_a_tab(cx: &mut TestAppContext) {
     init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let state = state_with_workspace_tree("right-catalog-control");
+        let state = state_with_workspace_tree("right-start-doc-tab");
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
     });
@@ -22695,26 +22556,154 @@ fn the_header_catalog_control_opens_the_searchable_overview(cx: &mut TestAppCont
             this.open_file(std::path::Path::new("README.md"), window, cx);
         });
     });
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-
-    let catalog = cx
-        .debug_bounds("right-catalog")
-        .expect("the header carries the catalogue control");
-    cx.simulate_click(catalog.center(), Modifiers::default());
-    draw_until(cx, "the searchable catalogue opens", DRAW_UNTIL_MAX, |cx| {
-        cx.debug_bounds("tab-catalog").is_some()
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| this.close_right_pane(cx));
     });
-    for id in [
-        "tab-catalog-search",
-        "tab-catalog-filter-all",
-        "tab-catalog-filter-documents",
-        "tab-catalog-filter-panes",
-    ] {
-        assert!(
-            cx.debug_bounds(id).is_some(),
-            "{id} is on screen when the catalogue opens"
-        );
+    draw_until(cx, "the document tile renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("right-start-file-0").is_some()
+    });
+    assert!(
+        cx.debug_bounds("file-tab-README.md").is_some(),
+        "the open file is also a tab in the strip while Start is showing"
+    );
+    let tile = cx
+        .debug_bounds("right-start-file-0")
+        .expect("the document tile")
+        .center();
+    cx.simulate_click(tile, Modifiers::default());
+    draw_until(cx, "the document opens as a tab", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| {
+            let shell = shell.read(cx);
+            shell.right.tab == Some(crate::ui::right_panel::RightTab::Files)
+                && shell.files.active == Some(0)
+        }) && cx.debug_bounds("file-tab-README.md").is_some()
+            && cx.debug_bounds("right-search-field").is_none()
+    });
+}
+
+/// Opening a file from another pane brings the Files tab up and adds the
+/// document's own tab; a document never opens into a pane that cannot show it.
+#[gpui::test]
+fn opening_a_file_from_another_pane_adds_its_tab(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("right-open-from-pane");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(crate::ui::right_panel::RightTab::Browser, window, cx);
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_file(std::path::Path::new("README.md"), window, cx);
+        });
+    });
+    draw_until(cx, "the file tab appears", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| {
+            let shell = shell.read(cx);
+            shell.right.tab == Some(crate::ui::right_panel::RightTab::Files)
+                && shell.files.active == Some(0)
+        }) && cx.debug_bounds("file-tab-README.md").is_some()
+    });
+}
+
+/// The Start screen is an Applications-style grid: tabs filter the categories,
+/// and the search field filters the grid in place rather than opening a list.
+#[gpui::test]
+fn the_start_grid_filters_by_category_and_search(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("right-start-grid");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(crate::ui::right_panel::RightTab::Files, window, cx);
+        });
+    });
+    for name in ["README.md", "Cargo.toml"] {
+        cx.update(|window, cx| {
+            shell.update(cx, |this, cx| {
+                this.open_file(std::path::Path::new(name), window, cx);
+            });
+        });
     }
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| this.close_right_pane(cx));
+    });
+    draw_until(cx, "the Start grid renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("right-start-grid").is_some()
+    });
+    assert!(
+        cx.debug_bounds("right-card-right.tab.files").is_some()
+            && cx.debug_bounds("right-start-file-0").is_some(),
+        "the grid starts with the panes and the documents"
+    );
+
+    let documents = cx
+        .debug_bounds("right-start-filter-documents")
+        .expect("the Documents category renders")
+        .center();
+    cx.simulate_click(documents, Modifiers::default());
+    draw_until(cx, "Documents hides the pane tiles", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("right-card-right.tab.files").is_none()
+            && cx.debug_bounds("right-start-file-0").is_some()
+    });
+
+    let panes = cx
+        .debug_bounds("right-start-filter-panes")
+        .expect("the Panes category renders")
+        .center();
+    cx.simulate_click(panes, Modifiers::default());
+    draw_until(cx, "Panes hides the document tiles", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("right-card-right.tab.files").is_some()
+            && cx.debug_bounds("right-start-file-0").is_none()
+    });
+
+    let all = cx
+        .debug_bounds("right-start-filter-all")
+        .expect("the All category renders")
+        .center();
+    cx.simulate_click(all, Modifiers::default());
+    draw_until(cx, "All shows both again", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("right-card-right.tab.files").is_some()
+            && cx.debug_bounds("right-start-file-0").is_some()
+    });
+
+    let field = cx
+        .debug_bounds("right-search-field")
+        .expect("the search field");
+    cx.simulate_click(field.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.simulate_keystrokes("brow");
+    draw_until(cx, "the grid narrows to Browser", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("right-card-right.tab.browser").is_some()
+            && cx.debug_bounds("right-card-right.tab.files").is_none()
+            && cx.debug_bounds("right-start-file-0").is_none()
+    });
+    // Choosing a tile opens the pane in the tab strip, exactly as the pane
+    // cards did before; the search belongs to the main right pane, so it goes
+    // away with the Start screen.
+    let browser = cx
+        .debug_bounds("right-card-right.tab.browser")
+        .expect("the Browser tile")
+        .center();
+    cx.simulate_click(browser, Modifiers::default());
+    draw_until(cx, "Browser opens in the tab strip", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| {
+            shell.read(cx).right.tab == Some(crate::ui::right_panel::RightTab::Browser)
+        }) && cx.debug_bounds("right-tab").is_some()
+            && cx.debug_bounds("right-search-field").is_none()
+    });
 }
 
 /// The catalogue's category tabs show one kind of card at a time: documents,

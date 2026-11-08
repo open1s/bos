@@ -985,6 +985,8 @@
 "right.tabs.all": "All"
 "right.tabs.documents": "Documents"
 "right.tabs.search": "Search tabs"
+"right.search.placeholder": "Search panes and files"
+"right.search.noResults": "No matches"
 "right.tabs.noResults": "No tabs match"
 "right.newTab": "New tab"
 "right.close": "Close Tab"

@@ -782,16 +782,6 @@ pub(crate) fn right_panel_width_at(available: f32, stored: Option<f32>) -> f32 {
 /// switching reader never re-measures the list.
 pub(crate) const RIGHT_ROW_H: f32 = 28.0;
 
-/// The Start card's measured min-height: the reference's own `min-height:56px`
-/// on its guide entry, which is what sets the card's box before its 14/20
-/// padding adds to it.
-pub(crate) const RIGHT_CARD_H: f32 = 56.0;
-
-/// The Start card's measured width. The reference pins its guide entry to
-/// 380px inside a centred column, so the cards read as a stack of plates
-/// rather than as rows filling whatever the panel happens to be.
-pub(crate) const RIGHT_CARD_W: f32 = 380.0;
-
 /// The panel's header and tab-bar height.
 pub(crate) const RIGHT_BAR_H: f32 = 40.0;
 

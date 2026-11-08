@@ -979,6 +979,8 @@
 "right.tabs.all": "全部"
 "right.tabs.documents": "文档"
 "right.tabs.search": "搜索标签页"
+"right.search.placeholder": "搜索面板和文件"
+"right.search.noResults": "没有匹配项"
 "right.tabs.noResults": "没有匹配的标签页"
 "right.newTab": "新建标签页"
 "right.close": "关闭标签页"
