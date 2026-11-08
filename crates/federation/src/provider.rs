@@ -77,6 +77,7 @@ impl CapabilityProvider for RemoteCapabilityProvider {
                 .or_else(|| call.input.get("uri"))
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string),
+            workspace: Some(call.context.workspace.to_string()),
         };
         self.federation
             .invoke_scoped(

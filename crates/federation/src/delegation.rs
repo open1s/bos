@@ -99,6 +99,12 @@ pub struct DelegationRequest {
     pub allow_sub_delegation: bool,
     /// What a result must satisfy, when the caller states it.
     pub result_contract: Option<String>,
+    /// The trace this delegation belongs to, when the caller supplied one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    /// The caller's span.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span_id: Option<String>,
 }
 
 /// The authoritative record of one delegation.
@@ -331,6 +337,13 @@ impl DelegationStore {
         request.parent = Some(parent.clone());
         if request.allow_sub_delegation && !parent_record.request.allow_sub_delegation {
             request.allow_sub_delegation = false;
+        }
+        // A sub-delegation stays in the caller's trace unless it names its own.
+        if request.trace_id.is_none() {
+            request.trace_id = parent_record.request.trace_id.clone();
+        }
+        if request.span_id.is_none() {
+            request.span_id = parent_record.request.span_id.clone();
         }
         let origin = parent_record.origin.clone().or(origin);
         self.create_for(request, origin, now_ms)
@@ -587,6 +600,8 @@ mod tests {
             deadline_ms: deadline,
             allow_sub_delegation: true,
             result_contract: None,
+            trace_id: None,
+            span_id: None,
         }
     }
 
@@ -735,6 +750,42 @@ mod tests {
         assert_eq!(
             store.record(&theirs).expect("theirs").state,
             DelegationState::Accepted
+        );
+    }
+
+    /// A child joins the parent's trace unless it names its own.
+    #[test]
+    fn a_sub_delegation_inherits_the_parent_trace() {
+        let mut store = DelegationStore::new();
+        let target = NodeId::new("node-a").expect("node id");
+        let mut parent_request = request("d-parent", &target, None);
+        parent_request.trace_id = Some("trace-1".to_string());
+        parent_request.span_id = Some("span-parent".to_string());
+        let parent = store.create(parent_request, 1_000).expect("parent");
+        store
+            .transition(&parent, DelegationState::Accepted, 1_000)
+            .expect("accepted");
+
+        let inherited = store
+            .delegate_for(&parent, request("d-child", &target, None), None, 1_000)
+            .expect("child");
+        let record = store.record(&inherited).expect("record");
+        assert_eq!(record.request.trace_id.as_deref(), Some("trace-1"));
+        assert_eq!(record.request.span_id.as_deref(), Some("span-parent"));
+
+        let mut own = request("d-own", &target, None);
+        own.trace_id = Some("trace-2".to_string());
+        let explicit = store
+            .delegate_for(&parent, own, None, 1_000)
+            .expect("own trace");
+        assert_eq!(
+            store
+                .record(&explicit)
+                .expect("record")
+                .request
+                .trace_id
+                .as_deref(),
+            Some("trace-2")
         );
     }
 }

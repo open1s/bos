@@ -22,6 +22,19 @@ pub const PROTOCOL_MAJOR: u32 = 1;
 /// The envelope schema generation this build writes.
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// Optional protocol features this build implements.
+///
+/// A feature is additive: a peer that does not know one ignores it, and a
+/// feature never widens authorization by itself.
+pub const FEATURES: &[&str] = &[
+    "invoke",
+    "delegate",
+    "resource",
+    "knowledge",
+    "tasks",
+    "coordinator",
+];
+
 /// The oldest schema generation this build still accepts.
 pub const SUPPORTED_SCHEMA_MIN: u32 = 1;
 

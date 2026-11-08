@@ -53,6 +53,8 @@ fn request(
         deadline_ms: None,
         allow_sub_delegation: allow_sub,
         result_contract: None,
+        trace_id: None,
+        span_id: None,
     }
 }
 

@@ -40,6 +40,12 @@ pub struct Grant {
     /// A selector is an exact string or a prefix ending in '*'.
     #[serde(default)]
     pub resources: Vec<String>,
+    /// Workspace selectors this grant permits; empty means every workspace.
+    ///
+    /// A call that carries no workspace fails closed under a workspace-scoped
+    /// grant: absence is not "any".
+    #[serde(default)]
+    pub workspaces: Vec<String>,
     /// When it was granted, in milliseconds since the Unix epoch.
     pub granted_at_ms: u64,
     /// When it stops being valid.
@@ -355,6 +361,31 @@ impl PeerStore {
         now_ms: u64,
         expires_at_ms: Option<u64>,
     ) -> Result<(), PeerError> {
+        self.grant_scoped_in(
+            node,
+            capability,
+            operations,
+            resources,
+            Vec::new(),
+            now_ms,
+            expires_at_ms,
+        )
+    }
+
+    /// Grant a capability with operation, resource and workspace selectors.
+    // The three selector lists are the scope; keeping them explicit avoids a
+    // second parallel struct next to `Grant`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn grant_scoped_in(
+        &mut self,
+        node: &NodeId,
+        capability: CapabilityId,
+        operations: Vec<String>,
+        resources: Vec<String>,
+        workspaces: Vec<String>,
+        now_ms: u64,
+        expires_at_ms: Option<u64>,
+    ) -> Result<(), PeerError> {
         let record = self
             .peers
             .get_mut(node)
@@ -364,10 +395,32 @@ impl PeerStore {
             capability,
             operations,
             resources,
+            workspaces,
             granted_at_ms: now_ms,
             expires_at_ms,
         });
         Ok(())
+    }
+
+    /// Grants that still rely on the legacy "no selector means any" rule.
+    ///
+    /// A report an operator can act on: migrate each with `grant_scoped_in`, or
+    /// accept that it admits every operation, resource and workspace.
+    pub fn unscoped_grants(&self) -> Vec<(NodeId, CapabilityId)> {
+        self.peers
+            .values()
+            .flat_map(|record| {
+                record
+                    .grants
+                    .iter()
+                    .filter(|grant| {
+                        grant.operations.is_empty()
+                            && grant.resources.is_empty()
+                            && grant.workspaces.is_empty()
+                    })
+                    .map(|grant| (record.node.clone(), grant.capability.clone()))
+            })
+            .collect()
     }
 
     /// Remove one grant.
@@ -409,7 +462,7 @@ impl PeerStore {
         capability: &CapabilityId,
         now_ms: u64,
     ) -> Result<(), CapabilityError> {
-        self.authorize_scoped(node, capability, now_ms, None, None)
+        self.authorize_scoped(node, capability, now_ms, None, None, None)
     }
 
     /// Authorize a scoped call: the capability AND the operation/resource it
@@ -421,6 +474,7 @@ impl PeerStore {
         now_ms: u64,
         operation: Option<&str>,
         resource: Option<&str>,
+        workspace: Option<&str>,
     ) -> Result<(), CapabilityError> {
         let Some(record) = self.peers.get(node) else {
             return Err(denied(format!("peer {node} is not enrolled")));
@@ -439,6 +493,9 @@ impl PeerStore {
                 })
                 && grant.resources.iter().all(|pattern| {
                     resource.is_some_and(|resource| selector_allows(pattern, resource))
+                })
+                && grant.workspaces.iter().all(|pattern| {
+                    workspace.is_some_and(|workspace| selector_allows(pattern, workspace))
                 })
         });
         if !granted {
@@ -559,9 +616,15 @@ mod tests {
                 &capability(),
                 1_000,
                 Some("write"),
-                Some("/etc/passwd")
+                Some("/etc/passwd"),
+                None
             )
             .is_ok());
+        assert_eq!(
+            store.unscoped_grants().len(),
+            1,
+            "the legacy grant is reported"
+        );
     }
 
     /// A scoped grant admits only the listed operations/resources, and refuses
@@ -579,13 +642,18 @@ mod tests {
                 None,
             )
             .expect("grant");
+        assert!(
+            store.unscoped_grants().is_empty(),
+            "a scoped grant is not legacy"
+        );
         assert!(store
             .authorize_scoped(
                 &peer,
                 &capability(),
                 1_000,
                 Some("read"),
-                Some("/workspace/notes.txt")
+                Some("/workspace/notes.txt"),
+                None
             )
             .is_ok());
         assert!(
@@ -595,7 +663,8 @@ mod tests {
                     &capability(),
                     1_000,
                     Some("write"),
-                    Some("/workspace/notes.txt")
+                    Some("/workspace/notes.txt"),
+                    None
                 )
                 .is_err(),
             "an unlisted operation is denied"
@@ -607,16 +676,63 @@ mod tests {
                     &capability(),
                     1_000,
                     Some("read"),
-                    Some("/etc/passwd")
+                    Some("/etc/passwd"),
+                    None
                 )
                 .is_err(),
             "an unlisted resource is denied"
         );
         assert!(
             store
-                .authorize_scoped(&peer, &capability(), 1_000, None, None)
+                .authorize_scoped(&peer, &capability(), 1_000, None, None, None)
                 .is_err(),
             "a scoped grant fails closed when the call names no scope"
+        );
+    }
+
+    /// A workspace selector is one more dimension of the same grant.
+    #[test]
+    fn a_workspace_scoped_grant_refuses_another_workspace() {
+        let (mut store, peer) = store();
+        store
+            .grant_scoped_in(
+                &peer,
+                capability(),
+                vec!["read".to_string()],
+                Vec::new(),
+                vec!["ws:research".to_string()],
+                1_000,
+                None,
+            )
+            .expect("grant");
+        assert!(store
+            .authorize_scoped(
+                &peer,
+                &capability(),
+                1_000,
+                Some("read"),
+                None,
+                Some("ws:research")
+            )
+            .is_ok());
+        assert!(
+            store
+                .authorize_scoped(
+                    &peer,
+                    &capability(),
+                    1_000,
+                    Some("read"),
+                    None,
+                    Some("ws:other")
+                )
+                .is_err(),
+            "another workspace is denied"
+        );
+        assert!(
+            store
+                .authorize_scoped(&peer, &capability(), 1_000, Some("read"), None, None)
+                .is_err(),
+            "a call with no workspace fails closed"
         );
     }
 

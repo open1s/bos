@@ -673,9 +673,40 @@ pub(crate) fn list_with(context: &TaskToolsContext, args: &Value) -> Result<Valu
 ///
 /// The child is the existing subagent tier: policy, slots and the runner are
 /// the subagent tool's own path, and the graph only decides order and
-/// concurrency.
+/// concurrency. Dropping the executor mid-task (a cancelled turn) interrupts
+/// the child it was waiting on, so cancellation propagates through the graph.
 struct SubagentGraphExecutor {
     subagents: Arc<crate::caps::SubagentContext>,
+}
+
+/// Interrupt a child run when the waiting future is dropped.
+struct ChildGuard {
+    subagents: Arc<crate::caps::SubagentContext>,
+    run: String,
+    armed: bool,
+}
+
+impl ChildGuard {
+    fn new(subagents: Arc<crate::caps::SubagentContext>, run: String) -> Self {
+        Self {
+            subagents,
+            run,
+            armed: true,
+        }
+    }
+
+    /// The child finished on its own: do not interrupt it on drop.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.subagents.interrupt_run(&self.run);
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -688,6 +719,7 @@ impl federation::TaskExecutor for SubagentGraphExecutor {
             .subagents
             .spawn_child(&task.id.to_string(), &task.objective)
             .map_err(|error| format!("{error}"))?;
+        let mut guard = ChildGuard::new(Arc::clone(&self.subagents), run.clone());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
         loop {
             let Some(snapshot) = self.subagents.snapshot(&run) else {
@@ -695,6 +727,7 @@ impl federation::TaskExecutor for SubagentGraphExecutor {
             };
             match snapshot.state {
                 crate::extension::runs::RunState::Succeeded => {
+                    guard.disarm();
                     return Ok(federation::TaskOutcome::value(serde_json::json!({
                         "run": run,
                         "text": snapshot.result,
@@ -703,6 +736,7 @@ impl federation::TaskExecutor for SubagentGraphExecutor {
                 crate::extension::runs::RunState::Failed
                 | crate::extension::runs::RunState::Cancelled
                 | crate::extension::runs::RunState::Unknown => {
+                    guard.disarm();
                     return Err(snapshot
                         .error
                         .unwrap_or_else(|| "the child run failed".to_string()));
@@ -711,7 +745,7 @@ impl federation::TaskExecutor for SubagentGraphExecutor {
                 | crate::extension::runs::RunState::Running => {}
             }
             if std::time::Instant::now() >= deadline {
-                let _ = self.subagents.interrupt_run(&run);
+                // Dropping the armed guard interrupts the child.
                 return Err("the child run timed out".to_string());
             }
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;

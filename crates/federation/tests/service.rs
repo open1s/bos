@@ -273,6 +273,91 @@ async fn a_granted_call_crosses_both_kernels() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_workspace_scope_is_enforced_on_both_sides() {
+    let pair = pair().await;
+    let now = capability::unix_ms();
+    let research = capability::WorkspaceId::new("ws:research").expect("a workspace");
+    {
+        let mut peers = pair.provider_peers.write().expect("peers");
+        peers
+            .grant_scoped_in(
+                &pair.caller_id,
+                capability("echo"),
+                vec!["echo".to_string()],
+                Vec::new(),
+                vec!["ws:research".to_string()],
+                now,
+                None,
+            )
+            .expect("a workspace-scoped grant");
+    }
+    {
+        let mut peers = pair.caller_peers.write().expect("peers");
+        peers
+            .grant_scoped_in(
+                &pair.provider_id,
+                capability("echo"),
+                vec!["echo".to_string()],
+                Vec::new(),
+                vec!["ws:research".to_string()],
+                now,
+                None,
+            )
+            .expect("a workspace-scoped grant");
+    }
+    let mut context = context();
+    context.workspace = research.clone();
+    let scope = federation::InvocationScope {
+        operation: Some("echo".to_string()),
+        resource: None,
+        workspace: Some(research.to_string()),
+    };
+    pair.caller
+        .invoke_scoped(
+            &pair.provider_id,
+            &capability("echo"),
+            json!({ "value": 1 }),
+            Some(&scope),
+            &context,
+        )
+        .await
+        .expect("the matching workspace is allowed");
+
+    let wrong = federation::InvocationScope {
+        workspace: Some("ws:other".to_string()),
+        ..scope.clone()
+    };
+    let error = pair
+        .caller
+        .invoke_scoped(
+            &pair.provider_id,
+            &capability("echo"),
+            json!({ "value": 1 }),
+            Some(&wrong),
+            &context,
+        )
+        .await
+        .expect_err("another workspace is denied");
+    assert!(matches!(error, CapabilityError::Denied { .. }), "{error:?}");
+
+    let unnamed = federation::InvocationScope {
+        workspace: None,
+        ..scope
+    };
+    let error = pair
+        .caller
+        .invoke_scoped(
+            &pair.provider_id,
+            &capability("echo"),
+            json!({ "value": 1 }),
+            Some(&unnamed),
+            &context,
+        )
+        .await
+        .expect_err("a call with no workspace fails closed");
+    assert!(matches!(error, CapabilityError::Denied { .. }), "{error:?}");
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_coordinator_administers_membership_without_granting_authority() {
     use federation::coordinator::{Coordinator, MemberRecord, MemberStatus};
 
@@ -391,6 +476,7 @@ async fn a_scoped_grant_checks_the_operation_and_resource() {
     let scope = federation::InvocationScope {
         operation: Some("read".to_string()),
         resource: Some("/ws/notes.txt".to_string()),
+        workspace: None,
     };
     let output = pair
         .caller
@@ -408,6 +494,7 @@ async fn a_scoped_grant_checks_the_operation_and_resource() {
     let wrong = federation::InvocationScope {
         operation: Some("write".to_string()),
         resource: Some("/ws/notes.txt".to_string()),
+        workspace: None,
     };
     let error = pair
         .caller
@@ -708,6 +795,8 @@ async fn both_sides_audit_a_delegation_and_its_cancellation() {
         deadline_ms: None,
         allow_sub_delegation: false,
         result_contract: None,
+        trace_id: None,
+        span_id: None,
     };
     pair.caller
         .delegate(&pair.provider_id, request, &context())
@@ -759,6 +848,8 @@ async fn both_sides_audit_a_delegation_and_its_cancellation() {
         deadline_ms: None,
         allow_sub_delegation: false,
         result_contract: None,
+        trace_id: None,
+        span_id: None,
     };
     pair.caller
         .delegate(&pair.provider_id, request, &context())
@@ -998,6 +1089,8 @@ async fn a_structured_delegation_is_executed_by_the_target() {
         result_contract: Some(
             json!({ "capability": "builtin/echo", "input": { "value": 9 } }).to_string(),
         ),
+        trace_id: None,
+        span_id: None,
     };
 
     let accepted = pair
@@ -1044,6 +1137,8 @@ async fn a_contract_outside_the_delegated_scope_is_refused() {
         deadline_ms: None,
         allow_sub_delegation: false,
         result_contract: Some(json!({ "capability": "builtin/other", "input": {} }).to_string()),
+        trace_id: None,
+        span_id: None,
     };
 
     let record = pair
@@ -1082,6 +1177,8 @@ async fn an_objective_only_delegation_stays_accepted() {
         deadline_ms: None,
         allow_sub_delegation: false,
         result_contract: None,
+        trace_id: None,
+        span_id: None,
     };
 
     let record = pair

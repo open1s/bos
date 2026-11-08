@@ -29,6 +29,8 @@ fn request(
         deadline_ms: None,
         allow_sub_delegation,
         result_contract: None,
+        trace_id: None,
+        span_id: None,
     }
 }
 

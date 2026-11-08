@@ -155,6 +155,8 @@ async fn an_objective_delegation_is_claimed_and_settled() {
                 deadline_ms: None,
                 allow_sub_delegation: false,
                 result_contract: None,
+                trace_id: None,
+                span_id: None,
             },
             &context(),
         )

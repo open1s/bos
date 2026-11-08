@@ -311,6 +311,8 @@ pub struct AdmissionLimits {
     pub control_per_peer: usize,
     /// Concurrent inbound resource streams.
     pub resource_streams: usize,
+    /// Aggregate bytes of in-flight frames per peer.
+    pub queued_bytes_per_peer: u64,
 }
 
 impl Default for AdmissionLimits {
@@ -321,6 +323,7 @@ impl Default for AdmissionLimits {
             control_global: MAX_IN_FLIGHT_CONTROL,
             control_per_peer: MAX_IN_FLIGHT_CONTROL_PER_PEER,
             resource_streams: MAX_RESOURCE_STREAMS,
+            queued_bytes_per_peer: 8 * 1024 * 1024,
         }
     }
 }
@@ -336,6 +339,75 @@ fn handler_class(kind: &str) -> HandlerClass {
         HandlerClass::Invocation
     } else {
         HandlerClass::Control
+    }
+}
+
+/// The largest frame one message kind may carry.
+///
+/// The frame ceiling in the transport bounds every message; these are the
+/// tighter per-kind budgets, so a resource chunk may be large while an
+/// invoke or a control message stays small.
+pub fn kind_payload_limit(kind: &str) -> u64 {
+    match kind {
+        "invoke" | "result" => 256 * 1024,
+        "resource" => 1024 * 1024,
+        "knowledge_query" | "knowledge_publication" => 512 * 1024,
+        "task_create" => 128 * 1024,
+        "delegate" => 64 * 1024,
+        _ => 64 * 1024,
+    }
+}
+
+#[derive(Clone)]
+struct ByteAdmission {
+    per_peer: Arc<Mutex<HashMap<NodeId, u64>>>,
+    limit: u64,
+}
+
+impl ByteAdmission {
+    fn new(limit: u64) -> Self {
+        Self {
+            per_peer: Arc::new(Mutex::new(HashMap::new())),
+            limit: limit.max(1),
+        }
+    }
+
+    fn try_reserve(&self, peer: &NodeId, bytes: u64) -> Option<BytePermit> {
+        let mut used = self
+            .per_peer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = used.get(peer).copied().unwrap_or(0);
+        if current.saturating_add(bytes) > self.limit {
+            return None;
+        }
+        used.insert(peer.clone(), current.saturating_add(bytes));
+        Some(BytePermit {
+            per_peer: Arc::clone(&self.per_peer),
+            peer: peer.clone(),
+            bytes,
+        })
+    }
+}
+
+struct BytePermit {
+    per_peer: Arc<Mutex<HashMap<NodeId, u64>>>,
+    peer: NodeId,
+    bytes: u64,
+}
+
+impl Drop for BytePermit {
+    fn drop(&mut self) {
+        let mut used = self
+            .per_peer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(current) = used.get_mut(&self.peer) {
+            *current = current.saturating_sub(self.bytes);
+            if *current == 0 {
+                used.remove(&self.peer);
+            }
+        }
     }
 }
 
@@ -355,7 +427,7 @@ impl ClassAdmission {
         }
     }
 
-    fn try_admit(&self, peer: &NodeId) -> Option<AdmissionPermit> {
+    fn try_admit(&self, peer: &NodeId) -> Option<ClassPermit> {
         let mut counts = self
             .per_peer
             .lock()
@@ -365,7 +437,7 @@ impl ClassAdmission {
         }
         let permit = Arc::clone(&self.global).try_acquire_owned().ok()?;
         *counts.entry(peer.clone()).or_insert(0) += 1;
-        Some(AdmissionPermit {
+        Some(ClassPermit {
             per_peer: Arc::clone(&self.per_peer),
             peer: peer.clone(),
             _global: permit,
@@ -383,6 +455,7 @@ impl ClassAdmission {
 struct Admission {
     invocation: ClassAdmission,
     control: ClassAdmission,
+    bytes: ByteAdmission,
 }
 
 impl Admission {
@@ -390,24 +463,30 @@ impl Admission {
         Self {
             invocation: ClassAdmission::new(limits.invocation_global, limits.invocation_per_peer),
             control: ClassAdmission::new(limits.control_global, limits.control_per_peer),
+            bytes: ByteAdmission::new(limits.queued_bytes_per_peer),
         }
     }
 
-    fn try_admit(&self, peer: &NodeId, kind: &str) -> Option<AdmissionPermit> {
-        match handler_class(kind) {
+    fn try_admit(&self, peer: &NodeId, kind: &str, bytes: u64) -> Option<AdmissionPermit> {
+        let class = match handler_class(kind) {
             HandlerClass::Invocation => self.invocation.try_admit(peer),
             HandlerClass::Control => self.control.try_admit(peer),
-        }
+        }?;
+        let reserved = self.bytes.try_reserve(peer, bytes)?;
+        Some(AdmissionPermit {
+            _class: class,
+            _bytes: reserved,
+        })
     }
 }
 
-struct AdmissionPermit {
+struct ClassPermit {
     per_peer: Arc<Mutex<HashMap<NodeId, usize>>>,
     peer: NodeId,
     _global: tokio::sync::OwnedSemaphorePermit,
 }
 
-impl Drop for AdmissionPermit {
+impl Drop for ClassPermit {
     fn drop(&mut self) {
         let mut counts = self
             .per_peer
@@ -422,6 +501,12 @@ impl Drop for AdmissionPermit {
     }
 }
 
+/// Holds both the handler count and the byte reservation for one frame.
+struct AdmissionPermit {
+    _class: ClassPermit,
+    _bytes: BytePermit,
+}
+
 /// The operation and resource a call touches, for a scoped grant.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct InvocationScope {
@@ -431,6 +516,9 @@ pub struct InvocationScope {
     /// The resource selector the operation touches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource: Option<String>,
+    /// The workspace the call belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
 }
 
 /// One Node's federation endpoint.
@@ -1181,8 +1269,24 @@ impl FederationNode {
                         | "coordinator_register"
                         | "coordinator_topology"
                 );
+                let frame_bytes = frame.len() as u64;
+                if handled && frame_bytes > kind_payload_limit(&envelope.kind) {
+                    let reply = seal_reply(
+                        &identity,
+                        &envelope,
+                        error_payload(CapabilityError::Invalid {
+                            message: format!(
+                                "a {} frame may carry at most {} bytes",
+                                envelope.kind,
+                                kind_payload_limit(&envelope.kind)
+                            ),
+                        }),
+                    );
+                    let _ = transport.send(&envelope.sender, reply).await;
+                    continue;
+                }
                 let permit = if handled {
-                    admission.try_admit(&envelope.sender, &envelope.kind)
+                    admission.try_admit(&envelope.sender, &envelope.kind, frame_bytes)
                 } else {
                     None
                 };
@@ -1524,11 +1628,12 @@ impl FederationNode {
         // use the peer for this capability.
         let operation = scope.and_then(|scope| scope.operation.as_deref());
         let resource = scope.and_then(|scope| scope.resource.as_deref());
+        let workspace = scope.and_then(|scope| scope.workspace.as_deref());
         let authorized = self
             .peers
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .authorize_scoped(peer, capability, unix_ms(), operation, resource);
+            .authorize_scoped(peer, capability, unix_ms(), operation, resource, workspace);
         if let Err(error) = &authorized {
             let mut event = FederationEvent::new(
                 Direction::Outbound,
@@ -1566,6 +1671,7 @@ impl FederationNode {
                 .map(|hop| json!({ "node": hop.node, "delegation": hop.delegation }))
                 .collect::<Vec<_>>(),
             "principal": principal_label(&context.principal),
+            "workspace": context.workspace.to_string(),
         });
         if let Some(scope) = scope {
             if let Some(operation) = &scope.operation {
@@ -2261,6 +2367,7 @@ async fn serve(
     // scoped grant refuses a call that does not say what it touches.
     let operation = payload.get("operation").and_then(Value::as_str);
     let resource = payload.get("resource").and_then(Value::as_str);
+    let workspace = payload.get("workspace").and_then(Value::as_str);
     let authorized = peers
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2270,6 +2377,7 @@ async fn serve(
             unix_ms(),
             operation,
             resource,
+            workspace,
         );
     if let Err(error) = &authorized {
         let mut event = FederationEvent::new(
@@ -2544,7 +2652,15 @@ fn persist_knowledge(service: &KnowledgeService, path: &std::path::Path) {
 }
 
 /// Attach the correlation a request payload carries to an audit event.
+///
+/// Delegation frames nest their fields under `request`; both shapes are read so
+/// a delegation row joins the same trace as the invoke that started it.
 fn correlate_payload(mut event: FederationEvent, payload: &Value) -> FederationEvent {
+    let payload = if payload.get("trace").is_some() || payload.get("task").is_some() {
+        payload
+    } else {
+        payload.get("request").unwrap_or(payload)
+    };
     if let Some(trace) = payload.get("trace") {
         if let (Some(trace_id), Some(span_id)) = (
             trace.get("trace_id").and_then(Value::as_str),
@@ -2555,6 +2671,13 @@ fn correlate_payload(mut event: FederationEvent, payload: &Value) -> FederationE
     }
     if let Some(task) = payload.get("task").and_then(Value::as_str) {
         event = event.with_task(task);
+    }
+    if let Some(trace_id) = payload.get("trace_id").and_then(Value::as_str) {
+        let span = payload
+            .get("span_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        event = event.with_trace(trace_id, span);
     }
     if let Some(delegation) = payload
         .get("delegation")
@@ -3899,6 +4022,23 @@ fn record_reply(
     if let Some(reason) = reason {
         event = event.with_reason(reason);
     }
+    // A delegation frame carries its trace and id inside `request`; the reply
+    // names the accepted delegation, which is the id an operator follows.
+    event = correlate_payload(event, &envelope.payload);
+    if operation == "delegate" {
+        // The reply is a sealed envelope; its payload names the record.
+        if let Ok(sealed) = Envelope::decode(reply) {
+            let value = &sealed.payload;
+            let id = value.get("id").and_then(Value::as_str).or_else(|| {
+                value
+                    .pointer("/delegation/request/id")
+                    .and_then(Value::as_str)
+            });
+            if let Some(id) = id {
+                event = event.with_delegation(id);
+            }
+        }
+    }
     record(audit, event);
 }
 
@@ -4841,21 +4981,21 @@ mod admission_tests {
         let mut permits: Vec<_> = (0..MAX_IN_FLIGHT_PER_PEER)
             .map(|_| {
                 admission
-                    .try_admit(&peer, "invoke")
+                    .try_admit(&peer, "invoke", 1)
                     .expect("within the peer budget")
             })
             .collect();
         assert!(
-            admission.try_admit(&peer, "invoke").is_none(),
+            admission.try_admit(&peer, "invoke", 1).is_none(),
             "the peer budget is finite"
         );
         assert!(
-            admission.try_admit(&node(2), "invoke").is_some(),
+            admission.try_admit(&node(2), "invoke", 1).is_some(),
             "another peer still gets its own share"
         );
         permits.pop();
         assert!(
-            admission.try_admit(&peer, "invoke").is_some(),
+            admission.try_admit(&peer, "invoke", 1).is_some(),
             "dropping a permit releases it"
         );
     }
@@ -4868,28 +5008,29 @@ mod admission_tests {
             control_global: 1,
             control_per_peer: 1,
             resource_streams: 1,
+            queued_bytes_per_peer: 1024,
         });
         let peer = node(3);
 
         let invoke = admission
-            .try_admit(&peer, "invoke")
+            .try_admit(&peer, "invoke", 1)
             .expect("the invocation budget");
         assert!(
-            admission.try_admit(&peer, "invoke").is_none(),
+            admission.try_admit(&peer, "invoke", 1).is_none(),
             "the invocation class is saturated"
         );
         let control = admission
-            .try_admit(&peer, "discover")
+            .try_admit(&peer, "discover", 1)
             .expect("control has its own budget");
         assert!(
-            admission.try_admit(&peer, "delegate").is_none(),
+            admission.try_admit(&peer, "delegate", 1).is_none(),
             "the control class is saturated independently"
         );
 
         drop(invoke);
         drop(control);
-        assert!(admission.try_admit(&peer, "invoke").is_some());
-        assert!(admission.try_admit(&peer, "discover").is_some());
+        assert!(admission.try_admit(&peer, "invoke", 1).is_some());
+        assert!(admission.try_admit(&peer, "discover", 1).is_some());
     }
 
     #[test]
@@ -4900,12 +5041,13 @@ mod admission_tests {
             control_global: 0,
             control_per_peer: 0,
             resource_streams: 0,
+            queued_bytes_per_peer: 1024,
         });
         let peer = node(4);
-        let first = admission.try_admit(&peer, "invoke").expect("one permit");
-        assert!(admission.try_admit(&peer, "invoke").is_none());
+        let first = admission.try_admit(&peer, "invoke", 1).expect("one permit");
+        assert!(admission.try_admit(&peer, "invoke", 1).is_none());
         drop(first);
-        assert!(admission.try_admit(&peer, "invoke").is_some());
+        assert!(admission.try_admit(&peer, "invoke", 1).is_some());
     }
 
     #[test]
@@ -4918,14 +5060,14 @@ mod admission_tests {
             for _ in 0..per_peer {
                 permits.push(
                     admission
-                        .try_admit(&node(seed as u8 + 10), "invoke")
+                        .try_admit(&node(seed as u8 + 10), "invoke", 1)
                         .expect("within the global ceiling"),
                 );
             }
         }
         assert_eq!(permits.len(), MAX_IN_FLIGHT_HANDLERS);
         assert!(
-            admission.try_admit(&node(200), "invoke").is_none(),
+            admission.try_admit(&node(200), "invoke", 1).is_none(),
             "the global ceiling is finite"
         );
     }
@@ -5032,5 +5174,68 @@ mod invoke_cancel_tests {
 
         assert_eq!(reply["ok"], false);
         assert_eq!(reply["error"]["kind"], "denied");
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    fn node(value: &str) -> NodeId {
+        NodeId::new(value).expect("a node id")
+    }
+
+    #[test]
+    fn a_peer_cannot_exceed_its_aggregate_byte_budget() {
+        let budget = ByteAdmission::new(8);
+        let peer = node("node-a");
+        let first = budget.try_reserve(&peer, 6).expect("the first frame fits");
+        assert!(
+            budget.try_reserve(&peer, 6).is_none(),
+            "6 + 6 is over the 8-byte budget"
+        );
+        drop(first);
+        assert!(
+            budget.try_reserve(&peer, 6).is_some(),
+            "released bytes are reusable"
+        );
+    }
+
+    #[test]
+    fn a_budget_is_per_peer() {
+        let budget = ByteAdmission::new(8);
+        assert!(budget.try_reserve(&node("node-a"), 8).is_some());
+        assert!(
+            budget.try_reserve(&node("node-b"), 8).is_some(),
+            "one peer's frames do not consume another's budget"
+        );
+    }
+
+    #[test]
+    fn message_kinds_have_tighter_limits_than_the_frame_ceiling() {
+        assert_eq!(kind_payload_limit("invoke"), 256 * 1024);
+        assert!(kind_payload_limit("resource") > kind_payload_limit("invoke"));
+        assert!(kind_payload_limit("delegate") <= kind_payload_limit("invoke"));
+        assert_eq!(kind_payload_limit("unknown-kind"), 64 * 1024);
+    }
+
+    #[test]
+    fn a_delegation_payload_correlates_its_request() {
+        let payload = serde_json::json!({
+            "request": {
+                "id": "d-1",
+                "objective": "audit",
+                "trace_id": "trace-1",
+                "span_id": "span-1",
+                "task": "task-1"
+            }
+        });
+        let event = correlate_payload(
+            FederationEvent::new(Direction::Inbound, "node-b", "delegate", None, "ok"),
+            &payload,
+        );
+        assert_eq!(event.trace_id.as_deref(), Some("trace-1"));
+        assert_eq!(event.span_id.as_deref(), Some("span-1"));
+        assert_eq!(event.task.as_deref(), Some("task-1"));
     }
 }

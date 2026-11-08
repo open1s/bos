@@ -54,6 +54,8 @@ pub struct Topology {
     pub members: Vec<MemberRecord>,
     /// The revision of the membership document.
     pub revision: u64,
+    /// The policy revision the coordinator considers current.
+    pub policy_revision: u64,
 }
 
 /// Why a coordinator operation was refused.
@@ -82,6 +84,14 @@ pub enum CoordinatorError {
         /// What happened.
         message: String,
     },
+    /// A policy revision cannot move backwards.
+    #[error("policy revision {requested} is older than {current}")]
+    StalePolicy {
+        /// What the administrator asked for.
+        requested: u64,
+        /// The current revision.
+        current: u64,
+    },
 }
 
 /// The optional coordinator state.
@@ -91,6 +101,9 @@ pub struct Coordinator {
     members: BTreeMap<NodeId, MemberRecord>,
     #[serde(default)]
     revision: u64,
+    /// The policy revision the coordinator considers current.
+    #[serde(default)]
+    policy_revision: u64,
     /// The one Node allowed to administer the membership. Absent means the
     /// coordinator is read-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -103,6 +116,7 @@ impl Coordinator {
         Self {
             members: BTreeMap::new(),
             revision: 0,
+            policy_revision: 0,
             admin,
         }
     }
@@ -154,11 +168,45 @@ impl Coordinator {
         Ok(())
     }
 
+    /// Set the current policy revision. Only the administrator may call it;
+    /// the revision never moves backwards.
+    pub fn set_policy_revision(
+        &mut self,
+        actor: &NodeId,
+        revision: u64,
+    ) -> Result<(), CoordinatorError> {
+        if self.admin.as_ref() != Some(actor) {
+            return Err(CoordinatorError::NotAdmin);
+        }
+        if revision < self.policy_revision {
+            return Err(CoordinatorError::StalePolicy {
+                requested: revision,
+                current: self.policy_revision,
+            });
+        }
+        self.policy_revision = revision;
+        self.revision = self.revision.saturating_add(1);
+        Ok(())
+    }
+
+    /// Members whose last advertised policy revision is behind the current one.
+    ///
+    /// The coordinator never pushes policy; this is the report an operator (or
+    /// a member reading the topology) uses to decide who must be re-informed.
+    pub fn members_behind(&self) -> Vec<MemberRecord> {
+        self.members
+            .values()
+            .filter(|member| member.policy_revision < self.policy_revision)
+            .cloned()
+            .collect()
+    }
+
     /// The current topology.
     pub fn topology(&self) -> Topology {
         Topology {
             members: self.members.values().cloned().collect(),
             revision: self.revision,
+            policy_revision: self.policy_revision,
         }
     }
 
@@ -262,5 +310,61 @@ mod tests {
             coordinator.register(&node("node-a"), member("node-b")),
             Err(CoordinatorError::NotAdmin)
         );
+    }
+
+    #[test]
+    fn policy_revisions_are_admin_gated_and_monotonic() {
+        let admin = node("node-admin");
+        let mut coordinator = Coordinator::new(Some(admin.clone()));
+        coordinator
+            .set_policy_revision(&admin, 5)
+            .expect("the admin sets the revision");
+        assert_eq!(coordinator.topology().policy_revision, 5);
+        assert_eq!(
+            coordinator.set_policy_revision(&admin, 4),
+            Err(CoordinatorError::StalePolicy {
+                requested: 4,
+                current: 5
+            })
+        );
+        assert_eq!(
+            coordinator.set_policy_revision(&node("node-x"), 6),
+            Err(CoordinatorError::NotAdmin)
+        );
+    }
+
+    #[test]
+    fn members_behind_the_policy_are_reported() {
+        let admin = node("node-admin");
+        let mut coordinator = Coordinator::new(Some(admin.clone()));
+        coordinator.set_policy_revision(&admin, 5).expect("policy");
+        let mut behind = member("node-b");
+        behind.policy_revision = 3;
+        let mut current = member("node-c");
+        current.policy_revision = 5;
+        coordinator.register(&admin, behind).expect("registered");
+        coordinator.register(&admin, current).expect("registered");
+        let stale = coordinator.members_behind();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].node, node("node-b"));
+        assert_eq!(coordinator.topology().members.len(), 2);
+    }
+
+    #[test]
+    fn the_membership_document_round_trips() {
+        let dir =
+            std::env::temp_dir().join(format!("federation-coordinator-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("coordinator.json");
+        let admin = node("node-admin");
+        let mut coordinator = Coordinator::new(Some(admin.clone()));
+        coordinator.set_policy_revision(&admin, 7).expect("policy");
+        coordinator
+            .register(&admin, member("node-b"))
+            .expect("registered");
+        coordinator.save(&path).expect("save");
+        let loaded = Coordinator::load(&path).expect("load");
+        assert_eq!(loaded.topology(), coordinator.topology());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

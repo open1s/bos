@@ -22433,6 +22433,26 @@ fn a_crowded_strip_moves_the_extra_tabs_into_the_catalog(cx: &mut TestAppContext
         cx.debug_bounds("right-pane-tasks").is_none(),
         "a launcher chip with no room moves into the catalog instead of overflowing"
     );
+    // The complaint this shape closes: nothing the strip draws may pass the
+    // panel's right edge, and the controls after it stay inside the header.
+    let panel = cx.debug_bounds("right-panel").expect("the panel renders");
+    let right_edge = f32::from(panel.origin.x) + f32::from(panel.size.width);
+    for id in [
+        "file-tab-README.md",
+        "file-tab-Cargo.toml",
+        "right-tab-overflow",
+        "right-new-tab",
+        "right-maximize",
+        "right-close",
+    ] {
+        let bounds = cx
+            .debug_bounds(id)
+            .unwrap_or_else(|| panic!("{id} renders in the strip"));
+        assert!(
+            f32::from(bounds.origin.x) + f32::from(bounds.size.width) <= right_edge + 0.5,
+            "{id} must stop at the panel's right edge: {bounds:?} vs {right_edge}"
+        );
+    }
 
     // The trigger is a real control, and choosing a document from its catalog
     // focuses that document.
@@ -22450,6 +22470,319 @@ fn a_crowded_strip_moves_the_extra_tabs_into_the_catalog(cx: &mut TestAppContext
     draw_until(cx, "the catalog's choice lands", DRAW_UNTIL_MAX, |cx| {
         cx.update(|_, cx| shell.read(cx).files.active == Some(0))
     });
+}
+
+/// Finder's Show All Tabs puts every open tab in one overview, and choosing a
+/// card takes the body there with one press.
+#[gpui::test]
+fn show_all_tabs_catalogs_every_open_tab(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("right-tab-catalog");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(crate::ui::right_panel::RightTab::Files, window, cx);
+        });
+    });
+    for name in ["README.md", "Cargo.toml", "src/lib.rs"] {
+        cx.update(|window, cx| {
+            shell.update(cx, |this, cx| {
+                this.open_file(std::path::Path::new(name), window, cx);
+            });
+        });
+    }
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| this.open_tab_catalog(window, cx));
+    });
+    draw_until(cx, "Show All Tabs covers the body", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("tab-catalog").is_some()
+    });
+
+    // One card for the pane, one per document, and the plus card.
+    for id in [
+        "tab-catalog-card-0",
+        "tab-catalog-card-1",
+        "tab-catalog-card-2",
+    ] {
+        assert!(
+            cx.debug_bounds(id).is_some(),
+            "{id} has a card in the catalogue"
+        );
+    }
+    assert!(
+        cx.debug_bounds("tab-catalog-pane-files").is_some(),
+        "the open pane is a card too"
+    );
+    assert!(
+        cx.debug_bounds("tab-catalog-new").is_some(),
+        "the plus card is how the overview opens a fresh tab"
+    );
+
+    // The active document is the third tab; choosing the first card moves the
+    // body there and puts the overview away.
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).files.active),
+        Some(2),
+        "the last opened document is the one on screen"
+    );
+    let card = cx
+        .debug_bounds("tab-catalog-card-0")
+        .expect("the first document's card");
+    cx.simulate_click(card.center(), Modifiers::default());
+    draw_until(cx, "the catalogue's choice lands", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| {
+            let shell = shell.read(cx);
+            shell.files.active == Some(0) && !shell.right.catalog_open
+        })
+    });
+    assert!(
+        cx.debug_bounds("tab-catalog").is_none(),
+        "choosing a card closes the overview"
+    );
+}
+
+/// Closing the pane leaves its documents in the strip beside Start, and
+/// pressing one brings Files back. This is the state that used to strand the
+/// buffers: Start had a title and no tab list.
+#[gpui::test]
+fn closing_the_pane_keeps_its_documents_in_the_start_strip(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("right-start-tabs");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(crate::ui::right_panel::RightTab::Files, window, cx);
+        });
+    });
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_file(std::path::Path::new("README.md"), window, cx);
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| this.close_right_pane(cx));
+    });
+    draw_until(cx, "the Start tab renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("right-start-tab").is_some()
+    });
+    assert!(
+        cx.update(|_, cx| shell.read(cx).right.tab.is_none()),
+        "the pane is closed"
+    );
+    assert!(
+        cx.debug_bounds("file-tab-README.md").is_some(),
+        "the document stays in the strip instead of disappearing with the pane"
+    );
+
+    // The overview reached from the Start tab catalogs Start itself as well as
+    // the documents the closed pane left behind.
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| this.open_tab_catalog(window, cx));
+    });
+    draw_until(cx, "the Start overview renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("tab-catalog-start").is_some()
+    });
+    let close = cx
+        .debug_bounds("tab-catalog-close")
+        .expect("the overview's close control");
+    cx.simulate_click(close.center(), Modifiers::default());
+    draw_until(cx, "the overview closes", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("tab-catalog").is_none()
+    });
+
+    let tab = cx
+        .debug_bounds("file-tab-README.md")
+        .expect("the document tab is on screen");
+    cx.simulate_click(tab.center(), Modifiers::default());
+    draw_until(cx, "the document brings Files back", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| {
+            let shell = shell.read(cx);
+            shell.right.tab == Some(crate::ui::right_panel::RightTab::Files)
+                && shell.files.active == Some(0)
+        })
+    });
+}
+
+/// The catalogue's search field narrows the cards by name, and Escape clears
+/// it through the input's own search behaviour.
+#[gpui::test]
+fn a_catalog_search_filters_the_tabs_by_name(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("right-catalog-search");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(crate::ui::right_panel::RightTab::Files, window, cx);
+        });
+    });
+    for name in ["README.md", "Cargo.toml"] {
+        cx.update(|window, cx| {
+            shell.update(cx, |this, cx| {
+                this.open_file(std::path::Path::new(name), window, cx);
+            });
+        });
+    }
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| this.open_tab_catalog(window, cx));
+    });
+    draw_until(cx, "the catalogue opens", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("tab-catalog").is_some()
+    });
+    assert!(
+        cx.debug_bounds("tab-catalog-card-0").is_some()
+            && cx.debug_bounds("tab-catalog-card-1").is_some(),
+        "both documents start in the catalogue"
+    );
+
+    let search = cx
+        .debug_bounds("tab-catalog-search")
+        .expect("the search field renders");
+    cx.simulate_click(search.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.simulate_keystrokes("cargo");
+    draw_until(cx, "the search narrows to Cargo", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("tab-catalog-card-1").is_some()
+            && cx.debug_bounds("tab-catalog-card-0").is_none()
+    });
+
+    // The field is the reference's type=search input: Escape clears it.
+    cx.simulate_keystrokes("escape");
+    draw_until(cx, "Escape clears the search", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("tab-catalog-card-0").is_some()
+    });
+}
+
+/// The header's catalogue control is the visible door to the searchable
+/// overview, so the search box and category filters are not hidden behind a
+/// right-click.
+#[gpui::test]
+fn the_header_catalog_control_opens_the_searchable_overview(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("right-catalog-control");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(crate::ui::right_panel::RightTab::Files, window, cx);
+        });
+    });
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_file(std::path::Path::new("README.md"), window, cx);
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let catalog = cx
+        .debug_bounds("right-catalog")
+        .expect("the header carries the catalogue control");
+    cx.simulate_click(catalog.center(), Modifiers::default());
+    draw_until(cx, "the searchable catalogue opens", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("tab-catalog").is_some()
+    });
+    for id in [
+        "tab-catalog-search",
+        "tab-catalog-filter-all",
+        "tab-catalog-filter-documents",
+        "tab-catalog-filter-panes",
+    ] {
+        assert!(
+            cx.debug_bounds(id).is_some(),
+            "{id} is on screen when the catalogue opens"
+        );
+    }
+}
+
+/// The catalogue's category tabs show one kind of card at a time: documents,
+/// panes, or both.
+#[gpui::test]
+fn a_catalog_category_filter_shows_one_kind_of_card(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("right-catalog-category");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(crate::ui::right_panel::RightTab::Files, window, cx);
+        });
+    });
+    for name in ["README.md", "Cargo.toml"] {
+        cx.update(|window, cx| {
+            shell.update(cx, |this, cx| {
+                this.open_file(std::path::Path::new(name), window, cx);
+            });
+        });
+    }
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| this.open_tab_catalog(window, cx));
+    });
+    draw_until(cx, "the catalogue opens", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("tab-catalog").is_some()
+    });
+    assert!(
+        cx.debug_bounds("tab-catalog-card-0").is_some()
+            && cx.debug_bounds("tab-catalog-pane-browser").is_some(),
+        "the all category carries the documents and every pane"
+    );
+
+    let panes = cx
+        .debug_bounds("tab-catalog-filter-panes")
+        .expect("the Panes filter renders")
+        .center();
+    cx.simulate_click(panes, Modifiers::default());
+    draw_until(
+        cx,
+        "the Panes filter hides documents",
+        DRAW_UNTIL_MAX,
+        |cx| {
+            cx.debug_bounds("tab-catalog-card-0").is_none()
+                && cx.debug_bounds("tab-catalog-pane-browser").is_some()
+        },
+    );
+
+    let documents = cx
+        .debug_bounds("tab-catalog-filter-documents")
+        .expect("the Documents filter renders")
+        .center();
+    cx.simulate_click(documents, Modifiers::default());
+    draw_until(
+        cx,
+        "the Documents filter hides panes",
+        DRAW_UNTIL_MAX,
+        |cx| {
+            cx.debug_bounds("tab-catalog-card-0").is_some()
+                && cx.debug_bounds("tab-catalog-pane-browser").is_none()
+        },
+    );
 }
 
 /// The editor's buffer marks the file dirty on a change and the save clears it,

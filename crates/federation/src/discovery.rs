@@ -78,6 +78,9 @@ pub struct DiscoveryRecord {
     /// The envelope schema the publisher writes; 0 on a legacy record.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub schema_version: u32,
+    /// Optional protocol features the publisher implements.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
     /// Public descriptors only.
     pub descriptors: Vec<CapabilityDescriptor>,
     /// Base64 Ed25519 signature over the canonical form.
@@ -123,6 +126,10 @@ impl DiscoveryRecord {
             policy_revision,
             protocol: crate::envelope::PROTOCOL.to_string(),
             schema_version: crate::envelope::SCHEMA_VERSION,
+            features: crate::envelope::FEATURES
+                .iter()
+                .map(|feature| feature.to_string())
+                .collect(),
             descriptors: descriptors
                 .into_iter()
                 .filter(|descriptor| descriptor.visibility == Visibility::Public)

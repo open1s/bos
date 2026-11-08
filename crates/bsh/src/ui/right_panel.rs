@@ -448,6 +448,12 @@ pub(crate) struct RightPanel {
     pub(crate) history_open: bool,
     /// Whether the graph fits itself to the pane (true) or keeps a manual zoom.
     pub(crate) graph_fit: bool,
+    /// Whether Finder's Show All Tabs catalogue covers the body.
+    ///
+    /// The strip's overflow menu catalogs what did not fit; this is the
+    /// deliberate overview of every tab, reached from the tab context menu the
+    /// way Finder reaches View > Show All Tabs.
+    pub(crate) catalog_open: bool,
 }
 
 /// One enrolled peer as the federation pane lists it.
@@ -755,8 +761,8 @@ pub(crate) const STRIP_TAB_MAX_W: f32 = 168.0;
 
 /// What the three header controls and the gaps around them reserve at the
 /// right edge, including the gap before the strip's own trailing spacer.
-fn strip_chrome_w() -> f32 {
-    STRIP_CONTROL_W * 3.0 + STRIP_GAP * 4.0
+fn strip_chrome_w(controls: usize) -> f32 {
+    STRIP_CONTROL_W * controls as f32 + STRIP_GAP * (controls + 1) as f32
 }
 
 /// The width a chip label needs at the chip size, before it is clipped.
@@ -788,9 +794,64 @@ pub(crate) fn file_tab_w(label: &str) -> f32 {
     (56.0 + chip_label_w(label)).clamp(STRIP_TAB_MIN_W, STRIP_TAB_MAX_W)
 }
 
+/// The category filter in Finder's Show All Tabs catalogue.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum CatalogFilter {
+    /// Every surface and document.
+    #[default]
+    All,
+    /// The documents opened out of Files.
+    Documents,
+    /// The open pane, or Start when the pane is closed, and every pane the
+    /// catalogue can switch to.
+    Panes,
+}
+
+impl CatalogFilter {
+    /// The filter's label key in the string table.
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            CatalogFilter::All => "right.tabs.all",
+            CatalogFilter::Documents => "right.tabs.documents",
+            CatalogFilter::Panes => "right.tabs.panes",
+        }
+    }
+
+    /// The filter's stable id stem, for its control and the tests.
+    pub(crate) fn slug(self) -> &'static str {
+        match self {
+            CatalogFilter::All => "all",
+            CatalogFilter::Documents => "documents",
+            CatalogFilter::Panes => "panes",
+        }
+    }
+
+    /// Whether this filter admits the entry.
+    fn admits(self, entry: CatalogEntry) -> bool {
+        match self {
+            CatalogFilter::All => true,
+            CatalogFilter::Documents => matches!(entry, CatalogEntry::File(_)),
+            CatalogFilter::Panes => !matches!(entry, CatalogEntry::File(_)),
+        }
+    }
+}
+
+/// One entry the Show All Tabs catalogue can draw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CatalogEntry {
+    /// The Start screen, when no pane is open.
+    Start,
+    /// A pane, whether it is the open one or a pane the catalogue can switch to.
+    Pane(RightTab),
+    /// A document opened out of Files.
+    File(usize),
+}
+
 /// One tab the strip can draw: the open pane, or a document opened in Files.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StripSlot {
+    /// The Start screen, the panel's own new-tab page.
+    Start,
     Pane(RightTab),
     File(usize),
 }
@@ -818,14 +879,18 @@ pub(crate) struct StripPlan {
 /// panel's own 320px floor keeps it out of reach in the real window.
 pub(crate) fn plan_tab_strip(
     available: f32,
-    active_pane: RightTab,
+    active_pane: Option<RightTab>,
     active_pane_w: f32,
     file_widths: &[f32],
     active_file: Option<usize>,
     inactive_panes: &[RightTab],
 ) -> StripPlan {
     let mut visible = Vec::with_capacity(1 + file_widths.len() + inactive_panes.len());
-    visible.push((StripSlot::Pane(active_pane), active_pane_w));
+    let lead = match active_pane {
+        Some(pane) => StripSlot::Pane(pane),
+        None => StripSlot::Start,
+    };
+    visible.push((lead, active_pane_w));
     let mut used = active_pane_w;
     let mut overflow = false;
 
@@ -861,8 +926,8 @@ pub(crate) fn plan_tab_strip(
             let shown = end - start + 1;
             let per = ((area - shown as f32 * STRIP_GAP) / shown as f32)
                 .clamp(STRIP_TAB_MIN_W, STRIP_TAB_MAX_W);
-            for index in start..=end {
-                let width = file_widths[index].min(per);
+            for (index, natural) in file_widths.iter().enumerate().take(end + 1).skip(start) {
+                let width = natural.min(per);
                 used += STRIP_GAP + width;
                 visible.push((StripSlot::File(index), width));
             }
@@ -1086,8 +1151,8 @@ impl Shell {
             ))
     }
 
-    /// The panel's bar: the Start screen's title, or the tab strip and the
-    /// controls the reference draws on every panel header.
+    /// The panel's bar: the Start screen's tab, or the open pane's strip, and
+    /// the controls the reference draws on every panel header.
     ///
     /// `band` selects the placement, but both share ONE 28px content row, so a
     /// 28px tab chip, a 26px file chip and a 26px control share one centre
@@ -1127,27 +1192,72 @@ impl Shell {
             .items_center()
             .gap(px(4.0));
         let content = match self.right.tab {
-            None => row
-                .child(icon(IconName::Compass, 15.0, theme::muted()))
-                .child(
-                    txt(
-                        self.state.lang.tr("right.start"),
-                        theme::SIDEBAR_SIZE,
-                        theme::text(),
-                    )
-                    .font_weight(FontWeight::MEDIUM),
-                )
-                .child(div().flex_1())
-                .child(self.right_panel_control(
-                    "right-maximize",
-                    if self.right.maximized {
-                        IconName::Minimize2
-                    } else {
-                        IconName::Maximize2
-                    },
-                    cx,
-                ))
-                .child(self.right_panel_close(cx)),
+            None => {
+                // The Start screen is the strip's own new-tab page, so it is a
+                // tab like any other: the documents opened before the pane was
+                // closed stay beside it instead of vanishing with the pane.
+                let start_w = pane_tab_w(&self.state.lang.tr("right.start"));
+                let file_widths: Vec<f32> = self
+                    .files
+                    .tabs
+                    .iter()
+                    .map(|file| file_tab_w(&file.label()))
+                    .collect();
+                // The catalogue control is drawn only when it has something to
+                // catalog, and the strip's budget follows it.
+                let controls = if self.files.tabs.is_empty() { 2 } else { 3 };
+                let plan = plan_tab_strip(
+                    self.strip_budget(band, controls),
+                    None,
+                    start_w,
+                    &file_widths,
+                    self.files.active,
+                    &[],
+                );
+                let mut strip = div()
+                    .h(px(theme::RIGHT_TAB_H))
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(STRIP_GAP))
+                    .child(self.start_tab_chip(start_w, cx).into_any_element());
+                for (slot, width) in plan.visible {
+                    match slot {
+                        StripSlot::Start => {}
+                        StripSlot::File(index) => {
+                            if let Some(file_tab) = self.files.tabs.get(index) {
+                                strip = strip.child(
+                                    self.files_tab_chip(index, file_tab, width, cx)
+                                        .into_any_element(),
+                                );
+                            }
+                        }
+                        StripSlot::Pane(pane) => {
+                            strip = strip.child(self.right_pane_chip(pane, cx).into_any_element());
+                        }
+                    }
+                }
+                strip = strip.child(div().flex_1());
+                if plan.overflow {
+                    strip = strip.child(self.tab_catalog(cx));
+                }
+                row.child(strip)
+                    .when(!self.files.tabs.is_empty(), |row| {
+                        row.child(self.right_catalog_control(cx))
+                    })
+                    .child(self.right_panel_control(
+                        "right-maximize",
+                        if self.right.maximized {
+                            IconName::Minimize2
+                        } else {
+                            IconName::Maximize2
+                        },
+                        cx,
+                    ))
+                    .child(self.right_panel_close(cx))
+            }
             Some(tab) => {
                 // The strip is the panel's whole tab list: the open pane, every
                 // document opened out of Files, then the glyph chips for the
@@ -1171,8 +1281,8 @@ impl Shell {
                     .collect();
                 let active_w = pane_tab_w(&self.state.lang.tr(tab.key()));
                 let plan = plan_tab_strip(
-                    self.strip_budget(band),
-                    tab,
+                    self.strip_budget(band, 4),
+                    Some(tab),
                     active_w,
                     &file_widths,
                     self.files.active,
@@ -1188,6 +1298,9 @@ impl Shell {
                     .gap(px(STRIP_GAP));
                 for (slot, width) in plan.visible {
                     let chip = match slot {
+                        // A pane is open here, so the planner can never lead
+                        // with Start; the arm only makes the enum exhaustive.
+                        StripSlot::Start => continue,
                         StripSlot::Pane(pane) if pane == tab => {
                             self.right_tab_chip(pane, width, cx).into_any_element()
                         }
@@ -1201,13 +1314,17 @@ impl Shell {
                     };
                     strip = strip.child(chip);
                 }
+                // The strip's own spacer takes what is left, so the controls
+                // stay at the right edge. The catalogue trigger sits AFTER it,
+                // at the trailing edge of the tab area, which is where Finder
+                // parks its overflow control - not against the last visible
+                // tab, where it would read as one more tab.
+                strip = strip.child(div().flex_1());
                 if plan.overflow {
                     strip = strip.child(self.tab_catalog(cx));
                 }
-                // The strip's own spacer takes what is left, so the controls
-                // stay at the right edge the way the reference draws them.
-                strip = strip.child(div().flex_1());
                 row.child(strip)
+                    .child(self.right_catalog_control(cx))
                     .child(self.right_new_tab(cx))
                     .child(self.right_panel_control(
                         "right-maximize",
@@ -1233,7 +1350,7 @@ impl Shell {
     /// The panel owns the traffic-light band when it is the window's corner
     /// column, and then its bar starts after the lights; the budget has to
     /// follow that, or the plan would fit one last tab under the buttons.
-    fn strip_budget(&self, band: bool) -> f32 {
+    fn strip_budget(&self, band: bool, controls: usize) -> f32 {
         let bar_w = if band {
             (self.right_panel_w() - theme::traffic_light_inset().right).max(0.0)
         } else {
@@ -1241,7 +1358,90 @@ impl Shell {
         };
         // The bar's 12px padding a side, the column's two .5px rules, and the
         // controls with the gaps around them and at the strip's trailing edge.
-        (bar_w - theme::RIGHT_PAD * 2.0 - 1.0 - strip_chrome_w()).max(0.0)
+        (bar_w - theme::RIGHT_PAD * 2.0 - 1.0 - strip_chrome_w(controls)).max(0.0)
+    }
+
+    /// The Start screen's own tab: the panel's new-tab page.
+    ///
+    /// It is the one tab with no close - closing it is what the panel's collapse
+    /// control does, and a Start tab that can be closed would leave the strip
+    /// with no surface at all. Its menu still carries the document operations,
+    /// so a reader who closed the pane can clear the documents from here.
+    fn start_tab_chip(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
+        let lang = self.state.lang;
+        let label = lang.tr("right.start");
+        let documents = self.files.tabs.len();
+        let entity = cx.entity();
+        div()
+            .id("right-start-tab")
+            .debug_selector(|| String::from("right-start-tab"))
+            .w(px(width))
+            .h(px(theme::RIGHT_TAB_H))
+            .flex_none()
+            .min_w_0()
+            .px(px(8.0))
+            .rounded(px(theme::RADIUS_SM))
+            .bg(rgb(theme::selected_row()))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .overflow_hidden()
+            .child(icon(IconName::Compass, 14.0, theme::text()).flex_none())
+            .child(
+                txt(label, theme::CHIP_SIZE, theme::text())
+                    .font_weight(FontWeight::MEDIUM)
+                    .flex_1()
+                    .min_w_0()
+                    .text_ellipsis(),
+            )
+            .context_menu(move |menu, _, _| {
+                let all = entity.clone();
+                let show = entity.clone();
+                menu.item(
+                    PopupMenuItem::new(lang.tr("right.closeAll"))
+                        .disabled(documents == 0)
+                        .on_click(move |_, _, cx| {
+                            all.update(cx, |this, cx| this.close_all_tabs(cx));
+                        }),
+                )
+                .item(PopupMenuItem::separator())
+                .item(
+                    PopupMenuItem::new(lang.tr("right.showAllTabs"))
+                        .disabled(documents == 0)
+                        .on_click(move |_, window, cx| {
+                            show.update(cx, |this, cx| this.open_tab_catalog(window, cx));
+                        }),
+                )
+            })
+    }
+
+    /// The header's Show All Tabs control.
+    ///
+    /// The command is also on every tab's context menu, where Finder puts it,
+    /// but a menu hidden behind a right-click is not a door: this control is the
+    /// visible way into the searchable catalogue. It is drawn whenever the
+    /// panel has at least one tab to catalog.
+    fn right_catalog_control(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let label = self.state.lang.tr("right.tabs.search");
+        div()
+            .id("right-catalog")
+            .debug_selector(|| String::from("right-catalog"))
+            .w(px(26.0))
+            .h(px(26.0))
+            .flex_none()
+            .rounded(px(theme::RADIUS_SM))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(theme::hover())))
+            .tooltip_show_delay(std::time::Duration::from_millis(500))
+            .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
+            .child(icon(IconName::Search, 14.0, theme::muted()))
+            .on_click(cx.listener(|this, _event, window, cx| {
+                this.open_tab_catalog(window, cx);
+            }))
     }
 
     /// The strip's new-tab control: a press lands on the Start screen, which is
@@ -1316,7 +1516,24 @@ impl Shell {
             .child(icon(IconName::Ellipsis, 14.0, theme::faint()))
             .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
                 let mut menu = menu.scrollable(true).max_h(px(420.0));
-                menu = menu.item(PopupMenuItem::label(lang.tr("right.tabs")));
+                // The overflow menu is the compact view of the catalogue; its
+                // first row is the door to the searchable one, so a reader who
+                // reaches for the ellipsis finds the search where they look.
+                let search = entity.clone();
+                menu = menu
+                    .item(
+                        catalog_row(
+                            String::from("tab-catalog-open"),
+                            IconName::Search,
+                            lang.tr("right.tabs.search"),
+                            false,
+                        )
+                        .on_click(move |_, window, cx| {
+                            search.update(cx, |this, cx| this.open_tab_catalog(window, cx));
+                        }),
+                    )
+                    .item(PopupMenuItem::separator())
+                    .item(PopupMenuItem::label(lang.tr("right.tabs")));
                 if docs.is_empty() {
                     menu = menu.item(PopupMenuItem::label(lang.tr("right.tabs.none")));
                 }
@@ -1353,12 +1570,6 @@ impl Shell {
                 }
                 if doc_count > 0 {
                     menu = menu.item(PopupMenuItem::separator());
-                    let all = entity.clone();
-                    menu = menu.item(PopupMenuItem::new(lang.tr("right.closeAll")).on_click(
-                        move |_, _, cx| {
-                            all.update(cx, |this, cx| this.close_all_tabs(cx));
-                        },
-                    ));
                     if let Some(keep) = active_doc {
                         let others = entity.clone();
                         menu =
@@ -1368,7 +1579,21 @@ impl Shell {
                                 },
                             ));
                     }
+                    let all = entity.clone();
+                    menu = menu.item(PopupMenuItem::new(lang.tr("right.closeAll")).on_click(
+                        move |_, _, cx| {
+                            all.update(cx, |this, cx| this.close_all_tabs(cx));
+                        },
+                    ));
                 }
+                let show = entity.clone();
+                menu = menu.item(PopupMenuItem::separator()).item(
+                    PopupMenuItem::new(lang.tr("right.showAllTabs")).on_click(
+                        move |_, window, cx| {
+                            show.update(cx, |this, cx| this.open_tab_catalog(window, cx));
+                        },
+                    ),
+                );
                 menu
             });
         div()
@@ -1433,9 +1658,11 @@ impl Shell {
         };
         let label = lang.tr(tab.key());
         let documents = self.files.tabs.len();
+        let group = SharedString::from("right-tab-group");
         let entity = cx.entity();
         div()
             .id("right-tab")
+            .group(group.clone())
             .debug_selector(|| String::from("right-tab"))
             .w(px(width))
             .h(px(theme::RIGHT_TAB_H))
@@ -1486,6 +1713,11 @@ impl Shell {
                     .flex_none()
                     .rounded(px(4.0))
                     .cursor_pointer()
+                    // Finder keeps the close out of the way until the tab is
+                    // under the pointer; the hitbox is there all along, so the
+                    // gesture is unchanged once the X appears.
+                    .opacity(0.0)
+                    .group_hover(group.clone(), |s| s.opacity(1.0))
                     .hover(|s| s.bg(rgb(theme::hover())))
                     .child(icon(IconName::X, 12.0, theme::faint()))
                     .on_click(cx.listener(|this, _event, _window, cx| {
@@ -1505,6 +1737,7 @@ impl Shell {
                 let close = entity.clone();
                 let others = entity.clone();
                 let all = entity.clone();
+                let show = entity.clone();
                 menu.item(
                     PopupMenuItem::new(lang.tr("right.close")).on_click(move |_, _, cx| {
                         close.update(cx, |this, cx| this.close_right_pane(cx));
@@ -1522,6 +1755,12 @@ impl Shell {
                         all.update(cx, |this, cx| this.close_all_tabs(cx));
                     }),
                 )
+                .item(PopupMenuItem::separator())
+                .item(PopupMenuItem::new(lang.tr("right.showAllTabs")).on_click(
+                    move |_, window, cx| {
+                        show.update(cx, |this, cx| this.open_tab_catalog(window, cx));
+                    },
+                ))
             })
     }
 
@@ -1577,6 +1816,7 @@ impl Shell {
             .child(icon(IconName::PanelRightClose, 14.0, theme::muted()))
             .on_click(cx.listener(|this, _event, _window, cx| {
                 this.right.open = false;
+                this.right.catalog_open = false;
                 this.browser_pane_closed();
                 this.hide_terminal_view(cx);
                 cx.notify();
@@ -1588,13 +1828,14 @@ impl Shell {
         let __all = std::time::Instant::now();
         let body = div()
             .debug_selector(|| String::from("right-panel-body"))
+            .relative()
             .flex_1()
             .min_h_0()
             .w_full()
             .flex()
             .flex_col()
             .overflow_hidden();
-        match self.right.tab {
+        let body = match self.right.tab {
             None => body.child(self.right_start(cx)),
             Some(RightTab::Files) => {
                 let pane = body.child(self.files_pane(cx));
@@ -1619,7 +1860,412 @@ impl Shell {
                     ))
                     .into_any_element(),
             }),
+        };
+        // Finder's overview sits over the body, under the strip: the tab bar
+        // that opened it stays visible, so closing the catalogue is the same
+        // gesture as opening it.
+        body.when(self.right.catalog_open, |body| {
+            body.child(self.tab_catalog_overlay(cx))
+        })
+    }
+
+    /// Finder's Show All Tabs: a card for every open tab, over the body.
+    ///
+    /// The strip's overflow menu is a list of what did not fit; this is the
+    /// deliberate overview, reached the way Finder reaches it - control-click a
+    /// tab and choose Show All Tabs. Cards are sized from the panel's width so
+    /// a 320px panel still gets two readable columns and a maximised one does
+    /// not stretch a name across the window.
+    fn tab_catalog_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let lang = self.state.lang;
+        let (card_w, gap) = self.catalog_card_size();
+        // Every surface the catalogue can switch to, then every document. The
+        // category and search filters are applied to this one list, so a search
+        // narrows the category the reader already chose instead of replacing it.
+        let mut entries: Vec<(CatalogEntry, String)> = Vec::new();
+        match self.right.tab {
+            Some(_) => {
+                for tab in RightTab::ALL {
+                    entries.push((CatalogEntry::Pane(tab), lang.tr(tab.key())));
+                }
+            }
+            None => entries.push((CatalogEntry::Start, lang.tr("right.start"))),
         }
+        for (index, tab) in self.files.tabs.iter().enumerate() {
+            entries.push((CatalogEntry::File(index), tab.label()));
+        }
+        let query = self.catalog_query_text.trim().to_lowercase();
+        let shown: Vec<(CatalogEntry, String)> = entries
+            .iter()
+            .filter(|(entry, label)| {
+                self.catalog_filter.admits(*entry)
+                    && (query.is_empty() || label.to_lowercase().contains(&query))
+            })
+            .cloned()
+            .collect();
+        let search = div()
+            .id("tab-catalog-search")
+            .debug_selector(|| String::from("tab-catalog-search"))
+            .flex_1()
+            .h(px(34.0))
+            .px(px(10.0))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(rgb(theme::border()))
+            .bg(rgb(theme::page()))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            // A press in the field belongs to the field, not to the empty space
+            // that closes the overview.
+            .on_click(cx.listener(|_this, _event, _window, cx| {
+                cx.stop_propagation();
+            }))
+            .child(icon(IconName::Search, 13.0, theme::faint()).flex_none())
+            .child(
+                Input::new(&self.catalog_query)
+                    .appearance(false)
+                    .w_full()
+                    .h(px(32.0)),
+            );
+
+        let mut filters = div()
+            .h(px(36.0))
+            .flex_none()
+            .px(px(16.0))
+            .flex()
+            .flex_row()
+            .items_center();
+        for filter in [
+            CatalogFilter::All,
+            CatalogFilter::Documents,
+            CatalogFilter::Panes,
+        ] {
+            let active = self.catalog_filter == filter;
+            let slug = filter.slug();
+            filters = filters.child(
+                div()
+                    .id(SharedString::from(format!("tab-catalog-filter-{slug}")))
+                    .debug_selector(move || format!("tab-catalog-filter-{slug}"))
+                    .relative()
+                    .flex_1()
+                    .h(px(36.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .child(
+                        txt(
+                            lang.tr(filter.key()),
+                            13.0,
+                            if active {
+                                theme::text()
+                            } else {
+                                theme::muted()
+                            },
+                        )
+                        .font_weight(FontWeight::MEDIUM),
+                    )
+                    .when(active, |tab| {
+                        tab.child(
+                            div()
+                                .absolute()
+                                .bottom(px(0.0))
+                                .left(px(0.0))
+                                .right(px(0.0))
+                                .h(px(2.0))
+                                .rounded(px(1.0))
+                                .bg(rgb(theme::accent())),
+                        )
+                    })
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        cx.stop_propagation();
+                        this.catalog_filter = filter;
+                        cx.notify();
+                    })),
+            );
+        }
+        let mut grid = div()
+            .id("tab-catalog-grid")
+            .debug_selector(|| String::from("tab-catalog-grid"))
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .p(px(16.0))
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .justify_center()
+            .gap(px(gap))
+            .overflow_y_scroll();
+        if shown.is_empty() {
+            grid = grid.child(
+                div()
+                    .w_full()
+                    .py(px(40.0))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(icon(IconName::Search, 20.0, theme::faint()))
+                    .child(txt(lang.tr("right.tabs.noResults"), 13.0, theme::muted())),
+            );
+        }
+        for (entry, _) in &shown {
+            let card = match entry {
+                CatalogEntry::Start => self.catalog_start_card(card_w, cx).into_any_element(),
+                CatalogEntry::Pane(tab) => {
+                    self.catalog_pane_card(*tab, card_w, cx).into_any_element()
+                }
+                CatalogEntry::File(index) => match self.files.tabs.get(*index) {
+                    Some(tab) => self
+                        .catalog_file_card(*index, tab, card_w, cx)
+                        .into_any_element(),
+                    None => continue,
+                },
+            };
+            grid = grid.child(card);
+        }
+        // The plus card is an action, not a tab: it stays put when a search
+        // narrows the catalogue to nothing.
+        grid = grid.child(self.catalog_new_card(card_w, cx));
+
+        div()
+            .id("tab-catalog")
+            .debug_selector(|| String::from("tab-catalog"))
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(rgb(theme::page()))
+            .flex()
+            .flex_col()
+            // The empty space around the cards closes the overview, the way
+            // clicking away from Finder's own grid does.
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.close_tab_catalog(cx);
+            }))
+            .child(
+                hairline_bottom(
+                    div()
+                        .h(px(52.0))
+                        .flex_none()
+                        .px(px(16.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0)),
+                )
+                .border_color(rgb(theme::border_soft()))
+                .child(icon(IconName::LayoutGrid, 15.0, theme::muted()))
+                .child(search)
+                .child(
+                    div()
+                        .id("tab-catalog-close")
+                        .debug_selector(|| String::from("tab-catalog-close"))
+                        .w(px(26.0))
+                        .h(px(26.0))
+                        .flex_none()
+                        .rounded(px(theme::RADIUS_SM))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(theme::hover())))
+                        .child(icon(IconName::X, 13.0, theme::muted()))
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            cx.stop_propagation();
+                            this.close_tab_catalog(cx);
+                        })),
+                ),
+            )
+            .child(hairline_bottom(filters).border_color(rgb(theme::border_soft())))
+            .child(grid)
+    }
+
+    /// The card width and gap the catalogue grid uses at this panel width.
+    fn catalog_card_size(&self) -> (f32, f32) {
+        let gap = 8.0;
+        let pad = 16.0;
+        // The column's own 0.5px seam rule is inside the width, so leave a
+        // pixel for it: a border-box card that lands exactly on the edge would
+        // wrap the second column on a fractional device pixel.
+        let width = (self.right_panel_w() - 1.0).max(0.0);
+        let columns = (((width - pad * 2.0 + gap) / 240.0).floor() as usize).clamp(2, 5);
+        let card = ((width - pad * 2.0 - gap * (columns - 1) as f32) / columns as f32).min(240.0);
+        (card, gap)
+    }
+
+    /// One catalogue card, styled once so every kind reads as the same grid.
+    fn catalog_card(&self, id: String, debug: String, width: f32, selected: bool) -> Stateful<Div> {
+        div()
+            .id(id)
+            .debug_selector(move || debug.clone())
+            .w(px(width))
+            .h(px(56.0))
+            .flex_none()
+            .px(px(10.0))
+            .rounded(px(theme::RADIUS_SM))
+            .border_1()
+            .border_color(rgb(if selected {
+                theme::accent()
+            } else {
+                theme::border_soft()
+            }))
+            .bg(rgb(if selected {
+                theme::selected_row()
+            } else {
+                theme::new_session_fill()
+            }))
+            .hover(|s| s.bg(rgb(theme::hover())))
+            .cursor_pointer()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+    }
+
+    /// The card for the Start screen when the pane is closed.
+    fn catalog_start_card(&self, width: f32, cx: &mut Context<Self>) -> Stateful<Div> {
+        let label = self.state.lang.tr("right.start");
+        self.catalog_card(
+            String::from("tab-catalog-start"),
+            String::from("tab-catalog-start"),
+            width,
+            true,
+        )
+        .on_click(cx.listener(|this, _event, _window, cx| {
+            cx.stop_propagation();
+            this.close_tab_catalog(cx);
+        }))
+        .child(icon(IconName::Compass, 16.0, theme::text()).flex_none())
+        .child(
+            txt(label, 13.0, theme::text())
+                .flex_1()
+                .min_w_0()
+                .text_ellipsis(),
+        )
+    }
+
+    /// The card for the pane that is up.
+    fn catalog_pane_card(
+        &self,
+        tab: RightTab,
+        width: f32,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let label = self.state.lang.tr(tab.key());
+        self.catalog_card(
+            format!("tab-catalog-pane-{}", tab.slug()),
+            format!("tab-catalog-pane-{}", tab.slug()),
+            width,
+            true,
+        )
+        .on_click(cx.listener(|this, _event, _window, cx| {
+            cx.stop_propagation();
+            this.close_tab_catalog(cx);
+        }))
+        .child(icon(tab.glyph(), 16.0, theme::text()).flex_none())
+        .child(
+            txt(label, 13.0, theme::text())
+                .flex_1()
+                .min_w_0()
+                .text_ellipsis(),
+        )
+        .child(
+            div()
+                .id("tab-catalog-pane-close")
+                .debug_selector(|| String::from("tab-catalog-pane-close"))
+                .w(px(20.0))
+                .h(px(20.0))
+                .flex_none()
+                .rounded(px(4.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(theme::hover())))
+                .child(icon(IconName::X, 12.0, theme::faint()))
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    cx.stop_propagation();
+                    this.close_tab_catalog(cx);
+                    this.close_right_pane(cx);
+                })),
+        )
+    }
+
+    /// The card for one open document, with the close that drops it.
+    fn catalog_file_card(
+        &self,
+        index: usize,
+        tab: &FileTab,
+        width: f32,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let name = tab.label();
+        let close_name = name.clone();
+        let selected = self.right.tab == Some(RightTab::Files) && self.files.active == Some(index);
+        self.catalog_card(
+            format!("tab-catalog-card-{index}"),
+            format!("tab-catalog-card-{index}"),
+            width,
+            selected,
+        )
+        .on_click(cx.listener(move |this, _event, _window, cx| {
+            cx.stop_propagation();
+            this.close_tab_catalog(cx);
+            this.focus_tab(index, cx);
+        }))
+        .child(icon(file_glyph_for_name(&name), 16.0, theme::muted()).flex_none())
+        .child(
+            txt(name, 13.0, theme::text())
+                .flex_1()
+                .min_w_0()
+                .text_ellipsis(),
+        )
+        .child(
+            div()
+                .id(SharedString::from(format!("tab-catalog-close-{index}")))
+                .debug_selector(move || format!("tab-catalog-close-{close_name}"))
+                .w(px(20.0))
+                .h(px(20.0))
+                .flex_none()
+                .rounded(px(4.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(theme::hover())))
+                .child(icon(IconName::X, 12.0, theme::faint()))
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    cx.stop_propagation();
+                    this.close_tab(index, cx);
+                })),
+        )
+    }
+
+    /// The plus card: a new tab lands on the Start screen, as the strip's plus
+    /// does.
+    fn catalog_new_card(&self, width: f32, cx: &mut Context<Self>) -> Stateful<Div> {
+        let label = self.state.lang.tr("right.newTab");
+        self.catalog_card(
+            String::from("tab-catalog-new"),
+            String::from("tab-catalog-new"),
+            width,
+            false,
+        )
+        .on_click(cx.listener(|this, _event, _window, cx| {
+            cx.stop_propagation();
+            this.close_tab_catalog(cx);
+            this.close_right_pane(cx);
+        }))
+        .child(icon(IconName::Plus, 16.0, theme::muted()).flex_none())
+        .child(
+            txt(label, 13.0, theme::muted())
+                .flex_1()
+                .min_w_0()
+                .text_ellipsis(),
+        )
     }
 
     /// The federation pane: the node's peers, their grants, and the two
@@ -5841,12 +6487,14 @@ impl Shell {
         };
         let close_name = name.clone();
         let documents = self.files.tabs.len();
-        let to_right = documents.saturating_sub(index + 1);
+        let full_path = tab.rel.display().to_string();
+        let group = SharedString::from(format!("file-tab-group-{index}"));
         let lang = self.state.lang;
         let entity = cx.entity();
         div()
             .debug_selector(move || format!("file-tab-{chip_name}"))
             .id(SharedString::from(format!("file-tab-{index}")))
+            .group(group.clone())
             .w(px(width))
             .h(px(26.0))
             .flex_none()
@@ -5861,6 +6509,10 @@ impl Shell {
             .cursor_pointer()
             .when(selected, |chip| chip.bg(rgb(theme::selected_row())))
             .hover(|s| s.bg(rgb(theme::hover())))
+            // A name that the tab had to clip still has a full path worth
+            // reading, which is what Finder's own tab tooltip shows.
+            .tooltip_show_delay(std::time::Duration::from_millis(500))
+            .tooltip(move |window, cx| Tooltip::new(full_path.clone()).build(window, cx))
             .child(icon(file_glyph_for_name(&name), 12.0, theme::faint()).flex_none())
             .child(
                 txt(name, theme::CHIP_SIZE, text_color)
@@ -5894,6 +6546,8 @@ impl Shell {
                     .flex_none()
                     .rounded(px(4.0))
                     .cursor_pointer()
+                    .opacity(0.0)
+                    .group_hover(group.clone(), |s| s.opacity(1.0))
                     .hover(|s| s.bg(rgb(theme::hover())))
                     .child(icon(IconName::X, 11.0, theme::faint()))
                     .on_click(cx.listener(move |this, _event, _window, cx| {
@@ -5907,8 +6561,8 @@ impl Shell {
             .context_menu(move |menu, _, _| {
                 let close = entity.clone();
                 let others = entity.clone();
-                let right = entity.clone();
                 let all = entity.clone();
+                let show = entity.clone();
                 menu.item(
                     PopupMenuItem::new(lang.tr("right.close")).on_click(move |_, _, cx| {
                         close.update(cx, |this, cx| this.close_tab(index, cx));
@@ -5922,17 +6576,18 @@ impl Shell {
                         }),
                 )
                 .item(
-                    PopupMenuItem::new(lang.tr("right.closeRight"))
-                        .disabled(to_right == 0)
-                        .on_click(move |_, _, cx| {
-                            right.update(cx, |this, cx| this.close_tabs_to_the_right(index, cx));
-                        }),
-                )
-                .item(
                     PopupMenuItem::new(lang.tr("right.closeAll")).on_click(move |_, _, cx| {
                         all.update(cx, |this, cx| this.close_all_tabs(cx));
                     }),
                 )
+                .item(PopupMenuItem::separator())
+                // Finder's catalogue command, on the tab where a reader looks
+                // for the rest of the tab operations.
+                .item(PopupMenuItem::new(lang.tr("right.showAllTabs")).on_click(
+                    move |_, window, cx| {
+                        show.update(cx, |this, cx| this.open_tab_catalog(window, cx));
+                    },
+                ))
             })
     }
 
@@ -6888,6 +7543,9 @@ impl Shell {
     pub(crate) fn show_right_tab(&mut self, tab: RightTab, cx: &mut Context<Self>) {
         self.right.open = true;
         self.right.tab = Some(tab);
+        // Choosing a tab is also leaving the overview, the way selecting a tab
+        // in Finder's own catalogue puts the window back.
+        self.right.catalog_open = false;
         if tab != RightTab::Terminal {
             self.hide_terminal_view(cx);
         }
@@ -6940,6 +7598,7 @@ impl Shell {
     ) {
         self.right.open = true;
         self.right.tab = Some(tab);
+        self.right.catalog_open = false;
         if tab == RightTab::Tasks {
             // One store read per open, never per frame.
             *self.right.tasks.borrow_mut() = None;
@@ -7198,7 +7857,9 @@ impl Shell {
         let visible = self.right.open
             && matches!(self.right.tab, Some(RightTab::Browser))
             // A native child view is drawn ABOVE the GPUI tree on this
-            // backend, so an open dialog would be hidden behind the page.
+            // backend, so an open dialog or the tab catalogue would be hidden
+            // behind the page.
+            && !self.right.catalog_open
             && matches!(self.state.overlay, crate::state::Overlay::None);
         if let Some(bounds) = self.browser_bounds.get() {
             let rect = wry::Rect {
@@ -8347,6 +9008,7 @@ impl Shell {
     /// Show the tree again, which is what pressing the Files chip does.
     pub(crate) fn focus_tree(&mut self, cx: &mut Context<Self>) {
         self.files.active = None;
+        self.right.catalog_open = false;
         cx.notify();
     }
 
@@ -8393,20 +9055,6 @@ impl Shell {
         cx.notify();
     }
 
-    /// Close every document tab to the right of `index`.
-    pub(crate) fn close_tabs_to_the_right(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index + 1 >= self.files.tabs.len() {
-            return;
-        }
-        self.files.tabs.truncate(index + 1);
-        if let Some(open) = self.files.active {
-            if open > index {
-                self.files.active = Some(index);
-            }
-        }
-        cx.notify();
-    }
-
     /// Close every document tab and leave the pane where it is.
     ///
     /// This is the pane tab's "Close Other Tabs": the pane is the tab being
@@ -8437,8 +9085,49 @@ impl Shell {
     /// comparison surface owns a parsed file; each has to be told the pane is
     /// gone, or it keeps painting behind the Start screen.
     pub(crate) fn close_right_pane(&mut self, cx: &mut Context<Self>) {
+        self.right.catalog_open = false;
         self.browser_pane_closed();
         self.hide_terminal_view(cx);
+        cx.notify();
+    }
+
+    /// Show Finder's Show All Tabs catalogue over the panel body.
+    ///
+    /// The terminal and the browser paint on native layers above this tree, so
+    /// the terminal surface is hidden for the duration; the browser is hidden
+    /// by its own visibility rule while the catalogue is up. Both are restored
+    /// by close_tab_catalog or by the tab a card chooses.
+    pub(crate) fn open_tab_catalog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.right.tab.is_none() && self.files.tabs.is_empty() {
+            return;
+        }
+        self.right.catalog_open = true;
+        self.hide_terminal_view(cx);
+        // A fresh overview is the whole catalogue: an old query and an old
+        // category would hide the very tab the reader just asked to find.
+        self.catalog_filter = CatalogFilter::All;
+        self.catalog_query_text.clear();
+        self.catalog_query.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+            state.focus_handle(cx).focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Put the body back after the catalogue closes.
+    pub(crate) fn close_tab_catalog(&mut self, cx: &mut Context<Self>) {
+        if !self.right.catalog_open {
+            return;
+        }
+        self.right.catalog_open = false;
+        // The terminal surface is a window layer, not part of this tree; hiding
+        // it for the overview means it has to be brought back explicitly when
+        // the pane it belongs to is still the one on screen.
+        if self.right.tab == Some(RightTab::Terminal) {
+            if let Some(view) = self.right.terminal_view.clone() {
+                view.update(cx, |view, _| view.set_visible(true));
+            }
+        }
         cx.notify();
     }
 
@@ -10002,7 +10691,7 @@ mod tests {
         let files = [file_tab_w("README.md"), file_tab_w("Cargo.toml")];
         let plan = plan_tab_strip(
             900.0,
-            RightTab::Files,
+            Some(RightTab::Files),
             pane_tab_w("Files"),
             &files,
             Some(0),
@@ -10018,6 +10707,41 @@ mod tests {
         assert_eq!(plan.visible[2].0, StripSlot::File(1));
     }
 
+    /// The Start screen is a tab too: closing the pane leaves its documents
+    /// beside the Start chip rather than hiding them with the pane.
+    #[test]
+    fn the_start_screen_keeps_its_documents_beside_it() {
+        let files = [file_tab_w("README.md"), file_tab_w("Cargo.toml")];
+        let plan = plan_tab_strip(365.0, None, pane_tab_w("Start"), &files, Some(0), &[]);
+        assert_eq!(plan.visible[0].0, StripSlot::Start);
+        assert!(plan
+            .visible
+            .iter()
+            .any(|(slot, _)| *slot == StripSlot::File(0)));
+        assert!(plan
+            .visible
+            .iter()
+            .any(|(slot, _)| *slot == StripSlot::File(1)));
+        assert!(!plan.overflow, "both documents fit beside the Start tab");
+    }
+
+    /// A crowded Start strip still holds the document that is open, even though
+    /// the Start tab comes first.
+    #[test]
+    fn a_crowded_start_strip_keeps_the_open_document() {
+        let files = [120.0; 8];
+        let plan = plan_tab_strip(280.0, None, pane_tab_w("Start"), &files, Some(6), &[]);
+        assert!(plan.overflow);
+        assert_eq!(plan.visible[0].0, StripSlot::Start);
+        assert!(
+            plan.visible
+                .iter()
+                .any(|(slot, _)| *slot == StripSlot::File(6)),
+            "the open document must stay beside Start: {:?}",
+            plan.visible
+        );
+    }
+
     /// The documents outrank the launcher chips: at the panel's default width
     /// both open files stay, and the panes that do not fit move into the
     /// catalog.
@@ -10026,7 +10750,7 @@ mod tests {
         let files = [file_tab_w("README.md"), file_tab_w("Cargo.toml")];
         let plan = plan_tab_strip(
             365.0,
-            RightTab::Files,
+            Some(RightTab::Files),
             pane_tab_w("Files"),
             &files,
             Some(0),
@@ -10053,7 +10777,7 @@ mod tests {
         let files = [120.0; 8];
         let plan = plan_tab_strip(
             280.0,
-            RightTab::Files,
+            Some(RightTab::Files),
             pane_tab_w("Files"),
             &files,
             Some(6),
@@ -10087,14 +10811,14 @@ mod tests {
         for budget in [206.0, 280.0, 365.0, 456.0, 900.0] {
             let plan = plan_tab_strip(
                 budget,
-                RightTab::Files,
+                Some(RightTab::Files),
                 pane_tab_w("Files"),
                 &files,
                 Some(4),
                 &launchers(),
             );
             let drawn = plan.visible.iter().map(|(_, width)| *width).sum::<f32>()
-                + plan.visible.len() as f32 * STRIP_GAP
+                + plan.visible.len().saturating_sub(1) as f32 * STRIP_GAP
                 + if plan.overflow {
                     STRIP_OVERFLOW_W + STRIP_GAP
                 } else {
@@ -10428,6 +11152,8 @@ mod federation_pane_tests {
                         deadline_ms: None,
                         allow_sub_delegation: false,
                         result_contract: None,
+                        trace_id: None,
+                        span_id: None,
                     },
                     now,
                 )

@@ -45,6 +45,8 @@ pub struct LedgerEntry {
 pub struct LedgerReport {
     /// Entries checked.
     pub entries: u64,
+    /// The hash the first entry chains from (empty for the first segment).
+    pub first_prev_hash: String,
     /// The last entry's hash.
     pub last_hash: String,
 }
@@ -94,7 +96,17 @@ impl AuditLedger {
             std::fs::create_dir_all(parent)?;
         }
         let (seq, last_hash) = match Self::verify(&path) {
-            Ok(report) => (report.entries, report.last_hash),
+            Ok(report) => {
+                let head = if report.entries == 0 {
+                    std::fs::read_to_string(path.with_extension("head"))
+                        .ok()
+                        .map(|head| head.trim().to_string())
+                        .unwrap_or_default()
+                } else {
+                    report.last_hash
+                };
+                (report.entries, head)
+            }
             Err(LedgerError::Io(_)) => (0, String::new()),
             Err(error) => {
                 return Err(std::io::Error::new(
@@ -103,7 +115,14 @@ impl AuditLedger {
                 ));
             }
         };
-        let writer = OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let writer = options.open(&path)?;
         Ok(Self {
             path,
             guard: Mutex::new(LedgerState {
@@ -144,6 +163,143 @@ impl AuditLedger {
         Ok(entry)
     }
 
+    /// Rotate the ledger: archive the current file and start a fresh segment
+    /// that chains from the archived one. The chain head is recorded in a
+    /// sidecar so a restart can continue across the rotation.
+    pub fn rotate(&self, suffix: &str) -> std::io::Result<PathBuf> {
+        let mut state = self
+            .guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.writer.flush()?;
+        let head = state.last_hash.clone();
+        let mut archive = self.path.with_extension(format!("{suffix}.jsonl"));
+        let mut counter = 0;
+        while archive.exists() {
+            counter += 1;
+            archive = self
+                .path
+                .with_extension(format!("{suffix}.{counter}.jsonl"));
+        }
+        std::fs::rename(&self.path, &archive)?;
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        state.writer = options.open(&self.path)?;
+        state.seq = 0;
+        // The first entry of the new segment chains from the archived tail.
+        state.last_hash = head.clone();
+        let head_path = self.path.with_extension("head");
+        if let Err(error) = std::fs::write(&head_path, &head) {
+            tracing::warn!("ledger head was not written: {error}");
+        }
+        Ok(archive)
+    }
+
+    /// Verify every segment in a directory and prove they form one chain.
+    ///
+    /// Segments are ordered by the hashes themselves (a segment chains from the
+    /// previous tail), not by file name, so rotation naming cannot hide a gap.
+    pub fn verify_dir(directory: &Path, prefix: &str) -> Result<LedgerReport, LedgerError> {
+        let entries =
+            std::fs::read_dir(directory).map_err(|error| LedgerError::Io(error.to_string()))?;
+        let mut reports: Vec<LedgerReport> = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| LedgerError::Io(error.to_string()))?;
+            let path = entry.path();
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            if !name.starts_with(prefix) || !name.ends_with(".jsonl") {
+                continue;
+            }
+            let report = Self::verify(&path)?;
+            if report.entries > 0 {
+                reports.push(report);
+            }
+        }
+        let mut total = 0u64;
+        let mut first_prev_hash = String::new();
+        let mut last_hash = String::new();
+        let mut remaining = reports;
+        let mut started = false;
+        while !remaining.is_empty() {
+            let index = if !started {
+                remaining
+                    .iter()
+                    .position(|report| report.first_prev_hash.is_empty())
+                    .unwrap_or(0)
+            } else {
+                match remaining
+                    .iter()
+                    .position(|report| report.first_prev_hash == last_hash)
+                {
+                    Some(index) => index,
+                    None => {
+                        return Err(LedgerError::Broken {
+                            line: 1,
+                            reason: "a ledger segment does not chain from the previous".to_string(),
+                        });
+                    }
+                }
+            };
+            let report = remaining.remove(index);
+            if !started {
+                first_prev_hash = report.first_prev_hash.clone();
+                started = true;
+            }
+            total += report.entries;
+            last_hash = report.last_hash;
+        }
+        Ok(LedgerReport {
+            entries: total,
+            first_prev_hash,
+            last_hash,
+        })
+    }
+
+    /// Write the last hash to an external checkpoint file with 0600 mode.
+    pub fn checkpoint_to(
+        path: &Path,
+        checkpoint_path: &Path,
+    ) -> Result<Option<String>, LedgerError> {
+        let hash = Self::checkpoint(path)?;
+        if let Some(hash) = &hash {
+            if let Some(parent) = checkpoint_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|error| LedgerError::Io(error.to_string()))?;
+            }
+            let mut options = OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+            let mut file = options
+                .open(checkpoint_path)
+                .map_err(|error| LedgerError::Io(error.to_string()))?;
+            file.write_all(hash.as_bytes())
+                .map_err(|error| LedgerError::Io(error.to_string()))?;
+        }
+        Ok(hash)
+    }
+
+    /// Verify against a checkpoint file written by [checkpoint_to].
+    pub fn verify_with_checkpoint_file(
+        path: &Path,
+        checkpoint_path: &Path,
+    ) -> Result<LedgerReport, LedgerError> {
+        let expected = std::fs::read_to_string(checkpoint_path)
+            .map_err(|error| LedgerError::Io(error.to_string()))?;
+        Self::verify_against(path, expected.trim())
+    }
+
     /// The ledger's file.
     pub fn path(&self) -> &Path {
         &self.path
@@ -153,6 +309,7 @@ impl AuditLedger {
     pub fn verify(path: &Path) -> Result<LedgerReport, LedgerError> {
         let file = File::open(path).map_err(|error| LedgerError::Io(error.to_string()))?;
         let mut entries = 0u64;
+        let mut first_prev_hash = String::new();
         let mut last_hash = String::new();
         for (index, line) in BufReader::new(file).lines().enumerate() {
             let line = line.map_err(|error| LedgerError::Io(error.to_string()))?;
@@ -174,7 +331,11 @@ impl AuditLedger {
                     reason: format!("expected seq {}, found {}", entries + 1, entry.seq),
                 });
             }
-            if entry.prev_hash != last_hash {
+            if entries == 0 {
+                // A rotated segment chains from the previous segment's last
+                // hash; the first segment starts from the empty string.
+                first_prev_hash = entry.prev_hash.clone();
+            } else if entry.prev_hash != last_hash {
                 return Err(LedgerError::Broken {
                     line: number,
                     reason: "prev_hash does not name the previous entry".to_string(),
@@ -189,7 +350,11 @@ impl AuditLedger {
             entries += 1;
             last_hash = entry.hash;
         }
-        Ok(LedgerReport { entries, last_hash })
+        Ok(LedgerReport {
+            entries,
+            first_prev_hash,
+            last_hash,
+        })
     }
 
     /// The last hash on disk, for an external checkpoint.
@@ -346,5 +511,97 @@ mod tests {
             Err(LedgerError::CheckpointMismatch)
         ));
         let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+    }
+
+    #[test]
+    fn a_rotated_chain_stays_verifiable_across_segments() {
+        let root = scratch("rotate");
+        let path = root.join("ledger.jsonl");
+        let ledger = AuditLedger::open(&path).expect("open");
+        ledger.append(&event(1)).expect("append");
+        ledger.append(&event(2)).expect("append");
+        let archive = ledger.rotate("seg").expect("rotated");
+        assert!(archive.exists());
+        ledger.append(&event(3)).expect("append");
+        ledger.append(&event(4)).expect("append");
+
+        let report = AuditLedger::verify_dir(&root, "ledger").expect("the chain verifies");
+        assert_eq!(report.entries, 4);
+        assert_eq!(report.first_prev_hash, "");
+        assert!(report.last_hash.len() == 64);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_restart_after_rotation_continues_the_chain() {
+        let root = scratch("rotate-restart");
+        let path = root.join("ledger.jsonl");
+        {
+            let ledger = AuditLedger::open(&path).expect("open");
+            ledger.append(&event(1)).expect("append");
+            ledger.rotate("seg").expect("rotated");
+        }
+        // No entry was written to the fresh segment, so the head sidecar keeps
+        // the chain's tail for the next process.
+        let ledger = AuditLedger::open(&path).expect("reopen");
+        ledger.append(&event(2)).expect("append");
+        let report = AuditLedger::verify_dir(&root, "ledger").expect("the chain verifies");
+        assert_eq!(report.entries, 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_tampered_archived_segment_is_detected() {
+        let root = scratch("rotate-tamper");
+        let path = root.join("ledger.jsonl");
+        let ledger = AuditLedger::open(&path).expect("open");
+        ledger.append(&event(1)).expect("append");
+        let archive = ledger.rotate("seg").expect("rotated");
+        ledger.append(&event(2)).expect("append");
+        let text = std::fs::read_to_string(&archive).expect("read");
+        let mut entry: LedgerEntry =
+            serde_json::from_str(text.lines().next().expect("line")).expect("parse");
+        entry.event.reason = Some("rewritten".to_string());
+        std::fs::write(
+            &archive,
+            serde_json::to_string(&entry).expect("serialize")
+                + "
+",
+        )
+        .expect("write");
+        assert!(AuditLedger::verify_dir(&root, "ledger").is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_checkpoint_file_detects_truncation() {
+        let root = scratch("checkpoint");
+        let path = root.join("ledger.jsonl");
+        let checkpoint = root.join("ledger.checkpoint");
+        let ledger = AuditLedger::open(&path).expect("open");
+        ledger.append(&event(1)).expect("append");
+        ledger.append(&event(2)).expect("append");
+        let hash = AuditLedger::checkpoint_to(&path, &checkpoint)
+            .expect("checkpoint")
+            .expect("a hash");
+        assert_eq!(
+            std::fs::read_to_string(&checkpoint).expect("read").trim(),
+            hash
+        );
+        assert!(AuditLedger::verify_with_checkpoint_file(&path, &checkpoint).is_ok());
+        let text = std::fs::read_to_string(&path).expect("read");
+        let first = text.lines().next().expect("line").to_string();
+        std::fs::write(
+            &path,
+            first
+                + "
+",
+        )
+        .expect("truncate");
+        assert!(matches!(
+            AuditLedger::verify_with_checkpoint_file(&path, &checkpoint),
+            Err(LedgerError::CheckpointMismatch)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

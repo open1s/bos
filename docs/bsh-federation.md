@@ -60,16 +60,43 @@ passes) + XChaCha20-Poly1305 with a per-file random salt and nonce, so a copied
 file is useless without the passphrase. `migrate` moves a key between backends
 (the target stores first; the source is deleted only after that succeeds). An
 encrypted custody file is also the backup: copy it and open it with the same
-passphrase on another host. The BSH shell still loads the raw key file by
-default; platform keychains are follow-up work.
+passphrase on another host.
+
+`KeychainCustody` uses the platform store (macOS `security`, Linux
+`secret-tool`) and reports `available() == false` elsewhere. BSH selects it
+with `[federation] identity_custody = "keychain"`: the node loads or creates
+its seed there, and falls back to the identity file only when no backend
+exists — a keychain read error is reported, never silently replaced by a new
+identity. The default remains `"file"`.
+
+### Ledger operations
+
+`AuditLedger::rotate` archives the current segment and continues the chain in a
+fresh one; a `.head` sidecar carries the archived tail so a restart before the
+first append still chains correctly. `verify_dir` orders segments by the hashes
+themselves (not by file name) and refuses a gap or a tampered archived segment.
+`checkpoint_to` writes the last hash to a 0600 file and
+`verify_with_checkpoint_file` refuses a truncated ledger. Ledger and checkpoint
+files are created 0600.
+
+### Audit correlation
+
+Invoke rows on both sides share the trace/span, the task, the last delegation
+hop and the original principal. A delegation request carries its own
+`trace_id`/`span_id` (a sub-delegation inherits the parent's unless it names
+its own), the receiver's row correlates from the nested `request`, and the
+reply adds the accepted delegation id. Those rows land in the hash-chained
+ledger beside the invoke that started them.
 
 ### Acceptance matrix
 
 `crates/federation/tests/acceptance.rs` runs the cross-node promises on the
 deterministic wire: three nodes publish their catalogue, a caller resolves a
-remote provider and invokes through it, a restart keeps the queued task, and an
-unreachable peer fails closed instead of hanging. `task_tcp_e2e.rs` covers the
-task and delegation flow on a real Zenoh loopback.
+remote provider and invokes through it, a restart keeps the queued task, an
+unreachable peer fails closed instead of hanging, a delegation correlates its
+trace and accepted id across both nodes, a workspace-scoped grant is enforced on
+the caller and the provider, and a revocation stops the next call immediately.
+`task_tcp_e2e.rs` covers the task and delegation flow on a real Zenoh loopback.
 
 ### Optional coordinator
 
@@ -81,6 +108,12 @@ configured administrator Node may register or suspend members; any trusted peer
 may read the topology. Membership is metadata, never authority: a member the
 coordinator marks active still needs the provider's local grants to invoke
 anything, and nodes keep operating peer-to-peer while the coordinator is down.
+
+The coordinator also carries the current policy revision: `set_policy_revision`
+is admin-gated and monotonic, `members_behind()` lists members whose advertised
+revision is older, and the topology reports both, so a member can detect
+staleness without the coordinator pushing anything. The membership document is
+saved atomically and reloaded on start.
 
 ### Resumable transfers
 
@@ -97,9 +130,12 @@ checks the major (the compatibility unit: `bsh.fed/1` and `bsh.fed/1.x` are
 accepted, `bsh.fed/2` is a breaking change) and a supported schema window, and
 refuses a mismatch with a typed error naming what it found and what the build
 accepts. Unknown envelope fields are ignored, so an additive change does not
-break a signed message. Discovery records advertise the publisher's protocol and
-schema, and a record outside the window is refused before its catalogue is used;
-a record written before these fields existed reads as v1.
+break a signed message. Discovery records advertise the publisher's protocol,
+schema and optional features (`invoke`, `delegate`, `resource`, `knowledge`,
+`tasks`, `coordinator`), and a record outside the window is refused before its
+catalogue is used; a record written before these fields existed reads as v1.
+`tests/conformance.rs` pins one envelope's exact signature, so a change to the
+canonical form is caught as a wire-format break.
 
 ### Membership lifecycle
 
@@ -217,6 +253,10 @@ with no GUI:
 
 ```sh
 bsh federation enroll <peer-node-id>
+bsh federation invite <peer-node-id>
+bsh federation approve <peer-node-id>
+bsh federation suspend <peer-node-id>
+bsh federation resume <peer-node-id>
 bsh federation grant <peer-node-id> builtin/read_file
 bsh federation revoke-grant <peer-node-id> builtin/read_file
 bsh federation revoke <peer-node-id>
@@ -224,7 +264,11 @@ bsh federation rotate [reason]
 bsh federation accept-rotation <record.json>
 ```
 
-`enroll` trusts the identity; it grants nothing. `grant` names one capability.
+`enroll` is invite+approve in one step; `invite` records a peer without
+trusting it, `approve` activates it, and `suspend`/`resume` stop and restart its
+calls while keeping its grants. `enroll` and the four verbs take the data
+directory's writer lock, so they refuse to write behind a running app.
+`grant` names one capability.
 `revoke` drops the peer and every grant it held. Enrollments and grants are
 persisted in `peers.json` beside the identity with an atomic write.
 

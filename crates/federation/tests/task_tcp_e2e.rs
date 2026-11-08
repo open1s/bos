@@ -197,6 +197,8 @@ async fn an_objective_delegation_crosses_two_real_sessions() {
                 deadline_ms: None,
                 allow_sub_delegation: false,
                 result_contract: None,
+                trace_id: None,
+                span_id: None,
             },
             &context(),
         )

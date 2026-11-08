@@ -94,6 +94,8 @@ pub(crate) async fn delegate_record(
         deadline_ms: Some(unix_ms() + 30_000),
         allow_sub_delegation: false,
         result_contract: contract,
+        trace_id: None,
+        span_id: None,
     };
     node.delegate(&target, request, &context())
         .await

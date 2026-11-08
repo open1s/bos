@@ -985,6 +985,34 @@ fn free_loopback_port() -> Result<u16, String> {
         .map_err(|error| error.to_string())
 }
 
+/// Load (or create) the node identity through the configured custody backend.
+///
+/// A keychain read error is returned, never papered over: falling back on a
+/// read error would silently replace a node's identity with a new one.
+fn load_identity(path: &std::path::Path, custody: &str) -> Result<NodeIdentity, String> {
+    if custody == "keychain" {
+        if federation::custody::KeychainCustody::available() {
+            let account = path.display().to_string();
+            let backend = federation::custody::KeychainCustody::new("bsh-federation");
+            match NodeIdentity::load_custody(&backend, &account) {
+                Ok(Some(identity)) => return Ok(identity),
+                Ok(None) => {
+                    let identity = NodeIdentity::generate().map_err(|error| error.to_string())?;
+                    identity
+                        .save_custody(&backend, &account)
+                        .map_err(|error| error.to_string())?;
+                    return Ok(identity);
+                }
+                Err(error) => {
+                    return Err(format!("the keychain custody could not be read: {error}"));
+                }
+            }
+        }
+        log::warn!("federation: keychain custody is not available; using the identity file");
+    }
+    NodeIdentity::load_or_create(path).map_err(|error| error.to_string())
+}
+
 async fn build(
     settings: crate::settings::Settings,
     identity_path: PathBuf,
@@ -997,8 +1025,7 @@ async fn build(
     // sorted pass - a shared peer store with two keys is the shape that would
     // otherwise corrupt it.
     let lock = crate::federation_lock::NodeLocks::acquire(&identity_path, &peers_path)?;
-    let identity =
-        NodeIdentity::load_or_create(&identity_path).map_err(|error| error.to_string())?;
+    let identity = load_identity(&identity_path, &settings.global.federation.identity_custody)?;
     let peers = PeerStore::load(&peers_path).map_err(|error| error.to_string())?;
     let mut config = config;
     if let Some(terminator) = start_tls_terminator(&mut config, &settings).await {
@@ -1931,6 +1958,8 @@ mod tests {
             deadline_ms: None,
             allow_sub_delegation: false,
             result_contract: None,
+            trace_id: None,
+            span_id: None,
         };
         let accepted = runtime
             .node()
@@ -2022,6 +2051,8 @@ mod tests {
             deadline_ms: None,
             allow_sub_delegation: false,
             result_contract: None,
+            trace_id: None,
+            span_id: None,
         };
         let refused = runtime
             .node()
@@ -2571,6 +2602,8 @@ mod tests {
             deadline_ms: None,
             allow_sub_delegation: false,
             result_contract: None,
+            trace_id: None,
+            span_id: None,
         };
         let accepted = b
             .node()
@@ -2631,6 +2664,8 @@ mod tests {
             deadline_ms: None,
             allow_sub_delegation: false,
             result_contract: None,
+            trace_id: None,
+            span_id: None,
         };
         assert!(
             b.node()
@@ -2646,6 +2681,21 @@ mod tests {
         assert!(crate::federation_lock::DataDirLock::acquire(&root.join("a")).is_ok());
         assert!(crate::federation_lock::DataDirLock::acquire(&root.join("b")).is_ok());
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn identity_custody_falls_back_to_the_file() {
+        let root =
+            std::env::temp_dir().join(format!("bsh-identity-custody-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("scratch");
+        let path = root.join("identity.key");
+        let first = crate::federation_node::load_identity(&path, "file").expect("created");
+        let second = crate::federation_node::load_identity(&path, "file").expect("reloaded");
+        assert_eq!(first.node_id(), second.node_id());
+        let unknown = crate::federation_node::load_identity(&path, "unknown").expect("falls back");
+        assert_eq!(unknown.node_id(), first.node_id());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

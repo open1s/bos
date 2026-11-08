@@ -520,6 +520,13 @@ pub(crate) struct Shell {
     pub(crate) audit_call_limits: std::collections::BTreeMap<usize, usize>,
     /// The model-id filter on the fetched-model picker.
     pub(crate) picker_search: Entity<InputState>,
+    /// The Show All Tabs search field.
+    pub(crate) catalog_query: Entity<InputState>,
+    /// What that field holds, mirrored so the catalogue filters without reading
+    /// the input on every card.
+    pub(crate) catalog_query_text: String,
+    /// The Show All Tabs category filter.
+    pub(crate) catalog_filter: super::right_panel::CatalogFilter,
     /// The task-name filter on the Automation tasks pane.
     pub(crate) task_search: Entity<InputState>,
     /// The name/id filter on the Installed extensions pane.
@@ -1441,6 +1448,11 @@ impl Shell {
         let picker_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "settings.fetchSearch"))
         });
+        let catalog_query = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(crate::i18n::tr(lang, "right.tabs.search"))
+                .clean_on_escape()
+        });
         let task_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "task.searchPlaceholder"))
         });
@@ -1591,6 +1603,20 @@ impl Shell {
                  cx: &mut Context<Shell>| {
                     if matches!(event, InputEvent::Change) {
                         this.skill_query = this.skill_search.read(cx).value().to_string();
+                        cx.notify();
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &catalog_query,
+                window,
+                |this: &mut Shell,
+                 _state: &Entity<InputState>,
+                 event: &InputEvent,
+                 _window: &mut Window,
+                 cx: &mut Context<Shell>| {
+                    if matches!(event, InputEvent::Change) {
+                        this.catalog_query_text = this.catalog_query.read(cx).value().to_string();
                         cx.notify();
                     }
                 },
@@ -1958,6 +1984,9 @@ impl Shell {
             audit_full: BTreeSet::new(),
             audit_call_limits: std::collections::BTreeMap::new(),
             picker_search,
+            catalog_query,
+            catalog_query_text: String::new(),
+            catalog_filter: super::right_panel::CatalogFilter::All,
             task_search,
             extension_search,
             task_name,

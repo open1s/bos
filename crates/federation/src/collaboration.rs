@@ -1144,6 +1144,8 @@ impl TaskExecutor for DelegationExecutor {
             deadline_ms,
             allow_sub_delegation: false,
             result_contract: self.contract.clone(),
+            trace_id: None,
+            span_id: None,
         };
         let accepted = self
             .node

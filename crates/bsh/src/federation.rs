@@ -375,7 +375,11 @@ bsh federation [--profile NAME] <command>
                                           state, peers, node id and name
   status                                  show this node's id, its peers, and
                                           the last decisions
-  enroll <node-id>                        trust a peer
+  enroll <node-id>                        trust a peer (invite + approve)
+  invite <node-id>                        record a peer with no trust yet
+  approve <node-id>                       make an invited/pending peer active
+  suspend <node-id>                       stop a peer's calls, keep its grants
+  resume <node-id>                        re-activate a suspended peer
   revoke <node-id>                        revoke a peer and its grants
   grant <node-id> <capability-id>         let a peer invoke one capability
   revoke-grant <node-id> <capability-id>  withdraw one grant
@@ -574,6 +578,45 @@ pub(crate) fn command(
                 Ok(()) => match store.save(&peers_path) {
                     Ok(()) => {
                         let _ = writeln!(out, "rotated {} -> {}", record.old, record.new);
+                        0
+                    }
+                    Err(error) => fail(out, &error.to_string()),
+                },
+                Err(error) => fail(out, &error.to_string()),
+            }
+        }
+        Some(verb @ ("invite" | "approve" | "suspend" | "resume")) => {
+            // Mutations take the data directory's writer lock: a running app
+            // owns it, and a CLI write behind its back would be lost.
+            let _lock = match crate::federation_lock::DataDirLock::acquire(root) {
+                Ok(lock) => lock,
+                Err(error) => return fail(out, &error),
+            };
+            let node = match node_arg(args.get(1), out) {
+                Some(node) => node,
+                None => return 1,
+            };
+            let mut store = match PeerStore::load(&peers_path) {
+                Ok(store) => store,
+                Err(error) => return fail(out, &error.to_string()),
+            };
+            let now = unix_ms();
+            let transition = match verb {
+                "invite" => store.invite(node.clone(), now, None),
+                "approve" => store.approve(&node, now),
+                "suspend" => store.suspend(&node),
+                _ => store.resume(&node),
+            };
+            match transition {
+                Ok(()) => match store.save(&peers_path) {
+                    Ok(()) => {
+                        let done = match verb {
+                            "invite" => "invited",
+                            "approve" => "approved",
+                            "suspend" => "suspended",
+                            _ => "resumed",
+                        };
+                        let _ = writeln!(out, "{done} {node}");
                         0
                     }
                     Err(error) => fail(out, &error.to_string()),
@@ -1026,6 +1069,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn the_membership_verbs_follow_the_lifecycle() {
+        let root = scratch("membership");
+        let peer = peer();
+
+        let (code, output) = run(&root, &["invite", &peer]);
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("invited"), "{output}");
+
+        let (code, output) = run(&root, &["suspend", &peer]);
+        assert_ne!(code, 0, "an invited peer cannot be suspended: {output}");
+
+        let (code, output) = run(&root, &["approve", &peer]);
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("approved"), "{output}");
+
+        let (code, output) = run(&root, &["suspend", &peer]);
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("suspended"), "{output}");
+
+        let (code, output) = run(&root, &["resume", &peer]);
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("resumed"), "{output}");
+
+        let store = PeerStore::load(&root.join("peers.json")).expect("the store");
+        let node = NodeId::new(peer).expect("a node");
+        assert!(store.is_trusted(&node, unix_ms()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
     #[test]
     fn a_grant_lets_the_peer_invoke_the_capability() {
         let root = scratch("grant");

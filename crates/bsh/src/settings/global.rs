@@ -669,6 +669,19 @@ pub(crate) struct FederationSection {
     /// The deployment profile. Production refuses an insecure transport.
     #[serde(default)]
     pub(crate) security: SecurityProfile,
+    /// Where the node identity lives: "file" (default) or "keychain".
+    ///
+    /// Keychain uses the platform store (macOS Keychain, Linux Secret Service)
+    /// and falls back to the identity file, with a warning, when the host has no
+    /// usable backend. A read error never falls back, so a present identity is
+    /// not silently replaced.
+    #[serde(default = "default_identity_custody")]
+    pub(crate) identity_custody: String,
+}
+
+/// The shipped identity custody backend.
+fn default_identity_custody() -> String {
+    "file".to_string()
 }
 
 /// The shipped remote-work step cap.
@@ -795,6 +808,7 @@ impl Default for FederationSection {
             max_task_tokens: default_remote_tokens(),
             max_task_deadline_ms: default_remote_deadline_ms(),
             security: SecurityProfile::Development,
+            identity_custody: default_identity_custody(),
         }
     }
 }

@@ -188,6 +188,10 @@ async fn three_nodes_publish_resolve_and_invoke() {
         );
         assert!(!record.protocol.is_empty());
         assert_eq!(record.schema_version, 1);
+        assert!(
+            record.features.iter().any(|feature| feature == "invoke"),
+            "the publisher advertises its features"
+        );
         let mut catalogue = Catalogue::new();
         for descriptor in &record.descriptors {
             catalogue.insert(descriptor.clone()).expect("unique");
@@ -315,6 +319,197 @@ async fn an_unreachable_peer_fails_closed() {
                 | capability::CapabilityError::Timeout { .. }
                 | capability::CapabilityError::UnknownOutcome { .. }
         ),
+        "{error:?}"
+    );
+}
+
+async fn wait_event(
+    audit: &federation::MemoryAudit,
+    predicate: impl Fn(&federation::FederationEvent) -> bool,
+) -> federation::FederationEvent {
+    for _ in 0..100 {
+        if let Some(event) = audit
+            .events()
+            .iter()
+            .find(|event| predicate(event))
+            .cloned()
+        {
+            return event;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the expected audit event did not arrive");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delegation_correlates_its_trace_across_nodes() {
+    use federation::{DelegationId, DelegationRequest};
+
+    let network = Arc::new(InMemoryNetwork::new());
+    let caller_identity = identity(51);
+    let provider_identity = identity(52);
+    let caller_id = caller_identity.node_id();
+    let provider_id = provider_identity.node_id();
+    let caller_audit = Arc::new(federation::MemoryAudit::new());
+    let provider_audit = Arc::new(federation::MemoryAudit::new());
+    let (caller_transport, caller_inbox) = network.join(caller_id.clone());
+    let (provider_transport, provider_inbox) = network.join(provider_id.clone());
+    let caller = Arc::new(
+        FederationNode::new(caller_identity, Arc::new(caller_transport))
+            .with_audit(caller_audit.clone()),
+    );
+    let provider = Arc::new(
+        FederationNode::new(provider_identity, Arc::new(provider_transport))
+            .with_runtime(echo_runtime(descriptor("echo")))
+            .with_audit(provider_audit.clone()),
+    );
+    let mut tasks = vec![caller.start(caller_inbox), provider.start(provider_inbox)];
+
+    let now = capability::unix_ms();
+    {
+        let peers = caller.peers();
+        let mut peers = peers.write().expect("peers");
+        peers.enroll(provider_id.clone(), now, None);
+        peers
+            .grant(&provider_id, capability("echo"), now, None)
+            .expect("granted");
+    }
+    {
+        let peers = provider.peers();
+        let mut peers = peers.write().expect("peers");
+        peers.enroll(caller_id.clone(), now, None);
+        peers
+            .grant(&caller_id, capability("echo"), now, None)
+            .expect("granted");
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let request = DelegationRequest {
+        id: DelegationId::new("d-correlate"),
+        parent: None,
+        target: provider_id.clone(),
+        objective: "echo the value".to_string(),
+        capabilities: vec![capability("echo")],
+        operations: Vec::new(),
+        resources: Vec::new(),
+        deadline_ms: None,
+        allow_sub_delegation: false,
+        result_contract: Some(
+            json!({ "capability": "builtin/echo", "input": { "matrix": true } }).to_string(),
+        ),
+        trace_id: Some("trace-matrix".to_string()),
+        span_id: Some("span-caller".to_string()),
+    };
+    let record = caller
+        .delegate(&provider_id, request, &context())
+        .await
+        .expect("the target accepts");
+    let event = wait_event(&provider_audit, |event| event.operation == "delegate").await;
+    assert_eq!(event.trace_id.as_deref(), Some("trace-matrix"));
+    assert_eq!(event.span_id.as_deref(), Some("span-caller"));
+    assert_eq!(
+        event.delegation.as_deref(),
+        Some(record.request.id.as_str()),
+        "the row names the accepted delegation"
+    );
+    tasks.retain(|task| !task.is_finished());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_workspace_scoped_grant_is_enforced_in_the_mesh() {
+    use federation::InvocationScope;
+
+    let nodes = mesh(2, &[53, 54]).await;
+    let caller = &nodes[0];
+    let provider = &nodes[1];
+    let now = capability::unix_ms();
+    {
+        let peers = provider.node.peers();
+        let mut peers = peers.write().expect("peers");
+        peers
+            .grant_scoped_in(
+                &caller.id,
+                capability("echo"),
+                vec!["echo".to_string()],
+                Vec::new(),
+                vec!["ws:research".to_string()],
+                now,
+                None,
+            )
+            .expect("a workspace-scoped grant");
+    }
+    {
+        let peers = caller.node.peers();
+        let mut peers = peers.write().expect("peers");
+        peers
+            .grant_scoped_in(
+                &provider.id,
+                capability("echo"),
+                vec!["echo".to_string()],
+                Vec::new(),
+                vec!["ws:research".to_string()],
+                now,
+                None,
+            )
+            .expect("a workspace-scoped grant");
+    }
+    let research = capability::WorkspaceId::new("ws:research").expect("a workspace");
+    let mut context = context();
+    context.workspace = research.clone();
+    let scope = InvocationScope {
+        operation: Some("echo".to_string()),
+        resource: None,
+        workspace: Some(research.to_string()),
+    };
+    caller
+        .node
+        .invoke_scoped(
+            &provider.id,
+            &capability("echo"),
+            json!({ "matrix": true }),
+            Some(&scope),
+            &context,
+        )
+        .await
+        .expect("the matching workspace is allowed");
+    let wrong = InvocationScope {
+        workspace: Some("ws:other".to_string()),
+        ..scope
+    };
+    let error = caller
+        .node
+        .invoke_scoped(
+            &provider.id,
+            &capability("echo"),
+            json!({ "matrix": true }),
+            Some(&wrong),
+            &context,
+        )
+        .await
+        .expect_err("another workspace is denied");
+    assert!(
+        matches!(error, capability::CapabilityError::Denied { .. }),
+        "{error:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoking_a_peer_stops_calls_immediately() {
+    let nodes = mesh(2, &[55, 56]).await;
+    let caller = &nodes[0];
+    let provider = &nodes[1];
+    {
+        let peers = provider.node.peers();
+        let mut peers = peers.write().expect("peers");
+        peers.revoke(&caller.id);
+    }
+    let error = caller
+        .node
+        .invoke(&provider.id, &capability("echo"), json!({}), &context())
+        .await
+        .expect_err("a revoked peer is refused");
+    assert!(
+        matches!(error, capability::CapabilityError::Denied { .. }),
         "{error:?}"
     );
 }

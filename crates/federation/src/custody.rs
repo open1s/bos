@@ -308,6 +308,253 @@ pub fn migrate(from: &dyn Custody, to: &dyn Custody, name: &str) -> Result<bool,
     Ok(true)
 }
 
+/// A platform keychain backend.
+///
+/// macOS uses `security` generic passwords; Linux uses `secret-tool` (Secret
+/// Service). Windows and any host without the tool report `available() == false`
+/// and the caller falls back explicitly.
+///
+/// macOS note: `security add-generic-password -w` takes the secret on the
+/// command line, so it is briefly visible in the process list. The keychain
+/// itself encrypts it at rest; a prompt-based flow is not available to a
+/// headless launch.
+#[derive(Debug, Clone)]
+pub struct KeychainCustody {
+    service: String,
+}
+
+impl KeychainCustody {
+    /// Keychain entries live under one service name.
+    pub fn new(service: impl Into<String>) -> Self {
+        Self {
+            service: service.into(),
+        }
+    }
+
+    /// Whether this host has a usable keychain tool.
+    pub fn available() -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            std::process::Command::new("security")
+                .arg("-h")
+                .output()
+                .map(|output| output.status.success() || !output.stderr.is_empty())
+                .unwrap_or(false)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            std::process::Command::new("secret-tool")
+                .arg("--help")
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            false
+        }
+    }
+
+    /// The service name.
+    pub fn service(&self) -> &str {
+        &self.service
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run(command: &mut std::process::Command) -> Result<Option<Vec<u8>>, CustodyError> {
+    let output = command.output().map_err(|error| CustodyError::Io {
+        path: "keychain".to_string(),
+        message: error.to_string(),
+    })?;
+    if output.status.success() {
+        return Ok(Some(output.stdout));
+    }
+    let message = String::from_utf8_lossy(&output.stderr).to_string();
+    if message.contains("could not be found") {
+        return Ok(None);
+    }
+    Err(CustodyError::Io {
+        path: "keychain".to_string(),
+        message,
+    })
+}
+
+#[cfg(target_os = "macos")]
+impl Custody for KeychainCustody {
+    fn describe(&self) -> String {
+        format!("keychain:{}", self.service)
+    }
+
+    fn load(&self, name: &str) -> Result<Option<Vec<u8>>, CustodyError> {
+        let output = run(std::process::Command::new("security")
+            .arg("find-generic-password")
+            .arg("-s")
+            .arg(&self.service)
+            .arg("-a")
+            .arg(name)
+            .arg("-w"))?;
+        Ok(output.map(|bytes| {
+            let text = String::from_utf8_lossy(&bytes);
+            text.trim_end_matches(['\n', '\r']).as_bytes().to_vec()
+        }))
+    }
+
+    fn store(&self, name: &str, secret: &[u8]) -> Result<(), CustodyError> {
+        let secret = String::from_utf8_lossy(secret).to_string();
+        let output = std::process::Command::new("security")
+            .arg("add-generic-password")
+            .arg("-U")
+            .arg("-s")
+            .arg(&self.service)
+            .arg("-a")
+            .arg(name)
+            .arg("-w")
+            .arg(&secret)
+            .output()
+            .map_err(|error| CustodyError::Io {
+                path: "keychain".to_string(),
+                message: error.to_string(),
+            })?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(CustodyError::Io {
+                path: "keychain".to_string(),
+                message: String::from_utf8_lossy(&output.stderr).to_string(),
+            })
+        }
+    }
+
+    fn delete(&self, name: &str) -> Result<(), CustodyError> {
+        let output = std::process::Command::new("security")
+            .arg("delete-generic-password")
+            .arg("-s")
+            .arg(&self.service)
+            .arg("-a")
+            .arg(name)
+            .output()
+            .map_err(|error| CustodyError::Io {
+                path: "keychain".to_string(),
+                message: error.to_string(),
+            })?;
+        if output.status.success()
+            || String::from_utf8_lossy(&output.stderr).contains("could not be found")
+        {
+            Ok(())
+        } else {
+            Err(CustodyError::Io {
+                path: "keychain".to_string(),
+                message: String::from_utf8_lossy(&output.stderr).to_string(),
+            })
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Custody for KeychainCustody {
+    fn describe(&self) -> String {
+        format!("keychain:{}", self.service)
+    }
+
+    fn load(&self, name: &str) -> Result<Option<Vec<u8>>, CustodyError> {
+        let output = std::process::Command::new("secret-tool")
+            .arg("lookup")
+            .arg("service")
+            .arg(&self.service)
+            .arg("account")
+            .arg(name)
+            .output()
+            .map_err(|error| CustodyError::Io {
+                path: "keychain".to_string(),
+                message: error.to_string(),
+            })?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        Ok(Some(output.stdout))
+    }
+
+    fn store(&self, name: &str, secret: &[u8]) -> Result<(), CustodyError> {
+        use std::io::Write as _;
+        let mut child = std::process::Command::new("secret-tool")
+            .arg("store")
+            .arg(format!("--label=bsh-federation {name}"))
+            .arg("service")
+            .arg(&self.service)
+            .arg("account")
+            .arg(name)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|error| CustodyError::Io {
+                path: "keychain".to_string(),
+                message: error.to_string(),
+            })?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(secret).map_err(|error| CustodyError::Io {
+                path: "keychain".to_string(),
+                message: error.to_string(),
+            })?;
+        }
+        let status = child.wait().map_err(|error| CustodyError::Io {
+            path: "keychain".to_string(),
+            message: error.to_string(),
+        })?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(CustodyError::Io {
+                path: "keychain".to_string(),
+                message: "secret-tool refused the entry".to_string(),
+            })
+        }
+    }
+
+    fn delete(&self, name: &str) -> Result<(), CustodyError> {
+        let output = std::process::Command::new("secret-tool")
+            .arg("clear")
+            .arg("service")
+            .arg(&self.service)
+            .arg("account")
+            .arg(name)
+            .output()
+            .map_err(|error| CustodyError::Io {
+                path: "keychain".to_string(),
+                message: error.to_string(),
+            })?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(CustodyError::Io {
+                path: "keychain".to_string(),
+                message: String::from_utf8_lossy(&output.stderr).to_string(),
+            })
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+impl Custody for KeychainCustody {
+    fn describe(&self) -> String {
+        format!("keychain:{} (unsupported)", self.service)
+    }
+
+    fn load(&self, _name: &str) -> Result<Option<Vec<u8>>, CustodyError> {
+        Ok(None)
+    }
+
+    fn store(&self, _name: &str, _secret: &[u8]) -> Result<(), CustodyError> {
+        Err(CustodyError::Io {
+            path: "keychain".to_string(),
+            message: "this platform has no keychain backend".to_string(),
+        })
+    }
+
+    fn delete(&self, _name: &str) -> Result<(), CustodyError> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
