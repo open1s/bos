@@ -252,6 +252,8 @@ pub(crate) fn bind_global_actions(cx: &mut App) {
         // The Browser pane's Start card prints this chord, so it has to open
         // the pane - a hint that presses nothing is a lying control.
         KeyBinding::new("cmd-t", right_panel::BrowserTab, None),
+        // The launcher advertises this chord in its search field.
+        KeyBinding::new("cmd-k", right_panel::FocusLauncher, None),
         // Tab belongs to the shell while the terminal has focus. Without a
         // binding the macOS input handler falls through to AppKit's key-view
         // loop, so focus leaves the pane and the shell never sees the byte.

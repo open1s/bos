@@ -573,6 +573,8 @@ pub(crate) struct AppState {
     /// its own small record beside the state it guards. Env values never enter
     /// it: only the command line, the package and its path.
     trust_audit: std::collections::VecDeque<TrustDecision>,
+    /// The launcher's automatically maintained recent rows.
+    pub(crate) launcher_recent: crate::recent::RecentStore,
     /// The last federation decisions, read once at launch and advanced by the
     /// audit broadcast while the shell runs.
     pub(crate) federation_recent: Vec<federation::FederationEvent>,
@@ -860,6 +862,7 @@ impl AppState {
             mcp: crate::mcp::McpPool::default(),
             browser: Arc::new(crate::browser::BrowserHandle::new()),
             trust_audit: std::collections::VecDeque::new(),
+            launcher_recent: crate::recent::RecentStore::default(),
             federation_recent: Vec::new(),
             federation_events: crate::federation_audit::subscribe(),
             federation_peers: Vec::new(),
@@ -912,6 +915,12 @@ impl AppState {
                 workspace.root = scratch.clone();
             }
         }
+        // The launcher's recent rows: read once, and only after a scratch
+        // store has redirected the save root, so a test cannot read or write
+        // the reader's own list.
+        if let Some(path) = state.settings.launcher_recent_path() {
+            state.launcher_recent = crate::recent::RecentStore::load(&path);
+        }
         // The last federation decisions, read once for the settings row: the
         // pane must not touch the log per frame, and a launch-time read is
         // enough to say what happened most recently.
@@ -955,6 +964,31 @@ impl AppState {
         // present from the first frame rather than appearing after a refresh.
         crate::caps::refresh_plugin_providers(&mut state.settings);
         state.ensure_active();
+        // A launch is also a use of the workspace it opens: seed the recent
+        // row so the launcher has the reader's own root on first run, not only
+        // after they switch away and back.
+        if let Some(workspace) = state
+            .settings
+            .global
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == state.settings.global.general.active_workspace)
+            .map(|workspace| {
+                (
+                    workspace.id.clone(),
+                    workspace.name.clone(),
+                    workspace.root.clone(),
+                )
+            })
+        {
+            state.record_launcher_recent(
+                crate::recent::RecentKind::Workspace,
+                workspace.0,
+                workspace.1,
+                crate::recent::display_path(&workspace.2),
+                Some(state.settings.global.general.active_workspace.clone()),
+            );
+        }
         // The allowlist is read, never seeded: with no file the workspace's
         // egress is UNRESTRICTED, and writing the starter here would flip a
         // fresh workspace into a deny-all before its owner asked for one. The
@@ -1269,6 +1303,41 @@ impl AppState {
     /// The reference's hero workspace picker reassigns the blank session it
     /// sits under; bsh keeps the same session and moves its owning workspace,
     /// because the chat the editor sits over already exists.
+    /// Record one launcher row and persist the list.
+    ///
+    /// The caller is the runtime, not a favorite control: opening a panel,
+    /// document or workspace is the whole gesture. A missing path (a test with
+    /// no save root) records in memory only.
+    pub(crate) fn record_launcher_recent(
+        &mut self,
+        kind: crate::recent::RecentKind,
+        id: impl Into<String>,
+        label: impl Into<String>,
+        detail: impl Into<String>,
+        workspace: Option<String>,
+    ) {
+        self.launcher_recent.record(
+            kind,
+            id,
+            label,
+            detail,
+            workspace,
+            agent::capability::unix_ms(),
+        );
+        if let Some(path) = self.settings.launcher_recent_path() {
+            let _ = self.launcher_recent.save(&path);
+        }
+    }
+
+    /// Forget one launcher row.
+    pub(crate) fn remove_launcher_recent(&mut self, kind: crate::recent::RecentKind, id: &str) {
+        if self.launcher_recent.remove(kind, id) {
+            if let Some(path) = self.settings.launcher_recent_path() {
+                let _ = self.launcher_recent.save(&path);
+            }
+        }
+    }
+
     pub(crate) fn set_workspace(&mut self, workspace: &str) {
         self.settings.global.general.active_workspace = workspace.to_string();
         // Re-read the new workspace's allowlist. Nothing is seeded: a missing

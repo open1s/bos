@@ -181,6 +181,7 @@ impl Shell {
                         move |_, _window, cx| {
                             let id = id.clone();
                             pick.update(cx, |this, cx| {
+                                this.record_workspace_recent(&id);
                                 this.state.set_workspace(&id);
                                 // The file pane's paths are relative, so the
                                 // switch rebases them onto another workspace.

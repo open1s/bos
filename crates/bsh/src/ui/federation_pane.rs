@@ -25,8 +25,8 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::*;
 
 use super::right_panel::{
-    display_name, enroll_and_grant, federation_status_off, grant_capability, parse_peer,
-    revoke_grant_action, revoke_peer_action, short_node, FederationPeerRow,
+    display_name, enroll_and_grant, federation_status_off, parse_peer, revoke_grant_action,
+    revoke_peer_action, short_node, FederationPeerRow,
 };
 use super::shell::Shell;
 use super::{hairline_all, hairline_bottom, icon, txt, DivExt, IconName};
@@ -969,6 +969,35 @@ fn peers_tab(
         .iter()
         .filter(|peer| discovered.iter().any(|row| row.node == peer.node))
         .count();
+    let trusted = shell
+        .right
+        .federation
+        .peers
+        .iter()
+        .filter(|peer| peer_matches_filter(super::right_panel::PeerFilter::Trusted, &peer.state))
+        .count();
+    let revoked = shell
+        .right
+        .federation
+        .peers
+        .iter()
+        .filter(|peer| peer.state == "revoked")
+        .count();
+    let revoked_filter = shell
+        .right
+        .federation
+        .peers
+        .iter()
+        .filter(|peer| peer_matches_filter(super::right_panel::PeerFilter::Revoked, &peer.state))
+        .count();
+    let pending = shell
+        .right
+        .federation
+        .peers
+        .iter()
+        .filter(|peer| peer_matches_filter(super::right_panel::PeerFilter::Pending, &peer.state))
+        .count();
+    let filter = shell.right.federation.peer_filter;
 
     let mut column = div().flex().flex_col().gap(px(CARD_GAP));
 
@@ -1001,14 +1030,95 @@ fn peers_tab(
             .into_any_element(),
         ),
     ));
+    let filters = [
+        (
+            super::right_panel::PeerFilter::All,
+            "right.federation.filterAll",
+            shell.right.federation.peers.len(),
+        ),
+        (
+            super::right_panel::PeerFilter::Trusted,
+            "right.federation.filterTrusted",
+            trusted,
+        ),
+        (
+            super::right_panel::PeerFilter::Revoked,
+            "right.federation.filterRevoked",
+            revoked_filter,
+        ),
+        (
+            super::right_panel::PeerFilter::Pending,
+            "right.federation.filterPending",
+            pending,
+        ),
+    ];
+    let mut filter_row = div().flex().flex_wrap().gap(px(4.0)).pt(px(2.0));
+    for (index, (value, key, count)) in filters.into_iter().enumerate() {
+        let active = filter == value;
+        filter_row = filter_row.child(
+            div()
+                .id(SharedString::from(format!(
+                    "federation-peer-filter-{index}"
+                )))
+                .debug_selector(move || format!("federation-peer-filter-{index}"))
+                .h(px(24.0))
+                .px(px(8.0))
+                .rounded(px(7.0))
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .cursor_pointer()
+                .bg(rgb(if active {
+                    theme::soft(theme::accent())
+                } else {
+                    theme::new_session_fill()
+                }))
+                .hover(|style| style.bg(rgb(theme::hover())))
+                .child(txt(
+                    lang.tr(key),
+                    10.0,
+                    if active {
+                        theme::accent()
+                    } else {
+                        theme::faint()
+                    },
+                ))
+                .child(txt(
+                    count.to_string(),
+                    9.0,
+                    if active {
+                        theme::accent()
+                    } else {
+                        theme::faint()
+                    },
+                ))
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.right.federation.peer_filter = value;
+                    cx.notify();
+                })),
+        );
+    }
+    peers_card = peers_card.child(filter_row);
     if shell.right.federation.peers.is_empty() {
         peers_card = peers_card.child(empty_state(
             lang.tr("right.federation.noPeers"),
             IconName::Users,
         ));
-    }
-    for (index, peer) in shell.right.federation.peers.iter().enumerate() {
-        peers_card = peers_card.child(peer_row(shell, peer, index, cx));
+    } else {
+        let mut shown = 0;
+        for (index, peer) in shell.right.federation.peers.iter().enumerate() {
+            if !peer_matches_filter(filter, &peer.state) {
+                continue;
+            }
+            shown += 1;
+            peers_card = peers_card.child(peer_row(shell, peer, index, cx));
+        }
+        if shown == 0 {
+            peers_card = peers_card.child(empty_state(
+                lang.tr("right.federation.noPeersFiltered"),
+                IconName::Users,
+            ));
+        }
     }
 
     let candidates: Vec<(usize, &super::right_panel::DiscoveredPeerRow)> = discovered
@@ -1047,6 +1157,149 @@ fn peers_tab(
         }
     }
 
+    if revoked > 0 {
+        let mut bulk = div().flex().flex_col().gap(px(6.0));
+        bulk = bulk.child(
+            div()
+                .id("federation-remove-revoked")
+                .debug_selector(|| "federation-remove-revoked".to_string())
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .h(px(28.0))
+                .px(px(4.0))
+                .rounded(px(8.0))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(theme::soft(theme::error()))))
+                .child(icon(IconName::Trash, 13.0, theme::error()))
+                .child(txt(
+                    crate::i18n::tr_args(
+                        lang,
+                        "right.federation.removeRevoked",
+                        &[("count", revoked.to_string())],
+                    ),
+                    11.0,
+                    theme::error(),
+                ))
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    if let Some(op) = this.right.federation.confirm_op.take() {
+                        this.fed_op_set(op, FederationActivityState::Cancelled, None);
+                    }
+                    if let Some(op) = this.right.federation.confirm_remove_op.take() {
+                        this.fed_op_set(op, FederationActivityState::Cancelled, None);
+                    }
+                    if this.right.federation.confirm_remove_all {
+                        if let Some(op) = this.right.federation.confirm_remove_all_op.take() {
+                            this.fed_op_set(op, FederationActivityState::Cancelled, None);
+                        }
+                        this.right.federation.confirm_remove_all = false;
+                    }
+                    this.right.federation.confirm_revoke = None;
+                    this.right.federation.confirm_remove = None;
+                    this.right.federation.confirm_remove_revoked = true;
+                    let target = crate::i18n::tr_args(
+                        lang,
+                        "right.federation.removeRevoked",
+                        &[("count", revoked.to_string())],
+                    );
+                    let op = this.fed_op_begin("right.federation.opRemoveRevoked", target);
+                    this.right.federation.confirm_remove_revoked_op = Some(op);
+                    cx.notify();
+                })),
+        );
+        if shell.right.federation.confirm_remove_revoked {
+            let count = revoked;
+            bulk = bulk.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(7.0))
+                    .p(px(8.0))
+                    .rounded(px(9.0))
+                    .bg(rgb(theme::soft(theme::error())))
+                    .child(txt(
+                        crate::i18n::tr_args(
+                            lang,
+                            "right.federation.confirmRemoveRevoked",
+                            &[("count", count.to_string())],
+                        ),
+                        11.0,
+                        theme::error(),
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(solid_button(
+                                "federation-remove-revoked-confirm",
+                                lang.tr("right.federation.removeConfirm"),
+                                true,
+                                true,
+                                cx,
+                                move |this, cx| {
+                                    let op = this.right.federation.confirm_remove_revoked_op.take();
+                                    if let Some(op) = op {
+                                        this.fed_op_set(op, FederationActivityState::Running, None);
+                                    }
+                                    this.right.federation.confirm_remove_revoked = false;
+                                    this.apply_federation(
+                                        move |store| {
+                                            super::right_panel::remove_revoked_peers(store)
+                                                .map(|removed| format!("removed {removed} peer(s)"))
+                                        },
+                                        cx,
+                                    );
+                                    if let Some(op) = op {
+                                        if let Some(error) = this.right.federation.error.clone() {
+                                            this.fed_op_set(
+                                                op,
+                                                FederationActivityState::Failed,
+                                                Some(error),
+                                            );
+                                        } else {
+                                            this.right.federation.notice =
+                                                Some(crate::i18n::tr_args(
+                                                    this.state.lang,
+                                                    "right.federation.peersRemoved",
+                                                    &[("count", count.to_string())],
+                                                ));
+                                            this.fed_op_set(
+                                                op,
+                                                FederationActivityState::Removed,
+                                                this.right.federation.notice.clone(),
+                                            );
+                                        }
+                                    }
+                                    cx.notify();
+                                },
+                            ))
+                            .child(solid_button(
+                                "federation-remove-revoked-cancel",
+                                lang.tr("right.federation.cancel"),
+                                false,
+                                true,
+                                cx,
+                                move |this, cx| {
+                                    if let Some(op) =
+                                        this.right.federation.confirm_remove_revoked_op.take()
+                                    {
+                                        this.fed_op_set(
+                                            op,
+                                            FederationActivityState::Cancelled,
+                                            None,
+                                        );
+                                    }
+                                    this.right.federation.confirm_remove_revoked = false;
+                                    cx.notify();
+                                },
+                            )),
+                    ),
+            );
+        }
+        peers_card = peers_card.child(bulk);
+    }
+
     peers_card = peers_card.child(
         div()
             .flex()
@@ -1079,10 +1332,151 @@ fn peers_tab(
             .child(div().flex_1())
             .child(icon(IconName::ChevronRight, 14.0, theme::faint())),
     );
+    let peer_count = shell.right.federation.peers.len();
+    if peer_count > 0 {
+        let mut all = div().flex().flex_col().gap(px(6.0)).pt(px(2.0));
+        all = all.child(
+            div()
+                .id("federation-remove-all")
+                .debug_selector(|| "federation-remove-all".to_string())
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .h(px(26.0))
+                .px(px(4.0))
+                .rounded(px(8.0))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(theme::soft(theme::error()))))
+                .child(icon(IconName::Trash, 12.0, theme::error()))
+                .child(txt(
+                    crate::i18n::tr_args(
+                        lang,
+                        "right.federation.removeAllPeers",
+                        &[("count", peer_count.to_string())],
+                    ),
+                    10.0,
+                    theme::error(),
+                ))
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    if let Some(op) = this.right.federation.confirm_op.take() {
+                        this.fed_op_set(op, FederationActivityState::Cancelled, None);
+                    }
+                    if let Some(op) = this.right.federation.confirm_remove_op.take() {
+                        this.fed_op_set(op, FederationActivityState::Cancelled, None);
+                    }
+                    if let Some(op) = this.right.federation.confirm_remove_revoked_op.take() {
+                        this.fed_op_set(op, FederationActivityState::Cancelled, None);
+                    }
+                    this.right.federation.confirm_revoke = None;
+                    this.right.federation.confirm_remove = None;
+                    this.right.federation.confirm_remove_revoked = false;
+                    this.right.federation.confirm_remove_all = true;
+                    let target = crate::i18n::tr_args(
+                        lang,
+                        "right.federation.removeAllPeers",
+                        &[("count", peer_count.to_string())],
+                    );
+                    let op = this.fed_op_begin("right.federation.opRemoveAll", target);
+                    this.right.federation.confirm_remove_all_op = Some(op);
+                    cx.notify();
+                })),
+        );
+        if shell.right.federation.confirm_remove_all {
+            all = all.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(7.0))
+                    .p(px(8.0))
+                    .rounded(px(9.0))
+                    .bg(rgb(theme::soft(theme::error())))
+                    .child(txt(
+                        crate::i18n::tr_args(
+                            lang,
+                            "right.federation.confirmRemoveAllPeers",
+                            &[("count", peer_count.to_string())],
+                        ),
+                        10.0,
+                        theme::error(),
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(solid_button(
+                                "federation-remove-all-confirm",
+                                lang.tr("right.federation.removeConfirm"),
+                                true,
+                                true,
+                                cx,
+                                move |this, cx| {
+                                    let op = this.right.federation.confirm_remove_all_op.take();
+                                    if let Some(op) = op {
+                                        this.fed_op_set(op, FederationActivityState::Running, None);
+                                    }
+                                    this.right.federation.confirm_remove_all = false;
+                                    this.apply_federation(
+                                        move |store| {
+                                            super::right_panel::remove_all_peers(store)
+                                                .map(|removed| format!("removed {removed} peer(s)"))
+                                        },
+                                        cx,
+                                    );
+                                    if let Some(op) = op {
+                                        if let Some(error) = this.right.federation.error.clone() {
+                                            this.fed_op_set(
+                                                op,
+                                                FederationActivityState::Failed,
+                                                Some(error),
+                                            );
+                                        } else {
+                                            this.right.federation.notice =
+                                                Some(crate::i18n::tr_args(
+                                                    this.state.lang,
+                                                    "right.federation.peersRemoved",
+                                                    &[("count", peer_count.to_string())],
+                                                ));
+                                            this.fed_op_set(
+                                                op,
+                                                FederationActivityState::Removed,
+                                                this.right.federation.notice.clone(),
+                                            );
+                                        }
+                                    }
+                                    cx.notify();
+                                },
+                            ))
+                            .child(solid_button(
+                                "federation-remove-all-cancel",
+                                lang.tr("right.federation.cancel"),
+                                false,
+                                true,
+                                cx,
+                                move |this, cx| {
+                                    if let Some(op) =
+                                        this.right.federation.confirm_remove_all_op.take()
+                                    {
+                                        this.fed_op_set(
+                                            op,
+                                            FederationActivityState::Cancelled,
+                                            None,
+                                        );
+                                    }
+                                    this.right.federation.confirm_remove_all = false;
+                                    cx.notify();
+                                },
+                            )),
+                    ),
+            );
+        }
+        peers_card = peers_card.child(all);
+    }
+
     column = column.child(peers_card);
 
-    column = column.child(identity_card(shell, runtime, cx));
     column = column.child(grant_card(shell, cx));
+    column = column.child(identity_card(shell, runtime, cx));
     column = column.child(exposed_card(shell, cx));
     column.into_any_element()
 }
@@ -1138,7 +1532,7 @@ fn peer_row(
     }))
     .on_click(cx.listener(move |this, _event, _window, cx| {
         this.right.federation.selected = Some(index);
-        this.right.federation.grant_choice = None;
+        this.right.federation.grant_choices.clear();
         cx.notify();
     }));
 
@@ -1200,6 +1594,18 @@ fn peer_row(
                     if let Some(op) = this.right.federation.confirm_remove_op.take() {
                         this.fed_op_set(op, FederationActivityState::Cancelled, None);
                     }
+                    if this.right.federation.confirm_remove_revoked {
+                        if let Some(op) = this.right.federation.confirm_remove_revoked_op.take() {
+                            this.fed_op_set(op, FederationActivityState::Cancelled, None);
+                        }
+                        this.right.federation.confirm_remove_revoked = false;
+                    }
+                    if this.right.federation.confirm_remove_all {
+                        if let Some(op) = this.right.federation.confirm_remove_all_op.take() {
+                            this.fed_op_set(op, FederationActivityState::Cancelled, None);
+                        }
+                        this.right.federation.confirm_remove_all = false;
+                    }
                     this.right.federation.confirm_remove = None;
                     this.right.federation.confirm_revoke = Some(node.clone());
                     let op = this.fed_op_begin("right.federation.opRevoke", target.clone());
@@ -1221,6 +1627,18 @@ fn peer_row(
             move |this, cx| {
                 if let Some(op) = this.right.federation.confirm_op.take() {
                     this.fed_op_set(op, FederationActivityState::Cancelled, None);
+                }
+                if this.right.federation.confirm_remove_revoked {
+                    if let Some(op) = this.right.federation.confirm_remove_revoked_op.take() {
+                        this.fed_op_set(op, FederationActivityState::Cancelled, None);
+                    }
+                    this.right.federation.confirm_remove_revoked = false;
+                }
+                if this.right.federation.confirm_remove_all {
+                    if let Some(op) = this.right.federation.confirm_remove_all_op.take() {
+                        this.fed_op_set(op, FederationActivityState::Cancelled, None);
+                    }
+                    this.right.federation.confirm_remove_all = false;
                 }
                 this.right.federation.confirm_revoke = None;
                 this.right.federation.confirm_remove = Some(node.clone());
@@ -1725,6 +2143,17 @@ fn grantable_label_with(
     grantable_label(lang, id)
 }
 
+/// Whether one peer's trust state belongs in the active filter.
+fn peer_matches_filter(filter: super::right_panel::PeerFilter, state: &str) -> bool {
+    use super::right_panel::PeerFilter;
+    match filter {
+        PeerFilter::All => true,
+        PeerFilter::Trusted => state == "trusted",
+        PeerFilter::Revoked => state == "revoked" || state == "suspended",
+        PeerFilter::Pending => state == "pending" || state == "invited",
+    }
+}
+
 fn trust_state(lang: crate::i18n::Lang, state: &str) -> (String, u32) {
     match state {
         "trusted" => (lang.tr("right.federation.badgeTrusted"), theme::success()),
@@ -1922,79 +2351,47 @@ fn grant_card(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
     for info in &shell.right.federation.extension_tools {
         capabilities.push(format!("builtin/{}", info.qualified));
     }
-    let choice = shell.right.federation.grant_choice.clone();
     let granted: std::collections::BTreeSet<String> = peer
         .map(|peer| peer.grants.iter().cloned().collect())
         .unwrap_or_default();
+    let choices = &shell.right.federation.grant_choices;
+    let extension_tools = &shell.right.federation.extension_tools;
+    let query = shell
+        .federation_capability_search
+        .read(cx)
+        .value()
+        .trim()
+        .to_lowercase();
+    let mut capability_rows: Vec<(String, String, bool)> = capabilities
+        .iter()
+        .map(|id| {
+            (
+                id.clone(),
+                grantable_label_with(lang, id, extension_tools),
+                granted.contains(id),
+            )
+        })
+        .collect();
+    if !query.is_empty() {
+        capability_rows.retain(|(id, label, _)| {
+            id.to_lowercase().contains(&query) || label.to_lowercase().contains(&query)
+        });
+    }
+    let visible: Vec<String> = capability_rows
+        .iter()
+        .map(|(id, _, _)| id.clone())
+        .collect();
+    // A stale choice (an extension that was removed while the pane was open)
+    // must not be granted; only ids the current catalogue still offers count.
+    let grant_choices: Vec<String> = choices
+        .iter()
+        .filter(|id| capabilities.contains(id))
+        .cloned()
+        .collect();
+    let selected_count = grant_choices.len();
 
     let peer_button = peer_picker(shell, "federation-peer-select", cx);
 
-    let shell_entity = cx.entity();
-    let capability_rows = capabilities.clone();
-    let chosen = choice.clone();
-    let granted_for_menu = granted.clone();
-    let extension_tools_for_menu = shell.right.federation.extension_tools.clone();
-    let capability_button = Button::new("federation-capability-select")
-        .ghost()
-        .w_full()
-        .h(px(32.0))
-        .px(px(10.0))
-        .rounded(px(9.0))
-        .bg(rgb(theme::new_session_fill()))
-        .flex()
-        .items_center()
-        .gap(px(6.0))
-        .cursor_pointer()
-        .child(
-            txt(
-                choice.as_deref().map(capability_label).unwrap_or_else(|| {
-                    if capability_rows.is_empty() {
-                        lang.tr("right.federation.noKnownCaps")
-                    } else {
-                        lang.tr("right.federation.capabilityMenu")
-                    }
-                }),
-                12.0,
-                if chosen.is_some() {
-                    theme::text()
-                } else {
-                    theme::faint()
-                },
-            )
-            .flex_1()
-            .min_w_0()
-            .text_ellipsis(),
-        )
-        .child(icon(IconName::ChevronDown, 12.0, theme::faint()))
-        .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
-            let mut menu = menu;
-            if capability_rows.is_empty() {
-                return menu.item(PopupMenuItem::label(crate::i18n::tr(
-                    lang,
-                    "right.federation.noKnownCaps",
-                )));
-            }
-            for capability in capability_rows.iter() {
-                let shell = shell_entity.clone();
-                let capability = capability.clone();
-                let checked = chosen.as_deref() == Some(capability.as_str())
-                    || granted_for_menu.contains(&capability);
-                let label = grantable_label_with(lang, &capability, &extension_tools_for_menu);
-                menu = menu.item(PopupMenuItem::new(label).checked(checked).on_click(
-                    move |_, _, cx| {
-                        shell.update(cx, |this, cx| {
-                            this.right.federation.grant_choice = Some(capability.clone());
-                            cx.notify();
-                        });
-                    },
-                ));
-            }
-            menu
-        });
-
-    let grant_enabled = selected.is_some() && choice.is_some();
-    let grant_peer = peer_id.clone();
-    let grant_choice = choice.clone();
     card = card.child(
         div()
             .flex()
@@ -2006,8 +2403,172 @@ fn grant_card(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
             ))
             .child(label_line(
                 lang.tr("right.federation.capabilityLabel"),
-                capability_button.into_any_element(),
+                field(
+                    &shell.federation_capability_search,
+                    "federation-field-capability-search",
+                ),
             ))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(pill(
+                        selected_count.to_string(),
+                        if selected_count == 0 {
+                            theme::faint()
+                        } else {
+                            theme::accent()
+                        },
+                        if selected_count == 0 {
+                            theme::hover()
+                        } else {
+                            theme::soft(theme::accent())
+                        },
+                    ))
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("federation-capability-select-all")
+                            .debug_selector(|| "federation-capability-select-all".to_string())
+                            .h(px(22.0))
+                            .px(px(6.0))
+                            .rounded(px(6.0))
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(theme::hover())))
+                            .child(txt(
+                                lang.tr("right.federation.selectAll"),
+                                10.0,
+                                theme::accent(),
+                            ))
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                this.right
+                                    .federation
+                                    .grant_choices
+                                    .extend(visible.iter().cloned());
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("federation-capability-clear")
+                            .debug_selector(|| "federation-capability-clear".to_string())
+                            .h(px(22.0))
+                            .px(px(6.0))
+                            .rounded(px(6.0))
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(theme::hover())))
+                            .child(txt(
+                                lang.tr("right.federation.clearSelection"),
+                                10.0,
+                                theme::faint(),
+                            ))
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.right.federation.grant_choices.clear();
+                                cx.notify();
+                            })),
+                    ),
+            ),
+    );
+
+    let mut list = div()
+        .id("federation-capability-list")
+        .flex()
+        .flex_col()
+        .gap(px(2.0))
+        .max_h(px(220.0))
+        .overflow_y_scroll()
+        .rounded(px(9.0))
+        .bg(rgb(theme::new_session_fill()))
+        .p(px(4.0));
+    if capability_rows.is_empty() {
+        list = list.child(empty_state(
+            if capabilities.is_empty() {
+                lang.tr("right.federation.noKnownCaps")
+            } else {
+                lang.tr("right.federation.noCapabilityMatches")
+            },
+            IconName::ShieldCheck,
+        ));
+    }
+    for (index, (capability, label, already_granted)) in capability_rows.iter().enumerate() {
+        let selected = choices.contains(capability);
+        let capability_for_click = capability.clone();
+        let row = div()
+            .id(SharedString::from(format!("federation-capability-{index}")))
+            .debug_selector(move || format!("federation-capability-{index}"))
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(8.0))
+            .py(px(6.0))
+            .rounded(px(8.0))
+            .cursor_pointer()
+            .bg(rgb(if selected {
+                theme::soft(theme::accent())
+            } else {
+                theme::page()
+            }))
+            .hover(|style| style.bg(rgb(theme::hover())))
+            .child(icon(
+                if selected {
+                    IconName::CircleCheck
+                } else {
+                    IconName::Circle
+                },
+                14.0,
+                if selected {
+                    theme::accent()
+                } else {
+                    theme::faint()
+                },
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.0))
+                    .flex_1()
+                    .min_w_0()
+                    .child(txt(label.clone(), 11.0, theme::text()).text_ellipsis())
+                    .child(txt(capability.clone(), 9.0, theme::faint()).font_family("monospace")),
+            )
+            .when(*already_granted, |row| {
+                row.child(pill(
+                    lang.tr("right.federation.grantedBadge"),
+                    theme::success(),
+                    theme::soft(theme::success()),
+                ))
+            })
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                if !this
+                    .right
+                    .federation
+                    .grant_choices
+                    .remove(&capability_for_click)
+                {
+                    this.right
+                        .federation
+                        .grant_choices
+                        .insert(capability_for_click.clone());
+                }
+                cx.notify();
+            }));
+        list = list.child(row);
+    }
+    card = card.child(list);
+
+    let grant_enabled = selected.is_some() && selected_count > 0 && !peer_id.is_empty();
+    let grant_peer = peer_id.clone();
+    card = card.child(
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
             .child(txt(
                 lang.tr("right.federation.grantNodeHint"),
                 9.5,
@@ -2020,18 +2581,23 @@ fn grant_card(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
                     .gap(px(8.0))
                     .child(solid_button(
                         "federation-grant",
-                        lang.tr("right.federation.grant"),
+                        crate::i18n::tr_args(
+                            lang,
+                            "right.federation.grantSelected",
+                            &[("count", selected_count.to_string())],
+                        ),
                         true,
                         grant_enabled,
                         cx,
                         move |this, cx| {
-                            let Some(capability) = grant_choice.clone() else {
+                            let Some(peer) = (!grant_peer.is_empty()).then(|| grant_peer.clone())
+                            else {
                                 return;
                             };
-                            if grant_peer.is_empty() {
+                            if grant_choices.is_empty() {
                                 return;
                             }
-                            let peer = grant_peer.clone();
+                            let count = grant_choices.len();
                             let target = this
                                 .right
                                 .federation
@@ -2042,12 +2608,36 @@ fn grant_card(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
                                 .unwrap_or_else(|| short_node(&peer));
                             let op = this.fed_op_begin("right.federation.opGrant", target);
                             let peer_for_store = peer.clone();
+                            let choices_for_store = grant_choices.clone();
                             this.apply_federation(
                                 move |store| {
-                                    grant_capability(store, &peer_for_store, &capability, None)
+                                    let node_id = parse_peer(&peer_for_store)?;
+                                    for raw in &choices_for_store {
+                                        let capability: agent::capability::CapabilityId =
+                                            raw.parse().map_err(|error| {
+                                                format!("invalid capability id: {error}")
+                                            })?;
+                                        store
+                                            .grant(
+                                                &node_id,
+                                                capability,
+                                                agent::capability::unix_ms(),
+                                                None,
+                                            )
+                                            .map_err(|error| error.to_string())?;
+                                    }
+                                    Ok(format!("granted {count} capability(ies)"))
                                 },
                                 cx,
                             );
+                            if this.right.federation.error.is_none() {
+                                this.right.federation.notice = Some(crate::i18n::tr_args(
+                                    this.state.lang,
+                                    "right.federation.grantedCapabilities",
+                                    &[("count", count.to_string())],
+                                ));
+                                this.right.federation.grant_choices.clear();
+                            }
                             finish_store_op(this, op);
                             cx.notify();
                         },
@@ -2122,7 +2712,7 @@ fn peer_picker(shell: &Shell, id: &'static str, cx: &mut Context<Shell>) -> AnyE
                         .on_click(move |_, _, cx| {
                             shell.update(cx, |this, cx| {
                                 this.right.federation.selected = Some(index);
-                                this.right.federation.grant_choice = None;
+                                this.right.federation.grant_choices.clear();
                                 cx.notify();
                             });
                         }),
@@ -3754,6 +4344,22 @@ mod tests {
             capability_label("builtin/workspace_context"),
             "workspace context"
         );
+    }
+
+    /// The status chips partition the trust states, and suspended rows count as
+    /// revoked while invited rows count as pending.
+    #[test]
+    fn the_peer_filter_matches_trust_states() {
+        use super::peer_matches_filter;
+        use crate::ui::right_panel::PeerFilter;
+        assert!(peer_matches_filter(PeerFilter::All, "revoked"));
+        assert!(peer_matches_filter(PeerFilter::Trusted, "trusted"));
+        assert!(!peer_matches_filter(PeerFilter::Trusted, "revoked"));
+        assert!(peer_matches_filter(PeerFilter::Revoked, "revoked"));
+        assert!(peer_matches_filter(PeerFilter::Revoked, "suspended"));
+        assert!(peer_matches_filter(PeerFilter::Pending, "pending"));
+        assert!(peer_matches_filter(PeerFilter::Pending, "invited"));
+        assert!(!peer_matches_filter(PeerFilter::Pending, "trusted"));
     }
 
     /// Extension tools join both menus, after the node's built-in surface.

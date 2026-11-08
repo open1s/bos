@@ -723,6 +723,19 @@ impl Settings {
         }
     }
 
+    /// The launcher's automatically maintained recent list.
+    ///
+    /// Beside the settings document, derived from `save_root` for the same
+    /// reason the vault is: a scratch configuration gets a scratch list, and a
+    /// test can never rewrite the reader's recent rows.
+    pub(crate) fn launcher_recent_path(&self) -> Option<PathBuf> {
+        match &self.save_root {
+            Some(root) => Some(root.join("recent.json")),
+            None if cfg!(test) => None,
+            None => Some(crate::settings::dir().join("recent.json")),
+        }
+    }
+
     /// The composition log, beside the settings document.
     ///
     /// Derived from save_root for the same reason the vault is: a scratch

@@ -334,6 +334,8 @@ pub(crate) struct Shell {
     pub(crate) federation_name: Entity<InputState>,
     /// The federation pane's expose search field.
     pub(crate) federation_expose_search: Entity<InputState>,
+    /// The federation pane's capability search field.
+    pub(crate) federation_capability_search: Entity<InputState>,
     /// The federation pane's knowledge query field.
     pub(crate) federation_knowledge: Entity<InputState>,
     /// The federation pane's knowledge publication payload.
@@ -551,6 +553,10 @@ pub(crate) struct Shell {
     /// The footer Save's confirmation, or none when nothing was saved this
     /// visit. At most ONE: a repeated save refreshes this instead of stacking a
     /// second notice.
+    /// The settings nav's own filter field.
+    pub(crate) settings_search: Entity<InputState>,
+    /// The settings nav filter; empty shows every cell.
+    pub(crate) settings_query: String,
     pub(crate) settings_toast: Option<SettingsToast>,
     /// The generation of `settings_toast`, so a later save can tell the earlier
     /// save's expiry timer that its confirmation is gone.
@@ -1200,9 +1206,13 @@ impl Shell {
     pub(crate) fn build_for_test(
         window: &mut Window,
         open_settings: Option<usize>,
-        state: AppState,
+        mut state: AppState,
         cx: &mut Context<Self>,
     ) -> Self {
+        // Existing tests start from the pre-launcher layout: the panel closed.
+        // The launcher has its own tests, which open it explicitly; production
+        // follows the stored preference instead.
+        state.settings.global.general.launcher_on_start = false;
         Self::assemble(window, open_settings, state, cx)
     }
 
@@ -1384,6 +1394,10 @@ impl Shell {
             InputState::new(window, cx)
                 .placeholder(crate::i18n::tr(lang, "right.federation.exposeSearch"))
         });
+        let federation_capability_search = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(crate::i18n::tr(lang, "right.federation.capabilitySearch"))
+        });
         let federation_knowledge = cx.new(|cx| {
             InputState::new(window, cx).placeholder(crate::i18n::tr(
                 lang,
@@ -1449,6 +1463,11 @@ impl Shell {
         let right_search = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(crate::i18n::tr(lang, "right.search.placeholder"))
+                .clean_on_escape()
+        });
+        let settings_search = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(crate::i18n::tr(lang, "settings.search"))
                 .clean_on_escape()
         });
         let task_search = cx.new(|cx| {
@@ -1638,6 +1657,20 @@ impl Shell {
                 },
             ),
             cx.subscribe_in(
+                &settings_search,
+                window,
+                |this: &mut Shell,
+                 _state: &Entity<InputState>,
+                 event: &InputEvent,
+                 _window: &mut Window,
+                 cx: &mut Context<Shell>| {
+                    if matches!(event, InputEvent::Change) {
+                        this.settings_query = this.settings_search.read(cx).value().to_string();
+                        cx.notify();
+                    }
+                },
+            ),
+            cx.subscribe_in(
                 &traj_search,
                 window,
                 |this: &mut Shell,
@@ -1704,6 +1737,34 @@ impl Shell {
                  cx: &mut Context<Shell>| {
                     if matches!(event, InputEvent::Change) {
                         this.state.picker_query = this.picker_search.read(cx).value().to_string();
+                        cx.notify();
+                    }
+                },
+            ),
+            // Both federation search fields are read while the pane renders;
+            // a keystroke only has to schedule the frame that reads them.
+            cx.subscribe_in(
+                &federation_expose_search,
+                window,
+                |_this: &mut Shell,
+                 _state: &Entity<InputState>,
+                 event: &InputEvent,
+                 _window: &mut Window,
+                 cx: &mut Context<Shell>| {
+                    if matches!(event, InputEvent::Change) {
+                        cx.notify();
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &federation_capability_search,
+                window,
+                |_this: &mut Shell,
+                 _state: &Entity<InputState>,
+                 event: &InputEvent,
+                 _window: &mut Window,
+                 cx: &mut Context<Shell>| {
+                    if matches!(event, InputEvent::Change) {
                         cx.notify();
                     }
                 },
@@ -1902,6 +1963,7 @@ impl Shell {
             }
         }));
         let (task_runs, task_requests) = crate::ui::task_runs::TaskRuns::new();
+        let launcher_on_start = state.settings.global.general.launcher_on_start;
         let mut shell = Self {
             state,
             foreground_tasks: Vec::new(),
@@ -1929,6 +1991,7 @@ impl Shell {
             default_model_open: false,
             federation_name,
             federation_expose_search,
+            federation_capability_search,
             federation_knowledge,
             federation_knowledge_payload,
             browser_pane: None,
@@ -2013,6 +2076,8 @@ impl Shell {
             trust_confirm: None,
             trust_error: None,
             developer_tools_failed: false,
+            settings_search,
+            settings_query: String::new(),
             settings_toast: None,
             settings_toast_seq: 0,
             shortcuts_open: false,
@@ -2154,6 +2219,7 @@ impl Shell {
             right_hover: false,
             right: super::right_panel::RightPanel {
                 graph_fit: true,
+                open: launcher_on_start,
                 ..super::right_panel::RightPanel::default()
             },
             files: super::right_panel::FilesPane::new(files_new, files_rename, files_note),
@@ -6475,6 +6541,7 @@ impl Shell {
 
     /// Open a chat in a named workspace from its own row.
     pub(crate) fn new_session_in_workspace(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.record_workspace_recent(id);
         if let Some(session) = self.state.new_session_in(id) {
             self.state.select(&session);
         }
@@ -7248,6 +7315,16 @@ impl Render for Shell {
             .on_action(
                 cx.listener(|this, _: &super::right_panel::BrowserTab, window, cx| {
                     this.open_right_tab(super::right_panel::RightTab::Browser, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &super::right_panel::FocusLauncher, window, cx| {
+                    if this.state.overlay == crate::state::Overlay::Settings {
+                        this.settings_search
+                            .update(cx, |state, cx| state.focus_handle(cx).focus(window, cx));
+                        return;
+                    }
+                    this.focus_launcher(window, cx);
                 }),
             )
             .on_action(

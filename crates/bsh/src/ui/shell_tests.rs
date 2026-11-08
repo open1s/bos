@@ -21870,6 +21870,323 @@ fn removing_a_peer_asks_first(cx: &mut TestAppContext) {
     );
 }
 
+/// The revoked peers can be cleared in one confirmed action, leaving the
+/// trusted rows alone.
+#[gpui::test]
+fn removing_revoked_peers_bulk_asks_first(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("right-federation-remove-revoked");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    shell.update(cx, |this, cx| {
+        this.right.open = true;
+        this.right.tab = Some(crate::ui::right_panel::RightTab::Federation);
+        this.right.federation.peers = vec![
+            crate::ui::right_panel::FederationPeerRow {
+                node: "revoked-one".to_string(),
+                name: Some("old-a".to_string()),
+                state: "revoked".to_string(),
+                grants: Vec::new(),
+            },
+            crate::ui::right_panel::FederationPeerRow {
+                node: "revoked-two".to_string(),
+                name: Some("old-b".to_string()),
+                state: "revoked".to_string(),
+                grants: Vec::new(),
+            },
+            crate::ui::right_panel::FederationPeerRow {
+                node: "trusted-one".to_string(),
+                name: Some("live".to_string()),
+                state: "trusted".to_string(),
+                grants: Vec::new(),
+            },
+        ];
+        this.right.federation.loaded = true;
+        this.right.federation.confirm_remove_revoked = false;
+        cx.notify();
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let bulk = cx
+        .debug_bounds("federation-remove-revoked")
+        .expect("the bulk cleanup is on screen");
+    cx.simulate_click(bulk.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.update(|_, cx| shell.read(cx).right.federation.confirm_remove_revoked),
+        "the first press asks"
+    );
+    assert!(
+        cx.debug_bounds("federation-remove-revoked-confirm")
+            .is_some(),
+        "the bulk confirmation is on screen"
+    );
+
+    let cancel = cx
+        .debug_bounds("federation-remove-revoked-cancel")
+        .expect("the bulk confirmation offers Cancel");
+    cx.simulate_click(cancel.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        !cx.update(|_, cx| shell.read(cx).right.federation.confirm_remove_revoked),
+        "Cancel clears the bulk question"
+    );
+
+    let bulk = cx
+        .debug_bounds("federation-remove-revoked")
+        .expect("the bulk cleanup is back");
+    cx.simulate_click(bulk.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let confirm = cx
+        .debug_bounds("federation-remove-revoked-confirm")
+        .expect("the bulk confirmation is back");
+    cx.simulate_click(confirm.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        !cx.update(|_, cx| shell.read(cx).right.federation.confirm_remove_revoked),
+        "the second press consumes the bulk question"
+    );
+    assert!(
+        cx.update(|_, cx| shell.read(cx).right.federation.error.clone())
+            .is_some(),
+        "a build without a store reports why nothing changed"
+    );
+}
+
+/// The status chips narrow the peer list without renumbering the rows.
+#[gpui::test]
+fn filtering_peers_keeps_the_full_row_index(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("right-federation-filter");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    shell.update(cx, |this, cx| {
+        this.right.open = true;
+        this.right.tab = Some(crate::ui::right_panel::RightTab::Federation);
+        this.right.federation.peers = vec![
+            crate::ui::right_panel::FederationPeerRow {
+                node: "trusted-one".to_string(),
+                name: Some("live".to_string()),
+                state: "trusted".to_string(),
+                grants: Vec::new(),
+            },
+            crate::ui::right_panel::FederationPeerRow {
+                node: "revoked-one".to_string(),
+                name: Some("old".to_string()),
+                state: "revoked".to_string(),
+                grants: Vec::new(),
+            },
+        ];
+        this.right.federation.loaded = true;
+        cx.notify();
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let revoked = cx
+        .debug_bounds("federation-peer-filter-2")
+        .expect("the Revoked chip is on screen");
+    cx.simulate_click(revoked.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    assert!(
+        cx.debug_bounds("federation-peer-0").is_none(),
+        "the trusted row is filtered out"
+    );
+    assert!(
+        cx.debug_bounds("federation-peer-1").is_some(),
+        "the revoked row keeps its full-list index"
+    );
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).right.federation.peer_filter),
+        crate::ui::right_panel::PeerFilter::Revoked
+    );
+}
+
+/// Removing every peer takes the same two-press confirmation as the bulk
+/// revoked action, and names the trusted ones in the question.
+#[gpui::test]
+fn removing_all_peers_asks_first(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("right-federation-remove-all");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    shell.update(cx, |this, cx| {
+        this.right.open = true;
+        this.right.tab = Some(crate::ui::right_panel::RightTab::Federation);
+        this.right.federation.peers = vec![
+            crate::ui::right_panel::FederationPeerRow {
+                node: "trusted-one".to_string(),
+                name: Some("live".to_string()),
+                state: "trusted".to_string(),
+                grants: Vec::new(),
+            },
+            crate::ui::right_panel::FederationPeerRow {
+                node: "revoked-one".to_string(),
+                name: Some("old".to_string()),
+                state: "revoked".to_string(),
+                grants: Vec::new(),
+            },
+        ];
+        this.right.federation.loaded = true;
+        this.right.federation.confirm_remove_all = false;
+        cx.notify();
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let all = cx
+        .debug_bounds("federation-remove-all")
+        .expect("the remove-all action is on screen");
+    cx.simulate_click(all.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.update(|_, cx| shell.read(cx).right.federation.confirm_remove_all),
+        "the first press asks"
+    );
+    assert!(
+        cx.debug_bounds("federation-remove-all-confirm").is_some(),
+        "the remove-all confirmation is on screen"
+    );
+
+    let cancel = cx
+        .debug_bounds("federation-remove-all-cancel")
+        .expect("the confirmation offers Cancel");
+    cx.simulate_click(cancel.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        !cx.update(|_, cx| shell.read(cx).right.federation.confirm_remove_all),
+        "Cancel clears the question"
+    );
+
+    let all = cx
+        .debug_bounds("federation-remove-all")
+        .expect("the remove-all action is back");
+    cx.simulate_click(all.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let confirm = cx
+        .debug_bounds("federation-remove-all-confirm")
+        .expect("the confirmation is back");
+    cx.simulate_click(confirm.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        !cx.update(|_, cx| shell.read(cx).right.federation.confirm_remove_all),
+        "the second press consumes the question"
+    );
+    assert!(
+        cx.update(|_, cx| shell.read(cx).right.federation.error.clone())
+            .is_some(),
+        "a build without a store reports why nothing changed"
+    );
+}
+
+/// The capability picker filters on the search field and accumulates a batch
+/// selection instead of replacing one choice.
+#[gpui::test]
+fn grant_capabilities_batch_and_search(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("right-federation-batch");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    shell.update(cx, |this, cx| {
+        this.right.open = true;
+        this.right.tab = Some(crate::ui::right_panel::RightTab::Federation);
+        this.right.federation.peers = vec![crate::ui::right_panel::FederationPeerRow {
+            node: "trusted-one".to_string(),
+            name: Some("live".to_string()),
+            state: "trusted".to_string(),
+            grants: Vec::new(),
+        }];
+        this.right.federation.selected = Some(0);
+        this.right.federation.grant_choices.clear();
+        this.right.federation.loaded = true;
+        cx.notify();
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let first = cx
+        .debug_bounds("federation-capability-0")
+        .expect("the first capability row is on screen");
+    cx.simulate_click(first.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.update(|_, cx| shell
+            .read(cx)
+            .right
+            .federation
+            .grant_choices
+            .contains("builtin/read_file")),
+        "a press adds to the batch"
+    );
+
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.federation_capability_search.update(cx, |input, cx| {
+                input.set_value("knowledge_publish", window, cx);
+            });
+            cx.notify();
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    assert!(
+        cx.debug_bounds("federation-capability-0").is_some(),
+        "the matching capability remains"
+    );
+    assert!(
+        cx.debug_bounds("federation-capability-1").is_none(),
+        "non-matching capabilities are filtered out"
+    );
+    let only = cx
+        .debug_bounds("federation-capability-0")
+        .expect("the matching row");
+    cx.simulate_click(only.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.update(|_, cx| shell
+            .read(cx)
+            .right
+            .federation
+            .grant_choices
+            .contains("builtin/knowledge_publish")),
+        "the filtered row joins the batch"
+    );
+
+    let select_all = cx
+        .debug_bounds("federation-capability-select-all")
+        .expect("Select all is on screen");
+    cx.simulate_click(select_all.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.update(|_, cx| !shell.read(cx).right.federation.grant_choices.is_empty()),
+        "Select all keeps the selection"
+    );
+
+    let clear = cx
+        .debug_bounds("federation-capability-clear")
+        .expect("Clear is on screen");
+    cx.simulate_click(clear.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.update(|_, cx| shell.read(cx).right.federation.grant_choices.is_empty()),
+        "Clear empties the batch"
+    );
+}
+
 /// The two switches persist their settings through the shell's settings file.
 #[gpui::test]
 fn the_federation_switches_write_the_settings(cx: &mut TestAppContext) {
@@ -22980,6 +23297,187 @@ fn the_start_grid_filters_by_category_and_search(cx: &mut TestAppContext) {
             shell.read(cx).right.tab == Some(crate::ui::right_panel::RightTab::Browser)
         }) && cx.debug_bounds("right-tab").is_some()
             && cx.debug_bounds("right-search-field").is_none()
+    });
+}
+
+/// The launcher's recent rows are runtime records: opening a document or a
+/// panel puts it there, and pressing the row opens it again.
+#[gpui::test]
+fn the_launcher_lists_and_reopens_recent_rows(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("right-launcher-recent");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_file(std::path::Path::new("README.md"), window, cx);
+        });
+    });
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.close_right_pane_tab(crate::ui::right_panel::RightTab::Files, cx)
+        });
+    });
+    draw_until(cx, "the recent document row", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("right-recent-0").is_some()
+    });
+    let first = cx
+        .debug_bounds("right-recent-0")
+        .expect("the recent document")
+        .center();
+    cx.simulate_click(first, Modifiers::default());
+    draw_until(cx, "the recent document opens", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| {
+            let shell = shell.read(cx);
+            shell.right.tab == Some(crate::ui::right_panel::RightTab::Files)
+                && shell.files.active == Some(0)
+        })
+    });
+
+    // A panel is recorded by the same open path, and its row reopens it.
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(crate::ui::right_panel::RightTab::Browser, window, cx);
+        });
+    });
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            // Return to Start without closing panes: closing one can record the
+            // pane it switches to, which would change the row under the test.
+            this.right.tab = None;
+            this.right.open = true;
+            cx.notify();
+        });
+    });
+    draw_until(cx, "the recent panel row", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("right-recent-0").is_some()
+    });
+    let first = cx
+        .debug_bounds("right-recent-0")
+        .expect("the recent panel")
+        .center();
+    cx.simulate_click(first, Modifiers::default());
+    draw_until(cx, "the recent panel opens", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| {
+            shell.read(cx).right.tab == Some(crate::ui::right_panel::RightTab::Browser)
+        })
+    });
+}
+
+/// The footer's Open takes the first result of the current search, so the
+/// launcher's primary control is not a decoration beside the cards.
+#[gpui::test]
+fn the_launcher_footer_opens_the_first_result(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("right-launcher-footer");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    shell.update(cx, |this, cx| {
+        this.right.open = true;
+        this.right.tab = None;
+        this.right_search_text = "brow".to_string();
+        cx.notify();
+    });
+    draw_until(cx, "the filtered grid", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("right-card-right.tab.browser").is_some()
+    });
+    let open = cx
+        .debug_bounds("right-launcher-open")
+        .expect("the footer Open")
+        .center();
+    cx.simulate_click(open, Modifiers::default());
+    draw_until(cx, "the first result opens", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| {
+            shell.read(cx).right.tab == Some(crate::ui::right_panel::RightTab::Browser)
+        })
+    });
+}
+
+/// The startup checkbox writes the preference the next launch reads.
+#[gpui::test]
+fn the_launcher_startup_toggle_writes_the_setting(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("right-launcher-startup");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    shell.update(cx, |this, cx| {
+        this.right.open = true;
+        this.right.tab = None;
+        cx.notify();
+    });
+    draw_until(cx, "the startup checkbox", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("right-launcher-startup").is_some()
+    });
+    assert!(
+        !cx.update(|_, cx| {
+            shell
+                .read(cx)
+                .state
+                .settings
+                .global
+                .general
+                .launcher_on_start
+        }),
+        "the test shell starts with the launcher closed"
+    );
+    let check = cx
+        .debug_bounds("right-launcher-startup")
+        .expect("the startup checkbox")
+        .center();
+    cx.simulate_click(check, Modifiers::default());
+    draw_until(cx, "the preference flips", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| {
+            shell
+                .read(cx)
+                .state
+                .settings
+                .global
+                .general
+                .launcher_on_start
+        })
+    });
+}
+
+/// cmd-k brings the launcher forward from anywhere in the shell.
+#[gpui::test]
+fn cmd_k_opens_the_launcher(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("right-launcher-cmdk");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    assert!(
+        !cx.update(|_, cx| shell.read(cx).right.open),
+        "the panel starts closed"
+    );
+    cx.update(|window, cx| {
+        use gpui_kit::Focusable as _;
+        shell.update(cx, |this, cx| {
+            this.composer
+                .update(cx, |state, cx| state.focus_handle(cx).focus(window, cx));
+        });
+    });
+    cx.simulate_keystrokes("cmd-k");
+    draw_until(cx, "the launcher opens", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| {
+            let shell = shell.read(cx);
+            shell.right.open && shell.right.tab.is_none()
+        }) && cx.debug_bounds("right-search-field").is_some()
     });
 }
 

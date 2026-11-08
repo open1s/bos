@@ -47,7 +47,10 @@ use gpui_libghostty::TerminalOptions;
 // editor, and a bar repeating the tab chip's name and one control read as
 // chrome - so the keyboard shortcut is the whole affordance, the way a
 // native document editor does it.
-actions!(bsh_files, [SaveFile, TerminalTab, BrowserTab]);
+actions!(
+    bsh_files,
+    [SaveFile, TerminalTab, BrowserTab, FocusLauncher]
+);
 
 /// How close in time two blank-space presses must be to read as a double-click.
 ///
@@ -373,6 +376,19 @@ impl RightTab {
         }
     }
 
+    /// The one-line description the Workspace Launcher shows under the card.
+    pub(crate) fn description_key(self) -> &'static str {
+        match self {
+            RightTab::Files => "right.start.filesHint",
+            RightTab::Terminal => "right.start.terminalHint",
+            RightTab::Diff => "right.start.diffHint",
+            RightTab::Browser => "right.start.browserHint",
+            RightTab::Extensions => "right.start.extensionsHint",
+            RightTab::Federation => "right.start.federationHint",
+            RightTab::Tasks => "right.start.tasksHint",
+        }
+    }
+
     /// The pane's stable id stem, for the strip's controls and the tests that
     /// press them. The label key is dotted ("right.tab.diff"), which makes a
     /// poor element id, so the two are separate facts.
@@ -386,6 +402,11 @@ impl RightTab {
             RightTab::Federation => "federation",
             RightTab::Tasks => "tasks",
         }
+    }
+
+    /// The pane with this slug, for a persisted launcher row.
+    pub(crate) fn from_slug(slug: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|tab| tab.slug() == slug)
     }
 
     /// Every pane the panel can show, in the order the Start screen lists the
@@ -432,6 +453,8 @@ pub(crate) struct RightPanel {
     /// Whether the panel has taken the whole column, which is what its header's
     /// maximise control does.
     pub(crate) maximized: bool,
+    /// Whether the launcher's recent list is showing every row.
+    pub(crate) launcher_recent_open: bool,
     /// The resize in flight, if any.
     pub(crate) drag: Option<SideDrag>,
     /// The managed terminal, spawned when the Terminal tab is first opened.
@@ -532,6 +555,20 @@ pub(crate) struct FederationKnowledgeRow {
     pub(crate) source: String,
 }
 
+/// The trust-state filter the peers card applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum PeerFilter {
+    /// Every enrolled peer.
+    #[default]
+    All,
+    /// Peers this node trusts.
+    Trusted,
+    /// Peers whose grants were withdrawn.
+    Revoked,
+    /// Peers whose enrollment is still waiting on a decision.
+    Pending,
+}
+
 /// One peer seen on the announce key, with the capabilities it advertises.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DiscoveredPeerRow {
@@ -565,6 +602,10 @@ pub(crate) struct FederationPane {
     pub(crate) confirm_remove_revoked: bool,
     /// The operation a pending bulk removal owns.
     pub(crate) confirm_remove_revoked_op: Option<u64>,
+    /// Whether removing every peer is waiting on a second press.
+    pub(crate) confirm_remove_all: bool,
+    /// The operation a pending remove-all owns.
+    pub(crate) confirm_remove_all_op: Option<u64>,
     /// Peers seen on the announce key, excluding this node.
     pub(crate) discovered: Vec<DiscoveredPeerRow>,
     /// Delegation records, newest first.
@@ -581,8 +622,8 @@ pub(crate) struct FederationPane {
     pub(crate) knowledge_items: Vec<FederationKnowledgeRow>,
     /// Files in the local artifact store.
     pub(crate) artifacts: Vec<FederationArtifactRow>,
-    /// The capability chosen from the selected peer's menu.
-    pub(crate) grant_choice: Option<String>,
+    /// The capabilities chosen for a batch grant to the selected peer.
+    pub(crate) grant_choices: std::collections::BTreeSet<String>,
     /// The compact pane's selected section: peers, work, resources, knowledge.
     pub(crate) tab: usize,
     /// Whether the raw/advanced controls are disclosed.
@@ -599,6 +640,8 @@ pub(crate) struct FederationPane {
     pub(crate) preview: Option<FederationPreview>,
     /// Extension tools the host listed at the last refresh.
     pub(crate) extension_tools: Vec<crate::extension::host::NodeToolInfo>,
+    /// The trust-state filter the peers card applies.
+    pub(crate) peer_filter: PeerFilter,
 }
 /// The workspace browser's place in the tree, and the files open beside it.
 ///
@@ -2026,9 +2069,9 @@ impl Shell {
             .debug_selector(|| String::from("right-search-field"))
             .w_full()
             .min_w_0()
-            .h(px(30.0))
-            .px(px(8.0))
-            .rounded(px(8.0))
+            .h(px(34.0))
+            .px(px(9.0))
+            .rounded(px(10.0))
             .border_1()
             .border_color(rgb(theme::border_soft()))
             .bg(rgb(theme::page()))
@@ -2036,16 +2079,40 @@ impl Shell {
             .flex_row()
             .items_center()
             .gap(px(6.0))
-            .child(icon(IconName::Search, 13.0, theme::faint()).flex_none())
+            .child(icon(IconName::Search, 14.0, theme::faint()).flex_none())
             .child(
-                Input::new(&self.right_search)
-                    .appearance(false)
-                    .w_full()
-                    .h(px(28.0)),
+                div().flex_1().min_w_0().child(
+                    Input::new(&self.right_search)
+                        .appearance(false)
+                        .w_full()
+                        .h(px(30.0)),
+                ),
+            )
+            .child(
+                div()
+                    .id("right-search-shortcut")
+                    .debug_selector(|| String::from("right-search-shortcut"))
+                    .flex_none()
+                    .h(px(20.0))
+                    .px(px(5.0))
+                    .rounded(px(5.0))
+                    .bg(rgb(theme::new_session_fill()))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .tooltip_show_delay(std::time::Duration::from_millis(500))
+                    .tooltip({
+                        let lang = self.state.lang;
+                        move |window, cx| {
+                            Tooltip::new(crate::i18n::tr(lang, "right.start.searchHint"))
+                                .build(window, cx)
+                        }
+                    })
+                    .child(txt("\u{2318}K", 9.5, theme::faint())),
             );
         hairline_bottom(
             div()
-                .h(px(36.0))
+                .h(px(46.0))
                 .flex_none()
                 .px(px(12.0))
                 .flex()
@@ -3465,6 +3532,7 @@ impl Shell {
         if let Some(selected) = self.right.federation.selected {
             if selected >= rows.len() {
                 self.right.federation.selected = None;
+                self.right.federation.grant_choices.clear();
             }
         }
         self.right.federation.peers = rows;
@@ -4526,11 +4594,19 @@ impl Shell {
         page = page.child(self.right_search_bar());
         page = page.child(self.start_filter_row(cx));
 
+        let mut body = div()
+            .id("right-start-body")
+            .debug_selector(|| String::from("right-start-body"))
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .flex()
+            .flex_col()
+            .overflow_y_scroll();
+
         let mut grid = div()
             .id("right-start-grid")
             .debug_selector(|| String::from("right-start-grid"))
-            .flex_1()
-            .min_h_0()
             .w_full()
             .p(px(16.0))
             .flex()
@@ -4538,8 +4614,7 @@ impl Shell {
             .flex_wrap()
             .justify_start()
             .content_start()
-            .gap(px(gap))
-            .overflow_y_scroll();
+            .gap(px(gap));
         let mut shown = 0usize;
         if scope != RightSearchScope::Documents {
             for tab in RightTab::ALL
@@ -4572,7 +4647,7 @@ impl Shell {
             grid = grid.child(
                 div()
                     .w_full()
-                    .py(px(40.0))
+                    .py(px(36.0))
                     .flex()
                     .flex_col()
                     .items_center()
@@ -4581,7 +4656,11 @@ impl Shell {
                     .child(txt(lang.tr("right.search.noResults"), 13.0, theme::muted())),
             );
         }
-        page.child(grid)
+        body = body.child(grid);
+        body = body.child(self.start_recent_section(cx));
+        page = page.child(body);
+        page = page.child(self.start_footer(cx));
+        page
     }
 
     /// The category tabs above the Start grid. They set the same scope the
@@ -4602,6 +4681,11 @@ impl Shell {
         ] {
             let active = self.right_search_scope == choice;
             let slug = choice.slug();
+            let glyph = match choice {
+                RightSearchScope::All => IconName::LayoutGrid,
+                RightSearchScope::Panes => IconName::LayoutDashboard,
+                RightSearchScope::Documents => IconName::FileText,
+            };
             row = row.child(
                 div()
                     .id(SharedString::from(format!("right-start-filter-{slug}")))
@@ -4612,13 +4696,23 @@ impl Shell {
                     .flex()
                     .items_center()
                     .justify_center()
+                    .gap(px(6.0))
                     .cursor_pointer()
+                    .child(icon(
+                        glyph,
+                        14.0,
+                        if active {
+                            theme::accent()
+                        } else {
+                            theme::muted()
+                        },
+                    ))
                     .child(
                         txt(
                             lang.tr(choice.key()),
                             13.0,
                             if active {
-                                theme::text()
+                                theme::accent()
                             } else {
                                 theme::muted()
                             },
@@ -4646,15 +4740,398 @@ impl Shell {
         hairline_bottom(row).border_color(rgb(theme::border_soft()))
     }
 
+    /// The recent rows the current scope and query show, newest first.
+    fn launcher_recent_rows(&self) -> Vec<crate::recent::RecentEntry> {
+        let query = self.right_search_text.trim().to_lowercase();
+        let scope = self.right_search_scope;
+        self.state
+            .launcher_recent
+            .entries()
+            .iter()
+            .filter(|entry| match scope {
+                RightSearchScope::All => true,
+                RightSearchScope::Panes => entry.kind == crate::recent::RecentKind::Panel,
+                RightSearchScope::Documents => entry.kind == crate::recent::RecentKind::Document,
+            })
+            .filter(|entry| {
+                query.is_empty()
+                    || entry.label.to_lowercase().contains(&query)
+                    || entry.detail.to_lowercase().contains(&query)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The launcher's automatically maintained recent rows.
+    ///
+    /// The section is filtered by the same scope and query as the grid, so a
+    /// reader searching "bos" sees the workspace as well as matching panes. The
+    /// rows are runtime records, not favorites; the only control is removing
+    /// one, which is offered behind the row's own menu.
+    fn start_recent_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let now = agent::capability::unix_ms();
+        let entries = self.launcher_recent_rows();
+        let total = entries.len();
+        let open = self.right.launcher_recent_open;
+        let limit = if open { 20 } else { 3 };
+
+        let mut section = div()
+            .w_full()
+            .px(px(16.0))
+            .pt(px(8.0))
+            .pb(px(12.0))
+            .border_t_1()
+            .border_color(rgb(theme::border_soft()))
+            .flex()
+            .flex_col()
+            .gap(px(3.0));
+        let mut header = div()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .pb(px(4.0))
+            .child(icon(IconName::Clock, 14.0, theme::muted()))
+            .child(
+                txt(lang.tr("right.start.recent"), 12.0, theme::text())
+                    .font_weight(FontWeight::MEDIUM),
+            )
+            .child(div().flex_1());
+        if total > 3 {
+            header = header.child(
+                div()
+                    .id("right-recent-toggle")
+                    .debug_selector(|| "right-recent-toggle".to_string())
+                    .px(px(4.0))
+                    .h(px(22.0))
+                    .rounded(px(6.0))
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(theme::hover())))
+                    .child(txt(
+                        lang.tr(if open {
+                            "right.start.showLess"
+                        } else {
+                            "right.start.viewMore"
+                        }),
+                        10.0,
+                        theme::accent(),
+                    ))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.right.launcher_recent_open = !this.right.launcher_recent_open;
+                        cx.notify();
+                    })),
+            );
+        }
+        section = section.child(header);
+
+        if total == 0 {
+            if !self.right_search_text.trim().is_empty() {
+                return section.into_any_element();
+            }
+            section = section.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .px(px(8.0))
+                    .py(px(10.0))
+                    .rounded(px(9.0))
+                    .bg(rgb(theme::new_session_fill()))
+                    .child(icon(IconName::Clock, 14.0, theme::faint()))
+                    .child(txt(
+                        lang.tr("right.start.recentEmpty"),
+                        10.5,
+                        theme::faint(),
+                    )),
+            );
+            return section.into_any_element();
+        }
+
+        for (index, entry) in entries.iter().take(limit).enumerate() {
+            let entry_for_click = entry.clone();
+            let entry_for_menu = entry.clone();
+            let (glyph, tint) = match entry.kind {
+                crate::recent::RecentKind::Workspace => (IconName::FolderOpen, theme::accent()),
+                crate::recent::RecentKind::Document => {
+                    (file_glyph_for_name(&entry.label), 0x7C5CFC)
+                }
+                crate::recent::RecentKind::Panel => RightTab::from_slug(&entry.id)
+                    .map(Self::start_card_meta)
+                    .unwrap_or((IconName::PanelsTopLeft, theme::muted())),
+            };
+            // Panel labels are translated at render, not stored: a row written
+            // under one language must not stay in it after a language change.
+            let (row_label, row_detail) = match entry.kind {
+                crate::recent::RecentKind::Panel => RightTab::from_slug(&entry.id)
+                    .map(|tab| (lang.tr(tab.key()), lang.tr(tab.description_key())))
+                    .unwrap_or_else(|| (entry.label.clone(), entry.detail.clone())),
+                _ => (entry.label.clone(), entry.detail.clone()),
+            };
+            let when = Self::recent_time_label(lang, now, entry.opened_at_ms);
+            let shell = cx.entity();
+            let remove_kind = entry.kind;
+            let remove_id = entry.id.clone();
+            let menu_button = Button::new(SharedString::from(format!("right-recent-more-{index}")))
+                .ghost()
+                .w(px(24.0))
+                .h(px(24.0))
+                .rounded(px(6.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .child(txt("⋮", 14.0, theme::faint()))
+                .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
+                    let open_shell = shell.clone();
+                    let open_entry = entry_for_menu.clone();
+                    let remove_shell = shell.clone();
+                    let remove_kind = remove_kind;
+                    let remove_id = remove_id.clone();
+                    menu.item(
+                        PopupMenuItem::new(crate::i18n::tr(lang, "right.start.open")).on_click(
+                            move |_, window, cx| {
+                                let entry = open_entry.clone();
+                                open_shell.update(cx, |this, cx| {
+                                    this.open_launcher_recent(entry, window, cx);
+                                });
+                            },
+                        ),
+                    )
+                    .item(
+                        PopupMenuItem::new(crate::i18n::tr(lang, "right.start.removeRecent"))
+                            .on_click(move |_, _, cx| {
+                                remove_shell.update(cx, |this, cx| {
+                                    this.state.remove_launcher_recent(remove_kind, &remove_id);
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                });
+
+            section = section.child(
+                div()
+                    .id(SharedString::from(format!("right-recent-{index}")))
+                    .debug_selector(move || format!("right-recent-{index}"))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .px(px(8.0))
+                    .py(px(7.0))
+                    .rounded(px(10.0))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(theme::new_session_fill())))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(28.0))
+                            .h(px(28.0))
+                            .rounded(px(8.0))
+                            .bg(rgb(theme::soft(tint)))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(icon(glyph, 14.0, tint)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(1.0))
+                            .flex_1()
+                            .min_w_0()
+                            .child(txt(row_label.clone(), 11.5, theme::text()).text_ellipsis())
+                            .child(txt(row_detail.clone(), 9.5, theme::faint()).text_ellipsis()),
+                    )
+                    .child(txt(when, 9.5, theme::faint()))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("right-recent-menu-{index}")))
+                            .flex_none()
+                            .on_click(cx.listener(|_, _, _, cx| cx.stop_propagation()))
+                            .child(menu_button),
+                    )
+                    .on_click(cx.listener(move |this, _event, window, cx| {
+                        this.open_launcher_recent(entry_for_click.clone(), window, cx);
+                    })),
+            );
+        }
+        section.into_any_element()
+    }
+
+    /// The one-line age of a recent row.
+    fn recent_time_label(lang: crate::i18n::Lang, now_ms: u64, opened_ms: u64) -> String {
+        let elapsed = now_ms.saturating_sub(opened_ms);
+        let minutes = elapsed / 60_000;
+        if minutes == 0 {
+            return lang.tr("right.start.justNow");
+        }
+        if minutes < 60 {
+            return crate::i18n::tr_args(
+                lang,
+                "right.start.minutesAgo",
+                &[("count", minutes.to_string())],
+            );
+        }
+        let hours = minutes / 60;
+        if hours < 24 {
+            return crate::i18n::tr_args(
+                lang,
+                "right.start.hoursAgo",
+                &[("count", hours.to_string())],
+            );
+        }
+        crate::i18n::tr_args(
+            lang,
+            "right.start.daysAgo",
+            &[("count", (hours / 24).to_string())],
+        )
+    }
+
+    /// Open one recent row: a panel, a document in its workspace, or a root.
+    fn open_launcher_recent(
+        &mut self,
+        entry: crate::recent::RecentEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.clear_right_search(window, cx);
+        self.right.open = true;
+        match entry.kind {
+            crate::recent::RecentKind::Panel => {
+                let Some(tab) = RightTab::from_slug(&entry.id) else {
+                    return;
+                };
+                self.open_right_tab(tab, window, cx);
+                if tab == RightTab::Terminal {
+                    window.focus(&self.terminal_focus, cx);
+                }
+            }
+            crate::recent::RecentKind::Document => {
+                if let Some(workspace) = &entry.workspace {
+                    if workspace != &self.state.settings.global.general.active_workspace {
+                        self.state.set_workspace(workspace);
+                        self.refile_workspace(cx);
+                    }
+                }
+                self.open_file(std::path::Path::new(&entry.id), window, cx);
+            }
+            crate::recent::RecentKind::Workspace => {
+                self.record_workspace_recent(&entry.id);
+                self.state.set_workspace(&entry.id);
+                self.refile_workspace(cx);
+                cx.notify();
+            }
+        }
+    }
+
+    /// The launcher's footer: the startup preference and the primary Open.
+    fn start_footer(&self, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let checked = self.state.settings.global.general.launcher_on_start;
+        let can_open =
+            !self.right_search_matches().is_empty() || !self.launcher_recent_rows().is_empty();
+        let checkbox = div()
+            .id("right-launcher-startup")
+            .debug_selector(|| "right-launcher-startup".to_string())
+            .w(px(16.0))
+            .h(px(16.0))
+            .flex_none()
+            .rounded(px(4.0))
+            .border_1()
+            .border_color(rgb(if checked {
+                theme::accent()
+            } else {
+                theme::border_strong()
+            }))
+            .bg(rgb(if checked {
+                theme::accent()
+            } else {
+                theme::page()
+            }))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .when(checked, |check| {
+                check.child(icon(IconName::Check, 11.0, 0xFFFFFF))
+            })
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                this.state.settings.global.general.launcher_on_start = !checked;
+                this.save_settings(cx);
+                cx.notify();
+            }));
+        let open = div()
+            .id("right-launcher-open")
+            .debug_selector(|| "right-launcher-open".to_string())
+            .h(px(34.0))
+            .px(px(16.0))
+            .rounded(px(9.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap(px(6.0))
+            .bg(rgb(theme::accent()))
+            .opacity(if can_open { 1.0 } else { 0.4 })
+            .when(can_open, |button| button.cursor_pointer())
+            .child(icon(IconName::Play, 14.0, 0xFFFFFF))
+            .child(txt(lang.tr("right.start.open"), 12.0, 0xFFFFFF).font_weight(FontWeight::MEDIUM))
+            .on_click(cx.listener(move |this, _event, window, cx| {
+                if can_open {
+                    this.open_first_launcher_item(window, cx);
+                }
+            }));
+        div()
+            .h(px(52.0))
+            .flex_none()
+            .px(px(16.0))
+            .border_t_1()
+            .border_color(rgb(theme::border_soft()))
+            .bg(rgb(theme::page()))
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .child(checkbox)
+            .child(txt(
+                lang.tr("right.start.showAtStartup"),
+                11.0,
+                theme::muted(),
+            ))
+            .child(div().flex_1())
+            .child(open)
+            .into_any_element()
+    }
+
     /// The grid card size at this panel width. Three columns at the default
     /// panel width, never wider than 200px.
     fn start_card_size(&self) -> (f32, f32) {
         let gap = 12.0;
         let pad = 16.0;
         let width = (self.right_panel_w() - 1.0).max(0.0);
-        let columns = (((width - pad * 2.0 + gap) / 88.0).floor() as usize).clamp(2, 8);
-        let card = ((width - pad * 2.0 - gap * (columns - 1) as f32) / columns as f32).min(128.0);
+        let columns = (((width - pad * 2.0 + gap) / 124.0).floor() as usize).clamp(2, 6);
+        let card = ((width - pad * 2.0 - gap * (columns - 1) as f32) / columns as f32).min(160.0);
         (card, gap)
+    }
+
+    /// The launcher's semantic colour and glyph for one pane.
+    ///
+    /// Colour is not decoration: it is the fast path to the right tile in a grid
+    /// the reader scans, so each family keeps one hue (files blue, terminal green,
+    /// browser violet, extensions amber, federation teal, tasks blue).
+    fn start_card_meta(tab: RightTab) -> (IconName, u32) {
+        const VIOLET: u32 = 0x7C5CFC;
+        const AMBER: u32 = 0xE8912D;
+        const TEAL: u32 = 0x0E9F9F;
+        match tab {
+            RightTab::Files => (IconName::FolderOpen, theme::accent()),
+            RightTab::Terminal => (IconName::SquareTerminal, theme::success()),
+            RightTab::Diff => (IconName::GitCompareArrows, theme::muted()),
+            RightTab::Browser => (IconName::Globe, VIOLET),
+            RightTab::Extensions => (IconName::Puzzle, AMBER),
+            RightTab::Federation => (IconName::GitBranch, TEAL),
+            RightTab::Tasks => (IconName::ClipboardList, 0x3B82F6),
+        }
     }
 
     /// One Start card, as an Applications-style icon tile.
@@ -4670,14 +5147,15 @@ impl Shell {
     ) -> impl IntoElement {
         let lang = self.state.lang;
         let label = lang.tr(tab.key());
+        let description = lang.tr(tab.description_key());
+        let (glyph, tint) = Self::start_card_meta(tab);
         // A pane with no key binding draws no hint: the shortcut is a fact
         // about the shell, and printing one nothing dispatches would be the
-        // exact "control that only looks wired" this crate refuses. Finder's
-        // icon view puts such detail in the tooltip, not under every label.
+        // exact "control that only looks wired" this crate refuses.
         let hint = match tab {
             RightTab::Files => Some("\u{2318}P"),
             RightTab::Diff => None,
-            RightTab::Terminal => Some("\u{2325}`"),
+            RightTab::Terminal => Some("\u{2325}\u{60}"),
             RightTab::Browser => Some("\u{2318}T"),
             RightTab::Extensions => None,
             RightTab::Federation => None,
@@ -4691,10 +5169,10 @@ impl Shell {
             .id(SharedString::from(format!("right-card-{}", tab.key())))
             .debug_selector(move || format!("right-card-{}", tab.key()))
             .w(px(width))
-            .h(px(92.0))
+            .h(px(118.0))
             .flex_none()
-            .p(px(4.0))
-            .rounded(px(8.0))
+            .p(px(8.0))
+            .rounded(px(12.0))
             .cursor_pointer()
             .hover(|s| s.bg(rgb(theme::hover())))
             .flex()
@@ -4707,18 +5185,27 @@ impl Shell {
             .child(
                 div()
                     .flex_none()
-                    .w(px(56.0))
-                    .h(px(56.0))
-                    .rounded(px(12.0))
-                    .border_1()
-                    .border_color(rgb(theme::border_soft()))
-                    .bg(rgb(theme::new_session_fill()))
+                    .w(px(48.0))
+                    .h(px(48.0))
+                    .rounded(px(13.0))
+                    .bg(rgb(theme::soft(tint)))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(icon(tab.glyph(), 28.0, theme::muted())),
+                    .child(icon(glyph, 24.0, tint)),
             )
-            .child(txt(label, 12.5, theme::text()).min_w_0().text_ellipsis())
+            .child(
+                txt(label, 12.5, theme::text())
+                    .font_weight(FontWeight::MEDIUM)
+                    .min_w_0()
+                    .text_ellipsis(),
+            )
+            .child(
+                txt(description, 10.0, theme::faint())
+                    .min_w_0()
+                    .whitespace_nowrap()
+                    .text_ellipsis(),
+            )
             .on_click(cx.listener(move |this, _event, window, cx| {
                 this.clear_right_search(window, cx);
                 this.open_right_tab(tab, window, cx);
@@ -4740,14 +5227,16 @@ impl Shell {
     ) -> impl IntoElement {
         let label = tab.label();
         let path = tab.rel.display().to_string();
+        let tip_path = path.clone();
+        const VIOLET: u32 = 0x7C5CFC;
         div()
             .id(SharedString::from(format!("right-start-file-{index}")))
             .debug_selector(move || format!("right-start-file-{index}"))
             .w(px(width))
-            .h(px(92.0))
+            .h(px(118.0))
             .flex_none()
-            .p(px(4.0))
-            .rounded(px(8.0))
+            .p(px(8.0))
+            .rounded(px(12.0))
             .cursor_pointer()
             .hover(|s| s.bg(rgb(theme::hover())))
             .flex()
@@ -4756,22 +5245,31 @@ impl Shell {
             .justify_center()
             .gap(px(5.0))
             .tooltip_show_delay(std::time::Duration::from_millis(500))
-            .tooltip(move |window, cx| Tooltip::new(path.clone()).build(window, cx))
+            .tooltip(move |window, cx| Tooltip::new(tip_path.clone()).build(window, cx))
             .child(
                 div()
                     .flex_none()
-                    .w(px(56.0))
-                    .h(px(56.0))
-                    .rounded(px(12.0))
-                    .border_1()
-                    .border_color(rgb(theme::border_soft()))
-                    .bg(rgb(theme::new_session_fill()))
+                    .w(px(48.0))
+                    .h(px(48.0))
+                    .rounded(px(13.0))
+                    .bg(rgb(theme::soft(VIOLET)))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(icon(file_glyph_for_name(&label), 28.0, theme::muted())),
+                    .child(icon(file_glyph_for_name(&label), 24.0, VIOLET)),
             )
-            .child(txt(label, 12.5, theme::text()).min_w_0().text_ellipsis())
+            .child(
+                txt(label, 12.5, theme::text())
+                    .font_weight(FontWeight::MEDIUM)
+                    .min_w_0()
+                    .text_ellipsis(),
+            )
+            .child(
+                txt(path, 10.0, theme::faint())
+                    .min_w_0()
+                    .whitespace_nowrap()
+                    .text_ellipsis(),
+            )
             .on_click(cx.listener(move |this, _event, window, cx| {
                 this.clear_right_search(window, cx);
                 this.focus_tab(index, cx);
@@ -6460,12 +6958,26 @@ impl Shell {
     /// the surface) goes through this: the terminal is a layer of the window's
     /// view, so it has to be hidden explicitly or it keeps painting over the
     /// pane that replaced it.
+    /// Record one panel opening in the launcher's automatic recent list.
+    fn record_panel_recent(&mut self, tab: RightTab) {
+        let label = self.state.lang.tr(tab.key());
+        let detail = self.state.lang.tr(tab.description_key());
+        self.state.record_launcher_recent(
+            crate::recent::RecentKind::Panel,
+            tab.slug(),
+            label,
+            detail,
+            None,
+        );
+    }
+
     pub(crate) fn show_right_tab(&mut self, tab: RightTab, cx: &mut Context<Self>) {
         self.right.open = true;
         self.right.tab = Some(tab);
         if !self.right.open_panes.contains(&tab) {
             self.right.open_panes.push(tab);
         }
+        self.record_panel_recent(tab);
         // Choosing a tab is also leaving the overview, the way selecting a tab
         // in Finder's own catalogue puts the window back.
         self.right.catalog_open = false;
@@ -6541,6 +7053,7 @@ impl Shell {
             self.right.open_panes.push(tab);
         }
         self.right.catalog_open = false;
+        self.record_panel_recent(tab);
         if tab == RightTab::Tasks {
             // One store read per open, never per frame.
             *self.right.tasks.borrow_mut() = None;
@@ -7832,6 +8345,50 @@ impl Shell {
         self.files.comment_open = false;
         cx.notify();
     }
+    /// Record one workspace activation in the launcher's automatic recent list.
+    pub(crate) fn record_workspace_recent(&mut self, id: &str) {
+        let (label, root) = self
+            .state
+            .settings
+            .global
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == id)
+            .map(|workspace| (workspace.name.clone(), workspace.root.clone()))
+            .unwrap_or_else(|| (id.to_string(), String::new()));
+        self.state.record_launcher_recent(
+            crate::recent::RecentKind::Workspace,
+            id,
+            label,
+            crate::recent::display_path(&root),
+            Some(id.to_string()),
+        );
+    }
+
+    /// Record one document opening in the launcher's automatic recent list.
+    fn record_document_recent(&mut self, rel: &Path) {
+        let id = rel.display().to_string();
+        let detail = self
+            .state
+            .workspace_root()
+            .map(|root| root.join(rel))
+            .map(|path| crate::recent::display_path(&path.to_string_lossy()))
+            .unwrap_or_else(|| crate::recent::display_path(&id));
+        let label = rel
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| detail.clone());
+        let workspace = self.state.settings.global.general.active_workspace.clone();
+        self.state.record_launcher_recent(
+            crate::recent::RecentKind::Document,
+            id,
+            label,
+            detail,
+            (!workspace.is_empty()).then_some(workspace),
+        );
+    }
+
     pub(crate) fn open_file(&mut self, rel: &Path, window: &mut Window, cx: &mut Context<Self>) {
         // A document's body only exists on the Files tab, so opening one from
         // anywhere else (a chat reference, a search result, the Start grid) has
@@ -7843,6 +8400,7 @@ impl Shell {
             // Reopening a tab shows its remarks if it has any; a file with
             // none keeps the surface clean until the reader opens the drawer.
             self.files.notes_open = self.files.notes.has_notes(rel);
+            self.record_document_recent(rel);
             cx.notify();
             return;
         }
@@ -7854,6 +8412,7 @@ impl Shell {
             cx.notify();
             return;
         };
+        self.record_document_recent(rel);
         // The name decides the language and the size decides the bound, so both
         // come from the resolved path rather than from the label on the row.
         let name = path
@@ -8219,6 +8778,35 @@ impl Shell {
 
     /// Enter in the search field opens the first match, the way Finder's own
     /// search opens the selection when Return is pressed.
+    /// Bring the Workspace Launcher forward and put the caret in its search.
+    pub(crate) fn focus_launcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.right.open = true;
+        self.right.tab = None;
+        self.right.catalog_open = false;
+        self.right_search
+            .update(cx, |state, cx| state.focus_handle(cx).focus(window, cx));
+        cx.notify();
+    }
+
+    /// Open the first launcher result, including when the search is empty.
+    ///
+    /// Enter in the search field requires a query (an empty Enter should do
+    /// nothing), but the footer's Open is the launcher's primary action: with
+    /// no query it opens the first pane card, which is Files.
+    pub(crate) fn open_first_launcher_item(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.right.tab.is_some() {
+            return;
+        }
+        if let Some((entry, _)) = self.right_search_matches().into_iter().next() {
+            self.clear_right_search(window, cx);
+            self.open_right_search_result(entry, window, cx);
+            return;
+        }
+        if let Some(entry) = self.launcher_recent_rows().into_iter().next() {
+            self.open_launcher_recent(entry, window, cx);
+        }
+    }
+
     pub(crate) fn open_first_right_search_result(
         &mut self,
         window: &mut Window,
@@ -9639,9 +10227,7 @@ pub(crate) fn enroll_peer(store: &mut federation::PeerStore, raw: &str) -> Resul
 /// it. A successful call means the reader asked for exactly the set that was
 /// revoked at that moment; a re-announcement of one of those peers starts a new
 /// relationship under Discovered.
-pub(crate) fn remove_revoked_peers(
-    store: &mut federation::PeerStore,
-) -> Result<usize, String> {
+pub(crate) fn remove_revoked_peers(store: &mut federation::PeerStore) -> Result<usize, String> {
     let nodes: Vec<agent::capability::NodeId> = store
         .iter()
         .filter(|record| record.state == federation::TrustState::Revoked)
@@ -9659,7 +10245,27 @@ pub(crate) fn remove_revoked_peers(
     Ok(removed)
 }
 
-/// Grant one capability to one peer.
+/// Remove every peer record, trusted included, returning how many went.
+///
+/// This is the administrative cleanup: a trusted peer is revoked implicitly
+/// by forgetting its record, exactly as the single-row Remove does.
+pub(crate) fn remove_all_peers(store: &mut federation::PeerStore) -> Result<usize, String> {
+    let nodes: Vec<agent::capability::NodeId> =
+        store.iter().map(|record| record.node.clone()).collect();
+    let mut removed = 0;
+    for node in nodes {
+        if store.remove(&node) {
+            removed += 1;
+        }
+    }
+    if removed == 0 {
+        return Err("no peers to remove".to_string());
+    }
+    Ok(removed)
+}
+
+/// Grant one capability to one peer, for the store operation's tests.
+#[cfg(test)]
 pub(crate) fn grant_capability(
     store: &mut federation::PeerStore,
     node: &str,
@@ -10326,13 +10932,49 @@ mod tests {
 #[cfg(test)]
 mod federation_pane_tests {
     use super::{
-        enroll_peer, federation_rows, grant_capability, revoke_grant_action, revoke_peer_action,
-        short_node,
+        enroll_peer, federation_rows, grant_capability, remove_all_peers, remove_revoked_peers,
+        revoke_grant_action, revoke_peer_action, short_node,
     };
     use federation::{NodeIdentity, PeerStore};
 
     fn peer() -> String {
         NodeIdentity::from_seed([5u8; 32]).node_id().to_string()
+    }
+
+    /// Bulk cleanup removes only the revoked rows, leaving trusted peers alone.
+    /// The administrative cleanup forgets every record, trusted included.
+    #[test]
+    fn bulk_removal_forgets_trusted_and_revoked_peers() {
+        let trusted = NodeIdentity::from_seed([61u8; 32]).node_id();
+        let revoked = NodeIdentity::from_seed([62u8; 32]).node_id();
+        let mut store = PeerStore::new();
+        store.enroll(trusted.clone(), 1_000, None);
+        store.enroll(revoked.clone(), 1_000, None);
+        store.revoke(&revoked);
+
+        assert_eq!(remove_all_peers(&mut store).expect("two peers"), 2);
+        assert!(!store.iter().any(|record| record.node == trusted));
+        assert!(!store.iter().any(|record| record.node == revoked));
+        assert!(remove_all_peers(&mut store).is_err(), "nothing is left");
+    }
+
+    #[test]
+    fn bulk_removal_forgets_only_revoked_peers() {
+        let trusted = NodeIdentity::from_seed([51u8; 32]).node_id();
+        let revoked = NodeIdentity::from_seed([52u8; 32]).node_id();
+        let mut store = PeerStore::new();
+        store.enroll(trusted.clone(), 1_000, None);
+        store.enroll(revoked.clone(), 1_000, None);
+        store.revoke(&revoked);
+
+        let removed = remove_revoked_peers(&mut store).expect("one revoked peer");
+        assert_eq!(removed, 1);
+        assert!(store.iter().any(|record| record.node == trusted));
+        assert!(!store.iter().any(|record| record.node == revoked));
+        assert!(
+            remove_revoked_peers(&mut store).is_err(),
+            "a second cleanup has nothing to remove"
+        );
     }
 
     #[test]

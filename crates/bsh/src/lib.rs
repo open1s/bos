@@ -39,6 +39,7 @@ mod open_in_app;
 pub(crate) mod plugins;
 pub(crate) mod preset_catalogue;
 pub(crate) mod prompts;
+pub(crate) mod recent;
 pub(crate) mod reference;
 pub(crate) mod runner;
 pub(crate) mod schedule;

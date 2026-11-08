@@ -991,6 +991,13 @@ pub(crate) struct General {
     /// has been made yet.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) open_in_app: String,
+    /// Whether the Workspace Launcher opens on the Start surface at launch.
+    ///
+    /// This is a window/layout preference, not a workspace fact: it decides
+    /// whether the right column starts on the launcher instead of closed. The
+    /// launcher's own checkbox writes it, and the next launch reads it.
+    #[serde(default = "default_true")]
+    pub(crate) launcher_on_start: bool,
     /// The workspace that was open; empty while none is registered.
     pub(crate) active_workspace: String,
     /// The session last on screen; empty while none has been selected.
@@ -1031,6 +1038,7 @@ impl Default for General {
             diff_wrap: false,
             session_sort: String::new(),
             open_in_app: String::new(),
+            launcher_on_start: true,
             active_workspace: String::new(),
             active_session: String::new(),
         }
