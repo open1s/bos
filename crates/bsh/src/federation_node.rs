@@ -20,7 +20,7 @@ use agent::capability::{
     unix_ms, CapabilityProvider, Catalogue, CompositionSnapshot, NodeId, WorkspaceId,
     WorkspaceRuntime,
 };
-use agent::tools::ToolRegistry;
+use agent::tools::{AsyncTool, ToolError, ToolRegistry};
 use bus::{Bus, BusConfig};
 use federation::{
     DiscoveryRecord, Envelope, FederationMessage, FederationNode, NodeIdentity, PeerStore,
@@ -144,6 +144,67 @@ async fn start_tls_terminator(
 
 /// How long a discovered record stays listed without a fresh announcement.
 const DISCOVERY_STALE_MS: u64 = 30_000;
+
+/// The directory the exposed read-only tools are confined to.
+///
+/// A deployment may pin one in the federation section's expose_root. When it
+/// does not, the active workspace's root is the natural boundary: the reader
+/// already chose that directory, and the pane no longer asks them to type a
+/// path next to the capability list. A process with no workspace root has
+/// nothing to expose, so assembly refuses rather than serving an unbounded
+/// filesystem.
+pub(crate) fn expose_root(settings: &crate::settings::Settings) -> Option<PathBuf> {
+    settings
+        .global
+        .federation
+        .expose_root
+        .as_deref()
+        .map(str::trim)
+        .filter(|root| !root.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            let active = settings.active_workspace_root();
+            (!active.is_empty()).then(|| PathBuf::from(active))
+        })
+}
+
+/// The read-only capabilities this node can serve to peers.
+///
+/// One list, shared by the composer that builds the tools and the pane that
+/// offers them, so a capability the node cannot serve never appears as a row a
+/// reader can check. Keep it in step with the match in the local provider: the
+/// ids are the tool names under `builtin/`.
+const EXPOSABLE: [&str; 6] = [
+    "read_file",
+    "read_files",
+    "glob",
+    "grep",
+    "workspace_context",
+    "skill",
+];
+
+/// The capabilities the pane may offer to expose, in the order it lists them.
+pub(crate) fn exposable_capabilities() -> &'static [&'static str] {
+    &EXPOSABLE
+}
+
+/// The built-in capabilities a peer may be granted on this node.
+///
+/// A grant is a permission the PEER holds to call something HERE, so the menu
+/// is the node's own surface: the read-only tools it can expose plus the two
+/// knowledge-service permissions. The pane appends the extension tools the
+/// installed manifests declare; it is deliberately not the peer's advertised
+/// catalogue - that is what the peer offers us, and it can be empty whenever
+/// the peer is offline or exposes nothing.
+pub(crate) fn grantable_capabilities() -> Vec<String> {
+    let mut ids: Vec<String> = EXPOSABLE
+        .iter()
+        .map(|name| format!("builtin/{name}"))
+        .collect();
+    ids.push("builtin/knowledge_query".to_string());
+    ids.push("builtin/knowledge_publish".to_string());
+    ids
+}
 
 /// One running federation endpoint and the state that must outlive it.
 pub(crate) struct FederationRuntime {
@@ -782,6 +843,139 @@ pub(crate) fn attach_remote_tools(
 /// Only the read-only file tools are accepted: a node that answers strangers
 /// must not be handed the shell. The tools are confined to `expose_root`, and
 /// the exposed descriptors are made Public so discovery can publish them.
+/// One extension tool, served through the process-global extension host.
+///
+/// The host may be reopened by a UI build with a different preset allowlist,
+/// so the handle is just the qualified name: every call looks the runtime up
+/// again. The federation grant is the gate in front of this tool; the
+/// extension's own capability policy still authorizes the call.
+struct HostedExtensionTool {
+    qualified: String,
+    description: String,
+    schema: serde_json::Value,
+}
+
+#[async_trait::async_trait]
+impl AsyncTool for HostedExtensionTool {
+    fn name(&self) -> &str {
+        &self.qualified
+    }
+
+    fn description(&self) -> String {
+        self.description.clone()
+    }
+
+    fn category(&self) -> String {
+        "extension".to_string()
+    }
+
+    async fn run(&self, input: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
+        crate::extension::host::call_node_tool(&self.qualified, input.clone())
+            .await
+            .map_err(|error| ToolError::Failed(error.to_string()))
+    }
+
+    fn json_schema(&self) -> serde_json::Value {
+        self.schema.clone()
+    }
+}
+
+/// A read-only skill reader over the skills this build enabled.
+struct SkillTool {
+    skills: std::collections::BTreeMap<String, (PathBuf, String)>,
+}
+
+impl agent::tools::Tool for SkillTool {
+    fn name(&self) -> &str {
+        "skill"
+    }
+
+    fn description(&self) -> String {
+        "Read one enabled skill's SKILL.md by name.".to_string()
+    }
+
+    fn category(&self) -> String {
+        "federation".to_string()
+    }
+
+    fn json_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "required": ["name"],
+            "properties": {"name": {"type": "string"}}
+        })
+    }
+
+    fn run(&self, input: &serde_json::Value) -> Result<serde_json::Value, agent::tools::ToolError> {
+        let name = input
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| agent::tools::ToolError::InvalidInput("name is required".to_string()))?;
+        let (path, description) = self
+            .skills
+            .get(name)
+            .ok_or_else(|| agent::tools::ToolError::Failed(format!("unknown skill {name:?}")))?;
+        let content = std::fs::read_to_string(path)
+            .map_err(|error| agent::tools::ToolError::Failed(format!("skill {name}: {error}")))?;
+        let content: String = content.chars().take(32 * 1024).collect();
+        Ok(serde_json::json!({
+            "name": name,
+            "description": description,
+            "content": content,
+        }))
+    }
+
+    fn metadata(&self) -> Option<&agent::tools::ToolMetadata> {
+        None
+    }
+}
+
+/// A read-only summary of the exposed workspace: its root and top-level entries.
+struct WorkspaceContextTool {
+    root: PathBuf,
+}
+
+impl agent::tools::Tool for WorkspaceContextTool {
+    fn name(&self) -> &str {
+        "workspace_context"
+    }
+
+    fn description(&self) -> String {
+        "List the workspace root and its top-level entries.".to_string()
+    }
+
+    fn category(&self) -> String {
+        "federation".to_string()
+    }
+
+    fn run(
+        &self,
+        _input: &serde_json::Value,
+    ) -> Result<serde_json::Value, agent::tools::ToolError> {
+        let mut entries = Vec::new();
+        let directory = std::fs::read_dir(&self.root).map_err(|error| {
+            agent::tools::ToolError::Failed(format!("workspace_context: {error}"))
+        })?;
+        for entry in directory.take(200) {
+            let entry = entry.map_err(|error| {
+                agent::tools::ToolError::Failed(format!("workspace_context: {error}"))
+            })?;
+            entries.push(serde_json::json!({
+                "name": entry.file_name().to_string_lossy(),
+                "directory": entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false),
+            }));
+        }
+        Ok(serde_json::json!({
+            "root": self.root.display().to_string(),
+            "entries": entries,
+        }))
+    }
+
+    fn metadata(&self) -> Option<&agent::tools::ToolMetadata> {
+        None
+    }
+}
+
 pub(crate) fn node_runtime(
     settings: &crate::settings::Settings,
 ) -> Result<
@@ -798,10 +992,7 @@ pub(crate) fn node_runtime(
     if config.expose.is_empty() {
         return Err("no capabilities are exposed".to_string());
     }
-    let root = config
-        .expose_root
-        .as_ref()
-        .map(PathBuf::from)
+    let root = expose_root(settings)
         .ok_or_else(|| "expose_root is required when expose is set".to_string())?;
     if !root.is_dir() {
         return Err(format!("expose_root {} is not a directory", root.display()));
@@ -816,10 +1007,75 @@ pub(crate) fn node_runtime(
     })?;
 
     let eff = settings.effective();
+    let skills: std::collections::BTreeMap<String, (PathBuf, String)> = eff
+        .enabled_skills()
+        .map(|skill| {
+            (
+                skill.name.clone(),
+                (skill.manifest.clone(), skill.description.clone()),
+            )
+        })
+        .collect();
     let policy = crate::caps::policy_for_effective(settings, &eff);
     let session = "federation:node".to_string();
     let preset = eff.preset_id.clone();
     let mut registry = ToolRegistry::new();
+    // Extension tools are runtime-owned: they are served through the same
+    // process-global host the agent builds use, not through the read-only
+    // file tools above. Only the ids the reader checked are registered.
+    let mut extension_tools: BTreeMap<String, Arc<dyn AsyncTool>> = BTreeMap::new();
+    let extension_ids: Vec<String> = config
+        .expose
+        .iter()
+        .filter(|raw| {
+            raw.parse::<agent::capability::CapabilityId>()
+                .map(|id| !EXPOSABLE.contains(&id.name()))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+    if !extension_ids.is_empty() {
+        // A typo must not start the extension host: only an id an installed
+        // manifest actually declares is allowed to reach the host.
+        let declared = crate::extension::host::declared_tool_catalogue(settings);
+        let requested: Vec<_> = declared
+            .iter()
+            .filter(|info| {
+                let capability = format!("builtin/{}", info.qualified);
+                extension_ids.iter().any(|raw| raw == &capability)
+            })
+            .collect();
+        if !requested.is_empty() {
+            let workspace = settings.active_workspace_root();
+            let workspace = (!workspace.is_empty()).then(|| PathBuf::from(workspace));
+            if !crate::extension::host::ensure_host(settings, workspace.as_deref()) {
+                return Err(
+                    "extension tools are exposed but the extension host could not start"
+                        .to_string(),
+                );
+            }
+            let hosted = crate::extension::host::node_tool_catalogue();
+            for info in requested {
+                let Some(hosted) = hosted
+                    .iter()
+                    .find(|candidate| candidate.qualified == info.qualified)
+                else {
+                    return Err(format!(
+                        "extension tool {} is declared but the host cannot serve it",
+                        info.qualified
+                    ));
+                };
+                extension_tools.insert(
+                    hosted.qualified.clone(),
+                    Arc::new(HostedExtensionTool {
+                        qualified: hosted.qualified.clone(),
+                        description: hosted.description.clone(),
+                        schema: hosted.schema.clone(),
+                    }),
+                );
+            }
+        }
+    }
     for raw in &config.expose {
         let id: agent::capability::CapabilityId = raw
             .parse()
@@ -855,6 +1111,20 @@ pub(crate) fn node_runtime(
                 )),
                 crate::tool_metadata::declared("read_file"),
             )),
+            "skill" => Arc::new(DeclaredTool::new(
+                Arc::new(SkillTool {
+                    skills: skills.clone(),
+                }),
+                agent::tools::ToolMetadata::new()
+                    .with_risk("low")
+                    .with_permissions(["filesystem.read"]),
+            )),
+            "workspace_context" => Arc::new(DeclaredTool::new(
+                Arc::new(WorkspaceContextTool { root: root.clone() }),
+                agent::tools::ToolMetadata::new()
+                    .with_risk("low")
+                    .with_permissions(["filesystem.read"]),
+            )),
             "read_files" => Arc::new(DeclaredTool::new(
                 Arc::new(crate::caps::read_files_tool(
                     Some(root.clone()),
@@ -866,8 +1136,15 @@ pub(crate) fn node_runtime(
                 crate::tool_metadata::declared("read_files"),
             )),
             other => {
+                if let Some(tool) = extension_tools.remove(other) {
+                    registry
+                        .register_async(tool)
+                        .map_err(|error| error.to_string())?;
+                    continue;
+                }
                 return Err(format!(
-                    "{other} is not a capability this node can expose; use read_file, read_files, glob, or grep"
+                    "{other} is not a capability this node can expose; use {} or an extension tool the host lists",
+                    EXPOSABLE.join(", ")
                 ));
             }
         };
@@ -1443,6 +1720,31 @@ mod tests {
     use super::*;
     use agent::capability::unix_ms;
     use federation::InMemoryNetwork;
+
+    /// The pane never asks for a root: a deployment may pin one, otherwise the
+    /// active workspace is the boundary the exposed read tools are confined to.
+    #[test]
+    fn the_expose_root_defaults_to_the_active_workspace() {
+        use crate::settings::global::WorkspaceRef;
+
+        let mut settings = crate::settings::Settings::default();
+        settings.global.federation.expose_root = None;
+        settings.global.general.active_workspace = "w1".to_string();
+        settings.global.workspaces = vec![WorkspaceRef {
+            id: "w1".to_string(),
+            name: "workspace".to_string(),
+            root: "/tmp/workspace".to_string(),
+            created_at: 0,
+            updated_at: 0,
+        }];
+        assert_eq!(
+            expose_root(&settings),
+            Some(PathBuf::from("/tmp/workspace"))
+        );
+
+        settings.global.federation.expose_root = Some("/srv/root".to_string());
+        assert_eq!(expose_root(&settings), Some(PathBuf::from("/srv/root")));
+    }
 
     /// Two nodes see each other on the announce key without any enrollment,
     /// and neither lists itself.
@@ -2992,5 +3294,28 @@ mod tests {
         let unknown = crate::federation_node::load_identity(&path, "unknown").expect("falls back");
         assert_eq!(unknown.node_id(), first.node_id());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_skill_capability_reads_only_its_enabled_manifest() {
+        let root = std::env::temp_dir().join(format!("bsh-skill-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("scratch");
+        let manifest = root.join("SKILL.md");
+        std::fs::write(&manifest, "# Hello\n\nDo the thing.\n").expect("manifest");
+        let tool = crate::federation_node::SkillTool {
+            skills: std::collections::BTreeMap::from([(
+                "hello".to_string(),
+                (manifest.clone(), "the hello skill".to_string()),
+            )]),
+        };
+        let result = agent::tools::Tool::run(&tool, &serde_json::json!({"name": "hello"}))
+            .expect("skill read");
+        assert!(result["content"].as_str().unwrap().contains("Do the thing"));
+        assert_eq!(result["description"], "the hello skill");
+        let error = agent::tools::Tool::run(&tool, &serde_json::json!({"name": "missing"}))
+            .expect_err("unknown skill");
+        assert!(error.to_string().contains("unknown skill"));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

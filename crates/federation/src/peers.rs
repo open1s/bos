@@ -138,6 +138,15 @@ pub struct PeerStore {
 }
 
 impl PeerStore {
+    /// Forget one peer record entirely, grants included.
+    ///
+    /// Revocation keeps the record so an audit can still name the relationship;
+    /// removal forgets it. Removing a trusted peer therefore revokes it too, and
+    /// a later announcement can enroll it again as a new relationship.
+    pub fn remove(&mut self, node: &NodeId) -> bool {
+        self.peers.remove(node).is_some()
+    }
+
     /// An empty store: nothing is trusted.
     pub fn new() -> Self {
         Self::default()
@@ -599,6 +608,20 @@ mod tests {
         let mut store = PeerStore::new();
         store.enroll(peer.clone(), 1_000, None);
         (store, peer)
+    }
+
+    /// Removal forgets the record, not just its grants: the peer disappears
+    /// from the list and a second removal has nothing left to do.
+    #[test]
+    fn removing_a_peer_forgets_its_record_and_grants() {
+        let (mut store, peer) = store();
+        store
+            .grant(&peer, capability(), 1_000, None)
+            .expect("grant");
+        assert!(store.remove(&peer));
+        assert!(!store.iter().any(|record| record.node == peer));
+        assert!(store.authorize(&peer, &capability(), 1_000).is_err());
+        assert!(!store.remove(&peer), "a second removal reports nothing");
     }
 
     /// A capability-only grant keeps its historical meaning: any operation and

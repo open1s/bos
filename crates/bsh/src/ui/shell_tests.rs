@@ -21684,12 +21684,14 @@ fn the_right_panel_offers_a_federation_pane(cx: &mut TestAppContext) {
         "the Federation tab opens its own pane"
     );
     assert!(
-        cx.debug_bounds("federation-enroll").is_some(),
-        "the pane offers Enroll"
-    );
-    assert!(
         cx.debug_bounds("federation-grant").is_some(),
         "the pane offers Grant"
+    );
+    assert!(
+        cx.debug_bounds("federation-field-enroll").is_none()
+            && cx.debug_bounds("federation-field-expose-root").is_none()
+            && cx.debug_bounds("federation-field-lease-id").is_none(),
+        "Advanced carries no raw peer id, root or lease field"
     );
     assert!(
         cx.debug_bounds("federation-expose-menu").is_some(),
@@ -21788,6 +21790,86 @@ fn revoking_a_peer_asks_first(cx: &mut TestAppContext) {
     );
 }
 
+/// Removing a peer takes two presses as well, and works for a revoked row as
+/// well as a trusted one.
+#[gpui::test]
+fn removing_a_peer_asks_first(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("right-federation-remove");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    shell.update(cx, |this, cx| {
+        this.right.open = true;
+        this.right.tab = Some(crate::ui::right_panel::RightTab::Federation);
+        this.right.federation.peers = vec![crate::ui::right_panel::FederationPeerRow {
+            node: "abcdefghijkl".to_string(),
+            name: Some("studio".to_string()),
+            state: "revoked".to_string(),
+            grants: Vec::new(),
+        }];
+        this.right.federation.loaded = true;
+        this.right.federation.confirm_revoke = None;
+        this.right.federation.confirm_remove = None;
+        cx.notify();
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let remove = cx
+        .debug_bounds("federation-remove-0")
+        .expect("the revoked row offers Remove");
+    cx.simulate_click(remove.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).right.federation.confirm_remove.clone()),
+        Some("abcdefghijkl".to_string()),
+        "the first press asks"
+    );
+    assert!(
+        cx.debug_bounds("federation-remove-confirm").is_some(),
+        "the confirmation control is on screen"
+    );
+    assert!(
+        cx.debug_bounds("federation-revoke").is_none(),
+        "a revoked row does not offer Revoke again"
+    );
+
+    let cancel = cx
+        .debug_bounds("federation-remove-cancel")
+        .expect("the confirmation offers Cancel");
+    cx.simulate_click(cancel.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.update(|_, cx| shell.read(cx).right.federation.confirm_remove.clone())
+            .is_none(),
+        "Cancel clears the question"
+    );
+
+    let remove = cx
+        .debug_bounds("federation-remove-0")
+        .expect("the row offers Remove again");
+    cx.simulate_click(remove.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let confirm = cx
+        .debug_bounds("federation-remove-confirm")
+        .expect("the confirmation is back");
+    cx.simulate_click(confirm.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.update(|_, cx| shell.read(cx).right.federation.confirm_remove.clone())
+            .is_none(),
+        "the second press consumes the question"
+    );
+    assert!(
+        cx.update(|_, cx| shell.read(cx).right.federation.error.clone())
+            .is_some(),
+        "a build without a store reports why nothing changed"
+    );
+}
+
 /// The two switches persist their settings through the shell's settings file.
 #[gpui::test]
 fn the_federation_switches_write_the_settings(cx: &mut TestAppContext) {
@@ -21837,10 +21919,11 @@ fn the_federation_switches_write_the_settings(cx: &mut TestAppContext) {
     );
 }
 
-/// A discovered peer lists its advertised capabilities; a press selects one,
-/// and the selection survives into the pending map the enroll action reads.
+/// A discovered peer shows its advertised capabilities as information and
+/// offers exactly one action, Trust. Grants are made later in Peer & Grant,
+/// against the capabilities THIS node serves.
 #[gpui::test]
-fn a_discovered_peer_offers_its_capabilities_for_selection(cx: &mut TestAppContext) {
+fn a_discovered_peer_lists_its_capabilities(cx: &mut TestAppContext) {
     init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_workspace_tree("right-federation-discovered");
@@ -21857,7 +21940,6 @@ fn a_discovered_peer_offers_its_capabilities_for_selection(cx: &mut TestAppConte
             name: Some("peer-b".to_string()),
             capabilities: vec![("builtin/read_file".to_string(), "low".to_string())],
         }];
-        this.right.federation.pending.clear();
         cx.notify();
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -21866,25 +21948,13 @@ fn a_discovered_peer_offers_its_capabilities_for_selection(cx: &mut TestAppConte
         cx.debug_bounds("federation-discovered-0").is_some(),
         "the discovered peer renders"
     );
-    let chip = cx
-        .debug_bounds("federation-choose-0-builtin/read_file")
-        .expect("the advertised capability is a selectable chip");
-    cx.simulate_click(chip.center(), Modifiers::default());
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-
-    let selected = cx.update(|_, cx| {
-        shell
-            .read(cx)
-            .right
-            .federation
-            .pending
-            .get("abcdefghijkl")
-            .cloned()
-            .unwrap_or_default()
-    });
     assert!(
-        selected.contains("builtin/read_file"),
-        "the press selects exactly that capability"
+        cx.debug_bounds("federation-discovered-caps-0").is_some(),
+        "its advertised capabilities are shown"
+    );
+    assert!(
+        cx.debug_bounds("federation-peer-trust-0").is_some(),
+        "the row's only action is Trust"
     );
 }
 

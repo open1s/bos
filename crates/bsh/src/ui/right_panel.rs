@@ -30,6 +30,7 @@ use gpui_kit::Focusable;
 use gpui_kit::*;
 
 use super::diff_pane::{self, DiffSource};
+use super::federation_pane::{FederationActivity, FederationPreview};
 use super::shell::{Shell, SideDrag};
 use super::terminal_view::TerminalView;
 use super::{hairline_bottom, hairline_left, handle_bar, icon, txt, DivExt, IconName};
@@ -497,6 +498,8 @@ pub(crate) struct FederationDelegationRow {
 pub(crate) struct FederationLeaseRow {
     /// The lease id.
     pub(crate) id: String,
+    /// The capability the lease grants access to.
+    pub(crate) capability: String,
     /// The holder Node.
     pub(crate) holder: String,
     /// Bytes used.
@@ -544,7 +547,7 @@ pub(crate) struct DiscoveredPeerRow {
 pub(crate) struct FederationPane {
     /// The peers, in store order.
     pub(crate) peers: Vec<FederationPeerRow>,
-    /// The peer the grant field applies to.
+    /// The peer the grant card applies to.
     pub(crate) selected: Option<usize>,
     /// Whether the list has been read since the pane opened.
     pub(crate) loaded: bool,
@@ -553,8 +556,15 @@ pub(crate) struct FederationPane {
     /// The last success, shown above the list.
     pub(crate) notice: Option<String>,
     /// The peer a revoke is waiting on a second press to confirm.
-    #[allow(dead_code)]
     pub(crate) confirm_revoke: Option<String>,
+    /// The peer a removal is waiting on a second press to confirm.
+    pub(crate) confirm_remove: Option<String>,
+    /// The operation a pending removal owns.
+    pub(crate) confirm_remove_op: Option<u64>,
+    /// Whether the bulk "remove revoked" is waiting on a second press.
+    pub(crate) confirm_remove_revoked: bool,
+    /// The operation a pending bulk removal owns.
+    pub(crate) confirm_remove_revoked_op: Option<u64>,
     /// Peers seen on the announce key, excluding this node.
     pub(crate) discovered: Vec<DiscoveredPeerRow>,
     /// Delegation records, newest first.
@@ -567,27 +577,28 @@ pub(crate) struct FederationPane {
     pub(crate) knowledge_error: Option<String>,
     /// The last successful knowledge publication.
     pub(crate) knowledge_notice: Option<String>,
-    /// The last opened resource stream, bounded to its first chunks.
-    pub(crate) lease_output: Option<String>,
-    /// The last resource-stream failure.
-    pub(crate) lease_error: Option<String>,
     /// Knowledge items this Node currently serves.
     pub(crate) knowledge_items: Vec<FederationKnowledgeRow>,
     /// Files in the local artifact store.
     pub(crate) artifacts: Vec<FederationArtifactRow>,
-    /// Capabilities selected for a discovered peer, by node id.
-    #[allow(dead_code)]
-    pub(crate) pending: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
     /// The capability chosen from the selected peer's menu.
-    #[allow(dead_code)]
     pub(crate) grant_choice: Option<String>,
-    /// Grant expiry in minutes; zero means no expiry.
-    #[allow(dead_code)]
-    pub(crate) grant_expiry: u64,
     /// The compact pane's selected section: peers, work, resources, knowledge.
     pub(crate) tab: usize,
     /// Whether the raw/advanced controls are disclosed.
     pub(crate) advanced: bool,
+    /// The unified operation log, newest last: every action the pane runs
+    /// reports pending, running, succeeded, failed, revoked or cancelled here.
+    pub(crate) activity: Vec<FederationActivity>,
+    /// The next action id.
+    pub(crate) activity_seq: u64,
+    /// The operation a pending revoke confirmation owns, so the question can be
+    /// settled as cancelled when the reader backs out.
+    pub(crate) confirm_op: Option<u64>,
+    /// The artifact the resources tab is previewing, read once on Open.
+    pub(crate) preview: Option<FederationPreview>,
+    /// Extension tools the host listed at the last refresh.
+    pub(crate) extension_tools: Vec<crate::extension::host::NodeToolInfo>,
 }
 /// The workspace browser's place in the tree, and the files open beside it.
 ///
@@ -2492,10 +2503,6 @@ impl Shell {
         )
     }
 
-    /// The federation pane: the node's peers, their grants, and the two
-    /// actions that change them (enroll a peer, grant a capability). Revoking
-    /// is per row. A running node is edited live; otherwise the peer store file
-    /// is edited and the change applies at the next launch.
     /// The Tasks board: durable work grouped by state.
     /// The workspace root the active session's tasks live in.
     fn task_workspace_root(&self) -> std::path::PathBuf {
@@ -3413,1620 +3420,10 @@ impl Shell {
         }
     }
 
-    fn federation_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let lang = self.state.lang;
-        let peers = self.right.federation.peers.clone();
-        let selected = self.right.federation.selected;
-        let discovered = self.right.federation.discovered.clone();
-        let confirming_peer = self.right.federation.confirm_revoke.clone();
-        let delegates = self.right.federation.delegations.clone();
-        let leases = self.right.federation.leases.clone();
-        let artifacts = self.right.federation.artifacts.clone();
-        let knowledge_items = self.right.federation.knowledge_items.clone();
-        let runtime = crate::federation_node::running();
-        let error = self.right.federation.error.clone();
-        let notice = self.right.federation.notice.clone();
-        let tab = self.right.federation.tab;
-
-        let status = match &runtime {
-            Some(runtime) => crate::i18n::tr_args(
-                lang,
-                "right.federation.running",
-                &[
-                    (
-                        "node",
-                        runtime
-                            .node_name()
-                            .filter(|name| !name.trim().is_empty())
-                            .unwrap_or_else(|| short_node(runtime.node_id().as_str())),
-                    ),
-                    ("peers", runtime.announced_peers().len().to_string()),
-                ],
-            ),
-            None => federation_status_off(lang, self.state.settings.global.federation.enabled),
-        };
-
-        let mut pane = div()
-            .id("federation-pane")
-            .debug_selector(|| "federation-pane".to_string())
-            .flex()
-            .flex_col()
-            .gap(px(12.0))
-            .p(px(16.0))
-            .overflow_y_scroll();
-
-        // Status card: one glance tells the reader whether the node is up, who
-        // it is, and whether peers are reachable. Node actions are compact.
-        pane =
-            pane.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(10.0))
-                    .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(rgb(
-                        if runtime.is_some() {
-                            theme::success()
-                        } else {
-                            theme::faint()
-                        },
-                    )))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.0))
-                            .flex_1()
-                            .min_w_0()
-                            .child(txt(lang.tr("right.federation.title"), 13.0, theme::text()))
-                            .child(txt(status, 11.0, theme::faint())),
-                    )
-                    .child(self.federation_small_button(
-                        "federation-refresh",
-                        lang.tr("right.federation.refresh"),
-                        cx,
-                        |this, cx| {
-                            this.reload_federation();
-                            cx.notify();
-                        },
-                    ))
-                    .child(if runtime.is_some() {
-                        self.federation_small_button(
-                            "federation-node-stop",
-                            lang.tr("right.federation.stop"),
-                            cx,
-                            |this, cx| {
-                                crate::federation_node::stop();
-                                this.reload_federation();
-                                cx.notify();
-                            },
-                        )
-                    } else {
-                        self.federation_small_button(
-                            "federation-node-start",
-                            lang.tr("right.federation.start"),
-                            cx,
-                            |this, cx| {
-                                std::thread::spawn(|| {
-                                    crate::federation_node::start_from_settings(
-                                        &crate::settings::Settings::load(),
-                                    );
-                                });
-                                this.right.federation.notice =
-                                    Some(this.state.lang.tr("right.federation.starting"));
-                                this.right.federation.error = None;
-                                cx.notify();
-                            },
-                        )
-                    })
-                    .child(if runtime.is_some() {
-                        self.federation_small_button(
-                            "federation-tls-reload",
-                            lang.tr("right.federation.reloadTls"),
-                            cx,
-                            |this, cx| {
-                                let settings = this.state.settings.clone();
-                                std::thread::spawn(move || {
-                                    crate::federation_node::reload_tls(&settings);
-                                });
-                                this.right.federation.notice =
-                                    Some(this.state.lang.tr("right.federation.reloadingTls"));
-                                this.right.federation.error = None;
-                                cx.notify();
-                            },
-                        )
-                    } else {
-                        div().into_any_element()
-                    }),
-            );
-
-        if let Some(error) = error {
-            pane = pane.child(self.federation_banner(error, false));
-        }
-        if let Some(notice) = notice {
-            pane = pane.child(self.federation_banner(notice, true));
-        }
-
-        // Four sections, worded as tasks rather than as protocol objects.
-        let tabs = [
-            (0, "right.federation.tabPeers"),
-            (1, "right.federation.tabWork"),
-            (2, "right.federation.tabResources"),
-            (3, "right.federation.tabKnowledge"),
-        ];
-        pane = pane.child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(4.0))
-                .children(tabs.into_iter().map(|(index, key)| {
-                    let active = tab == index;
-                    div()
-                        .id(SharedString::from(format!("federation-tab-{index}")))
-                        .debug_selector(move || format!("federation-tab-{index}"))
-                        .h(px(28.0))
-                        .px(px(10.0))
-                        .rounded(px(8.0))
-                        .flex()
-                        .items_center()
-                        .cursor_pointer()
-                        .bg(rgb(if active {
-                            theme::selected_row()
-                        } else {
-                            theme::page()
-                        }))
-                        .child(txt(
-                            lang.tr(key),
-                            12.0,
-                            if active {
-                                theme::text()
-                            } else {
-                                theme::faint()
-                            },
-                        ))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.right.federation.tab = index;
-                            this.right.federation.error = None;
-                            this.right.federation.notice = None;
-                            cx.notify();
-                        }))
-                })),
-        );
-
-        if tab == 1 {
-            pane = pane.child(self.federation_small_button(
-                "federation-audit-receipts",
-                lang.tr("right.federation.auditReceipts"),
-                cx,
-                |this, cx| {
-                    let Some(runtime) = crate::federation_node::running() else {
-                        this.right.federation.error =
-                            Some(this.state.lang.tr("right.federation.notRunning"));
-                        cx.notify();
-                        return;
-                    };
-                    let Some(peers_path) = this.state.settings.federation_peers_path() else {
-                        this.right.federation.error =
-                            Some(this.state.lang.tr("right.federation.noTasks"));
-                        cx.notify();
-                        return;
-                    };
-                    let tasks_path = peers_path.with_file_name("tasks.json");
-                    let Ok(graph) = federation::TaskGraph::load(&tasks_path) else {
-                        this.right.federation.error =
-                            Some(this.state.lang.tr("right.federation.noTasks"));
-                        cx.notify();
-                        return;
-                    };
-                    let tasks: Vec<federation::TaskNode> = graph.tasks.values().cloned().collect();
-                    let auditor = federation::ReceiptAuditor::new(
-                        std::sync::Arc::clone(runtime.node()),
-                        agent::capability::InvocationContext::local(
-                            agent::capability::InvocationId::new(format!(
-                                "audit-{}",
-                                agent::capability::unix_ms()
-                            )),
-                            agent::capability::Principal::Local {
-                                session: "federation-pane".to_string(),
-                                preset: String::new(),
-                            },
-                            agent::capability::WorkspaceId::new("ws:federation")
-                                .expect("a workspace"),
-                        ),
-                    );
-                    let handle =
-                        crate::extension::spawn_async(async move { auditor.audit(&tasks).await });
-                    cx.spawn(async move |this, cx| {
-                        let mismatches = handle.await;
-                        let _ = this.update(cx, |this, cx| {
-                            match mismatches {
-                                Ok(mismatches) if mismatches.is_empty() => {
-                                    this.right.federation.notice =
-                                        Some(this.state.lang.tr("right.federation.receiptsMatch"));
-                                }
-                                Ok(mismatches) => {
-                                    this.right.federation.error = Some(crate::i18n::tr_args(
-                                        this.state.lang,
-                                        "right.federation.receiptsMismatch",
-                                        &[("count", mismatches.len().to_string())],
-                                    ));
-                                }
-                                Err(error) => {
-                                    this.right.federation.error = Some(error.to_string());
-                                }
-                            }
-                            cx.notify();
-                        });
-                    })
-                    .detach();
-                },
-            ));
-        }
-
-        if tab == 1 {
-            pane = pane.child(self.federation_small_button(
-                "federation-clear-all",
-                lang.tr("right.federation.clearAll"),
-                cx,
-                |this, cx| {
-                    let Some(runtime) = crate::federation_node::running() else {
-                        this.right.federation.error =
-                            Some(this.state.lang.tr("right.federation.notRunning"));
-                        cx.notify();
-                        return;
-                    };
-                    let count = runtime.node().clear_delegations(true).unwrap_or_default();
-                    this.right.federation.notice = Some(crate::i18n::tr_args(
-                        this.state.lang,
-                        "right.federation.clearedAll",
-                        &[("count", count.to_string())],
-                    ));
-                    this.right.federation.error = None;
-                    this.reload_federation_quiet();
-                    cx.notify();
-                },
-            ));
-        }
-
-        pane = match tab {
-            1 => {
-                // Work: one card per delegation, with the only useful action
-                // (cancel) on the card itself.
-                if delegates.is_empty() {
-                    pane.child(self.federation_empty(lang.tr("right.federation.noWork")))
-                } else {
-                    pane.child(div().flex().flex_col().gap(px(6.0)).children(
-                        delegates.iter().take(12).enumerate().map(|(index, delegation)| {
-                            let cancellable = delegation.cancellable;
-                            let id = delegation.id.clone();
-                            let target = delegation.target.clone();
-                            let objective = delegation.objective.clone();
-                            let state = delegation.state;
-                            let failure = delegation.error.clone();
-                            let mut card = div()
-                                .id(SharedString::from(format!("federation-work-{index}")))
-                                .debug_selector(move || format!("federation-work-{index}"))
-                                .flex()
-                                .flex_col()
-                                .gap(px(4.0))
-                                .p(px(10.0))
-                                .rounded(px(10.0))
-                                .bg(rgb(theme::page()))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(6.0))
-                                        .child(Self::federation_badge(
-                                            lang.tr(state),
-                                            state != "right.federation.stateFailed",
-                                        ))
-                                        .child(txt(short_node(&target), 11.0, theme::faint()))
-                                        .child(txt(short_node(&id), 10.0, theme::faint())),
-                                )
-                                .child(txt(objective, 12.0, theme::text()));
-                            if let Some(failure) = failure {
-                                card = card.child(txt(failure, 11.0, theme::error()));
-                            }
-                            if cancellable {
-                                let runtime = runtime.clone();
-                                card = card.child(self.federation_small_button(
-                                    "federation-work-cancel",
-                                    lang.tr("right.federation.cancelDelegation"),
-                                    cx,
-                                    move |_this, cx| {
-                                        let Some(runtime) = runtime.as_ref() else {
-                                            return;
-                                        };
-                                        let Ok(target) = agent::capability::NodeId::new(target.clone())
-                                        else {
-                                            return;
-                                        };
-                                        let delegation = federation::DelegationId::new(id.clone());
-                                        let node = std::sync::Arc::clone(runtime.node());
-                                        let context = agent::capability::InvocationContext::local(
-                                            agent::capability::InvocationId::new(format!(
-                                                "cancel-{}",
-                                                delegation
-                                            )),
-                                            agent::capability::Principal::Local {
-                                                session: "federation-pane".to_string(),
-                                                preset: String::new(),
-                                            },
-                                            agent::capability::WorkspaceId::new("ws:federation")
-                                                .expect("a workspace"),
-                                        );
-                                        let handle = crate::extension::spawn_async(async move {
-                                            node.cancel_delegation(&target, &delegation, &context)
-                                                .await
-                                        });
-                                        cx.spawn(async move |this, cx| {
-                                            let outcome = handle.await;
-                                            let _ = this.update(cx, |this, cx| {
-                                                match outcome {
-                                                    Ok(Ok(_)) => {
-                                                        this.right.federation.notice = Some(
-                                                            this.state.lang.tr(
-                                                                "right.federation.delegationCancelled",
-                                                            ),
-                                                        );
-                                                    }
-                                                    Ok(Err(error)) => {
-                                                        this.right.federation.error =
-                                                            Some(error.to_string());
-                                                    }
-                                                    Err(error) => {
-                                                        this.right.federation.error =
-                                                            Some(error.to_string());
-                                                    }
-                                                }
-                                                this.reload_federation_quiet();
-                                                cx.notify();
-                                            });
-                                        })
-                                        .detach();
-                                    },
-                                ));
-                            } else {
-                                let runtime = runtime.clone();
-                                let id = id.clone();
-                                card = card.child(self.federation_small_button(
-                                    "federation-work-clear",
-                                    lang.tr("right.federation.clearWork"),
-                                    cx,
-                                    move |this, cx| {
-                                        if let Some(runtime) = runtime.as_ref() {
-                                            runtime.node().clear_delegation(
-                                                &federation::DelegationId::new(id.clone()),
-                                            );
-                                        }
-                                        this.reload_federation_quiet();
-                                        cx.notify();
-                                    },
-                                ));
-                            }
-                            card
-                        }),
-                    ))
-                }
-            }
-            2 => {
-                // Resources: leases first, then local artifacts. No raw ids.
-                let mut list = div().flex().flex_col().gap(px(6.0));
-                if leases.is_empty() {
-                    list =
-                        list.child(self.federation_empty(lang.tr("right.federation.noResources")));
-                }
-                for lease in leases.iter().take(8) {
-                    list = list.child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.0))
-                            .p(px(10.0))
-                            .rounded(px(10.0))
-                            .bg(rgb(theme::page()))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(2.0))
-                                    .flex_1()
-                                    .child(txt(short_node(&lease.holder), 12.0, theme::text()))
-                                    .child(txt(short_node(&lease.id), 10.0, theme::faint())),
-                            )
-                            .child(txt(
-                                match lease.max {
-                                    Some(max) => format!("{} / {max}", lease.used),
-                                    None => lease.used.to_string(),
-                                },
-                                11.0,
-                                theme::muted(),
-                            )),
-                    );
-                }
-                for (index, artifact) in artifacts.iter().take(8).enumerate() {
-                    let path = artifact.path.clone();
-                    list = list.child(
-                        div()
-                            .id(SharedString::from(format!("federation-artifact-{index}")))
-                            .debug_selector(move || format!("federation-artifact-{index}"))
-                            .flex()
-                            .items_center()
-                            .gap(px(8.0))
-                            .p(px(10.0))
-                            .rounded(px(10.0))
-                            .bg(rgb(theme::page()))
-                            .child(txt(artifact.name.clone(), 12.0, theme::text()).flex_1())
-                            .child(txt(format!("{} B", artifact.bytes), 11.0, theme::faint()))
-                            .child(self.federation_small_button(
-                                "federation-artifact-remove",
-                                lang.tr("right.federation.remove"),
-                                cx,
-                                move |this, cx| {
-                                    if let Err(error) = std::fs::remove_file(&path) {
-                                        this.right.federation.error =
-                                            Some(format!("{}: {error}", path.display()));
-                                    } else {
-                                        this.right.federation.notice = Some(
-                                            this.state.lang.tr("right.federation.artifactRemoved"),
-                                        );
-                                    }
-                                    this.reload_federation_quiet();
-                                    cx.notify();
-                                },
-                            )),
-                    );
-                }
-                pane.child(list)
-            }
-            3 => {
-                // Knowledge: one natural-language question to the selected peer.
-                // Publication and raw payloads live under Advanced.
-                let target_name = selected
-                    .and_then(|index| peers.get(index))
-                    .map(|peer| display_name(peer.name.as_deref(), &peer.node))
-                    .or_else(|| {
-                        peers
-                            .first()
-                            .map(|peer| display_name(peer.name.as_deref(), &peer.node))
-                    })
-                    .unwrap_or_else(|| lang.tr("right.federation.noPeer"));
-                let mut section = div().flex().flex_col().gap(px(8.0));
-                section = section.child(self.federation_section_title(crate::i18n::tr_args(
-                    lang,
-                    "right.federation.askTitle",
-                    &[("peer", target_name)],
-                )));
-                section = section.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .child(self.federation_field(
-                            &self.federation_knowledge,
-                            "federation-field-knowledge",
-                            None,
-                        ))
-                        .child(self.federation_small_button(
-                            "federation-knowledge-ask",
-                            lang.tr("right.federation.ask"),
-                            cx,
-                            move |this, cx| {
-                                let index = this.right.federation.selected.or(
-                                    if this.right.federation.peers.is_empty() {
-                                        None
-                                    } else {
-                                        Some(0)
-                                    },
-                                );
-                                let Some(peer) = index.and_then(|index| {
-                                    this.right.federation.peers.get(index).cloned()
-                                }) else {
-                                    this.right.federation.knowledge_error =
-                                        Some(this.state.lang.tr("right.federation.noPeer"));
-                                    cx.notify();
-                                    return;
-                                };
-                                let Ok(node_id) = agent::capability::NodeId::new(peer.node.clone())
-                                else {
-                                    return;
-                                };
-                                let terms: Vec<String> = this
-                                    .federation_knowledge
-                                    .read(cx)
-                                    .value()
-                                    .split_whitespace()
-                                    .map(str::to_string)
-                                    .collect();
-                                let mut query = federation::KnowledgeQuery::new(
-                                    format!("pane-{}", agent::capability::unix_ms()),
-                                    federation::KnowledgePurpose::Answer,
-                                );
-                                query.terms = terms;
-                                query.max_items = 8;
-                                let Some(runtime) = crate::federation_node::running() else {
-                                    this.right.federation.knowledge_error =
-                                        Some(this.state.lang.tr("right.federation.notRunning"));
-                                    cx.notify();
-                                    return;
-                                };
-                                let node = std::sync::Arc::clone(runtime.node());
-                                let context = agent::capability::InvocationContext::local(
-                                    agent::capability::InvocationId::new(format!(
-                                        "knowledge-{}",
-                                        agent::capability::unix_ms()
-                                    )),
-                                    agent::capability::Principal::Local {
-                                        session: "federation-pane".to_string(),
-                                        preset: String::new(),
-                                    },
-                                    agent::capability::WorkspaceId::new("ws:federation")
-                                        .expect("a workspace"),
-                                );
-                                let handle = crate::extension::spawn_async(async move {
-                                    node.query_knowledge(&node_id, &query, &context).await
-                                });
-                                cx.spawn(async move |this, cx| {
-                                    let outcome = handle.await;
-                                    let _ = this.update(cx, |this, cx| {
-                                        match outcome {
-                                            Ok(Ok(response)) => {
-                                                this.right.federation.knowledge_output =
-                                                    serde_json::to_string_pretty(&response).ok();
-                                                this.right.federation.knowledge_error = None;
-                                            }
-                                            Ok(Err(error)) => {
-                                                this.right.federation.knowledge_error =
-                                                    Some(error.to_string());
-                                            }
-                                            Err(error) => {
-                                                this.right.federation.knowledge_error =
-                                                    Some(error.to_string());
-                                            }
-                                        }
-                                        cx.notify();
-                                    });
-                                })
-                                .detach();
-                            },
-                        )),
-                );
-                if let Some(output) = &self.right.federation.knowledge_output {
-                    section = section.child(txt(
-                        output.chars().take(2_000).collect::<String>(),
-                        11.0,
-                        theme::text(),
-                    ));
-                }
-                if let Some(error) = &self.right.federation.knowledge_error {
-                    section = section.child(self.federation_banner(error.clone(), false));
-                }
-                if !knowledge_items.is_empty() {
-                    for (index, item) in knowledge_items.iter().take(6).enumerate() {
-                        let id = item.id.clone();
-                        section = section.child(
-                            div()
-                                .id(SharedString::from(format!("federation-knowledge-{index}")))
-                                .debug_selector(move || format!("federation-knowledge-{index}"))
-                                .flex()
-                                .items_center()
-                                .gap(px(6.0))
-                                .p(px(8.0))
-                                .rounded(px(8.0))
-                                .bg(rgb(theme::page()))
-                                .child(txt(short_node(&item.id), 11.0, theme::text()).flex_1())
-                                .child(txt(item.class.clone(), 10.0, theme::faint()))
-                                .child(self.federation_small_button(
-                                    "federation-knowledge-revoke",
-                                    lang.tr("right.federation.remove"),
-                                    cx,
-                                    move |this, cx| {
-                                        let Some(runtime) = crate::federation_node::running()
-                                        else {
-                                            return;
-                                        };
-                                        match runtime.node().revoke_knowledge(&id) {
-                                            Ok(_) => {
-                                                this.right.federation.notice = Some(
-                                                    this.state
-                                                        .lang
-                                                        .tr("right.federation.knowledgeRevoked"),
-                                                );
-                                            }
-                                            Err(error) => {
-                                                this.right.federation.error =
-                                                    Some(error.to_string());
-                                            }
-                                        }
-                                        this.reload_federation_quiet();
-                                        cx.notify();
-                                    },
-                                )),
-                        );
-                    }
-                }
-                pane.child(section)
-            }
-            _ => {
-                // Peers: enrolled first, then discovered candidates. A card is
-                // the unit; capability chips are the grant controls.
-                let mut list = div().flex().flex_col().gap(px(6.0));
-                if peers.is_empty() && discovered.is_empty() {
-                    list = list.child(self.federation_empty(lang.tr("right.federation.noPeers")));
-                }
-                for (index, peer) in peers.iter().enumerate() {
-                    let node = peer.node.clone();
-                    let label = display_name(peer.name.as_deref(), &peer.node);
-                    let grants = peer.grants.clone();
-                    let caps: Vec<String> = discovered
-                        .iter()
-                        .find(|row| row.node == peer.node)
-                        .map(|row| row.capabilities.iter().map(|(id, _)| id.clone()).collect())
-                        .unwrap_or_default();
-                    let is_selected = selected == Some(index);
-                    let selected_node = node.clone();
-                    let mut card = div()
-                        .id(SharedString::from(format!("federation-peer-{index}")))
-                        .debug_selector(move || format!("federation-peer-{index}"))
-                        .flex()
-                        .flex_col()
-                        .gap(px(5.0))
-                        .p(px(10.0))
-                        .rounded(px(10.0))
-                        .bg(rgb(if is_selected {
-                            theme::selected_row()
-                        } else {
-                            theme::page()
-                        }))
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.right.federation.selected = Some(index);
-                            cx.notify();
-                        }))
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(6.0))
-                                .child(txt(label, 12.0, theme::text()).flex_1())
-                                .child(Self::federation_badge(
-                                    peer.state.clone(),
-                                    peer.state != "revoked",
-                                )),
-                        )
-                        .child(txt(short_node(&node), 10.0, theme::faint()));
-                    if !grants.is_empty() {
-                        card = card.child(div().flex().flex_wrap().gap(px(4.0)).children(
-                            grants.iter().take(6).map(|grant| {
-                                txt(short_node(grant), 10.0, theme::muted())
-                                    .px(px(6.0))
-                                    .py(px(2.0))
-                                    .rounded(px(6.0))
-                                    .bg(rgb(theme::hover()))
-                            }),
-                        ));
-                    }
-                    if is_selected && !caps.is_empty() {
-                        let mut chips = div().flex().flex_wrap().gap(px(4.0));
-                        for capability in caps.iter().take(6) {
-                            let node = node.clone();
-                            let capability = capability.clone();
-                            chips = chips.child(self.federation_small_button(
-                                "federation-grant-chip",
-                                format!("+ {capability}"),
-                                cx,
-                                move |this, cx| {
-                                    let mut grants = std::collections::BTreeSet::new();
-                                    grants.insert(capability.clone());
-                                    this.right
-                                        .federation
-                                        .pending
-                                        .entry(node.clone())
-                                        .or_default()
-                                        .insert(capability.clone());
-                                    let node = node.clone();
-                                    this.apply_federation(
-                                        move |store| enroll_and_grant(store, &node, None, &grants),
-                                        cx,
-                                    );
-                                },
-                            ));
-                        }
-                        card = card.child(chips);
-                    }
-                    if confirming_peer.as_deref() == Some(node.as_str()) {
-                        let confirm_node = node.clone();
-                        let cancel_node = node.clone();
-                        card = card.child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(6.0))
-                                .child(txt(
-                                    crate::i18n::tr_args(
-                                        lang,
-                                        "right.federation.confirmRevoke",
-                                        &[("node", short_node(&node))],
-                                    ),
-                                    11.0,
-                                    theme::error(),
-                                ))
-                                .child(self.federation_small_button(
-                                    "federation-revoke-confirm",
-                                    lang.tr("right.federation.revoke"),
-                                    cx,
-                                    move |this, cx| {
-                                        let node = confirm_node.clone();
-                                        this.right.federation.confirm_revoke = None;
-                                        this.apply_federation(
-                                            move |store| {
-                                                let node_id = parse_peer(&node)?;
-                                                if !store.revoke(&node_id) {
-                                                    return Err("peer is not enrolled".to_string());
-                                                }
-                                                Ok("peer revoked".to_string())
-                                            },
-                                            cx,
-                                        );
-                                    },
-                                ))
-                                .child(self.federation_small_button(
-                                    "federation-revoke-cancel",
-                                    lang.tr("right.federation.cancel"),
-                                    cx,
-                                    move |this, cx| {
-                                        let _ = &cancel_node;
-                                        this.right.federation.confirm_revoke = None;
-                                        cx.notify();
-                                    },
-                                )),
-                        );
-                    } else {
-                        let revoke_node = node.clone();
-                        card = card.child(self.federation_small_button(
-                            "federation-revoke",
-                            lang.tr("right.federation.revoke"),
-                            cx,
-                            move |this, cx| {
-                                this.right.federation.confirm_revoke = Some(revoke_node.clone());
-                                cx.notify();
-                            },
-                        ));
-                    }
-                    let _ = selected_node;
-                    list = list.child(card);
-                }
-                for (index, row) in discovered
-                    .iter()
-                    .filter(|row| !peers.iter().any(|peer| peer.node == row.node))
-                    .take(8)
-                    .enumerate()
-                {
-                    let node = row.node.clone();
-                    let label = display_name(row.name.as_deref(), &row.node);
-                    let capabilities = row.capabilities.clone();
-                    let mut card = div()
-                        .id(SharedString::from(format!("federation-discovered-{index}")))
-                        .debug_selector(move || format!("federation-discovered-{index}"))
-                        .flex()
-                        .flex_col()
-                        .gap(px(5.0))
-                        .p(px(10.0))
-                        .rounded(px(10.0))
-                        .border_1()
-                        .border_color(rgb(theme::border_soft()))
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(6.0))
-                                .child(txt(label, 12.0, theme::text()).flex_1())
-                                .child(Self::federation_badge(
-                                    lang.tr("right.federation.discoveredBadge"),
-                                    true,
-                                ))
-                                .child(self.federation_small_button(
-                                    "federation-peer-trust",
-                                    lang.tr("right.federation.trust"),
-                                    cx,
-                                    {
-                                        let node = node.clone();
-                                        move |this, cx| {
-                                            let node = node.clone();
-                                            this.apply_federation(
-                                                move |store| {
-                                                    let node_id = parse_peer(&node)?;
-                                                    store.enroll(
-                                                        node_id.clone(),
-                                                        agent::capability::unix_ms(),
-                                                        None,
-                                                    );
-                                                    Ok(format!(
-                                                        "trusted {}",
-                                                        short_node(node.as_str())
-                                                    ))
-                                                },
-                                                cx,
-                                            );
-                                        }
-                                    },
-                                )),
-                        )
-                        .child(txt(short_node(&node), 10.0, theme::faint()));
-                    if !capabilities.is_empty() {
-                        let mut chips = div().flex().flex_wrap().gap(px(4.0));
-                        for (capability, risk) in capabilities.iter().take(6) {
-                            let node = node.clone();
-                            let capability = capability.clone();
-                            let risk = risk.clone();
-                            chips = chips.child(self.federation_small_button(
-                                SharedString::from(format!(
-                                    "federation-choose-{index}-{capability}"
-                                )),
-                                format!("{capability} · {risk}"),
-                                cx,
-                                move |this, cx| {
-                                    let mut grants = std::collections::BTreeSet::new();
-                                    grants.insert(capability.clone());
-                                    this.right
-                                        .federation
-                                        .pending
-                                        .entry(node.clone())
-                                        .or_default()
-                                        .insert(capability.clone());
-                                    let node = node.clone();
-                                    this.apply_federation(
-                                        move |store| enroll_and_grant(store, &node, None, &grants),
-                                        cx,
-                                    );
-                                },
-                            ));
-                        }
-                        card = card.child(chips);
-                    }
-                    list = list.child(card);
-                }
-                pane.child(list)
-            }
-        };
-
-        // Advanced is a disclosure, not a second primary surface.
-        pane = pane.child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(6.0))
-                .id("federation-advanced-toggle")
-                .cursor_pointer()
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.right.federation.advanced = !this.right.federation.advanced;
-                    cx.notify();
-                }))
-                .child(txt(
-                    if self.right.federation.advanced {
-                        lang.tr("right.federation.hideAdvanced")
-                    } else {
-                        lang.tr("right.federation.showAdvanced")
-                    },
-                    11.0,
-                    theme::faint(),
-                )),
-        );
-        if self.right.federation.advanced {
-            let mut advanced = div().flex().flex_col().gap(px(8.0));
-            advanced = advanced
-                .child(self.federation_switch_row(
-                    "federation-run-node",
-                    lang.tr("right.federation.runNode"),
-                    lang.tr("right.federation.runNodeHint"),
-                    self.state.settings.global.federation.enabled,
-                    cx,
-                    |settings, on| settings.global.federation.enabled = on,
-                ))
-                .child(self.federation_switch_row(
-                    "federation-remote-tools",
-                    lang.tr("right.federation.remoteTools"),
-                    lang.tr("right.federation.remoteToolsHint"),
-                    self.state.settings.global.federation.include_remote_tools,
-                    cx,
-                    |settings, on| settings.global.federation.include_remote_tools = on,
-                ))
-                .child(self.federation_switch_row(
-                    "federation-knowledge-service",
-                    lang.tr("right.federation.knowledgeService"),
-                    lang.tr("right.federation.knowledgeServiceHint"),
-                    self.state.settings.global.federation.knowledge_enabled,
-                    cx,
-                    |settings, on| settings.global.federation.knowledge_enabled = on,
-                ))
-                .child(self.federation_section_title(lang.tr("right.federation.nodeName")))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .child(self.federation_field(
-                            &self.federation_name,
-                            "federation-field-name",
-                            None,
-                        ))
-                        .child(self.federation_small_button(
-                            "federation-name-save",
-                            lang.tr("right.federation.save"),
-                            cx,
-                            move |this, cx| {
-                                let raw = this.federation_name.read(cx).value().trim().to_string();
-                                let configured = if raw.is_empty() { None } else { Some(raw) };
-                                this.state.settings.global.federation.node_name =
-                                    configured.clone();
-                                if let Some(runtime) = crate::federation_node::running() {
-                                    runtime.set_name(configured);
-                                }
-                                this.save_settings(cx);
-                                let shown = this.federation_name.read(cx).value().to_string();
-                                this.right.federation.notice = Some(crate::i18n::tr_args(
-                                    this.state.lang,
-                                    "right.federation.nameStored",
-                                    &[("name", shown)],
-                                ));
-                                cx.notify();
-                            },
-                        )),
-                )
-                .child(self.federation_section_title(lang.tr("right.federation.manualTitle")))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .child(self.federation_field(
-                            &self.federation_enroll,
-                            "federation-field-enroll",
-                            None,
-                        ))
-                        .child(self.federation_small_button(
-                            "federation-enroll",
-                            lang.tr("right.federation.trust"),
-                            cx,
-                            move |this, cx| {
-                                let node = this.federation_enroll.read(cx).value().to_string();
-                                this.apply_federation(move |store| enroll_peer(store, &node), cx);
-                            },
-                        )),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .child(self.federation_field(
-                            &self.federation_grant,
-                            "federation-field-grant",
-                            None,
-                        ))
-                        .child(self.federation_small_button(
-                            "federation-grant",
-                            lang.tr("right.federation.grant"),
-                            cx,
-                            move |this, cx| {
-                                let capability = this.federation_grant.read(cx).value().to_string();
-                                let Some(index) = this.right.federation.selected else {
-                                    this.right.federation.error =
-                                        Some(this.state.lang.tr("right.federation.selectPeer"));
-                                    cx.notify();
-                                    return;
-                                };
-                                let Some(peer) = this.right.federation.peers.get(index).cloned()
-                                else {
-                                    return;
-                                };
-                                this.apply_federation(
-                                    move |store| {
-                                        grant_capability(store, &peer.node, &capability, None)
-                                    },
-                                    cx,
-                                );
-                            },
-                        )),
-                )
-                .child(self.federation_section_title(lang.tr("right.federation.exposeTitle")))
-                .child({
-                    let entity = cx.entity();
-                    let exposed = self.state.settings.global.federation.expose.clone();
-                    let summary = if exposed.is_empty() {
-                        lang.tr("right.federation.exposeNone")
-                    } else {
-                        exposed.join(", ")
-                    };
-                    let count = exposed.len();
-                    let needle = self
-                        .federation_expose_search
-                        .read(cx)
-                        .value()
-                        .trim()
-                        .to_lowercase();
-                    let mut candidates: Vec<String> = [
-                        "builtin/read_file",
-                        "builtin/read_files",
-                        "builtin/glob",
-                        "builtin/grep",
-                    ]
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect();
-                    for id in &exposed {
-                        if !candidates.contains(id) {
-                            candidates.push(id.clone());
-                        }
-                    }
-                    if !needle.is_empty() {
-                        candidates.retain(|id| id.to_lowercase().contains(&needle));
-                    }
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .child(self.federation_field(
-                            &self.federation_expose_search,
-                            "federation-field-expose-search",
-                            None,
-                        ))
-                        .child(
-                            div()
-                                .debug_selector(|| "federation-expose-menu".to_string())
-                                .child(
-                                    Button::new("federation-expose-menu")
-                                        .ghost()
-                                        .h(px(28.0))
-                                        .px(px(10.0))
-                                        .rounded(px(theme::RADIUS_SM))
-                                        .bg(rgb(theme::selected_row()))
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(6.0))
-                                        .cursor_pointer()
-                                        .child(txt(
-                                    format!(
-                                        "{} ({count})",
-                                        lang.tr("right.federation.exposeMenu")
-                                    ),
-                                    theme::CHIP_SIZE,
-                                    theme::text(),
-                                ))
-                                .child(txt("▾", 11.0, theme::faint()))
-                                .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
-                                    let mut menu = menu;
-                                    if candidates.is_empty() {
-                                        menu = menu.item(PopupMenuItem::label(
-                                            lang.tr("right.federation.exposeNone"),
-                                        ));
-                                    }
-                                    for capability in candidates.iter().cloned() {
-                                        let shell = entity.clone();
-                                        let active = exposed.iter().any(|id| id == &capability);
-                                        let id = capability.clone();
-                                        menu = menu.item(
-                                            PopupMenuItem::new(capability)
-                                                .checked(active)
-                                                .on_click(move |_, _, cx| {
-                                                    shell.update(cx, |this, cx| {
-                                                        let expose = &mut this
-                                                            .state
-                                                            .settings
-                                                            .global
-                                                            .federation
-                                                            .expose;
-                                                        if let Some(position) = expose
-                                                            .iter()
-                                                            .position(|grant| grant == &id)
-                                                        {
-                                                            expose.remove(position);
-                                                        } else {
-                                                            expose.push(id.clone());
-                                                        }
-                                                        this.save_settings(cx);
-                                                        this.right.federation.notice = Some(
-                                                            this.state
-                                                                .lang
-                                                                .tr("right.federation.exposeChanged"),
-                                                        );
-                                                        this.right.federation.error = None;
-                                                        cx.notify();
-                                                    });
-                                                }),
-                                        );
-                                    }
-                                    let shell = entity.clone();
-                                    menu = menu
-                                        .item(PopupMenuItem::separator())
-                                        .item(
-                                            PopupMenuItem::new(
-                                                lang.tr("right.federation.exposeClear"),
-                                            )
-                                            .on_click(move |_, _, cx| {
-                                                shell.update(cx, |this, cx| {
-                                                    this.state
-                                                        .settings
-                                                        .global
-                                                        .federation
-                                                        .expose
-                                                        .clear();
-                                                    this.save_settings(cx);
-                                                    this.right.federation.notice = Some(
-                                                        this.state
-                                                            .lang
-                                                            .tr("right.federation.exposeChanged"),
-                                                    );
-                                                    cx.notify();
-                                                });
-                                            }),
-                                        );
-                                    menu
-                                }),
-                                ),
-                        )
-                        .child(txt(summary, 11.0, theme::faint()))
-                })
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .child(self.federation_field(
-                            &self.federation_expose_root,
-                            "federation-field-expose-root",
-                            None,
-                        ))
-                        .child(self.federation_small_button(
-                            "federation-expose-save",
-                            lang.tr("right.federation.save"),
-                            cx,
-                            move |this, cx| {
-                                let raw = this.federation_expose_root.read(cx).value().to_string();
-                                this.state.settings.global.federation.expose_root =
-                                    if raw.trim().is_empty() {
-                                        None
-                                    } else {
-                                        Some(raw)
-                                    };
-                                this.save_settings(cx);
-                                this.right.federation.notice =
-                                    Some(this.state.lang.tr("right.federation.exposeSaved"));
-                                cx.notify();
-                            },
-                        )),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .child(self.federation_field(
-                            &self.federation_lease_id,
-                            "federation-field-lease-id",
-                            None,
-                        ))
-                        .child(self.federation_field(
-                            &self.federation_lease_uri,
-                            "federation-field-lease-uri",
-                            None,
-                        ))
-                        .child(self.federation_small_button(
-                            "federation-lease-open",
-                            lang.tr("right.federation.leaseOpen"),
-                            cx,
-                            move |this, cx| {
-                                let Some(index) = this.right.federation.selected else {
-                                    this.right.federation.error =
-                                        Some(this.state.lang.tr("right.federation.selectPeer"));
-                                    cx.notify();
-                                    return;
-                                };
-                                let Some(peer) = this.right.federation.peers.get(index).cloned()
-                                else {
-                                    return;
-                                };
-                                let lease = federation::LeaseId::new(
-                                    this.federation_lease_id.read(cx).value().to_string(),
-                                );
-                                let uri = this.federation_lease_uri.read(cx).value().to_string();
-                                let Some(runtime) = crate::federation_node::running() else {
-                                    this.right.federation.error =
-                                        Some(this.state.lang.tr("right.federation.notRunning"));
-                                    cx.notify();
-                                    return;
-                                };
-                                let node = std::sync::Arc::clone(runtime.node());
-                                let peer = peer.node.clone();
-                                let peer = agent::capability::NodeId::new(peer).ok();
-                                let Some(peer) = peer else {
-                                    return;
-                                };
-                                let handle = crate::extension::spawn_async(async move {
-                                    let mut stream = node
-                                        .open_resource(&peer, &lease, &uri, 0, 64 * 1024)
-                                        .await?;
-                                    let mut output = String::new();
-                                    for _ in 0..4 {
-                                        match stream.next().await {
-                                            Some(federation::ResourceStreamMessage::Chunk {
-                                                bytes,
-                                                ..
-                                            }) => {
-                                                output.push_str(&String::from_utf8_lossy(&bytes));
-                                            }
-                                            Some(_) => {}
-                                            None => break,
-                                        }
-                                    }
-                                    Ok::<_, agent::capability::CapabilityError>(output)
-                                });
-                                cx.spawn(async move |this, cx| {
-                                    let outcome = handle.await;
-                                    let _ = this.update(cx, |this, cx| {
-                                        match outcome {
-                                            Ok(Ok(output)) => {
-                                                this.right.federation.lease_output = Some(output);
-                                                this.right.federation.lease_error = None;
-                                            }
-                                            Ok(Err(error)) => {
-                                                this.right.federation.lease_error =
-                                                    Some(error.to_string());
-                                            }
-                                            Err(error) => {
-                                                this.right.federation.lease_error =
-                                                    Some(error.to_string());
-                                            }
-                                        }
-                                        cx.notify();
-                                    });
-                                })
-                                .detach();
-                            },
-                        )),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .child(self.federation_field(
-                            &self.federation_knowledge_payload,
-                            "federation-field-knowledge-payload",
-                            None,
-                        ))
-                        .child(self.federation_small_button(
-                            "federation-knowledge-publish",
-                            lang.tr("right.federation.knowledgePublish"),
-                            cx,
-                            move |this, cx| {
-                                let Some(index) = this.right.federation.selected else {
-                                    this.right.federation.error =
-                                        Some(this.state.lang.tr("right.federation.selectPeer"));
-                                    cx.notify();
-                                    return;
-                                };
-                                let Some(peer) = this.right.federation.peers.get(index).cloned()
-                                else {
-                                    return;
-                                };
-                                let Ok(peer_id) = agent::capability::NodeId::new(peer.node.clone())
-                                else {
-                                    return;
-                                };
-                                let raw = this
-                                    .federation_knowledge_payload
-                                    .read(cx)
-                                    .value()
-                                    .to_string();
-                                let Ok(payload) = serde_json::from_str::<serde_json::Value>(&raw)
-                                else {
-                                    this.right.federation.error = Some(
-                                        this.state.lang.tr("right.federation.knowledgeBadJson"),
-                                    );
-                                    cx.notify();
-                                    return;
-                                };
-                                let Some(runtime) = crate::federation_node::running() else {
-                                    this.right.federation.error =
-                                        Some(this.state.lang.tr("right.federation.notRunning"));
-                                    cx.notify();
-                                    return;
-                                };
-                                let node = std::sync::Arc::clone(runtime.node());
-                                let origin = node.node();
-                                let now = agent::capability::unix_ms();
-                                let item = federation::KnowledgeItem {
-                                    id: format!("ui-{now}"),
-                                    class: federation::KnowledgeClass::Public,
-                                    workspace: None,
-                                    payload: payload.clone(),
-                                    provenance: federation::Provenance {
-                                        origin,
-                                        source: "bsh:ui".to_string(),
-                                        issued_at_ms: now,
-                                        expires_at_ms: None,
-                                        content_hash: federation::knowledge_hash(&payload),
-                                    },
-                                    retention_ms: None,
-                                };
-                                let publication = federation::KnowledgePublication::new(vec![item]);
-                                let context = agent::capability::InvocationContext::local(
-                                    agent::capability::InvocationId::new(format!("publish-{now}")),
-                                    agent::capability::Principal::Local {
-                                        session: "federation-pane".to_string(),
-                                        preset: String::new(),
-                                    },
-                                    agent::capability::WorkspaceId::new("ws:federation")
-                                        .expect("a workspace"),
-                                );
-                                let handle = crate::extension::spawn_async(async move {
-                                    node.publish_knowledge(&peer_id, &publication, &context)
-                                        .await
-                                });
-                                cx.spawn(async move |this, cx| {
-                                    let outcome = handle.await;
-                                    let _ = this.update(cx, |this, cx| {
-                                        match outcome {
-                                            Ok(Ok(accepted)) => {
-                                                this.right.federation.knowledge_notice =
-                                                    Some(crate::i18n::tr_args(
-                                                        this.state.lang,
-                                                        "right.federation.knowledgePublished",
-                                                        &[("count", accepted.to_string())],
-                                                    ));
-                                                this.right.federation.error = None;
-                                            }
-                                            Ok(Err(error)) => {
-                                                this.right.federation.error =
-                                                    Some(error.to_string());
-                                            }
-                                            Err(error) => {
-                                                this.right.federation.error =
-                                                    Some(error.to_string());
-                                            }
-                                        }
-                                        cx.notify();
-                                    });
-                                })
-                                .detach();
-                            },
-                        )),
-                );
-            if let Some(output) = &self.right.federation.lease_output {
-                advanced = advanced.child(txt(
-                    output.chars().take(1_000).collect::<String>(),
-                    11.0,
-                    theme::text(),
-                ));
-            }
-            if let Some(error) = &self.right.federation.lease_error {
-                advanced = advanced.child(self.federation_banner(error.clone(), false));
-            }
-            pane = pane.child(advanced);
-        }
-
-        pane
-    }
-
-    fn federation_section_title(&self, label: String) -> AnyElement {
-        txt(label, 12.0, theme::faint())
-            .font_weight(FontWeight::MEDIUM)
-            .into_any_element()
-    }
-
-    /// A copy control for a full node id: the row shows only the short form,
-    /// and enrolling the peer elsewhere needs the whole key.
-    #[allow(dead_code)]
-    fn federation_copy_button(
-        &self,
-        id: String,
-        node: String,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let lang = self.state.lang;
-        let selector = id.clone();
-        let label = lang.tr("right.federation.copyId");
-        let copy_node = node.clone();
-        div()
-            .id(SharedString::from(id))
-            .debug_selector(move || selector.clone())
-            .flex()
-            .items_center()
-            .cursor_pointer()
-            .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
-            .child(icon(IconName::Copy, 12.0, theme::faint()))
-            .on_click(cx.listener(move |this, _event, _window, cx| {
-                cx.stop_propagation();
-                cx.write_to_clipboard(ClipboardItem::new_string(copy_node.clone()));
-                this.right.federation.notice = Some(crate::i18n::tr_args(
-                    lang,
-                    "right.federation.idCopied",
-                    &[("node", short_node(&copy_node))],
-                ));
-                cx.notify();
-            }))
-            .into_any_element()
-    }
-
-    /// A bordered field: the referenced design puts an input in a 34px box,
-    /// not on the bare page, and so does this pane.
-    fn federation_field(
-        &self,
-        input: &Entity<InputState>,
-        id: &'static str,
-        width: Option<f32>,
-    ) -> AnyElement {
-        let mut field = div()
-            .id(SharedString::from(id))
-            .debug_selector(move || id.to_string())
-            .h(px(34.0))
-            .rounded(px(theme::RADIUS_SM))
-            .bg(rgb(theme::page()))
-            .border_1()
-            .border_color(rgb(theme::border()))
-            .px(px(10.0))
-            .flex()
-            .items_center();
-        field = match width {
-            Some(width) => field.w(px(width)),
-            None => field.w_full(),
-        };
-        field
-            .child(Input::new(input).appearance(false).w_full())
-            .into_any_element()
-    }
-
-    /// A small state badge: trusted gets the accent tint, everything else the
-    /// neutral one.
-    fn federation_badge(label: String, good: bool) -> AnyElement {
-        div()
-            .flex()
-            .items_center()
-            .h(px(18.0))
-            .px(px(6.0))
-            .rounded(px(999.0))
-            .bg(rgb(if good {
-                theme::accent_soft()
-            } else {
-                theme::hover()
-            }))
-            .child(txt(
-                label,
-                10.0,
-                if good {
-                    theme::accent()
-                } else {
-                    theme::faint()
-                },
-            ))
-            .into_any_element()
-    }
-
-    /// An empty-state line with the pane's leading glyph.
-    fn federation_empty(&self, label: String) -> AnyElement {
-        div()
-            .flex()
-            .items_center()
-            .gap(px(8.0))
-            .py(px(6.0))
-            .child(icon(IconName::Inbox, 14.0, theme::faint()))
-            .child(txt(label, 12.0, theme::faint()))
-            .into_any_element()
-    }
-
-    /// A one-line error or success banner.
-    fn federation_banner(&self, text: String, good: bool) -> AnyElement {
-        div()
-            .flex()
-            .items_center()
-            .gap(px(6.0))
-            .px(px(10.0))
-            .py(px(8.0))
-            .rounded(px(theme::RADIUS_SM))
-            .bg(rgb(theme::hover()))
-            .child(icon(
-                if good {
-                    IconName::Check
-                } else {
-                    IconName::TriangleAlert
-                },
-                12.0,
-                if good {
-                    theme::success()
-                } else {
-                    theme::error()
-                },
-            ))
-            .child(txt(
-                text,
-                12.0,
-                if good {
-                    theme::success()
-                } else {
-                    theme::error()
-                },
-            ))
-            .into_any_element()
-    }
-
-    /// One labelled switch in the federation pane: the label, the hint under
-    /// it, and the control, which persists the setting on press.
-    fn federation_switch_row(
-        &self,
-        id: &'static str,
-        label: String,
-        hint: String,
-        checked: bool,
-        cx: &mut Context<Self>,
-        set: fn(&mut crate::settings::Settings, bool),
-    ) -> AnyElement {
-        hairline_bottom(
-            div()
-                .py(px(8.0))
-                .flex()
-                .items_center()
-                .gap(px(12.0))
-                .border_color(rgb(theme::border_soft()))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(3.0))
-                        .flex_1()
-                        .min_w_0()
-                        .child(txt(label, 13.0, theme::text()).font_weight(FontWeight::MEDIUM))
-                        .child(txt(hint, 11.0, theme::faint())),
-                )
-                .child(self.switch(
-                    id,
-                    checked,
-                    true,
-                    move |this, on, cx| {
-                        set(&mut this.state.settings, on);
-                        match this.state.settings.save() {
-                            Ok(()) => {
-                                this.right.federation.notice =
-                                    Some(this.state.lang.tr("right.federation.saved"));
-                                this.right.federation.error = None;
-                            }
-                            Err(error) => {
-                                this.right.federation.error = Some(error.to_string());
-                                this.right.federation.notice = None;
-                            }
-                        }
-                        cx.notify();
-                    },
-                    cx,
-                )),
-        )
-        .into_any_element()
-    }
-    /// A small text button for the federation pane. Plain, because the kit's
-    /// Button cannot carry a debug selector and these rows are test targets.
-    fn federation_small_button(
-        &self,
-        id: impl Into<SharedString>,
-        label: String,
-        cx: &mut Context<Self>,
-        action: impl Fn(&mut Shell, &mut Context<Shell>) + 'static,
-    ) -> AnyElement {
-        let id = id.into();
-        let selector = id.to_string();
-        div()
-            .id(id)
-            .debug_selector(move || selector.clone())
-            .h(px(28.0))
-            .px(px(10.0))
-            .rounded(px(theme::RADIUS_SM))
-            .bg(rgb(theme::selected_row()))
-            .flex()
-            .items_center()
-            .cursor_pointer()
-            .hover(|style| style.bg(rgb(theme::hover())))
-            .child(txt(label, theme::CHIP_SIZE, theme::text()))
-            .on_click(cx.listener(move |this, _event, _window, cx| action(this, cx)))
-            .into_any_element()
+    /// The federation pane: the node's health, peers, work, resources and
+    /// knowledge, drawn by the pane's own module.
+    fn federation_pane(&self, cx: &mut Context<Self>) -> AnyElement {
+        super::federation_pane::pane(self, cx)
     }
 
     /// Read the peer list from the running node when there is one, otherwise
@@ -5131,11 +3528,18 @@ impl Shell {
                 federation_lease_rows(&leases)
             })
             .unwrap_or_default();
+        if announce {
+            // A manifest scan, not a host start: the list is cheap enough for a
+            // tab open and a Refresh, and too expensive for the two-second
+            // discovery tick, which passes announce = false.
+            self.right.federation.extension_tools =
+                crate::extension::host::declared_tool_catalogue(&self.state.settings);
+        }
         self.right.federation.loaded = true;
     }
 
     /// Apply one change to the peer store and persist it.
-    fn apply_federation<F>(&mut self, apply: F, cx: &mut Context<Self>)
+    pub(crate) fn apply_federation<F>(&mut self, apply: F, cx: &mut Context<Self>)
     where
         F: FnOnce(&mut federation::PeerStore) -> Result<String, String>,
     {
@@ -11106,7 +9510,7 @@ fn federation_expiry_label(lang: crate::i18n::Lang, minutes: u64) -> String {
 }
 
 /// The name a peer shows: the announced one, else the short id.
-fn display_name(name: Option<&str>, node: &str) -> String {
+pub(crate) fn display_name(name: Option<&str>, node: &str) -> String {
     name.map(str::trim)
         .filter(|name| !name.is_empty())
         .map(str::to_string)
@@ -11202,6 +9606,7 @@ pub(crate) fn federation_lease_rows(store: &federation::LeaseStore) -> Vec<Feder
         .iter()
         .map(|lease| FederationLeaseRow {
             id: lease.id.to_string(),
+            capability: lease.capability.to_string(),
             holder: lease.holder.to_string(),
             used: lease.used_bytes,
             max: lease.max_bytes,
@@ -11211,7 +9616,7 @@ pub(crate) fn federation_lease_rows(store: &federation::LeaseStore) -> Vec<Feder
 }
 
 /// Parse a peer id the way the CLI does: it must look like a Node's key.
-fn parse_peer(raw: &str) -> Result<agent::capability::NodeId, String> {
+pub(crate) fn parse_peer(raw: &str) -> Result<agent::capability::NodeId, String> {
     let raw = raw.trim();
     let node = agent::capability::NodeId::new(raw).map_err(|error| error.to_string())?;
     if !federation::identity::is_valid_node_id(&node) {
@@ -11220,15 +9625,42 @@ fn parse_peer(raw: &str) -> Result<agent::capability::NodeId, String> {
     Ok(node)
 }
 
-/// Enroll one peer from the pane's field value.
-fn enroll_peer(store: &mut federation::PeerStore, raw: &str) -> Result<String, String> {
+/// Enroll one peer from a raw node id, for the store operation's tests.
+#[cfg(test)]
+pub(crate) fn enroll_peer(store: &mut federation::PeerStore, raw: &str) -> Result<String, String> {
     let node = parse_peer(raw)?;
     store.enroll(node.clone(), agent::capability::unix_ms(), None);
     Ok(format!("enrolled {}", short_node(node.as_str())))
 }
 
+/// Remove every peer currently in the revoked state, returning how many went.
+///
+/// The rows are collected before mutating the store because the iterator borrows
+/// it. A successful call means the reader asked for exactly the set that was
+/// revoked at that moment; a re-announcement of one of those peers starts a new
+/// relationship under Discovered.
+pub(crate) fn remove_revoked_peers(
+    store: &mut federation::PeerStore,
+) -> Result<usize, String> {
+    let nodes: Vec<agent::capability::NodeId> = store
+        .iter()
+        .filter(|record| record.state == federation::TrustState::Revoked)
+        .map(|record| record.node.clone())
+        .collect();
+    let mut removed = 0;
+    for node in nodes {
+        if store.remove(&node) {
+            removed += 1;
+        }
+    }
+    if removed == 0 {
+        return Err("no revoked peers".to_string());
+    }
+    Ok(removed)
+}
+
 /// Grant one capability to one peer.
-fn grant_capability(
+pub(crate) fn grant_capability(
     store: &mut federation::PeerStore,
     node: &str,
     raw: &str,
@@ -11254,7 +9686,7 @@ fn grant_capability(
 }
 
 /// Enroll one discovered peer and grant exactly the capabilities chosen.
-fn enroll_and_grant(
+pub(crate) fn enroll_and_grant(
     store: &mut federation::PeerStore,
     node: &str,
     name: Option<&str>,
@@ -11282,8 +9714,7 @@ fn enroll_and_grant(
 }
 
 /// Revoke one peer and every grant it holds.
-#[allow(dead_code)]
-fn revoke_peer_action(
+pub(crate) fn revoke_peer_action(
     store: &mut federation::PeerStore,
     node: &str,
     label: &str,
@@ -11297,8 +9728,7 @@ fn revoke_peer_action(
 }
 
 /// Withdraw one capability from one peer.
-#[allow(dead_code)]
-fn revoke_grant_action(
+pub(crate) fn revoke_grant_action(
     store: &mut federation::PeerStore,
     node: &str,
     capability: &str,

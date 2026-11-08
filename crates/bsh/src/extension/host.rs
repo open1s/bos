@@ -3850,6 +3850,217 @@ pub(crate) fn open(
     ))
 }
 
+/// One extension tool the federation node may expose.
+#[derive(Debug, Clone)]
+pub(crate) struct NodeToolInfo {
+    /// The model-facing, globally unique tool name (extension-qualified).
+    pub(crate) qualified: String,
+    /// The extension's display name.
+    pub(crate) extension: String,
+    /// The description the model sees.
+    pub(crate) description: String,
+    /// The argument schema the runtime declared.
+    pub(crate) schema: Value,
+}
+
+/// The extension tools the loaded host can serve.
+///
+/// The list is empty until the host is open. It is deliberately built from
+/// configured entries, not applied ones: the federation node is not a
+/// preset-bound agent build, and the node's own expose list is the allowlist
+/// that decides what it serves.
+pub(crate) fn node_tool_catalogue() -> Vec<NodeToolInfo> {
+    let slot = HOST.get_or_init(|| Mutex::new(None));
+    let Ok(guard) = slot.lock() else {
+        return Vec::new();
+    };
+    let Some(host) = guard.as_ref() else {
+        return Vec::new();
+    };
+    let mut tools = Vec::new();
+    for entry in host
+        .loaded
+        .values()
+        .filter(|entry| entry.configured && entry.runtime.is_some())
+    {
+        for descriptor in &entry.tools {
+            tools.push(NodeToolInfo {
+                qualified: entry.package.id().qualify(&descriptor.id),
+                extension: entry.package.manifest.extension.name.clone(),
+                description: descriptor.description.clone(),
+                schema: descriptor.input_schema.clone(),
+            });
+        }
+    }
+    tools.sort_by(|left, right| left.qualified.cmp(&right.qualified));
+    tools
+}
+
+/// Built-in extension tools, which live in linked-in packages rather than the
+/// installed store. Keep in step with register_builtins.
+const DECLARED_BUILTIN_TOOLS: [(&str, &str, &str); 3] = [
+    (
+        "extensions__list",
+        "Extension Inspector",
+        "List the extensions installed on this machine",
+    ),
+    (
+        "diagnostics__graph",
+        "Extension Diagnostics",
+        "Return the declared extension graph",
+    ),
+    (
+        "diagnostics__why",
+        "Extension Diagnostics",
+        "Explain why one extension is or is not applied",
+    ),
+];
+
+/// The extension tools the installed manifests declare, without starting a
+/// runtime.
+///
+/// This is what the pane lists and what the node uses to decide whether an
+/// exposed id is an extension tool at all. Descriptions and schemas come from
+/// the manifest only, so the catalogue stays cheap; the host's own catalogue
+/// supplies the full descriptor once the node actually serves the tool.
+pub(crate) fn declared_tool_catalogue(settings: &crate::settings::Settings) -> Vec<NodeToolInfo> {
+    let config = HostConfig::from_settings(settings, None, None);
+    let mut tools: Vec<NodeToolInfo> = DECLARED_BUILTIN_TOOLS
+        .iter()
+        .map(|(qualified, extension, description)| NodeToolInfo {
+            qualified: qualified.to_string(),
+            extension: extension.to_string(),
+            description: description.to_string(),
+            schema: serde_json::json!({ "type": "object" }),
+        })
+        .collect();
+    let Ok(store) = ExtensionStore::open(&config.root) else {
+        tools.sort_by(|left, right| left.qualified.cmp(&right.qualified));
+        return tools;
+    };
+    let Ok((packages, _)) = store.scan_installed() else {
+        tools.sort_by(|left, right| left.qualified.cmp(&right.qualified));
+        return tools;
+    };
+    let packages = select_active_versions(packages, &store);
+    for package in packages {
+        if !package.report.is_valid()
+            || !store.state_of(package.id()).enabled
+            || config.disabled.contains(package.id().as_str())
+        {
+            continue;
+        }
+        for tool in &package.manifest.contributes.tools {
+            let qualified = package.id().qualify(tool);
+            if tools.iter().any(|info| info.qualified == qualified) {
+                continue;
+            }
+            tools.push(NodeToolInfo {
+                qualified,
+                extension: package.manifest.extension.name.clone(),
+                description: "Extension tool".to_string(),
+                schema: serde_json::json!({ "type": "object" }),
+            });
+        }
+    }
+    tools.sort_by(|left, right| left.qualified.cmp(&right.qualified));
+    tools
+}
+
+/// Open the extension host for a federation node when it is not open yet.
+///
+/// The node starts before any agent build, so it cannot borrow a session's
+/// host. Opening here makes the extension runtimes available to the node's
+/// proxy tools; a later UI build may reopen the host with a preset allowlist,
+/// and the node's proxy looks the tool up again on every call for that reason.
+pub(crate) fn ensure_host(settings: &crate::settings::Settings, workspace: Option<&Path>) -> bool {
+    let config = HostConfig::from_settings(settings, workspace.map(Path::to_path_buf), None);
+    let slot = HOST.get_or_init(|| Mutex::new(None));
+    let Ok(mut guard) = slot.lock() else {
+        return false;
+    };
+    if guard.as_ref().is_some_and(|host| host.config == config) {
+        return true;
+    }
+    match ExtensionHost::open(config) {
+        Ok(host) => {
+            *guard = Some(host);
+            true
+        }
+        Err(error) => {
+            log::warn!("extension host for the federation node did not open: {error}");
+            false
+        }
+    }
+}
+
+/// Run one extension tool the host owns.
+///
+/// The host is looked up on every call: a UI build can reopen it with a
+/// different preset allowlist, so a handle captured at node assembly would go
+/// stale. The extension's own capability policy still authorizes the call; the
+/// federation grant is the separate gate in front of this function.
+pub(crate) async fn call_node_tool(
+    qualified: &str,
+    arguments: Value,
+) -> Result<Value, ExtensionError> {
+    let parts = {
+        let slot = HOST.get_or_init(|| Mutex::new(None));
+        let guard = slot.lock().map_err(|_| ExtensionError::Denied {
+            extension: "federation".to_string(),
+            capability: "extension.call".to_string(),
+            reason: "the extension host is poisoned".to_string(),
+        })?;
+        let host = guard.as_ref().ok_or_else(|| ExtensionError::Denied {
+            extension: "federation".to_string(),
+            capability: "extension.call".to_string(),
+            reason: "the extension host is not running".to_string(),
+        })?;
+        let mut found = None;
+        for entry in host
+            .loaded
+            .values()
+            .filter(|entry| entry.configured && entry.runtime.is_some())
+        {
+            let Some(runtime) = entry.runtime.as_ref() else {
+                continue;
+            };
+            if let Some(descriptor) = entry
+                .tools
+                .iter()
+                .find(|descriptor| entry.package.id().qualify(&descriptor.id) == qualified)
+            {
+                found = Some((
+                    Arc::clone(runtime),
+                    Arc::clone(&host.policy),
+                    entry.package.id().clone(),
+                    entry.package.trust,
+                    descriptor.clone(),
+                    host.config.workspace.clone(),
+                    entry.package.manifest.resources.execution_ms(),
+                ));
+                break;
+            }
+        }
+        found.ok_or_else(|| ExtensionError::NotFound {
+            id: qualified.to_string(),
+        })?
+    };
+    let (runtime, policy, owner, trust, descriptor, workspace, timeout) = parts;
+    let scope = ferris_sdk::capability::call_scope(&arguments, workspace.as_deref());
+    ferris_sdk::capability::authorize_each(
+        &policy,
+        owner.as_str(),
+        trust,
+        &descriptor.capabilities,
+        &scope,
+    )?;
+    let context = CallContext::new(owner, "federation-node", workspace, timeout);
+    runtime
+        .call_tool(descriptor.id.as_str(), arguments, &context)
+        .await
+}
+
 /// A build that only needs the report (the CLI doctor path).
 pub(crate) fn doctor_report(config: HostConfig) -> Result<DiagnosticsReport, ExtensionError> {
     Ok(ExtensionHost::open(config)?.doctor())

@@ -161,6 +161,21 @@ pub(crate) fn accent_soft() -> u32 {
     blend(accent(), page(), 0.88)
 }
 
+/// A state colour mixed 12% into the page, for a soft badge or icon tile.
+///
+/// The federation pane paints one tile per section and per peer, each in the
+/// colour of the state it reports (blue for knowledge, green for health, red
+/// for a revoked peer), and a translucent tint is the reference's own
+/// `*-tertiary` treatment: the state colour at 12% over the surface.
+pub(crate) fn soft(color: u32) -> u32 {
+    blend(color, page(), 0.88)
+}
+
+/// A state colour mixed into `surface` at an explicit share.
+pub(crate) fn blend_into(color: u32, surface: u32, share: f32) -> u32 {
+    blend(color, surface, share)
+}
+
 /// How much wider the composer card is than the chat column.
 ///
 /// Measured: `--dsh-composer-card-max-width` is the chat content width plus

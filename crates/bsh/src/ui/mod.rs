@@ -8,6 +8,7 @@ mod command_menu;
 pub(crate) mod composer;
 pub(crate) mod diff_pane;
 pub(crate) mod extension_panel;
+pub(crate) mod federation_pane;
 pub(crate) mod frame_trace;
 pub(crate) mod header;
 pub(crate) mod hero;
