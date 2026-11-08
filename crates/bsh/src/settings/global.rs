@@ -983,6 +983,14 @@ pub(crate) struct General {
     pub(crate) diff_wrap: bool,
     /// The session-list ordering a reader chose.
     pub(crate) session_sort: String,
+    /// The application the workspace was last opened in, by catalog id.
+    ///
+    /// The reference remembers the last successful directory choice in
+    /// `dsh.open-in-app.choice` and falls back to the first offered
+    /// application; bsh's store is the settings file. Empty means no choice
+    /// has been made yet.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) open_in_app: String,
     /// The workspace that was open; empty while none is registered.
     pub(crate) active_workspace: String,
     /// The session last on screen; empty while none has been selected.
@@ -1022,6 +1030,7 @@ impl Default for General {
             diff_mode: super::DEFAULT_DIFF_MODE.to_string(),
             diff_wrap: false,
             session_sort: String::new(),
+            open_in_app: String::new(),
             active_workspace: String::new(),
             active_session: String::new(),
         }

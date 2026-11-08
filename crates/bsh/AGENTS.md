@@ -3832,3 +3832,78 @@ locale entry draws the raw `settings.web-search` - the build showed exactly
 that until `settings.web-search` was added to both YAML files, and the label
 assertion is what keeps it from coming back.
 
+
+**The header's open control is the reference's split button now (round 131).**
+It used to be TWO controls - a bordered pill reading "Open in <first installed
+editor>" beside a ghost button reading "More ways to open" - so every editor but
+the first hid behind a menu whose label named no application, and a terminal
+could not be offered at all. The reference (`dsh-client-ui-open-in-app`) draws
+ONE split button instead: the main half launches the remembered application from
+its icon alone and the chevron lists every catalog application, the one in use
+marked "(default)".
+
+Measured, from `OpenTargetButton.module.css` plus the package README:
+`.split{border:.5px solid border-l4;border-radius:radius-sm;height:24px;
+align-items:stretch;display:inline-flex;overflow:hidden}`,
+`.main{gap:4px;padding:3px 5px;font-size:11px;line-height:16px}` (compact draws
+the icon and no label), `.chevron{border-left:.5px solid border-l4;
+color:label-secondary;padding:3px 4px 3px 3px}` with a 10px glyph,
+`.menuAnchor{flex:none;align-self:center}`. The menu is the reference's own
+catalog order - file managers, editors and IDEs, Git GUIs, terminals - its card
+is `min-width:144;max-width:360;padding:4` with `align:end`, a dense row is
+`min-height:30;padding:4px 8px;gap:6px;font-size:13px;line-height:20px` at
+radius 12, and the preferred row's label is `{app} (default)`.
+`src/open_in_app.rs` replaces `editors.rs`: 28 catalog entries with the
+reference's ids (`finder`, `vscode`, `zed`, `pycharm`, `ghostty`,
+`terminal`, ...), probed once per process over `/Applications` then
+`~/Applications` - the reference's `applicationRoots` order - with Finder and
+Terminal resolved from their shipped bundles. Launch is
+`open -a <bundle> <dir>` for an application and the bare `open <dir>` for the
+file manager's reveal, which is what the reference's `app`/`shell-open`
+locators compose. The choice persists as `general.open_in_app` (the reference's
+`dsh.open-in-app.choice`), written only by a MENU pick, as its `kind:
+"application"` arm does; the main half sends `kind:"default"` and changes
+nothing.
+
+Icons are real ones. GPUI cannot decode `.icns`, so `NSWorkspace`'s
+`iconForFile:` supplies the bundle image, `NSBitmapImageRep` re-encodes it as
+PNG, and `image::DynamicImage::thumbnail` cuts it to 64px before the bytes reach
+`Image::from_bytes` - the bundle's largest rep is 1024px, which would upload a
+4 MB texture per application behind a 24px menu. The decoded icons are cached
+per id in one process-wide map; a miss draws the reference's own fallback glyph
+(`IconRightUpOutlineRegular` -> `IconName::ArrowUpRight`), never an invented
+placeholder. Locales gained `hdr.appDefault` ("{app} (default)" / "{app}（默认）"),
+the OS application names (`app.finder`/`app.terminal`/`app.filemanager`), the
+reference's own `hdr.openIn` wording ("用 {app} 打开"), and `hdr.openFailed`
+took the reference's toast copy; `hdr.revealFinder` is gone with the second
+control.
+
+Evidence: `open_in_app::tests::only_installed_applications_are_offered_in_catalog_order`
+(probe order and catalog order diverge), `the_remembered_application_is_the_preferred_row`,
+`the_open_command_names_the_bundle_and_the_folder`,
+`the_catalog_covers_the_reference_rows` and `every_catalog_id_is_unique`;
+`ui::shell_tests::the_header_offers_to_open_the_workspace` now pins the split's
+23x23 main half (icon-only: a text pill could not be 23 wide) and the 23-tall,
+17.5-wide chevron beside it, and `the_open_control_lists_the_installed_applications`
+presses the chevron and reads the menu's first two rows back. Captured live: the
+menu lists Finder (default), VS Code, Zed, PyCharm, Ghostty, Terminal with their
+own icons, which is the image the round was asked for.
+
+Traps worth keeping: `dropdown_menu_with_anchor` is implemented ONLY for the
+kit `Button`, so the chevron is a Button inside a wrapper `div` - the wrapper
+carries the debug selector, the tooltip and the `.5px` divider, because a kit
+Button records no selector and owns its own hover fill. `PopupMenuItem::element`
+rows take their own `on_click` and the popup dismisses itself afterwards, which
+is what makes an icon + image row possible where `PopupMenuItem::new` takes only
+text. `image` was ALREADY a dependency (it decodes captured frames), so the
+thumbnail step added no package - adding a second `[dependencies.image]` table
+fails the manifest with "duplicate key". A `.5px` hairline plus `h(24)` renders
+23 inside, so the geometry assertions are 23 and 17.5, not 24 and 18.
+
+Honest gaps: no shortcut hint in the tooltip (the reference binds Open locally to
+mod-alt-O; bsh has no shortcut registry for it), no busy/disabled state during a
+launch (the reference serialises gestures), no arrow-key navigation inside the
+kit popup, and a launch reports only a SPAWN failure - the reference also rejects
+an early nonzero exit, which bsh does not observe because it does not wait on the
+child.
+

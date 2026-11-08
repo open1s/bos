@@ -7217,13 +7217,75 @@ fn the_header_offers_to_open_the_workspace(cx: &mut TestAppContext) {
         Some("/tmp".to_string()),
         "and the id must resolve to the root the open control edits"
     );
-    assert!(
-        cx.debug_bounds("hdr-open").is_some(),
-        "the header must offer to open the workspace in an editor"
+    let bounds = cx
+        .debug_bounds("hdr-open")
+        .expect("the header must offer to open the workspace in an application");
+    // The measured compact split: a 13px application icon inside the measured
+    // 3px/5px padding (23 = 13 + 5 + 5), one pixel shorter than the 24px box
+    // because the two .5px hairlines take theirs from it.
+    assert_eq!(
+        f32::from(bounds.size.width),
+        23.0,
+        "the main half is icon-only, not a text pill naming an editor"
     );
+    assert_eq!(f32::from(bounds.size.height), 23.0, "inside the 24px split");
+    // macOS always resolves the file manager and its own terminal, so the menu
+    // half exists; its 17.5px width is 3 + 10 + 4 plus the .5px divider. A
+    // platform whose catalog resolves a single application draws no menu half -
+    // the reference's own hasMenu rule - so this assertion is macOS-only.
+    #[cfg(target_os = "macos")]
+    {
+        let chevron = cx
+            .debug_bounds("hdr-open-more")
+            .expect("the catalog's second application gives the split its menu half");
+        assert_eq!(f32::from(chevron.size.width), 17.5);
+        assert_eq!(f32::from(chevron.size.height), 23.0);
+        assert!(
+            f32::from(chevron.origin.x) >= f32::from(bounds.origin.x + bounds.size.width),
+            "the chevron sits beside the main half rather than over it"
+        );
+    }
     // The menu beside it is a kit Button, which builds no debug selector of its own,
     // so its presence is not observable here - the same limit the header's More
     // actions button has.
+}
+
+/// The chevron's menu is the catalog: one row per installed application, which
+/// is what turns "Open in <one editor>" plus "More ways to open" into the
+/// reference's one split button.
+#[cfg(target_os = "macos")]
+#[gpui::test]
+fn the_open_control_lists_the_installed_applications(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (_harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("open-menu", 1);
+        let id = state.settings.note_workspace("scratch", "/tmp");
+        state.settings.global.general.active_workspace = id;
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    draw_until(cx, "the split button", 4, |cx| {
+        cx.debug_bounds("hdr-open-more").is_some()
+    });
+    let chevron = cx
+        .debug_bounds("hdr-open-more")
+        .expect("the menu half of the split");
+    cx.simulate_click(chevron.center(), Modifiers::default());
+    draw_until(cx, "the application menu", 8, |cx| {
+        cx.debug_bounds("hdr-open-app-0").is_some()
+    });
+    let first = cx
+        .debug_bounds("hdr-open-app-0")
+        .expect("the menu's first row");
+    assert!(
+        f32::from(first.size.height) >= 20.0,
+        "a row is a row, not a collapsed line: {first:?}"
+    );
+    // The rows are the catalog's own order: the file manager leads.
+    assert!(
+        cx.debug_bounds("hdr-open-app-1").is_some(),
+        "the catalog's second application is a second row"
+    );
 }
 
 /// With no workspace registered there is nothing to open, so the control is absent.
@@ -22436,7 +22498,9 @@ fn closing_the_pane_keeps_its_documents_in_the_start_strip(cx: &mut TestAppConte
     cx.update(|window, cx| window.draw(cx).clear(cx));
 
     cx.update(|_, cx| {
-        shell.update(cx, |this, cx| this.close_right_pane(cx));
+        shell.update(cx, |this, cx| {
+            this.close_right_pane_tab(crate::ui::right_panel::RightTab::Files, cx)
+        });
     });
     draw_until(cx, "the Start tab renders", DRAW_UNTIL_MAX, |cx| {
         cx.debug_bounds("right-start-tab").is_some()
@@ -22557,7 +22621,9 @@ fn a_start_document_tile_opens_the_file_as_a_tab(cx: &mut TestAppContext) {
         });
     });
     cx.update(|_, cx| {
-        shell.update(cx, |this, cx| this.close_right_pane(cx));
+        shell.update(cx, |this, cx| {
+            this.close_right_pane_tab(crate::ui::right_panel::RightTab::Files, cx)
+        });
     });
     draw_until(cx, "the document tile renders", DRAW_UNTIL_MAX, |cx| {
         cx.debug_bounds("right-start-file-0").is_some()
@@ -22613,6 +22679,129 @@ fn opening_a_file_from_another_pane_adds_its_tab(cx: &mut TestAppContext) {
     });
 }
 
+/// A strip that cannot hold its tabs shows the overflow trigger, and the
+/// close actions the trigger exposes act on the same tab set.
+#[gpui::test]
+fn a_crowded_strip_shows_overflow_and_closes_its_tabs(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("right-crowded-tabs");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    for tab in [
+        crate::ui::right_panel::RightTab::Files,
+        crate::ui::right_panel::RightTab::Extensions,
+        crate::ui::right_panel::RightTab::Federation,
+        crate::ui::right_panel::RightTab::Tasks,
+        crate::ui::right_panel::RightTab::Browser,
+        crate::ui::right_panel::RightTab::Diff,
+    ] {
+        cx.update(|window, cx| {
+            shell.update(cx, |this, cx| this.open_right_tab(tab, window, cx));
+        });
+    }
+    draw_until(cx, "the overflow trigger appears", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("right-tab-overflow").is_some()
+    });
+
+    // Close Others is the menu action: keep the active Diff tab, drop the rest.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| this.close_other_active_tabs(cx));
+    });
+    draw_until(cx, "only the active tab remains", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| shell.read(cx).right.open_panes.len() == 1)
+            && cx.debug_bounds("right-tab-overflow").is_none()
+    });
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).right.tab),
+        Some(crate::ui::right_panel::RightTab::Diff)
+    );
+
+    // Close is the menu action for the tab on screen; with no tabs left the
+    // panel returns to Start.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| this.close_active_tab(cx));
+    });
+    draw_until(cx, "the last tab closes to Start", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| {
+            let right = &shell.read(cx).right;
+            right.tab.is_none() && right.open_panes.is_empty()
+        })
+    });
+}
+
+/// Every opened pane keeps its own tab; choosing a tab returns to that pane
+/// without reopening or replacing the others.
+#[gpui::test]
+fn opening_several_panes_keeps_a_tab_for_each(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("right-multi-pane-tabs");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    for tab in [
+        crate::ui::right_panel::RightTab::Files,
+        crate::ui::right_panel::RightTab::Browser,
+        crate::ui::right_panel::RightTab::Extensions,
+    ] {
+        cx.update(|window, cx| {
+            shell.update(cx, |this, cx| this.open_right_tab(tab, window, cx));
+        });
+    }
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // Extensions is the active tab; the other two are still on screen.
+    assert!(
+        cx.debug_bounds("right-tab").is_some(),
+        "the active pane has its tab"
+    );
+    for slug in ["files", "browser"] {
+        assert!(
+            cx.debug_bounds(match slug {
+                "files" => "right-tab-files",
+                _ => "right-tab-browser",
+            })
+            .is_some(),
+            "the {slug} pane keeps a tab beside the active one"
+        );
+    }
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).right.open_panes.len()),
+        3,
+        "all three panes are open tabs"
+    );
+
+    // Choosing Files returns to that pane; Browser is still there after it.
+    let files = cx
+        .debug_bounds("right-tab-files")
+        .expect("the Files tab")
+        .center();
+    cx.simulate_click(files, Modifiers::default());
+    draw_until(cx, "Files becomes active", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| shell.read(cx).right.tab == Some(crate::ui::right_panel::RightTab::Files))
+    });
+    let browser = cx
+        .debug_bounds("right-tab-browser")
+        .expect("the Browser tab is still there")
+        .center();
+    cx.simulate_click(browser, Modifiers::default());
+    draw_until(cx, "Browser becomes active", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| {
+            shell.read(cx).right.tab == Some(crate::ui::right_panel::RightTab::Browser)
+        })
+    });
+    assert!(
+        cx.update(|_, cx| shell.read(cx).right.open_panes.len()) == 3,
+        "switching tabs leaves the other panes open"
+    );
+}
+
 /// The Start screen is an Applications-style grid: tabs filter the categories,
 /// and the search field filters the grid in place rather than opening a list.
 #[gpui::test]
@@ -22638,7 +22827,9 @@ fn the_start_grid_filters_by_category_and_search(cx: &mut TestAppContext) {
         });
     }
     cx.update(|_, cx| {
-        shell.update(cx, |this, cx| this.close_right_pane(cx));
+        shell.update(cx, |this, cx| {
+            this.close_right_pane_tab(crate::ui::right_panel::RightTab::Files, cx)
+        });
     });
     draw_until(cx, "the Start grid renders", DRAW_UNTIL_MAX, |cx| {
         cx.debug_bounds("right-start-grid").is_some()

@@ -69,6 +69,17 @@ const JOB_OUTPUT_DEBUG: [&str; 4] = [
 const SUBAGENT_ROW_W: f32 = 360.0;
 
 const SUBAGENT_ROW_DEBUG: [&str; 3] = ["subagent-row-0", "subagent-row-1", "subagent-row-many"];
+
+/// Static debug selectors for the first application rows of the open menu. The
+/// popover is a kit layer, but an ElementItem is an ordinary element, so its
+/// wrapper is readable; the names are indexed because a shared name would make
+/// every row look like the first.
+const OPEN_ROW_DEBUG: [&str; 4] = [
+    "hdr-open-app-0",
+    "hdr-open-app-1",
+    "hdr-open-app-2",
+    "hdr-open-app-many",
+];
 const SUBAGENT_SUMMARY_DEBUG: [&str; 3] = [
     "subagent-summary-0",
     "subagent-summary-1",
@@ -78,6 +89,18 @@ const SUBAGENT_SUMMARY_DEBUG: [&str; 3] = [
 /// The debug selector for one row, clamped to the measured set.
 fn job_debug(selectors: [&'static str; 4], index: usize) -> &'static str {
     selectors[index.min(selectors.len() - 1)]
+}
+
+/// One application's own image at the measured size.
+///
+/// The reference draws the catalog's icon and falls back to
+/// `IconRightUpOutlineRegular` when the host served none, so a missing image is
+/// the arrow glyph rather than an empty box or an invented placeholder.
+fn app_icon(image: Option<std::sync::Arc<Image>>, size: f32) -> AnyElement {
+    match image {
+        Some(image) => img(image).w(px(size)).h(px(size)).into_any_element(),
+        None => icon(IconName::ArrowUpRight, size, theme::muted()).into_any_element(),
+    }
 }
 
 /// The measured live row line: `.rowLine{align-items:stretch;gap:6px}` and
@@ -620,11 +643,6 @@ impl Shell {
                 cx,
             ))
     }
-    /// Open the active workspace in an installed editor, or reveal it.
-    ///
-    /// The reference header carries Open in Zed and More ways to open; which
-    /// editors exist is a property of the machine, so the primary control names the
-    /// first installed one and the menu offers the rest plus the file browser.
     /// The background-jobs chip label, or None when nothing runs in the
     /// background. It is split out from the chip because a kit Button records no
     /// bounds the harness could look up - not even through a wrapper - so the
@@ -1483,6 +1501,21 @@ impl Shell {
         stop.into_any_element()
     }
 
+    /// The reference's Session-header open control: ONE split button, not a
+    /// button beside a menu.
+    ///
+    /// Measured from `dsh-client-ui-open-in-app`'s `OpenTargetButton.module.css`:
+    /// `.split{border:.5px solid border-l4;border-radius:radius-sm;height:24px;
+    /// align-items:stretch;display:inline-flex;overflow:hidden}`,
+    /// `.main{gap:4px;padding:3px 5px;font-size:11px;line-height:16px}` holding
+    /// the preferred application's 13px icon (the reference names no compact
+    /// label), and `.chevron{border-left:.5px solid border-l4;
+    /// color:label-secondary;padding:3px 4px 3px 3px}` holding a 10px chevron.
+    /// The chevron's menu is the whole catalog - file managers, editors and
+    /// IDEs, Git GUIs, terminals - with the preferred row reading
+    /// "{app} (default)". A directory gets no separate reveal row: the file
+    /// manager is a catalog application itself, which is why the reference's
+    /// footer is file-only.
     fn open_controls(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let root = self
             .state
@@ -1494,81 +1527,140 @@ impl Shell {
             return None;
         }
         let lang = self.state.lang;
-        let editors = crate::editors::installed_editors();
-        let primary = editors.first().copied();
-        let label = match primary {
-            Some(name) => lang.tr("hdr.openIn").replace("{editor}", name),
-            None => lang.tr("hdr.revealFinder"),
-        };
-        let rest: Vec<&str> = editors.into_iter().skip(1).collect();
+        let apps = crate::open_in_app::installed();
+        let preferred = crate::open_in_app::preferred_index(
+            apps,
+            &self.state.settings.global.general.open_in_app,
+        )?;
+        let app = apps[preferred].clone();
+        let tip = crate::i18n::tr_args(lang, "hdr.openIn", &[("app", app.label(lang))]);
+        let more_label = lang.tr("hdr.moreWays");
         let menu_shell = cx.entity();
-        let menu_root = root.clone();
-        let reveal = lang.tr("hdr.revealFinder");
-        Some(
+        let menu_path = root.clone();
+        // The catalog is process-static, so the menu builder borrows it rather
+        // than cloning every entry's bundle path on each frame.
+        let menu_apps = apps;
+        let main_tip = tip.clone();
+
+        // The kit hands the dropdown only to a Button, so the chevron IS the
+        // button; the measured half-pixel divider and the tooltip ride on the
+        // wrapper, which is also what a debug selector can read back.
+        let chevron = Button::new("hdr-open-more-button")
+            .ghost()
+            .h(px(24.0))
+            .pl(px(3.0))
+            .pr(px(4.0))
+            .py(px(3.0))
+            .rounded(px(0.0))
+            .child(icon(IconName::ChevronDown, 10.0, theme::muted()))
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                let mut menu = menu.min_w(px(144.0)).max_w(px(360.0));
+                for (index, entry) in menu_apps.iter().enumerate() {
+                    let label = if index == preferred {
+                        crate::i18n::tr_args(lang, "hdr.appDefault", &[("app", entry.label(lang))])
+                    } else {
+                        entry.label(lang)
+                    };
+                    let image = entry.icon();
+                    let shell = menu_shell.clone();
+                    let path = menu_path.clone();
+                    let chosen = entry.clone();
+                    let row_debug = OPEN_ROW_DEBUG[index.min(OPEN_ROW_DEBUG.len() - 1)];
+                    menu = menu.item(PopupMenuItem::element(move |_, _| {
+                        let shell = shell.clone();
+                        let path = path.clone();
+                        let chosen = chosen.clone();
+                        div()
+                            .id(format!("hdr-open-app-{index}"))
+                            .debug_selector(move || row_debug.to_string())
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(app_icon(image.clone(), 14.0))
+                            .child(
+                                txt(label.clone(), 13.0, theme::text())
+                                    .line_height(px(20.0))
+                                    .truncate(),
+                            )
+                            .on_click(move |_, _, cx| {
+                                shell.update(cx, |this, cx| {
+                                    this.open_workspace(&chosen, &path, true, cx);
+                                });
+                            })
+                            .into_any_element()
+                    }));
+                }
+                menu
+            });
+        let more = hairline_left(
             div()
+                .id("hdr-open-more")
+                .debug_selector(|| "hdr-open-more".to_string())
                 .flex()
-                .flex_row()
                 .items_center()
-                .gap(px(6.0))
-                .child(
-                    div()
-                        .debug_selector(|| "hdr-open".to_string())
-                        .id("hdr-open")
-                        .px(px(8.0))
-                        .py(px(3.0))
-                        .rounded(px(6.0))
-                        .border_1()
-                        .border_color(rgb(theme::border()))
-                        .cursor_pointer()
-                        .hover(|style| style.bg(rgb(theme::hover())))
-                        .child(txt(label, theme::CHIP_SIZE, theme::muted()))
-                        .on_click(cx.listener({
-                            let root = root.clone();
-                            move |this, _event, _window, cx| {
-                                this.open_workspace(primary, &root, cx);
-                            }
-                        })),
-                )
-                .child(
-                    Button::new("hdr-open-more")
-                        .ghost()
-                        .compact()
-                        .label(lang.tr("hdr.moreWays"))
-                        .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
-                            let mut menu = menu;
-                            for name in rest.iter().copied() {
-                                let shell = menu_shell.clone();
-                                let path = menu_root.clone();
-                                menu = menu.item(PopupMenuItem::new(name).on_click(
-                                    move |_, _, cx| {
-                                        shell.update(cx, |this, cx| {
-                                            this.open_workspace(Some(name), &path, cx);
-                                        });
-                                    },
-                                ));
-                            }
-                            let shell = menu_shell.clone();
-                            let path = menu_root.clone();
-                            menu.item(PopupMenuItem::new(reveal.clone()).on_click(
-                                move |_, _, cx| {
-                                    shell.update(cx, |this, cx| {
-                                        this.open_workspace(None, &path, cx);
-                                    });
-                                },
-                            ))
-                        }),
-                )
+                .justify_center()
+                .h_full()
+                .tooltip({
+                    let label = more_label.clone();
+                    move |window, cx| Tooltip::new(label.clone()).build(window, cx)
+                })
+                .tooltip_show_delay(std::time::Duration::from_millis(500))
+                .child(chevron),
+        )
+        .border_color(rgb(theme::border()));
+
+        let main = div()
+            .id("hdr-open")
+            .debug_selector(|| "hdr-open".to_string())
+            .flex()
+            .items_center()
+            .justify_center()
+            .h_full()
+            .px(px(5.0))
+            .py(px(3.0))
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(theme::hover())))
+            .tooltip(move |window, cx| Tooltip::new(main_tip.clone()).build(window, cx))
+            .tooltip_show_delay(std::time::Duration::from_millis(500))
+            .child(app_icon(app.icon(), 13.0))
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                this.open_workspace(&app, &root, false, cx);
+            }));
+
+        let split = div()
+            .flex()
+            .flex_row()
+            .items_stretch()
+            .h(px(24.0))
+            .rounded(px(theme::RADIUS_SM))
+            .overflow_hidden()
+            .child(main)
+            .when(apps.len() > 1, |split| split.child(more));
+        Some(
+            hairline_all(split)
+                .border_color(rgb(theme::border()))
                 .into_any_element(),
         )
     }
 
-    /// Open the active workspace, reporting a failure rather than doing nothing
-    /// when no handler accepts the path.
-    fn open_workspace(&mut self, editor: Option<&str>, path: &str, cx: &mut Context<Self>) {
+    /// Open the active workspace, remembering the application the reader chose
+    /// and reporting a failure rather than doing nothing when the launch fails.
+    fn open_workspace(
+        &mut self,
+        app: &crate::open_in_app::App,
+        path: &str,
+        remember: bool,
+        cx: &mut Context<Self>,
+    ) {
         let lang = self.state.lang;
-        if crate::editors::open_in(editor, path).is_err() {
+        if crate::open_in_app::open(app, path).is_err() {
             self.state.notice(lang.tr("hdr.openFailed"));
             cx.notify();
+            return;
+        }
+        if remember {
+            self.state.draft_mut().global.general.open_in_app = app.id.to_string();
+            let _ = self.state.commit_settings();
         }
     }
 

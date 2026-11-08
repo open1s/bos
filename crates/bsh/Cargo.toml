@@ -194,7 +194,15 @@ libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSImage", "NSResponder"] }
+objc2-app-kit = { version = "0.3.2", features = [
+    "NSApplication",
+    "NSImage",
+    "NSResponder",
+    # Reading an installed application's own icon for the workspace's open
+    # menu: AppKit asks the Launch Services icon cache and re-encodes it.
+    "NSWorkspace",
+    "NSBitmapImageRep",
+] }
 objc2-foundation = { version = "0.3.2", features = ["NSData"] }
 
 # The Browser pane launches the installed Chrome/Chromium binary and speaks CDP
