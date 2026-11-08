@@ -428,8 +428,10 @@ pub(crate) fn command(
                                 .map(|grant| grant.capability.to_string())
                                 .collect();
                             let state = match record.state {
+                                TrustState::Invited => "invited",
                                 TrustState::Pending => "pending",
                                 TrustState::Trusted => "trusted",
+                                TrustState::Suspended => "suspended",
                                 TrustState::Revoked => "revoked",
                             };
                             let _ = writeln!(

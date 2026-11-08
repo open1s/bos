@@ -19,10 +19,12 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::diff::{Diff, DiffEvent, DiffFile, DiffMode, DiffState};
 use gpui_kit::component::input::{
     Editor, EditorState, Input, InputEvent, InputState, Textarea, TextareaState,
 };
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::Focusable;
 use gpui_kit::*;
@@ -721,6 +723,208 @@ fn normalize_address(typed: &str) -> String {
     format!("https://{}", text.trim_start_matches('/'))
 }
 
+/// The gap the strip puts between two chips.
+///
+/// Every width the overflow planner uses is this same figure, because the bar
+/// draws its children with this gap: a plan that forgot it would fit tabs on
+/// paper and then paint one gap past the edge it was respecting.
+pub(crate) const STRIP_GAP: f32 = 4.0;
+
+/// The width of one pane's launcher chip while that pane is not the open one.
+///
+/// A launcher is only its glyph; the label belongs to the open tab and to the
+/// catalog, so the six panes that are not up stay narrow enough to leave the
+/// documents the room they need.
+pub(crate) const STRIP_PANE_CHIP_W: f32 = 26.0;
+
+/// The width of the catalog trigger that replaces the chips that do not fit.
+pub(crate) const STRIP_OVERFLOW_W: f32 = 26.0;
+
+/// The width of one header control: new tab, maximise, collapse.
+const STRIP_CONTROL_W: f32 = 26.0;
+
+/// The narrowest an open tab may get before it moves into the catalog.
+///
+/// Finder stops shrinking a tab while the file glyph, the label's first
+/// characters and the close are all still hittable; below this a tab is a
+/// button with no name, so the catalog is the better home for it.
+pub(crate) const STRIP_TAB_MIN_W: f32 = 72.0;
+
+/// The widest an open tab grows before its label is ellipsised.
+pub(crate) const STRIP_TAB_MAX_W: f32 = 168.0;
+
+/// What the three header controls and the gaps around them reserve at the
+/// right edge, including the gap before the strip's own trailing spacer.
+fn strip_chrome_w() -> f32 {
+    STRIP_CONTROL_W * 3.0 + STRIP_GAP * 4.0
+}
+
+/// The width a chip label needs at the chip size, before it is clipped.
+///
+/// A CJK glyph is a full em and an ASCII one a little over half, so a
+/// per-character estimate is honest in both locales. It only picks a tab's
+/// width: the chip clips its own label, so a long name can never overrun the
+/// strip even when the estimate is a pixel or two short.
+fn chip_label_w(label: &str) -> f32 {
+    label
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii() {
+                theme::CHIP_SIZE * 0.53
+            } else {
+                theme::CHIP_SIZE
+            }
+        })
+        .sum()
+}
+
+/// The width an open pane's tab asks for: padding, glyph, gap, label, close.
+pub(crate) fn pane_tab_w(label: &str) -> f32 {
+    (58.0 + chip_label_w(label)).clamp(STRIP_TAB_MIN_W, STRIP_TAB_MAX_W)
+}
+
+/// The width a document tab asks for: padding, glyph, gap, label, close.
+pub(crate) fn file_tab_w(label: &str) -> f32 {
+    (56.0 + chip_label_w(label)).clamp(STRIP_TAB_MIN_W, STRIP_TAB_MAX_W)
+}
+
+/// One tab the strip can draw: the open pane, or a document opened in Files.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StripSlot {
+    Pane(RightTab),
+    File(usize),
+}
+
+/// The tabs that fit this frame, in strip order, and whether some did not.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct StripPlan {
+    /// What to draw, each with the width it was given.
+    pub(crate) visible: Vec<(StripSlot, f32)>,
+    /// Whether the catalog trigger must stand in for the tabs left out.
+    pub(crate) overflow: bool,
+}
+
+/// Decide which tabs the strip can show at a given width.
+///
+/// The priority is Finder's: the tab that is open first, then the documents the
+/// reader opened, and the launcher chips for panes that are not up last. That
+/// order is what keeps a wide pane from starving the documents: a document
+/// whose name no longer fits moves into the catalog before any tab is drawn
+/// narrower than legibility allows.
+///
+/// The open document is never hidden, even when the window is too narrow for
+/// its floor: a strip with no tab on screen has nothing to name the body with.
+/// That is the one branch where a width may exceed the available room, and the
+/// panel's own 320px floor keeps it out of reach in the real window.
+pub(crate) fn plan_tab_strip(
+    available: f32,
+    active_pane: RightTab,
+    active_pane_w: f32,
+    file_widths: &[f32],
+    active_file: Option<usize>,
+    inactive_panes: &[RightTab],
+) -> StripPlan {
+    let mut visible = Vec::with_capacity(1 + file_widths.len() + inactive_panes.len());
+    visible.push((StripSlot::Pane(active_pane), active_pane_w));
+    let mut used = active_pane_w;
+    let mut overflow = false;
+
+    if !file_widths.is_empty() {
+        let count = file_widths.len();
+        let natural: f32 = file_widths.iter().sum();
+        let gaps = count as f32 * STRIP_GAP;
+        if used + natural + gaps <= available {
+            for (index, width) in file_widths.iter().enumerate() {
+                used += STRIP_GAP + width;
+                visible.push((StripSlot::File(index), *width));
+            }
+        } else if used + STRIP_TAB_MIN_W * count as f32 + gaps <= available {
+            for index in 0..count {
+                used += STRIP_GAP + STRIP_TAB_MIN_W;
+                visible.push((StripSlot::File(index), STRIP_TAB_MIN_W));
+            }
+        } else {
+            overflow = true;
+            let area = (available - used - STRIP_OVERFLOW_W - STRIP_GAP).max(0.0);
+            let active = active_file.unwrap_or(0).min(count - 1);
+            let mut start = active;
+            let mut end = active;
+            let mut cost = file_widths[active] + STRIP_GAP;
+            while start > 0 && cost + STRIP_GAP + file_widths[start - 1] <= area {
+                start -= 1;
+                cost += STRIP_GAP + file_widths[start];
+            }
+            while end + 1 < count && cost + STRIP_GAP + file_widths[end + 1] <= area {
+                end += 1;
+                cost += STRIP_GAP + file_widths[end];
+            }
+            let shown = end - start + 1;
+            let per = ((area - shown as f32 * STRIP_GAP) / shown as f32)
+                .clamp(STRIP_TAB_MIN_W, STRIP_TAB_MAX_W);
+            for index in start..=end {
+                let width = file_widths[index].min(per);
+                used += STRIP_GAP + width;
+                visible.push((StripSlot::File(index), width));
+            }
+        }
+    }
+
+    if !inactive_panes.is_empty() {
+        let pane_cost = STRIP_PANE_CHIP_W + STRIP_GAP;
+        let room = available
+            - used
+            - if overflow {
+                STRIP_OVERFLOW_W + STRIP_GAP
+            } else {
+                0.0
+            };
+        let mut fit = (room / pane_cost).floor().max(0.0) as usize;
+        if fit < inactive_panes.len() {
+            overflow = true;
+            let room = available - used - STRIP_OVERFLOW_W - STRIP_GAP;
+            fit = (room / pane_cost).floor().max(0.0) as usize;
+        }
+        for pane in inactive_panes.iter().take(fit) {
+            visible.push((StripSlot::Pane(*pane), STRIP_PANE_CHIP_W));
+        }
+    }
+
+    StripPlan { visible, overflow }
+}
+
+/// One row of the tab catalog: the tab's glyph, its label, and the check that
+/// says which one the body is showing.
+///
+/// The kit's own item draws a plain label and cannot carry the assets crate's
+/// glyphs, so the row is an element the same way the workspace menu's rows are.
+fn catalog_row(selector: String, glyph: IconName, label: String, active: bool) -> PopupMenuItem {
+    PopupMenuItem::element(move |_window, _cx| {
+        let selector = selector.clone();
+        let color = if active {
+            theme::text()
+        } else {
+            theme::muted()
+        };
+        div()
+            .debug_selector(move || selector.clone())
+            .w_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .child(icon(glyph, 13.0, color).flex_none())
+            .child(
+                txt(label.clone(), 13.0, color)
+                    .flex_1()
+                    .min_w_0()
+                    .text_ellipsis(),
+            )
+            .when(active, |row| {
+                row.child(icon(IconName::Check, 12.0, theme::accent()))
+            })
+    })
+}
+
 impl Shell {
     /// Whether the panel is the column at the window's top-left corner.
     ///
@@ -945,54 +1149,66 @@ impl Shell {
                 ))
                 .child(self.right_panel_close(cx)),
             Some(tab) => {
-                // The strip is a real tab list: the open pane carries its
-                // label, every other pane keeps its glyph one press away. It
-                // used to carry only the pane that was already open, which left
-                // the Start screen as the only door to a pane - and Diff, whose
-                // body needs no picker, had no door at all from here.
-                let mut content = row;
-                for pane in RightTab::ALL {
-                    content = content.child(if pane == tab {
-                        self.right_tab_chip(pane, cx).into_any_element()
-                    } else {
-                        self.right_pane_chip(pane, cx).into_any_element()
-                    });
+                // The strip is the panel's whole tab list: the open pane, every
+                // document opened out of Files, then the glyph chips for the
+                // panes that are not up. It used to carry only the open pane,
+                // which left the Start screen as the only door to another one.
+                //
+                // The planner decides what fits BEFORE anything is drawn, so the
+                // strip never paints past the edge: the documents outrank the
+                // launcher chips, and whatever is left out becomes the catalog
+                // behind the ellipsis. That is Finder's own order - the open
+                // window's document tabs first, the rest in an overflow menu.
+                let inactive: Vec<RightTab> = RightTab::ALL
+                    .into_iter()
+                    .filter(|pane| *pane != tab)
+                    .collect();
+                let file_widths: Vec<f32> = self
+                    .files
+                    .tabs
+                    .iter()
+                    .map(|file| file_tab_w(&file.label()))
+                    .collect();
+                let active_w = pane_tab_w(&self.state.lang.tr(tab.key()));
+                let plan = plan_tab_strip(
+                    self.strip_budget(band),
+                    tab,
+                    active_w,
+                    &file_widths,
+                    self.files.active,
+                    &inactive,
+                );
+                let mut strip = div()
+                    .h(px(theme::RIGHT_TAB_H))
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(STRIP_GAP));
+                for (slot, width) in plan.visible {
+                    let chip = match slot {
+                        StripSlot::Pane(pane) if pane == tab => {
+                            self.right_tab_chip(pane, width, cx).into_any_element()
+                        }
+                        StripSlot::Pane(pane) => self.right_pane_chip(pane, cx).into_any_element(),
+                        StripSlot::File(index) => match self.files.tabs.get(index) {
+                            Some(file_tab) => self
+                                .files_tab_chip(index, file_tab, width, cx)
+                                .into_any_element(),
+                            None => continue,
+                        },
+                    };
+                    strip = strip.child(chip);
                 }
-                // The files open out of the Files pane join the panel's own tab
-                // strip, right after its chip: the reference's dock carries
-                // every open pane and document in one strip, and a second strip
-                // inside the pane would read as two unrelated rows.
-                if tab == RightTab::Files {
-                    for (index, file_tab) in self.files.tabs.iter().enumerate() {
-                        content = content.child(self.files_tab_chip(index, file_tab, cx));
-                    }
+                if plan.overflow {
+                    strip = strip.child(self.tab_catalog(cx));
                 }
-                content
-                    .child(
-                        div()
-                            .id("right-new-tab")
-                            .debug_selector(|| String::from("right-new-tab"))
-                            .w(px(26.0))
-                            .h(px(26.0))
-                            .rounded(px(theme::RADIUS_SM))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(theme::hover())))
-                            .child(icon(IconName::Plus, 14.0, theme::faint()))
-                            // A new tab lands back on the Start screen, which is
-                            // where a pane without a chip of its own would be
-                            // picked.
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.browser_pane_closed();
-                                cx.notify();
-                            })),
-                    )
-                    .child(div().flex_1())
-                    // No strip control for the review drawer: the + that follows
-                    // a selection is its door now, so the strip carries only the
-                    // panel's own tabs and controls.
+                // The strip's own spacer takes what is left, so the controls
+                // stay at the right edge the way the reference draws them.
+                strip = strip.child(div().flex_1());
+                row.child(strip)
+                    .child(self.right_new_tab(cx))
                     .child(self.right_panel_control(
                         "right-maximize",
                         if self.right.maximized {
@@ -1009,6 +1225,161 @@ impl Shell {
             }
         };
         bar.child(content)
+    }
+
+    /// The pixels the strip itself may use, after the padding and the three
+    /// header controls have taken theirs.
+    ///
+    /// The panel owns the traffic-light band when it is the window's corner
+    /// column, and then its bar starts after the lights; the budget has to
+    /// follow that, or the plan would fit one last tab under the buttons.
+    fn strip_budget(&self, band: bool) -> f32 {
+        let bar_w = if band {
+            (self.right_panel_w() - theme::traffic_light_inset().right).max(0.0)
+        } else {
+            self.right_panel_w()
+        };
+        // The bar's 12px padding a side, the column's two .5px rules, and the
+        // controls with the gaps around them and at the strip's trailing edge.
+        (bar_w - theme::RIGHT_PAD * 2.0 - 1.0 - strip_chrome_w()).max(0.0)
+    }
+
+    /// The strip's new-tab control: a press lands on the Start screen, which is
+    /// where a pane without a chip of its own is picked.
+    fn right_new_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let label = self.state.lang.tr("right.newTab");
+        div()
+            .id("right-new-tab")
+            .debug_selector(|| String::from("right-new-tab"))
+            .w(px(26.0))
+            .h(px(26.0))
+            .flex_none()
+            .rounded(px(theme::RADIUS_SM))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(theme::hover())))
+            .tooltip_show_delay(std::time::Duration::from_millis(500))
+            .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
+            .child(icon(IconName::Plus, 14.0, theme::faint()))
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.close_right_pane(cx);
+            }))
+    }
+
+    /// The catalog behind the ellipsis: every open tab, then the actions that
+    /// close them.
+    ///
+    /// This is the overflow menu Finder shows when a window cannot fit another
+    /// tab, except that it catalogs the WHOLE strip rather than only the tabs
+    /// that were left out: a reader who opens it can see where they are and
+    /// move to any tab, not just recover the hidden ones. The strip only draws
+    /// the trigger when something actually did not fit; hiding tabs behind a
+    /// control that is always there would make the strip lie about its width.
+    fn tab_catalog(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let lang = self.state.lang;
+        let entity = cx.entity();
+        let docs: Vec<(usize, String, bool)> = self
+            .files
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| {
+                (
+                    index,
+                    tab.label(),
+                    self.right.tab == Some(RightTab::Files) && self.files.active == Some(index),
+                )
+            })
+            .collect();
+        let panes: Vec<(RightTab, String, bool)> = RightTab::ALL
+            .iter()
+            .map(|pane| (*pane, lang.tr(pane.key()), self.right.tab == Some(*pane)))
+            .collect();
+        let active_doc = self.files.active;
+        let doc_count = docs.len();
+        let title = format!("{} ({})", lang.tr("right.tabs"), docs.len() + panes.len());
+        let tooltip = title.clone();
+        // The kit's dropdown rides a Button; the wrapper is what carries the
+        // debug selector, because a Button records no bounds of its own.
+        let trigger = Button::new("right-tab-overflow")
+            .ghost()
+            .w(px(STRIP_OVERFLOW_W))
+            .h(px(26.0))
+            .p(px(0.0))
+            .flex_none()
+            .rounded(px(theme::RADIUS_SM))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(icon(IconName::Ellipsis, 14.0, theme::faint()))
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                let mut menu = menu.scrollable(true).max_h(px(420.0));
+                menu = menu.item(PopupMenuItem::label(lang.tr("right.tabs")));
+                if docs.is_empty() {
+                    menu = menu.item(PopupMenuItem::label(lang.tr("right.tabs.none")));
+                }
+                for (index, label, active) in docs.iter().cloned() {
+                    let shell = entity.clone();
+                    menu = menu.item(
+                        catalog_row(
+                            format!("tab-catalog-file-{index}"),
+                            file_glyph_for_name(&label),
+                            label,
+                            active,
+                        )
+                        .on_click(move |_, _window, cx| {
+                            shell.update(cx, |this, cx| this.focus_tab(index, cx));
+                        }),
+                    );
+                }
+                menu = menu
+                    .item(PopupMenuItem::separator())
+                    .item(PopupMenuItem::label(lang.tr("right.tabs.panes")));
+                for (pane, label, active) in panes.iter().cloned() {
+                    let shell = entity.clone();
+                    menu = menu.item(
+                        catalog_row(
+                            format!("tab-catalog-pane-{}", pane.slug()),
+                            pane.glyph(),
+                            label,
+                            active,
+                        )
+                        .on_click(move |_, window, cx| {
+                            shell.update(cx, |this, cx| this.open_right_tab(pane, window, cx));
+                        }),
+                    );
+                }
+                if doc_count > 0 {
+                    menu = menu.item(PopupMenuItem::separator());
+                    let all = entity.clone();
+                    menu = menu.item(PopupMenuItem::new(lang.tr("right.closeAll")).on_click(
+                        move |_, _, cx| {
+                            all.update(cx, |this, cx| this.close_all_tabs(cx));
+                        },
+                    ));
+                    if let Some(keep) = active_doc {
+                        let others = entity.clone();
+                        menu =
+                            menu.item(PopupMenuItem::new(lang.tr("right.closeOthers")).on_click(
+                                move |_, _, cx| {
+                                    others.update(cx, |this, cx| this.close_other_tabs(keep, cx));
+                                },
+                            ));
+                    }
+                }
+                menu
+            });
+        div()
+            .id("right-tab-overflow-wrap")
+            .debug_selector(|| String::from("right-tab-overflow"))
+            .w(px(STRIP_OVERFLOW_W))
+            .h(px(26.0))
+            .flex_none()
+            .child(trigger)
+            .tooltip_show_delay(std::time::Duration::from_millis(500))
+            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
     }
 
     /// One pane's chip in the strip, for every pane that is not the open one.
@@ -1049,16 +1420,27 @@ impl Shell {
     /// holds the body, the chip sits unselected and pressing it hands the body
     /// back, which is how the reference's dock moves between a pane and the
     /// documents opened out of it.
-    fn right_tab_chip(&self, tab: RightTab, cx: &mut Context<Self>) -> impl IntoElement {
+    fn right_tab_chip(
+        &self,
+        tab: RightTab,
+        width: f32,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let lang = self.state.lang;
         let selected = match tab {
             RightTab::Files => self.files.active.is_none(),
             _ => true,
         };
+        let label = lang.tr(tab.key());
+        let documents = self.files.tabs.len();
+        let entity = cx.entity();
         div()
             .id("right-tab")
             .debug_selector(|| String::from("right-tab"))
+            .w(px(width))
             .h(px(theme::RIGHT_TAB_H))
+            .flex_none()
+            .min_w_0()
             .px(px(8.0))
             .rounded(px(theme::RADIUS_SM))
             .when(selected, |chip| chip.bg(rgb(theme::selected_row())))
@@ -1068,43 +1450,78 @@ impl Shell {
             .flex_row()
             .items_center()
             .gap(px(6.0))
-            .child(icon(
-                tab.glyph(),
-                14.0,
-                if selected {
-                    theme::text()
-                } else {
-                    theme::muted()
-                },
-            ))
-            .child(txt(
-                lang.tr(tab.key()),
-                theme::CHIP_SIZE,
-                if selected {
-                    theme::text()
-                } else {
-                    theme::muted()
-                },
-            ))
+            .overflow_hidden()
+            .child(
+                icon(
+                    tab.glyph(),
+                    14.0,
+                    if selected {
+                        theme::text()
+                    } else {
+                        theme::muted()
+                    },
+                )
+                .flex_none(),
+            )
+            .child(
+                txt(
+                    label,
+                    theme::CHIP_SIZE,
+                    if selected {
+                        theme::text()
+                    } else {
+                        theme::muted()
+                    },
+                )
+                .flex_1()
+                .min_w_0()
+                .text_ellipsis(),
+            )
             .child(
                 div()
                     .id("right-tab-close")
                     .debug_selector(|| String::from("right-tab-close"))
                     .ml(px(2.0))
                     .px(px(3.0))
+                    .flex_none()
                     .rounded(px(4.0))
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(theme::hover())))
                     .child(icon(IconName::X, 12.0, theme::faint()))
                     .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.browser_pane_closed();
-                        cx.notify();
+                        cx.stop_propagation();
+                        this.close_right_pane(cx);
                     })),
             )
             .when(tab == RightTab::Files && !selected, |chip| {
                 chip.on_click(cx.listener(|this, _event, _window, cx| {
                     this.focus_tree(cx);
                 }))
+            })
+            // The context menu is the tab's own operations, in the order macOS
+            // Finder lists them. The pane is the tab that is up here, so
+            // "other tabs" means every document opened beside it.
+            .context_menu(move |menu, _, _| {
+                let close = entity.clone();
+                let others = entity.clone();
+                let all = entity.clone();
+                menu.item(
+                    PopupMenuItem::new(lang.tr("right.close")).on_click(move |_, _, cx| {
+                        close.update(cx, |this, cx| this.close_right_pane(cx));
+                    }),
+                )
+                .item(
+                    PopupMenuItem::new(lang.tr("right.closeOthers"))
+                        .disabled(documents == 0)
+                        .on_click(move |_, _, cx| {
+                            others.update(cx, |this, cx| this.close_all_document_tabs(cx));
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new(lang.tr("right.closeAll")).on_click(move |_, _, cx| {
+                        all.update(cx, |this, cx| this.close_all_tabs(cx));
+                    }),
+                )
             })
     }
 
@@ -1120,6 +1537,7 @@ impl Shell {
             .id(id)
             .w(px(26.0))
             .h(px(26.0))
+            .flex_none()
             .rounded(px(theme::RADIUS_SM))
             .flex()
             .items_center()
@@ -1149,6 +1567,7 @@ impl Shell {
             .id("right-close")
             .w(px(26.0))
             .h(px(26.0))
+            .flex_none()
             .rounded(px(theme::RADIUS_SM))
             .flex()
             .items_center()
@@ -3313,6 +3732,7 @@ impl Shell {
                                 let item = federation::KnowledgeItem {
                                     id: format!("ui-{now}"),
                                     class: federation::KnowledgeClass::Public,
+                                    workspace: None,
                                     payload: payload.clone(),
                                     provenance: federation::Provenance {
                                         origin,
@@ -5399,38 +5819,56 @@ impl Shell {
         &self,
         index: usize,
         tab: &FileTab,
+        width: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let active = self.files.active == Some(index);
+        // The document is only "on screen" while Files holds the body: another
+        // pane can be up with the same buffer still open, and a chip painted as
+        // selected then would name a body the reader cannot see.
+        let selected = self.right.tab == Some(RightTab::Files) && self.files.active == Some(index);
         let name = tab.label();
         let chip_name = name.clone();
         let dirty = tab.dirty;
-        let active_color = if active {
+        let text_color = if selected {
             theme::text()
         } else {
             theme::muted()
         };
-        let weight = if active {
+        let weight = if selected {
             FontWeight::MEDIUM
         } else {
             FontWeight::default()
         };
         let close_name = name.clone();
+        let documents = self.files.tabs.len();
+        let to_right = documents.saturating_sub(index + 1);
+        let lang = self.state.lang;
+        let entity = cx.entity();
         div()
             .debug_selector(move || format!("file-tab-{chip_name}"))
             .id(SharedString::from(format!("file-tab-{index}")))
+            .w(px(width))
             .h(px(26.0))
+            .flex_none()
+            .min_w_0()
             .px(px(8.0))
             .rounded(px(6.0))
             .flex()
             .flex_row()
             .items_center()
             .gap(px(6.0))
+            .overflow_hidden()
             .cursor_pointer()
-            .when(active, |chip| chip.bg(rgb(theme::selected_row())))
+            .when(selected, |chip| chip.bg(rgb(theme::selected_row())))
             .hover(|s| s.bg(rgb(theme::hover())))
             .child(icon(file_glyph_for_name(&name), 12.0, theme::faint()).flex_none())
-            .child(txt(name, theme::CHIP_SIZE, active_color).font_weight(weight))
+            .child(
+                txt(name, theme::CHIP_SIZE, text_color)
+                    .font_weight(weight)
+                    .flex_1()
+                    .min_w_0()
+                    .text_ellipsis(),
+            )
             // A note glyph rides the chip the way the dirty dot does, so a
             // reader sees at a glance that the file carries remarks.
             .when(self.files.notes.has_notes(&tab.rel), |chip| {
@@ -5453,6 +5891,7 @@ impl Shell {
                     .id(SharedString::from(format!("file-tab-close-{index}")))
                     .debug_selector(move || format!("file-tab-close-{close_name}"))
                     .px(px(3.0))
+                    .flex_none()
                     .rounded(px(4.0))
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(theme::hover())))
@@ -5465,6 +5904,36 @@ impl Shell {
             .on_click(cx.listener(move |this, _event, _window, cx| {
                 this.focus_tab(index, cx);
             }))
+            .context_menu(move |menu, _, _| {
+                let close = entity.clone();
+                let others = entity.clone();
+                let right = entity.clone();
+                let all = entity.clone();
+                menu.item(
+                    PopupMenuItem::new(lang.tr("right.close")).on_click(move |_, _, cx| {
+                        close.update(cx, |this, cx| this.close_tab(index, cx));
+                    }),
+                )
+                .item(
+                    PopupMenuItem::new(lang.tr("right.closeOthers"))
+                        .disabled(documents < 2)
+                        .on_click(move |_, _, cx| {
+                            others.update(cx, |this, cx| this.close_other_tabs(index, cx));
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new(lang.tr("right.closeRight"))
+                        .disabled(to_right == 0)
+                        .on_click(move |_, _, cx| {
+                            right.update(cx, |this, cx| this.close_tabs_to_the_right(index, cx));
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new(lang.tr("right.closeAll")).on_click(move |_, _, cx| {
+                        all.update(cx, |this, cx| this.close_all_tabs(cx));
+                    }),
+                )
+            })
     }
 
     /// Raise the review card for the current selection.
@@ -7862,8 +8331,14 @@ impl Shell {
     }
 
     /// Focus a tab by index, which is what pressing its chip does.
+    ///
+    /// A document only has a body while Files is the pane, so a chip pressed
+    /// from another pane brings Files back with it. The reference's dock does
+    /// the same: selecting a document tab is selecting the surface that draws
+    /// it, not merely recolouring the chip.
     pub(crate) fn focus_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         if index < self.files.tabs.len() {
+            self.show_right_tab(RightTab::Files, cx);
             self.files.active = Some(index);
             cx.notify();
         }
@@ -7877,20 +8352,93 @@ impl Shell {
 
     /// Close a tab and leave the neighbour that was beside it active.
     ///
-    /// Closing the last one empties the editor area, so the tree takes the
-    /// panel back over rather than leaving a dead header behind.
+    /// Finder hands the body to the tab that takes the closed one's place -
+    /// its right neighbour, or its left when it was the last. bsh used to drop
+    /// the reader back to the tree instead, which made closing a tab feel like
+    /// closing the pane; the tree is the destination only when no document is
+    /// left.
     pub(crate) fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         if index >= self.files.tabs.len() {
             return;
         }
+        let was_active = self.files.active == Some(index);
         self.files.tabs.remove(index);
-        match self.files.active {
-            // Closing the tab on screen hands the panel back to the tree,
-            // which is the surface the Files chip names.
-            Some(open) if open == index => self.files.active = None,
-            Some(open) if open > index => self.files.active = Some(open - 1),
-            _ => {}
+        self.files.active = if was_active {
+            if self.files.tabs.is_empty() {
+                None
+            } else {
+                Some(index.min(self.files.tabs.len() - 1))
+            }
+        } else {
+            match self.files.active {
+                Some(open) if open > index => Some(open - 1),
+                other => other,
+            }
+        };
+        cx.notify();
+    }
+
+    /// Close every document tab except the one at `keep`.
+    ///
+    /// The kept tab becomes the only tab, so it takes index 0 and the body.
+    /// Finder's "Close Other Tabs" is this action; the pane stays where it is.
+    pub(crate) fn close_other_tabs(&mut self, keep: usize, cx: &mut Context<Self>) {
+        if keep >= self.files.tabs.len() {
+            return;
         }
+        let kept = self.files.tabs.remove(keep);
+        self.files.tabs.clear();
+        self.files.tabs.push(kept);
+        self.files.active = Some(0);
+        cx.notify();
+    }
+
+    /// Close every document tab to the right of `index`.
+    pub(crate) fn close_tabs_to_the_right(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index + 1 >= self.files.tabs.len() {
+            return;
+        }
+        self.files.tabs.truncate(index + 1);
+        if let Some(open) = self.files.active {
+            if open > index {
+                self.files.active = Some(index);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Close every document tab and leave the pane where it is.
+    ///
+    /// This is the pane tab's "Close Other Tabs": the pane is the tab being
+    /// kept, so the documents are the ones that go.
+    pub(crate) fn close_all_document_tabs(&mut self, cx: &mut Context<Self>) {
+        if self.files.tabs.is_empty() {
+            return;
+        }
+        self.files.tabs.clear();
+        self.files.active = None;
+        cx.notify();
+    }
+
+    /// Close every tab, documents and pane alike, and return to Start.
+    ///
+    /// The label means what it says: after this the panel has no tab open, and
+    /// the Start screen - the empty surface - is what shows.
+    pub(crate) fn close_all_tabs(&mut self, cx: &mut Context<Self>) {
+        self.files.tabs.clear();
+        self.files.active = None;
+        self.close_right_pane(cx);
+    }
+
+    /// Close the pane that is up, keeping the documents that were opened
+    /// beside it.
+    ///
+    /// A browser owns a process, a terminal owns a native layer, and the
+    /// comparison surface owns a parsed file; each has to be told the pane is
+    /// gone, or it keeps painting behind the Start screen.
+    pub(crate) fn close_right_pane(&mut self, cx: &mut Context<Self>) {
+        self.browser_pane_closed();
+        self.hide_terminal_view(cx);
         cx.notify();
     }
 
@@ -9163,8 +9711,10 @@ pub(crate) fn federation_rows(store: &federation::PeerStore) -> Vec<FederationPe
             node: record.node.to_string(),
             name: record.note.clone(),
             state: match record.state {
+                federation::TrustState::Invited => "invited",
                 federation::TrustState::Pending => "pending",
                 federation::TrustState::Trusted => "trusted",
+                federation::TrustState::Suspended => "suspended",
                 federation::TrustState::Revoked => "revoked",
             }
             .to_string(),
@@ -9399,8 +9949,9 @@ mod tests {
     };
 
     use super::{
-        anchor_line, chord_modifiers, named_key, page_point, page_wheel, typed_text, BrowserClick,
-        BROWSER_WHEEL_GAIN,
+        anchor_line, chord_modifiers, file_tab_w, named_key, page_point, page_wheel, pane_tab_w,
+        plan_tab_strip, typed_text, BrowserClick, RightTab, StripSlot, BROWSER_WHEEL_GAIN,
+        STRIP_GAP, STRIP_OVERFLOW_W, STRIP_TAB_MIN_W,
     };
 
     fn key(key: &str, key_char: Option<&str>) -> Keystroke {
@@ -9430,6 +9981,130 @@ mod tests {
     fn an_empty_selection_has_no_anchor() {
         assert_eq!(anchor_line("one\ntwo\n", &(0..0), &(0..10)), None);
         assert_eq!(anchor_line("one\ntwo\n", &(3..3), &(0..10)), None);
+    }
+
+    /// Every pane that is not the open one, in the order the strip offers them.
+    fn launchers() -> [RightTab; 6] {
+        [
+            RightTab::Diff,
+            RightTab::Terminal,
+            RightTab::Browser,
+            RightTab::Extensions,
+            RightTab::Federation,
+            RightTab::Tasks,
+        ]
+    }
+
+    /// Room to spare draws the pane, its documents, and every launcher chip,
+    /// with no catalog trigger.
+    #[test]
+    fn a_wide_strip_keeps_every_tab_and_chip() {
+        let files = [file_tab_w("README.md"), file_tab_w("Cargo.toml")];
+        let plan = plan_tab_strip(
+            900.0,
+            RightTab::Files,
+            pane_tab_w("Files"),
+            &files,
+            Some(0),
+            &launchers(),
+        );
+        assert!(
+            !plan.overflow,
+            "everything fits, so nothing needs a catalog"
+        );
+        assert_eq!(plan.visible.len(), 1 + files.len() + launchers().len());
+        assert_eq!(plan.visible[0].0, StripSlot::Pane(RightTab::Files));
+        assert_eq!(plan.visible[1].0, StripSlot::File(0));
+        assert_eq!(plan.visible[2].0, StripSlot::File(1));
+    }
+
+    /// The documents outrank the launcher chips: at the panel's default width
+    /// both open files stay, and the panes that do not fit move into the
+    /// catalog.
+    #[test]
+    fn documents_outrank_the_launcher_chips() {
+        let files = [file_tab_w("README.md"), file_tab_w("Cargo.toml")];
+        let plan = plan_tab_strip(
+            365.0,
+            RightTab::Files,
+            pane_tab_w("Files"),
+            &files,
+            Some(0),
+            &launchers(),
+        );
+        assert!(plan.overflow, "the strip cannot hold all six chips too");
+        let shown: Vec<StripSlot> = plan.visible.iter().map(|(slot, _)| *slot).collect();
+        assert!(shown.contains(&StripSlot::File(0)));
+        assert!(shown.contains(&StripSlot::File(1)));
+        assert_eq!(
+            shown
+                .iter()
+                .filter(|slot| matches!(slot, StripSlot::Pane(_)))
+                .count(),
+            1,
+            "only the open pane is drawn: {shown:?}"
+        );
+    }
+
+    /// A crowded strip keeps the tab on screen and never draws a document
+    /// narrower than the legibility floor.
+    #[test]
+    fn a_crowded_strip_keeps_the_open_document() {
+        let files = [120.0; 8];
+        let plan = plan_tab_strip(
+            280.0,
+            RightTab::Files,
+            pane_tab_w("Files"),
+            &files,
+            Some(6),
+            &launchers(),
+        );
+        assert!(plan.overflow);
+        assert!(
+            plan.visible
+                .iter()
+                .any(|(slot, _)| *slot == StripSlot::File(6)),
+            "the open document must stay on screen: {:?}",
+            plan.visible
+        );
+        for (slot, width) in &plan.visible {
+            if matches!(slot, StripSlot::File(_)) {
+                assert!(
+                    *width >= STRIP_TAB_MIN_W,
+                    "a document tab shrank below the floor: {slot:?} is {width}px"
+                );
+            }
+        }
+    }
+
+    /// The plan is a budget, not a suggestion: what it draws - tabs, gaps and
+    /// the catalog trigger - never adds up to more than the strip may use.
+    #[test]
+    fn no_plan_draws_past_its_budget() {
+        let files: Vec<f32> = (0..9)
+            .map(|index| file_tab_w(&format!("document-{index}.md")))
+            .collect();
+        for budget in [206.0, 280.0, 365.0, 456.0, 900.0] {
+            let plan = plan_tab_strip(
+                budget,
+                RightTab::Files,
+                pane_tab_w("Files"),
+                &files,
+                Some(4),
+                &launchers(),
+            );
+            let drawn = plan.visible.iter().map(|(_, width)| *width).sum::<f32>()
+                + plan.visible.len() as f32 * STRIP_GAP
+                + if plan.overflow {
+                    STRIP_OVERFLOW_W + STRIP_GAP
+                } else {
+                    0.0
+                };
+            assert!(
+                drawn <= budget + 0.01,
+                "budget {budget}: drew {drawn}: {plan:?}"
+            );
+        }
     }
 
     /// The pre-warm paints `about:blank` before any navigation, so a capture
@@ -9748,6 +10423,8 @@ mod federation_pane_tests {
                         target: target.clone(),
                         objective: objective.to_string(),
                         capabilities: Vec::new(),
+                        operations: Vec::new(),
+                        resources: Vec::new(),
                         deadline_ms: None,
                         allow_sub_delegation: false,
                         result_contract: None,

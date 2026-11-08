@@ -460,6 +460,8 @@ impl self::bsh::extension::host::Host for HostState {
         path: String,
     ) -> Result<Vec<u8>, self::bsh::extension::types::HostError> {
         self.check_alive()?;
+        let relative = validate_relative_path(&path)
+            .map_err(self::bsh::extension::types::HostError::Denied)?;
         let path = self.workspace_path(&path)?;
         self.authorize(
             Capability::WorkspaceRead,
@@ -469,16 +471,66 @@ impl self::bsh::extension::host::Host for HostState {
                 ..CallScope::default()
             },
         )?;
-        let metadata = std::fs::metadata(&path)
-            .map_err(|error| self::bsh::extension::types::HostError::Runtime(error.to_string()))?;
-        if metadata.len() > MAX_HOST_BODY as u64 {
-            return Err(self::bsh::extension::types::HostError::Limited(format!(
-                "{} is larger than {MAX_HOST_BODY} bytes",
-                path.display()
-            )));
+        // Open BEFORE reading and never follow a final symlink: the check in
+        // workspace_path cannot bind the later read, so a leaf swapped for a
+        // symlink between the two would be followed. O_NOFOLLOW makes the open
+        // itself refuse it (ELOOP); the size ceiling is then taken from the
+        // opened handle, not a second (re-resolved) path lookup.
+        //
+        // The open walks the relative path one component at a time from the
+        // workspace handle (see open_beneath), so swapping a parent directory
+        // after workspace_path resolves it cannot redirect the read: every
+        // intermediate directory is pinned by its own handle.
+        #[cfg(unix)]
+        {
+            use std::io::Read as _;
+            let workspace = self.workspace.as_ref().ok_or_else(|| {
+                self::bsh::extension::types::HostError::Denied("no workspace is open".to_string())
+            })?;
+            // Open one component at a time beneath the workspace handle. Each
+            // directory fd is pinned before the next component is resolved, so
+            // a parent swapped after the check cannot redirect the read.
+            let mut file = open_beneath(workspace, &relative).map_err(|error| {
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::ELOOP) | Some(libc::ENOTDIR)
+                ) {
+                    self::bsh::extension::types::HostError::Denied(
+                        "a path component is a symlink or not a directory".to_string(),
+                    )
+                } else {
+                    self::bsh::extension::types::HostError::Runtime(error.to_string())
+                }
+            })?;
+            let metadata = file.metadata().map_err(|error| {
+                self::bsh::extension::types::HostError::Runtime(error.to_string())
+            })?;
+            if metadata.len() > MAX_HOST_BODY as u64 {
+                return Err(self::bsh::extension::types::HostError::Limited(format!(
+                    "{} is larger than {MAX_HOST_BODY} bytes",
+                    path.display()
+                )));
+            }
+            let mut bytes = Vec::with_capacity(metadata.len() as usize);
+            file.read_to_end(&mut bytes).map_err(|error| {
+                self::bsh::extension::types::HostError::Runtime(error.to_string())
+            })?;
+            Ok(bytes)
         }
-        std::fs::read(&path)
-            .map_err(|error| self::bsh::extension::types::HostError::Runtime(error.to_string()))
+        #[cfg(not(unix))]
+        {
+            let metadata = std::fs::metadata(&path).map_err(|error| {
+                self::bsh::extension::types::HostError::Runtime(error.to_string())
+            })?;
+            if metadata.len() > MAX_HOST_BODY as u64 {
+                return Err(self::bsh::extension::types::HostError::Limited(format!(
+                    "{} is larger than {MAX_HOST_BODY} bytes",
+                    path.display()
+                )));
+            }
+            std::fs::read(&path)
+                .map_err(|error| self::bsh::extension::types::HostError::Runtime(error.to_string()))
+        }
     }
 
     fn write_file(
@@ -1831,5 +1883,121 @@ mod tests {
         assert_eq!(result["x"], 1);
         runtime.shutdown().await.expect("shutdown");
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+}
+
+/// Open a file beneath `root` one component at a time.
+///
+/// Each intermediate directory is opened with O_DIRECTORY|O_NOFOLLOW and the
+/// next component is opened relative to that pinned handle, so a parent
+/// directory swapped after the check cannot redirect the read: every step is
+/// resolved against a handle the caller already holds. The final component uses
+/// O_NOFOLLOW as well.
+#[cfg(unix)]
+fn open_beneath(
+    root: &std::path::Path,
+    relative: &std::path::Path,
+) -> std::io::Result<std::fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::{FromRawFd, IntoRawFd};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let root_file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(root)?;
+    let mut fd = root_file.into_raw_fd();
+    let mut components = relative.components().peekable();
+    if components.peek().is_none() {
+        unsafe { libc::close(fd) };
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "an empty path names no file",
+        ));
+    }
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(name) = component else {
+            unsafe { libc::close(fd) };
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "a path component is not a plain name",
+            ));
+        };
+        let last = components.peek().is_none();
+        let mut flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        if !last {
+            flags |= libc::O_DIRECTORY;
+        }
+        let Ok(name) = CString::new(name.as_bytes()) else {
+            unsafe { libc::close(fd) };
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "a path component contains NUL",
+            ));
+        };
+        let next = unsafe { libc::openat(fd, name.as_ptr(), flags) };
+        if next < 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(error);
+        }
+        unsafe { libc::close(fd) };
+        fd = next;
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(all(test, unix))]
+mod open_beneath_tests {
+    use super::open_beneath;
+    use std::io::Read as _;
+    use std::path::Path;
+
+    fn root(label: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "ferris-open-beneath-{label}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("a/b")).expect("dirs");
+        std::fs::write(root.join("a/b/file.txt"), b"hello").expect("write");
+        root
+    }
+
+    #[test]
+    fn a_nested_file_opens() {
+        let root = root("nested");
+        let mut file = open_beneath(&root, Path::new("a/b/file.txt")).expect("open");
+        let mut text = String::new();
+        file.read_to_string(&mut text).expect("read");
+        assert_eq!(text, "hello");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_symlinked_component_is_refused() {
+        let root = root("symlink");
+        std::os::unix::fs::symlink(root.join("a"), root.join("link")).expect("symlink");
+        assert!(
+            open_beneath(&root, Path::new("link/b/file.txt")).is_err(),
+            "a symlinked intermediate is refused"
+        );
+        std::os::unix::fs::symlink(root.join("a/b/file.txt"), root.join("leaf")).expect("symlink");
+        assert!(
+            open_beneath(&root, Path::new("leaf")).is_err(),
+            "a symlinked leaf is refused"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_parent_component_is_refused() {
+        let root = root("parent");
+        assert!(
+            open_beneath(&root, Path::new("../a/b/file.txt")).is_err(),
+            "a .. component never reaches the kernel"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

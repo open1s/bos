@@ -65,11 +65,25 @@ impl CapabilityProvider for RemoteCapabilityProvider {
     }
 
     async fn invoke(&self, call: CapabilityCall<'_>) -> Result<CapabilityOutput, CapabilityError> {
+        // The generic adapter sends the scope convention a scoped grant can
+        // enforce: the capability's leaf name as the operation, and its path or
+        // uri argument (when it has one) as the resource. A legacy grant with no
+        // selectors admits either value.
+        let scope = crate::InvocationScope {
+            operation: Some(call.capability.name().to_string()),
+            resource: call
+                .input
+                .get("path")
+                .or_else(|| call.input.get("uri"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+        };
         self.federation
-            .invoke(
+            .invoke_scoped(
                 &self.node,
                 call.capability,
                 call.input.clone(),
+                Some(&scope),
                 call.context,
             )
             .await

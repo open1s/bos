@@ -386,3 +386,124 @@ fn a_catalogue_refuses_a_duplicate_id_and_a_duplicate_surface() {
     let error = catalogue.insert(shared_surface);
     assert!(error.is_err());
 }
+
+fn peer_catalogue(id: &str, entries: &[(&str, &str)]) -> PeerCatalogue {
+    PeerCatalogue::new(node(id), catalogue(entries))
+}
+
+#[test]
+fn a_pinned_peer_wins_and_the_decision_explains_why() {
+    let local = Catalogue::new();
+    let scope = LocalScope::admitting(workspace(), &local);
+    let mut spec = spec().with_requirement(
+        requirement("builtin/read_file", "^1")
+            .with_remote(RemotePolicy::Allowed)
+            .with_prefer(vec![node("node:b")]),
+    );
+    spec.peers = vec![granted("node:a"), granted("node:b"), granted("node:c")];
+    let peers = vec![
+        peer_catalogue("node:a", &[("builtin/read_file", "1.0.0")]).with_priority(-5),
+        peer_catalogue("node:b", &[("builtin/read_file", "1.0.0")]).with_priority(10),
+        peer_catalogue("node:c", &[("builtin/read_file", "1.0.0")]),
+    ];
+
+    let resolved = resolve_host(&spec, &local, &peers, &scope).expect("a plan");
+    let capability = &resolved.capabilities[0];
+    let selected = match &capability.binding {
+        Binding::Remote { node, .. } => node.as_str().to_string(),
+        Binding::Local { .. } => panic!("a remote binding"),
+    };
+    assert_eq!(
+        selected, "node:b",
+        "the pinned peer wins over priority and order"
+    );
+    let decision = capability.decision.as_ref().expect("a decision");
+    assert_eq!(decision.selected.as_str(), "node:b");
+    assert_eq!(decision.prefer_rank, Some(0));
+    assert!(
+        decision
+            .rejected
+            .iter()
+            .any(|rejection| rejection.node.as_str() == "node:a"
+                && rejection.reason.contains("outranked")),
+        "the losing alternatives are explained: {:?}",
+        decision.rejected
+    );
+}
+
+#[test]
+fn an_unhealthy_peer_is_skipped_unless_allowed() {
+    let local = Catalogue::new();
+    let scope = LocalScope::admitting(workspace(), &local);
+    let mut spec = spec().with_requirement(
+        requirement("builtin/read_file", "^1").with_remote(RemotePolicy::Allowed),
+    );
+    spec.peers = vec![granted("node:a"), granted("node:b")];
+    let peers = vec![
+        peer_catalogue("node:a", &[("builtin/read_file", "1.0.0")]).with_health(false),
+        peer_catalogue("node:b", &[("builtin/read_file", "1.0.0")]),
+    ];
+    let resolved = resolve_host(&spec, &local, &peers, &scope).expect("a plan");
+    match &resolved.capabilities[0].binding {
+        Binding::Remote { node, .. } => assert_eq!(node.as_str(), "node:b"),
+        Binding::Local { .. } => panic!("a remote binding"),
+    }
+    assert!(resolved.capabilities[0]
+        .decision
+        .as_ref()
+        .expect("a decision")
+        .rejected
+        .iter()
+        .any(|rejection| rejection.node.as_str() == "node:a" && rejection.reason == "unhealthy"));
+
+    let mut allowed = spec.clone();
+    allowed.requirements[0] = requirement("builtin/read_file", "^1")
+        .with_remote(RemotePolicy::Allowed)
+        .with_allow_unhealthy(true);
+    let resolved = resolve_host(&allowed, &local, &peers, &scope).expect("a plan");
+    match &resolved.capabilities[0].binding {
+        Binding::Remote { node, .. } => assert_eq!(node.as_str(), "node:a"),
+        Binding::Local { .. } => panic!("a remote binding"),
+    }
+}
+
+#[test]
+fn an_excluded_peer_is_never_selected() {
+    let local = Catalogue::new();
+    let scope = LocalScope::admitting(workspace(), &local);
+    let mut spec = spec().with_requirement(
+        requirement("builtin/read_file", "^1")
+            .with_remote(RemotePolicy::Allowed)
+            .with_exclude(vec![node("node:a")]),
+    );
+    spec.peers = vec![granted("node:a")];
+    let peers = vec![peer_catalogue("node:a", &[("builtin/read_file", "1.0.0")])];
+    assert!(resolve_host(&spec, &local, &peers, &scope).is_err());
+}
+
+#[test]
+fn selection_is_deterministic_regardless_of_listing_order() {
+    let local = Catalogue::new();
+    let scope = LocalScope::admitting(workspace(), &local);
+    let mut spec = spec().with_requirement(
+        requirement("builtin/read_file", "^1").with_remote(RemotePolicy::Allowed),
+    );
+    spec.peers = vec![granted("node:a"), granted("node:b"), granted("node:c")];
+    let forward = vec![
+        peer_catalogue("node:a", &[("builtin/read_file", "1.0.0")]).with_priority(5),
+        peer_catalogue("node:b", &[("builtin/read_file", "1.0.0")]).with_priority(1),
+        peer_catalogue("node:c", &[("builtin/read_file", "1.0.0")]).with_priority(9),
+    ];
+    let reversed: Vec<PeerCatalogue> = forward.iter().rev().cloned().collect();
+    let first = resolve_host(&spec, &local, &forward, &scope).expect("a plan");
+    let second = resolve_host(&spec, &local, &reversed, &scope).expect("a plan");
+    let selected = |resolved: &capability::composition::ResolvedComposition| match &resolved
+        .capabilities[0]
+        .binding
+    {
+        Binding::Remote { node, .. } => node.as_str().to_string(),
+        Binding::Local { .. } => panic!("a remote binding"),
+    };
+    assert_eq!(selected(&first), "node:b", "lowest priority wins");
+    assert_eq!(selected(&first), selected(&second));
+}

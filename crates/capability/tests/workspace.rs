@@ -71,6 +71,7 @@ fn plan(binding: Binding, id: &str) -> ResolvedComposition {
         capabilities: vec![ResolvedCapability {
             descriptor: descriptor(id),
             binding,
+            decision: None,
         }],
         skipped: Vec::new(),
         budgets: Budgets::default(),

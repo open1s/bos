@@ -15,6 +15,12 @@ fn item(id: &str, class: KnowledgeClass, payload: serde_json::Value) -> Knowledg
     KnowledgeItem {
         id: id.to_string(),
         class,
+        workspace: match class {
+            KnowledgeClass::Workspace => {
+                Some(capability::WorkspaceId::new("ws:test").expect("a valid workspace id"))
+            }
+            _ => None,
+        },
         provenance: Provenance {
             origin: node("node:source"),
             source: format!("memory/{id}"),
@@ -273,6 +279,66 @@ fn class_ceiling_and_minimisation_are_enforced() {
     );
 }
 
+/// A scoped query sees its own workspace's items plus unscoped public items,
+/// never another workspace's knowledge.
+#[test]
+fn workspace_knowledge_answers_only_its_own_scope() {
+    let source = node("node:source");
+    let mut service = KnowledgeService::new();
+    let mut one = item("k-ws1", KnowledgeClass::Public, json!({ "fact": "one" }));
+    one.workspace = Some(capability::WorkspaceId::new("ws:one").expect("a valid workspace id"));
+    let mut two = item("k-ws2", KnowledgeClass::Public, json!({ "fact": "two" }));
+    two.workspace = Some(capability::WorkspaceId::new("ws:two").expect("a valid workspace id"));
+    let public = item("k-public", KnowledgeClass::Public, json!({ "fact": "all" }));
+    service
+        .publish(
+            &source,
+            &KnowledgePublication::new(vec![one, two, public]),
+            200,
+        )
+        .expect("published");
+
+    let mut scoped = KnowledgeQuery::new("q1", KnowledgePurpose::Answer);
+    scoped.scope = Some(capability::WorkspaceId::new("ws:one").expect("a valid workspace id"));
+    scoped.max_items = 10;
+    let mut audit = Vec::new();
+    let response = service
+        .query(
+            &source,
+            &node("node:caller"),
+            &scoped,
+            200,
+            authorize_all,
+            &mut audit,
+        )
+        .expect("the query runs");
+    let ids: Vec<&str> = response.items.iter().map(|item| item.id.as_str()).collect();
+    assert!(ids.contains(&"k-ws1"), "{ids:?}");
+    assert!(!ids.contains(&"k-ws2"), "another workspace leaked: {ids:?}");
+    assert!(
+        ids.contains(&"k-public"),
+        "an unscoped public item still answers"
+    );
+
+    let mut unscoped = KnowledgeQuery::new("q2", KnowledgePurpose::Answer);
+    unscoped.max_items = 10;
+    let response = service
+        .query(
+            &source,
+            &node("node:caller"),
+            &unscoped,
+            200,
+            authorize_all,
+            &mut audit,
+        )
+        .expect("the query runs");
+    let ids: Vec<&str> = response.items.iter().map(|item| item.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["k-public"],
+        "an unscoped query sees only unscoped items"
+    );
+}
 #[test]
 fn a_revoked_grant_denies_the_next_query() {
     let mut service = KnowledgeService::new();

@@ -138,6 +138,12 @@ pub enum ResourceError {
         /// What is wrong.
         message: String,
     },
+    /// A transfer checkpoint could not be read or written.
+    #[error("cannot access the transfer checkpoints: {message}")]
+    Checkpoint {
+        /// What happened.
+        message: String,
+    },
     /// The lease state could not be persisted.
     #[error("the lease store could not be written: {message}")]
     Storage {
@@ -327,6 +333,112 @@ impl LeaseStore {
             return Err(error);
         }
         Ok(())
+    }
+}
+
+/// One resumable transfer's checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferRecord {
+    /// The lease the transfer runs under.
+    pub lease: String,
+    /// The resource being read.
+    pub uri: String,
+    /// The peer serving it.
+    pub peer: String,
+    /// The next byte to request.
+    pub position: u64,
+    /// When the checkpoint was written, in milliseconds since the Unix epoch.
+    pub updated_at_ms: u64,
+}
+
+/// Durable transfer checkpoints, so a restart resumes at the last byte.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TransferStore {
+    #[serde(default)]
+    records: std::collections::BTreeMap<String, TransferRecord>,
+}
+
+impl TransferStore {
+    /// An empty store.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Load the checkpoints; a missing file is an empty store.
+    pub fn load(path: &std::path::Path) -> Result<Self, ResourceError> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => serde_json::from_str(&text).map_err(|error| ResourceError::Checkpoint {
+                message: format!("{}: {error}", path.display()),
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::new()),
+            Err(error) => Err(ResourceError::Checkpoint {
+                message: format!("{}: {error}", path.display()),
+            }),
+        }
+    }
+
+    /// Write the checkpoints atomically.
+    pub fn save(&self, path: &std::path::Path) -> Result<(), ResourceError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| ResourceError::Checkpoint {
+                message: format!("{}: {error}", parent.display()),
+            })?;
+        }
+        let text =
+            serde_json::to_string_pretty(self).map_err(|error| ResourceError::Checkpoint {
+                message: error.to_string(),
+            })?;
+        let temporary = path.with_extension("json.part");
+        std::fs::write(&temporary, text).map_err(|error| ResourceError::Checkpoint {
+            message: format!("{}: {error}", temporary.display()),
+        })?;
+        std::fs::rename(&temporary, path).map_err(|error| ResourceError::Checkpoint {
+            message: format!("{}: {error}", path.display()),
+        })
+    }
+
+    fn key(lease: &LeaseId, uri: &str) -> String {
+        format!("{}:{uri}", lease.as_str())
+    }
+
+    /// Record one transfer's position.
+    pub fn checkpoint(&mut self, record: TransferRecord) {
+        self.records.insert(
+            Self::key(&LeaseId::new(record.lease.clone()), &record.uri),
+            record,
+        );
+    }
+
+    /// Forget a completed transfer.
+    pub fn remove(&mut self, lease: &LeaseId, uri: &str) {
+        self.records.remove(&Self::key(lease, uri));
+    }
+
+    /// The next byte to request for one transfer, or 0 when it is new.
+    pub fn position(&self, lease: &LeaseId, uri: &str) -> u64 {
+        self.records
+            .get(&Self::key(lease, uri))
+            .map(|record| record.position)
+            .unwrap_or(0)
+    }
+
+    /// One transfer's checkpoint.
+    pub fn get(&self, lease: &LeaseId, uri: &str) -> Option<&TransferRecord> {
+        self.records.get(&Self::key(lease, uri))
+    }
+
+    /// Every checkpoint.
+    pub fn records(&self) -> impl Iterator<Item = &TransferRecord> {
+        self.records.values()
+    }
+}
+
+/// The offset to request: a nonzero request wins, else the stored checkpoint.
+pub fn resume_offset(requested: u64, stored: u64) -> u64 {
+    if requested == 0 {
+        stored
+    } else {
+        requested
     }
 }
 
@@ -613,5 +725,76 @@ impl StreamReceiver {
     /// Credit still available to the sender.
     pub fn credit(&self) -> u64 {
         self.credit
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "federation-transfer-{label}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        dir.join("transfers.json")
+    }
+
+    /// A checkpointed position survives a save/load cycle, and completion
+    /// removes it.
+    #[test]
+    fn a_transfer_checkpoint_round_trips() {
+        let path = scratch("round-trip");
+        let lease = LeaseId::new("lease-1");
+        let mut store = TransferStore::new();
+        store.checkpoint(TransferRecord {
+            lease: lease.as_str().to_string(),
+            uri: "file:///artifact".to_string(),
+            peer: "node-b".to_string(),
+            position: 512,
+            updated_at_ms: 1_000,
+        });
+        store.save(&path).expect("save");
+
+        let loaded = TransferStore::load(&path).expect("load");
+        assert_eq!(loaded.position(&lease, "file:///artifact"), 512);
+        assert_eq!(
+            loaded.get(&lease, "file:///artifact").expect("record").peer,
+            "node-b"
+        );
+
+        let mut loaded = loaded;
+        loaded.remove(&lease, "file:///artifact");
+        assert_eq!(loaded.position(&lease, "file:///artifact"), 0);
+        loaded.save(&path).expect("save");
+        let reloaded = TransferStore::load(&path).expect("load");
+        assert_eq!(reloaded.position(&lease, "file:///artifact"), 0);
+        let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+    }
+
+    /// A resume uses the stored position only when the caller did not name one.
+    #[test]
+    fn a_resume_offset_keeps_an_explicit_request() {
+        assert_eq!(resume_offset(0, 512), 512);
+        assert_eq!(resume_offset(128, 512), 128);
+        assert_eq!(resume_offset(0, 0), 0);
+    }
+
+    /// A missing file is a fresh store; a corrupt one is an error.
+    #[test]
+    fn a_missing_or_corrupt_checkpoint_file_is_handled() {
+        let path = scratch("corrupt");
+        assert_eq!(
+            TransferStore::load(&path)
+                .expect("missing is empty")
+                .records()
+                .count(),
+            0
+        );
+        std::fs::write(&path, "not json").expect("write");
+        assert!(TransferStore::load(&path).is_err());
+        let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
     }
 }

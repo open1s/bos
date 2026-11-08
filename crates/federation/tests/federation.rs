@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use capability::transport::{unix_ms, FederationMessage, FederationTransport};
 use capability::{CapabilityError, DeliveryState};
-use federation::envelope::EnvelopeError;
+use federation::envelope::{EnvelopeError, PROTOCOL, SUPPORTED_SCHEMA_MAX, SUPPORTED_SCHEMA_MIN};
 use federation::{Envelope, InMemoryNetwork, NodeIdentity};
 use serde_json::json;
 
@@ -85,7 +85,8 @@ fn an_unknown_protocol_is_refused_before_anything_else() {
     assert_eq!(
         envelope.open(unix_ms()),
         Err(EnvelopeError::UnknownProtocol {
-            found: "other.fed/9".to_string()
+            found: "other.fed/9".to_string(),
+            expected: PROTOCOL.to_string(),
         })
     );
 }
@@ -97,7 +98,11 @@ fn an_unknown_schema_version_is_refused() {
 
     assert_eq!(
         envelope.open(unix_ms()),
-        Err(EnvelopeError::UnsupportedSchema { found: 2 })
+        Err(EnvelopeError::UnsupportedSchema {
+            found: 2,
+            min: SUPPORTED_SCHEMA_MIN,
+            max: SUPPORTED_SCHEMA_MAX,
+        })
     );
 }
 

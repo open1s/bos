@@ -6546,6 +6546,7 @@ mod tests {
                 binding: Binding::Local {
                     provider: ProviderId::builtin(),
                 },
+                decision: None,
             }],
             skipped: Vec::new(),
             budgets: agent::capability::composition::Budgets::default(),

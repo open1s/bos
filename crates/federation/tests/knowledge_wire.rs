@@ -53,6 +53,7 @@ fn item(origin: &NodeId, id: &str, payload: serde_json::Value) -> KnowledgeItem 
     KnowledgeItem {
         id: id.to_string(),
         class: KnowledgeClass::Public,
+        workspace: None,
         provenance: Provenance {
             origin: origin.clone(),
             source: format!("memory/{id}"),

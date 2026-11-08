@@ -24,6 +24,8 @@ fn request(
         target: node("node:builder"),
         objective: "verify the change".to_string(),
         capabilities,
+        operations: Vec::new(),
+        resources: Vec::new(),
         deadline_ms: None,
         allow_sub_delegation,
         result_contract: None,

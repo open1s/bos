@@ -182,6 +182,9 @@ pub struct KnowledgeItem {
     pub id: String,
     /// Sensitivity.
     pub class: KnowledgeClass,
+    /// The workspace this item belongs to, when it is workspace-bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceId>,
     /// The knowledge itself. It is data, never instructions.
     pub payload: Value,
     /// Where it came from and how to verify it.
@@ -559,6 +562,11 @@ impl KnowledgeService {
                     id: item.id.clone(),
                 });
             }
+            if item.class == KnowledgeClass::Workspace && item.workspace.is_none() {
+                return Err(KnowledgeError::Invalid {
+                    message: format!("workspace knowledge {} names no workspace", item.id),
+                });
+            }
             item.verify_provenance(publisher)?;
             if !item.fresh(now_ms) {
                 return Err(KnowledgeError::Stale);
@@ -658,6 +666,14 @@ impl KnowledgeService {
             .items
             .values()
             .filter(|item| item.class.allowed_by(query.max_class))
+            // A workspace-bound item answers only a query for that workspace; a
+            // query without a scope sees only unscoped items. Never another
+            // workspace's knowledge.
+            .filter(|item| match (&query.scope, &item.workspace) {
+                (Some(scope), Some(owner)) => owner == scope,
+                (Some(_), None) | (None, None) => true,
+                (None, Some(_)) => false,
+            })
             .filter(|item| item.fresh(now_ms))
             .filter(|item| {
                 let payload = item.payload.to_string().to_lowercase();
@@ -711,6 +727,7 @@ mod tests {
         KnowledgeItem {
             id: "k-1".to_string(),
             class: KnowledgeClass::Public,
+            workspace: None,
             payload: payload.clone(),
             provenance: Provenance {
                 origin: node.clone(),

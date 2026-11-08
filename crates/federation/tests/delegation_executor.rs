@@ -62,6 +62,7 @@ fn runtime(provider: Arc<dyn CapabilityProvider>, workspace: &str) -> Arc<Worksp
             binding: Binding::Local {
                 provider: ProviderId::builtin(),
             },
+            decision: None,
         }],
         skipped: Vec::new(),
         budgets: Budgets::default(),

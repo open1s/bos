@@ -39,6 +39,9 @@ pub enum DiscoveryError {
     /// The signature does not verify.
     #[error("the discovery record's signature does not verify")]
     Invalid,
+    /// The publisher speaks a protocol or schema this build cannot accept.
+    #[error("the peer speaks an unsupported protocol or schema")]
+    Incompatible,
 }
 
 /// What one Node publishes about its capabilities.
@@ -69,6 +72,12 @@ pub struct DiscoveryRecord {
     /// The publisher's policy revision at publication time.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub policy_revision: u64,
+    /// The protocol the publisher speaks; empty on a legacy record.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub protocol: String,
+    /// The envelope schema the publisher writes; 0 on a legacy record.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub schema_version: u32,
     /// Public descriptors only.
     pub descriptors: Vec<CapabilityDescriptor>,
     /// Base64 Ed25519 signature over the canonical form.
@@ -112,6 +121,8 @@ impl DiscoveryRecord {
             expires_at_ms: published_at_ms.saturating_add(DISCOVERY_TTL_MS),
             federation,
             policy_revision,
+            protocol: crate::envelope::PROTOCOL.to_string(),
+            schema_version: crate::envelope::SCHEMA_VERSION,
             descriptors: descriptors
                 .into_iter()
                 .filter(|descriptor| descriptor.visibility == Visibility::Public)
@@ -136,6 +147,14 @@ impl DiscoveryRecord {
         }
         if self.published_at_ms > now_ms.saturating_add(DISCOVERY_CLOCK_SKEW_MS) {
             return Err(DiscoveryError::FutureDated);
+        }
+        // A record written before these fields existed reads as empty/0 and is
+        // treated as v1; anything else must be inside the compatibility window.
+        if !self.protocol.is_empty() && !crate::envelope::accepts_protocol(&self.protocol) {
+            return Err(DiscoveryError::Incompatible);
+        }
+        if self.schema_version != 0 && !crate::envelope::accepts_schema(self.schema_version) {
+            return Err(DiscoveryError::Incompatible);
         }
         if let Some(known) = known_ms {
             if self.published_at_ms < known {
@@ -183,6 +202,10 @@ impl DiscoveryRecord {
 }
 
 fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+fn is_zero_u32(value: &u32) -> bool {
     *value == 0
 }
 

@@ -88,18 +88,19 @@ impl ProcessSession {
     fn terminate(&mut self) {
         #[cfg(unix)]
         if self.pid != 0 {
-            let exited = self.child.try_wait().ok().flatten().is_some();
-            let owned = if exited {
-                child_identity(self.pid).is_none()
-            } else {
-                true
-            };
-            if owned {
-                // SAFETY: this session spawned the group leader.
-                unsafe {
-                    libc::killpg(self.pid as libc::pid_t, libc::SIGKILL);
-                }
+            // Kill the GROUP before reaping the leader. While the leader is an
+            // unreaped zombie its pid, and therefore its pgid, cannot be
+            // recycled, so a descendant that outlived the leader is still in
+            // THIS session's group. Asking whether the leader's pid is still
+            // live answers the wrong question: the leader can be gone while the
+            // group survives.
+            //
+            // SAFETY: this session spawned the group leader.
+            unsafe {
+                libc::killpg(self.pid as libc::pid_t, libc::SIGKILL);
             }
+            // Reap now so the zombie does not linger past the drop.
+            let _ = self.child.try_wait();
         }
         start_kill(&mut self.child);
     }

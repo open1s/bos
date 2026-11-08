@@ -150,6 +150,8 @@ async fn an_objective_delegation_is_claimed_and_settled() {
                 target: pair.target_id.clone(),
                 objective: "Audit the working copy".to_string(),
                 capabilities: Vec::new(),
+                operations: Vec::new(),
+                resources: Vec::new(),
                 deadline_ms: None,
                 allow_sub_delegation: false,
                 result_contract: None,

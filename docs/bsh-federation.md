@@ -49,7 +49,71 @@ federation_id = "team:research"
 The id and a policy revision travel in the signed discovery record, and a peer
 record can carry the federation it was enrolled under. Membership is metadata,
 never authority: the peer still needs explicit enrollment and a grant, and a
-matching federation id does not widen one. A signed RotationRecord lets the old
+matching federation id does not widen one.
+
+### Key custody
+
+`federation::custody` defines where a node's seed lives. `FileCustody` writes
+one 0600 file per name (names are sanitized so they cannot escape the
+directory); `PassphraseCustody` wraps each secret in Argon2id (64 MiB, 3
+passes) + XChaCha20-Poly1305 with a per-file random salt and nonce, so a copied
+file is useless without the passphrase. `migrate` moves a key between backends
+(the target stores first; the source is deleted only after that succeeds). An
+encrypted custody file is also the backup: copy it and open it with the same
+passphrase on another host. The BSH shell still loads the raw key file by
+default; platform keychains are follow-up work.
+
+### Acceptance matrix
+
+`crates/federation/tests/acceptance.rs` runs the cross-node promises on the
+deterministic wire: three nodes publish their catalogue, a caller resolves a
+remote provider and invokes through it, a restart keeps the queued task, and an
+unreachable peer fails closed instead of hanging. `task_tcp_e2e.rs` covers the
+task and delegation flow on a real Zenoh loopback.
+
+### Optional coordinator
+
+A node can run a coordinator (`FederationNode::with_coordinator` or
+`with_coordinator_persistence`). It records membership — status, advertised
+catalogue revision, policy revision, endpoint — and answers
+`coordinator_topology` and `coordinator_register` from trusted peers. Only the
+configured administrator Node may register or suspend members; any trusted peer
+may read the topology. Membership is metadata, never authority: a member the
+coordinator marks active still needs the provider's local grants to invoke
+anything, and nodes keep operating peer-to-peer while the coordinator is down.
+
+### Resumable transfers
+
+With `FederationNode::with_transfer_persistence` a node checkpoints each
+resource transfer after every chunk (lease, uri, peer, next byte). A later
+`open_resource` with offset 0 resumes from the checkpoint automatically; an
+explicit nonzero offset still wins. A completed or cancelled stream removes its
+checkpoint, and a missing checkpoint file is just a fresh store.
+
+### Protocol compatibility
+
+The envelope speaks `bsh.fed/<major>` and a schema generation. A receiver
+checks the major (the compatibility unit: `bsh.fed/1` and `bsh.fed/1.x` are
+accepted, `bsh.fed/2` is a breaking change) and a supported schema window, and
+refuses a mismatch with a typed error naming what it found and what the build
+accepts. Unknown envelope fields are ignored, so an additive change does not
+break a signed message. Discovery records advertise the publisher's protocol and
+schema, and a record outside the window is refused before its catalogue is used;
+a record written before these fields existed reads as v1.
+
+### Membership lifecycle
+
+A peer record moves through explicit states, and a transition that does not fit
+the current state is refused:
+
+`invited` → `pending` → `trusted` (active) → `suspended` → `trusted`;
+`revoked` is terminal.
+
+The store exposes `invite`, `approve`, `suspend`, `resume` and `revoke`;
+`enroll` (the CLI's default action) is invite+approve in one step. Suspending a
+peer stops new calls but keeps its grants for a resume; `FederationNode::revoke_peer`
+also cancels the delegations that peer submitted and persists the cancelled
+records. An enrollment past `expires_at_ms` is inactive without a state change. A signed RotationRecord lets the old
 key authorize a successor and moves the peer's grants. After `rotate`, the next
 BSH launch reads `rotation.json` and delivers it to every enrolled peer; the
 same record can be applied by hand with `accept-rotation`, and delivery is
@@ -222,6 +286,15 @@ A node that asks for TLS and cannot use it does not start: the generated Zenoh
 document is validated, a listener that cannot read its material is an error, and
 the failure is logged like any other startup failure. It never falls back to an
 unencrypted session.
+
+### Production profile
+
+Set `security = "production"` to make transport security a startup
+requirement. In production a node refuses to start unless the TLS material is
+complete (`tls_ca`, `tls_cert`, `tls_key`), certificate-name verification is on
+(`tls_verify_name` not false), mutual TLS is on (`tls_mtls = true`), and every
+`endpoints`/`listen` entry is a `tls/` locator. `security = "development"` (the
+default) keeps plaintext loopback testing permissive.
 
 A node that cannot start is logged and the app runs without federation: a
 broken peer configuration must never keep the window from opening.

@@ -171,14 +171,16 @@ impl ReplayCache {
         if duplicate {
             return false;
         }
+        // Capacity pressure must never reopen a still-valid window: refuse the
+        // new identities instead of evicting an earlier one, so a flood cannot
+        // turn a previously accepted request into a fresh one. The caller sees
+        // a denial; the sender can retry once the window has moved on.
+        if inner.seen.len().saturating_add(keys.len()) > REPLAY_CAPACITY {
+            return false;
+        }
         for key in keys {
             inner.seen.insert(key.clone(), expires_at_ms);
             inner.order.push_back(key.clone());
-        }
-        while inner.seen.len() > REPLAY_CAPACITY {
-            if let Some(oldest) = inner.order.pop_front() {
-                inner.seen.remove(&oldest);
-            }
         }
         true
     }
@@ -420,6 +422,17 @@ impl Drop for AdmissionPermit {
     }
 }
 
+/// The operation and resource a call touches, for a scoped grant.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InvocationScope {
+    /// The operation below the capability id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
+    /// The resource selector the operation touches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
+}
+
 /// One Node's federation endpoint.
 pub struct FederationNode {
     identity: NodeIdentity,
@@ -434,6 +447,14 @@ pub struct FederationNode {
     /// The host's authorization decision for knowledge queries and publications.
     knowledge_authorizer: Option<Arc<dyn KnowledgeAuthorizer>>,
     streams: Arc<Mutex<HashMap<LeaseId, InboundStream>>>,
+    /// Transfer checkpoints, when persistence is configured.
+    transfers: Option<Arc<Mutex<crate::resource::TransferStore>>>,
+    /// Where the checkpoints are saved.
+    transfer_path: Option<PathBuf>,
+    /// The optional coordinator membership, when this node runs one.
+    coordinator: Option<Arc<Mutex<crate::coordinator::Coordinator>>>,
+    /// Where the membership document is saved.
+    coordinator_path: Option<PathBuf>,
     sessions: Arc<Mutex<HashMap<LeaseId, Arc<ServerSession>>>>,
     source: Option<Arc<dyn ResourceSource>>,
     public_capabilities: Arc<Vec<CapabilityDescriptor>>,
@@ -496,6 +517,10 @@ impl FederationNode {
             knowledge: None,
             knowledge_authorizer: None,
             streams: Arc::new(Mutex::new(HashMap::new())),
+            transfers: None,
+            transfer_path: None,
+            coordinator: None,
+            coordinator_path: None,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             source: None,
             public_capabilities: Arc::new(Vec::new()),
@@ -641,6 +666,62 @@ impl FederationNode {
         self
     }
 
+    /// Run the optional coordinator on this node.
+    pub fn with_coordinator(mut self, coordinator: crate::coordinator::Coordinator) -> Self {
+        self.coordinator = Some(Arc::new(Mutex::new(coordinator)));
+        self
+    }
+
+    /// Load the coordinator membership from a file and keep it there.
+    pub fn with_coordinator_persistence(
+        mut self,
+        path: impl Into<PathBuf>,
+        admin: Option<NodeId>,
+    ) -> Self {
+        let path = path.into();
+        match crate::coordinator::Coordinator::load(&path) {
+            Ok(coordinator) => {
+                let coordinator = if coordinator.admin().is_none() && admin.is_some() {
+                    crate::coordinator::Coordinator::new(admin)
+                } else {
+                    coordinator
+                };
+                self.coordinator = Some(Arc::new(Mutex::new(coordinator)));
+                self.coordinator_path = Some(path);
+            }
+            Err(error) => {
+                tracing::warn!("federation: coordinator membership did not load: {error}")
+            }
+        }
+        self
+    }
+
+    /// The coordinator this node runs, when it runs one.
+    pub fn coordinator(&self) -> Option<Arc<Mutex<crate::coordinator::Coordinator>>> {
+        self.coordinator.clone()
+    }
+
+    /// Persist resource-transfer checkpoints, so a restart resumes at the last
+    /// acknowledged byte.
+    pub fn with_transfer_persistence(mut self, path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        match crate::resource::TransferStore::load(&path) {
+            Ok(store) => {
+                self.transfers = Some(Arc::new(Mutex::new(store)));
+                self.transfer_path = Some(path);
+            }
+            Err(error) => {
+                tracing::warn!("federation: transfer checkpoints did not load: {error}");
+            }
+        }
+        self
+    }
+
+    /// The transfer checkpoints this node keeps, when configured.
+    pub fn transfers(&self) -> Option<Arc<Mutex<crate::resource::TransferStore>>> {
+        self.transfers.clone()
+    }
+
     /// Load and persist the replay/idempotency cache across restarts.
     ///
     /// Expired entries are dropped at load. A write failure is logged and the
@@ -726,6 +807,60 @@ impl FederationNode {
         self.identity.node_id()
     }
 
+    /// Revoke a peer and cancel the delegations it submitted.
+    ///
+    /// Revocation is immediate for new calls (every authorization re-reads the
+    /// shared store); this also stops the work the peer already started, and
+    /// persists the cancelled records for the audit trail.
+    pub fn revoke_peer(&self, peer: &NodeId, now_ms: u64) -> usize {
+        {
+            let mut peers = self
+                .peers
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            peers.revoke(peer);
+        }
+        let mut store = self
+            .delegations
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cancelled = store.cancel_from(peer, now_ms);
+        if cancelled > 0 {
+            self.persist_delegations(&store);
+        }
+        cancelled
+    }
+
+    /// Read the coordinator's current topology.
+    pub async fn coordinator_topology(
+        &self,
+        coordinator: &NodeId,
+    ) -> Result<crate::coordinator::Topology, CapabilityError> {
+        let reply = self
+            .round_trip(coordinator, "coordinator_topology", json!({}), None)
+            .await?;
+        decode_topology(reply)
+    }
+
+    /// Ask the coordinator to register (or update) one member.
+    ///
+    /// Only the coordinator's configured administrator may do this; the
+    /// authenticated sender is the actor the coordinator checks.
+    pub async fn coordinator_register(
+        &self,
+        coordinator: &NodeId,
+        member: crate::coordinator::MemberRecord,
+    ) -> Result<crate::coordinator::Topology, CapabilityError> {
+        let reply = self
+            .round_trip(
+                coordinator,
+                "coordinator_register",
+                json!({ "member": member }),
+                None,
+            )
+            .await?;
+        decode_topology(reply)
+    }
     /// The shared peer store, so an administrator (or a test) can enroll and
     /// revoke while the node is live.
     pub fn peers(&self) -> Arc<RwLock<PeerStore>> {
@@ -763,17 +898,34 @@ impl FederationNode {
             .map(|record| record.request.id.clone())
             .collect();
         let mut claimed = Vec::new();
+        let mut changed = false;
         for id in ids {
+            // An expired bound must not be claimed: the record fails here
+            // instead of executing without its deadline.
+            if store
+                .record(&id)
+                .and_then(|record| record.request.deadline_ms)
+                .is_some_and(|deadline| deadline <= now_ms)
+            {
+                let _ = store.fail(
+                    &id,
+                    "the delegation deadline has expired".to_string(),
+                    now_ms,
+                );
+                changed = true;
+                continue;
+            }
             if store
                 .transition(&id, DelegationState::Running, now_ms)
                 .is_ok()
             {
+                changed = true;
                 if let Some(record) = store.record(&id) {
                     claimed.push(record.clone());
                 }
             }
         }
-        if !claimed.is_empty() {
+        if changed {
             self.persist_delegations(&store);
         }
         claimed
@@ -821,6 +973,19 @@ impl FederationNode {
             Err(error) => tracing::warn!("federation: delegation store was not written: {error}"),
         }
     }
+    /// Persist the peer-task queue now, for a direct create or edit.
+    pub fn persist_tasks(&self) {
+        let queue = self
+            .tasks
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(path) = &self.task_path {
+            if let Err(error) = queue.save(path) {
+                tracing::warn!("federation: task queue was not written: {error}");
+            }
+        }
+    }
+
     /// Claim the peer tasks due now, persisting the Running marks.
     pub fn claim_due_tasks(&self, now_ms: u64) -> Vec<FederatedTask> {
         let mut queue = self
@@ -879,6 +1044,8 @@ impl FederationNode {
         let knowledge_path = self.knowledge_path.clone();
         let artifact_store = self.artifact_store.clone();
         let streams = Arc::clone(&self.streams);
+        let coordinator = self.coordinator.clone();
+        let coordinator_path = self.coordinator_path.clone();
         let sessions = Arc::clone(&self.sessions);
         let source = self.source.clone();
         let public_capabilities = Arc::clone(&self.public_capabilities);
@@ -983,6 +1150,8 @@ impl FederationNode {
                             | "task_create"
                             | "task_status"
                             | "task_cancel"
+                            | "coordinator_register"
+                            | "coordinator_topology"
                     ) {
                         if let Some(path) = &replay_path {
                             if let Err(error) = replay.save(path) {
@@ -1009,6 +1178,8 @@ impl FederationNode {
                         | "task_create"
                         | "task_status"
                         | "task_cancel"
+                        | "coordinator_register"
+                        | "coordinator_topology"
                 );
                 let permit = if handled {
                     admission.try_admit(&envelope.sender, &envelope.kind)
@@ -1164,6 +1335,27 @@ impl FederationNode {
                             let _ = transport.send(&envelope.sender, reply).await;
                         });
                     }
+                    "coordinator_register" | "coordinator_topology" => {
+                        let identity = identity.clone();
+                        let transport = Arc::clone(&transport);
+                        let peers = Arc::clone(&peers);
+                        let coordinator = coordinator.clone();
+                        let coordinator_path = coordinator_path.clone();
+                        let audit = audit.clone();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            let reply = serve_coordinator(
+                                &identity,
+                                &peers,
+                                &coordinator,
+                                &coordinator_path,
+                                &audit,
+                                &envelope,
+                            )
+                            .await;
+                            let _ = transport.send(&envelope.sender, reply).await;
+                        });
+                    }
                     "discover" => {
                         let identity = identity.clone();
                         let transport = Arc::clone(&transport);
@@ -1310,15 +1502,33 @@ impl FederationNode {
         input: Value,
         context: &InvocationContext,
     ) -> Result<CapabilityOutput, CapabilityError> {
+        self.invoke_scoped(peer, capability, input, None, context)
+            .await
+    }
+
+    /// Invoke with an explicit operation/resource scope.
+    ///
+    /// A scoped grant on either side narrows the call to these values; the
+    /// scope travels in the payload so the provider can enforce its own grant.
+    pub async fn invoke_scoped(
+        &self,
+        peer: &NodeId,
+        capability: &CapabilityId,
+        input: Value,
+        scope: Option<&InvocationScope>,
+        context: &InvocationContext,
+    ) -> Result<CapabilityOutput, CapabilityError> {
         let started = Instant::now();
         let capability_text = capability.to_string();
         // Caller-side decision: this kernel must allow its own principal to
         // use the peer for this capability.
+        let operation = scope.and_then(|scope| scope.operation.as_deref());
+        let resource = scope.and_then(|scope| scope.resource.as_deref());
         let authorized = self
             .peers
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .authorize(peer, capability, unix_ms());
+            .authorize_scoped(peer, capability, unix_ms(), operation, resource);
         if let Err(error) = &authorized {
             let mut event = FederationEvent::new(
                 Direction::Outbound,
@@ -1330,7 +1540,7 @@ impl FederationNode {
             if let Some(reason) = error_reason(error) {
                 event = event.with_reason(reason);
             }
-            self.audit(event);
+            self.audit(correlate_context(event, context));
             return Err(authorized.expect_err("checked above"));
         }
 
@@ -1341,7 +1551,7 @@ impl FederationNode {
                     .as_millis() as u64,
             )
         });
-        let payload = json!({
+        let mut payload = json!({
             "capability": capability_text,
             "input": input,
             "deadline_ms": deadline_ms,
@@ -1355,7 +1565,16 @@ impl FederationNode {
                 .iter()
                 .map(|hop| json!({ "node": hop.node, "delegation": hop.delegation }))
                 .collect::<Vec<_>>(),
+            "principal": principal_label(&context.principal),
         });
+        if let Some(scope) = scope {
+            if let Some(operation) = &scope.operation {
+                payload["operation"] = json!(operation);
+            }
+            if let Some(resource) = &scope.resource {
+                payload["resource"] = json!(resource);
+            }
+        }
         let reply = match self
             .round_trip(peer, "invoke", payload, context.deadline)
             .await
@@ -1372,7 +1591,10 @@ impl FederationNode {
                 if let Some(reason) = error_reason(&error) {
                     event = event.with_reason(reason);
                 }
-                self.audit(event.with_elapsed_ms(started.elapsed().as_millis() as u64));
+                self.audit(correlate_context(
+                    event.with_elapsed_ms(started.elapsed().as_millis() as u64),
+                    context,
+                ));
                 return Err(error);
             }
         };
@@ -1394,7 +1616,7 @@ impl FederationNode {
                 event = event.with_reason(reason);
             }
         }
-        self.audit(event);
+        self.audit(correlate_context(event, context));
         decoded
     }
 
@@ -1769,6 +1991,36 @@ impl FederationNode {
             }
         }
 
+        // A restart resumes from the checkpoint unless the caller named an
+        // explicit nonzero offset.
+        let (resume, transfers) = match &self.transfers {
+            Some(store) => {
+                let stored = store
+                    .lock()
+                    .map(|store| store.position(lease, uri))
+                    .unwrap_or(0);
+                (
+                    crate::resource::resume_offset(offset, stored),
+                    Some(Arc::clone(store)),
+                )
+            }
+            None => (offset, None),
+        };
+        if let Some(store) = &transfers {
+            if let Ok(mut store) = store.lock() {
+                store.checkpoint(crate::resource::TransferRecord {
+                    lease: lease.as_str().to_string(),
+                    uri: uri.to_string(),
+                    peer: peer.to_string(),
+                    position: resume,
+                    updated_at_ms: now,
+                });
+                if let Some(path) = &self.transfer_path {
+                    let _ = store.save(path);
+                }
+            }
+        }
+
         let (sender, receiver) = tokio::sync::mpsc::channel(RESOURCE_QUEUE);
         {
             let mut streams = self
@@ -1795,7 +2047,7 @@ impl FederationNode {
             ResourceStreamMessage::Open {
                 lease: lease.clone(),
                 uri: uri.to_string(),
-                offset,
+                offset: resume,
                 credit,
             },
         )
@@ -1811,6 +2063,10 @@ impl FederationNode {
             audit: self.audit.clone(),
             received: 0,
             settled: false,
+            offset: resume,
+            uri: uri.to_string(),
+            transfers,
+            transfer_path: self.transfer_path.clone(),
         })
     }
 
@@ -1984,8 +2240,11 @@ async fn serve(
     let Some(capability) = capability else {
         record(
             audit,
-            FederationEvent::new(Direction::Inbound, caller, "invoke", None, "invalid")
-                .with_reason("the request does not name a capability"),
+            correlate_payload(
+                FederationEvent::new(Direction::Inbound, caller, "invoke", None, "invalid")
+                    .with_reason("the request does not name a capability"),
+                payload,
+            ),
         );
         return seal_reply(
             identity,
@@ -1998,10 +2257,20 @@ async fn serve(
 
     // Provider-side decision: the receiving kernel checks the caller, with its
     // own grant state, regardless of what the caller already decided.
+    // A scoped grant narrows the capability to operations and resources; a
+    // scoped grant refuses a call that does not say what it touches.
+    let operation = payload.get("operation").and_then(Value::as_str);
+    let resource = payload.get("resource").and_then(Value::as_str);
     let authorized = peers
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .authorize(&envelope.sender, &capability, unix_ms());
+        .authorize_scoped(
+            &envelope.sender,
+            &capability,
+            unix_ms(),
+            operation,
+            resource,
+        );
     if let Err(error) = &authorized {
         let mut event = FederationEvent::new(
             Direction::Inbound,
@@ -2013,7 +2282,7 @@ async fn serve(
         if let Some(reason) = error_reason(error) {
             event = event.with_reason(reason);
         }
-        record(audit, event);
+        record(audit, correlate_payload(event, payload));
         return seal_reply(
             identity,
             envelope,
@@ -2024,14 +2293,17 @@ async fn serve(
     let Some(runtime) = runtime else {
         record(
             audit,
-            FederationEvent::new(
-                Direction::Inbound,
-                caller,
-                "invoke",
-                Some(&capability.to_string()),
-                "unavailable",
-            )
-            .with_reason("this Node serves no capabilities"),
+            correlate_payload(
+                FederationEvent::new(
+                    Direction::Inbound,
+                    caller,
+                    "invoke",
+                    Some(&capability.to_string()),
+                    "unavailable",
+                )
+                .with_reason("this Node serves no capabilities"),
+                payload,
+            ),
         );
         return seal_reply(
             identity,
@@ -2088,14 +2360,17 @@ async fn serve(
         if deadline <= now {
             record(
                 audit,
-                FederationEvent::new(
-                    Direction::Inbound,
-                    caller,
-                    "invoke",
-                    Some(&capability.to_string()),
-                    "timeout",
-                )
-                .with_reason("the caller's deadline had already passed"),
+                correlate_payload(
+                    FederationEvent::new(
+                        Direction::Inbound,
+                        caller,
+                        "invoke",
+                        Some(&capability.to_string()),
+                        "timeout",
+                    )
+                    .with_reason("the caller's deadline had already passed"),
+                    payload,
+                ),
             );
             return seal_reply(
                 identity,
@@ -2136,6 +2411,7 @@ async fn serve(
         },
     )
     .with_elapsed_ms(elapsed);
+    event = correlate_payload(event, payload);
     if let Err(error) = &result {
         if let Some(reason) = error_reason(error) {
             event = event.with_reason(reason);
@@ -2197,7 +2473,8 @@ fn resource_kind(error: &crate::resource::ResourceError) -> &'static str {
         crate::resource::ResourceError::OutOfOrder { .. }
         | crate::resource::ResourceError::ChecksumMismatch { .. }
         | crate::resource::ResourceError::Invalid { .. } => "invalid",
-        crate::resource::ResourceError::Storage { .. } => "storage",
+        crate::resource::ResourceError::Storage { .. }
+        | crate::resource::ResourceError::Checkpoint { .. } => "storage",
     }
 }
 
@@ -2263,6 +2540,62 @@ fn persist_knowledge(service: &KnowledgeService, path: &std::path::Path) {
             "federation: knowledge store {} was not written: {error}",
             path.display()
         );
+    }
+}
+
+/// Attach the correlation a request payload carries to an audit event.
+fn correlate_payload(mut event: FederationEvent, payload: &Value) -> FederationEvent {
+    if let Some(trace) = payload.get("trace") {
+        if let (Some(trace_id), Some(span_id)) = (
+            trace.get("trace_id").and_then(Value::as_str),
+            trace.get("span_id").and_then(Value::as_str),
+        ) {
+            event = event.with_trace(trace_id, span_id);
+        }
+    }
+    if let Some(task) = payload.get("task").and_then(Value::as_str) {
+        event = event.with_task(task);
+    }
+    if let Some(delegation) = payload
+        .get("delegation")
+        .and_then(Value::as_array)
+        .and_then(|hops| hops.last())
+        .and_then(|hop| hop.get("delegation"))
+        .and_then(Value::as_str)
+    {
+        event = event.with_delegation(delegation);
+    }
+    if let Some(principal) = payload.get("principal") {
+        let label = principal
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| principal.to_string());
+        event = event.with_principal(label);
+    }
+    event
+}
+
+/// Attach a local invocation's correlation to an audit event.
+fn correlate_context(mut event: FederationEvent, context: &InvocationContext) -> FederationEvent {
+    event = event.with_trace(
+        context.trace.trace_id.clone(),
+        context.trace.span_id.clone(),
+    );
+    if let Some(task) = &context.task {
+        event = event.with_task(task.as_str());
+    }
+    if let Some(hop) = context.delegation.last() {
+        event = event.with_delegation(hop.delegation.clone());
+    }
+    event = event.with_principal(principal_label(&context.principal));
+    event
+}
+
+/// A stable, non-secret label for a principal.
+fn principal_label(principal: &Principal) -> String {
+    match principal {
+        Principal::Local { session, preset } => format!("local:{session}/{preset}"),
+        Principal::Remote { node } => format!("remote:{node}"),
     }
 }
 
@@ -3414,6 +3747,23 @@ async fn run_delegation(
     deadline_ms: Option<u64>,
 ) {
     let started = Instant::now();
+    // Re-check the bound before the transition: a request that expired after
+    // acceptance must not start running.
+    if let Some(deadline) = deadline_ms {
+        if deadline <= unix_ms() {
+            let mut store = delegations
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _ = store.fail(
+                &id,
+                "the delegation deadline has expired".to_string(),
+                unix_ms(),
+            );
+            drop(store);
+            journal.persist(&delegations);
+            return;
+        }
+    }
     {
         let mut store = delegations
             .write()
@@ -3439,9 +3789,17 @@ async fn run_delegation(
     );
     if let Some(deadline) = deadline_ms {
         let now = unix_ms();
-        if deadline > now {
-            context.deadline = Some(Instant::now() + Duration::from_millis(deadline - now));
+        if deadline <= now {
+            // The window closed between acceptance and dispatch.
+            let mut store = delegations
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _ = store.fail(&id, "the delegation deadline has expired".to_string(), now);
+            drop(store);
+            journal.persist(&delegations);
+            return;
         }
+        context.deadline = Some(Instant::now() + Duration::from_millis(deadline - now));
     }
 
     let result = runtime.invoke(&capability, input, &context).await;
@@ -3600,6 +3958,14 @@ fn delegation_error(error: crate::delegation::DelegationError) -> CapabilityErro
             reason: "the delegation outlives its parent".to_string(),
             policy: None,
         },
+        DelegationError::DeadlineExpired => CapabilityError::Denied {
+            reason: "the delegation's deadline has expired".to_string(),
+            policy: None,
+        },
+        DelegationError::ScopeExceedsParent => CapabilityError::Denied {
+            reason: "the delegation's scope exceeds its parent's".to_string(),
+            policy: None,
+        },
     }
 }
 
@@ -3614,6 +3980,14 @@ pub struct RemoteStream {
     audit: Option<Arc<dyn FederationAudit>>,
     received: u64,
     settled: bool,
+    /// The start offset this stream opened at.
+    offset: u64,
+    /// The resource being read.
+    uri: String,
+    /// Transfer checkpoints, when configured.
+    transfers: Option<Arc<Mutex<crate::resource::TransferStore>>>,
+    /// Where the checkpoints are saved.
+    transfer_path: Option<PathBuf>,
 }
 
 impl RemoteStream {
@@ -3628,6 +4002,7 @@ impl RemoteStream {
         match &message {
             ResourceStreamMessage::Chunk { bytes, .. } => {
                 self.received += bytes.len() as u64;
+                self.checkpoint();
             }
             ResourceStreamMessage::Close { .. } => self.settle("ok", None),
             ResourceStreamMessage::Error { message, .. } => {
@@ -3636,6 +4011,25 @@ impl RemoteStream {
             _ => {}
         }
         Some(message)
+    }
+
+    /// Record the position a resumed stream would continue from.
+    fn checkpoint(&self) {
+        let Some(store) = &self.transfers else {
+            return;
+        };
+        if let Ok(mut store) = store.lock() {
+            store.checkpoint(crate::resource::TransferRecord {
+                lease: self.lease.as_str().to_string(),
+                uri: self.uri.clone(),
+                peer: self.peer.to_string(),
+                position: self.offset + self.received,
+                updated_at_ms: unix_ms(),
+            });
+            if let Some(path) = &self.transfer_path {
+                let _ = store.save(path);
+            }
+        }
     }
 
     /// Record how this stream ended, once.
@@ -3648,6 +4042,18 @@ impl RemoteStream {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&self.lease);
+        if let Some(store) = &self.transfers {
+            if let Ok(mut store) = store.lock() {
+                // Only a completed transfer forgets its checkpoint. An error or
+                // a reader that walked away leaves the position for a resume.
+                if outcome == "ok" {
+                    store.remove(&self.lease, &self.uri);
+                }
+                if let Some(path) = &self.transfer_path {
+                    let _ = store.save(path);
+                }
+            }
+        }
         let mut event = FederationEvent::new(
             Direction::Outbound,
             self.peer.as_str(),
@@ -4175,6 +4581,98 @@ async fn send_stream(
     }
 }
 
+fn decode_topology(reply: Value) -> Result<crate::coordinator::Topology, CapabilityError> {
+    if reply.get("ok").and_then(Value::as_bool) == Some(true) {
+        serde_json::from_value(reply.get("topology").cloned().unwrap_or(Value::Null)).map_err(
+            |error| CapabilityError::Invalid {
+                message: format!("the coordinator returned an unreadable topology: {error}"),
+            },
+        )
+    } else {
+        Err(wire_error(&reply, None))
+    }
+}
+
+async fn serve_coordinator(
+    identity: &NodeIdentity,
+    peers: &Arc<RwLock<PeerStore>>,
+    coordinator: &Option<Arc<Mutex<crate::coordinator::Coordinator>>>,
+    path: &Option<PathBuf>,
+    audit: &Option<Arc<dyn FederationAudit>>,
+    envelope: &Envelope,
+) -> Vec<u8> {
+    let trusted = peers
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_trusted(&envelope.sender, unix_ms());
+    let reply = if !trusted {
+        error_payload(CapabilityError::Denied {
+            reason: format!("peer {} is not enrolled", envelope.sender),
+            policy: None,
+        })
+    } else if let Some(coordinator) = coordinator {
+        let mut state = coordinator
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if envelope.kind == "coordinator_topology" {
+            json!({ "ok": true, "topology": state.topology() })
+        } else {
+            let member: Option<crate::coordinator::MemberRecord> = envelope
+                .payload
+                .get("member")
+                .and_then(|value| serde_json::from_value(value.clone()).ok());
+            match member {
+                Some(member) => {
+                    match state.register(&envelope.sender, member) {
+                        Ok(()) => {
+                            if let Some(path) = path {
+                                if let Err(error) = state.save(path) {
+                                    tracing::warn!("federation: coordinator membership was not written: {error}");
+                                }
+                            }
+                            json!({ "ok": true, "topology": state.topology() })
+                        }
+                        Err(error) => json!({
+                            "ok": false,
+                            "error": { "kind": "denied", "message": error.to_string() },
+                        }),
+                    }
+                }
+                None => json!({
+                    "ok": false,
+                    "error": { "kind": "invalid", "message": "the request names no member" },
+                }),
+            }
+        }
+    } else {
+        json!({
+            "ok": false,
+            "error": { "kind": "unavailable", "message": "this node does not run a coordinator" },
+        })
+    };
+    let outcome = if reply.get("ok").and_then(Value::as_bool) == Some(true) {
+        "ok"
+    } else {
+        "denied"
+    };
+    let mut event = FederationEvent::new(
+        Direction::Inbound,
+        envelope.sender.as_str(),
+        "coordinator",
+        None,
+        outcome,
+    );
+    if let Some(reason) = reply
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+    {
+        event = event.with_reason(reason);
+    }
+    record(audit, correlate_payload(event, &envelope.payload));
+    seal_reply(identity, envelope, reply)
+}
+
 async fn serve_discover(
     identity: &NodeIdentity,
     peers: &Arc<RwLock<PeerStore>>,
@@ -4252,6 +4750,27 @@ mod admission_tests {
         NodeIdentity::from_seed([seed; 32]).node_id()
     }
 
+    /// Capacity pressure refuses new identities instead of evicting a
+    /// still-valid one, so a flood cannot reopen a replay window.
+    #[test]
+    fn replay_capacity_fails_closed_instead_of_evicting() {
+        let cache = ReplayCache::new();
+        let sender = node(21);
+        for index in 0..REPLAY_CAPACITY {
+            assert!(
+                cache.admit(&[(sender.clone(), format!("m-{index}"))], 1_000_000, 0),
+                "entry {index} fits"
+            );
+        }
+        assert!(
+            !cache.admit(&[(sender.clone(), "fresh".to_string())], 1_000_000, 0),
+            "a full cache refuses the new identity"
+        );
+        assert!(
+            !cache.admit(&[(sender, "m-0".to_string())], 1_000_000, 0),
+            "the oldest identity is still protected"
+        );
+    }
     #[test]
     fn a_fresh_cache_forgets_like_a_restart() {
         let sender = node(13);
@@ -4303,12 +4822,16 @@ mod admission_tests {
 
         let cache = ReplayCache::new();
         let sender = node(12);
-        for index in 0..REPLAY_CAPACITY + 10 {
+        for index in 0..REPLAY_CAPACITY {
             assert!(cache.admit(&[(sender.clone(), format!("m-{index}"))], 10_000, 0));
         }
         assert!(
-            cache.admit(&[(sender.clone(), "m-0".to_string())], 10_000, 0),
-            "the oldest entry was evicted at the bound"
+            !cache.admit(&[(sender.clone(), "m-fresh".to_string())], 10_000, 0),
+            "a full cache refuses a new identity instead of evicting"
+        );
+        assert!(
+            !cache.admit(&[(sender, "m-0".to_string())], 10_000, 0),
+            "the oldest identity is still protected"
         );
     }
     #[test]

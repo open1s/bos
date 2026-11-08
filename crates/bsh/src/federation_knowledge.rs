@@ -8,8 +8,12 @@ use std::sync::{Arc, RwLock};
 use agent::capability::{unix_ms, CapabilityId, NodeId, WorkspaceId};
 use federation::{KnowledgeAuthorizer, KnowledgeClass, KnowledgePurpose, PeerStore};
 
-/// Query grant a peer must hold to ask this node.
+/// Query grant a peer must hold to ask this node for public knowledge.
 pub(crate) const QUERY_CAPABILITY: &str = "builtin/knowledge_query";
+/// Additional grant required for a workspace-scoped answer.
+pub(crate) const WORKSPACE_QUERY_CAPABILITY: &str = "builtin/knowledge_query.workspace";
+/// Grant required for the restricted class.
+pub(crate) const RESTRICTED_QUERY_CAPABILITY: &str = "builtin/knowledge_query.restricted";
 /// Publication grant a peer must hold to publish here.
 pub(crate) const PUBLISH_CAPABILITY: &str = "builtin/knowledge_publish";
 
@@ -39,11 +43,27 @@ impl KnowledgeAuthorizer for GrantKnowledgeAuthorizer {
     fn may_query(
         &self,
         peer: &NodeId,
-        _class: KnowledgeClass,
+        class: KnowledgeClass,
         _purpose: KnowledgePurpose,
-        _scope: Option<&WorkspaceId>,
+        scope: Option<&WorkspaceId>,
     ) -> bool {
-        self.holds(peer, QUERY_CAPABILITY)
+        // The class and the scope are authorization inputs, not decoration: a
+        // public grant never buys a workspace answer, and a workspace answer
+        // always names the workspace it is for.
+        match class {
+            KnowledgeClass::Public => {
+                if scope.is_some() {
+                    self.holds(peer, QUERY_CAPABILITY)
+                        && self.holds(peer, WORKSPACE_QUERY_CAPABILITY)
+                } else {
+                    self.holds(peer, QUERY_CAPABILITY)
+                }
+            }
+            KnowledgeClass::Workspace => {
+                scope.is_some() && self.holds(peer, WORKSPACE_QUERY_CAPABILITY)
+            }
+            KnowledgeClass::Restricted => self.holds(peer, RESTRICTED_QUERY_CAPABILITY),
+        }
     }
 
     fn may_publish(&self, peer: &NodeId) -> bool {
@@ -93,7 +113,61 @@ mod tests {
             KnowledgePurpose::Answer,
             None
         ));
+        let workspace = WorkspaceId::new("ws-1").expect("workspace");
+        assert!(
+            !authorizer.may_query(
+                &peer,
+                KnowledgeClass::Workspace,
+                KnowledgePurpose::Answer,
+                None
+            ),
+            "workspace knowledge needs a scope"
+        );
+        assert!(
+            !authorizer.may_query(
+                &peer,
+                KnowledgeClass::Workspace,
+                KnowledgePurpose::Answer,
+                Some(&workspace)
+            ),
+            "the public grant is not workspace authority"
+        );
+        assert!(
+            !authorizer.may_query(
+                &peer,
+                KnowledgeClass::Public,
+                KnowledgePurpose::Answer,
+                Some(&workspace)
+            ),
+            "a scoped query needs the workspace grant"
+        );
         assert!(!authorizer.may_publish(&peer));
+
+        store
+            .write()
+            .expect("peers")
+            .grant(
+                &peer,
+                WORKSPACE_QUERY_CAPABILITY.parse().expect("capability"),
+                unix_ms(),
+                None,
+            )
+            .expect("grant");
+        assert!(authorizer.may_query(
+            &peer,
+            KnowledgeClass::Workspace,
+            KnowledgePurpose::Answer,
+            Some(&workspace)
+        ));
+        assert!(
+            !authorizer.may_query(
+                &peer,
+                KnowledgeClass::Restricted,
+                KnowledgePurpose::Answer,
+                Some(&workspace)
+            ),
+            "restricted needs its own grant"
+        );
 
         store
             .write()

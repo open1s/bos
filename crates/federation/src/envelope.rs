@@ -16,8 +16,34 @@ use crate::identity::{self, NodeIdentity};
 /// The protocol name and version this build speaks.
 pub const PROTOCOL: &str = "bsh.fed/1";
 
-/// The envelope schema generation.
+/// The protocol major this build speaks.
+pub const PROTOCOL_MAJOR: u32 = 1;
+
+/// The envelope schema generation this build writes.
 pub const SCHEMA_VERSION: u32 = 1;
+
+/// The oldest schema generation this build still accepts.
+pub const SUPPORTED_SCHEMA_MIN: u32 = 1;
+
+/// The newest schema generation this build accepts.
+pub const SUPPORTED_SCHEMA_MAX: u32 = 1;
+
+/// Whether a protocol string is compatible with this build.
+///
+/// The major is the compatibility unit: `bsh.fed/1` and `bsh.fed/1.x` are
+/// accepted, `bsh.fed/2` is a breaking change and is refused with a reason.
+pub fn accepts_protocol(protocol: &str) -> bool {
+    protocol
+        .strip_prefix("bsh.fed/")
+        .and_then(|rest| rest.split('.').next())
+        .and_then(|major| major.parse::<u32>().ok())
+        .is_some_and(|major| major == PROTOCOL_MAJOR)
+}
+
+/// Whether a schema generation is inside the supported window.
+pub fn accepts_schema(schema: u32) -> bool {
+    (SUPPORTED_SCHEMA_MIN..=SUPPORTED_SCHEMA_MAX).contains(&schema)
+}
 
 /// How long a message stays valid when it carries no expiry of its own.
 pub const DEFAULT_LIFETIME_MS: u64 = 60_000;
@@ -80,16 +106,22 @@ pub enum EnvelopeError {
     #[error("the envelope is not valid JSON: {0}")]
     Json(String),
     /// The protocol name or version is not ours.
-    #[error("unknown protocol {found}")]
+    #[error("unsupported protocol {found}; this build speaks {expected}")]
     UnknownProtocol {
         /// What the envelope declared.
         found: String,
+        /// What this build speaks.
+        expected: String,
     },
-    /// The schema generation is not ours.
-    #[error("unsupported schema version {found}")]
+    /// The schema generation is outside the supported window.
+    #[error("unsupported schema {found}; this build accepts {min}..={max}")]
     UnsupportedSchema {
         /// What the envelope declared.
         found: u32,
+        /// The oldest accepted generation.
+        min: u32,
+        /// The newest accepted generation.
+        max: u32,
     },
     /// The signature does not verify.
     #[error("the envelope signature does not verify")]
@@ -155,14 +187,17 @@ impl Envelope {
 
     /// Check protocol, schema, signature, and validity, then return the payload.
     pub fn open(&self, now_ms: u64) -> Result<&Value, EnvelopeError> {
-        if self.protocol != PROTOCOL {
+        if !accepts_protocol(&self.protocol) {
             return Err(EnvelopeError::UnknownProtocol {
                 found: self.protocol.clone(),
+                expected: PROTOCOL.to_string(),
             });
         }
-        if self.schema_version != SCHEMA_VERSION {
+        if !accepts_schema(self.schema_version) {
             return Err(EnvelopeError::UnsupportedSchema {
                 found: self.schema_version,
+                min: SUPPORTED_SCHEMA_MIN,
+                max: SUPPORTED_SCHEMA_MAX,
             });
         }
         if !self.verify() {
@@ -209,5 +244,71 @@ impl Envelope {
     /// The signature as raw bytes, for a caller that stores it inline.
     pub fn signature_bytes(&self) -> Option<Vec<u8>> {
         STANDARD.decode(&self.signature).ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::NodeIdentity;
+
+    fn sealed() -> Envelope {
+        let sender = NodeIdentity::from_seed([71u8; 32]);
+        let recipient = NodeIdentity::from_seed([72u8; 32]).node_id();
+        let message = FederationMessage::new(
+            "invoke",
+            br#"{"capability":"builtin/echo","input":{}}"#.to_vec(),
+        );
+        Envelope::seal_at(&message, &sender, &recipient, 1_000).expect("a sealed envelope")
+    }
+
+    #[test]
+    fn the_protocol_window_is_major_based() {
+        assert!(accepts_protocol("bsh.fed/1"));
+        assert!(accepts_protocol("bsh.fed/1.4"));
+        assert!(!accepts_protocol("bsh.fed/2"));
+        assert!(!accepts_protocol("bsh.fing/1"));
+        assert!(accepts_schema(1));
+        assert!(!accepts_schema(0));
+        assert!(!accepts_schema(2));
+    }
+
+    #[test]
+    fn an_unsupported_protocol_is_named() {
+        let mut envelope = sealed();
+        envelope.protocol = "bsh.fed/2".to_string();
+        match envelope.open(1_000) {
+            Err(EnvelopeError::UnknownProtocol { found, expected }) => {
+                assert_eq!(found, "bsh.fed/2");
+                assert_eq!(expected, PROTOCOL);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unsupported_schema_names_the_window() {
+        let mut envelope = sealed();
+        envelope.schema_version = 7;
+        match envelope.open(1_000) {
+            Err(EnvelopeError::UnsupportedSchema { found, min, max }) => {
+                assert_eq!(found, 7);
+                assert_eq!((min, max), (SUPPORTED_SCHEMA_MIN, SUPPORTED_SCHEMA_MAX));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn additive_and_unknown_fields_are_tolerated() {
+        let envelope = sealed();
+        let mut value = serde_json::to_value(&envelope).expect("json");
+        value["future_field"] = serde_json::json!({ "x": 1 });
+        let bytes = serde_json::to_vec(&value).expect("bytes");
+        let decoded = Envelope::decode(&bytes).expect("decode");
+        assert!(
+            decoded.open(1_000).is_ok(),
+            "an unknown field does not break a signed envelope"
+        );
     }
 }

@@ -120,6 +120,94 @@ async fn a_dependency_graph_runs_dependencies_first_and_bounds_concurrency() {
 }
 
 #[tokio::test]
+async fn a_successful_executor_result_must_pass_acceptance() {
+    let mut graph = TaskGraph::new();
+    graph.add(id("a"), "a", Vec::new()).expect("a");
+    graph.add(id("b"), "b", vec![id("a")]).expect("b");
+    graph.tasks.get_mut(&id("a")).expect("a").acceptance = Some("equals:never".to_string());
+    let executor = Arc::new(Recorder::new(&[]));
+    let mut orchestrator = Orchestrator::new(graph);
+
+    let progress = orchestrator
+        .run(executor.clone(), 1)
+        .await
+        .expect("the graph runs");
+
+    assert_eq!(
+        progress.failed, 1,
+        "execution succeeded but acceptance did not"
+    );
+    assert_eq!(progress.succeeded, 0);
+    let task = &orchestrator.graph().tasks[&id("a")];
+    assert_eq!(task.state, TaskState::Failed);
+    assert!(task
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .starts_with("acceptance rejected"));
+    let report = task
+        .acceptance_result
+        .as_ref()
+        .expect("a verdict is recorded");
+    assert!(!report.accepted);
+    assert_eq!(report.evaluator, "bsh.acceptance/1");
+    assert!(task.result.is_some(), "the rejected output is preserved");
+    assert!(
+        !executor
+            .events
+            .lock()
+            .expect("events")
+            .contains(&"b".to_string()),
+        "a dependent does not start after a rejected dependency"
+    );
+}
+
+#[tokio::test]
+async fn a_matching_acceptance_marks_the_task_succeeded() {
+    let mut graph = TaskGraph::new();
+    graph.add(id("a"), "a", Vec::new()).expect("a");
+    graph.tasks.get_mut(&id("a")).expect("a").acceptance = Some("contains:a".to_string());
+    let executor = Arc::new(Recorder::new(&[]));
+    let mut orchestrator = Orchestrator::new(graph);
+
+    let progress = orchestrator
+        .run(executor.clone(), 1)
+        .await
+        .expect("the graph runs");
+    assert_eq!(progress.succeeded, 1);
+    let task = &orchestrator.graph().tasks[&id("a")];
+    assert_eq!(task.state, TaskState::Succeeded);
+    assert!(task
+        .acceptance_result
+        .as_ref()
+        .is_some_and(|report| report.accepted));
+}
+
+#[tokio::test]
+async fn a_malformed_acceptance_criterion_is_rejected() {
+    let mut graph = TaskGraph::new();
+    graph.add(id("a"), "a", Vec::new()).expect("a");
+    graph.tasks.get_mut(&id("a")).expect("a").acceptance = Some("telepathy".to_string());
+    let executor = Arc::new(Recorder::new(&[]));
+    let mut orchestrator = Orchestrator::new(graph);
+
+    orchestrator
+        .run(executor.clone(), 1)
+        .await
+        .expect("the graph runs");
+    let task = &orchestrator.graph().tasks[&id("a")];
+    assert_eq!(task.state, TaskState::Failed);
+    let detail = task
+        .acceptance_result
+        .as_ref()
+        .and_then(|report| report.detail.clone())
+        .unwrap_or_default();
+    assert!(
+        detail.contains("unknown acceptance criterion"),
+        "a malformed criterion fails closed: {detail}"
+    );
+}
+#[tokio::test]
 async fn a_failure_cancels_only_dependents() {
     let mut graph = TaskGraph::new();
     graph.add(id("a"), "a", Vec::new()).expect("a");
@@ -217,7 +305,7 @@ async fn a_task_retries_until_its_ceiling_then_succeeds() {
     graph.add(id("a"), "a", Vec::new()).expect("a");
     graph.set_max_attempts(&id("a"), 2).expect("retries");
     graph
-        .set_acceptance(&id("a"), "the report exists")
+        .set_acceptance(&id("a"), "non_empty")
         .expect("acceptance");
     let executor = Arc::new(Flaky {
         attempts: std::sync::Mutex::new(std::collections::BTreeMap::new()),
@@ -230,7 +318,7 @@ async fn a_task_retries_until_its_ceiling_then_succeeds() {
     let task = &orchestrator.graph().tasks[&id("a")];
     assert_eq!(task.state, TaskState::Succeeded);
     assert_eq!(task.attempts, 2);
-    assert_eq!(task.acceptance.as_deref(), Some("the report exists"));
+    assert_eq!(task.acceptance.as_deref(), Some("non_empty"));
     assert_eq!(task.artifacts.len(), 1);
     assert_eq!(task.artifacts[0].name, "report");
 }

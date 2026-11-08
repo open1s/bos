@@ -87,6 +87,12 @@ pub struct DelegationRequest {
     pub objective: String,
     /// The capabilities the target may use.
     pub capabilities: Vec<CapabilityId>,
+    /// Operations the delegation may use; empty means any.
+    #[serde(default)]
+    pub operations: Vec<String>,
+    /// Resource selectors the delegation may use; empty means any.
+    #[serde(default)]
+    pub resources: Vec<String>,
     /// Absolute deadline in milliseconds since the Unix epoch.
     pub deadline_ms: Option<u64>,
     /// Whether the target may delegate further. False by default.
@@ -166,6 +172,9 @@ pub enum DelegationError {
     /// The request's deadline has already passed.
     #[error("delegation deadline has already expired")]
     DeadlineExpired,
+    /// A child's operation or resource scope widens the parent's.
+    #[error("delegation scope exceeds the parent's")]
+    ScopeExceedsParent,
 }
 
 /// The authoritative delegation records.
@@ -279,6 +288,33 @@ impl DelegationStore {
                 });
             }
         }
+        // Scope attenuates exactly like the capability list: a bounded parent
+        // does not permit an unbounded child, and a child selector must be
+        // covered by one of the parent's selectors.
+        if !parent_record.request.operations.is_empty()
+            && (request.operations.is_empty()
+                || !request.operations.iter().all(|child| {
+                    parent_record
+                        .request
+                        .operations
+                        .iter()
+                        .any(|parent| selector_covers(parent, child))
+                }))
+        {
+            return Err(DelegationError::ScopeExceedsParent);
+        }
+        if !parent_record.request.resources.is_empty()
+            && (request.resources.is_empty()
+                || !request.resources.iter().all(|child| {
+                    parent_record
+                        .request
+                        .resources
+                        .iter()
+                        .any(|parent| selector_covers(parent, child))
+                }))
+        {
+            return Err(DelegationError::ScopeExceedsParent);
+        }
         // A child may not widen the parent's temporal bound: a later deadline
         // is refused, and so is omitting the deadline entirely when the parent
         // has one. Only a parent without a deadline leaves the child free.
@@ -298,6 +334,29 @@ impl DelegationStore {
         }
         let origin = parent_record.origin.clone().or(origin);
         self.create_for(request, origin, now_ms)
+    }
+
+    /// Cancel every active delegation submitted by one origin.
+    ///
+    /// A revoked peer must not keep work running that it started; the records
+    /// stay for the audit trail, in the cancelled state.
+    pub fn cancel_from(&mut self, origin: &NodeId, now_ms: u64) -> usize {
+        let ids: Vec<DelegationId> = self
+            .records
+            .values()
+            .filter(|record| record.origin.as_ref() == Some(origin) && record.state.is_active())
+            .map(|record| record.request.id.clone())
+            .collect();
+        let mut cancelled = 0;
+        for id in ids {
+            if self
+                .transition(&id, DelegationState::Cancelled, now_ms)
+                .is_ok()
+            {
+                cancelled += 1;
+            }
+        }
+        cancelled
     }
 
     /// Move one delegation to a new state.
@@ -487,4 +546,195 @@ fn allowed(from: DelegationState, to: DelegationState) -> bool {
             | (DelegationState::Running, DelegationState::Failed)
             | (DelegationState::Running, DelegationState::Cancelled)
     )
+}
+
+/// Whether a parent selector covers a child selector.
+///
+/// Both are exact strings or prefixes ending in '*'. The bare "*" covers
+/// everything; a child wildcard is only covered by a parent wildcard whose
+/// prefix contains it.
+fn selector_covers(parent: &str, child: &str) -> bool {
+    if parent == "*" {
+        return true;
+    }
+    match child.strip_suffix('*') {
+        Some(child_prefix) => parent
+            .strip_suffix('*')
+            .is_some_and(|parent_prefix| child_prefix.starts_with(parent_prefix)),
+        None => {
+            parent == child
+                || parent
+                    .strip_suffix('*')
+                    .is_some_and(|prefix| child.starts_with(prefix))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use capability::NodeId;
+
+    fn request(id: &str, target: &NodeId, deadline: Option<u64>) -> DelegationRequest {
+        DelegationRequest {
+            id: DelegationId::new(id),
+            parent: None,
+            target: target.clone(),
+            objective: "audit".to_string(),
+            capabilities: Vec::new(),
+            operations: Vec::new(),
+            resources: Vec::new(),
+            deadline_ms: deadline,
+            allow_sub_delegation: true,
+            result_contract: None,
+        }
+    }
+
+    /// An already-expired bound is refused at acceptance.
+    #[test]
+    fn an_expired_delegation_is_refused() {
+        let mut store = DelegationStore::new();
+        let target = NodeId::new("node-a").expect("node id");
+        let error = store
+            .create(request("d-1", &target, Some(1_000)), 1_000)
+            .expect_err("expired");
+        assert!(matches!(error, DelegationError::DeadlineExpired));
+    }
+
+    /// A child may not drop or extend the parent's deadline.
+    #[test]
+    fn a_child_cannot_widen_the_parent_deadline() {
+        let mut store = DelegationStore::new();
+        let target = NodeId::new("node-a").expect("node id");
+        let parent = store
+            .create_for(request("d-parent", &target, Some(10_000)), None, 1_000)
+            .expect("parent");
+        store
+            .transition(&parent, DelegationState::Accepted, 1_000)
+            .expect("accepted");
+
+        let error = store
+            .delegate_for(&parent, request("d-child-none", &target, None), None, 2_000)
+            .expect_err("missing deadline");
+        assert!(
+            matches!(error, DelegationError::DeadlineExceedsParent),
+            "got {error:?}"
+        );
+
+        let error = store
+            .delegate_for(
+                &parent,
+                request("d-child-late", &target, Some(20_000)),
+                None,
+                2_000,
+            )
+            .expect_err("later deadline");
+        assert!(matches!(error, DelegationError::DeadlineExceedsParent));
+
+        let exact = store
+            .delegate_for(
+                &parent,
+                request("d-child-exact", &target, Some(10_000)),
+                None,
+                2_000,
+            )
+            .expect("equal deadline");
+        let earlier = store
+            .delegate_for(
+                &parent,
+                request("d-child-early", &target, Some(5_000)),
+                None,
+                2_000,
+            )
+            .expect("earlier deadline");
+        assert!(store.record(&exact).is_some());
+        assert!(store.record(&earlier).is_some());
+        store
+            .transition(&exact, DelegationState::Accepted, 2_000)
+            .expect("accepted child");
+
+        // A grandchild inherits through the child: still no unbounded deadline.
+        let error = store
+            .delegate_for(&exact, request("d-grandchild", &target, None), None, 3_000)
+            .expect_err("grandchild missing");
+        assert!(matches!(error, DelegationError::DeadlineExceedsParent));
+    }
+
+    /// A child may not widen the parent's operation or resource scope.
+    #[test]
+    fn a_child_cannot_widen_the_parent_scope() {
+        let mut store = DelegationStore::new();
+        let target = NodeId::new("node-a").expect("node id");
+        let mut parent_request = request("d-parent", &target, None);
+        parent_request.operations = vec!["read".to_string()];
+        parent_request.resources = vec!["/ws/*".to_string()];
+        let parent = store
+            .create_for(parent_request, None, 1_000)
+            .expect("parent");
+        store
+            .transition(&parent, DelegationState::Accepted, 1_000)
+            .expect("accepted");
+
+        let unbounded = request("d-child-none", &target, None);
+        assert!(matches!(
+            store
+                .delegate_for(&parent, unbounded, None, 2_000)
+                .expect_err("unbounded child"),
+            DelegationError::ScopeExceedsParent
+        ));
+
+        let mut wider = request("d-child-wide", &target, None);
+        wider.operations = vec!["write".to_string()];
+        wider.resources = vec!["/ws/*".to_string()];
+        assert!(matches!(
+            store
+                .delegate_for(&parent, wider, None, 2_000)
+                .expect_err("wider operation"),
+            DelegationError::ScopeExceedsParent
+        ));
+
+        let mut narrower = request("d-child-ok", &target, None);
+        narrower.operations = vec!["read".to_string()];
+        narrower.resources = vec!["/ws/notes/*".to_string()];
+        assert!(store.delegate_for(&parent, narrower, None, 2_000).is_ok());
+    }
+
+    /// Revoking an origin cancels the delegations it submitted, and only those.
+    #[test]
+    fn revoking_an_origin_cancels_its_active_delegations() {
+        let mut store = DelegationStore::new();
+        let target = NodeId::new("node-a").expect("node id");
+        let origin = NodeId::new("node-owner").expect("node id");
+        let other = NodeId::new("node-other").expect("node id");
+        let mine = store
+            .create_for(
+                request("d-mine", &target, None),
+                Some(origin.clone()),
+                1_000,
+            )
+            .expect("mine");
+        let theirs = store
+            .create_for(
+                request("d-theirs", &target, None),
+                Some(other.clone()),
+                1_000,
+            )
+            .expect("theirs");
+        store
+            .transition(&mine, DelegationState::Accepted, 1_000)
+            .expect("accepted");
+        store
+            .transition(&theirs, DelegationState::Accepted, 1_000)
+            .expect("accepted");
+
+        assert_eq!(store.cancel_from(&origin, 2_000), 1);
+        assert_eq!(
+            store.record(&mine).expect("mine").state,
+            DelegationState::Cancelled
+        );
+        assert_eq!(
+            store.record(&theirs).expect("theirs").state,
+            DelegationState::Accepted
+        );
+    }
 }

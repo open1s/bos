@@ -66,6 +66,42 @@ impl FileAudit {
     }
 }
 
+/// The authoritative ledger plus the diagnostic tail.
+///
+/// The diagnostic file stays bounded and best-effort; the ledger is append-only
+/// and hash-chained. A ledger failure is logged and never fails an operation.
+pub(crate) struct DurableAudit {
+    file: FileAudit,
+    ledger: federation::ledger::AuditLedger,
+}
+
+impl DurableAudit {
+    /// Build both sinks beside the configured audit path.
+    pub(crate) fn new(path: PathBuf) -> io::Result<Self> {
+        let ledger_path = path.with_file_name(format!("ledger-{}.jsonl", std::process::id()));
+        let ledger = federation::ledger::AuditLedger::open(ledger_path)?;
+        Ok(Self {
+            file: FileAudit::new(path),
+            ledger,
+        })
+    }
+
+    /// The ledger file this sink writes.
+    #[cfg(test)]
+    pub(crate) fn ledger_path(&self) -> &Path {
+        self.ledger.path()
+    }
+}
+
+impl FederationAudit for DurableAudit {
+    fn record(&self, event: FederationEvent) {
+        self.file.record(event.clone());
+        if let Err(error) = self.ledger.append(&event) {
+            log::warn!("federation audit ledger append failed: {error}");
+        }
+    }
+}
+
 impl FederationAudit for FileAudit {
     fn record(&self, event: FederationEvent) {
         let _guard = self
@@ -190,7 +226,7 @@ pub(crate) fn load(path: &Path, limit: usize) -> Vec<FederationEvent> {
 
 #[cfg(test)]
 mod tests {
-    use super::{load, push_recent, record_bounded, subscribe, FileAudit};
+    use super::{load, push_recent, record_bounded, subscribe, DurableAudit, FileAudit};
     use federation::{Direction, FederationAudit, FederationEvent};
 
     fn event(peer: &str) -> FederationEvent {
@@ -351,6 +387,39 @@ mod tests {
             "no payload is recorded: {text}"
         );
         assert!(text.contains("\"outcome\":\"ok\""), "{text}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_durable_sink_writes_a_verifiable_ledger() {
+        use federation::Direction;
+        let root = std::env::temp_dir().join(format!("bsh-ledger-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("scratch");
+        let path = root.join("audit.jsonl");
+        let sink = DurableAudit::new(path.clone()).expect("sink");
+        sink.record(FederationEvent::new(
+            Direction::Inbound,
+            "node-b",
+            "invoke",
+            Some("builtin/echo"),
+            "ok",
+        ));
+        sink.record(FederationEvent::new(
+            Direction::Outbound,
+            "node-b",
+            "delegate",
+            None,
+            "denied",
+        ));
+        let report = federation::ledger::AuditLedger::verify(sink.ledger_path())
+            .expect("the chain verifies");
+        assert_eq!(report.entries, 2);
+        assert!(
+            root.join(format!("audit-{}.jsonl", std::process::id()))
+                .exists(),
+            "the diagnostic tail is still written"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

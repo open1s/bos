@@ -3466,10 +3466,12 @@ dependencies = [
 name = "federation"
 version = "4.0.2"
 dependencies = [
+ "argon2",
  "async-trait",
  "base64 0.23.1",
  "bus",
  "capability",
+ "chacha20poly1305",
  "ed25519-dalek",
  "rand 0.10.3",
  "rcgen 0.13.2",
@@ -3480,6 +3482,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

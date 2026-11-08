@@ -84,6 +84,9 @@ pub struct TaskNode {
     /// The acceptance criterion the host will evaluate on the result.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acceptance: Option<String>,
+    /// The acceptance verdict, once evaluated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance_result: Option<AcceptanceReport>,
     /// Artifacts produced by the successful attempt.
     #[serde(default)]
     pub artifacts: Vec<ArtifactRef>,
@@ -105,6 +108,113 @@ pub struct TaskNode {
     /// The remote acknowledgement of compensation, when one exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compensation_receipt: Option<Value>,
+}
+
+/// The evaluator that decides a task's acceptance criterion.
+pub const ACCEPTANCE_EVALUATOR: &str = "bsh.acceptance/1";
+
+/// What an acceptance evaluation decided, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptanceReport {
+    /// The evaluator's own identity, so a verdict is attributable.
+    pub evaluator: String,
+    /// The criterion exactly as evaluated.
+    pub criterion: String,
+    /// Whether the result was accepted.
+    pub accepted: bool,
+    /// Why it was rejected, when it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// Evaluate TaskNode.acceptance against a result.
+///
+/// The vocabulary is deliberately small and deterministic, so a task is never
+/// marked complete by an opaque string nobody evaluates:
+///
+/// - non_empty: the result's text is not blank
+/// - json_object: the result is a JSON object
+/// - json_array: the result is a JSON array
+/// - contains:<text>: the result's text contains the text
+/// - equals:<text>: the result's text equals the text
+/// - sha256:<hex>: the result's text hashes to the hex digest
+///
+/// Anything else is rejected as malformed. A criterion that cannot be evaluated
+/// must never read as success.
+pub fn evaluate_acceptance(criterion: &str, result: &Value) -> AcceptanceReport {
+    let criterion = criterion.trim();
+    let text = result
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| result.to_string());
+    let verdict = if criterion.is_empty() {
+        Err("the criterion is empty".to_string())
+    } else {
+        match criterion {
+            "non_empty" => {
+                if text.trim().is_empty() {
+                    Err("the result is empty".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+            "json_object" => {
+                if result.is_object() {
+                    Ok(())
+                } else {
+                    Err("the result is not a JSON object".to_string())
+                }
+            }
+            "json_array" => {
+                if result.is_array() {
+                    Ok(())
+                } else {
+                    Err("the result is not a JSON array".to_string())
+                }
+            }
+            _ => {
+                if let Some(needle) = criterion.strip_prefix("contains:") {
+                    if text.contains(needle) {
+                        Ok(())
+                    } else {
+                        Err(format!("the result does not contain {needle:?}"))
+                    }
+                } else if let Some(expected) = criterion.strip_prefix("equals:") {
+                    if text == expected {
+                        Ok(())
+                    } else {
+                        Err("the result does not equal the expectation".to_string())
+                    }
+                } else if let Some(expected) = criterion.strip_prefix("sha256:") {
+                    let actual = sha256_hex(text.as_bytes());
+                    if actual.eq_ignore_ascii_case(expected.trim()) {
+                        Ok(())
+                    } else {
+                        Err(format!("the result hashes to {actual}"))
+                    }
+                } else {
+                    Err(format!("unknown acceptance criterion {criterion:?}"))
+                }
+            }
+        }
+    };
+    AcceptanceReport {
+        evaluator: ACCEPTANCE_EVALUATOR.to_string(),
+        criterion: criterion.to_string(),
+        accepted: verdict.is_ok(),
+        detail: verdict.err(),
+    }
+}
+
+/// The lower-case hex SHA-256 of the bytes.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 fn one_attempt() -> u32 {
@@ -235,6 +345,7 @@ impl TaskGraph {
                 attempts: 0,
                 max_attempts: 1,
                 acceptance: None,
+                acceptance_result: None,
                 artifacts: Vec::new(),
                 compensation: None,
                 compensated: false,
@@ -1028,6 +1139,8 @@ impl TaskExecutor for DelegationExecutor {
             target: self.target.clone(),
             objective: task.objective.clone(),
             capabilities: self.capabilities.clone(),
+            operations: Vec::new(),
+            resources: Vec::new(),
             deadline_ms,
             allow_sub_delegation: false,
             result_contract: self.contract.clone(),
@@ -1215,7 +1328,51 @@ impl Orchestrator {
             };
             match joined {
                 Ok((id, Ok(result))) => {
+                    // A successful executor return is not completion: when the
+                    // task names an acceptance criterion, evaluate it first and
+                    // keep the output even when it is rejected.
+                    let task = self.graph.tasks.get(&id).cloned();
+                    let evaluated = task
+                        .as_ref()
+                        .and_then(|task| task.acceptance.as_ref())
+                        .map(|criterion| evaluate_acceptance(criterion, &result.result));
+                    if let Some(report) = &evaluated {
+                        if let Some(node) = self.graph.tasks.get_mut(&id) {
+                            node.result = Some(result.result.clone());
+                            node.acceptance_result = Some(report.clone());
+                        }
+                        self.graph.revision = self.graph.revision.saturating_add(1);
+                        if !report.accepted {
+                            let reason = format!(
+                                "acceptance rejected: {}",
+                                report.detail.clone().unwrap_or_default()
+                            );
+                            let final_failure = self.graph.fail(&id, reason)?;
+                            if final_failure {
+                                if let Some(task) = task {
+                                    if task.compensation.is_some() {
+                                        let compensation = executor.compensate(&task).await;
+                                        let receipt = if compensation.is_ok() {
+                                            executor.compensation_evidence(&task)
+                                        } else {
+                                            None
+                                        };
+                                        self.graph.set_compensated(
+                                            &id,
+                                            compensation.err(),
+                                            receipt,
+                                        )?;
+                                    }
+                                }
+                            }
+                            self.persist()?;
+                            continue;
+                        }
+                    }
                     self.graph.succeed(&id, result)?;
+                    if evaluated.is_some() {
+                        self.persist()?;
+                    }
                 }
                 Ok((id, Err(error))) => {
                     let task = self.graph.tasks.get(&id).cloned();

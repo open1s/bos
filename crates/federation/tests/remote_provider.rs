@@ -105,6 +105,7 @@ fn echo_runtime(
             binding: Binding::Local {
                 provider: ProviderId::builtin(),
             },
+            decision: None,
         }],
         skipped: Vec::new(),
         budgets: capability::composition::Budgets::default(),
@@ -115,6 +116,7 @@ fn echo_runtime(
 struct Pair {
     caller: Arc<FederationNode>,
     provider_node: NodeId,
+    provider_peers: Arc<std::sync::RwLock<federation::PeerStore>>,
     calls: Arc<AtomicUsize>,
     _tasks: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -162,6 +164,7 @@ async fn pair() -> Pair {
     Pair {
         caller,
         provider_node,
+        provider_peers: provider.peers(),
         calls,
         _tasks: tasks,
     }
@@ -213,6 +216,62 @@ async fn a_remote_binding_executes_through_the_peer_provider() {
     assert_eq!(runtime.workspace(), &workspace());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scoped_remote_grant_checks_the_derived_scope() {
+    let pair = pair().await;
+    let caller_id = pair.caller.node().clone();
+    {
+        let mut peers = pair.provider_peers.write().expect("peers");
+        peers
+            .grant_scoped(
+                &caller_id,
+                capability("echo"),
+                vec!["echo".to_string()],
+                vec!["/ws/*".to_string()],
+                capability::unix_ms(),
+                None,
+            )
+            .expect("a scoped grant");
+    }
+    let local = Catalogue::new();
+    let scope = LocalScope::admitting(workspace(), &local);
+    let peer = PeerCatalogue::new(pair.provider_node.clone(), {
+        let mut catalogue = Catalogue::new();
+        catalogue.insert(descriptor("echo")).expect("unique");
+        catalogue
+    });
+    let plan = resolve_host(&remote_spec(&pair.provider_node), &local, &[peer], &scope)
+        .expect("resolved remotely");
+    let provider: Arc<dyn CapabilityProvider> = Arc::new(RemoteCapabilityProvider::new(
+        pair.provider_node.clone(),
+        Arc::clone(&pair.caller),
+        vec![descriptor("echo")],
+    ));
+    let runtime = WorkspaceRuntime::instantiate(plan, &[provider]).expect("a workspace");
+
+    let allowed = runtime
+        .invoke(
+            &capability("echo"),
+            json!({ "path": "/ws/notes.txt" }),
+            &context(),
+        )
+        .await
+        .expect("the path is inside the grant");
+    assert!(allowed.structured.is_some());
+
+    let denied = runtime
+        .invoke(
+            &capability("echo"),
+            json!({ "path": "/etc/passwd" }),
+            &context(),
+        )
+        .await
+        .expect_err("the path is outside the grant");
+    assert!(
+        matches!(denied, CapabilityError::Denied { .. }),
+        "{denied:?}"
+    );
+}
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unreachable_peer_fails_without_a_local_fallback() {
     let pair = pair().await;

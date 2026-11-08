@@ -37,6 +37,27 @@ const INGRESS_CAPACITY: usize = 1024;
 /// losing one is the same as waiting for the next tick.
 const ANNOUNCE_CAPACITY: usize = 256;
 
+/// The largest inbound frame this transport accepts.
+///
+/// A sealed control frame is small; resource bytes travel as a separate
+/// chunked stream, so this ceiling cannot truncate a legitimate transfer. The
+/// check runs on the transport sample BEFORE the payload is copied or decoded,
+/// so an oversized frame from an authenticated peer costs no allocation.
+pub const MAX_FRAME_BYTES: usize = 1 << 20;
+
+/// Announcements are smaller still: they carry presence metadata only.
+pub const MAX_ANNOUNCE_FRAME_BYTES: usize = 64 * 1024;
+
+/// Whether an inbound frame fits the control-frame ceiling.
+pub fn frame_allowed(bytes: usize) -> bool {
+    bytes <= MAX_FRAME_BYTES
+}
+
+/// Whether an announcement fits its smaller ceiling.
+pub fn announcement_allowed(bytes: usize) -> bool {
+    bytes <= MAX_ANNOUNCE_FRAME_BYTES
+}
+
 /// The Zenoh transport for one Node.
 #[derive(Clone)]
 pub struct ZenohTransport {
@@ -78,7 +99,19 @@ impl ZenohTransport {
         tokio::spawn(async move {
             let mut dropped = 0u64;
             while let Ok(sample) = subscriber.recv_async().await {
-                let frame = sample.payload().to_bytes().to_vec();
+                let payload = sample.payload();
+                if !announcement_allowed(payload.len()) {
+                    dropped += 1;
+                    if dropped == 1 || dropped.is_multiple_of(1024) {
+                        tracing::warn!(
+                            "federation: announcement of {} bytes exceeds the {} byte ceiling; dropped {dropped} frame(s)",
+                            payload.len(),
+                            MAX_ANNOUNCE_FRAME_BYTES
+                        );
+                    }
+                    continue;
+                }
+                let frame = payload.to_bytes().to_vec();
                 match sender.try_send(frame) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
@@ -113,7 +146,19 @@ impl ZenohTransport {
         tokio::spawn(async move {
             let mut dropped = 0u64;
             while let Ok(sample) = subscriber.recv_async().await {
-                let frame = sample.payload().to_bytes().to_vec();
+                let payload = sample.payload();
+                if !frame_allowed(payload.len()) {
+                    dropped += 1;
+                    if dropped == 1 || dropped.is_multiple_of(1024) {
+                        tracing::warn!(
+                            "federation: frame of {} bytes exceeds the {} byte ceiling; dropped {dropped} frame(s)",
+                            payload.len(),
+                            MAX_FRAME_BYTES
+                        );
+                    }
+                    continue;
+                }
+                let frame = payload.to_bytes().to_vec();
                 match sender.try_send(frame) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
@@ -217,4 +262,19 @@ pub fn node_key(node: &NodeId) -> Result<String, CapabilityError> {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{announcement_allowed, frame_allowed, MAX_ANNOUNCE_FRAME_BYTES, MAX_FRAME_BYTES};
+
+    /// The ceiling admits the limit and rejects one byte over it.
+    #[test]
+    fn the_frame_ceiling_is_enforced() {
+        assert!(frame_allowed(0));
+        assert!(frame_allowed(MAX_FRAME_BYTES));
+        assert!(!frame_allowed(MAX_FRAME_BYTES + 1));
+        assert!(announcement_allowed(MAX_ANNOUNCE_FRAME_BYTES));
+        assert!(!announcement_allowed(MAX_ANNOUNCE_FRAME_BYTES + 1));
+    }
 }

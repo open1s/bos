@@ -17,11 +17,14 @@ pub mod artifacts;
 pub mod audit;
 pub mod collaboration;
 pub mod compensation;
+pub mod coordinator;
+pub mod custody;
 pub mod delegation;
 pub mod discovery;
 pub mod envelope;
 pub mod identity;
 pub mod knowledge;
+pub mod ledger;
 pub mod membership;
 pub mod memory;
 pub mod peers;
@@ -67,9 +70,10 @@ pub use resource::{
 };
 pub use rotation::RotationRecord;
 pub use service::{
-    AdmissionLimits, FederationNode, RemoteStream, ResourceSource, MAX_CONCURRENT_STREAMS,
-    MAX_IN_FLIGHT_CONTROL, MAX_IN_FLIGHT_CONTROL_PER_PEER, MAX_IN_FLIGHT_HANDLERS,
-    MAX_IN_FLIGHT_PER_PEER, MAX_RESOURCE_STREAMS, MAX_STREAM_DURATION, STREAM_CHUNK,
+    AdmissionLimits, FederationNode, InvocationScope, RemoteStream, ResourceSource,
+    MAX_CONCURRENT_STREAMS, MAX_IN_FLIGHT_CONTROL, MAX_IN_FLIGHT_CONTROL_PER_PEER,
+    MAX_IN_FLIGHT_HANDLERS, MAX_IN_FLIGHT_PER_PEER, MAX_RESOURCE_STREAMS, MAX_STREAM_DURATION,
+    STREAM_CHUNK,
 };
 pub use task::{
     FederatedTask, FederatedTaskState, TaskCreateRequest, TaskIdRequest, TaskQueue, TaskQueueError,

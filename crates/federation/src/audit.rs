@@ -47,6 +47,21 @@ pub struct FederationEvent {
     /// Bytes moved, for a resource event.
     #[serde(default)]
     pub bytes: Option<u64>,
+    /// The distributed trace this operation belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    /// The span this operation ran in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span_id: Option<String>,
+    /// The task this operation serves, when it serves one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    /// The delegation this operation acts under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<String>,
+    /// The ORIGINAL principal, which is not the immediate peer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
 }
 
 impl FederationEvent {
@@ -69,7 +84,37 @@ impl FederationEvent {
             reason: None,
             elapsed_ms: None,
             bytes: None,
+            trace_id: None,
+            span_id: None,
+            task: None,
+            delegation: None,
+            principal: None,
         }
+    }
+
+    /// Attach the trace correlation.
+    pub fn with_trace(mut self, trace_id: impl Into<String>, span_id: impl Into<String>) -> Self {
+        self.trace_id = Some(trace_id.into());
+        self.span_id = Some(span_id.into());
+        self
+    }
+
+    /// Attach the task this operation serves.
+    pub fn with_task(mut self, task: impl Into<String>) -> Self {
+        self.task = Some(task.into());
+        self
+    }
+
+    /// Attach the delegation this operation acts under.
+    pub fn with_delegation(mut self, delegation: impl Into<String>) -> Self {
+        self.delegation = Some(delegation.into());
+        self
+    }
+
+    /// Attach the original principal (not the immediate peer).
+    pub fn with_principal(mut self, principal: impl Into<String>) -> Self {
+        self.principal = Some(principal.into());
+        self
     }
 
     /// Attach a reason.

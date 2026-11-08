@@ -933,8 +933,10 @@ impl AppState {
                         node: record.node.to_string(),
                         name: record.note.clone(),
                         state: match record.state {
+                            federation::TrustState::Invited => "invited",
                             federation::TrustState::Pending => "pending",
                             federation::TrustState::Trusted => "trusted",
+                            federation::TrustState::Suspended => "suspended",
                             federation::TrustState::Revoked => "revoked",
                         }
                         .to_string(),

@@ -650,6 +650,11 @@ pub(crate) fn start_profile(
     if !config.enabled {
         return false;
     }
+    // Production fails closed: an insecure transport never reaches the bus.
+    if let Err(reason) = config.validate_transport() {
+        log::error!("federation: refusing to start profile {profile}: {reason}");
+        return false;
+    }
     if running_profile(profile).is_some() {
         return true;
     }
@@ -1160,7 +1165,16 @@ pub(crate) fn assemble_with_federation(
         node = node.with_delegation_persistence(path);
     }
     if let Some(path) = audit {
-        node = node.with_audit(Arc::new(crate::federation_audit::FileAudit::new(path)));
+        // The ledger is the authoritative record; the bounded tail stays the
+        // diagnostic view. If the ledger cannot open, the node keeps the tail
+        // rather than failing to start, and the warning names the reason.
+        match crate::federation_audit::DurableAudit::new(path.clone()) {
+            Ok(sink) => node = node.with_audit(Arc::new(sink)),
+            Err(error) => {
+                log::warn!("federation audit ledger did not open: {error}");
+                node = node.with_audit(Arc::new(crate::federation_audit::FileAudit::new(path)));
+            }
+        }
     }
     let node = Arc::new(node);
     let node_id = node.node();
@@ -1808,6 +1822,7 @@ mod tests {
                 binding: Binding::Local {
                     provider: ProviderId::builtin(),
                 },
+                decision: None,
             }],
             skipped: Vec::new(),
             budgets: agent::capability::composition::Budgets::default(),
@@ -1911,6 +1926,8 @@ mod tests {
             target: provider_id.clone(),
             objective: "verify the deployment".to_string(),
             capabilities: vec!["builtin/deploy".parse().expect("an id")],
+            operations: Vec::new(),
+            resources: Vec::new(),
             deadline_ms: None,
             allow_sub_delegation: false,
             result_contract: None,
@@ -2000,6 +2017,8 @@ mod tests {
             target: provider_id.clone(),
             objective: "should be refused".to_string(),
             capabilities: vec!["builtin/deploy".parse().expect("an id")],
+            operations: Vec::new(),
+            resources: Vec::new(),
             deadline_ms: None,
             allow_sub_delegation: false,
             result_contract: None,
@@ -2229,6 +2248,7 @@ mod tests {
                 binding: Binding::Local {
                     provider: ProviderId::builtin(),
                 },
+                decision: None,
             }],
             skipped: Vec::new(),
             budgets: agent::capability::composition::Budgets::default(),
@@ -2546,6 +2566,8 @@ mod tests {
             target: a_id.clone(),
             objective: "read hello.txt".to_string(),
             capabilities: vec!["builtin/read_file".parse().expect("a capability")],
+            operations: Vec::new(),
+            resources: Vec::new(),
             deadline_ms: None,
             allow_sub_delegation: false,
             result_contract: None,
@@ -2604,6 +2626,8 @@ mod tests {
             target: a_id.clone(),
             objective: "should not run".to_string(),
             capabilities: vec!["builtin/read_file".parse().expect("a capability")],
+            operations: Vec::new(),
+            resources: Vec::new(),
             deadline_ms: None,
             allow_sub_delegation: false,
             result_contract: None,

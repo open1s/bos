@@ -566,6 +566,16 @@ impl Default for GlobalSettings {
     }
 }
 
+/// How strictly federation transport is validated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SecurityProfile {
+    /// Local development: plaintext is allowed and the settings are advisory.
+    #[default]
+    Development,
+    /// Production: an insecure transport refuses to start.
+    Production,
+}
 /// The federation node's persisted settings.
 ///
 /// Enabled by default: a node that only answers enrolled peers is harmless
@@ -656,6 +666,9 @@ pub(crate) struct FederationSection {
     /// The longest wall clock one remote run may claim.
     #[serde(default = "default_remote_deadline_ms")]
     pub(crate) max_task_deadline_ms: u64,
+    /// The deployment profile. Production refuses an insecure transport.
+    #[serde(default)]
+    pub(crate) security: SecurityProfile,
 }
 
 /// The shipped remote-work step cap.
@@ -674,6 +687,38 @@ fn default_remote_deadline_ms() -> u64 {
 }
 
 impl FederationSection {
+    /// Refuse a production configuration whose transport is not authenticated
+    /// and encrypted.
+    ///
+    /// Development is deliberately permissive; production fails closed rather
+    /// than starting a plaintext or unauthenticated node.
+    pub(crate) fn validate_transport(&self) -> Result<(), String> {
+        if !matches!(self.security, SecurityProfile::Production) {
+            return Ok(());
+        }
+        let tls = self.tls_ca.is_some() && self.tls_cert.is_some() && self.tls_key.is_some();
+        if !tls {
+            return Err(
+                "production federation requires TLS material (tls_ca, tls_cert, tls_key)"
+                    .to_string(),
+            );
+        }
+        if self.tls_verify_name == Some(false) {
+            return Err("production federation must verify the peer certificate name".to_string());
+        }
+        if !self.tls_mtls {
+            return Err("production federation requires mutual TLS (tls_mtls = true)".to_string());
+        }
+        for endpoint in self.endpoints.iter().chain(self.listen.iter()) {
+            if !endpoint.starts_with("tls/") {
+                return Err(format!(
+                    "production federation refuses the non-TLS endpoint {endpoint}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Whether this node accepts remote work at all.
     pub(crate) fn remote_work_enabled(&self) -> bool {
         self.enabled && self.remote_work
@@ -749,6 +794,7 @@ impl Default for FederationSection {
             max_task_steps: default_remote_steps(),
             max_task_tokens: default_remote_tokens(),
             max_task_deadline_ms: default_remote_deadline_ms(),
+            security: SecurityProfile::Development,
         }
     }
 }
@@ -2419,6 +2465,71 @@ impl GlobalSettings {
 
 #[cfg(test)]
 mod tests {
+
+    /// Production refuses plaintext, unverified, or non-mTLS transports;
+    /// development stays permissive.
+    #[test]
+    fn production_refuses_an_insecure_transport() {
+        use super::{FederationSection, SecurityProfile};
+        let insecure = FederationSection {
+            security: SecurityProfile::Production,
+            ..FederationSection::default()
+        };
+        assert!(insecure.validate_transport().is_err(), "no TLS material");
+
+        let tls = || {
+            (
+                Some("/ca.pem".to_string()),
+                Some("/cert.pem".to_string()),
+                Some("/key.pem".to_string()),
+            )
+        };
+        let (ca, cert, key) = tls();
+        let plaintext = FederationSection {
+            security: SecurityProfile::Production,
+            tls_ca: ca.clone(),
+            tls_cert: cert.clone(),
+            tls_key: key.clone(),
+            tls_mtls: true,
+            endpoints: vec!["tcp/127.0.0.1:7447".to_string()],
+            ..FederationSection::default()
+        };
+        assert!(
+            plaintext.validate_transport().is_err(),
+            "a plaintext endpoint is refused in production"
+        );
+
+        let no_verify = FederationSection {
+            security: SecurityProfile::Production,
+            tls_ca: ca.clone(),
+            tls_cert: cert.clone(),
+            tls_key: key.clone(),
+            tls_mtls: true,
+            tls_verify_name: Some(false),
+            ..FederationSection::default()
+        };
+        assert!(
+            no_verify.validate_transport().is_err(),
+            "name verification is required"
+        );
+
+        let secure = FederationSection {
+            security: SecurityProfile::Production,
+            tls_ca: ca,
+            tls_cert: cert,
+            tls_key: key,
+            tls_mtls: true,
+            endpoints: vec!["tls/127.0.0.1:7447".to_string()],
+            listen: vec!["tls/0.0.0.0:7447".to_string()],
+            ..FederationSection::default()
+        };
+        assert!(secure.validate_transport().is_ok());
+
+        assert!(
+            FederationSection::default().validate_transport().is_ok(),
+            "development stays permissive"
+        );
+    }
 
     /// The remote-work policy refuses an over-budget ask and clamps to its cap.
     #[test]

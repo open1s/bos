@@ -111,6 +111,15 @@ pub struct CapabilityRequirement {
     pub required: bool,
     /// Where it may execute.
     pub remote: RemotePolicy,
+    /// Peers to try first, in the listed order.
+    #[serde(default)]
+    pub prefer: Vec<NodeId>,
+    /// Peers that must never be selected for this requirement.
+    #[serde(default)]
+    pub exclude: Vec<NodeId>,
+    /// Whether an unhealthy peer may still serve this requirement.
+    #[serde(default)]
+    pub allow_unhealthy: bool,
 }
 
 impl CapabilityRequirement {
@@ -121,7 +130,28 @@ impl CapabilityRequirement {
             version,
             required: true,
             remote: RemotePolicy::Forbidden,
+            prefer: Vec::new(),
+            exclude: Vec::new(),
+            allow_unhealthy: false,
         }
+    }
+
+    /// Try these peers first, in order.
+    pub fn with_prefer(mut self, prefer: Vec<NodeId>) -> Self {
+        self.prefer = prefer;
+        self
+    }
+
+    /// Never select these peers for this requirement.
+    pub fn with_exclude(mut self, exclude: Vec<NodeId>) -> Self {
+        self.exclude = exclude;
+        self
+    }
+
+    /// Permit an unhealthy peer to serve this requirement.
+    pub fn with_allow_unhealthy(mut self, allow: bool) -> Self {
+        self.allow_unhealthy = allow;
+        self
     }
 
     /// Whether a missing capability fails the composition.
@@ -217,12 +247,33 @@ pub struct PeerCatalogue {
     pub node: NodeId,
     /// What the peer published.
     pub catalogue: Catalogue,
+    /// Whether the peer is healthy for new work.
+    pub healthy: bool,
+    /// Lower numbers are preferred among otherwise equal peers.
+    pub priority: i32,
 }
 
 impl PeerCatalogue {
     /// Pair a peer with its catalogue.
     pub fn new(node: NodeId, catalogue: Catalogue) -> Self {
-        Self { node, catalogue }
+        Self {
+            node,
+            catalogue,
+            healthy: true,
+            priority: 0,
+        }
+    }
+
+    /// Mark the peer unhealthy for new work.
+    pub fn with_health(mut self, healthy: bool) -> Self {
+        self.healthy = healthy;
+        self
+    }
+
+    /// Set the peer's selection priority (lower wins).
+    pub fn with_priority(mut self, priority: i32) -> Self {
+        self.priority = priority;
+        self
     }
 }
 
@@ -291,6 +342,32 @@ impl Binding {
     }
 }
 
+/// Why one peer was not selected for a requirement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderRejection {
+    /// The peer that was rejected.
+    pub node: NodeId,
+    /// A safe, human-readable reason.
+    pub reason: String,
+}
+
+/// How one remote capability's provider was chosen.
+///
+/// Recorded on the resolved capability so a snapshot can reproduce the decision
+/// and an operator can see which alternatives were considered and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderDecision {
+    /// The selected peer.
+    pub selected: NodeId,
+    /// Peers that were considered and rejected, with reasons.
+    pub rejected: Vec<ProviderRejection>,
+    /// The selected peer's configured priority.
+    pub priority: i32,
+    /// Its position in the requirement's prefer list, when it was pinned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefer_rank: Option<usize>,
+}
+
 /// One requirement, resolved.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedCapability {
@@ -298,6 +375,8 @@ pub struct ResolvedCapability {
     pub descriptor: CapabilityDescriptor,
     /// Where it will execute.
     pub binding: Binding,
+    /// How a remote provider was chosen, when one was.
+    pub decision: Option<ProviderDecision>,
 }
 
 /// A validated, resolved composition.
@@ -495,6 +574,7 @@ fn resolve_one(
                 binding: Binding::Local {
                     provider: descriptor.id.provider.clone(),
                 },
+                decision: None,
             }));
         }
     }
@@ -503,34 +583,91 @@ fn resolve_one(
         RemotePolicy::Forbidden => missing(requirement),
         RemotePolicy::Allowed => {
             // Every allowlisted peer is a candidate. A peer that publishes the
-            // capability but cannot satisfy the version, or holds no grant,
-            // must not stop the scan: a later peer may be usable. The first
-            // usable peer in spec order wins; authorization is never weakened.
+            // capability but cannot satisfy the version, holds no grant, is
+            // unhealthy, or is excluded must not stop the scan: a later peer may
+            // be usable. Selection is deterministic: pinned peers first (in
+            // their listed order), then priority, then the node id.
             let mut version_error: Option<CompositionError> = None;
             let mut grant_error: Option<CompositionError> = None;
-            for peer in &spec.peers {
-                let Some(catalogue) = catalogue_of(peers, &peer.node) else {
+            let mut rejected: Vec<ProviderRejection> = Vec::new();
+            let mut candidates: Vec<(&PeerRef, &CapabilityDescriptor, i32, Option<usize>, usize)> =
+                Vec::new();
+            for (index, peer) in spec.peers.iter().enumerate() {
+                if requirement.exclude.contains(&peer.node) {
+                    rejected.push(ProviderRejection {
+                        node: peer.node.clone(),
+                        reason: "excluded by policy".to_string(),
+                    });
+                    continue;
+                }
+                let Some(catalogue) = peers.iter().find(|candidate| candidate.node == peer.node)
+                else {
                     continue;
                 };
-                let Some(descriptor) = catalogue.get(&requirement.id) else {
+                let Some(descriptor) = catalogue.catalogue.get(&requirement.id) else {
                     continue;
                 };
                 if let Err(error) = check_version(requirement, descriptor) {
-                    version_error.get_or_insert(error);
+                    version_error.get_or_insert_with(|| error.clone());
+                    rejected.push(ProviderRejection {
+                        node: peer.node.clone(),
+                        reason: error.to_string(),
+                    });
                     continue;
                 }
-                let Some(grant) = peer.grant.clone() else {
+                if !catalogue.healthy && !requirement.allow_unhealthy {
+                    rejected.push(ProviderRejection {
+                        node: peer.node.clone(),
+                        reason: "unhealthy".to_string(),
+                    });
+                    continue;
+                }
+                if peer.grant.is_none() {
                     // Authorization outranks a version mismatch in the report:
                     // a peer that holds no grant is a stronger refusal.
                     grant_error.get_or_insert_with(|| missing_grant(peer, requirement));
+                    rejected.push(ProviderRejection {
+                        node: peer.node.clone(),
+                        reason: "no grant".to_string(),
+                    });
                     continue;
-                };
+                }
+                let prefer_rank = requirement
+                    .prefer
+                    .iter()
+                    .position(|node| node == &peer.node);
+                candidates.push((peer, descriptor, catalogue.priority, prefer_rank, index));
+            }
+            // Spec order is the documented default preference, so it is the
+            // final tie-break: pinned peers first, then explicit priority, then
+            // the order the composition listed its peers in.
+            candidates.sort_by_key(|candidate| {
+                (candidate.3.unwrap_or(usize::MAX), candidate.2, candidate.4)
+            });
+            if let Some((peer, descriptor, priority, prefer_rank, _)) = candidates.first() {
+                let mut rejected = rejected;
+                for (other, _, _, _, _) in candidates.iter().skip(1) {
+                    rejected.push(ProviderRejection {
+                        node: other.node.clone(),
+                        reason: "outranked by policy".to_string(),
+                    });
+                }
+                let grant = peer
+                    .grant
+                    .clone()
+                    .expect("a candidate without a grant was rejected");
                 return Ok(Some(ResolvedCapability {
-                    descriptor: descriptor.clone(),
+                    descriptor: (*descriptor).clone(),
                     binding: Binding::Remote {
                         node: peer.node.clone(),
                         grant,
                     },
+                    decision: Some(ProviderDecision {
+                        selected: peer.node.clone(),
+                        rejected,
+                        priority: *priority,
+                        prefer_rank: *prefer_rank,
+                    }),
                 }));
             }
             if !requirement.required {
@@ -559,12 +696,23 @@ fn resolve_one(
                 .grant
                 .clone()
                 .ok_or_else(|| missing_grant(peer, requirement))?;
+            let priority = peers
+                .iter()
+                .find(|candidate| &candidate.node == node)
+                .map(|candidate| candidate.priority)
+                .unwrap_or(0);
             Ok(Some(ResolvedCapability {
                 descriptor: descriptor.clone(),
                 binding: Binding::Remote {
                     node: node.clone(),
                     grant,
                 },
+                decision: Some(ProviderDecision {
+                    selected: node.clone(),
+                    rejected: Vec::new(),
+                    priority,
+                    prefer_rank: None,
+                }),
             }))
         }
     }

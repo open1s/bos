@@ -15,10 +15,14 @@ use crate::rotation::RotationRecord;
 /// Where a peer relationship stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TrustState {
+    /// Invited, waiting for the peer or the operator to move it to pending.
+    Invited,
     /// Known but not yet approved. It cannot invoke anything.
     Pending,
     /// Approved; grants still decide what it may invoke.
     Trusted,
+    /// Temporarily stopped. Grants are retained but unusable until resumed.
+    Suspended,
     /// Revoked. It cannot invoke anything, and no grant survives.
     Revoked,
 }
@@ -28,6 +32,14 @@ pub enum TrustState {
 pub struct Grant {
     /// The capability granted.
     pub capability: CapabilityId,
+    /// Operations this grant permits; empty means every operation.
+    #[serde(default)]
+    pub operations: Vec<String>,
+    /// Resource selectors this grant permits; empty means every resource.
+    ///
+    /// A selector is an exact string or a prefix ending in '*'.
+    #[serde(default)]
+    pub resources: Vec<String>,
     /// When it was granted, in milliseconds since the Unix epoch.
     pub granted_at_ms: u64,
     /// When it stops being valid.
@@ -100,6 +112,16 @@ pub enum PeerError {
     Rotation {
         /// Why.
         message: String,
+    },
+    /// The relationship is not in a state that allows this transition.
+    #[error("peer {node} cannot move from {from:?} to {to:?}")]
+    Transition {
+        /// The peer.
+        node: NodeId,
+        /// Its current state.
+        from: TrustState,
+        /// The state the caller asked for.
+        to: TrustState,
     },
 }
 
@@ -222,11 +244,114 @@ impl PeerStore {
         }
     }
 
+    /// Invite a peer. It holds nothing until it is approved.
+    pub fn invite(
+        &mut self,
+        node: NodeId,
+        now_ms: u64,
+        note: Option<String>,
+    ) -> Result<(), PeerError> {
+        if let Some(existing) = self.peers.get(&node) {
+            return Err(PeerError::Transition {
+                node,
+                from: existing.state,
+                to: TrustState::Invited,
+            });
+        }
+        self.peers.insert(
+            node.clone(),
+            PeerRecord {
+                node,
+                state: TrustState::Invited,
+                grants: Vec::new(),
+                enrolled_at_ms: now_ms,
+                expires_at_ms: None,
+                federation: None,
+                note,
+            },
+        );
+        Ok(())
+    }
+
+    /// Approve an invited or pending peer, making it active.
+    pub fn approve(&mut self, node: &NodeId, now_ms: u64) -> Result<(), PeerError> {
+        let record = self
+            .peers
+            .get_mut(node)
+            .ok_or_else(|| PeerError::UnknownPeer { node: node.clone() })?;
+        if !matches!(record.state, TrustState::Invited | TrustState::Pending) {
+            return Err(PeerError::Transition {
+                node: node.clone(),
+                from: record.state,
+                to: TrustState::Trusted,
+            });
+        }
+        record.state = TrustState::Trusted;
+        record.enrolled_at_ms = now_ms;
+        Ok(())
+    }
+
+    /// Suspend an active peer. Its grants are retained but unusable.
+    pub fn suspend(&mut self, node: &NodeId) -> Result<(), PeerError> {
+        let record = self
+            .peers
+            .get_mut(node)
+            .ok_or_else(|| PeerError::UnknownPeer { node: node.clone() })?;
+        if record.state != TrustState::Trusted {
+            return Err(PeerError::Transition {
+                node: node.clone(),
+                from: record.state,
+                to: TrustState::Suspended,
+            });
+        }
+        record.state = TrustState::Suspended;
+        Ok(())
+    }
+
+    /// Resume a suspended peer.
+    pub fn resume(&mut self, node: &NodeId) -> Result<(), PeerError> {
+        let record = self
+            .peers
+            .get_mut(node)
+            .ok_or_else(|| PeerError::UnknownPeer { node: node.clone() })?;
+        if record.state != TrustState::Suspended {
+            return Err(PeerError::Transition {
+                node: node.clone(),
+                from: record.state,
+                to: TrustState::Trusted,
+            });
+        }
+        record.state = TrustState::Trusted;
+        Ok(())
+    }
     /// Grant one capability, with an optional expiry.
     pub fn grant(
         &mut self,
         node: &NodeId,
         capability: CapabilityId,
+        now_ms: u64,
+        expires_at_ms: Option<u64>,
+    ) -> Result<(), PeerError> {
+        self.grant_scoped(
+            node,
+            capability,
+            Vec::new(),
+            Vec::new(),
+            now_ms,
+            expires_at_ms,
+        )
+    }
+
+    /// Grant a capability with explicit operation and resource selectors.
+    ///
+    /// An empty selector list means "any"; a non-empty list narrows the grant,
+    /// and a call that supplies no operation/resource then fails closed.
+    pub fn grant_scoped(
+        &mut self,
+        node: &NodeId,
+        capability: CapabilityId,
+        operations: Vec<String>,
+        resources: Vec<String>,
         now_ms: u64,
         expires_at_ms: Option<u64>,
     ) -> Result<(), PeerError> {
@@ -237,6 +362,8 @@ impl PeerStore {
         record.grants.retain(|grant| grant.capability != capability);
         record.grants.push(Grant {
             capability,
+            operations,
+            resources,
             granted_at_ms: now_ms,
             expires_at_ms,
         });
@@ -282,6 +409,19 @@ impl PeerStore {
         capability: &CapabilityId,
         now_ms: u64,
     ) -> Result<(), CapabilityError> {
+        self.authorize_scoped(node, capability, now_ms, None, None)
+    }
+
+    /// Authorize a scoped call: the capability AND the operation/resource it
+    /// touches. A grant with selectors refuses a call that does not name them.
+    pub fn authorize_scoped(
+        &self,
+        node: &NodeId,
+        capability: &CapabilityId,
+        now_ms: u64,
+        operation: Option<&str>,
+        resource: Option<&str>,
+    ) -> Result<(), CapabilityError> {
         let Some(record) = self.peers.get(node) else {
             return Err(denied(format!("peer {node} is not enrolled")));
         };
@@ -291,13 +431,19 @@ impl PeerStore {
         if !record.enrolled(now_ms) {
             return Err(denied(format!("peer {node} enrollment has expired")));
         }
-        let granted = record
-            .grants
-            .iter()
-            .any(|grant| &grant.capability == capability && grant.is_valid(now_ms));
+        let granted = record.grants.iter().any(|grant| {
+            &grant.capability == capability
+                && grant.is_valid(now_ms)
+                && grant.operations.iter().all(|pattern| {
+                    operation.is_some_and(|operation| selector_allows(pattern, operation))
+                })
+                && grant.resources.iter().all(|pattern| {
+                    resource.is_some_and(|resource| selector_allows(pattern, resource))
+                })
+        });
         if !granted {
             return Err(denied(format!(
-                "peer {node} holds no valid grant for {capability}"
+                "peer {node} holds no valid grant for {capability} at this scope"
             )));
         }
         Ok(())
@@ -309,6 +455,18 @@ fn denied(reason: String) -> CapabilityError {
         reason,
         policy: None,
     }
+}
+
+/// Whether a grant selector admits a value.
+///
+/// A selector is exact, or a prefix ending in '*'. The bare "*" admits
+/// everything.
+fn selector_allows(pattern: &str, value: &str) -> bool {
+    pattern == "*"
+        || pattern == value
+        || pattern
+            .strip_suffix('*')
+            .is_some_and(|prefix| value.starts_with(prefix))
 }
 
 impl PeerStore {
@@ -363,5 +521,157 @@ impl PeerStore {
                 source,
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::NodeIdentity;
+
+    fn peer() -> NodeId {
+        NodeIdentity::from_seed([91u8; 32]).node_id()
+    }
+
+    fn capability() -> CapabilityId {
+        "builtin/read_file".parse().expect("a capability")
+    }
+
+    fn store() -> (PeerStore, NodeId) {
+        let peer = peer();
+        let mut store = PeerStore::new();
+        store.enroll(peer.clone(), 1_000, None);
+        (store, peer)
+    }
+
+    /// A capability-only grant keeps its historical meaning: any operation and
+    /// any resource under that capability.
+    #[test]
+    fn a_legacy_grant_allows_every_scope() {
+        let (mut store, peer) = store();
+        store
+            .grant(&peer, capability(), 1_000, None)
+            .expect("grant");
+        assert!(store.authorize(&peer, &capability(), 1_000).is_ok());
+        assert!(store
+            .authorize_scoped(
+                &peer,
+                &capability(),
+                1_000,
+                Some("write"),
+                Some("/etc/passwd")
+            )
+            .is_ok());
+    }
+
+    /// A scoped grant admits only the listed operations/resources, and refuses
+    /// a call that does not name them.
+    #[test]
+    fn a_scoped_grant_refuses_anything_outside_its_selectors() {
+        let (mut store, peer) = store();
+        store
+            .grant_scoped(
+                &peer,
+                capability(),
+                vec!["read".to_string()],
+                vec!["/workspace/*".to_string()],
+                1_000,
+                None,
+            )
+            .expect("grant");
+        assert!(store
+            .authorize_scoped(
+                &peer,
+                &capability(),
+                1_000,
+                Some("read"),
+                Some("/workspace/notes.txt")
+            )
+            .is_ok());
+        assert!(
+            store
+                .authorize_scoped(
+                    &peer,
+                    &capability(),
+                    1_000,
+                    Some("write"),
+                    Some("/workspace/notes.txt")
+                )
+                .is_err(),
+            "an unlisted operation is denied"
+        );
+        assert!(
+            store
+                .authorize_scoped(
+                    &peer,
+                    &capability(),
+                    1_000,
+                    Some("read"),
+                    Some("/etc/passwd")
+                )
+                .is_err(),
+            "an unlisted resource is denied"
+        );
+        assert!(
+            store
+                .authorize_scoped(&peer, &capability(), 1_000, None, None)
+                .is_err(),
+            "a scoped grant fails closed when the call names no scope"
+        );
+    }
+
+    /// Membership follows an explicit lifecycle; every wrong transition is
+    /// refused instead of silently taking effect.
+    #[test]
+    fn membership_follows_an_explicit_lifecycle() {
+        let mut store = PeerStore::new();
+        let peer = peer();
+        store
+            .invite(peer.clone(), 1_000, None)
+            .expect("an invitation");
+        assert!(!store.is_trusted(&peer, 1_000), "an invite is not trust");
+        assert!(
+            store.invite(peer.clone(), 1_000, None).is_err(),
+            "no re-invite"
+        );
+        assert!(
+            store.suspend(&peer).is_err(),
+            "an invite cannot be suspended"
+        );
+
+        store.approve(&peer, 1_000).expect("approval");
+        assert!(store.is_trusted(&peer, 1_000));
+        assert!(store.approve(&peer, 1_000).is_err(), "already active");
+        store.suspend(&peer).expect("suspension");
+        assert!(
+            !store.is_trusted(&peer, 1_000),
+            "a suspended peer cannot invoke"
+        );
+        store.resume(&peer).expect("resume");
+        assert!(store.is_trusted(&peer, 1_000));
+        store.revoke(&peer);
+        assert!(
+            !store.is_trusted(&peer, 1_000),
+            "a revoked peer cannot invoke"
+        );
+        assert!(
+            store.resume(&peer).is_err(),
+            "a revoked peer is not resumed"
+        );
+    }
+
+    /// A matching federation id is metadata: it never confers trust.
+    #[test]
+    fn a_federation_id_does_not_grant_trust() {
+        let mut store = PeerStore::new();
+        let peer = peer();
+        store
+            .invite(peer.clone(), 1_000, None)
+            .expect("an invitation");
+        if let Some(record) = store.peers.get_mut(&peer) {
+            record.federation = Some(FederationId::new("fed:test"));
+        }
+        assert!(!store.is_trusted(&peer, 1_000));
+        assert!(store.authorize(&peer, &capability(), 1_000).is_err());
     }
 }

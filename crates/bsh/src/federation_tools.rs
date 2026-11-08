@@ -89,6 +89,8 @@ pub(crate) async fn delegate_record(
         target: target.clone(),
         objective: objective.to_string(),
         capabilities: capability.into_iter().collect(),
+        operations: Vec::new(),
+        resources: Vec::new(),
         deadline_ms: Some(unix_ms() + 30_000),
         allow_sub_delegation: false,
         result_contract: contract,

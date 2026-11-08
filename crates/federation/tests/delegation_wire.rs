@@ -48,6 +48,8 @@ fn request(
         target: target.clone(),
         objective: "verify the change".to_string(),
         capabilities,
+        operations: Vec::new(),
+        resources: Vec::new(),
         deadline_ms: None,
         allow_sub_delegation: allow_sub,
         result_contract: None,

@@ -105,6 +105,7 @@ fn plan(entries: &[(&str, &str)]) -> ResolvedComposition {
                 binding: Binding::Local {
                     provider: ProviderId::new(*provider),
                 },
+                decision: None,
             })
             .collect(),
         skipped: Vec::new(),

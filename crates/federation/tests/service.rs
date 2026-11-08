@@ -93,6 +93,7 @@ fn runtime_with(
             binding: Binding::Local {
                 provider: ProviderId::builtin(),
             },
+            decision: None,
         }],
         skipped: Vec::new(),
         budgets: capability::composition::Budgets::default(),
@@ -213,6 +214,44 @@ async fn pair_with_limits(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_invocation_correlates_both_sides() {
+    let caller_audit = Arc::new(MemoryAudit::new());
+    let provider_audit = Arc::new(MemoryAudit::new());
+    let pair = pair_with(Some(caller_audit.clone()), Some(provider_audit.clone())).await;
+    let mut context = context();
+    context.trace = capability::TraceContext::new("trace-1", "span-1");
+    context.task = Some(capability::TaskId::new("task-1"));
+    pair.caller
+        .invoke(
+            &pair.provider_id,
+            &capability("echo"),
+            json!({ "value": 7 }),
+            &context,
+        )
+        .await
+        .expect("the call crosses");
+
+    let outbound = caller_audit.events();
+    let event = outbound
+        .iter()
+        .find(|event| event.operation == "invoke")
+        .expect("the caller recorded the invocation");
+    assert_eq!(event.trace_id.as_deref(), Some("trace-1"));
+    assert_eq!(event.span_id.as_deref(), Some("span-1"));
+    assert_eq!(event.task.as_deref(), Some("task-1"));
+    assert_eq!(event.principal.as_deref(), Some("local:session/preset"));
+
+    let inbound = provider_audit.events();
+    let event = inbound
+        .iter()
+        .find(|event| event.operation == "invoke")
+        .expect("the provider recorded the invocation");
+    assert_eq!(event.trace_id.as_deref(), Some("trace-1"));
+    assert_eq!(event.task.as_deref(), Some("task-1"));
+    assert_eq!(event.principal.as_deref(), Some("local:session/preset"));
+    assert_eq!(event.peer, pair.caller_id.to_string());
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_granted_call_crosses_both_kernels() {
     let pair = pair().await;
 
@@ -233,6 +272,168 @@ async fn a_granted_call_crosses_both_kernels() {
     assert_eq!(pair.caller.node(), pair.caller_id);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_coordinator_administers_membership_without_granting_authority() {
+    use federation::coordinator::{Coordinator, MemberRecord, MemberStatus};
+
+    let network = Arc::new(InMemoryNetwork::new());
+    let admin_identity = identity(61);
+    let coordinator_identity = identity(62);
+    let member_identity = identity(63);
+    let admin_id = admin_identity.node_id();
+    let coordinator_id = coordinator_identity.node_id();
+    let member_id = member_identity.node_id();
+
+    let (admin_transport, admin_inbox) = network.join(admin_id.clone());
+    let (coordinator_transport, coordinator_inbox) = network.join(coordinator_id.clone());
+    let (member_transport, member_inbox) = network.join(member_id.clone());
+
+    let admin = FederationNode::new(admin_identity, Arc::new(admin_transport));
+    let coordinator = FederationNode::new(coordinator_identity, Arc::new(coordinator_transport))
+        .with_coordinator(Coordinator::new(Some(admin_id.clone())));
+    let member = FederationNode::new(member_identity, Arc::new(member_transport));
+
+    let mut tasks = vec![
+        admin.start(admin_inbox),
+        coordinator.start(coordinator_inbox),
+        member.start(member_inbox),
+    ];
+    let now = capability::unix_ms();
+    {
+        let store = coordinator.peers();
+        let mut peers = store.write().expect("peers");
+        peers.enroll(admin_id.clone(), now, None);
+        peers.enroll(member_id.clone(), now, None);
+    }
+    {
+        let store = admin.peers();
+        let mut peers = store.write().expect("peers");
+        peers.enroll(coordinator_id.clone(), now, None);
+    }
+    {
+        let store = member.peers();
+        let mut peers = store.write().expect("peers");
+        peers.enroll(coordinator_id.clone(), now, None);
+        peers
+            .grant(&coordinator_id, capability("echo"), now, None)
+            .expect("granted");
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let topology = admin
+        .coordinator_register(
+            &coordinator_id,
+            MemberRecord {
+                node: member_id.clone(),
+                status: MemberStatus::Active,
+                catalogue_revision: 4,
+                policy_revision: 9,
+                endpoint: None,
+                updated_at_ms: now,
+            },
+        )
+        .await
+        .expect("the admin registers a member");
+    assert_eq!(topology.members.len(), 1);
+    assert_eq!(topology.members[0].node, member_id);
+    assert_eq!(topology.members[0].policy_revision, 9);
+
+    let read = admin
+        .coordinator_topology(&coordinator_id)
+        .await
+        .expect("the topology is readable");
+    assert_eq!(read.members, topology.members);
+
+    let denied = member
+        .coordinator_register(
+            &coordinator_id,
+            MemberRecord {
+                node: member_id.clone(),
+                status: MemberStatus::Active,
+                catalogue_revision: 0,
+                policy_revision: 0,
+                endpoint: None,
+                updated_at_ms: now,
+            },
+        )
+        .await
+        .expect_err("a member is not the administrator");
+    assert!(
+        matches!(denied, CapabilityError::Denied { .. }),
+        "{denied:?}"
+    );
+
+    // Membership is not authority: the registered member still holds no grant
+    // on the coordinator, so the invocation is refused provider-side.
+    let error = member
+        .invoke(&coordinator_id, &capability("echo"), json!({}), &context())
+        .await
+        .expect_err("no grant on the coordinator");
+    assert!(matches!(error, CapabilityError::Denied { .. }), "{error:?}");
+    tasks.retain(|task| !task.is_finished());
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scoped_grant_checks_the_operation_and_resource() {
+    let pair = pair().await;
+    {
+        let mut peers = pair.provider_peers.write().expect("peers");
+        peers
+            .grant_scoped(
+                &pair.caller_id,
+                capability("echo"),
+                vec!["read".to_string()],
+                vec!["/ws/*".to_string()],
+                capability::unix_ms(),
+                None,
+            )
+            .expect("a scoped grant");
+    }
+    let scope = federation::InvocationScope {
+        operation: Some("read".to_string()),
+        resource: Some("/ws/notes.txt".to_string()),
+    };
+    let output = pair
+        .caller
+        .invoke_scoped(
+            &pair.provider_id,
+            &capability("echo"),
+            json!({ "value": 7 }),
+            Some(&scope),
+            &context(),
+        )
+        .await
+        .expect("the scoped call is allowed");
+    assert_eq!(output.structured, Some(json!({ "value": 7 })));
+
+    let wrong = federation::InvocationScope {
+        operation: Some("write".to_string()),
+        resource: Some("/ws/notes.txt".to_string()),
+    };
+    let error = pair
+        .caller
+        .invoke_scoped(
+            &pair.provider_id,
+            &capability("echo"),
+            json!({ "value": 7 }),
+            Some(&wrong),
+            &context(),
+        )
+        .await
+        .expect_err("an unlisted operation is denied");
+    assert!(matches!(error, CapabilityError::Denied { .. }), "{error:?}");
+
+    let error = pair
+        .caller
+        .invoke(
+            &pair.provider_id,
+            &capability("echo"),
+            json!({ "value": 7 }),
+            &context(),
+        )
+        .await
+        .expect_err("a scoped grant refuses an unscoped call");
+    assert!(matches!(error, CapabilityError::Denied { .. }), "{error:?}");
+}
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_provider_refuses_a_caller_it_revoked() {
     let pair = pair().await;
@@ -502,6 +703,8 @@ async fn both_sides_audit_a_delegation_and_its_cancellation() {
         target: pair.provider_id.clone(),
         objective: "inspect the tree".to_string(),
         capabilities: vec![capability("echo")],
+        operations: Vec::new(),
+        resources: Vec::new(),
         deadline_ms: None,
         allow_sub_delegation: false,
         result_contract: None,
@@ -551,6 +754,8 @@ async fn both_sides_audit_a_delegation_and_its_cancellation() {
         target: pair.provider_id.clone(),
         objective: "should be refused".to_string(),
         capabilities: vec![capability("echo")],
+        operations: Vec::new(),
+        resources: Vec::new(),
         deadline_ms: None,
         allow_sub_delegation: false,
         result_contract: None,
@@ -786,6 +991,8 @@ async fn a_structured_delegation_is_executed_by_the_target() {
         target: pair.provider_id.clone(),
         objective: "echo the value".to_string(),
         capabilities: vec![capability("echo")],
+        operations: Vec::new(),
+        resources: Vec::new(),
         deadline_ms: None,
         allow_sub_delegation: false,
         result_contract: Some(
@@ -832,6 +1039,8 @@ async fn a_contract_outside_the_delegated_scope_is_refused() {
         target: pair.provider_id.clone(),
         objective: "try to escape the scope".to_string(),
         capabilities: vec![capability("echo")],
+        operations: Vec::new(),
+        resources: Vec::new(),
         deadline_ms: None,
         allow_sub_delegation: false,
         result_contract: Some(json!({ "capability": "builtin/other", "input": {} }).to_string()),
@@ -868,6 +1077,8 @@ async fn an_objective_only_delegation_stays_accepted() {
         target: pair.provider_id.clone(),
         objective: "write a poem".to_string(),
         capabilities: vec![capability("echo")],
+        operations: Vec::new(),
+        resources: Vec::new(),
         deadline_ms: None,
         allow_sub_delegation: false,
         result_contract: None,

@@ -22310,8 +22310,12 @@ fn opening_a_second_file_adds_a_tab_and_keeps_the_first(cx: &mut TestAppContext)
     );
     assert_eq!(
         cx.update(|_, cx| shell.read(cx).files.active),
-        None,
-        "closing the tab on screen returns to the tree"
+        Some(0),
+        "closing the tab on screen hands the body to its neighbour"
+    );
+    assert!(
+        cx.debug_bounds("files-editor").is_some(),
+        "the surviving document keeps the editor, rather than dropping to the tree"
     );
 
     // Closing the last one empties the editor area, so the tree takes over.
@@ -22329,6 +22333,123 @@ fn opening_a_second_file_adds_a_tab_and_keeps_the_first(cx: &mut TestAppContext)
         cx.debug_bounds("files-editor").is_none(),
         "and the editor column goes with it"
     );
+}
+
+/// Finder's close operations act on the strip's documents: Close Other Tabs
+/// keeps the chosen tab, and Close All Tabs leaves the panel on Start.
+#[gpui::test]
+fn closing_other_and_all_tabs_act_on_the_documents(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("right-close-tabs");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(crate::ui::right_panel::RightTab::Files, window, cx);
+        });
+    });
+    for name in ["README.md", "Cargo.toml", "src/lib.rs"] {
+        cx.update(|window, cx| {
+            shell.update(cx, |this, cx| {
+                this.open_file(std::path::Path::new(name), window, cx);
+            });
+        });
+    }
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).files.tabs.len()),
+        3,
+        "three documents are open"
+    );
+
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| this.close_other_tabs(1, cx));
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let (len, active, name) = cx.update(|_, cx| {
+        let pane = &shell.read(cx).files;
+        (pane.tabs.len(), pane.active, pane.tabs[0].label())
+    });
+    assert_eq!(len, 1, "only the kept tab survives");
+    assert_eq!(active, Some(0), "and it takes the body");
+    assert_eq!(
+        name, "Cargo.toml",
+        "the tab the reader chose is the survivor"
+    );
+
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| this.close_all_tabs(cx));
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let (len, active, tab) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (shell.files.tabs.len(), shell.files.active, shell.right.tab)
+    });
+    assert_eq!(len, 0, "Close All Tabs empties the strip");
+    assert_eq!(active, None);
+    assert_eq!(tab, None, "and returns the panel to Start");
+}
+
+/// At the panel's default width two documents and every launcher chip cannot
+/// fit, so the strip keeps the documents and moves the chips into the catalog.
+#[gpui::test]
+fn a_crowded_strip_moves_the_extra_tabs_into_the_catalog(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("right-tab-overflow");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(crate::ui::right_panel::RightTab::Files, window, cx);
+        });
+    });
+    for name in ["README.md", "Cargo.toml"] {
+        cx.update(|window, cx| {
+            shell.update(cx, |this, cx| {
+                this.open_file(std::path::Path::new(name), window, cx);
+            });
+        });
+    }
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    assert!(
+        cx.debug_bounds("right-tab-overflow").is_some(),
+        "the strip cannot fit the documents and every chip, so the catalog stands in"
+    );
+    assert!(
+        cx.debug_bounds("file-tab-README.md").is_some()
+            && cx.debug_bounds("file-tab-Cargo.toml").is_some(),
+        "the documents are the tabs that stay visible"
+    );
+    assert!(
+        cx.debug_bounds("right-pane-tasks").is_none(),
+        "a launcher chip with no room moves into the catalog instead of overflowing"
+    );
+
+    // The trigger is a real control, and choosing a document from its catalog
+    // focuses that document.
+    let overflow = cx
+        .debug_bounds("right-tab-overflow")
+        .expect("the catalog trigger renders");
+    cx.simulate_click(overflow.center(), Modifiers::default());
+    draw_until(cx, "the catalog opens", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("tab-catalog-file-0").is_some()
+    });
+    let readme = cx
+        .debug_bounds("tab-catalog-file-0")
+        .expect("the catalog lists the documents");
+    cx.simulate_click(readme.center(), Modifiers::default());
+    draw_until(cx, "the catalog's choice lands", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| shell.read(cx).files.active == Some(0))
+    });
 }
 
 /// The editor's buffer marks the file dirty on a change and the save clears it,

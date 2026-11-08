@@ -43,7 +43,8 @@ pub(crate) fn attach(agent: &mut Agent, context: TaskToolsContext) {
     attach_cancel(agent, context.clone());
     attach_status(agent, context.clone());
     attach_list(agent, context.clone());
-    attach_retry(agent, context);
+    attach_retry(agent, context.clone());
+    attach_graph(agent, context);
 }
 
 /// The create tool.
@@ -666,6 +667,203 @@ pub(crate) fn list_with(context: &TaskToolsContext, args: &Value) -> Result<Valu
         })
         .collect();
     Ok(json!({ "total": total, "tasks": rows }))
+}
+
+/// A graph executor that runs each task as a subagent child of this turn.
+///
+/// The child is the existing subagent tier: policy, slots and the runner are
+/// the subagent tool's own path, and the graph only decides order and
+/// concurrency.
+struct SubagentGraphExecutor {
+    subagents: Arc<crate::caps::SubagentContext>,
+}
+
+#[async_trait::async_trait]
+impl federation::TaskExecutor for SubagentGraphExecutor {
+    async fn execute(
+        &self,
+        task: &federation::TaskNode,
+    ) -> Result<federation::TaskOutcome, String> {
+        let (run, _) = self
+            .subagents
+            .spawn_child(&task.id.to_string(), &task.objective)
+            .map_err(|error| format!("{error}"))?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        loop {
+            let Some(snapshot) = self.subagents.snapshot(&run) else {
+                return Err("the child run disappeared".to_string());
+            };
+            match snapshot.state {
+                crate::extension::runs::RunState::Succeeded => {
+                    return Ok(federation::TaskOutcome::value(serde_json::json!({
+                        "run": run,
+                        "text": snapshot.result,
+                    })));
+                }
+                crate::extension::runs::RunState::Failed
+                | crate::extension::runs::RunState::Cancelled
+                | crate::extension::runs::RunState::Unknown => {
+                    return Err(snapshot
+                        .error
+                        .unwrap_or_else(|| "the child run failed".to_string()));
+                }
+                crate::extension::runs::RunState::Queued
+                | crate::extension::runs::RunState::Running => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = self.subagents.interrupt_run(&run);
+                return Err("the child run timed out".to_string());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
+}
+
+/// The graph tool.
+fn attach_graph(agent: &mut Agent, context: TaskToolsContext) {
+    let tool = AsyncFunctionTool::from_fn(
+        "task_graph",
+        "Run a DAG of agent tasks inside this turn: each task runs as a subagent child, dependencies run first, and the result reports every task's state and output. Bounded to 32 tasks and 4 concurrent children.",
+        json!({
+            "type": "object",
+            "properties": {
+                "tasks": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 32,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string" },
+                            "objective": { "type": "string" },
+                            "depends_on": {
+                                "type": "array",
+                                "items": { "type": "string" }
+                            },
+                            "acceptance": { "type": "string" },
+                            "max_attempts": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 5
+                            }
+                        },
+                        "required": ["id", "objective"]
+                    }
+                },
+                "concurrency": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 4
+                }
+            },
+            "required": ["tasks"]
+        }),
+        move |args| {
+            let context = context.clone();
+            async move { graph_with(&context, &args).await }
+        },
+    );
+    let metadata = crate::tool_metadata::builtin_metadata("task_graph")
+        .expect("task_graph metadata is declared");
+    if let Err(error) =
+        agent.try_add_async_tool(Arc::new(DeclaredAsyncTool::new(Arc::new(tool), metadata)))
+    {
+        log::warn!("task_graph tool was not registered: {error}");
+    }
+}
+
+/// Build and run a task graph.
+pub(crate) async fn graph_with(
+    context: &TaskToolsContext,
+    args: &Value,
+) -> Result<Value, ToolError> {
+    let tasks = args
+        .get("tasks")
+        .and_then(Value::as_array)
+        .filter(|tasks| !tasks.is_empty())
+        .ok_or_else(|| ToolError::InvalidInput("tasks is required".to_string()))?;
+    if tasks.len() > 32 {
+        return Err(ToolError::InvalidInput(
+            "a graph may have at most 32 tasks".to_string(),
+        ));
+    }
+    let concurrency = args
+        .get("concurrency")
+        .and_then(Value::as_u64)
+        .unwrap_or(2)
+        .clamp(1, 4) as usize;
+    let mut graph = federation::TaskGraph::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for task in tasks {
+        let id = task
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| ToolError::InvalidInput("every task needs an id".to_string()))?;
+        if !seen.insert(id.to_string()) {
+            return Err(ToolError::InvalidInput(format!("duplicate task id {id}")));
+        }
+        let objective = task
+            .get("objective")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|objective| !objective.is_empty())
+            .ok_or_else(|| ToolError::InvalidInput(format!("task {id} needs an objective")))?;
+        let depends_on: Vec<federation::TaskNodeId> = task
+            .get("depends_on")
+            .and_then(Value::as_array)
+            .map(|deps| {
+                deps.iter()
+                    .filter_map(Value::as_str)
+                    .map(federation::TaskNodeId::new)
+                    .collect()
+            })
+            .unwrap_or_default();
+        graph
+            .add(federation::TaskNodeId::new(id), objective, depends_on)
+            .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
+        if let Some(acceptance) = task.get("acceptance").and_then(Value::as_str) {
+            graph
+                .set_acceptance(&federation::TaskNodeId::new(id), acceptance)
+                .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
+        }
+        if let Some(attempts) = task.get("max_attempts").and_then(Value::as_u64) {
+            graph
+                .set_max_attempts(&federation::TaskNodeId::new(id), attempts as u32)
+                .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
+        }
+    }
+    let Some(subagents) = context.subagents.clone() else {
+        return Err(ToolError::Failed(
+            "subagents are not available in this turn".to_string(),
+        ));
+    };
+    let mut orchestrator = federation::Orchestrator::new(graph);
+    let executor = Arc::new(SubagentGraphExecutor { subagents });
+    let progress = orchestrator
+        .run(executor, concurrency)
+        .await
+        .map_err(|error| ToolError::Failed(error.to_string()))?;
+    let rows: Vec<Value> = orchestrator
+        .graph()
+        .tasks
+        .values()
+        .map(|task| {
+            json!({
+                "id": task.id.to_string(),
+                "state": format!("{:?}", task.state).to_lowercase(),
+                "result": task.result,
+                "error": task.error,
+                "acceptance": task.acceptance_result,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "succeeded": progress.succeeded,
+        "failed": progress.failed,
+        "tasks": rows,
+    }))
 }
 
 /// A short board label from the intent when the model names none.
@@ -2371,6 +2569,50 @@ mod tests {
         let id = response["job_id"].as_str().expect("id").to_string();
         assert!(jobs.job(&id).is_some(), "the registry holds it");
         jobs.kill(&id);
+    }
+
+    /// The graph tool validates the plan before it needs subagents.
+    #[tokio::test]
+    async fn graph_rejects_a_bad_plan_and_needs_subagents() {
+        let context = context("graph");
+        let duplicate = graph_with(
+            &context,
+            &json!({
+                "tasks": [
+                    {"id": "a", "objective": "x"},
+                    {"id": "a", "objective": "y"}
+                ]
+            }),
+        )
+        .await
+        .expect_err("duplicate");
+        assert!(format!("{duplicate:?}").contains("duplicate"));
+
+        let unknown = graph_with(
+            &context,
+            &json!({
+                "tasks": [{"id": "a", "objective": "x", "depends_on": ["nope"]}]
+            }),
+        )
+        .await;
+        assert!(unknown.is_err(), "an unknown dependency is refused");
+
+        let cycle = graph_with(
+            &context,
+            &json!({
+                "tasks": [
+                    {"id": "a", "objective": "x", "depends_on": ["b"]},
+                    {"id": "b", "objective": "y", "depends_on": ["a"]}
+                ]
+            }),
+        )
+        .await;
+        assert!(cycle.is_err(), "a cycle is refused");
+
+        let no_subagents = graph_with(&context, &json!({"tasks": [{"id": "a", "objective": "x"}]}))
+            .await
+            .expect_err("no subagents");
+        assert!(format!("{no_subagents:?}").contains("subagents are not available"));
     }
     /// An unknown id is a refusal, not an empty report.
     #[tokio::test]

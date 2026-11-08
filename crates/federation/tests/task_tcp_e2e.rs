@@ -192,6 +192,8 @@ async fn an_objective_delegation_crosses_two_real_sessions() {
                 target: pair.target_id.clone(),
                 objective: "Audit the working copy".to_string(),
                 capabilities: Vec::new(),
+                operations: Vec::new(),
+                resources: Vec::new(),
                 deadline_ms: None,
                 allow_sub_delegation: false,
                 result_contract: None,

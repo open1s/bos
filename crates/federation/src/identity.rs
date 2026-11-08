@@ -87,6 +87,30 @@ impl NodeIdentity {
         }
     }
 
+    /// Store this identity's seed through a custody backend.
+    pub fn save_custody(
+        &self,
+        custody: &dyn crate::custody::Custody,
+        name: &str,
+    ) -> Result<(), crate::custody::CustodyError> {
+        custody.store(name, STANDARD.encode(self.signing.to_bytes()).as_bytes())
+    }
+
+    /// Load an identity from a custody backend, when the name is stored.
+    pub fn load_custody(
+        custody: &dyn crate::custody::Custody,
+        name: &str,
+    ) -> Result<Option<Self>, crate::custody::CustodyError> {
+        let Some(secret) = custody.load(name)? else {
+            return Ok(None);
+        };
+        let text =
+            std::str::from_utf8(&secret).map_err(|_| crate::custody::CustodyError::Format)?;
+        Self::from_seed_base64(text)
+            .map(Some)
+            .map_err(|_| crate::custody::CustodyError::Format)
+    }
+
     /// Build an identity from a base64 32-byte seed.
     pub fn from_seed_base64(value: &str) -> Result<Self, IdentityError> {
         let bytes = STANDARD
