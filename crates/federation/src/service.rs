@@ -1865,6 +1865,11 @@ impl FederationNode {
         request: DelegationRequest,
         context: &InvocationContext,
     ) -> Result<DelegationRecord, CapabilityError> {
+        if peer == &self.node() {
+            return Err(CapabilityError::Invalid {
+                message: "a Node cannot delegate to itself".to_string(),
+            });
+        }
         if &request.target != peer {
             return Err(CapabilityError::Invalid {
                 message: format!(

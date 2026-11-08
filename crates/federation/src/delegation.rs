@@ -482,14 +482,21 @@ impl DelegationStore {
     /// delegation keeps its state. The rewritten file is saved before the store
     /// is returned.
     pub fn load(path: &Path) -> std::io::Result<Self> {
+        let mut store = Self::load_read_only(path)?;
+        if store.recover(capability::unix_ms()) > 0 {
+            store.save(path)?;
+        }
+        Ok(store)
+    }
+
+    /// Read a store without the restart recovery pass.
+    ///
+    /// Read-only commands must use this: loading a shared file must not turn a
+    /// live Accepted/Running delegation into a Failed one behind the owning
+    /// process.
+    pub fn load_read_only(path: &Path) -> std::io::Result<Self> {
         match std::fs::read_to_string(path) {
-            Ok(text) => {
-                let mut store = Self::from_json(&text)?;
-                if store.recover(capability::unix_ms()) > 0 {
-                    store.save(path)?;
-                }
-                Ok(store)
-            }
+            Ok(text) => Self::from_json(&text),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::new()),
             Err(error) => Err(error),
         }
@@ -787,5 +794,36 @@ mod tests {
                 .as_deref(),
             Some("trace-2")
         );
+    }
+
+    #[test]
+    fn read_only_load_does_not_recover_live_delegations() {
+        let mut store = DelegationStore::new();
+        let target = NodeId::new("node-a").expect("node id");
+        let id = store
+            .create(request("live", &target, Some(10_000)), 1_000)
+            .expect("created");
+        store
+            .transition(&id, DelegationState::Accepted, 1_000)
+            .expect("accepted");
+        let path = std::env::temp_dir().join(format!(
+            "bos-delegation-readonly-{}.json",
+            std::process::id()
+        ));
+        store.save(&path).expect("saved");
+
+        let read_only = DelegationStore::load_read_only(&path).expect("read only");
+        assert_eq!(
+            read_only.record(&id).expect("record").state,
+            DelegationState::Accepted,
+            "a status reader must not settle a live delegation"
+        );
+        let recovered = DelegationStore::load(&path).expect("recovered");
+        assert_eq!(
+            recovered.record(&id).expect("record").state,
+            DelegationState::Failed,
+            "the owning load still performs recovery"
+        );
+        let _ = std::fs::remove_file(path);
     }
 }

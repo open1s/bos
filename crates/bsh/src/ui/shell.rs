@@ -2411,7 +2411,7 @@ impl Shell {
         // window is open without needing a turn of its own to hang off.
         cx.spawn(async move |this, cx| loop {
             cx.background_executor()
-                .timer(std::time::Duration::from_secs(30))
+                .timer(std::time::Duration::from_secs(5))
                 .await;
             if this
                 .update(cx, |this, cx| {
@@ -2419,14 +2419,16 @@ impl Shell {
                         this.check_schedules(cx);
                         this.check_task_schedules(cx);
                         this.expire_task_deadlines(cx);
-                        this.settle_observed_tasks();
-                        this.check_peer_delegation_cancels();
-                        this.check_task_resumes(cx);
-                        this.check_peer_tasks(cx);
-                        this.check_peer_delegations(cx);
-                        this.check_peer_task_deadlines();
-                        this.refresh_peer_mirrors();
                     }
+                    // Peer work must not depend on the reader having a local
+                    // schedule: an accepted delegation is claimed by this tick.
+                    this.settle_observed_tasks();
+                    this.check_peer_delegation_cancels();
+                    this.check_task_resumes(cx);
+                    this.check_peer_tasks(cx);
+                    this.check_peer_delegations(cx);
+                    this.check_peer_task_deadlines();
+                    this.refresh_peer_mirrors();
                 })
                 .is_err()
             {

@@ -1662,6 +1662,301 @@ mod tests {
         assert!(text.contains("hello from the node"), "{text}");
     }
 
+    /// The same delegation over real Zenoh TCP, not the in-memory seam.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_delegation_crosses_two_bsh_nodes_over_tcp() {
+        use agent::capability::{
+            CapabilityId, InvocationContext, InvocationId, Principal, WorkspaceId,
+        };
+        use federation::{DelegationId, DelegationRequest, DelegationState};
+        use serde_json::json;
+        use std::net::TcpListener;
+
+        let root =
+            std::env::temp_dir().join(format!("bsh-node-tcp-delegate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("a scratch root");
+        std::fs::write(root.join("a.txt"), b"tcp delegated content\n").expect("a file");
+
+        let mut settings = crate::settings::Settings::default();
+        let workspace = settings.note_workspace("tcp-delegate", &root.to_string_lossy());
+        settings.global.general.active_workspace = workspace;
+        settings.global.federation.expose = vec!["builtin/read_file".to_string()];
+        settings.global.federation.expose_root = Some(root.to_string_lossy().to_string());
+        let (runtime, advertise) = node_runtime(&settings).expect("the node runtime");
+
+        let port = TcpListener::bind("127.0.0.1:0")
+            .expect("probe")
+            .local_addr()
+            .expect("address")
+            .port();
+        let bus_config = |listen: Option<u16>, connect: Option<u16>| BusConfig {
+            mode: "peer".to_string(),
+            connect: connect.map(|port| vec![format!("tcp/127.0.0.1:{port}")]),
+            listen: listen.map(|port| vec![format!("tcp/127.0.0.1:{port}")]),
+            peer: None,
+            tls: None,
+            scouting: false,
+        };
+        let provider_bus = Bus::from(bus_config(Some(port), None)).await;
+        let caller_bus = Bus::from(bus_config(None, Some(port))).await;
+
+        let provider_identity = NodeIdentity::from_seed([93u8; 32]);
+        let provider_id = provider_identity.node_id();
+        let caller_identity = NodeIdentity::from_seed([94u8; 32]);
+        let caller_id = caller_identity.node_id();
+        let provider_transport = ZenohTransport::new(provider_bus.session(), provider_id.clone());
+        let caller_transport = ZenohTransport::new(caller_bus.session(), caller_id.clone());
+        let provider_inbox = provider_transport
+            .subscribe()
+            .await
+            .expect("provider inbox")
+            .into_receiver();
+        let caller_inbox = caller_transport
+            .subscribe()
+            .await
+            .expect("caller inbox")
+            .into_receiver();
+
+        let provider = assemble(
+            provider_identity,
+            PeerStore::new(),
+            Arc::new(provider_transport),
+            provider_inbox,
+            None,
+            None,
+            None,
+            Some(Arc::clone(&runtime)),
+            None,
+            advertise,
+            Some("provider".to_string()),
+        );
+        let caller = assemble(
+            caller_identity,
+            PeerStore::new(),
+            Arc::new(caller_transport),
+            caller_inbox,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Some("caller".to_string()),
+        );
+
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        let capability: CapabilityId = "builtin/read_file".parse().expect("an id");
+        let now = unix_ms();
+        {
+            let peers = provider.node().peers();
+            let mut peers = peers.write().expect("peers");
+            peers.enroll(caller_id.clone(), now, None);
+            peers
+                .grant(&caller_id, capability.clone(), now, None)
+                .expect("provider grant");
+        }
+        {
+            let peers = caller.node().peers();
+            let mut peers = peers.write().expect("peers");
+            peers.enroll(provider_id.clone(), now, None);
+            peers
+                .grant(&provider_id, capability.clone(), now, None)
+                .expect("caller grant");
+        }
+
+        let mut context = InvocationContext::local(
+            InvocationId::new("inv:tcp-node-delegate"),
+            Principal::Local {
+                session: "session".to_string(),
+                preset: "preset".to_string(),
+            },
+            WorkspaceId::new("ws:caller").expect("workspace"),
+        );
+        context.deadline = Some(std::time::Instant::now() + Duration::from_secs(15));
+        let id = DelegationId::new("tcp-node-delegate");
+        let mut record = caller
+            .node()
+            .delegate(
+                &provider_id,
+                DelegationRequest {
+                    id: id.clone(),
+                    parent: None,
+                    target: provider_id.clone(),
+                    objective: "read over tcp".to_string(),
+                    capabilities: vec![capability],
+                    operations: Vec::new(),
+                    resources: Vec::new(),
+                    deadline_ms: Some(unix_ms() + 15_000),
+                    allow_sub_delegation: false,
+                    result_contract: Some(
+                        json!({
+                            "capability": "builtin/read_file",
+                            "input": { "path": "a.txt" }
+                        })
+                        .to_string(),
+                    ),
+                    trace_id: None,
+                    span_id: None,
+                },
+                &context,
+            )
+            .await
+            .expect("the peer accepts the delegation");
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while !record.state.is_terminal() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            record = caller
+                .node()
+                .delegation_status(&provider_id, &id, &context)
+                .await
+                .expect("status polls");
+        }
+        assert_eq!(record.state, DelegationState::Succeeded, "{record:?}");
+        assert!(serde_json::to_string(&record.result)
+            .expect("result")
+            .contains("tcp delegated content"));
+    }
+
+    /// The same exposed capability must execute through a *delegation*, not only
+    /// through a direct invoke. This is the path the Federation pane and the
+    /// model tool use.
+    #[tokio::test]
+    async fn a_delegation_executes_an_exposed_capability() {
+        use agent::capability::{
+            CapabilityId, InvocationContext, InvocationId, Principal, WorkspaceId,
+        };
+        use federation::{DelegationId, DelegationRequest, DelegationState};
+        use serde_json::json;
+
+        let root = std::env::temp_dir().join(format!("bsh-node-delegate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("a scratch root");
+        std::fs::write(root.join("a.txt"), b"delegated file content\n").expect("a file");
+
+        let mut settings = crate::settings::Settings::default();
+        let workspace = settings.note_workspace("delegate", &root.to_string_lossy());
+        settings.global.general.active_workspace = workspace;
+        settings.global.federation.expose = vec!["builtin/read_file".to_string()];
+        settings.global.federation.expose_root = Some(root.to_string_lossy().to_string());
+        let (runtime, advertise) = node_runtime(&settings).expect("the node runtime");
+
+        let network = Arc::new(InMemoryNetwork::new());
+        let provider_identity = NodeIdentity::from_seed([91u8; 32]);
+        let provider_id = provider_identity.node_id();
+        let (provider_transport, provider_inbox) = network.join(provider_id.clone());
+        let provider = assemble(
+            provider_identity,
+            PeerStore::new(),
+            Arc::new(provider_transport),
+            provider_inbox,
+            None,
+            None,
+            None,
+            Some(Arc::clone(&runtime)),
+            None,
+            advertise,
+            Some("provider".to_string()),
+        );
+
+        let caller_identity = NodeIdentity::from_seed([92u8; 32]);
+        let caller_id = caller_identity.node_id();
+        let (caller_transport, caller_inbox) = network.join(caller_id.clone());
+        let caller = assemble(
+            caller_identity,
+            PeerStore::new(),
+            Arc::new(caller_transport),
+            caller_inbox,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Some("caller".to_string()),
+        );
+
+        let capability: CapabilityId = "builtin/read_file".parse().expect("an id");
+        let now = unix_ms();
+        {
+            let peers = provider.node().peers();
+            let mut peers = peers.write().expect("peers");
+            peers.enroll(caller_id.clone(), now, None);
+            peers
+                .grant(&caller_id, capability.clone(), now, None)
+                .expect("provider grant");
+        }
+        {
+            let peers = caller.node().peers();
+            let mut peers = peers.write().expect("peers");
+            peers.enroll(provider_id.clone(), now, None);
+            peers
+                .grant(&provider_id, capability.clone(), now, None)
+                .expect("caller grant");
+        }
+
+        let mut context = InvocationContext::local(
+            InvocationId::new("inv:node-delegate"),
+            Principal::Local {
+                session: "session".to_string(),
+                preset: "preset".to_string(),
+            },
+            WorkspaceId::new("ws:caller").expect("a workspace"),
+        );
+        context.deadline = Some(std::time::Instant::now() + Duration::from_secs(10));
+        let id = DelegationId::new("node-delegate");
+        let created = caller
+            .node()
+            .delegate(
+                &provider_id,
+                DelegationRequest {
+                    id: id.clone(),
+                    parent: None,
+                    target: provider_id.clone(),
+                    objective: "read the delegated file".to_string(),
+                    capabilities: vec![capability],
+                    operations: Vec::new(),
+                    resources: Vec::new(),
+                    deadline_ms: Some(unix_ms() + 10_000),
+                    allow_sub_delegation: false,
+                    result_contract: Some(
+                        json!({
+                            "capability": "builtin/read_file",
+                            "input": { "path": "a.txt" }
+                        })
+                        .to_string(),
+                    ),
+                    trace_id: None,
+                    span_id: None,
+                },
+                &context,
+            )
+            .await
+            .expect("the peer accepts the delegation");
+        assert!(
+            matches!(
+                created.state,
+                DelegationState::Accepted | DelegationState::Running | DelegationState::Succeeded
+            ),
+            "unexpected initial state: {:?}",
+            created.state
+        );
+
+        let mut record = created;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !record.state.is_terminal() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            record = caller
+                .node()
+                .delegation_status(&provider_id, &id, &context)
+                .await
+                .expect("status polls");
+        }
+        assert_eq!(record.state, DelegationState::Succeeded, "{record:?}");
+        let result = serde_json::to_string(&record.result).expect("result serializes");
+        assert!(result.contains("delegated file content"), "{result}");
+    }
+
     #[test]
     fn an_expose_entry_the_node_cannot_serve_is_refused() {
         let mut settings = crate::settings::Settings::default();

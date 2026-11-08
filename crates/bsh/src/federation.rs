@@ -457,7 +457,7 @@ pub(crate) fn command(
                             std::time::SystemTime::now(),
                         );
                         let delegation_path = root.join("delegations.json");
-                        if let Ok(delegations) = DelegationStore::load(&delegation_path) {
+                        if let Ok(delegations) = DelegationStore::load_read_only(&delegation_path) {
                             let mut records: Vec<_> = delegations.iter().collect();
                             records.sort_by(|left, right| {
                                 right.updated_at_ms.cmp(&left.updated_at_ms)

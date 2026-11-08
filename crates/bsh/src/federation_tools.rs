@@ -71,7 +71,7 @@ pub(crate) async fn delegate_record(
 ) -> Result<federation::DelegationRecord, ToolError> {
     let runtime = runtime()?;
     let node = runtime.node();
-    let target = NodeId::new(target).map_err(|error| ToolError::InvalidInput(error.to_string()))?;
+    let target = resolve_peer(target, &enrolled_peers()?)?;
     let capability = capability
         .map(str::parse::<CapabilityId>)
         .transpose()
@@ -109,7 +109,7 @@ pub(crate) async fn create_peer_task(
 ) -> Result<federation::FederatedTask, ToolError> {
     let runtime = runtime()?;
     let node = runtime.node();
-    let target = NodeId::new(target).map_err(|error| ToolError::InvalidInput(error.to_string()))?;
+    let target = resolve_peer(target, &enrolled_peers()?)?;
     node.create_task(&target, request, &context())
         .await
         .map_err(|error| ToolError::Failed(error.to_string()))
@@ -122,7 +122,7 @@ pub(crate) async fn peer_task_status(
 ) -> Result<federation::FederatedTask, ToolError> {
     let runtime = runtime()?;
     let node = runtime.node();
-    let target = NodeId::new(target).map_err(|error| ToolError::InvalidInput(error.to_string()))?;
+    let target = resolve_peer(target, &enrolled_peers()?)?;
     node.task_status(&target, id, &context())
         .await
         .map_err(|error| ToolError::Failed(error.to_string()))
@@ -135,7 +135,7 @@ pub(crate) async fn cancel_peer_task(
 ) -> Result<federation::FederatedTask, ToolError> {
     let runtime = runtime()?;
     let node = runtime.node();
-    let target = NodeId::new(target).map_err(|error| ToolError::InvalidInput(error.to_string()))?;
+    let target = resolve_peer(target, &enrolled_peers()?)?;
     node.cancel_task(&target, id, &context())
         .await
         .map_err(|error| ToolError::Failed(error.to_string()))
@@ -146,7 +146,7 @@ pub(crate) async fn cancel_peer_task(
 pub(crate) async fn cancel_delegation(target: &str, id: &str) -> Result<(), ToolError> {
     let runtime = runtime()?;
     let node = runtime.node();
-    let target = NodeId::new(target).map_err(|error| ToolError::InvalidInput(error.to_string()))?;
+    let target = resolve_peer(target, &enrolled_peers()?)?;
     let delegation = DelegationId::new(id.to_string());
     node.cancel_delegation(&target, &delegation, &context())
         .await
@@ -189,12 +189,105 @@ pub(crate) fn delegation_snapshot(id: &str) -> Option<crate::extension::runs::Ru
     })
 }
 
+/// Resolve a model-supplied target by id, name, unique id prefix, or "auto".
+///
+/// Models often know a peer by its announced name, not its base64 id. The tool
+/// resolves the same spelling a reader sees in the pane; an unknown target
+/// returns the enrolled names instead of an opaque "not enrolled".
+fn resolve_peer(raw: &str, peers: &[(NodeId, Option<String>)]) -> Result<NodeId, ToolError> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("auto") {
+        return match peers {
+            [only] => Ok(only.0.clone()),
+            [] => Err(ToolError::InvalidInput(
+                "no enrolled peer: ask the reader to trust a peer first".to_string(),
+            )),
+            many => Err(ToolError::InvalidInput(format!(
+                "target is required when {} peers are enrolled; choose one of: {}",
+                many.len(),
+                peer_labels(peers)
+            ))),
+        };
+    }
+    if let Some((node, _)) = peers.iter().find(|(node, _)| node.as_str() == raw) {
+        return Ok(node.clone());
+    }
+    if let Some((node, _)) = peers.iter().find(|(_, name)| {
+        name.as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case(raw))
+    }) {
+        return Ok(node.clone());
+    }
+    let matches: Vec<&(NodeId, Option<String>)> = peers
+        .iter()
+        .filter(|(node, _)| raw.len() >= 8 && node.as_str().starts_with(raw))
+        .collect();
+    match matches.as_slice() {
+        [only] => Ok(only.0.clone()),
+        [] => Err(ToolError::InvalidInput(format!(
+            "unknown peer {raw:?}; enrolled peers: {}",
+            peer_labels(peers)
+        ))),
+        _ => Err(ToolError::InvalidInput(format!(
+            "peer prefix {raw:?} is ambiguous; enrolled peers: {}",
+            peer_labels(peers)
+        ))),
+    }
+}
+
+fn peer_labels(peers: &[(NodeId, Option<String>)]) -> String {
+    if peers.is_empty() {
+        return "none".to_string();
+    }
+    peers
+        .iter()
+        .map(|(node, name)| {
+            let id = node.as_str();
+            let short = &id[..id.len().min(10)];
+            match name {
+                Some(name) => format!("{name} ({short})"),
+                None => short.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn enrolled_peers() -> Result<Vec<(NodeId, Option<String>)>, ToolError> {
+    let runtime = runtime()?;
+    let peers = runtime.node().peers();
+    let store = peers
+        .read()
+        .map_err(|_| ToolError::Failed("the peer store is poisoned".to_string()))?;
+    let own = runtime.node_id();
+    Ok(store
+        .iter()
+        .filter(|peer| matches!(peer.state, federation::TrustState::Trusted))
+        .filter(|peer| &peer.node != own)
+        .map(|peer| (peer.node.clone(), peer.note.clone()))
+        .collect())
+}
+
 fn target(input: &Value) -> Result<NodeId, ToolError> {
-    let raw = input
-        .get("target")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ToolError::InvalidInput("target is required".to_string()))?;
-    NodeId::new(raw).map_err(|error| ToolError::InvalidInput(error.to_string()))
+    let raw = input.get("target").and_then(Value::as_str).unwrap_or("");
+    let peers = enrolled_peers()?;
+    if raw.trim().is_empty() || raw.eq_ignore_ascii_case("auto") {
+        let runtime = runtime()?;
+        let live: std::collections::BTreeSet<NodeId> = runtime
+            .announced_peers()
+            .into_iter()
+            .map(|row| row.node)
+            .collect();
+        let reachable: Vec<(NodeId, Option<String>)> = peers
+            .iter()
+            .filter(|(node, _)| live.contains(node))
+            .cloned()
+            .collect();
+        if !reachable.is_empty() {
+            return resolve_peer("auto", &reachable);
+        }
+    }
+    resolve_peer(raw, &peers)
 }
 
 fn string(input: &Value, key: &str) -> Result<String, ToolError> {
@@ -214,7 +307,7 @@ impl Tool for FederationTool {
         match self.name {
             "federation_status" => "Federation status: node identity, enrolled peers and outstanding delegations. The rest of the family (peers, delegate, query, cancel, cleanup) is reachable through find_tool.".to_string(),
             "federation_peers" => "List enrolled and discovered peers.".to_string(),
-            "federation_delegate" => "Delegate a task to a peer.".to_string(),
+            "federation_delegate" => "Run work on another node. Use this whenever the user asks a peer/node/other machine to do something. target may be omitted when exactly one trusted peer exists; the tool waits for the terminal result.".to_string(),
             "federation_cancel" => "Cancel a delegation.".to_string(),
             "federation_query" => "Ask a peer for knowledge.".to_string(),
             "federation_cleanup" => "Delete artifacts on a peer.".to_string(),
@@ -250,12 +343,13 @@ impl Tool for FederationTool {
             }),
             "federation_delegate" => json!({
                 "type": "object",
-                "required": ["target", "objective"],
+                "required": ["objective"],
                 "properties": {
-                    "target": {"type": "string"},
+                    "target": {"type": "string", "description": "peer id or name; omit to use the only trusted peer"},
                     "objective": {"type": "string"},
                     "capability": {"type": "string"},
-                    "input": {}
+                    "input": {},
+                    "wait_ms": {"type": "integer"}
                 }
             }),
             "federation_cancel" => json!({
@@ -309,17 +403,25 @@ impl FederationTool {
                 "federation": runtime.federation().map(ToString::to_string),
             })),
             "federation_peers" => {
+                let live: std::collections::BTreeSet<NodeId> = runtime
+                    .announced_peers()
+                    .into_iter()
+                    .map(|row| row.node)
+                    .collect();
                 let peers = node
                     .peers()
                     .read()
                     .map(|store| {
                         store
                             .iter()
+                            .filter(|peer| matches!(peer.state, federation::TrustState::Trusted))
+                            .filter(|peer| peer.node != runtime.node_id().clone())
                             .map(|peer| {
                                 json!({
                                     "node": peer.node.to_string(),
                                     "name": peer.note,
-                                    "state": format!("{:?}", peer.state).to_lowercase(),
+                                    "state": "trusted",
+                                    "online": live.contains(&peer.node),
                                     "grants": peer.grants.iter().map(|grant| grant.capability.to_string()).collect::<Vec<_>>(),
                                 })
                             })
@@ -329,12 +431,41 @@ impl FederationTool {
                 Ok(json!({ "peers": peers }))
             }
             "federation_delegate" => {
-                let target = string(input, "target")?;
+                let target = target(input)?;
                 let objective = string(input, "objective")?;
                 let capability = input.get("capability").and_then(Value::as_str);
                 let payload = input.get("input").cloned().unwrap_or(Value::Null);
-                let record = delegate_record(&target, &objective, capability, payload).await?;
-                serde_json::to_value(record).map_err(|error| ToolError::Failed(error.to_string()))
+                let record =
+                    delegate_record(&target.to_string(), &objective, capability, payload).await?;
+                let target = record.request.target.clone();
+                let id = record.request.id.clone();
+                let wait_ms = input
+                    .get("wait_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(20_000)
+                    .min(60_000);
+                let mut record = record;
+                let deadline = std::time::Instant::now() + Duration::from_millis(wait_ms);
+                while !record.state.is_terminal() && std::time::Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    match node.delegation_status(&target, &id, &context()).await {
+                        Ok(next) => record = next,
+                        Err(error) => {
+                            return Err(ToolError::Failed(format!(
+                                "delegation {} submitted, but status failed: {error}",
+                                id.as_str()
+                            )))
+                        }
+                    }
+                }
+                Ok(json!({
+                    "target": target.to_string(),
+                    "delegation": id.as_str(),
+                    "state": format!("{:?}", record.state).to_lowercase(),
+                    "terminal": record.state.is_terminal(),
+                    "result": record.result,
+                    "error": record.error,
+                }))
             }
             "federation_cancel" => {
                 let target = target(input)?;
@@ -396,6 +527,7 @@ async fn run_tool(name: &'static str, input: &Value) -> Result<Value, ToolError>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use federation::NodeIdentity;
 
     #[test]
     fn the_federation_bundle_has_stable_model_facing_names() {
@@ -422,7 +554,22 @@ mod tests {
             name: "federation_delegate",
         };
         let schema = tool.json_schema();
-        assert_eq!(schema["required"][0], "target");
-        assert_eq!(schema["required"][1], "objective");
+        assert_eq!(schema["required"][0], "objective");
+        assert!(schema["properties"]["target"].is_object());
+    }
+
+    #[test]
+    fn a_peer_name_resolves_to_its_node_id() {
+        let node = NodeIdentity::from_seed([7u8; 32]).node_id();
+        let peers = vec![(node.clone(), Some("provider".to_string()))];
+        assert_eq!(resolve_peer("provider", &peers).expect("name"), node);
+        assert_eq!(resolve_peer("PROVIDER", &peers).expect("case"), node);
+        assert_eq!(resolve_peer("auto", &peers).expect("auto"), node);
+        assert_eq!(
+            resolve_peer(&node.as_str()[..10], &peers).expect("prefix"),
+            node
+        );
+        let error = resolve_peer("node-b", &peers).expect_err("unknown");
+        assert!(error.to_string().contains("provider"), "{error}");
     }
 }

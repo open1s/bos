@@ -525,3 +525,15 @@ async fn another_peer_cannot_read_or_cancel_a_delegation() {
         task.abort();
     }
 }
+
+#[tokio::test]
+async fn a_node_refuses_to_delegate_to_itself() {
+    let pair = pair(true).await;
+    let own = pair.caller.node();
+    let error = pair
+        .caller
+        .delegate(&own, request("self", &own, Vec::new(), false), &context())
+        .await
+        .expect_err("self delegation is refused");
+    assert!(error.to_string().contains("itself"), "{error}");
+}
