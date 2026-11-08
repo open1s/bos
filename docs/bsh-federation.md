@@ -750,8 +750,13 @@ let progress = runner.run(executor, 4).await?;
   recovered as `Failed` with an indeterminate-outcome reason; an expired lease is
   never revived. A lease whose stream ended still requires the peer to re-open.
 - The Federation pane is task-shaped: tabs for Peers, Work, Resources and
-  Knowledge, grant chips on a peer card, and one Ask field for knowledge. Raw
-  node ids, capability ids, lease ids, URIs and JSON payloads live under an
+  Knowledge, grant chips on a peer card, and one Ask field for knowledge. Under
+  Advanced, **Exposed capabilities** is a checkbox dropdown over the safe
+  file-reading set (plus any capability already configured), with a one-click
+  clear, instead of four always-on chips. In Work, each finished card has its own
+  **Clear** action; **Clear all** removes every work record, including active
+  ones, so it is the explicit bulk reset.
+  Raw node ids, capability ids, lease ids, URIs and JSON payloads live under an
   Advanced disclosure rather than in the primary path. The local artifact store
   is listed with size and Remove; an executor that supports cleanup deletes
   expired bytes at the end of a task run.

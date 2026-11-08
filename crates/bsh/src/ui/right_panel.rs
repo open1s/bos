@@ -3662,6 +3662,31 @@ impl Shell {
             ));
         }
 
+        if tab == 1 {
+            pane = pane.child(self.federation_small_button(
+                "federation-clear-all",
+                lang.tr("right.federation.clearAll"),
+                cx,
+                |this, cx| {
+                    let Some(runtime) = crate::federation_node::running() else {
+                        this.right.federation.error =
+                            Some(this.state.lang.tr("right.federation.notRunning"));
+                        cx.notify();
+                        return;
+                    };
+                    let count = runtime.node().clear_delegations(true).unwrap_or_default();
+                    this.right.federation.notice = Some(crate::i18n::tr_args(
+                        this.state.lang,
+                        "right.federation.clearedAll",
+                        &[("count", count.to_string())],
+                    ));
+                    this.right.federation.error = None;
+                    this.reload_federation_quiet();
+                    cx.notify();
+                },
+            ));
+        }
+
         pane = match tab {
             1 => {
                 // Work: one card per delegation, with the only useful action
@@ -3759,6 +3784,23 @@ impl Shell {
                                             });
                                         })
                                         .detach();
+                                    },
+                                ));
+                            } else {
+                                let runtime = runtime.clone();
+                                let id = id.clone();
+                                card = card.child(self.federation_small_button(
+                                    "federation-work-clear",
+                                    lang.tr("right.federation.clearWork"),
+                                    cx,
+                                    move |this, cx| {
+                                        if let Some(runtime) = runtime.as_ref() {
+                                            runtime.node().clear_delegation(
+                                                &federation::DelegationId::new(id.clone()),
+                                            );
+                                        }
+                                        this.reload_federation_quiet();
+                                        cx.notify();
                                     },
                                 ));
                             }
@@ -4388,48 +4430,143 @@ impl Shell {
                         )),
                 )
                 .child(self.federation_section_title(lang.tr("right.federation.exposeTitle")))
-                .child(
-                    div().flex().flex_wrap().gap(px(4.0)).children(
-                        [
-                            "builtin/read_file",
-                            "builtin/read_files",
-                            "builtin/glob",
-                            "builtin/grep",
-                        ]
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, capability)| {
-                            let active = self
-                                .state
-                                .settings
-                                .global
-                                .federation
-                                .expose
-                                .iter()
-                                .any(|id| id == capability);
-                            self.federation_small_button(
-                                SharedString::from(format!("federation-expose-{index}")),
-                                format!("{} {capability}", if active { "✓" } else { "+" }),
-                                cx,
-                                move |this, cx| {
-                                    let expose = &mut this.state.settings.global.federation.expose;
-                                    if let Some(position) =
-                                        expose.iter().position(|id| id == capability)
-                                    {
-                                        expose.remove(position);
-                                    } else {
-                                        expose.push(capability.to_string());
+                .child({
+                    let entity = cx.entity();
+                    let exposed = self.state.settings.global.federation.expose.clone();
+                    let summary = if exposed.is_empty() {
+                        lang.tr("right.federation.exposeNone")
+                    } else {
+                        exposed.join(", ")
+                    };
+                    let count = exposed.len();
+                    let needle = self
+                        .federation_expose_search
+                        .read(cx)
+                        .value()
+                        .trim()
+                        .to_lowercase();
+                    let mut candidates: Vec<String> = [
+                        "builtin/read_file",
+                        "builtin/read_files",
+                        "builtin/glob",
+                        "builtin/grep",
+                    ]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect();
+                    for id in &exposed {
+                        if !candidates.contains(id) {
+                            candidates.push(id.clone());
+                        }
+                    }
+                    if !needle.is_empty() {
+                        candidates.retain(|id| id.to_lowercase().contains(&needle));
+                    }
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(self.federation_field(
+                            &self.federation_expose_search,
+                            "federation-field-expose-search",
+                            None,
+                        ))
+                        .child(
+                            div()
+                                .debug_selector(|| "federation-expose-menu".to_string())
+                                .child(
+                                    Button::new("federation-expose-menu")
+                                        .ghost()
+                                        .h(px(28.0))
+                                        .px(px(10.0))
+                                        .rounded(px(theme::RADIUS_SM))
+                                        .bg(rgb(theme::selected_row()))
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.0))
+                                        .cursor_pointer()
+                                        .child(txt(
+                                    format!(
+                                        "{} ({count})",
+                                        lang.tr("right.federation.exposeMenu")
+                                    ),
+                                    theme::CHIP_SIZE,
+                                    theme::text(),
+                                ))
+                                .child(txt("▾", 11.0, theme::faint()))
+                                .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
+                                    let mut menu = menu;
+                                    if candidates.is_empty() {
+                                        menu = menu.item(PopupMenuItem::label(
+                                            lang.tr("right.federation.exposeNone"),
+                                        ));
                                     }
-                                    this.save_settings(cx);
-                                    this.right.federation.notice =
-                                        Some(this.state.lang.tr("right.federation.exposeChanged"));
-                                    this.right.federation.error = None;
-                                    cx.notify();
-                                },
-                            )
-                        }),
-                    ),
-                )
+                                    for capability in candidates.iter().cloned() {
+                                        let shell = entity.clone();
+                                        let active = exposed.iter().any(|id| id == &capability);
+                                        let id = capability.clone();
+                                        menu = menu.item(
+                                            PopupMenuItem::new(capability)
+                                                .checked(active)
+                                                .on_click(move |_, _, cx| {
+                                                    shell.update(cx, |this, cx| {
+                                                        let expose = &mut this
+                                                            .state
+                                                            .settings
+                                                            .global
+                                                            .federation
+                                                            .expose;
+                                                        if let Some(position) = expose
+                                                            .iter()
+                                                            .position(|grant| grant == &id)
+                                                        {
+                                                            expose.remove(position);
+                                                        } else {
+                                                            expose.push(id.clone());
+                                                        }
+                                                        this.save_settings(cx);
+                                                        this.right.federation.notice = Some(
+                                                            this.state
+                                                                .lang
+                                                                .tr("right.federation.exposeChanged"),
+                                                        );
+                                                        this.right.federation.error = None;
+                                                        cx.notify();
+                                                    });
+                                                }),
+                                        );
+                                    }
+                                    let shell = entity.clone();
+                                    menu = menu
+                                        .item(PopupMenuItem::separator())
+                                        .item(
+                                            PopupMenuItem::new(
+                                                lang.tr("right.federation.exposeClear"),
+                                            )
+                                            .on_click(move |_, _, cx| {
+                                                shell.update(cx, |this, cx| {
+                                                    this.state
+                                                        .settings
+                                                        .global
+                                                        .federation
+                                                        .expose
+                                                        .clear();
+                                                    this.save_settings(cx);
+                                                    this.right.federation.notice = Some(
+                                                        this.state
+                                                            .lang
+                                                            .tr("right.federation.exposeChanged"),
+                                                    );
+                                                    cx.notify();
+                                                });
+                                            }),
+                                        );
+                                    menu
+                                }),
+                                ),
+                        )
+                        .child(txt(summary, 11.0, theme::faint()))
+                })
                 .child(
                     div()
                         .flex()

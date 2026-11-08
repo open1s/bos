@@ -9,8 +9,9 @@
 //! IDEs, Git GUIs, then terminals - so the menu order is a property of the
 //! product rather than of this shell, and a new application is a row here.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::i18n::Lang;
 use crate::settings::OPENER;
@@ -49,28 +50,38 @@ impl App {
         }
     }
 
-    /// The application's icon, decoded once and cached.
+    /// The application's icon, as the warm-up cache holds it.
     ///
     /// The reference serves the icon from the host's catalog; bsh asks AppKit
     /// for the same bundle icon and hands GPUI PNG bytes, because GPUI's
     /// decoder reads PNG and not `.icns`. None means GPUI draws the reference's
     /// own fallback glyph instead of an application image.
-    pub(crate) fn icon(&self) -> Option<Arc<gpui_kit::Image>> {
+    ///
+    /// This is a pure read by design. Decoding asks AppKit for the bundle image
+    /// and re-encodes it, which measured 0.2-3 s per application - Finder alone
+    /// took 3.0 s while the icon service cold-started - so a caller on the
+    /// render or click path must never pay it. [`App::warm`] fills the cache
+    /// from a background task instead.
+    pub(crate) fn cached_icon(&self) -> Option<Arc<gpui_kit::Image>> {
+        icons().lock().ok()?.get(self.id).cloned().flatten()
+    }
+
+    /// Decode this application's icon into the process cache.
+    ///
+    /// Idempotent, and the only place an icon is decoded: the first menu open
+    /// used to run this for every installed application on the UI thread, so a
+    /// six-application catalog stalled the click for 4.4 seconds.
+    pub(crate) fn warm(&self) -> Option<Arc<gpui_kit::Image>> {
         #[cfg(target_os = "macos")]
         {
-            use std::collections::HashMap;
-            use std::sync::Mutex;
-
-            /// Decoded icons by catalog id, filled once per process.
-            type Icons = Mutex<HashMap<&'static str, Option<Arc<gpui_kit::Image>>>>;
-
-            static ICONS: OnceLock<Icons> = OnceLock::new();
-            let icons = ICONS.get_or_init(|| Mutex::new(HashMap::new()));
-            let mut icons = icons.lock().ok()?;
-            icons
-                .entry(self.id)
-                .or_insert_with(|| load_icon(&self.icon_bundle()?))
-                .clone()
+            if let Some(hit) = self.cached_icon() {
+                return Some(hit);
+            }
+            let decoded = self.icon_bundle().and_then(|bundle| load_icon(&bundle));
+            if let Ok(mut icons) = icons().lock() {
+                icons.insert(self.id, decoded.clone());
+            }
+            decoded
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -91,6 +102,18 @@ impl App {
             None => None,
         }
     }
+}
+
+/// Decoded icons by catalog id, filled by the launch warm-up and read by the views.
+///
+/// One process-wide map rather than a field on each `App`, so a decoded PNG is
+/// never held twice. The lock only guards a lookup or an insert and is released
+/// around the decode itself, so a cold read never waits behind AppKit.
+type IconCache = Mutex<HashMap<&'static str, Option<Arc<gpui_kit::Image>>>>;
+static ICONS: OnceLock<IconCache> = OnceLock::new();
+
+fn icons() -> &'static IconCache {
+    ICONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// The edge an application icon is decoded at, four times the largest drawn
@@ -384,6 +407,19 @@ pub(crate) fn open(app: &App, path: &str) -> std::io::Result<()> {
     open_command(app, path).spawn().map(|_| ())
 }
 
+/// How many bundle icons have been decoded in this process.
+///
+/// Test-only, and the proof that the view path reads the cache instead of
+/// paying AppKit on a click: a menu open must not move this counter.
+#[cfg(test)]
+static ICON_DECODES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The number of bundle icons decoded so far, for the cache-miss test.
+#[cfg(test)]
+pub(crate) fn icon_decodes() -> usize {
+    ICON_DECODES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Decode an application bundle's icon into the PNG bytes GPUI draws.
 ///
 /// AppKit is asked for the bundle icon the Finder and the Dock show, which is
@@ -395,6 +431,9 @@ fn load_icon(bundle: &std::path::Path) -> Option<Arc<gpui_kit::Image>> {
     use gpui_kit::{Image, ImageFormat};
     use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSWorkspace};
     use objc2_foundation::{NSDictionary, NSString};
+
+    #[cfg(test)]
+    ICON_DECODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let path = NSString::from_str(bundle.to_str()?);
     let icon = NSWorkspace::sharedWorkspace().iconForFile(&path);
@@ -590,5 +629,32 @@ mod tests {
         );
         #[cfg(not(target_os = "macos"))]
         assert_eq!(ids, vec!["filemanager"]);
+    }
+
+    /// The view path is a pure cache read: a cold entry draws the fallback
+    /// glyph instead of paying AppKit on a click.
+    ///
+    /// This is the regression guard for the first-click stall: the menu rows and
+    /// the header's main half call `cached_icon`, and only the launch warm-up
+    /// may decode. Measured before the split: 4.4 s for the six installed
+    /// applications, Finder alone 3.0 s.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_cold_read_never_decodes_an_icon() {
+        let app = super::App {
+            id: "probe-not-installed",
+            label: Label::Product("Probe"),
+            bundle: Some(PathBuf::from("/Applications/Probe.app")),
+        };
+        let before = super::icon_decodes();
+        assert!(
+            app.cached_icon().is_none(),
+            "an application the warm-up never saw has no icon"
+        );
+        assert_eq!(
+            super::icon_decodes(),
+            before,
+            "reading an icon must never reach AppKit"
+        );
     }
 }

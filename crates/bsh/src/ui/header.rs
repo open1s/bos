@@ -1561,7 +1561,7 @@ impl Shell {
                     } else {
                         entry.label(lang)
                     };
-                    let image = entry.icon();
+                    let image = entry.cached_icon();
                     let shell = menu_shell.clone();
                     let path = menu_path.clone();
                     let chosen = entry.clone();
@@ -1622,7 +1622,7 @@ impl Shell {
             .hover(|style| style.bg(rgb(theme::hover())))
             .tooltip(move |window, cx| Tooltip::new(main_tip.clone()).build(window, cx))
             .tooltip_show_delay(std::time::Duration::from_millis(500))
-            .child(app_icon(app.icon(), 13.0))
+            .child(app_icon(app.cached_icon(), 13.0))
             .on_click(cx.listener(move |this, _event, _window, cx| {
                 this.open_workspace(&app, &root, false, cx);
             }));

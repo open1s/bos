@@ -1044,6 +1044,36 @@ impl FederationNode {
         done
     }
 
+    /// Remove finished delegations, or every record when none is active.
+    pub fn clear_delegations(&self, all: bool) -> Result<usize, CapabilityError> {
+        let mut store = self
+            .delegations
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let removed = if all {
+            store.clear_all()
+        } else {
+            store.clear_finished()
+        };
+        if removed > 0 {
+            self.persist_delegations(&store);
+        }
+        Ok(removed)
+    }
+
+    /// Remove one delegation record and persist the result.
+    pub fn clear_delegation(&self, id: &DelegationId) -> bool {
+        let mut store = self
+            .delegations
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let removed = store.clear_one(id);
+        if removed {
+            self.persist_delegations(&store);
+        }
+        removed
+    }
+
     /// Write the delegation store through the same gate the request handlers use.
     fn persist_delegations(&self, store: &DelegationStore) {
         let Some(path) = &self.delegation_path else {

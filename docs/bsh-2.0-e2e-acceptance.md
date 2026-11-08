@@ -194,3 +194,32 @@ A release note or README may say “workspace composition is implemented” only
 - the implementation status in `ARCHITECTURE.md` is updated with links to the code and tests.
 
 Until then, use “workspace composition foundation” or “composition in development”, not “complete composable workspace runtime”.
+
+## 9. Federation three-node acceptance
+
+The single-node gate above deliberately excludes Federation. Federation has its
+own acceptance gate with **three distinct Nodes**: a caller, a coordinator, and
+a worker.
+
+### Scenario
+
+1. Caller A delegates an objective to coordinator B.
+2. B claims the objective, selects worker C, and delegates the concrete
+   capability to C.
+3. C executes the capability and returns the structured result.
+4. B settles A's parent objective with C's result.
+5. A reads the terminal parent record and sees the worker's result.
+
+### Required evidence
+
+- Three real Zenoh TCP sessions, not one shared in-memory transport.
+- Trust and grants are explicit in both directions at each hop.
+- The parent objective is claimed before settlement.
+- The worker record and the parent record both reach `Succeeded`.
+- The result crosses two hops without being rewritten.
+
+Automated test: `crates/federation/tests/three_node_acceptance.rs`.
+
+This gate does not claim transitive sub-delegation to a different target; the
+current sub-delegation contract attenuates to the same target. A coordinator
+uses a fresh root delegation to a worker, which is the supported pattern.

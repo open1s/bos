@@ -338,6 +338,8 @@ pub(crate) struct Shell {
     pub(crate) federation_grant: Entity<InputState>,
     /// The federation pane's expose-root field.
     pub(crate) federation_expose_root: Entity<InputState>,
+    /// The federation pane's expose search field.
+    pub(crate) federation_expose_search: Entity<InputState>,
     /// The federation pane's knowledge query field.
     pub(crate) federation_knowledge: Entity<InputState>,
     /// The federation pane's knowledge publication payload.
@@ -1172,7 +1174,34 @@ impl Shell {
         open_settings: Option<usize>,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::assemble(window, open_settings, AppState::new(), cx)
+        let shell = Self::assemble(window, open_settings, AppState::new(), cx);
+        shell.warm_application_icons(cx);
+        shell
+    }
+
+    /// Decode the open-in-app icons away from every interaction.
+    ///
+    /// The header's split control draws the preferred application's icon and its
+    /// menu draws one per installed application. A decode is 0.2-3 s of AppKit
+    /// work (measured: 4.4 s for the six applications installed here), so the
+    /// views only read the cache - see `open_in_app::App::cached_icon` - and this
+    /// task fills it at launch. The control paints its fallback glyph first and
+    /// repaints as each icon lands, which is the one visible cost of never
+    /// stalling a click.
+    fn warm_application_icons(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            for app in crate::open_in_app::installed() {
+                cx.background_executor()
+                    .spawn(async move {
+                        let _ = app.warm();
+                    })
+                    .await;
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
     }
 
     /// Build the view over a supplied state. Tests point the store at a scratch
@@ -1381,6 +1410,10 @@ impl Shell {
                 lang,
                 "right.federation.exposeRootPlaceholder",
             ))
+        });
+        let federation_expose_search = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(crate::i18n::tr(lang, "right.federation.exposeSearch"))
         });
         if !expose_root_value.is_empty() {
             federation_expose_root.update(cx, |input, cx| {
@@ -1944,6 +1977,7 @@ impl Shell {
             federation_enroll,
             federation_grant,
             federation_expose_root,
+            federation_expose_search,
             federation_knowledge,
             federation_knowledge_payload,
             federation_lease_id,

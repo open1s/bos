@@ -3907,3 +3907,19 @@ kit popup, and a launch reports only a SPAWN failure - the reference also reject
 an early nonzero exit, which bsh does not observe because it does not wait on the
 child.
 
+**The open control's first click stopped decoding icons (round 132).** The
+chevron menu decoded every installed application's icon while it was being built
+(the rows called `App::icon`, which took the cache lock and called AppKit on a
+miss), and the measured cost was **4.4 s for the six applications installed
+here** - Finder alone took 3.0 s while the icon service cold-started, then 0.19
+to 0.33 s each. The view path is `App::cached_icon` now: a pure map lookup, so a
+cold entry draws the reference's fallback glyph instead of stalling. `App::warm`
+is the only decoder, and `Shell::new` warms the catalog one application per
+background task, notifying after each, so the header's own icon lands as soon as
+it is decoded and the rest fill in behind it. Evidence: the test-only decode
+counter `open_in_app::icon_decodes` is asserted unchanged around the menu open in
+`ui::shell_tests::the_open_control_lists_the_installed_applications`, and
+`a_cold_read_never_decodes_an_icon` pins the read path. Trap: one background task
+for the whole catalog delays the header's icon by the full serial time; await one
+decode per iteration so each gets its own repaint.
+

@@ -474,13 +474,41 @@ impl DelegationStore {
         self.revision
     }
 
+    /// Remove every terminal record; active records stay.
+    pub fn clear_finished(&mut self) -> usize {
+        let before = self.records.len();
+        self.records.retain(|_, record| !record.state.is_terminal());
+        let removed = before.saturating_sub(self.records.len());
+        if removed > 0 {
+            self.revision += 1;
+        }
+        removed
+    }
+
+    /// Remove one record by id; returns whether it existed.
+    pub fn clear_one(&mut self, id: &DelegationId) -> bool {
+        let removed = self.records.remove(id).is_some();
+        if removed {
+            self.revision += 1;
+        }
+        removed
+    }
+
+    /// Remove every record, including active ones.
+    pub fn clear_all(&mut self) -> usize {
+        let removed = self.records.len();
+        self.records.clear();
+        if removed > 0 {
+            self.revision += 1;
+        }
+        removed
+    }
+
     /// Read a store from its persistence file; a missing file is empty.
     ///
     /// Recovery is explicit: a delegation that was still Created, Accepted, or
     /// Running when the process stopped is marked Failed with an indeterminate-
-    /// outcome reason. It is never silently returned to Created, and a terminal
-    /// delegation keeps its state. The rewritten file is saved before the store
-    /// is returned.
+    /// outcome reason. The rewritten file is saved before the store is returned.
     pub fn load(path: &Path) -> std::io::Result<Self> {
         let mut store = Self::load_read_only(path)?;
         if store.recover(capability::unix_ms()) > 0 {
@@ -794,6 +822,40 @@ mod tests {
                 .as_deref(),
             Some("trace-2")
         );
+    }
+
+    #[test]
+    fn clear_one_removes_one_and_clear_all_removes_every_record() {
+        let mut store = DelegationStore::new();
+        let target = NodeId::new("node-a").expect("node id");
+        let done = store
+            .create(request("done", &target, Some(10_000)), 1_000)
+            .expect("done");
+        store
+            .transition(&done, DelegationState::Accepted, 1_000)
+            .expect("accepted");
+        store
+            .transition(&done, DelegationState::Running, 1_000)
+            .expect("running");
+        store
+            .transition(&done, DelegationState::Succeeded, 1_000)
+            .expect("succeeded");
+        let live = store
+            .create(request("live", &target, Some(10_000)), 1_000)
+            .expect("live");
+        store
+            .transition(&live, DelegationState::Accepted, 1_000)
+            .expect("accepted");
+
+        assert_eq!(store.clear_finished(), 1);
+        assert!(store.record(&live).is_some());
+        assert!(store.clear_one(&live), "clear one removes the live record");
+        assert!(store.iter().next().is_none());
+        let again = store
+            .create(request("again", &target, Some(10_000)), 1_000)
+            .expect("again");
+        assert_eq!(store.clear_all(), 1);
+        assert!(store.record(&again).is_none());
     }
 
     #[test]

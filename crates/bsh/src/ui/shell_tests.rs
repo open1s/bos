@@ -7270,10 +7270,18 @@ fn the_open_control_lists_the_installed_applications(cx: &mut TestAppContext) {
     let chevron = cx
         .debug_bounds("hdr-open-more")
         .expect("the menu half of the split");
+    // The click path only reads the icon cache: decoding six bundle icons is
+    // 4.4 s of AppKit work (measured), and none of it may land inside the press.
+    let decoded = crate::open_in_app::icon_decodes();
     cx.simulate_click(chevron.center(), Modifiers::default());
     draw_until(cx, "the application menu", 8, |cx| {
         cx.debug_bounds("hdr-open-app-0").is_some()
     });
+    assert_eq!(
+        crate::open_in_app::icon_decodes(),
+        decoded,
+        "opening the menu must not decode an icon"
+    );
     let first = cx
         .debug_bounds("hdr-open-app-0")
         .expect("the menu's first row");
@@ -21682,6 +21690,14 @@ fn the_right_panel_offers_a_federation_pane(cx: &mut TestAppContext) {
     assert!(
         cx.debug_bounds("federation-grant").is_some(),
         "the pane offers Grant"
+    );
+    assert!(
+        cx.debug_bounds("federation-expose-menu").is_some(),
+        "exposure is a dropdown, not four always-on chips"
+    );
+    assert!(
+        cx.debug_bounds("federation-field-expose-search").is_some(),
+        "the dropdown is searchable"
     );
     assert!(
         cx.debug_bounds("right-tab").is_some(),

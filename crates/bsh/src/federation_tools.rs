@@ -24,20 +24,29 @@ pub(crate) struct FederationTool {
 impl FederationTool {
     /// The full bundle, in the order the model sees it.
     pub(crate) fn bundle() -> Vec<Self> {
-        ["status", "peers", "delegate", "cancel", "query", "cleanup"]
-            .into_iter()
-            .map(|name| Self {
-                name: match name {
-                    "status" => "federation_status",
-                    "peers" => "federation_peers",
-                    "delegate" => "federation_delegate",
-                    "cancel" => "federation_cancel",
-                    "query" => "federation_query",
-                    "cleanup" => "federation_cleanup",
-                    _ => unreachable!("a fixed tool list"),
-                },
-            })
-            .collect()
+        [
+            "status",
+            "peers",
+            "capabilities",
+            "delegate",
+            "cancel",
+            "query",
+            "cleanup",
+        ]
+        .into_iter()
+        .map(|name| Self {
+            name: match name {
+                "status" => "federation_status",
+                "peers" => "federation_peers",
+                "capabilities" => "federation_capabilities",
+                "delegate" => "federation_delegate",
+                "cancel" => "federation_cancel",
+                "query" => "federation_query",
+                "cleanup" => "federation_cleanup",
+                _ => unreachable!("a fixed tool list"),
+            },
+        })
+        .collect()
     }
 }
 
@@ -540,6 +549,7 @@ mod tests {
             [
                 "federation_status",
                 "federation_peers",
+                "federation_capabilities",
                 "federation_delegate",
                 "federation_cancel",
                 "federation_query",
