@@ -3923,3 +3923,58 @@ counter `open_in_app::icon_decodes` is asserted unchanged around the menu open i
 for the whole catalog delays the header's icon by the full serial time; await one
 decode per iteration so each gets its own repaint.
 
+
+Round 189: the file editor's comments became threads the code keeps (2026-11-09)
+
+The ask: the right-pane editor should make reading a file and commenting on it
+one gesture, and carry the comment into a model turn without losing the draft.
+
+What changed:
+- `notes.rs`: a `Note` now carries `quote` (the code it was pinned to, at most
+  8 lines / 400 B), `resolved` and `sent`. `Notes::reanchor` searches the quote
+  when the anchor line no longer carries it (the nearest occurrence wins), so an
+  edit above a comment moves the comment with its code; it runs when a file
+  opens and when a buffer is saved. `review_prompt` builds the request - path,
+  `### L12-18`, a fenced CURRENT excerpt, the remark and one instruction line -
+  and leaves resolved remarks out.
+- The editor draws one 4x13 rail dash per comment at its line's own y (accent
+  open, `border_strong` resolved), and a focused comment opens in a dock UNDER
+  the code instead of a card over it. `RangeDecoration::Fill` tints the
+  commented lines; the collection tracks text edits itself, so it is re-set only
+  when the NOTES change.
+- The strip's `right-comments` control (dot while anything is open) opens the
+  `files-notes` drawer, which lists threads with resolve/delete and Send to
+  chat; `cmd-alt-m` opens the comment card from the keyboard.
+- Ask/Comment send through `Shell::deliver_request` (the same path the composer
+  uses: queued while a turn runs, a new turn when idle, announced on the
+  extension bus), so the reader's draft is never overwritten; a refusal puts the
+  request into the composer instead of losing it. The card's Comment sends only
+  the UNSENT remarks, so a second comment does not re-ask the file's history.
+
+Evidence: 12 unit tests in `notes::`; 4 new and 6 updated shell tests -
+`pinning_a_comment_records_its_quote`,
+`resolving_a_comment_takes_it_out_of_the_next_review`,
+`the_strip_comment_control_opens_the_drawer`,
+`saving_reanchors_a_comment_that_moved`, plus the mark/dock geometry test.
+
+Traps worth keeping:
+- `RangeDecoration::with_color` takes `Hsla` while `theme::rgb` is `Rgba`, so the
+  fill needs `Hsla::from(..)`; its alpha is the only thing that separates an
+  open mark from a resolved one.
+- The overlays' parent is the editor box: `document_origin(range_to_bounds(..),
+  text_bounds())` is the whole conversion, and the thread dock must be a SIBLING
+  of the editor body - inside the same relative frame the editor's own scroller
+  clips it.
+- `Note`'s new fields mean every literal moved to `Note::new`; old sidecars still
+  load because every field is `serde(default)` (an empty quote falls back to the
+  line).
+- Environment trap this round: the shared working copy had another writer
+  running `cargo check -p bsh`; two cargo processes on one target dir delete
+  each other's `.rmeta` ("extern location for log does not exist"). Wait for the
+  peer's cargo to exit before starting a build.
+
+Honest gaps: the kit editor exposes no soft wrap and no outline/minimap, so the
+reference's wrap toggle cannot be mirrored; a comment is a line-anchored remark
+with no reply chain (the conversation happens in chat); the rail dash is not
+reachable by the synthetic harness, so the click tests drive `focus_comment`
+and assert the dock/drawer geometry instead.

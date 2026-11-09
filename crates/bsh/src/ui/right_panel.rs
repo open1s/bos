@@ -1685,7 +1685,11 @@ impl Shell {
             .child(icon(
                 IconName::MessageSquare,
                 14.0,
-                if open > 0 { theme::text() } else { theme::faint() },
+                if open > 0 {
+                    theme::text()
+                } else {
+                    theme::faint()
+                },
             ))
             .when(open > 0, |control| {
                 control.child(
@@ -6739,8 +6743,10 @@ impl Shell {
 
     /// Raise the review card for the current selection.
     pub(crate) fn open_comment_card(&mut self, cx: &mut Context<Self>) {
+        // The card is the write surface and the thread panel is the reading one,
+        // so raising the card does not also open the drawer: the drawer would
+        // take the code's height for a list the reader did not ask to see.
         self.files.comment_open = true;
-        self.files.notes_open = true;
         cx.notify();
     }
 
@@ -6856,12 +6862,15 @@ impl Shell {
             Some(text) => crate::notes::excerpt(&note, text),
             None => note.quote.clone(),
         };
-        let shown: Vec<&str> = quote.lines().take(3).collect();
-        let mut quote = shown.join("\n");
-        if quote.lines().count() < note.quote.lines().count() || quote.lines().count() > shown.len()
-        {
-            quote.push('…');
-        }
+        let quote = {
+            let total = quote.lines().count();
+            let shown: Vec<&str> = quote.lines().take(3).collect();
+            let mut text = shown.join("\n");
+            if total > shown.len() {
+                text.push('…');
+            }
+            text
+        };
         let anchor = note.anchor();
         let body = note.text.clone();
         let resolved = note.resolved;
@@ -7276,13 +7285,13 @@ impl Shell {
                                         theme::page(),
                                     ))
                                     .on_click(cx.listener(move |this, _event, window, cx| {
-                                        // Comment SENDS the review: the note is
-                                        // pinned and the whole set goes to the model
-                                        // as a prompt, queued when a turn is already
-                                        // running - what the composer's own send
-                                        // does, so nothing is sent twice or lost.
+                                        // Comment pins the remark and asks about
+                                        // it in one press. Only the remarks that have
+                                        // not gone out yet travel, and the send goes
+                                        // through the composer's own submit path, so
+                                        // it queues behind a running turn.
                                         this.pin_note(window, cx);
-                                        this.send_review_to_chat(&send_rel, window, cx);
+                                        this.send_unsent_notes(&send_rel, window, cx);
                                         this.files.comment_open = false;
                                         this.files.notes_open = false;
                                         cx.notify();
@@ -9330,15 +9339,7 @@ impl Shell {
         cx.notify();
     }
 
-    /// Open a file in the editor area as a tab.
-    ///
-    /// A file already open is focused rather than reopened, so the strip never
-    /// carries the same file twice and a buffer with unsaved changes is never
-    /// thrown away by clicking its row again. The read is bounded and the
-    /// format decides the body: a text file lands in a highlighted editor, an
-    /// image lands in an image pane, and anything else says it cannot be shown
-    /// rather than dropping bytes into a buffer.
-    /// Send the file's open, not-yet-sent comments to the model as one review.
+    /// Send the file's open comments to the model as one review.
     ///
     /// This is the deliberate batch - the drawer's button, and the card's own
     /// Comment action right after it pins the remark the reader just wrote.
@@ -9346,6 +9347,35 @@ impl Shell {
     /// asks about the new comment instead of repeating the whole file's
     /// history at the model.
     pub(crate) fn send_review_to_chat(
+        &mut self,
+        rel: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let indices: Vec<usize> = self
+            .files
+            .notes
+            .on(rel)
+            .iter()
+            .enumerate()
+            .filter(|(_, note)| !note.resolved)
+            .map(|(index, _)| index)
+            .collect();
+        if indices.is_empty() {
+            return;
+        }
+        self.send_notes(rel, &indices, window, cx);
+        self.files.notes_open = false;
+        self.files.comment_open = false;
+    }
+
+    /// Send only the remarks this file has not sent before.
+    ///
+    /// The card's own Comment action uses this: the reader just wrote ONE
+    /// remark, and re-asking about every earlier one on the file would spend a
+    /// turn repeating a conversation the model already had. The drawer's
+    /// explicit Send is the other shape - it means the whole open review.
+    pub(crate) fn send_unsent_notes(
         &mut self,
         rel: &Path,
         window: &mut Window,
@@ -9366,6 +9396,7 @@ impl Shell {
         self.send_notes(rel, &indices, window, cx);
         self.files.notes_open = false;
         self.files.comment_open = false;
+        cx.notify();
     }
 
     /// Ask the model about one comment: the thread panel's own action.
@@ -9532,9 +9563,9 @@ impl Shell {
                     continue;
                 }
                 let color = if note.resolved {
-                    rgb(theme::muted()).alpha(0.06)
+                    Hsla::from(rgb(theme::muted())).alpha(0.06)
                 } else {
-                    rgb(theme::accent()).alpha(0.10)
+                    Hsla::from(rgb(theme::accent())).alpha(0.10)
                 };
                 marks.push(
                     RangeDecoration::new(start..end)
@@ -9610,6 +9641,14 @@ impl Shell {
         );
     }
 
+    /// Open a file in the editor area as a tab.
+    ///
+    /// A file already open is focused rather than reopened, so the strip never
+    /// carries the same file twice and a buffer with unsaved changes is never
+    /// thrown away by clicking its row again. The read is bounded and the
+    /// format decides the body: a text file lands in a highlighted editor, an
+    /// image lands in an image pane, and anything else says it cannot be shown
+    /// rather than dropping bytes into a buffer.
     pub(crate) fn open_file(&mut self, rel: &Path, window: &mut Window, cx: &mut Context<Self>) {
         // A document's body only exists on the Files tab, so opening one from
         // anywhere else (a chat reference, a search result, the Start grid) has

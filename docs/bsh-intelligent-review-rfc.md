@@ -30,7 +30,7 @@
 | P1 GPUI Review tab | 已实现 | crates/bsh/src/ui/review.rs |
 | P1 digest-bound Approve / Request changes | 已实现 | ReviewStore::decide |
 | P1 Task attempt -> change set | 已实现 | Attempt.change_set_id |
-| P1 Task / Audit -> Review 链接 | 已实现 | right_panel.rs / audit.rs |
+| P1 Task / Audit -> Review 链接 | 已实现（Task 精确到 attempt；Audit 打开当前会话最新 Review） | right_panel.rs / audit.rs |
 | P1 Audit 显示 review decisions | 未实现 | 仅写入 audit.jsonl |
 | P2 shell observed capture | 未实现 | 仍为 Unattributed |
 | P2 image/PDF/docx/archive 语义 diff | 部分 | metadata/binary summary only |
@@ -38,7 +38,7 @@
 | P2 extension host review service | 未实现 | 后续 |
 | P2 tamper-evident audit chain | 未实现 | 后续 |
 
-验证：review 模块 9 个单测、write_file 精确捕获集成测试、state 生命周期测试、Review tab 点击测试均通过；详见下面的验收标准。
+验证：review 模块 10 个单测、write_file 精确捕获集成测试、state 生命周期与任务链接测试、Review tab 点击与渲染测试均通过；详见下面的验收标准。
 
 ---
 

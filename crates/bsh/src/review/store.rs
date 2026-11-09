@@ -673,6 +673,30 @@ mod tests {
     }
 
     #[test]
+    fn a_moved_digest_refuses_the_old_decision() {
+        let root = scratch("stale");
+        let path = root.join("a.txt");
+        fs::write(&path, "one").unwrap();
+        let runtime = ReviewRuntime::new(&root, "session").unwrap();
+        let before = runtime.before(&path);
+        fs::write(&path, "two").unwrap();
+        runtime.record(&path, ChangeOperation::Write, before, "write_file");
+        let snapshot = runtime.seal().expect("sealed");
+        let store = ReviewStore::open(&root);
+        let mut set = store
+            .load_changeset(&snapshot.changeset.id)
+            .expect("the manifest");
+        set.digest = Some("sha256:moved".to_string());
+        store.save_changeset(&set).expect("the moved manifest");
+        let refused = store.decide(
+            &snapshot.changeset.id,
+            Decision::Approve,
+            "stale approval".into(),
+        );
+        assert!(refused.is_err(), "a decision cannot outlive its digest");
+    }
+
+    #[test]
     fn decision_is_bound_to_the_digest() {
         let root = scratch("decision");
         let path = root.join("a.txt");

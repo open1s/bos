@@ -540,10 +540,16 @@ mod tests {
     fn two_identical_lines_do_not_steal_each_others_notes() {
         let mut notes = Notes::default();
         let rel = Path::new("same.rs");
-        notes.add(rel, Note::new(Some(5), None, "the x", "x"));
-        let moved = "x\nx\nx\nx\nx\nx\nx\nx\n";
+        // The note was pinned to the sixth line's code and an edit above it
+        // removed that line, leaving three identical candidates at 1, 3 and 5.
+        notes.add(rel, Note::new(Some(6), None, "the x", "x"));
+        let moved = "x\na\nx\nb\nx\nc\n";
         assert!(notes.reanchor(rel, moved));
-        assert_eq!(notes.on(rel)[0].line, Some(5), "the nearest x wins");
+        assert_eq!(
+            notes.on(rel)[0].line,
+            Some(5),
+            "the occurrence nearest the old anchor wins, not the first one"
+        );
     }
 
     #[test]

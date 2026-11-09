@@ -7386,9 +7386,12 @@ mod tests {
             before,
             "edit_file",
         );
+        state.link_review_task(&runtime.change_set_id(), "task-1", "attempt-1");
         state.finish_review("session");
         let snapshot = state.review_snapshot("session").expect("a sealed review");
         assert_eq!(snapshot.changeset.changes.len(), 1);
+        assert_eq!(snapshot.changeset.task.as_deref(), Some("task-1"));
+        assert_eq!(snapshot.changeset.attempt.as_deref(), Some("attempt-1"));
         let id = snapshot.changeset.id.clone();
         let decided = state
             .decide_review(

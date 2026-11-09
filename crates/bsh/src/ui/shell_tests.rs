@@ -2257,6 +2257,14 @@ fn review_tab_renders_a_captured_changeset(cx: &mut TestAppContext) {
     init_test_app(cx);
     let mut state = AppState::with_store(scratch_store("review-tab"));
     let session = state.new_session().expect("a session");
+    state.settings.global.general.active_session = session.clone();
+    if let Some(workspace) = state
+        .store
+        .session(&session)
+        .map(|session| session.workspace.clone())
+    {
+        state.settings.global.general.active_workspace = workspace;
+    }
     let root = state.workspace_root().expect("a workspace root");
     std::fs::create_dir_all(root.join("src")).expect("src");
     let path = root.join("src").join("lib.rs");
@@ -19732,16 +19740,16 @@ fn a_file_step_opens_in_the_right_panel_editor(cx: &mut TestAppContext) {
     );
     assert_eq!(files, 1, "with the file opened as a tab");
 }
-/// A pinned comment is drawn at its own line, in the code - not only in the
-/// drawer: the card's top sits below the editor's top and inside its body.
+/// A pinned comment marks its line, and the reader reads it in the thread
+/// panel under the code instead of in a card over the line it is about.
 #[gpui::test]
-fn a_pinned_comment_draws_at_its_line(cx: &mut TestAppContext) {
+fn a_pinned_comment_marks_its_line_and_opens_in_the_thread(cx: &mut TestAppContext) {
     init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("inline-note", 1);
         tests_pin_reference_defaults(&mut state);
         let root = state.workspace_root().expect("a workspace root");
-        std::fs::write(root.join("inline.txt"), "one\ntwo\nthree\n").expect("a file");
+        std::fs::write(root.join("inline.txt"), "one\ntwo\nthree\nfour\nfive\n").expect("a file");
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
     });
@@ -19756,22 +19764,36 @@ fn a_pinned_comment_draws_at_its_line(cx: &mut TestAppContext) {
                 std::path::Path::new("inline.txt"),
                 crate::notes::Note::new(Some(2), Some(3), "this range", "two\nthree"),
             );
+            this.files.focus_note = Some(0);
             cx.notify();
         });
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
 
-    let card = cx
-        .debug_bounds("note-inline-0")
-        .expect("the comment draws in the code");
+    let mark = cx
+        .debug_bounds("note-mark-0")
+        .expect("the commented line carries a mark");
     let body = cx.debug_bounds("files-editor-body").expect("the editor");
     assert!(
-        card.top() > body.top() && card.bottom() < body.bottom(),
-        "the card sits inside the document: card {}..{} body {}..{}",
-        f32::from(card.top()),
-        f32::from(card.bottom()),
+        mark.top() > body.top() && mark.bottom() < body.bottom(),
+        "the mark sits on a line of the document: mark {}..{} body {}..{}",
+        f32::from(mark.top()),
+        f32::from(mark.bottom()),
         f32::from(body.top()),
         f32::from(body.bottom())
+    );
+    let thread = cx
+        .debug_bounds("files-thread")
+        .expect("the focused comment opens in the thread panel");
+    assert!(
+        thread.top() >= body.bottom() - px(1.0),
+        "the panel is docked UNDER the code it is about, not over it: {} vs {}",
+        f32::from(thread.top()),
+        f32::from(body.bottom())
+    );
+    assert!(
+        cx.debug_bounds("files-thread-ask").is_some(),
+        "and it carries the action that asks the model"
     );
 }
 /// Comment SENDS the review: the note is pinned and the prompt goes to the model
@@ -19818,13 +19840,14 @@ fn commenting_sends_the_review_to_the_queue(cx: &mut TestAppContext) {
     let queued = cx.update(|window, cx| {
         shell.update(cx, |this, cx| {
             this.send_review_to_chat(std::path::Path::new("send.txt"), window, cx);
-            this.send(window, cx);
             this.state.inbox(&id).len()
         })
     });
     assert!(queued >= 1, "the review is queued for the model: {queued}");
+    // The request does not ride the composer, so the reader's own draft is
+    // still theirs.
     let draft = cx.update(|_, cx| shell.read(cx).composer_value.clone());
-    assert!(draft.is_empty(), "and the composer was consumed: {draft:?}");
+    assert!(draft.is_empty(), "the draft was never written: {draft:?}");
 }
 /// Selecting lines raises the + that opens the comment card, the reference's
 /// affordance: the reader has just marked the lines, so the way to comment on
@@ -19969,8 +19992,9 @@ fn the_comment_card_pins_a_note(cx: &mut TestAppContext) {
     assert_eq!(notes[0].1, "tighten this");
     assert!(notes[0].0.is_some(), "anchored to a line");
 }
-/// A review note goes to the model: pressing Send puts the file, the anchored
-/// line and the note into the composer as a prompt, and the drawer closes.
+/// A review note goes to the model: pressing Send queues the file, the anchored
+/// line and the note as a request behind the running turn, and the drawer
+/// closes. The reader's own draft is not the carrier.
 #[gpui::test]
 fn review_notes_become_a_prompt(cx: &mut TestAppContext) {
     init_test_app(cx);
@@ -19986,6 +20010,11 @@ fn review_notes_become_a_prompt(cx: &mut TestAppContext) {
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
     cx.update(|window, cx| {
         shell.update(cx, |this, cx| {
+            // A running turn is what makes the send a QUEUE row, which is the
+            // path that proves the request reached the model's queue without
+            // running the network in a unit test.
+            let id = this.state.active_id.clone().expect("an active session");
+            this.state.begin_turn_in(&id, "already running");
             this.right.open = true;
             this.right.tab = Some(crate::ui::right_panel::RightTab::Files);
             this.open_file(std::path::Path::new("review.txt"), window, cx);
@@ -20005,21 +20034,251 @@ fn review_notes_become_a_prompt(cx: &mut TestAppContext) {
     cx.simulate_click(send.center(), Modifiers::default());
     cx.update(|window, cx| window.draw(cx).clear(cx));
 
-    let (draft, open) = cx.update(|_, cx| {
+    let (prompt, open, draft) = cx.update(|_, cx| {
         let shell = shell.read(cx);
-        (shell.composer_value.clone(), shell.files.notes_open)
+        let id = shell.state.active_id.clone().expect("an active session");
+        let prompt = shell
+            .state
+            .inbox(&id)
+            .last()
+            .map(|row| row.text.clone())
+            .unwrap_or_default();
+        (prompt, shell.files.notes_open, shell.composer_value.clone())
     });
-    assert!(draft.contains("review.txt"), "the file is named: {draft:?}");
+    assert!(
+        prompt.contains("review.txt"),
+        "the file is named: {prompt:?}"
+    );
     // The anchor is already one-based (it is the editor's own line number), so
     // it is printed as-is; the prompt used to add one and say "line 2" for a
     // note on line 1.
     assert!(
-        draft.contains("line 1"),
-        "the note keeps its line: {draft:?}"
+        prompt.contains("### L1"),
+        "the note keeps its line: {prompt:?}"
     );
-    assert!(draft.contains("rename this"), "and its text: {draft:?}");
-    assert!(!open, "the drawer closes once the review is drafted");
+    assert!(prompt.contains("rename this"), "and its text: {prompt:?}");
+    assert!(
+        prompt.contains("```"),
+        "and the code the remark is about: {prompt:?}"
+    );
+    assert!(
+        draft.is_empty(),
+        "the request does not ride the reader's draft: {draft:?}"
+    );
+    assert!(!open, "the drawer closes once the review goes out");
 }
+/// Pinning a comment records the code it quotes, focuses it in the thread
+/// panel, and does not ask the model by itself.
+#[gpui::test]
+fn pinning_a_comment_records_its_quote(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let body = "one\ntwo\nthree\nfour\n";
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("comment-quote", 1);
+        tests_pin_reference_defaults(&mut state);
+        let root = state.workspace_root().expect("a workspace root");
+        std::fs::write(root.join("quote.txt"), "one\ntwo\nthree\nfour\n").expect("a file");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.right.open = true;
+            this.right.tab = Some(crate::ui::right_panel::RightTab::Files);
+            this.open_file(std::path::Path::new("quote.txt"), window, cx);
+            let from = crate::notes::line_start_offset(body, 2);
+            let to = crate::notes::line_start_offset(body, 3);
+            if let Some(editor) = this.files.active_tab().and_then(|tab| tab.editor.clone()) {
+                editor.update(cx, |state, cx| state.set_selected_range(from..to, cx));
+            }
+            this.files.note_text.update(cx, |state, cx| {
+                state.set_value("tighten this".to_string(), window, cx);
+            });
+            this.pin_note(window, cx);
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let (note, focus, draft) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        let note = shell.files.notes.on(std::path::Path::new("quote.txt"))[0].clone();
+        (note, shell.files.focus_note, shell.composer_value.clone())
+    });
+    assert_eq!(note.line, Some(2));
+    assert_eq!(note.to, Some(3), "the range is the one the reader marked");
+    assert_eq!(
+        note.quote, "two\nthree",
+        "the code is recorded with the remark"
+    );
+    assert!(!note.sent, "pinning alone does not ask the model");
+    assert!(!note.resolved, "and it is open");
+    assert_eq!(focus, Some(0), "the new remark is the one on screen");
+    assert!(
+        cx.debug_bounds("files-thread").is_some(),
+        "in the thread panel"
+    );
+    assert!(draft.is_empty(), "the reader's draft is untouched");
+}
+
+/// A resolved comment is history: the next review asks only about what is
+/// still open, and the resolved one stays out of the request.
+#[gpui::test]
+fn resolving_a_comment_takes_it_out_of_the_next_review(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("comment-resolve", 1);
+        tests_pin_reference_defaults(&mut state);
+        let root = state.workspace_root().expect("a workspace root");
+        std::fs::write(root.join("two.txt"), "one\ntwo\n").expect("a file");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            let id = this.state.active_id.clone().expect("an active session");
+            this.state.begin_turn_in(&id, "already running");
+            this.right.open = true;
+            this.right.tab = Some(crate::ui::right_panel::RightTab::Files);
+            this.open_file(std::path::Path::new("two.txt"), window, cx);
+            this.files.notes.add(
+                std::path::Path::new("two.txt"),
+                crate::notes::Note::new(Some(1), None, "the first", "one"),
+            );
+            this.files.notes.add(
+                std::path::Path::new("two.txt"),
+                crate::notes::Note::new(Some(2), None, "the second", "two"),
+            );
+            // The first one is done with.
+            this.resolve_comment(std::path::Path::new("two.txt"), 0, cx);
+            this.send_review_to_chat(std::path::Path::new("two.txt"), window, cx);
+        });
+    });
+    let (prompt, open) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        let id = shell.state.active_id.clone().expect("an active session");
+        let prompt = shell
+            .state
+            .inbox(&id)
+            .last()
+            .map(|row| row.text.clone())
+            .unwrap_or_default();
+        (
+            prompt,
+            shell
+                .files
+                .notes
+                .open_count(std::path::Path::new("two.txt")),
+        )
+    });
+    assert_eq!(open, 1, "the resolved remark is no longer open");
+    assert!(
+        prompt.contains("the second"),
+        "the open remark goes: {prompt:?}"
+    );
+    assert!(
+        !prompt.contains("the first"),
+        "the resolved one does not: {prompt:?}"
+    );
+}
+
+/// The strip's comment control opens the drawer that lists the file's remarks.
+#[gpui::test]
+fn the_strip_comment_control_opens_the_drawer(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("comment-control", 1);
+        tests_pin_reference_defaults(&mut state);
+        let root = state.workspace_root().expect("a workspace root");
+        std::fs::write(root.join("control.txt"), "one\ntwo\n").expect("a file");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.right.open = true;
+            this.right.tab = Some(crate::ui::right_panel::RightTab::Files);
+            this.open_file(std::path::Path::new("control.txt"), window, cx);
+            this.files.notes.add(
+                std::path::Path::new("control.txt"),
+                crate::notes::Note::new(Some(1), None, "a remark", "one"),
+            );
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let control = cx
+        .debug_bounds("right-comments")
+        .expect("the strip carries the comment control on a document");
+    assert!(
+        cx.debug_bounds("files-notes").is_none(),
+        "the drawer starts closed"
+    );
+    cx.simulate_click(control.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.update(|_, cx| shell.read(cx).files.notes_open),
+        "the press opens the drawer"
+    );
+    assert!(
+        cx.debug_bounds("files-notes").is_some(),
+        "and the list is on screen"
+    );
+}
+
+/// Saving settles a note's anchor against the saved text: an edit above a
+/// comment moves every line, and the remark follows its code instead of
+/// pointing at whatever line inherited its number.
+#[gpui::test]
+fn saving_reanchors_a_comment_that_moved(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("comment-reanchor", 1);
+        tests_pin_reference_defaults(&mut state);
+        let root = state.workspace_root().expect("a workspace root");
+        std::fs::write(root.join("move.txt"), "one\ntwo\nthree\n").expect("a file");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.right.open = true;
+            this.right.tab = Some(crate::ui::right_panel::RightTab::Files);
+            this.open_file(std::path::Path::new("move.txt"), window, cx);
+            this.files.notes.add(
+                std::path::Path::new("move.txt"),
+                crate::notes::Note::new(Some(2), None, "about two", "two"),
+            );
+        });
+    });
+    // Insert a line above the remark: its code is now on line three.
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            if let Some(editor) = this.files.active_tab().and_then(|tab| tab.editor.clone()) {
+                editor.update(cx, |state, cx| {
+                    state.set_value("zero\none\ntwo\nthree\n".to_string(), window, cx);
+                });
+            }
+            this.save_file(std::path::Path::new("move.txt"), cx);
+        });
+    });
+    let (line, stored) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        let line = shell.files.notes.on(std::path::Path::new("move.txt"))[0].line;
+        let root = shell.state.workspace_root().expect("the root");
+        let stored = crate::notes::Notes::load(&root).on(std::path::Path::new("move.txt"))[0].line;
+        (line, stored)
+    });
+    assert_eq!(line, Some(3), "the remark followed its code on save");
+    assert_eq!(stored, Some(3), "and the sidecar holds the new anchor");
+}
+
 /// The + that opens the review card sits on the middle of the selection it
 /// follows, at every panel width.
 ///
@@ -20268,15 +20527,14 @@ fn the_comment_plus_rides_the_selection_through_a_scroll(cx: &mut TestAppContext
     );
 }
 
-/// The review card and the notes drawer cannot both host the note field.
+/// The review card and the notes drawer render together.
 ///
-/// Both draw the same `note_text` entity, and a frame that renders one entity
-/// twice duplicates its accessibility node, which gpui-pre panics on in a debug
-/// build. Raising the card also raises the drawer, so a press on the + crashed
-/// the shell. One draft, one field: the drawer keeps its list of pinned notes
-/// but folds its pin field while the card owns it.
+/// Both surfaces draw in the same frame, and the drawer is a LIST: the note
+/// field belongs to the card alone, so one draft has one field and the
+/// duplicate-accessibility-node crash the old drawer field caused cannot come
+/// back.
 #[gpui::test]
-fn the_review_card_and_the_notes_drawer_do_not_double_the_field(cx: &mut TestAppContext) {
+fn the_review_card_and_the_notes_drawer_share_one_field(cx: &mut TestAppContext) {
     init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("comment-field", 1);
@@ -20293,20 +20551,24 @@ fn the_review_card_and_the_notes_drawer_do_not_double_the_field(cx: &mut TestApp
             this.right.open = true;
             this.right.tab = Some(crate::ui::right_panel::RightTab::Files);
             this.open_file(std::path::Path::new("field.txt"), window, cx);
-            // The drawer is up first: that is the state a reader is in when they
-            // select a line and press the +.
+            this.files.notes.add(
+                std::path::Path::new("field.txt"),
+                crate::notes::Note::new(Some(1), None, "first", "alpha"),
+            );
             this.files.notes_open = true;
             cx.notify();
         });
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("files-notes").is_some(), "the drawer is up");
     assert!(
-        cx.debug_bounds("files-note-field").is_some(),
-        "the drawer owns the field while it is alone"
+        cx.debug_bounds("files-note-field").is_none(),
+        "and it is a list, not a second field"
     );
 
-    // This draw is the regression: the same entity used to be prepainted twice,
-    // which the app panics on as a duplicate accessibility node.
+    // This draw is the regression: the card and the drawer together used to
+    // prepaint the same entity twice, which the app panics on as a duplicate
+    // accessibility node.
     cx.update(|_, cx| {
         shell.update(cx, |this, cx| this.open_comment_card(cx));
     });
@@ -20321,14 +20583,14 @@ fn the_review_card_and_the_notes_drawer_do_not_double_the_field(cx: &mut TestApp
     );
     assert!(
         cx.debug_bounds("files-note-field").is_none(),
-        "while the drawer folds its copy instead of drawing the same field twice"
+        "while the drawer still draws no field of its own"
     );
     assert!(
         cx.debug_bounds("files-notes").is_some(),
         "the drawer itself stays, so the pinned notes are still readable"
     );
 
-    // Cancelling gives the field back to the drawer.
+    // Cancelling leaves no field behind anywhere.
     cx.update(|_, cx| {
         shell.update(cx, |this, cx| {
             this.files.comment_open = false;
@@ -20337,12 +20599,12 @@ fn the_review_card_and_the_notes_drawer_do_not_double_the_field(cx: &mut TestApp
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(
-        cx.debug_bounds("files-note-field").is_some(),
-        "the drawer field returns"
+        cx.debug_bounds("files-comment-field").is_none(),
+        "the card field is gone"
     );
     assert!(
-        cx.debug_bounds("files-comment-field").is_none(),
-        "and the card field is gone"
+        cx.debug_bounds("files-note-field").is_none(),
+        "and the drawer never hosted one"
     );
 }
 /// The editor fills the panel: it used to draw a few lines and clip the rest,
