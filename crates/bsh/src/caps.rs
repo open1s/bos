@@ -6868,11 +6868,37 @@ mod tests {
         names
     }
 
+    /// The intent contract is not merely a constant: a real build carries the
+    /// three layers in order, with the product context and tool rules appended.
+    #[test]
+    fn the_built_prompt_carries_the_intent_contract() {
+        let built = build(&bare());
+        let prompt = &built.agent.config().system_prompt;
+        assert!(prompt.contains(agent::HARNESS_IDENTITY));
+        assert!(prompt.contains(agent::WORKFLOW_GUIDANCE));
+        assert!(prompt.contains(crate::prompts::HARNESS_CONTEXT));
+        assert!(
+            prompt.contains("A message that arrives while you work steers this task"),
+            "the steering rule reaches the request"
+        );
+        assert!(
+            prompt.contains(
+                "The conversation carries the intent; the workspace carries the evidence"
+            ),
+            "the product's intent/evidence split reaches the request"
+        );
+        assert!(
+            prompt.find(agent::WORKFLOW_GUIDANCE) < prompt.find(crate::prompts::HARNESS_CONTEXT),
+            "the contract precedes the product context"
+        );
+    }
+
     /// The system prompt rides on EVERY step of EVERY turn, so its size is a
     /// per-request cost, not a wording preference. A change that doubles it is a
-    /// performance bug: the measured prompt with the tool rules is about 5 KB,
-    /// and the skill catalogue is deliberately NOT part of it (the vendor ranks
-    /// that against the request instead).
+    /// performance bug: measured at 9,909 bytes with the full tool roster, and
+    /// the skill catalogue is deliberately NOT part of it (the vendor ranks that
+    /// against the request instead). The headroom below the cap is kept for
+    /// capability-gated rules, not for prose.
     #[test]
     fn the_system_prompt_stays_within_its_budget() {
         let built = build(&bare());

@@ -20729,6 +20729,18 @@ fn the_run_view_opens_a_step_and_returns_to_the_timeline(cx: &mut TestAppContext
     draw_until(cx, "the current run is restored", DRAW_UNTIL_MAX, |cx| {
         cx.update(|_, cx| shell.read(cx).traj_run == Some(current_turn))
     });
+    let row = cx
+        .debug_bounds("traj-row-2")
+        .expect("a step in the current run");
+    cx.simulate_click(row.center(), Modifiers::default());
+    draw_until(cx, "the inspector reopens", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("traj-tab-1").is_some()
+    });
+    let preview = cx.debug_bounds("traj-tab-1").expect("the Preview tab");
+    cx.simulate_click(preview.center(), Modifiers::default());
+    draw_until(cx, "the rich preview renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("traj-detail-body").is_some()
+    });
     let toggle = cx
         .debug_bounds("traj-timeline-toggle")
         .expect("the timeline toggle");

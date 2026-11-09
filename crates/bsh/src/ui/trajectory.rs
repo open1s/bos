@@ -14,9 +14,10 @@
 
 use gpui_kit::*;
 
-use super::shell::Shell;
+use super::shell::{BodySlot, Shell};
 use super::todo_panel::spinner;
 use gpui_kit::component::input::Input;
+use gpui_kit::component::text::TextView;
 
 use super::lane::{block_box, equal_lane, fixed_box, time_lane, LaneRecord, TimeAxis};
 use super::{icon, txt, DivExt, IconName};
@@ -145,6 +146,56 @@ pub(crate) fn preview_body(event: &Event) -> String {
     } else {
         event.outcome.clone()
     }
+}
+
+/// The Preview tab's document: markdown stays markdown, structured tool
+/// arguments become JSON code, and a unified diff becomes a diff block. A
+/// fenced body is left exactly as written.
+pub(crate) fn preview_markdown(event: &Event) -> String {
+    let text = preview_body(event);
+    let trimmed = text.trim_start();
+    if trimmed.starts_with("\u{60}\u{60}\u{60}") {
+        return text;
+    }
+    if trimmed.starts_with("diff --git") || trimmed.starts_with("--- ") || trimmed.starts_with("@@")
+    {
+        return format!("\u{60}\u{60}\u{60}diff\n{text}\n\u{60}\u{60}\u{60}");
+    }
+    if matches!(event.kind, Kind::Tool) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Ok(pretty) = serde_json::to_string_pretty(&value) {
+                return format!("\u{60}\u{60}\u{60}json\n{pretty}\n\u{60}\u{60}\u{60}");
+            }
+        }
+    }
+    text
+}
+
+/// Local image targets in a markdown body, in source order. Remote targets are
+/// deliberately skipped: the trajectory never fetches the network.
+pub(crate) fn preview_images(text: &str) -> Vec<String> {
+    let mut images = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("![") {
+        let after = &rest[start + 2..];
+        let Some(mid) = after.find("](") else {
+            break;
+        };
+        let tail = &after[mid + 2..];
+        let Some(end) = tail.find(')') else {
+            break;
+        };
+        let target = tail[..end].trim();
+        if !target.is_empty()
+            && !target.starts_with("http://")
+            && !target.starts_with("https://")
+            && !target.starts_with("data:")
+        {
+            images.push(target.trim_matches('"').to_string());
+        }
+        rest = &tail[end + 1..];
+    }
+    images
 }
 
 fn clip(text: &str, max: usize) -> String {
@@ -2401,7 +2452,7 @@ impl Shell {
         // never join.
         let verdict = self.state.policy_verdict_for(&event.source, &event.target);
         let body: String = match self.traj_tab {
-            1 => preview_body(event),
+            1 => preview_markdown(event),
             2 => event.raw.clone(),
             3 => event.source.clone(),
             4 => String::new(),
@@ -2412,6 +2463,31 @@ impl Shell {
                     format!("{}\n\n{}", event.title, event.outcome)
                 }
             }
+        };
+        // The Preview tab is a document, not a preformatted dump: markdown,
+        // fenced code, JSON and diffs go through the same parser the transcript
+        // uses, and local markdown images get a real preview.
+        let preview_state = (self.traj_tab == 1).then(|| {
+            let slot = BodySlot::Row(201, event.message.wrapping_add(event.turn));
+            self.body_state(slot, &body, cx)
+        });
+        let preview_images: Vec<std::path::PathBuf> = if self.traj_tab == 1 {
+            let root = self.state.workspace_root();
+            preview_images(&body)
+                .into_iter()
+                .filter_map(|target| {
+                    let path = std::path::Path::new(&target);
+                    let full = if path.is_absolute() {
+                        path.to_path_buf()
+                    } else {
+                        root.as_ref()
+                            .map(|root| std::path::Path::new(root).join(path))?
+                    };
+                    full.is_file().then_some(full)
+                })
+                .collect()
+        } else {
+            Vec::new()
         };
         let field = |label: String, value: String| {
             div()
@@ -2543,7 +2619,29 @@ impl Shell {
                     .when(self.traj_tab == 4, |panel| {
                         panel.child(self.policy_body(&verdict, cx))
                     })
-                    .when(self.traj_tab != 4, |panel| {
+                    .when(self.traj_tab == 1, |panel| {
+                        let state = preview_state
+                            .as_ref()
+                            .expect("the preview tab built its document");
+                        let mut preview = div()
+                            .w_full()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.0))
+                            .child(
+                                TextView::new(state)
+                                    .style(self.markdown_style())
+                                    .selectable(true)
+                                    .w_full(),
+                            );
+                        for image in &preview_images {
+                            preview = preview
+                                .child(img(image.clone()).max_w(relative(1.0)).rounded(px(8.0)));
+                        }
+                        panel.child(preview)
+                    })
+                    .when(self.traj_tab != 1 && self.traj_tab != 4, |panel| {
                         panel.child(txt(body, 12.0, theme::text()).line_height(px(20.0)))
                     }),
             )
@@ -2840,8 +2938,9 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::{
-        action_of, collapse_turns, duration_label, events, events_for, preview_body, project_lane,
-        verdict_for, BlockWidth, Event, Kind, PolicyVerdict, Projection, MINIMUM_BLOCK_MS,
+        action_of, collapse_turns, duration_label, events, events_for, preview_body,
+        preview_images, preview_markdown, project_lane, verdict_for, BlockWidth, Event, Kind,
+        PolicyVerdict, Projection, MINIMUM_BLOCK_MS,
     };
     use crate::i18n::Lang;
     use crate::model::{ChatMessage, Session};
@@ -3506,5 +3605,46 @@ mod tests {
             target: String::new(),
         };
         assert_eq!(preview_body(&event), "hello there");
+    }
+
+    /// The Preview parser keeps markdown, fences JSON tools and diffs, and
+    /// finds local images without touching the network.
+    #[test]
+    fn the_preview_formats_json_diffs_markdown_and_images() {
+        let tool = Event {
+            kind: Kind::Tool,
+            turn: 1,
+            title: "bash".to_string(),
+            outcome: String::new(),
+            raw: "{\"command\":\"ls\",\"ok\":true}".to_string(),
+            source: "bash".to_string(),
+            ms: None,
+            live: false,
+            message: 0,
+            tool: 0,
+            at: None,
+            target: String::new(),
+        };
+        assert!(
+            preview_markdown(&tool).starts_with("\u{60}\u{60}\u{60}json"),
+            "tool JSON is a code block"
+        );
+        let mut diff = tool.clone();
+        diff.raw = "diff --git a/a b/a\n@@ -1 +1 @@".to_string();
+        assert!(
+            preview_markdown(&diff).starts_with("\u{60}\u{60}\u{60}diff"),
+            "a unified diff keeps its diff block"
+        );
+        let mut markdown = diff.clone();
+        markdown.kind = Kind::Assistant;
+        markdown.raw = "**bold** and [link](https://example.com)".to_string();
+        assert_eq!(
+            preview_markdown(&markdown),
+            "**bold** and [link](https://example.com)"
+        );
+        assert_eq!(
+            preview_images("![shot](/tmp/shot.png) ![remote](https://x/y.png)"),
+            vec!["/tmp/shot.png".to_string()]
+        );
     }
 }

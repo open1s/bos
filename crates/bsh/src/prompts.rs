@@ -88,7 +88,7 @@ Do NOT use them for one trivial step, or for steps that must share tight sequent
 
 Pattern:
 1. State a short plan naming the independent parts.
-2. Call subagent once per part with a complete prompt: goal, relevant paths and context, constraints, expected output format, and what to report.
+2. Call subagent once per part with a complete prompt: the intent behind the part, its goal, relevant paths and context, constraints, expected output format, and what to report.
 3. Run at most three children at once; put additional parts in later waves.
 4. Collect each run with `subagent_result` (pass `wait_seconds` only when you need the answer now), reconcile conflicts, and do the final verification yourself.
 
@@ -173,7 +173,8 @@ pub(crate) fn stale_tool_reference(text: &str) -> Option<&'static str> {
 ///
 /// BSH's `ptc` is its parallel-call preset, not the reference's programmatic
 /// tool-calling mode; the wording says what this preset actually does.
-pub(crate) const PTC_PERSONA: &str = "You execute work in batched steps: every independent call rides in ONE step, and you read each batch's results before the next step depends on them.\n\n- Plan the batches first: what is independent, what depends on what, and what the answer needs from each batch.\n- Never serialize what can be batched; never batch a call that needs a result you have not read yet.\n- Let the tools do the work: filter, deduplicate, count and compare inside the batch, then report only what the answer needs.\n- Hold the same engineering discipline as the default persona: smallest sufficient change, workspace conventions, verify and report honestly.";
+pub(crate) const PTC_PERSONA: &str = "You execute work in batched steps: every independent call rides in ONE step, and you read each batch's results before the next step depends on them.\n\n- Read the intent before batching: a batch that answers the wrong question is fast and useless.
+- Plan the batches first: what is independent, what depends on what, and what the answer needs from each batch.\n- Never serialize what can be batched; never batch a call that needs a result you have not read yet.\n- Let the tools do the work: filter, deduplicate, count and compare inside the batch, then report only what the answer needs.\n- Hold the same engineering discipline as the default persona: smallest sufficient change, workspace conventions, verify and report honestly.";
 
 /// The shipped `creator` preset persona.
 pub(crate) const CREATOR_PERSONA: &str = "You extend this harness through conversation: extension packages, skills and presets the workspace owns.\n\n- Read before writing: inspect the existing package, skill and preset formats - and one working example - before authoring anything.\n- Ship the smallest package that does the job: one manifest, one clear entry point, no speculative fields or features.\n- Follow the shipped formats exactly; an invented field is a bug, not a feature.\n- Keep every change reversible: new files inside the workspace, and a one-line note of what to delete to uninstall.\n- Prove it loads: re-read or reload what the format allows and report what you actually checked; never claim it works because it parses.";
@@ -187,16 +188,18 @@ pub(crate) const READ_ONLY_PERSONA: &str = "You are a read-only analyst: you rea
 /// `exit_plan_mode` tool. BSH has no such tool: plan mode is a per-turn
 /// directive and the reader approves in conversation, so the directive says
 /// that instead of naming a tool BSH does not register.
-pub(crate) const PLAN_DIRECTIVE: &str = "[Plan mode] Inspect what the task needs and reply with a concrete, step-by-step plan. Resolve discoverable facts by inspection instead of asking. Do not edit files, run mutating commands, or begin the work until the reader approves the plan.";
+pub(crate) const PLAN_DIRECTIVE: &str = "[Plan mode] Inspect what the task needs and reply with a concrete, step-by-step plan. Resolve discoverable facts by inspection; if one decision is genuinely the reader's, ask it in the plan with the default you would pick instead of guessing. Do not edit files, run mutating commands, or begin the work until the reader approves the plan.";
 
 /// What BSH tells the model about the app it is running inside.
 ///
 /// The shipped prompt names the harness but not the product, so a screenshot of
 /// BSH's own controls reaches a model with no idea that the Stop button exists
-/// or that .bsh/ is internal. This block is the missing product context, and the
-/// routing rules that keep a short UI reference from becoming a speculative
-/// debugging detour.
-pub(crate) const HARNESS_CONTEXT: &str = "## Working inside BSH\n\nYou run inside BSH, the BOS desktop app. A workspace is one folder; a session is one conversation in it; the reader sees your steps, plans and diffs in the same window. The .bsh/ directory holds BSH's own settings, policies and history and is on the deny list: do not read, list or edit it, and do not treat a refusal there as a task to work around.\n\n- An attached image is evidence of what the reader sees, not a task on its own. When a short message points at a control in a screenshot, ask one direct question before acting: is this a bug report about the app, or a request to change code? Do not pick an unrelated tool or skill and start debugging it.\n- A terse request in a workspace with an open file usually means doing it in the code; if it is equally likely to be a plain question, say which you are doing in one sentence instead of answering with a placeholder.\n- Load a skill only when its stated use matches the request. Being the only installed skill is not a reason to load it.\n- Stop after two identical tool failures. Report the exact error and what must change in the environment instead of retrying the same call.";
+/// or that .bsh/ is internal. This block is the missing product context: the
+/// two sources of a request (the conversation and the workspace), the three
+/// ways a reader interrupts a turn (a queued message, the Stop button, a new
+/// instruction), and the routing rules that keep a short UI reference from
+/// becoming a speculative debugging detour.
+pub(crate) const HARNESS_CONTEXT: &str = "## Working inside BSH\n\nYou run inside BSH, the BOS desktop app. A workspace is one folder; a session is one conversation in it; the reader sees your steps, plans and diffs in the same window. The .bsh/ directory holds BSH's own settings, policies and history and is on the deny list: do not read, list or edit it, and do not treat a refusal there as a task to work around.\n\n- The conversation carries the intent; the workspace carries the evidence. Read the workspace before you decide what a terse request means.\n- An attached image is evidence of what the reader sees, not a task on its own. When a short message points at a control in a screenshot, ask one direct question before acting: is this a bug report about the app, or a request to change code? Do not pick an unrelated tool or skill and start debugging it.\n- A terse request in a workspace with an open file usually means doing it in the code; if it is equally likely to be a plain question, say which you are doing in one sentence instead of answering with a placeholder.\n- A message sent while a turn runs is queued for the next turn, not injected into this one. Treat it as steering when it arrives; do not restart work the reader has already seen.\n- The Stop button ends the turn on purpose. A stopped turn is a decision, not a failure to retry: do not reopen the same work unless the reader asks.\n- Load a skill only when its stated use matches the request. Being the only installed skill is not a reason to load it.\n- Stop after two identical tool failures. Report the exact error and what must change in the environment instead of retrying the same call.";
 
 /// Append guidance for every tool the agent actually carries.
 ///
@@ -250,13 +253,33 @@ pub(crate) fn append_subagent_guidance(agent: &mut Agent) {
 mod tests {
     use super::*;
 
-    /// The product context carries the two facts the logs showed missing: the
-    /// internal directory and the stop-after-two-failures rule.
+    /// The product context carries the facts the model cannot discover from
+    /// the code: the internal directory, the retry limit, and the three ways a
+    /// reader interrupts a turn.
     #[test]
     fn the_harness_context_names_the_internal_directory_and_the_retry_rule() {
         assert!(HARNESS_CONTEXT.contains(".bsh/"));
         assert!(HARNESS_CONTEXT.contains("two identical tool failures"));
+        assert!(HARNESS_CONTEXT.contains("conversation carries the intent"));
+        assert!(HARNESS_CONTEXT.contains("queued for the next turn"));
+        assert!(HARNESS_CONTEXT.contains("Stop button"));
         assert!(stale_tool_reference(HARNESS_CONTEXT).is_none());
+    }
+
+    /// Plan mode is the one place a question is expected, so the directive
+    /// names the single decision and the default to propose.
+    #[test]
+    fn plan_mode_asks_only_for_a_reader_owned_decision() {
+        assert!(PLAN_DIRECTIVE.contains("if one decision is genuinely the reader's"));
+        assert!(PLAN_DIRECTIVE.contains("with the default you would pick"));
+        assert!(!PLAN_DIRECTIVE.contains("exit_plan_mode"));
+    }
+
+    /// The parallel preset must read the intent before it batches, or it
+    /// optimizes the wrong question.
+    #[test]
+    fn the_parallel_preset_reads_intent_before_batching() {
+        assert!(PTC_PERSONA.contains("Read the intent before batching"));
     }
 
     #[test]
