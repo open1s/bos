@@ -93,6 +93,7 @@ impl App {
     ///
     /// The file manager's launch is the shell's open verb, so it carries no
     /// bundle of its own; the OS still draws its icon from Finder.app.
+    #[cfg(target_os = "macos")]
     fn icon_bundle(&self) -> Option<PathBuf> {
         match &self.bundle {
             Some(bundle) => Some(bundle.clone()),
@@ -144,8 +145,10 @@ enum Source {
     /// reveals the folder, and nothing has to be installed for it to exist.
     Shell,
     /// A bundle the OS ships at a fixed path; absent means the row is hidden.
+    #[cfg(target_os = "macos")]
     Fixed(&'static str),
     /// Bundle names probed under the application roots, in order.
+    #[cfg(target_os = "macos")]
     Bundles(&'static [&'static str]),
 }
 
@@ -352,6 +355,7 @@ fn installed_in(roots: &[PathBuf]) -> Vec<App> {
         .filter_map(|entry| {
             let bundle = match entry.source {
                 Source::Shell => None,
+                #[cfg(target_os = "macos")]
                 Source::Fixed(path) => {
                     let path = PathBuf::from(path);
                     if !path.is_dir() {
@@ -359,6 +363,7 @@ fn installed_in(roots: &[PathBuf]) -> Vec<App> {
                     }
                     Some(path)
                 }
+                #[cfg(target_os = "macos")]
                 Source::Bundles(names) => Some(
                     roots
                         .iter()
@@ -411,11 +416,11 @@ pub(crate) fn open(app: &App, path: &str) -> std::io::Result<()> {
 ///
 /// Test-only, and the proof that the view path reads the cache instead of
 /// paying AppKit on a click: a menu open must not move this counter.
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 static ICON_DECODES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// The number of bundle icons decoded so far, for the cache-miss test.
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) fn icon_decodes() -> usize {
     ICON_DECODES.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -464,10 +469,13 @@ fn load_icon(bundle: &std::path::Path) -> Option<Arc<gpui_kit::Image>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{installed_in, open_command, preferred_index, Entry, Label};
+    #[cfg(target_os = "macos")]
+    use super::{installed_in, preferred_index};
+    use super::{open_command, Entry, Label};
     use std::path::{Path, PathBuf};
 
     /// A scratch directory tree that lives only for one test.
+    #[cfg(target_os = "macos")]
     fn scratch(label: &str) -> PathBuf {
         let root =
             std::env::temp_dir().join(format!("bsh-open-in-app-{label}-{}", std::process::id()));
@@ -477,6 +485,7 @@ mod tests {
     }
 
     /// A bundle directory, which is all a probe reads.
+    #[cfg(target_os = "macos")]
     fn bundle(root: &Path, name: &str) {
         std::fs::create_dir_all(root.join(name)).expect("bundle");
     }
