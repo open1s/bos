@@ -395,8 +395,8 @@ impl Shell {
             .flex()
             .flex_row()
             .items_center()
-            .h(px(32.0))
-            .px(px(6.0))
+            .h(px(38.0))
+            .px(px(10.0))
             .gap(px(8.0))
             .flex_none()
             .border_b_1()
@@ -414,15 +414,18 @@ impl Shell {
                         div()
                             .debug_selector(|| format!("audit-mode-{index}"))
                             .id(SharedString::from(format!("audit-mode-{index}")))
-                            .h(px(20.0))
-                            .px(px(7.0))
+                            .h(px(24.0))
+                            .px(px(9.0))
                             .flex()
                             .items_center()
                             .cursor_pointer()
-                            .rounded(px(6.0))
+                            .rounded(px(8.0))
                             .when(on, |cell| {
-                                cell.bg(rgb(theme::hover()))
-                                    .child(txt(label, 12.0, theme::text()))
+                                cell.bg(rgb(theme::soft(theme::accent()))).child(txt(
+                                    label,
+                                    12.0,
+                                    theme::accent(),
+                                ))
                             })
                             .when(!on, |cell| cell.child(txt(other, 12.0, theme::faint())))
                             .on_click(cx.listener(move |this, _event, _window, cx| {
@@ -455,17 +458,17 @@ impl Shell {
                             let on = self.audit_category == category;
                             div()
                                 .id(SharedString::from(format!("audit-category-{}", key)))
-                                .h(px(20.0))
-                                .px(px(5.0))
+                                .h(px(22.0))
+                                .px(px(7.0))
                                 .flex()
                                 .items_center()
                                 .cursor_pointer()
-                                .rounded(px(5.0))
+                                .rounded(px(999.0))
                                 .when(on, |cell| {
-                                    cell.bg(rgb(theme::hover())).child(txt(
+                                    cell.bg(rgb(theme::soft(theme::accent()))).child(txt(
                                         label.clone(),
                                         10.0,
-                                        theme::text(),
+                                        theme::accent(),
                                     ))
                                 })
                                 .when(!on, |cell| {
@@ -490,14 +493,14 @@ impl Shell {
                     .flex_row()
                     .items_center()
                     .gap(px(4.0))
-                    .px(px(6.0))
-                    .h(px(22.0))
-                    .w(px(164.0))
+                    .px(px(8.0))
+                    .h(px(26.0))
+                    .w(px(180.0))
                     .flex_none()
-                    .rounded(px(6.0))
+                    .rounded(px(8.0))
                     .border_1()
-                    .border_color(rgb(theme::border_soft()))
-                    .bg(rgb(theme::new_session_fill()))
+                    .border_color(rgb(theme::border()))
+                    .bg(rgb(theme::page()))
                     .child(icon(IconName::Search, 11.0, theme::faint()))
                     .child(
                         div()
@@ -510,13 +513,13 @@ impl Shell {
                 div()
                     .debug_selector(|| "audit-export".to_string())
                     .id("audit-export")
-                    .h(px(20.0))
-                    .px(px(7.0))
+                    .h(px(24.0))
+                    .px(px(9.0))
                     .flex()
                     .items_center()
                     .gap(px(4.0))
                     .flex_none()
-                    .rounded(px(6.0))
+                    .rounded(px(8.0))
                     .cursor_pointer()
                     .hover(|cell| cell.bg(rgb(theme::hover())))
                     .child(icon(IconName::Download, 11.0, theme::muted()))

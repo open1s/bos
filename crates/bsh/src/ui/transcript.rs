@@ -1414,6 +1414,13 @@ impl Shell {
                 .flex_row()
                 .items_center()
                 .gap(px(6.0))
+                .h(px(24.0))
+                .px(px(8.0))
+                .rounded(px(999.0))
+                .border_1()
+                .border_color(rgb(theme::border_soft()))
+                .bg(rgb(theme::new_session_fill()))
+                .child(icon(IconName::Clock, 11.0, theme::faint()))
                 .child(txt(
                     crate::state::stamp(session.created_at),
                     theme::CHIP_SIZE,
@@ -2238,8 +2245,26 @@ impl Shell {
                     .max_w(relative(1.0))
                     .px(px(16.0))
                     .py(px(10.0))
-                    .rounded(px(20.0))
-                    .bg(rgb(theme::user_bubble()))
+                    .rounded(px(18.0))
+                    .border_1()
+                    .border_color(rgb(theme::blend_into(theme::accent(), theme::page(), 0.78)))
+                    .bg(linear_gradient(
+                        135.0,
+                        linear_color_stop(
+                            rgba(
+                                (theme::blend_into(theme::accent(), theme::page(), 0.88) << 8)
+                                    | 0xFF,
+                            ),
+                            0.0,
+                        ),
+                        linear_color_stop(
+                            rgba(
+                                (theme::blend_into(theme::accent(), theme::page(), 0.95) << 8)
+                                    | 0xFF,
+                            ),
+                            1.0,
+                        ),
+                    ))
                     .child(
                         txt(
                             queued.text.clone(),
@@ -4100,38 +4125,65 @@ impl Shell {
             // 12 makes the whole space match.
             .mt(px(12.0))
             .ml(px(-6.0))
-            .child(copy)
-            .child(good)
-            .child(bad)
-            .child(branch)
-            .child(cut)
+            .child(
+                div()
+                    .h(px(side))
+                    .px(px(3.0))
+                    .rounded(px(999.0))
+                    .border_1()
+                    .border_color(rgb(theme::border_soft()))
+                    .bg(rgb(theme::new_session_fill()))
+                    .flex()
+                    .items_center()
+                    .gap(px(2.0))
+                    .child(copy)
+                    .child(good)
+                    .child(bad)
+                    .child(branch)
+                    .child(cut),
+            )
             .child(div().flex_1());
         // Performance & usage: the reference's Compact mode keeps the per-turn
         // usage reading to itself, so the footer's own token figure is the row
-        // the preference governs.
+        // the preference governs. The figures share one soft capsule so the
+        // cost, the time and the clock read as one status object.
+        let mut bits: Vec<(String, f32)> = Vec::new();
         if usage > 0 && !compact_usage {
-            row = row.child(txt(
+            bits.push((
                 format!("{usage} {}", lang.tr("turn.tokens")),
                 theme::small_size_at(content),
-                theme::faint(),
             ));
         }
-        // How long the turn took. The reference prints this in the turn's
-        // process summary; the footer carries it beside usage so the cost and
-        // the time of one turn read together.
         if let Some(ms) = duration.filter(|ms| *ms > 0) {
-            row = row.child(txt(
+            bits.push((
                 super::header::job_duration(ms, lang),
                 theme::small_size_at(content) - 1.0,
-                theme::faint(),
             ));
         }
         if let Some(at) = at {
-            row = row.child(txt(
+            bits.push((
                 crate::state::clock_at(at, lang),
                 theme::small_size_at(content) - 1.0,
-                theme::faint(),
             ));
+        }
+        if !bits.is_empty() {
+            let mut meta = div()
+                .h(px(24.0))
+                .px(px(8.0))
+                .rounded(px(999.0))
+                .border_1()
+                .border_color(rgb(theme::border_soft()))
+                .bg(rgb(theme::new_session_fill()))
+                .flex()
+                .items_center()
+                .gap(px(6.0));
+            for (index, (text, size)) in bits.into_iter().enumerate() {
+                if index > 0 {
+                    meta = meta.child(txt("·", 10.0, theme::border_strong()));
+                }
+                meta = meta.child(txt(text, size, theme::faint()));
+            }
+            row = row.child(meta);
         }
         row
     }
@@ -4201,7 +4253,12 @@ impl Shell {
                 move || selector.clone()
             })
             .ml(px(10.0))
-            .py(px(4.0))
+            .mr(px(4.0))
+            .px(px(8.0))
+            .py(px(5.0))
+            .rounded(px(8.0))
+            .bg(rgb(theme::new_session_fill()))
+            .hover(|style| style.bg(rgb(theme::soft(theme::accent()))))
             .flex()
             .flex_row()
             .items_center()

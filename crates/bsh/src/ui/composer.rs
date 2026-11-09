@@ -606,30 +606,27 @@ impl Shell {
                     // the plus card.
                     .when_some(self.composer_overlay(cx), |card, menu| card.child(menu));
                 let card = hairline_all(card).border_color(rgb(theme::border_soft()));
-                if hero {
-                    div()
-                        .debug_selector(|| "composer-frame".to_string())
-                        .relative()
-                        .w_full()
-                        .child(
-                            div()
-                                .absolute()
-                                .top(px(-2.0))
-                                .left(px(-2.0))
-                                .right(px(-2.0))
-                                .bottom(px(-2.0))
-                                .rounded(px(30.0))
-                                .bg(linear_gradient(
-                                    135.0,
-                                    linear_color_stop(rgba((theme::accent() << 8) | 0xFF), 0.0),
-                                    linear_color_stop(rgba((0x22D3EE << 8) | 0xFF), 1.0),
-                                )),
-                        )
-                        .child(card)
-                        .into_any_element()
-                } else {
-                    card.into_any_element()
-                }
+                let inset = if hero { 2.0 } else { 1.0 };
+                div()
+                    .debug_selector(|| "composer-frame".to_string())
+                    .relative()
+                    .w_full()
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(-inset))
+                            .left(px(-inset))
+                            .right(px(-inset))
+                            .bottom(px(-inset))
+                            .rounded(px(30.0))
+                            .bg(linear_gradient(
+                                135.0,
+                                linear_color_stop(rgba((theme::accent() << 8) | 0xFF), 0.0),
+                                linear_color_stop(rgba((0x22D3EE << 8) | 0xFF), 1.0),
+                            )),
+                    )
+                    .child(card)
+                    .into_any_element()
             });
         // The context meter moved into the status row, at its left end, so the
         // reading sits with the other figures about the same turn instead of on
