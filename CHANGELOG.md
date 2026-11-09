@@ -1,5 +1,28 @@
 # Changelog
 
+## v4.0.3 (2026-11-09)
+
+- **BSH interface refresh**: the settings shell now uses the macOS-style
+  blue-white design system across Account, General, Models, Web Search,
+  Extensions and Agent Presets, with a fixed navigation rail, runtime status,
+  recent activity and the unified account/data paths.
+- **Chat and trajectory**: conversation rows, composer and message actions use
+  the new visual language. Trajectory gained a run navigator, step timeline,
+  progress header, step inspector and rich Markdown/code/diff/image previews.
+  The measured timeline remains available from the same tab.
+- **Audit**: a flat event table with overview statistics, event/result/time
+  filters, inline event inspector and a direct jump to the related Run.
+- **Tasks**: the right dock now draws the execution tree as real work units
+  with Main Agent, Subagent, Peer and Task nodes, distinct run states, a
+  selected-unit inspector, a work-unit List and the durable task board.
+- **Tool discovery**: the model-facing `call_tool` dispatcher was removed.
+  `find_tool` now returns each tool's name, description and full JSON Schema,
+  and those definitions are added to the next model step so discovered tools
+  are called directly by name.
+- **Federation and runtime**: additional federation work, extension runtime
+  fixes, scheduling and agent-loop corrections, and test coverage for deferred
+  tools and the new BSH surfaces.
+
 ## v4.0.2 (2026-11-05)
 
 - **Ferris SDK bindings**: `nbos` and `jsbos` expose `FerrisManifest`,
