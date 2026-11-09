@@ -20662,6 +20662,62 @@ fn the_chat_scrolls_smoothly_with_the_wheel(cx: &mut TestAppContext) {
     );
 }
 
+/// The new run view: a run navigator, a status header, a step timeline and the
+/// selected step's inspector, with the measured timeline still one press away.
+#[gpui::test]
+fn the_run_view_opens_a_step_and_returns_to_the_timeline(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("traj-runs", 3);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.state.tab = Tab::Trajectory;
+            this.traj_runs = true;
+            this.traj_select = None;
+            cx.notify();
+        });
+    });
+    draw_until(cx, "the run view renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("traj-current-run").is_some() && cx.debug_bounds("traj-row-2").is_some()
+    });
+    assert!(
+        cx.debug_bounds("traj-pause").is_some(),
+        "the run header offers its disabled pause control"
+    );
+    let row = cx.debug_bounds("traj-row-2").expect("the first step");
+    cx.simulate_click(row.center(), Modifiers::default());
+    draw_until(cx, "the step inspector opens", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("traj-detail").is_some()
+    });
+    let current_turn = cx.update(|_, cx| shell.read(cx).traj_log().last().unwrap().turn);
+    let history_turn = current_turn - 1;
+    let selector: &'static str = Box::leak(format!("traj-run-{history_turn}").into_boxed_str());
+    let history = cx.debug_bounds(selector).expect("a history run");
+    cx.simulate_click(history.center(), Modifiers::default());
+    draw_until(cx, "the history run is selected", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| shell.read(cx).traj_run == Some(history_turn))
+    });
+    let current = cx
+        .debug_bounds("traj-current-run")
+        .expect("the current run");
+    cx.simulate_click(current.center(), Modifiers::default());
+    draw_until(cx, "the current run is restored", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| shell.read(cx).traj_run == Some(current_turn))
+    });
+    let toggle = cx
+        .debug_bounds("traj-timeline-toggle")
+        .expect("the timeline toggle");
+    cx.simulate_click(toggle.center(), Modifiers::default());
+    draw_until(cx, "the measured timeline returns", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("traj-duration").is_some()
+    });
+}
+
 /// The trajectory tab scrolls the same way, through its own tracked handle.
 #[gpui::test]
 fn the_trajectory_scrolls_with_the_wheel(cx: &mut TestAppContext) {
@@ -28369,6 +28425,46 @@ fn the_audit_tab_sits_beside_chat_and_keeps_the_chat_position(cx: &mut TestAppCo
             && (cx.update(|_, cx| f32::from(shell.read(cx).transcript_scroll.offset().y)) - before)
                 .abs()
                 < 2.0
+    });
+}
+
+/// The flat audit table: selecting a row opens the inspector without leaving
+/// the page, and its related execution jumps to the matching run.
+#[gpui::test]
+fn the_audit_table_opens_an_event_and_its_run(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("audit-table", 3);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.state.tab = Tab::Audit;
+            this.audit_table = true;
+            this.audit_event = None;
+            cx.notify();
+        });
+    });
+    draw_until(cx, "the flat audit table renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("audit-event-0").is_some()
+    });
+    let row = cx.debug_bounds("audit-event-0").expect("the newest event");
+    cx.simulate_click(row.center(), Modifiers::default());
+    draw_until(cx, "the event inspector opens", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("audit-view-trajectory").is_some()
+    });
+    let jump = cx
+        .debug_bounds("audit-view-trajectory")
+        .expect("the related execution");
+    cx.simulate_click(jump.center(), Modifiers::default());
+    draw_until(cx, "the run view opens", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| {
+            let shell = shell.read(cx);
+            shell.state.tab == Tab::Trajectory && shell.traj_runs && shell.traj_run.is_some()
+        })
     });
 }
 

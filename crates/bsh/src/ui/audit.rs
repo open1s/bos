@@ -23,7 +23,9 @@
 //! preview and, on demand, the whole stored record. The full record is read only
 //! in that last branch, so a huge output never becomes a per-frame cost.
 
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::Input;
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::*;
 
 use super::shell::Shell;
@@ -70,6 +72,52 @@ struct AuditKey {
 pub(crate) struct AuditCache {
     key: Option<AuditKey>,
     view: std::rc::Rc<AuditView>,
+}
+
+/// One flat event the table shows, built from the audit view's turns,
+/// calls and refusals. The row is owned so sorting and filtering never touch
+/// the view model.
+#[derive(Clone)]
+struct FlatEvent {
+    ordinal: usize,
+    turn: usize,
+    at: Option<u64>,
+    kind: FlatKind,
+    actor: String,
+    target: String,
+    tool: String,
+    ok: bool,
+    denied: bool,
+    rule: Option<String>,
+    reason: Option<String>,
+    preview: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FlatKind {
+    Session,
+    Call(AuditCategory),
+    Permission,
+}
+
+impl FlatKind {
+    fn label(self, lang: crate::i18n::Lang) -> String {
+        match self {
+            FlatKind::Session => crate::i18n::tr(lang, "audit.type.session"),
+            FlatKind::Permission => crate::i18n::tr(lang, "audit.type.permission"),
+            FlatKind::Call(category) => match category {
+                AuditCategory::FileRead | AuditCategory::FileWrite => {
+                    crate::i18n::tr(lang, "audit.type.file")
+                }
+                AuditCategory::Shell => crate::i18n::tr(lang, "audit.type.shell"),
+                AuditCategory::Network => crate::i18n::tr(lang, "audit.type.network"),
+                AuditCategory::Browser => crate::i18n::tr(lang, "audit.type.browser"),
+                AuditCategory::Mcp => crate::i18n::tr(lang, "audit.type.mcp"),
+                AuditCategory::Subagent => crate::i18n::tr(lang, "audit.type.agent"),
+                AuditCategory::Other => crate::i18n::tr(lang, "audit.type.other"),
+            },
+        }
+    }
 }
 
 impl Shell {
@@ -385,6 +433,825 @@ impl Shell {
     const MEASURE_W: f32 = 96.0;
     /// The measure bar's thickness.
     const MEASURE_H: f32 = 5.0;
+    /// The flat event list the table filters: one row per turn opening, tool
+    /// call and policy refusal, newest first.
+    fn audit_flat_events(&self, view: &AuditView) -> Vec<FlatEvent> {
+        let lang = self.state.lang;
+        let mut rows = Vec::new();
+        for turn in &view.turns {
+            rows.push(FlatEvent {
+                ordinal: rows.len(),
+                turn: turn.index,
+                at: turn.started_at,
+                kind: FlatKind::Session,
+                actor: lang.tr("audit.actorUser"),
+                target: format!("Session #{}", turn.index),
+                tool: String::new(),
+                ok: true,
+                denied: false,
+                rule: None,
+                reason: None,
+                preview: String::new(),
+            });
+            for call in &turn.calls {
+                rows.push(FlatEvent {
+                    ordinal: rows.len(),
+                    turn: turn.index,
+                    at: call.at.or(turn.started_at),
+                    kind: FlatKind::Call(call.category),
+                    actor: lang.tr("audit.actorAgent"),
+                    target: call.target.clone(),
+                    tool: call.tool.clone(),
+                    ok: matches!(call.outcome, AuditOutcome::Ok),
+                    denied: false,
+                    rule: None,
+                    reason: None,
+                    preview: call.preview.clone(),
+                });
+            }
+            for refusal in &turn.refusals {
+                rows.push(FlatEvent {
+                    ordinal: rows.len(),
+                    turn: turn.index,
+                    at: Some(refusal.at_ms),
+                    kind: FlatKind::Permission,
+                    actor: lang.tr("audit.actorPolicy"),
+                    target: refusal.target.clone(),
+                    tool: refusal.tool.clone(),
+                    ok: false,
+                    denied: true,
+                    rule: refusal.rule.clone(),
+                    reason: refusal.reason.clone(),
+                    preview: String::new(),
+                });
+            }
+        }
+        rows.sort_by_key(|row| std::cmp::Reverse(row.at));
+        rows
+    }
+
+    /// The audit overview: statistics, filters, the flat event table and the
+    /// selected event's inline inspector.
+    fn render_audit_table(&self, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let Some(_session) = self.state.active_session() else {
+            return div()
+                .debug_selector(|| "audit".to_string())
+                .id("audit")
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(txt(lang.tr("empty.none"), 12.0, theme::muted()))
+                .into_any_element();
+        };
+        let view = self.audit_view();
+        let all = self.audit_flat_events(&view);
+        let total = all.len();
+        let succeeded = all.iter().filter(|event| event.ok).count();
+        let denied = all.iter().filter(|event| event.denied).count();
+        let failed = all
+            .iter()
+            .filter(|event| !event.ok && !event.denied)
+            .count();
+        let security = denied;
+        let now = crate::state::now_ms();
+        let query = self.audit_query.trim().to_lowercase();
+        let filtered: Vec<FlatEvent> = all
+            .into_iter()
+            .filter(|event| {
+                if let Some(category) = self.audit_category {
+                    if !matches!(event.kind, FlatKind::Call(call) if call == category) {
+                        return false;
+                    }
+                }
+                match self.audit_result {
+                    1 if !event.ok => return false,
+                    2 if event.ok => return false,
+                    _ => {}
+                }
+                if self.audit_range == 1 {
+                    if let Some(at) = event.at {
+                        if at + 86_400_000 < now {
+                            return false;
+                        }
+                    }
+                }
+                if query.is_empty() {
+                    return true;
+                }
+                let label = event.kind.label(lang).to_lowercase();
+                label.contains(&query)
+                    || event.actor.to_lowercase().contains(&query)
+                    || event.target.to_lowercase().contains(&query)
+                    || event.tool.to_lowercase().contains(&query)
+                    || event
+                        .rule
+                        .as_deref()
+                        .is_some_and(|rule| rule.to_lowercase().contains(&query))
+            })
+            .collect();
+        let selected = self.audit_event.filter(|index| *index < filtered.len());
+
+        let control = |id: &'static str, label: String, active: bool| -> Button {
+            Button::new(id)
+                .ghost()
+                .h(px(34.0))
+                .px(px(12.0))
+                .rounded(px(10.0))
+                .border_1()
+                .border_color(rgb(if active {
+                    theme::accent()
+                } else {
+                    theme::border_soft()
+                }))
+                .bg(rgb(theme::page()))
+                .child(txt(label, 11.5, theme::text()))
+                .child(icon(IconName::ChevronDown, 11.0, theme::faint()))
+        };
+
+        let type_label = match self.audit_category {
+            Some(category) => FlatKind::Call(category).label(lang),
+            None => lang.tr("audit.allEvents"),
+        };
+        let categories = [
+            None,
+            Some(AuditCategory::FileRead),
+            Some(AuditCategory::FileWrite),
+            Some(AuditCategory::Shell),
+            Some(AuditCategory::Network),
+            Some(AuditCategory::Browser),
+            Some(AuditCategory::Mcp),
+            Some(AuditCategory::Subagent),
+            Some(AuditCategory::Other),
+        ];
+        let current_category = self.audit_category;
+        let menu_shell = cx.entity();
+        let type_control = control("audit-filter-type", type_label, false)
+            .dropdown_menu_with_anchor(Anchor::BottomLeft, {
+                let shell = menu_shell.clone();
+                move |menu, _, _| {
+                    let mut menu = menu;
+                    for category in categories {
+                        let pick = shell.clone();
+                        let label = match category {
+                            Some(category) => FlatKind::Call(category).label(lang),
+                            None => lang.tr("audit.allEvents"),
+                        };
+                        menu = menu.item(
+                            PopupMenuItem::new(label)
+                                .checked(category == current_category)
+                                .on_click(move |_, _window, cx| {
+                                    pick.update(cx, |this, cx| {
+                                        this.audit_category = category;
+                                        this.audit_event = None;
+                                        this.audit_page = 0;
+                                        cx.notify();
+                                    });
+                                }),
+                        );
+                    }
+                    menu
+                }
+            });
+        let result_label = match self.audit_result {
+            1 => lang.tr("audit.success"),
+            2 => lang.tr("audit.deniedFailed"),
+            _ => lang.tr("audit.allResults"),
+        };
+        let current_result = self.audit_result;
+        let result_control = control("audit-filter-result", result_label, false)
+            .dropdown_menu_with_anchor(Anchor::BottomLeft, {
+                let shell = menu_shell.clone();
+                move |menu, _, _| {
+                    let mut menu = menu;
+                    for (value, key) in [
+                        (0, "audit.allResults"),
+                        (1, "audit.success"),
+                        (2, "audit.deniedFailed"),
+                    ] {
+                        let pick = shell.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(lang.tr(key))
+                                .checked(value == current_result)
+                                .on_click(move |_, _window, cx| {
+                                    pick.update(cx, |this, cx| {
+                                        this.audit_result = value;
+                                        this.audit_event = None;
+                                        cx.notify();
+                                    });
+                                }),
+                        );
+                    }
+                    menu
+                }
+            });
+        let range_label = if self.audit_range == 1 {
+            lang.tr("audit.last24h")
+        } else {
+            lang.tr("audit.allTime")
+        };
+        let current_range = self.audit_range;
+        let range_control = control("audit-filter-range", range_label, self.audit_range == 1)
+            .dropdown_menu_with_anchor(Anchor::BottomLeft, {
+                let shell = menu_shell;
+                move |menu, _, _| {
+                    let mut menu = menu;
+                    for (value, key) in [(0, "audit.allTime"), (1, "audit.last24h")] {
+                        let pick = shell.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(lang.tr(key))
+                                .checked(value == current_range)
+                                .on_click(move |_, _window, cx| {
+                                    pick.update(cx, |this, cx| {
+                                        this.audit_range = value;
+                                        this.audit_event = None;
+                                        cx.notify();
+                                    });
+                                }),
+                        );
+                    }
+                    menu
+                }
+            });
+
+        let stat = |label: String, value: String, color: u32| {
+            div()
+                .flex_1()
+                .min_w_0()
+                .p(px(14.0))
+                .rounded(px(12.0))
+                .border_1()
+                .border_color(rgb(theme::border_soft()))
+                .bg(rgb(theme::page()))
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .child(txt(label, 11.0, theme::muted()))
+                .child(txt(value, 24.0, color).font_weight(FontWeight::SEMIBOLD))
+        };
+        let integrity = if view.policy.error.is_some() {
+            lang.tr("audit.degraded")
+        } else {
+            lang.tr("audit.normal")
+        };
+        let stats = div()
+            .flex()
+            .flex_row()
+            .gap(px(12.0))
+            .child(stat(
+                lang.tr("audit.totalEvents"),
+                total.to_string(),
+                theme::text(),
+            ))
+            .child(stat(
+                lang.tr("audit.success"),
+                succeeded.to_string(),
+                theme::success(),
+            ))
+            .child(stat(
+                lang.tr("audit.deniedFailed"),
+                (denied + failed).to_string(),
+                theme::warn(),
+            ))
+            .child(stat(
+                lang.tr("audit.securityEvents"),
+                security.to_string(),
+                theme::error(),
+            ))
+            .child(stat(
+                lang.tr("audit.integrity"),
+                integrity,
+                if view.policy.error.is_some() {
+                    theme::error()
+                } else {
+                    theme::success()
+                },
+            ));
+
+        let mut table_rows = div().flex().flex_col();
+        for (index, event) in filtered.iter().enumerate() {
+            let active = selected == Some(index);
+            let ink = if event.denied {
+                theme::error()
+            } else if event.ok {
+                theme::success()
+            } else {
+                theme::warn()
+            };
+            let status = if event.denied {
+                lang.tr("audit.denied")
+            } else if event.ok {
+                lang.tr("audit.success")
+            } else {
+                lang.tr("audit.outcome.failed")
+            };
+            let time = event
+                .at
+                .map(|at| {
+                    format!(
+                        "{}:{:02}",
+                        crate::state::clock_at(at / 1000, lang),
+                        (at / 1000) % 60
+                    )
+                })
+                .unwrap_or_else(|| "\u{2014}".to_string());
+            table_rows = table_rows.child(
+                div()
+                    .id(SharedString::from(format!("audit-event-{index}")))
+                    .debug_selector(move || format!("audit-event-{index}"))
+                    .h(px(46.0))
+                    .px(px(12.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .border_b_1()
+                    .border_color(rgb(theme::border_soft()))
+                    .when(active, |row| row.bg(rgb(theme::soft(theme::accent()))))
+                    .when(!active, |row| row.hover(|s| s.bg(rgb(theme::hover()))))
+                    .cursor_pointer()
+                    .child(txt(time, 11.0, theme::faint()).w(px(86.0)).flex_none())
+                    .child(
+                        txt(event.kind.label(lang), 11.5, theme::text())
+                            .w(px(132.0))
+                            .flex_none()
+                            .truncate(),
+                    )
+                    .child(
+                        txt(event.actor.clone(), 11.5, theme::muted())
+                            .w(px(104.0))
+                            .flex_none()
+                            .truncate(),
+                    )
+                    .child(
+                        txt(
+                            if event.target.is_empty() {
+                                event.tool.clone()
+                            } else {
+                                event.target.clone()
+                            },
+                            11.5,
+                            theme::text(),
+                        )
+                        .flex_1()
+                        .min_w_0()
+                        .truncate(),
+                    )
+                    .child(
+                        div().w(px(76.0)).flex_none().flex().justify_end().child(
+                            div()
+                                .h(px(20.0))
+                                .px(px(8.0))
+                                .rounded(px(999.0))
+                                .bg(rgb(theme::soft(ink)))
+                                .flex()
+                                .items_center()
+                                .child(txt(status, 10.0, ink).whitespace_nowrap()),
+                        ),
+                    )
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.audit_event = Some(index);
+                        cx.notify();
+                    })),
+            );
+        }
+        if filtered.is_empty() {
+            table_rows = table_rows.child(
+                div()
+                    .h(px(120.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(txt(lang.tr("audit.empty"), 11.5, theme::muted())),
+            );
+        }
+
+        let table = div()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .border_1()
+            .border_color(rgb(theme::border_soft()))
+            .rounded(px(12.0))
+            .bg(rgb(theme::page()))
+            .child(
+                div()
+                    .h(px(38.0))
+                    .px(px(14.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .border_b_1()
+                    .border_color(rgb(theme::border_soft()))
+                    .child(txt(lang.tr("audit.eventsTitle"), 12.0, theme::text()).flex_1())
+                    .child(txt(
+                        crate::i18n::tr_args(
+                            lang,
+                            "audit.records",
+                            &[("count", filtered.len().to_string())],
+                        ),
+                        10.5,
+                        theme::faint(),
+                    )),
+            )
+            .child(
+                div()
+                    .h(px(30.0))
+                    .px(px(12.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .border_b_1()
+                    .border_color(rgb(theme::border_soft()))
+                    .child(
+                        txt(lang.tr("audit.time"), 10.0, theme::faint())
+                            .w(px(86.0))
+                            .flex_none(),
+                    )
+                    .child(
+                        txt(lang.tr("audit.eventType"), 10.0, theme::faint())
+                            .w(px(132.0))
+                            .flex_none(),
+                    )
+                    .child(
+                        txt(lang.tr("audit.actor"), 10.0, theme::faint())
+                            .w(px(104.0))
+                            .flex_none(),
+                    )
+                    .child(txt(lang.tr("audit.resource"), 10.0, theme::faint()).flex_1())
+                    .child(
+                        txt(lang.tr("audit.result"), 10.0, theme::faint())
+                            .w(px(76.0))
+                            .flex_none(),
+                    ),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "audit-list".to_string())
+                    .id("audit-list")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.audit_scroll)
+                    .child(table_rows),
+            )
+            .child(
+                div()
+                    .h(px(32.0))
+                    .px(px(14.0))
+                    .flex()
+                    .items_center()
+                    .border_t_1()
+                    .border_color(rgb(theme::border_soft()))
+                    .child(txt(lang.tr("audit.partialNote"), 10.0, theme::faint())),
+            );
+
+        let inspector = if let Some(index) = selected {
+            let event = &filtered[index];
+            let ink = if event.denied {
+                theme::error()
+            } else if event.ok {
+                theme::success()
+            } else {
+                theme::warn()
+            };
+            let status = if event.denied {
+                lang.tr("audit.denied")
+            } else if event.ok {
+                lang.tr("audit.success")
+            } else {
+                lang.tr("audit.outcome.failed")
+            };
+            let field = |label: String, value: String, color: u32, mono: bool| {
+                let value = txt(value, 11.5, color);
+                let value = if mono {
+                    value.font_family("monospace")
+                } else {
+                    value
+                };
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.0))
+                    .child(txt(label, 9.5, theme::faint()))
+                    .child(value)
+            };
+            let at = event
+                .at
+                .map(|at| {
+                    format!(
+                        "{}:{:02}",
+                        crate::state::local_stamp(at / 1000),
+                        (at / 1000) % 60
+                    )
+                })
+                .unwrap_or_else(|| "\u{2014}".to_string());
+            let authorization = if event.denied {
+                match (event.rule.as_deref(), event.reason.as_deref()) {
+                    (Some(rule), _) => format!(
+                        "{} · {} {rule}",
+                        lang.tr("audit.denied"),
+                        lang.tr("audit.policyRule")
+                    ),
+                    (None, Some(reason)) => {
+                        format!("{} · {reason}", lang.tr("audit.denied"))
+                    }
+                    (None, None) => lang.tr("audit.denied"),
+                }
+            } else if event.ok {
+                lang.tr("audit.granted")
+            } else {
+                lang.tr("audit.outcome.failed")
+            };
+            let turn = event.turn;
+            div()
+                .w(px(380.0))
+                .flex_none()
+                .h_full()
+                .ml(px(14.0))
+                .rounded(px(12.0))
+                .border_1()
+                .border_color(rgb(theme::border_soft()))
+                .bg(rgb(theme::page()))
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .h(px(42.0))
+                        .px(px(14.0))
+                        .flex()
+                        .items_center()
+                        .border_b_1()
+                        .border_color(rgb(theme::border_soft()))
+                        .child(txt(lang.tr("audit.detailTitle"), 12.0, theme::text()).flex_1())
+                        .child(
+                            div()
+                                .id("audit-detail-close")
+                                .debug_selector(|| "audit-detail-close".to_string())
+                                .w(px(24.0))
+                                .h(px(24.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(6.0))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(theme::hover())))
+                                .child(icon(IconName::Close, 12.0, theme::muted()))
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    this.audit_event = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .m(px(12.0))
+                        .p(px(12.0))
+                        .rounded(px(10.0))
+                        .bg(rgb(theme::soft(theme::accent())))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(div().w(px(7.0)).h(px(7.0)).rounded_full().bg(rgb(ink)))
+                        .child(
+                            txt(
+                                format!("{} · {status}", event.kind.label(lang)),
+                                12.0,
+                                theme::text(),
+                            )
+                            .font_weight(FontWeight::MEDIUM),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("audit-detail-body")
+                        .px(px(14.0))
+                        .pb(px(12.0))
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .flex()
+                        .flex_col()
+                        .gap(px(12.0))
+                        .child(field(
+                            lang.tr("audit.eventId"),
+                            format!("evt_{:04}{:03}", event.turn, event.ordinal),
+                            theme::text(),
+                            true,
+                        ))
+                        .child(field(
+                            lang.tr("audit.actorLabel"),
+                            event.actor.clone(),
+                            theme::text(),
+                            false,
+                        ))
+                        .child(field(
+                            lang.tr("audit.capability"),
+                            if event.tool.is_empty() {
+                                event.kind.label(lang)
+                            } else {
+                                event.tool.clone()
+                            },
+                            theme::text(),
+                            true,
+                        ))
+                        .child(field(
+                            lang.tr("audit.authorization"),
+                            authorization,
+                            ink,
+                            false,
+                        ))
+                        .child(field(
+                            lang.tr("audit.resourceLabel"),
+                            event.target.clone(),
+                            theme::text(),
+                            true,
+                        ))
+                        .child(field(lang.tr("audit.timestamp"), at, theme::muted(), false))
+                        .when(!event.preview.is_empty(), |column| {
+                            column.child(field(
+                                lang.tr("audit.preview"),
+                                event.preview.clone(),
+                                theme::muted(),
+                                false,
+                            ))
+                        })
+                        .child(
+                            div()
+                                .pt(px(10.0))
+                                .border_t_1()
+                                .border_color(rgb(theme::border_soft()))
+                                .flex()
+                                .flex_col()
+                                .gap(px(8.0))
+                                .child(txt(lang.tr("audit.related"), 10.0, theme::faint()))
+                                .child(
+                                    div()
+                                        .id("audit-view-trajectory")
+                                        .debug_selector(|| "audit-view-trajectory".to_string())
+                                        .h(px(34.0))
+                                        .px(px(10.0))
+                                        .rounded(px(8.0))
+                                        .bg(rgb(theme::new_session_fill()))
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(8.0))
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(rgb(theme::hover())))
+                                        .child(txt(
+                                            format!("{} #{turn}", lang.tr("traj.run")),
+                                            11.0,
+                                            theme::text(),
+                                        ))
+                                        .child(div().flex_1())
+                                        .child(txt(
+                                            lang.tr("audit.viewTrajectory"),
+                                            10.5,
+                                            theme::accent(),
+                                        ))
+                                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                                            this.state.tab = Tab::Trajectory;
+                                            this.traj_runs = true;
+                                            this.traj_run = Some(turn);
+                                            this.traj_select = None;
+                                            cx.notify();
+                                        })),
+                                ),
+                        ),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .w(px(380.0))
+                .flex_none()
+                .h_full()
+                .ml(px(14.0))
+                .rounded(px(12.0))
+                .border_1()
+                .border_color(rgb(theme::border_soft()))
+                .bg(rgb(theme::page()))
+                .p(px(14.0))
+                .flex()
+                .flex_col()
+                .gap(px(10.0))
+                .child(txt(lang.tr("audit.detailTitle"), 12.0, theme::text()))
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(txt(lang.tr("audit.selectEvent"), 11.0, theme::muted())),
+                )
+                .into_any_element()
+        };
+
+        div()
+            .debug_selector(|| "audit".to_string())
+            .id("audit")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .child(
+                div()
+                    .px(px(18.0))
+                    .pt(px(14.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.0))
+                    .child(txt(lang.tr("audit.overview"), 11.0, theme::faint()))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(type_control)
+                            .child(result_control)
+                            .child(range_control)
+                            .child(
+                                div()
+                                    .h(px(34.0))
+                                    .flex_1()
+                                    .min_w(px(180.0))
+                                    .max_w(px(340.0))
+                                    .px(px(10.0))
+                                    .rounded(px(10.0))
+                                    .border_1()
+                                    .border_color(rgb(theme::border_soft()))
+                                    .bg(rgb(theme::page()))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .child(icon(IconName::Search, 11.0, theme::faint()))
+                                    .child(
+                                        div().flex_1().min_w_0().child(
+                                            Input::new(&self.audit_search).appearance(false),
+                                        ),
+                                    ),
+                            )
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .id("audit-export")
+                                    .debug_selector(|| "audit-export".to_string())
+                                    .h(px(34.0))
+                                    .px(px(12.0))
+                                    .rounded(px(10.0))
+                                    .border_1()
+                                    .border_color(rgb(theme::border_soft()))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(theme::hover())))
+                                    .child(txt(lang.tr("audit.export"), 11.0, theme::muted()))
+                                    .child(icon(IconName::ExternalLink, 11.0, theme::muted()))
+                                    .on_click(cx.listener(|this, _event, window, cx| {
+                                        this.export_audit(window, cx);
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("audit-refresh")
+                                    .debug_selector(|| "audit-refresh".to_string())
+                                    .h(px(34.0))
+                                    .px(px(12.0))
+                                    .rounded(px(10.0))
+                                    .border_1()
+                                    .border_color(rgb(theme::border_soft()))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(theme::hover())))
+                                    .child(txt(lang.tr("audit.refresh"), 11.0, theme::muted()))
+                                    .child(icon(IconName::RefreshCw, 11.0, theme::muted()))
+                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                        this.audit_cache.borrow_mut().key = None;
+                                        this.audit_event = None;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(stats),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .p(px(18.0))
+                    .flex()
+                    .child(table)
+                    .child(inspector),
+            )
+            .into_any_element()
+    }
+
     fn audit_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let modes = [
             self.state.lang.tr("traj.duration"),
@@ -1508,6 +2375,9 @@ impl Shell {
 
     /// The whole tab.
     pub(crate) fn render_audit(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.audit_table {
+            return self.render_audit_table(cx);
+        }
         let Some(_session) = self.state.active_session() else {
             return div()
                 .debug_selector(|| "audit".to_string())

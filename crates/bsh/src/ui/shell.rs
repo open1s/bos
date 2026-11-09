@@ -474,6 +474,10 @@ pub(crate) struct Shell {
     /// state is recorded and the fill applied on the next frame.
     pub(crate) traj_summary_hover: bool,
     /// The selected trajectory event (an index into the rendered log).
+    /// Whether Trajectory opens on the run/step design instead of the timeline.
+    pub(crate) traj_runs: bool,
+    /// The run (turn) the run view is showing; none follows the newest.
+    pub(crate) traj_run: Option<usize>,
     pub(crate) traj_select: Option<usize>,
     /// The detail panel's tab: 0 summary, 1 preview, 2 raw, 3 source.
     pub(crate) traj_tab: usize,
@@ -494,6 +498,14 @@ pub(crate) struct Shell {
     /// box lands on the next frame.
     pub(crate) traj_lane_w: std::rc::Rc<std::cell::Cell<Option<f32>>>,
     /// The Audit tab's own search field.
+    /// Whether Audit opens on the flat event table instead of the turn list.
+    pub(crate) audit_table: bool,
+    /// Result filter: 0 all, 1 success, 2 denied/failed.
+    pub(crate) audit_result: usize,
+    /// Time range: 0 all, 1 the last 24 hours.
+    pub(crate) audit_range: usize,
+    /// The flat event row the table's inspector shows.
+    pub(crate) audit_event: Option<usize>,
     pub(crate) audit_search: Entity<InputState>,
     /// Which measure the audit toolbar shows: 0 duration, 1 turns, 2 calls.
     pub(crate) audit_mode: usize,
@@ -1215,7 +1227,12 @@ impl Shell {
         // The launcher has its own tests, which open it explicitly; production
         // follows the stored preference instead.
         state.settings.global.general.launcher_on_start = false;
-        Self::assemble(window, open_settings, state, cx)
+        let mut shell = Self::assemble(window, open_settings, state, cx);
+        // The existing trajectory tests exercise the measured timeline; the run
+        // view has its own test and is the production default.
+        shell.traj_runs = false;
+        shell.audit_table = false;
+        shell
     }
 
     /// The one place the shell is wired up.
@@ -1697,6 +1714,7 @@ impl Shell {
                     if matches!(event, InputEvent::Change) {
                         this.audit_query = this.audit_search.read(cx).value().to_string();
                         this.audit_page = 0;
+                        this.audit_event = None;
                         cx.notify();
                     }
                 },
@@ -2047,10 +2065,16 @@ impl Shell {
             traj_turns_collapsed: false,
             traj_calls_collapsed: false,
             traj_summary_hover: false,
+            traj_runs: true,
+            traj_run: None,
             traj_select: None,
             traj_tab: 0,
             traj_query: String::new(),
             traj_lane_w: std::rc::Rc::new(std::cell::Cell::new(None)),
+            audit_table: true,
+            audit_result: 0,
+            audit_range: 0,
+            audit_event: None,
             audit_search,
             audit_mode: 0,
             audit_query: String::new(),
@@ -7072,6 +7096,7 @@ impl Render for Shell {
             // the top the way the reference resets a mounted pane.
             self.audit_turn_open.clear();
             self.audit_open.clear();
+            self.audit_event = None;
             self.audit_full.clear();
             self.audit_query.clear();
             self.audit_jump_to = None;

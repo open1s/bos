@@ -136,6 +136,17 @@ pub(crate) fn duration_label(ms: Option<u64>) -> String {
     }
 }
 
+/// The Preview tab's body: a tool's returned output when it has one, and
+/// otherwise the record's own body. A message event carries its text in `raw`
+/// and leaves `outcome` empty, so previewing it must not show a blank panel.
+pub(crate) fn preview_body(event: &Event) -> String {
+    if event.outcome.is_empty() {
+        event.raw.clone()
+    } else {
+        event.outcome.clone()
+    }
+}
+
 fn clip(text: &str, max: usize) -> String {
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() <= max {
@@ -1034,6 +1045,642 @@ impl Shell {
     /// in the table, and its glyph flips between the expand and collapse box.
     /// They are left exactly as measured; the strip's own measure is the
     /// Duration toggle.
+    /// The run/step design: a run navigator, a status header and progress bar,
+    /// a vertical step timeline, and the selected step's inspector.
+    fn render_trajectory_runs(&self, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let events = self.traj_log();
+        if events.is_empty() {
+            return div()
+                .debug_selector(|| "trajectory".to_string())
+                .id("trajectory")
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(txt(lang.tr("traj.empty"), 12.0, theme::muted()))
+                .into_any_element();
+        }
+        let mut runs: Vec<usize> = events.iter().map(|event| event.turn).collect();
+        runs.sort_unstable();
+        runs.dedup();
+        runs.reverse();
+        let current_turn = runs[0];
+        let selected_turn = self
+            .traj_run
+            .filter(|turn| runs.contains(turn))
+            .unwrap_or(current_turn);
+        let run_events: Vec<(usize, &Event)> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event.turn == selected_turn)
+            .collect();
+        let live = self.state.any_streaming() && run_events.iter().any(|(_, event)| event.live);
+        let failed = run_events
+            .iter()
+            .any(|(_, event)| event.kind == Kind::Error);
+        let (status_label, status_ink) = if failed {
+            (lang.tr("traj.failed"), theme::error())
+        } else if live {
+            (lang.tr("traj.running"), theme::success())
+        } else {
+            (lang.tr("traj.completed"), theme::success())
+        };
+        let total = run_events.len() + usize::from(live);
+        let done = run_events.iter().filter(|(_, event)| !event.live).count();
+        let ratio = if total == 0 {
+            0.0
+        } else {
+            done as f32 / total as f32
+        };
+        let percent = (ratio * 100.0).round() as u32;
+        let started_at = run_events.iter().filter_map(|(_, event)| event.at).min();
+        let duration = run_events
+            .iter()
+            .filter_map(|(_, event)| event.ms)
+            .reduce(|a, b| a + b);
+        let session_title = self
+            .state
+            .active_session()
+            .map(|session| session.title.clone())
+            .unwrap_or_default();
+        let run_label = format!("{} #{}", lang.tr("traj.run"), selected_turn);
+
+        let nav = self.traj_run_nav(&runs, selected_turn, current_turn, &events, cx);
+
+        let header = div()
+            .px(px(22.0))
+            .pt(px(18.0))
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .child(txt(run_label, 22.0, theme::text()).font_weight(FontWeight::SEMIBOLD))
+                    .child(
+                        div()
+                            .h(px(22.0))
+                            .px(px(8.0))
+                            .rounded(px(999.0))
+                            .bg(rgb(theme::soft(status_ink)))
+                            .flex()
+                            .items_center()
+                            .gap(px(5.0))
+                            .child(
+                                div()
+                                    .w(px(6.0))
+                                    .h(px(6.0))
+                                    .rounded_full()
+                                    .bg(rgb(status_ink)),
+                            )
+                            .child(txt(status_label, 10.0, status_ink)),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("traj-timeline-toggle")
+                            .debug_selector(|| "traj-timeline-toggle".to_string())
+                            .h(px(28.0))
+                            .px(px(10.0))
+                            .rounded(px(8.0))
+                            .border_1()
+                            .border_color(rgb(theme::border()))
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(theme::hover())))
+                            .child(txt(lang.tr("traj.timeline"), 11.0, theme::muted()))
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.traj_runs = false;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("traj-pause")
+                            .debug_selector(|| "traj-pause".to_string())
+                            .h(px(28.0))
+                            .px(px(12.0))
+                            .rounded(px(8.0))
+                            .border_1()
+                            .border_color(rgb(theme::border()))
+                            .flex()
+                            .items_center()
+                            .opacity(0.45)
+                            .tooltip({
+                                let text = lang.tr("traj.noPause");
+                                move |window, cx| {
+                                    gpui_kit::component::tooltip::Tooltip::new(text.clone())
+                                        .build(window, cx)
+                                }
+                            })
+                            .child(txt(lang.tr("traj.pause"), 11.0, theme::muted())),
+                    )
+                    .when(live, |row| {
+                        row.child(
+                            div()
+                                .id("traj-stop-run")
+                                .debug_selector(|| "traj-stop-run".to_string())
+                                .h(px(28.0))
+                                .px(px(12.0))
+                                .rounded(px(8.0))
+                                .border_1()
+                                .border_color(rgb(theme::border()))
+                                .flex()
+                                .items_center()
+                                .cursor_pointer()
+                                .hover(|style| style.bg(rgb(theme::hover())))
+                                .child(txt(lang.tr("traj.stopRun"), 11.0, theme::error()))
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    this.stop_active(cx);
+                                })),
+                        )
+                    }),
+            )
+            .child(
+                txt(
+                    format!(
+                        "{}: {} · {} {} · {} {}",
+                        lang.tr("traj.session"),
+                        session_title,
+                        lang.tr("traj.started"),
+                        started_at
+                            .map(|at| crate::state::clock_at(at / 1000, lang))
+                            .unwrap_or_else(|| "\u{2014}".to_string()),
+                        lang.tr("traj.durationLabel"),
+                        duration_label(duration),
+                    ),
+                    11.5,
+                    theme::muted(),
+                )
+                .whitespace_nowrap(),
+            );
+
+        let header = header.child(
+            div()
+                .mt(px(10.0))
+                .p(px(14.0))
+                .rounded(px(14.0))
+                .border_1()
+                .border_color(rgb(theme::border_soft()))
+                .bg(rgb(theme::page()))
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.0))
+                        .child(txt(lang.tr("traj.progress"), 11.5, theme::muted()).flex_1())
+                        .child(txt(
+                            crate::i18n::tr_args(
+                                lang,
+                                "traj.stepsOf",
+                                &[("done", done.to_string()), ("total", total.to_string())],
+                            ),
+                            11.5,
+                            theme::text(),
+                        ))
+                        .child(txt(format!("{percent}%"), 14.0, theme::text())),
+                )
+                .child(
+                    div()
+                        .h(px(8.0))
+                        .w_full()
+                        .rounded(px(999.0))
+                        .bg(rgb(theme::hover()))
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .h_full()
+                                .w(relative(ratio.max(0.02)))
+                                .rounded(px(999.0))
+                                .bg(linear_gradient(
+                                    90.0,
+                                    linear_color_stop(rgba((theme::accent() << 8) | 0xFF), 0.0),
+                                    linear_color_stop(rgba((0x22D3EE << 8) | 0xFF), 1.0),
+                                )),
+                        ),
+                ),
+        );
+
+        let mut timeline = div()
+            .debug_selector(|| "traj-list".to_string())
+            .id("traj-list")
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .overflow_y_scroll()
+            .track_scroll(&self.traj_scroll)
+            .on_scroll(cx.listener(super::transcript::traj_wheel))
+            .py(px(12.0))
+            .px(px(22.0))
+            .flex()
+            .flex_col()
+            .gap(px(10.0));
+        for (index, event) in &run_events {
+            timeline = timeline.child(self.traj_run_step(*index, event, live, cx));
+        }
+        if live {
+            timeline = timeline.child(self.traj_run_waiting());
+        }
+
+        let inspector = if let Some(event) = self
+            .traj_select
+            .and_then(|index| events.get(index))
+            .filter(|event| event.turn == selected_turn)
+        {
+            div()
+                .w(px(390.0))
+                .flex_none()
+                .h_full()
+                .child(self.traj_detail_at(event, 390.0, cx))
+                .into_any_element()
+        } else {
+            div()
+                .w(px(390.0))
+                .flex_none()
+                .h_full()
+                .border_l_1()
+                .border_color(rgb(theme::border_soft()))
+                .bg(rgb(theme::page()))
+                .p(px(16.0))
+                .flex()
+                .flex_col()
+                .gap(px(10.0))
+                .child(
+                    txt(lang.tr("traj.detailTitle"), 13.0, theme::text())
+                        .font_weight(FontWeight::SEMIBOLD),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(txt(lang.tr("traj.selectStep"), 11.5, theme::muted())),
+                )
+                .into_any_element()
+        };
+
+        let main = div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_row()
+                    .child(timeline)
+                    .child(inspector),
+            );
+
+        div()
+            .debug_selector(|| "trajectory".to_string())
+            .id("trajectory")
+            .flex()
+            .flex_row()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .child(nav)
+            .child(main)
+            .into_any_element()
+    }
+
+    fn traj_run_nav(
+        &self,
+        runs: &[usize],
+        selected_turn: usize,
+        current_turn: usize,
+        events: &[Event],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let lang = self.state.lang;
+        let mut history = div().flex().flex_col().gap(px(2.0));
+        for turn in runs.iter().copied().filter(|turn| *turn != current_turn) {
+            let failed = events
+                .iter()
+                .any(|event| event.turn == turn && event.kind == Kind::Error);
+            let active = turn == selected_turn;
+            let status = if failed {
+                lang.tr("traj.failed")
+            } else {
+                lang.tr("traj.completed")
+            };
+            history = history.child(
+                div()
+                    .id(SharedString::from(format!("traj-run-{turn}")))
+                    .debug_selector(move || format!("traj-run-{turn}"))
+                    .h(px(32.0))
+                    .px(px(8.0))
+                    .rounded(px(8.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .cursor_pointer()
+                    .when(active, |row| row.bg(rgb(theme::new_session_fill())))
+                    .when(!active, |row| row.hover(|s| s.bg(rgb(theme::hover()))))
+                    .child(
+                        txt(
+                            format!("{} #{}", lang.tr("traj.run"), turn),
+                            11.5,
+                            theme::text(),
+                        )
+                        .flex_1(),
+                    )
+                    .child(txt(
+                        status,
+                        10.0,
+                        if failed {
+                            theme::error()
+                        } else {
+                            theme::faint()
+                        },
+                    ))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.traj_run = Some(turn);
+                        this.traj_select = None;
+                        cx.notify();
+                    })),
+            );
+        }
+        let current_failed = events
+            .iter()
+            .any(|event| event.turn == current_turn && event.kind == Kind::Error);
+        let current_live = self.state.any_streaming()
+            && events
+                .iter()
+                .any(|event| event.turn == current_turn && event.live);
+        let current_status = if current_failed {
+            lang.tr("traj.failed")
+        } else if current_live {
+            lang.tr("traj.running")
+        } else {
+            lang.tr("traj.completed")
+        };
+        let current_steps = events
+            .iter()
+            .filter(|event| event.turn == current_turn)
+            .count();
+        div()
+            .w(px(220.0))
+            .flex_none()
+            .h_full()
+            .border_r_1()
+            .border_color(rgb(theme::border_soft()))
+            .bg(rgb(theme::new_session_fill()))
+            .p(px(10.0))
+            .flex()
+            .flex_col()
+            .gap(px(10.0))
+            .child(txt(lang.tr("traj.runsTitle"), 11.0, theme::faint()))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(txt(lang.tr("traj.currentRun"), 10.0, theme::faint()))
+                    .child(
+                        div()
+                            .id("traj-current-run")
+                            .debug_selector(|| "traj-current-run".to_string())
+                            .p(px(10.0))
+                            .rounded(px(10.0))
+                            .border_1()
+                            .border_color(rgb(theme::border_soft()))
+                            .bg(rgb(theme::page()))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(theme::hover())))
+                            .flex()
+                            .flex_col()
+                            .gap(px(3.0))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .child(div().w(px(7.0)).h(px(7.0)).rounded_full().bg(rgb(
+                                        if current_failed {
+                                            theme::error()
+                                        } else if current_live {
+                                            theme::accent()
+                                        } else {
+                                            theme::success()
+                                        },
+                                    )))
+                                    .child(txt(
+                                        format!("{} #{}", lang.tr("traj.run"), current_turn),
+                                        12.0,
+                                        theme::text(),
+                                    )),
+                            )
+                            .child(txt(
+                                format!(
+                                    "{} {} · {}",
+                                    current_steps,
+                                    lang.tr("traj.steps"),
+                                    current_status
+                                ),
+                                10.0,
+                                theme::faint(),
+                            ))
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                this.traj_run = Some(current_turn);
+                                this.traj_select = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(txt(lang.tr("traj.historyRuns"), 10.0, theme::faint()))
+                    .child(history),
+            )
+            .into_any_element()
+    }
+
+    fn traj_run_step(
+        &self,
+        index: usize,
+        event: &Event,
+        run_live: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let lang = self.state.lang;
+        let running = event.live && run_live;
+        let failed = event.kind == Kind::Error;
+        let status = if failed {
+            lang.tr("traj.failed")
+        } else if running {
+            lang.tr("traj.running")
+        } else {
+            lang.tr("traj.completed")
+        };
+        let ink = if failed {
+            theme::error()
+        } else if running {
+            theme::accent()
+        } else {
+            theme::success()
+        };
+        let title = match event.kind {
+            Kind::User => lang.tr("traj.userInput"),
+            Kind::Assistant => lang.tr("traj.modelInference"),
+            Kind::Tool => format!("{} · {}", lang.tr("traj.toolInvocation"), event.source),
+            Kind::Error => lang.tr("traj.kindError"),
+            Kind::Context => lang.tr("traj.kindContext"),
+            Kind::Subtool => lang.tr("traj.kindSubtool"),
+            Kind::Compaction => lang.tr("traj.kindCompaction"),
+        };
+        let description = if event.outcome.is_empty() {
+            clip(&event.raw, 120)
+        } else {
+            clip(&event.outcome, 120)
+        };
+        let meta = match (event.at, event.ms) {
+            (Some(at), Some(ms)) => format!(
+                "{} · {}",
+                crate::state::clock_at(at / 1000, lang),
+                duration_label(Some(ms))
+            ),
+            (Some(at), None) => crate::state::clock_at(at / 1000, lang),
+            (None, Some(ms)) => duration_label(Some(ms)),
+            (None, None) => String::new(),
+        };
+        div()
+            .debug_selector(move || format!("traj-row-{index}"))
+            .id(SharedString::from(format!("traj-run-step-{index}")))
+            .flex()
+            .flex_row()
+            .gap(px(12.0))
+            .child(
+                div()
+                    .relative()
+                    .w(px(22.0))
+                    .flex_none()
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(18.0))
+                            .bottom(px(-18.0))
+                            .left(px(10.0))
+                            .w(px(1.0))
+                            .bg(rgb(theme::border())),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(12.0))
+                            .left(px(5.0))
+                            .w(px(11.0))
+                            .h(px(11.0))
+                            .rounded_full()
+                            .border_2()
+                            .border_color(rgb(theme::page()))
+                            .bg(rgb(ink)),
+                    ),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("traj-run-step-card-{index}")))
+                    .debug_selector(move || format!("traj-run-step-card-{index}"))
+                    .flex_1()
+                    .min_w_0()
+                    .p(px(12.0))
+                    .rounded(px(12.0))
+                    .border_1()
+                    .border_color(rgb(if running {
+                        theme::accent()
+                    } else {
+                        theme::border_soft()
+                    }))
+                    .bg(rgb(if running {
+                        theme::soft(theme::accent())
+                    } else {
+                        theme::page()
+                    }))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .cursor_pointer()
+                    .hover(|style| style.border_color(rgb(theme::accent())))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                txt(title, 13.0, theme::text())
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .flex_1(),
+                            )
+                            .child(txt(status, 10.0, ink)),
+                    )
+                    .child(txt(description, 11.5, theme::muted()))
+                    .when(!meta.is_empty(), |card| {
+                        card.child(txt(meta, 10.0, theme::faint()))
+                    })
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.traj_select = Some(index);
+                        this.traj_tab = 0;
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
+
+    fn traj_run_waiting(&self) -> AnyElement {
+        let lang = self.state.lang;
+        div()
+            .debug_selector(|| "traj-run-waiting".to_string())
+            .flex()
+            .flex_row()
+            .gap(px(12.0))
+            .child(
+                div().relative().w(px(22.0)).flex_none().child(
+                    div()
+                        .absolute()
+                        .top(px(18.0))
+                        .left(px(5.0))
+                        .w(px(11.0))
+                        .h(px(11.0))
+                        .rounded_full()
+                        .border_2()
+                        .border_color(rgb(theme::page()))
+                        .bg(rgb(theme::border_strong())),
+                ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .p(px(12.0))
+                    .rounded(px(12.0))
+                    .border_1()
+                    .border_dashed()
+                    .border_color(rgb(theme::border()))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(txt(lang.tr("traj.finalResponse"), 13.0, theme::muted()))
+                    .child(txt(lang.tr("traj.waiting"), 11.0, theme::faint())),
+            )
+            .into_any_element()
+    }
+
     pub(crate) fn traj_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let lang = self.state.lang;
         let actual = self.traj_actual_duration;
@@ -1153,6 +1800,25 @@ impl Shell {
                     ),
             )
             .child(div().flex_1())
+            .child(
+                div()
+                    .id("traj-runs-toggle")
+                    .debug_selector(|| "traj-runs-toggle".to_string())
+                    .h(px(24.0))
+                    .px(px(9.0))
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(rgb(theme::border()))
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(theme::hover())))
+                    .child(txt(self.state.lang.tr("traj.runs"), 11.0, theme::muted()))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.traj_runs = true;
+                        cx.notify();
+                    })),
+            )
             // The field is flex:0 164px tall 22, radius-sm, a .5px border-l4 over
             // bg-layer-2, padded 0 6px with a 4px gap.
             .child(
@@ -1703,6 +2369,10 @@ impl Shell {
 
     /// The detail panel, from the reference's own header, tabs and fields.
     pub(crate) fn traj_detail(&self, event: &Event, cx: &mut Context<Self>) -> AnyElement {
+        self.traj_detail_at(event, 470.0, cx)
+    }
+
+    fn traj_detail_at(&self, event: &Event, width: f32, cx: &mut Context<Self>) -> AnyElement {
         let tabs = [
             self.state.lang.tr("traj.summary"),
             self.state.lang.tr("traj.preview"),
@@ -1719,7 +2389,7 @@ impl Shell {
         // never join.
         let verdict = self.state.policy_verdict_for(&event.source, &event.target);
         let body: String = match self.traj_tab {
-            1 => event.outcome.clone(),
+            1 => preview_body(event),
             2 => event.raw.clone(),
             3 => event.source.clone(),
             4 => String::new(),
@@ -1742,7 +2412,7 @@ impl Shell {
         div()
             .debug_selector(|| "traj-detail".to_string())
             .id("traj-detail")
-            .w(px(470.0))
+            .w(px(width))
             .flex_none()
             .h_full()
             .flex()
@@ -2092,6 +2762,9 @@ impl Shell {
 
     /// The whole tab.
     pub(crate) fn render_trajectory_view(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.traj_runs {
+            return self.render_trajectory_runs(cx);
+        }
         let events = self.traj_log();
         let query = self.traj_query.clone();
         let visible: Vec<(usize, &Event)> = events
@@ -2155,8 +2828,8 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::{
-        action_of, collapse_turns, duration_label, events, events_for, project_lane, verdict_for,
-        BlockWidth, Kind, PolicyVerdict, Projection, MINIMUM_BLOCK_MS,
+        action_of, collapse_turns, duration_label, events, events_for, preview_body, project_lane,
+        verdict_for, BlockWidth, Event, Kind, PolicyVerdict, Projection, MINIMUM_BLOCK_MS,
     };
     use crate::i18n::Lang;
     use crate::model::{ChatMessage, Session};
@@ -2800,5 +3473,26 @@ mod tests {
             cx.debug_bounds("traj-row-0").is_none(),
             "the top of the log is a spacer while the reader is at the tail"
         );
+    }
+
+    /// A message carries its text in raw and leaves outcome empty; the
+    /// Preview tab must show the message, not a blank panel.
+    #[test]
+    fn a_message_preview_falls_back_to_its_raw_body() {
+        let event = Event {
+            kind: Kind::Assistant,
+            turn: 1,
+            title: "hello".to_string(),
+            outcome: String::new(),
+            raw: "hello there".to_string(),
+            source: "Message".to_string(),
+            ms: None,
+            live: false,
+            message: 0,
+            tool: usize::MAX,
+            at: None,
+            target: String::new(),
+        };
+        assert_eq!(preview_body(&event), "hello there");
     }
 }

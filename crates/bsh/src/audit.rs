@@ -181,6 +181,8 @@ pub(crate) struct AuditCall {
     pub(crate) target: String,
     /// How the call ended.
     pub(crate) outcome: AuditOutcome,
+    /// The recorded start instant, epoch milliseconds, when one was placed.
+    pub(crate) at: Option<u64>,
     /// The recorded wall-clock duration, when one was measured.
     pub(crate) ms: Option<u64>,
     /// A bounded, redacted one-line preview of the output (or the arguments).
@@ -520,6 +522,7 @@ impl AuditView {
                     category: AuditCategory::classify_in(&tool.name, mcp_namespaces),
                     target: target_of(&tool.args),
                     outcome: outcome_of(tool.output.as_deref()),
+                    at: tool.at,
                     ms: tool.ms,
                     preview: preview(
                         tool.output
