@@ -208,8 +208,11 @@ impl Shell {
 
     /// The left column.
     pub(crate) fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let wave = crate::assets::sidebar_wave(theme::is_dark());
         div()
             .debug_selector(|| String::from("sidebar"))
+            .relative()
+            .overflow_hidden()
             .w(px(self.sidebar_w()))
             .h_full()
             .flex_shrink_0()
@@ -217,7 +220,26 @@ impl Shell {
             .flex_col()
             .pt(px(6.0))
             .px(px(theme::SIDEBAR_PAD_X))
-            .bg(rgb(theme::sidebar_bg()))
+            .bg(linear_gradient(
+                180.0,
+                linear_color_stop(
+                    rgba((theme::blend_into(theme::accent(), theme::page(), 0.98) << 8) | 0xFF),
+                    0.0,
+                ),
+                linear_color_stop(
+                    rgba((theme::blend_into(theme::accent(), theme::page(), 0.82) << 8) | 0xFF),
+                    1.0,
+                ),
+            ))
+            .child(
+                div()
+                    .absolute()
+                    .top(px(-6.0))
+                    .bottom(px(0.0))
+                    .left(px(-theme::SIDEBAR_PAD_X))
+                    .right(px(-theme::SIDEBAR_PAD_X))
+                    .child(img(wave).w_full().h_full().object_fit(ObjectFit::Fill)),
+            )
             .child(self.titlebar_row(cx))
             .child(self.brand_row())
             .child(self.new_session_button(cx))
@@ -324,14 +346,15 @@ impl Shell {
             .px(px(12.0))
             .rounded(px(12.0))
             .border_color(rgb(theme::border_soft()))
-            .bg(rgb(theme::new_session_fill()))
+            .bg(rgb(theme::page()))
+            .shadow_sm()
             .cursor_pointer()
             .flex()
             .flex_row()
             .items_center()
             .justify_center()
             .gap(px(6.0))
-            .hover(|s| s.bg(rgb(theme::hover())))
+            .hover(|s| s.bg(rgb(theme::soft(theme::accent()))))
             .child(icon(IconName::Plus, 15.0, theme::text()))
             .child(
                 txt(
@@ -655,25 +678,36 @@ impl Shell {
                         .group(row_group.clone())
                         .h(px(theme::ROW_H))
                         .flex_shrink_0()
-                        .px(px(12.0))
+                        .mx(px(4.0))
+                        .px(px(10.0))
+                        .rounded(px(10.0))
                         .flex()
                         .flex_row()
                         .items_center()
                         .gap(px(8.0))
                         .cursor_pointer()
-                        .when(selected, |row| row.bg(rgb(theme::selected_row())))
+                        .when(selected, |row| row.bg(rgb(theme::page())).shadow_sm())
                         .when(!selected, |row| row.hover(|s| s.bg(rgb(theme::hover()))))
                         .child(
                             div()
                                 .w(px(theme::TREE_ROW_LEAD))
                                 .h(px(6.0))
                                 .rounded_full()
-                                .bg(if streaming {
+                                .bg(if streaming || selected {
                                     rgb(theme::accent())
                                 } else {
-                                    rgb(theme::sidebar_bg())
+                                    rgb(theme::border_strong())
                                 }),
                         )
+                        .child(icon(
+                            IconName::MessageSquare,
+                            13.0,
+                            if selected {
+                                theme::accent()
+                            } else {
+                                theme::muted()
+                            },
+                        ))
                         .child(if self.renaming_session.as_deref() == Some(id.as_str()) {
                             // The rename happens in place on the row: the
                             // reference's ⌥⌘G puts the field where the title
@@ -988,15 +1022,19 @@ impl Shell {
                             .group(row_group.clone())
                             .h(px(theme::ROW_H))
                             .flex_shrink_0()
-                            .px(px(12.0))
+                            .mx(px(4.0))
+                            .px(px(10.0))
+                            .rounded(px(10.0))
                             .flex()
                             .flex_row()
                             .items_center()
                             .gap(px(8.0))
+                            .hover(|row| row.bg(rgb(theme::hover())))
                             // The same leading column the live rows use, empty: an
                             // archived session is the same session, put away, so it
                             // starts where they start.
                             .child(div().w(px(theme::TREE_ROW_LEAD)).h(px(6.0)).flex_none())
+                            .child(icon(IconName::MessageSquare, 13.0, theme::faint()))
                             .child(
                                 txt(title, theme::SIDEBAR_SIZE, theme::muted())
                                     .debug_selector(|| format!("archived-title-{}", id))

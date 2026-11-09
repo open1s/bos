@@ -5,6 +5,7 @@ schema_version = 0
 [agent]
 system_prompt = ""
 complete = false
+reasoning_effort = "low"
 permission = "workspace-write"
 bash_enabled = true
 file_tools_enabled = true

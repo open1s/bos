@@ -27,6 +27,35 @@ pub(crate) fn mark() -> Arc<Image> {
     .clone()
 }
 
+/// The sidebar's blue-white wave backdrop.
+///
+/// Raster rather than SVG: GPUI's SVG path goes through a line-icon renderer
+/// that drops a gradient-only document. The PNG is generated at 2x from the
+/// same two curves the prototype uses, so the wave stays smooth at the panel's
+/// 280px width and covers the full height.
+pub(crate) fn sidebar_wave(dark: bool) -> Arc<Image> {
+    static LIGHT: OnceLock<Arc<Image>> = OnceLock::new();
+    static DARK: OnceLock<Arc<Image>> = OnceLock::new();
+    if dark {
+        DARK.get_or_init(|| {
+            Arc::new(Image::from_bytes(
+                ImageFormat::Png,
+                include_bytes!("assets/sidebar-wave-dark.png").to_vec(),
+            ))
+        })
+        .clone()
+    } else {
+        LIGHT
+            .get_or_init(|| {
+                Arc::new(Image::from_bytes(
+                    ImageFormat::Png,
+                    include_bytes!("assets/sidebar-wave-light.png").to_vec(),
+                ))
+            })
+            .clone()
+    }
+}
+
 /// Give the process its Dock icon.
 ///
 /// `make-dev-app.sh` sets `CFBundleIconFile` for `BSH.app`, but the bare
