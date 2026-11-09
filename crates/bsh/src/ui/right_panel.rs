@@ -3104,8 +3104,17 @@ impl Shell {
                             .cursor_pointer()
                             .hover(|style| style.bg(rgb(theme::hover())))
                             .child(txt(lang.tr("right.tasks.board"), 9.5, theme::muted()))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _event: &MouseDownEvent, _window, cx| {
+                                    this.graph_board = true;
+                                    this.graph_tree = false;
+                                    cx.notify();
+                                }),
+                            )
                             .on_click(cx.listener(|this, _event, _window, cx| {
                                 this.graph_board = true;
+                                this.graph_tree = false;
                                 cx.notify();
                             })),
                     ),
@@ -3741,45 +3750,10 @@ impl Shell {
             }
         }
         if !any {
-            return div()
-                .debug_selector(|| "tasks-empty".to_string())
-                .flex()
-                .flex_col()
-                .flex_1()
-                .items_center()
-                .justify_center()
-                .gap(px(6.0))
-                .child(
-                    div()
-                        .id("task-view-list")
-                        .debug_selector(|| "task-view-list".to_string())
-                        .h(px(24.0))
-                        .px(px(8.0))
-                        .rounded(px(7.0))
-                        .border_1()
-                        .border_color(rgb(theme::border_soft()))
-                        .flex()
-                        .items_center()
-                        .cursor_pointer()
-                        .hover(|style| style.bg(rgb(theme::hover())))
-                        .child(txt(lang.tr("right.tasks.list"), 10.0, theme::muted()))
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.graph_board = false;
-                            this.graph_tree = false;
-                            cx.notify();
-                        })),
-                )
-                .child(txt(
-                    lang.tr("right.tasks.empty"),
-                    theme::SIDEBAR_SIZE,
-                    theme::text(),
-                ))
-                .child(txt(
-                    lang.tr("right.tasks.emptyHint"),
-                    theme::RIGHT_HINT_SIZE,
-                    theme::faint(),
-                ))
-                .into_any_element();
+            // The board has no durable records, but the session still has work
+            // units. Do not strand the reader on an empty card: show the same
+            // List projection the Tree/List control offers.
+            return self.task_graph_list(cx);
         }
         div()
             .flex()

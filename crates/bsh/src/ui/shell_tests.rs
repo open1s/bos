@@ -5401,8 +5401,8 @@ fn the_tasks_tab_shows_the_workspace_board(cx: &mut TestAppContext) {
     cx.simulate_click(mode.center(), Modifiers::default());
     cx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(
-        cx.debug_bounds("tasks-empty").is_some(),
-        "an empty workspace says there are no tasks"
+        cx.debug_bounds("task-graph-list-view").is_some(),
+        "an empty board falls back to the work-unit list"
     );
 
     let task = crate::extension::tasks::Task::open(
