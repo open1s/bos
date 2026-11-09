@@ -208,7 +208,24 @@ impl Shell {
 
     /// The left column.
     pub(crate) fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let wave = crate::assets::sidebar_wave(theme::is_dark());
+        let dark = theme::is_dark();
+        // macOS graphite: a lifted top and a sunken floor, translucent so the
+        // window's blurred backdrop reads through the column. Light keeps the
+        // blue-white wave it was designed around.
+        let (top, bottom, alpha) = if dark {
+            (
+                theme::lift(theme::sidebar_bg(), 0.025),
+                theme::sink(theme::sidebar_bg(), 0.08),
+                0xE8,
+            )
+        } else {
+            (
+                theme::blend_into(theme::accent(), theme::page(), 0.98),
+                theme::blend_into(theme::accent(), theme::page(), 0.82),
+                0xFF,
+            )
+        };
+        let wave = (!dark).then(|| crate::assets::sidebar_wave(false));
         div()
             .debug_selector(|| String::from("sidebar"))
             .relative()
@@ -222,24 +239,38 @@ impl Shell {
             .px(px(theme::SIDEBAR_PAD_X))
             .bg(linear_gradient(
                 180.0,
-                linear_color_stop(
-                    rgba((theme::blend_into(theme::accent(), theme::page(), 0.98) << 8) | 0xFF),
-                    0.0,
-                ),
-                linear_color_stop(
-                    rgba((theme::blend_into(theme::accent(), theme::page(), 0.82) << 8) | 0xFF),
-                    1.0,
-                ),
+                linear_color_stop(rgba((top << 8) | alpha), 0.0),
+                linear_color_stop(rgba((bottom << 8) | alpha), 1.0),
             ))
-            .child(
-                div()
-                    .absolute()
-                    .top(px(-6.0))
-                    .bottom(px(0.0))
-                    .left(px(-theme::SIDEBAR_PAD_X))
-                    .right(px(-theme::SIDEBAR_PAD_X))
-                    .child(img(wave).w_full().h_full().object_fit(ObjectFit::Fill)),
-            )
+            .when(dark, |sidebar| {
+                sidebar.child(
+                    // The floor glow is the one colour in the column: a 6%
+                    // system-blue wash at the bottom, where macOS vibrancy
+                    // picks up the wallpaper's tint.
+                    div()
+                        .absolute()
+                        .bottom(px(0.0))
+                        .left(px(-theme::SIDEBAR_PAD_X))
+                        .right(px(-theme::SIDEBAR_PAD_X))
+                        .h(px(380.0))
+                        .bg(linear_gradient(
+                            180.0,
+                            linear_color_stop(rgba(0x0A84FF00), 0.0),
+                            linear_color_stop(rgba(0x6BA6FF0C), 1.0),
+                        )),
+                )
+            })
+            .when_some(wave, |sidebar, wave| {
+                sidebar.child(
+                    div()
+                        .absolute()
+                        .top(px(-6.0))
+                        .bottom(px(0.0))
+                        .left(px(-theme::SIDEBAR_PAD_X))
+                        .right(px(-theme::SIDEBAR_PAD_X))
+                        .child(img(wave).w_full().h_full().object_fit(ObjectFit::Fill)),
+                )
+            })
             .child(self.titlebar_row(cx))
             .child(self.brand_row())
             .child(self.new_session_button(cx))
@@ -346,7 +377,14 @@ impl Shell {
             .px(px(12.0))
             .rounded(px(12.0))
             .border_color(rgb(theme::border_soft()))
-            .bg(rgb(theme::page()))
+            // In dark the button is a raised graphite control, the way macOS
+            // lifts a toolbar button off the vibrant sidebar; light keeps the
+            // white card.
+            .bg(if theme::is_dark() {
+                rgb(theme::new_session_fill())
+            } else {
+                rgb(theme::page())
+            })
             .shadow_sm()
             .cursor_pointer()
             .flex()
@@ -686,7 +724,16 @@ impl Shell {
                         .items_center()
                         .gap(px(8.0))
                         .cursor_pointer()
-                        .when(selected, |row| row.bg(rgb(theme::page())).shadow_sm())
+                        .when(selected, |row| {
+                            // macOS selection is a lifted graphite row, not a
+                            // hole punched through the sidebar.
+                            row.bg(rgb(if theme::is_dark() {
+                                theme::lift(theme::sidebar_bg(), 0.06)
+                            } else {
+                                theme::page()
+                            }))
+                            .shadow_sm()
+                        })
                         .when(!selected, |row| row.hover(|s| s.bg(rgb(theme::hover()))))
                         .child(
                             div()

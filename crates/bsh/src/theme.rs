@@ -176,6 +176,19 @@ pub(crate) fn blend_into(color: u32, surface: u32, share: f32) -> u32 {
     blend(color, surface, share)
 }
 
+/// Lift a colour towards white by `amount` (0..=1).
+///
+/// A dark surface is built from a base plus a small white lift, the way macOS
+/// graphite separates the sidebar from the page without a visible seam.
+pub(crate) fn lift(color: u32, amount: f32) -> u32 {
+    blend(color, 0xFFFFFF, amount)
+}
+
+/// Sink a colour towards black by `amount` (0..=1).
+pub(crate) fn sink(color: u32, amount: f32) -> u32 {
+    blend(color, 0x000000, amount)
+}
+
 /// How much wider the composer card is than the chat column.
 ///
 /// Measured: `--dsh-composer-card-max-width` is the chat content width plus
@@ -1134,13 +1147,13 @@ pub(crate) fn sync(cx: &App) {
         let mut palette = Palette {
             page: hx(t.background),
             sidebar_bg: hx(t.sidebar),
-            selected_row: hx(t.sidebar_accent),
+            selected_row: hx_over(t.sidebar_accent, t.sidebar),
             new_session_fill: hx(t.secondary),
             hover: hx(t.secondary_hover),
             text: hx(fg),
             muted: hx(t.muted_foreground),
-            faint: hx(t.muted_foreground),
-            border_soft: hx(t.border),
+            faint: blend(hx(t.muted_foreground), hx(bg), 0.30),
+            border_soft: hx_over(t.border, bg),
             border: mix(fg, bg, 0.16),
             border_strong: mix(fg, bg, 0.32),
             accent: hx(t.primary),
@@ -1153,6 +1166,20 @@ pub(crate) fn sync(cx: &App) {
         cell.set(palette);
     });
 }
+/// Turn the window's vibrancy material on for dark and off for light.
+///
+/// macOS backs a blurred window with an NSVisualEffectView that samples the
+/// desktop. Only the dark theme is translucent enough to use it; leaving the
+/// material on in light would pay for a blur the opaque page hides.
+#[cfg(target_os = "macos")]
+fn set_vibrancy(window: &mut Window, dark: bool) {
+    window.set_background_appearance(if dark {
+        WindowBackgroundAppearance::Blurred
+    } else {
+        WindowBackgroundAppearance::Opaque
+    });
+}
+
 /// Switch between the kit's light and dark palettes.
 pub(crate) fn toggle(window: &mut Window, cx: &mut App) {
     let next = if cx.theme().mode.is_dark() {
@@ -1161,6 +1188,8 @@ pub(crate) fn toggle(window: &mut Window, cx: &mut App) {
         ThemeMode::Dark
     };
     Theme::change(next, Some(window), cx);
+    #[cfg(target_os = "macos")]
+    set_vibrancy(window, next.is_dark());
     sync(cx);
 }
 /// Resolve a saved mode name to "light" or "dark".
@@ -1187,6 +1216,8 @@ fn theme_mode(name: &str) -> ThemeMode {
 /// Apply a saved mode name ("light" or "dark") and refresh the tokens.
 pub(crate) fn apply(name: &str, window: &mut Window, cx: &mut App) {
     let resolved = resolve(name, Some(&mut *window), cx);
+    #[cfg(target_os = "macos")]
+    set_vibrancy(window, resolved == "dark");
     // Create the theme global before its configs are swapped, then apply
     // them: change reloads the theme of the current mode even when the mode
     // did not change, which is what makes the swap take effect.
@@ -1198,6 +1229,11 @@ pub(crate) fn apply(name: &str, window: &mut Window, cx: &mut App) {
 /// Apply a saved mode name when the caller has no window (the settings pane).
 pub(crate) fn apply_here(name: &str, cx: &mut App) {
     let resolved = resolve(name, None, cx);
+    #[cfg(target_os = "macos")]
+    if let Some(handle) = cx.active_window() {
+        let dark = resolved == "dark";
+        let _ = handle.update(cx, |_, window, _| set_vibrancy(window, dark));
+    }
     Theme::change(theme_mode(&resolved), None, cx);
     install(cx);
     Theme::change(theme_mode(&resolved), None, cx);
@@ -1243,6 +1279,20 @@ fn hx(color: Hsla) -> u32 {
     let c = Rgba::from(color);
     let ch = |v: f32| ((v.clamp(0.0, 1.0)) * 255.0).round() as u32;
     (ch(c.r) << 16) | (ch(c.g) << 8) | ch(c.b)
+}
+
+/// Flatten a translucent token onto the surface it is drawn over.
+///
+/// The palette stores RGB, so a token like `sidebar.accent.background`
+/// (`#FFFFFF12`) used to lose its alpha here and become pure white - which
+/// turned the selected preset card and the session rows white in dark mode.
+/// Keep the alpha in the kit colour and composite it for the palette copy.
+fn hx_over(color: Hsla, backdrop: Hsla) -> u32 {
+    let c = Rgba::from(color);
+    let b = Rgba::from(backdrop);
+    let a = c.a.clamp(0.0, 1.0);
+    let ch = |x: f32, y: f32| (((x * a) + (y * (1.0 - a))).clamp(0.0, 1.0) * 255.0).round() as u32;
+    (ch(c.r, b.r) << 16) | (ch(c.g, b.g) << 8) | ch(c.b, b.b)
 }
 
 /// Blend two packed colours in RGB space; `t` is the share of `b`.
@@ -1316,8 +1366,22 @@ pub(crate) fn terminal_palette() -> [u32; 16] {
 #[cfg(test)]
 mod tests {
     use super::terminal_font_size;
-    use super::{apply_extension_tokens, clear_extension_tokens, set_extension_tokens, Palette};
+    use super::{
+        apply_extension_tokens, clear_extension_tokens, hx_over, set_extension_tokens, Palette,
+    };
+    use gpui_kit::hsla;
     use std::collections::BTreeMap;
+
+    /// A token carrying alpha must composite, not lose it. Losing it turned
+    /// the 7%-white selected-row fill into pure white in dark mode.
+    #[test]
+    fn a_translucent_token_composites_over_its_surface() {
+        let over = hx_over(hsla(0.0, 0.0, 1.0, 0.07), hsla(0.0, 0.0, 0.125, 1.0));
+        assert!(
+            over < 0x606060,
+            "7% white over graphite stays graphite, got {over:06x}"
+        );
+    }
 
     #[test]
     fn extension_theme_tokens_override_only_the_named_fields() {
@@ -1434,6 +1498,33 @@ mod tests {
         let other = std::thread::spawn(super::page).join().expect("the thread");
         assert_eq!(super::page(), 0x010203, "this thread keeps its own palette");
         assert_eq!(other, shipped, "a new thread starts from the shipped one");
+    }
+
+    /// The dark set is the macOS system palette, not a dimmed copy of the
+    /// light one: graphite surfaces, system blue, vibrancy-alpha hairlines.
+    #[test]
+    fn the_dark_theme_is_macos_graphite() {
+        let set: serde_json::Value = serde_json::from_str(THEME_SET).expect("theme JSON");
+        let dark = set["themes"]
+            .as_array()
+            .expect("themes")
+            .iter()
+            .find(|theme| theme["name"] == "BSH Dark")
+            .expect("BSH Dark");
+        let colors = &dark["colors"];
+        assert_eq!(colors["background"], "#202024", "the soft graphite page");
+        assert_eq!(
+            colors["sidebar.background"], "#26262B",
+            "a graphite sidebar"
+        );
+        assert_eq!(
+            colors["foreground"], "#E6E6EC",
+            "label primary, not pure white"
+        );
+        assert_eq!(colors["primary.background"], "#6BA6FF", "soft system blue");
+        assert_eq!(colors["border"], "#FFFFFF1A", "a 10% vibrancy hairline");
+        assert_eq!(colors["success.background"], "#6FCF97");
+        assert_eq!(colors["danger.background"], "#E5675F");
     }
 
     #[test]

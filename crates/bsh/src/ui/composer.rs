@@ -517,8 +517,27 @@ impl Shell {
                     .relative()
                     .w_full()
                     .rounded(px(28.0))
-                    .bg(rgb(theme::page()))
-                    .shadow_sm()
+                    // macOS dark raises the composer off the page with a
+                    // graphite fill and a deep, soft shadow. Light keeps the
+                    // white card and the kit's shadcn elevation.
+                    .bg(if theme::is_dark() {
+                        rgb(theme::new_session_fill())
+                    } else {
+                        rgb(theme::page())
+                    })
+                    .when(theme::is_dark(), |card| {
+                        card.shadow(vec![
+                            BoxShadow::new(px(0.0), px(24.0), hsla(0.0, 0.0, 0.0, 0.30))
+                                .blur_radius(px(64.0)),
+                            BoxShadow::new(px(0.0), px(1.0), hsla(0.0, 0.0, 0.0, 0.35))
+                                .blur_radius(px(2.0)),
+                            // The glass edge: one white line inside the top lip.
+                            BoxShadow::new(px(0.0), px(1.0), hsla(0.0, 0.0, 1.0, 0.05))
+                                .blur_radius(px(1.0))
+                                .inset(),
+                        ])
+                    })
+                    .when(!theme::is_dark(), |card| card.shadow_sm())
                     .pt(px(8.0))
                     .flex()
                     .flex_col()
@@ -651,26 +670,35 @@ impl Shell {
                     // slash palette while a leading slash is being typed, otherwise
                     // the plus card.
                     .when_some(self.composer_overlay(cx), |card, menu| card.child(menu));
-                let card = hairline_all(card).border_color(rgb(theme::border_soft()));
-                let inset = if hero { 2.0 } else { 1.0 };
+                let card = hairline_all(card).border_color(if theme::is_dark() {
+                    rgba(0xFFFFFF1A)
+                } else {
+                    rgb(theme::border_soft())
+                });
+                let inset = if theme::is_dark() || hero { 2.0 } else { 1.0 };
+                // macOS dark draws a fine system-blue focus edge around the
+                // raised card; light keeps the measured accent-to-cyan ring.
+                let halo = div()
+                    .absolute()
+                    .top(px(-inset))
+                    .left(px(-inset))
+                    .right(px(-inset))
+                    .bottom(px(-inset))
+                    .rounded(px(30.0));
+                let halo = if theme::is_dark() {
+                    halo.bg(rgba(0x6BA6FF40))
+                } else {
+                    halo.bg(linear_gradient(
+                        135.0,
+                        linear_color_stop(rgba((theme::accent() << 8) | 0xFF), 0.0),
+                        linear_color_stop(rgba((0x22D3EE << 8) | 0xFF), 1.0),
+                    ))
+                };
                 div()
                     .debug_selector(|| "composer-frame".to_string())
                     .relative()
                     .w_full()
-                    .child(
-                        div()
-                            .absolute()
-                            .top(px(-inset))
-                            .left(px(-inset))
-                            .right(px(-inset))
-                            .bottom(px(-inset))
-                            .rounded(px(30.0))
-                            .bg(linear_gradient(
-                                135.0,
-                                linear_color_stop(rgba((theme::accent() << 8) | 0xFF), 0.0),
-                                linear_color_stop(rgba((0x22D3EE << 8) | 0xFF), 1.0),
-                            )),
-                    )
+                    .child(halo)
                     .child(card)
                     .into_any_element()
             });
@@ -1208,15 +1236,22 @@ impl Shell {
         let label: SharedString = lang
             .tr(if stops { "input.stop" } else { "input.send" })
             .into();
+        // The dark accent is a soft pastel blue, so its glyph is the page's
+        // graphite rather than white; light keeps the white-on-blue mark.
+        let on_accent = if theme::is_dark() {
+            theme::page()
+        } else {
+            ON_ACCENT
+        };
         let glyph = if stops {
             div()
                 .debug_selector(|| "composer-stop-mark".to_string())
                 .w(px(10.0))
                 .h(px(10.0))
                 .rounded(px(3.0))
-                .bg(rgb(ON_ACCENT))
+                .bg(rgb(on_accent))
         } else {
-            icon(IconName::ArrowUp, 16.0, ON_ACCENT)
+            icon(IconName::ArrowUp, 16.0, on_accent)
         };
         div()
             .debug_selector(|| "composer-send".to_string())
@@ -1225,11 +1260,19 @@ impl Shell {
             .h(px(34.0))
             .flex_none()
             .rounded_full()
-            .bg(linear_gradient(
-                135.0,
-                linear_color_stop(rgba((theme::accent() << 8) | 0xFF), 0.0),
-                linear_color_stop(rgba((0x7C5CFC << 8) | 0xFF), 1.0),
-            ))
+            .bg(if theme::is_dark() {
+                linear_gradient(
+                    135.0,
+                    linear_color_stop(rgba((theme::accent() << 8) | 0xFF), 0.0),
+                    linear_color_stop(rgba(0x8AB9FF), 1.0),
+                )
+            } else {
+                linear_gradient(
+                    135.0,
+                    linear_color_stop(rgba((theme::accent() << 8) | 0xFF), 0.0),
+                    linear_color_stop(rgba((0x7C5CFC << 8) | 0xFF), 1.0),
+                )
+            })
             .flex()
             .items_center()
             .justify_center()

@@ -288,6 +288,8 @@ pub(crate) fn run(startup: Startup) {
             cx.activate(true);
             gpui_kit::init(cx);
             bind_global_actions(cx);
+            // The window opens opaque; `Shell::new` applies the saved theme,
+            // and `theme::apply` turns macOS vibrancy on only for dark.
             gpui_kit::open_window(
                 WindowOptions {
                     // The reference is a frameless window: its content starts at y=0 and

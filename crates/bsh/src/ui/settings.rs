@@ -2322,14 +2322,26 @@ impl Shell {
                             .w(px(62.0))
                             .h(px(62.0))
                             .rounded(px(999.0))
-                            .bg(linear_gradient(
-                                140.0,
-                                linear_color_stop(settings_opaque(tint), 0.0),
-                                linear_color_stop(
-                                    settings_opaque(theme::blend_into(tint, 0xFFFFFF, 0.35)),
-                                    1.0,
-                                ),
-                            ))
+                            // In dark the tile is glass, not a coin: a 5%
+                            // white wash that is almost invisible on the
+                            // banner, so only the 29px glyph reads. Light
+                            // keeps the tinted disc.
+                            .bg(if theme::is_dark() {
+                                linear_gradient(
+                                    140.0,
+                                    linear_color_stop(rgba(0xFFFFFF0D), 0.0),
+                                    linear_color_stop(rgba(0xFFFFFF04), 1.0),
+                                )
+                            } else {
+                                linear_gradient(
+                                    140.0,
+                                    linear_color_stop(settings_opaque(tint), 0.0),
+                                    linear_color_stop(
+                                        settings_opaque(theme::blend_into(tint, 0xFFFFFF, 0.35)),
+                                        1.0,
+                                    ),
+                                )
+                            })
                             .flex()
                             .items_center()
                             .justify_center()

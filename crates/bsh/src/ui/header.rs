@@ -296,7 +296,19 @@ impl Shell {
             .h_full()
             .flex()
             .flex_col()
-            .overflow_hidden();
+            .overflow_hidden()
+            // The page is painted here, not on the frame, so the sidebar can
+            // stay translucent over the window's vibrancy material. Dark gets a
+            // 1.5% top lift and a 2% floor sink - the graphite depth macOS
+            // gives a window without a visible gradient.
+            .when(theme::is_dark(), |column| {
+                column.bg(linear_gradient(
+                    180.0,
+                    linear_color_stop(rgba((theme::lift(theme::page(), 0.008) << 8) | 0xFF), 0.0),
+                    linear_color_stop(rgba((theme::sink(theme::page(), 0.012) << 8) | 0xFF), 1.0),
+                ))
+            })
+            .when(!theme::is_dark(), |column| column.bg(rgb(theme::page())));
         // The reference hangs the shell's only structural rule on the centre
         // column - `.5px` at border-l3 - and drops it when the sidebar folds away.
         let column = if self.sidebar_folded() {

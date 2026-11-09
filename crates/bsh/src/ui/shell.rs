@@ -7400,7 +7400,14 @@ impl Render for Shell {
                     }
                 },
             ))
-            .bg(rgb(crate::theme::page()))
+            .bg(if cfg!(target_os = "macos") && crate::theme::is_dark() {
+                // Let the window's blurred backdrop show through the sidebar.
+                // Every other column paints the page itself, so only the
+                // translucent sidebar reveals the material.
+                rgba(crate::theme::page() << 8)
+            } else {
+                rgb(crate::theme::page())
+            })
             .text_color(rgb(crate::theme::text()))
             .when(!self.sidebar_folded(), |root| {
                 root.child(self.render_sidebar(cx))
