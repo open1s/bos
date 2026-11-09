@@ -483,7 +483,9 @@ mod tests {
 
     /// Only installed applications are offered, in catalog order: the file
     /// manager first, then editors and IDEs as the catalog lists them rather
-    /// than as the filesystem happens to answer.
+    /// than as the filesystem happens to answer. The multi-application catalog
+    /// is macOS-only; other platforms resolve the file manager alone.
+    #[cfg(target_os = "macos")]
     #[test]
     fn only_installed_applications_are_offered_in_catalog_order() {
         let system = scratch("system");
@@ -523,7 +525,9 @@ mod tests {
     }
 
     /// The remembered application is the preferred row while it is installed,
-    /// and a stale or empty choice falls back to the first one offered.
+    /// and a stale or empty choice falls back to the first one offered. This
+    /// names macOS products, so the fixture is macOS-only.
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_remembered_application_is_the_preferred_row() {
         let root = scratch("preferred");
