@@ -1625,9 +1625,21 @@ impl Shell {
                             .child(
                                 txt(title, 13.0, theme::text())
                                     .font_weight(FontWeight::MEDIUM)
-                                    .flex_1(),
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate(),
                             )
-                            .child(txt(status, 10.0, ink)),
+                            .child(
+                                div()
+                                    .h(px(18.0))
+                                    .px(px(6.0))
+                                    .rounded(px(999.0))
+                                    .bg(rgb(theme::soft(ink)))
+                                    .flex()
+                                    .flex_none()
+                                    .items_center()
+                                    .child(txt(status, 9.0, ink).whitespace_nowrap()),
+                            ),
                     )
                     .child(txt(description, 11.5, theme::muted()))
                     .when(!meta.is_empty(), |card| {
